@@ -1,0 +1,13 @@
+[package]
+name = "kardamom"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kardamom-node = { path = "../node" }
+alloy-primitives.workspace = true
+anyhow = "1"
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

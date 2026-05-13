@@ -1,0 +1,23 @@
+[package]
+name = "kardamom-node"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+revm.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-rlp.workspace = true
+alloy-network.workspace = true
+jsonrpsee.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+alloy-eips.workspace = true
+alloy-signer-local.workspace = true
