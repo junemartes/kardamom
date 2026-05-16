@@ -8,6 +8,7 @@ use jsonrpsee::server::{Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 
 use crate::error::NodeError;
+use crate::instrument_method;
 use crate::node::Node;
 
 #[rpc(server, namespace = "eth")]
@@ -53,37 +54,51 @@ fn require_latest(block: BlockNumberOrTag) -> Result<(), NodeError> {
 #[async_trait::async_trait]
 impl EthApiServer for EthHandlers {
     async fn chain_id(&self) -> RpcResult<U256> {
-        Ok(U256::from(self.node.chain_id()))
+        instrument_method!("eth_chainId", {
+            Ok::<U256, ErrorObjectOwned>(U256::from(self.node.chain_id()))
+        })
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        Ok(U256::from(self.node.block_number().await))
+        instrument_method!("eth_blockNumber", {
+            Ok::<U256, ErrorObjectOwned>(U256::from(self.node.block_number().await))
+        })
     }
 
     async fn balance(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256> {
-        require_latest(block).map_err(ErrorObjectOwned::from)?;
-        Ok(self.node.balance(addr).await)
+        instrument_method!("eth_getBalance", {
+            require_latest(block).map_err(ErrorObjectOwned::from)?;
+            Ok::<U256, ErrorObjectOwned>(self.node.balance(addr).await)
+        })
     }
 
     async fn nonce(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256> {
-        require_latest(block).map_err(ErrorObjectOwned::from)?;
-        Ok(U256::from(self.node.nonce(addr).await))
+        instrument_method!("eth_getTransactionCount", {
+            require_latest(block).map_err(ErrorObjectOwned::from)?;
+            Ok::<U256, ErrorObjectOwned>(U256::from(self.node.nonce(addr).await))
+        })
     }
 
     async fn call(&self, req: TransactionRequest, block: BlockNumberOrTag) -> RpcResult<Bytes> {
-        require_latest(block).map_err(ErrorObjectOwned::from)?;
-        self.node.call(req).await.map_err(ErrorObjectOwned::from)
+        instrument_method!("eth_call", {
+            require_latest(block).map_err(ErrorObjectOwned::from)?;
+            self.node.call(req).await.map_err(ErrorObjectOwned::from)
+        })
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256> {
-        self.node
-            .submit_raw_transaction(bytes)
-            .await
-            .map_err(ErrorObjectOwned::from)
+        instrument_method!("eth_sendRawTransaction", {
+            self.node
+                .submit_raw_transaction(bytes)
+                .await
+                .map_err(ErrorObjectOwned::from)
+        })
     }
 
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
-        Ok(self.node.receipt(hash).await)
+        instrument_method!("eth_getTransactionReceipt", {
+            Ok::<Option<TransactionReceipt>, ErrorObjectOwned>(self.node.receipt(hash).await)
+        })
     }
 }
 

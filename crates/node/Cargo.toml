@@ -16,8 +16,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+metrics.workspace = true
 async-trait = "0.1"
 
 [dev-dependencies]
 alloy-eips.workspace = true
 alloy-signer-local.workspace = true
+metrics-exporter-prometheus.workspace = true

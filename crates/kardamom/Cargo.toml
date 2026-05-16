@@ -6,8 +6,11 @@ edition.workspace = true
 [dependencies]
 kardamom-node = { path = "../node" }
 alloy-primitives.workspace = true
-anyhow = "1"
+anyhow.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-flame.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true

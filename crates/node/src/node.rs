@@ -15,6 +15,8 @@ use tokio::sync::RwLock;
 
 use crate::error::NodeError;
 use crate::executor::{self, ExecEnv};
+use crate::metrics as kmetrics;
+use crate::{stage, stage_await};
 
 #[derive(Clone)]
 pub struct Node {
@@ -87,39 +89,58 @@ impl Node {
     }
 
     pub async fn call(&self, req: TransactionRequest) -> Result<Bytes, NodeError> {
-        let state = self.inner.read().await;
+        const METHOD: &str = "eth_call";
+        let state = stage_await!("acquire_read_lock", method = METHOD, self.inner.read());
+        let tx = stage!("build_tx_env", method = METHOD, {
+            executor::tx_env_from_request(&req)
+        });
         let env = ExecEnv {
             chain_id: self.chain_id,
             block_number: state.block_number,
         };
-        let tx = executor::tx_env_from_request(&req);
-        executor::call(&state.db, env, tx)
+        stage!("execute", method = METHOD, {
+            executor::call(&state.db, env, tx)
+        })
     }
 
     /// Decode an EIP-2718-encoded signed transaction, execute it against the
     /// node's mutable state, store a receipt, and bump the block number.
     pub async fn submit_raw_transaction(&self, bytes: Bytes) -> Result<B256, NodeError> {
-        let envelope = TxEnvelope::decode(&mut bytes.as_ref())
-            .map_err(|e| NodeError::Decode(e.to_string()))?;
-        let signer = envelope
-            .recover_signer()
-            .map_err(|_| NodeError::SignatureRecovery)?;
+        const METHOD: &str = "eth_sendRawTransaction";
+
+        let envelope: TxEnvelope = stage!("decode", method = METHOD, {
+            TxEnvelope::decode(&mut bytes.as_ref()).map_err(|e| NodeError::Decode(e.to_string()))?
+        });
+        let signer = stage!("recover_signer", method = METHOD, {
+            envelope
+                .recover_signer()
+                .map_err(|_| NodeError::SignatureRecovery)?
+        });
         let tx_hash = *envelope.tx_hash();
 
-        let mut state = self.inner.write().await;
+        let mut state = stage_await!("acquire_write_lock", method = METHOD, self.inner.write());
         let sealed_block = state.block_number + 1;
         let env = ExecEnv {
             chain_id: self.chain_id,
             block_number: sealed_block,
         };
-        let tx = executor::tx_env_from_envelope(&envelope, signer);
+        let tx = stage!("build_tx_env", method = METHOD, {
+            executor::tx_env_from_envelope(&envelope, signer)
+        });
 
-        let out = executor::execute(&mut state.db, env, tx)?;
-        let receipt = build_receipt(&envelope, &out.result, signer, tx_hash, sealed_block);
+        let out = stage!("execute", method = METHOD, {
+            executor::execute(&mut state.db, env, tx)?
+        });
+        let receipt = stage!("build_receipt", method = METHOD, {
+            build_receipt(&envelope, &out.result, signer, tx_hash, sealed_block)
+        });
 
-        state.receipts.insert(tx_hash, receipt);
-        state.block_number = sealed_block;
+        stage!("store_receipt", method = METHOD, {
+            state.receipts.insert(tx_hash, receipt);
+            state.block_number = sealed_block;
+        });
 
+        kmetrics::set_block_number(sealed_block);
         Ok(tx_hash)
     }
 

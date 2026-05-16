@@ -4,6 +4,8 @@ pub mod error;
 
 pub use error::NodeError;
 
+pub mod metrics;
+
 pub mod node;
 
 pub use node::Node;

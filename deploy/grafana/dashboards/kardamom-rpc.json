@@ -1,0 +1,176 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "schemaVersion": 38,
+  "tags": ["kardamom"],
+  "timezone": "browser",
+  "title": "Kardamom RPC",
+  "uid": "kardamom-rpc",
+  "version": 1,
+  "refresh": "5s",
+  "time": {
+    "from": "now-5m",
+    "to": "now"
+  },
+  "templating": {
+    "list": []
+  },
+  "panels": [
+    {
+      "type": "timeseries",
+      "title": "Request rate (rps by method)",
+      "id": 1,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (method) (rate(kardamom_rpc_requests_total[30s]))",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Error rate (rps by method)",
+      "id": 2,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (method) (rate(kardamom_rpc_requests_total{outcome=\"err\"}[30s]))",
+          "legendFormat": "{{method}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "color": {"mode": "palette-classic"}
+        }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Handler latency P50 / P90 / P99 (by method)",
+      "id": 3,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket[30s])))",
+          "legendFormat": "p50 {{method}}",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.90, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket[30s])))",
+          "legendFormat": "p90 {{method}}",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket[30s])))",
+          "legendFormat": "p99 {{method}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth"}
+        }
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "eth_sendRawTransaction — mean time per stage",
+      "id": 4,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_sum{method=\"eth_sendRawTransaction\"}[30s])) / sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_count{method=\"eth_sendRawTransaction\"}[30s]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "stacking": "normal",
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "type": "barchart",
+      "title": "eth_call — mean time per stage",
+      "id": 5,
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_sum{method=\"eth_call\"}[30s])) / sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_count{method=\"eth_call\"}[30s]))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "stacking": "normal",
+        "orientation": "horizontal"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Block number",
+      "id": 6,
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "targets": [
+        {
+          "expr": "kardamom_block_number",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short"
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"]
+        },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "text",
+      "title": "Build",
+      "id": 7,
+      "gridPos": {"h": 3, "w": 24, "x": 0, "y": 24},
+      "options": {
+        "mode": "html",
+        "content": "<small>Build info comes from the <code>kardamom_build_info</code> gauge. Run <code>curl http://localhost:9000/metrics | grep kardamom_build_info</code> on the node to inspect.</small>"
+      }
+    }
+  ]
+}
