@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use alloy_primitives::{Address, Bytes, B256, U256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
@@ -19,25 +19,13 @@ pub trait EthApi {
     async fn block_number(&self) -> RpcResult<U256>;
 
     #[method(name = "getBalance")]
-    async fn balance(
-        &self,
-        addr: Address,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<U256>;
+    async fn balance(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256>;
 
     #[method(name = "getTransactionCount")]
-    async fn nonce(
-        &self,
-        addr: Address,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<U256>;
+    async fn nonce(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256>;
 
     #[method(name = "call")]
-    async fn call(
-        &self,
-        req: TransactionRequest,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<Bytes>;
+    async fn call(&self, req: TransactionRequest, block: BlockNumberOrTag) -> RpcResult<Bytes>;
 
     #[method(name = "sendRawTransaction")]
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>;
@@ -72,29 +60,17 @@ impl EthApiServer for EthHandlers {
         Ok(U256::from(self.node.block_number().await))
     }
 
-    async fn balance(
-        &self,
-        addr: Address,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<U256> {
+    async fn balance(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256> {
         require_latest(block).map_err(ErrorObjectOwned::from)?;
         Ok(self.node.balance(addr).await)
     }
 
-    async fn nonce(
-        &self,
-        addr: Address,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<U256> {
+    async fn nonce(&self, addr: Address, block: BlockNumberOrTag) -> RpcResult<U256> {
         require_latest(block).map_err(ErrorObjectOwned::from)?;
         Ok(U256::from(self.node.nonce(addr).await))
     }
 
-    async fn call(
-        &self,
-        req: TransactionRequest,
-        block: BlockNumberOrTag,
-    ) -> RpcResult<Bytes> {
+    async fn call(&self, req: TransactionRequest, block: BlockNumberOrTag) -> RpcResult<Bytes> {
         require_latest(block).map_err(ErrorObjectOwned::from)?;
         self.node.call(req).await.map_err(ErrorObjectOwned::from)
     }

@@ -131,5 +131,8 @@ where
         ExecutionResult::Halt { .. } => Bytes::new(),
     };
 
-    Ok(ExecOutput { result, output_bytes })
+    Ok(ExecOutput {
+        result,
+        output_bytes,
+    })
 }

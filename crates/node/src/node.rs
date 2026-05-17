@@ -245,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_returns_constant_from_bytecode() {
-        use alloy_primitives::{address, hex, TxKind};
+        use alloy_primitives::{TxKind, address, hex};
         use alloy_rpc_types_eth::TransactionRequest;
 
         // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
@@ -292,10 +292,7 @@ mod tests {
         let mut bytes = Vec::new();
         envelope.encode_2718(&mut bytes);
 
-        let node = Node::new(
-            1,
-            &[(from, U256::from(10u64).pow(U256::from(18u64)))],
-        );
+        let node = Node::new(1, &[(from, U256::from(10u64).pow(U256::from(18u64)))]);
         let hash = node
             .submit_raw_transaction(Bytes::from(bytes))
             .await
