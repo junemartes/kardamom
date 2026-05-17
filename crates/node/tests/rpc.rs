@@ -13,7 +13,7 @@ use jsonrpsee::rpc_params;
 
 use kardamom_node::Node;
 use kardamom_node::genesis::{AllocEntry, Genesis};
-use kardamom_node::rpc::EthApiServer;
+use kardamom_node::rpc::{EthApiServer, KardamomApiServer};
 
 #[tokio::test]
 async fn end_to_end_send_and_query() {
@@ -137,6 +137,78 @@ async fn end_to_end_send_and_query() {
         .await
         .unwrap();
     assert_eq!(call_result, Bytes::new());
+
+    handle.stop().unwrap();
+    handle.stopped().await;
+}
+
+#[tokio::test]
+async fn kardamom_submit_deposit_tx_round_trip() {
+    use alloy_primitives::B256;
+    use op_alloy_consensus::{OpTxEnvelope, TxDeposit};
+
+    let from = Address::from([0xAAu8; 20]);
+    let to = Address::from([0xBBu8; 20]);
+    let dep = TxDeposit {
+        source_hash: B256::repeat_byte(0x42),
+        from,
+        to: TxKind::Call(to),
+        mint: 1_000u128,
+        value: U256::from(400u64),
+        gas_limit: 200_000,
+        is_system_transaction: false,
+        input: Bytes::new(),
+    };
+    let envelope: OpTxEnvelope = dep.into();
+    let mut raw = Vec::new();
+    envelope.encode_2718(&mut raw);
+
+    let node = Node::new(&Genesis {
+        chain_id: 1,
+        alloc: Vec::new(),
+    });
+    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let server = jsonrpsee::server::Server::builder()
+        .build(addr)
+        .await
+        .unwrap();
+    let bound = server.local_addr().unwrap();
+
+    let mut module = kardamom_node::rpc::EthHandlers::new(node.clone()).into_rpc();
+    module
+        .merge(kardamom_node::rpc::KardamomHandlers::new(node.clone()).into_rpc())
+        .unwrap();
+    let handle = server.start(module);
+
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{}", bound))
+        .unwrap();
+
+    let hash: B256 = client
+        .request("kardamom_submitDepositTx", rpc_params![Bytes::from(raw)])
+        .await
+        .unwrap();
+
+    let bal_to: U256 = client
+        .request("eth_getBalance", rpc_params![to, BlockNumberOrTag::Latest])
+        .await
+        .unwrap();
+    assert_eq!(bal_to, U256::from(400u64));
+
+    let bal_from: U256 = client
+        .request(
+            "eth_getBalance",
+            rpc_params![from, BlockNumberOrTag::Latest],
+        )
+        .await
+        .unwrap();
+    assert_eq!(bal_from, U256::from(600u64));
+
+    let receipt: Option<TransactionReceipt> = client
+        .request("eth_getTransactionReceipt", rpc_params![hash])
+        .await
+        .unwrap();
+    assert!(receipt.is_some());
 
     handle.stop().unwrap();
     handle.stopped().await;

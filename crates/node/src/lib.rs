@@ -19,3 +19,5 @@ pub mod executor;
 pub mod rpc;
 
 pub use rpc::start_server;
+
+pub mod deposit;

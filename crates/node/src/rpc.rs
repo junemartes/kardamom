@@ -102,10 +102,42 @@ impl EthApiServer for EthHandlers {
     }
 }
 
+#[rpc(server, namespace = "kardamom")]
+pub trait KardamomApi {
+    #[method(name = "submitDepositTx")]
+    async fn submit_deposit_tx(&self, bytes: Bytes) -> RpcResult<B256>;
+}
+
+pub struct KardamomHandlers {
+    node: Node,
+}
+
+impl KardamomHandlers {
+    pub fn new(node: Node) -> Self {
+        Self { node }
+    }
+}
+
+#[async_trait::async_trait]
+impl KardamomApiServer for KardamomHandlers {
+    async fn submit_deposit_tx(&self, bytes: Bytes) -> RpcResult<B256> {
+        self.node
+            .submit_deposit_transaction(bytes)
+            .await
+            .map_err(ErrorObjectOwned::from)
+    }
+}
+
 pub async fn start_server(node: Node, addr: SocketAddr) -> Result<ServerHandle, NodeError> {
     let server = Server::builder()
         .build(addr)
         .await
         .map_err(|e| NodeError::Server(e.to_string()))?;
-    Ok(server.start(EthHandlers::new(node).into_rpc()))
+
+    let mut module = EthHandlers::new(node.clone()).into_rpc();
+    module
+        .merge(KardamomHandlers::new(node).into_rpc())
+        .map_err(|e| NodeError::Server(e.to_string()))?;
+
+    Ok(server.start(module))
 }
