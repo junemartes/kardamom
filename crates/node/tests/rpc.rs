@@ -122,8 +122,10 @@ async fn end_to_end_send_and_query() {
     assert_eq!(nonce_after, U256::from(1u64));
 
     // eth_call against a plain EOA — no code, expect empty output
-    let mut call_req = TransactionRequest::default();
-    call_req.to = Some(TxKind::Call(to));
+    let call_req = TransactionRequest {
+        to: Some(TxKind::Call(to)),
+        ..Default::default()
+    };
     let call_result: Bytes = client
         .request("eth_call", rpc_params![call_req, BlockNumberOrTag::Latest])
         .await
