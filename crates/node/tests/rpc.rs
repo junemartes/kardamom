@@ -11,8 +11,8 @@ use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 
-use kardamom_node::rpc::EthApiServer;
 use kardamom_node::Node;
+use kardamom_node::rpc::EthApiServer;
 
 #[tokio::test]
 async fn end_to_end_send_and_query() {
@@ -32,9 +32,7 @@ async fn end_to_end_send_and_query() {
         .await
         .unwrap();
     let bound = server.local_addr().unwrap();
-    let handle = server.start(
-        kardamom_node::rpc::EthHandlers::new(node.clone()).into_rpc(),
-    );
+    let handle = server.start(kardamom_node::rpc::EthHandlers::new(node.clone()).into_rpc());
 
     let client = HttpClientBuilder::default()
         .build(format!("http://{}", bound))
@@ -45,7 +43,10 @@ async fn end_to_end_send_and_query() {
     assert_eq!(cid, U256::from(chain_id));
 
     // initial block
-    let bn: U256 = client.request("eth_blockNumber", rpc_params![]).await.unwrap();
+    let bn: U256 = client
+        .request("eth_blockNumber", rpc_params![])
+        .await
+        .unwrap();
     assert_eq!(bn, U256::ZERO);
 
     // balance
@@ -99,13 +100,13 @@ async fn end_to_end_send_and_query() {
     assert_eq!(receipt.to, Some(to));
 
     // post-state
-    let bn_after: U256 = client.request("eth_blockNumber", rpc_params![]).await.unwrap();
+    let bn_after: U256 = client
+        .request("eth_blockNumber", rpc_params![])
+        .await
+        .unwrap();
     assert_eq!(bn_after, U256::from(1u64));
     let bal_to: U256 = client
-        .request(
-            "eth_getBalance",
-            rpc_params![to, BlockNumberOrTag::Latest],
-        )
+        .request("eth_getBalance", rpc_params![to, BlockNumberOrTag::Latest])
         .await
         .unwrap();
     assert_eq!(bal_to, U256::from(5_000u64));
@@ -121,8 +122,10 @@ async fn end_to_end_send_and_query() {
     assert_eq!(nonce_after, U256::from(1u64));
 
     // eth_call against a plain EOA — no code, expect empty output
-    let mut call_req = TransactionRequest::default();
-    call_req.to = Some(TxKind::Call(to));
+    let call_req = TransactionRequest {
+        to: Some(TxKind::Call(to)),
+        ..Default::default()
+    };
     let call_result: Bytes = client
         .request("eth_call", rpc_params![call_req, BlockNumberOrTag::Latest])
         .await

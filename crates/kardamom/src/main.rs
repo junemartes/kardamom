@@ -1,10 +1,10 @@
 use std::net::SocketAddr;
 
-use alloy_primitives::{address, Address, U256};
+use alloy_primitives::{Address, U256, address};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-use kardamom_node::{start_server, Node};
+use kardamom_node::{Node, start_server};
 
 /// Kardamom — a small revm-backed L2 scaffold.
 #[derive(Parser, Debug)]
@@ -31,7 +31,9 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("kardamom=info".parse().unwrap()))
+        .with_env_filter(
+            EnvFilter::from_default_env().add_directive("kardamom=info".parse().unwrap()),
+        )
         .init();
 
     let args = Args::parse();

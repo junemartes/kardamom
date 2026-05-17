@@ -20,11 +20,15 @@ pub struct ExecEnv {
 
 impl ExecEnv {
     pub fn block_env(&self) -> BlockEnv {
-        let mut b = BlockEnv::default();
-        b.number = U256::from(self.block_number);
-        b
+        BlockEnv {
+            number: U256::from(self.block_number),
+            ..Default::default()
+        }
     }
 
+    // CfgEnv is #[non_exhaustive], so a struct literal with ..Default::default()
+    // is rejected (E0639). Field-by-field assignment is the only option here.
+    #[allow(clippy::field_reassign_with_default)]
     pub fn cfg_env(&self) -> CfgEnv {
         let mut c = CfgEnv::default();
         c.chain_id = self.chain_id;
@@ -34,20 +38,21 @@ impl ExecEnv {
 
 /// Convert an RPC `TransactionRequest` to a revm `TxEnv` suitable for `eth_call`.
 pub fn tx_env_from_request(req: &TransactionRequest) -> TxEnv {
-    let mut tx = TxEnv::default();
-    tx.caller = req.from.unwrap_or(Address::ZERO);
-    // Default below the EIP-7825 cap (2^24 = 16_777_216) enforced by Osaka spec.
-    tx.gas_limit = req.gas.unwrap_or(15_000_000);
-    tx.gas_price = req.gas_price.unwrap_or(0);
-    tx.kind = match req.to {
-        Some(alloy_primitives::TxKind::Call(addr)) => TxKind::Call(addr),
-        Some(alloy_primitives::TxKind::Create) | None => TxKind::Create,
-    };
-    tx.value = req.value.unwrap_or(U256::ZERO);
-    tx.data = req.input.input().cloned().unwrap_or_default();
-    tx.nonce = req.nonce.unwrap_or(0);
-    tx.chain_id = req.chain_id;
-    tx
+    TxEnv {
+        caller: req.from.unwrap_or(Address::ZERO),
+        // Default below the EIP-7825 cap (2^24 = 16_777_216) enforced by Osaka spec.
+        gas_limit: req.gas.unwrap_or(15_000_000),
+        gas_price: req.gas_price.unwrap_or(0),
+        kind: match req.to {
+            Some(alloy_primitives::TxKind::Call(addr)) => TxKind::Call(addr),
+            Some(alloy_primitives::TxKind::Create) | None => TxKind::Create,
+        },
+        value: req.value.unwrap_or(U256::ZERO),
+        data: req.input.input().cloned().unwrap_or_default(),
+        nonce: req.nonce.unwrap_or(0),
+        chain_id: req.chain_id,
+        ..Default::default()
+    }
 }
 
 /// Execute a transaction read-only: state changes are discarded.
@@ -90,23 +95,24 @@ pub struct ExecOutput {
 
 /// Convert a signed transaction envelope plus its recovered signer to a `TxEnv`.
 pub fn tx_env_from_envelope(envelope: &TxEnvelope, signer: Address) -> TxEnv {
-    let mut tx = TxEnv::default();
-    tx.caller = signer;
-    tx.chain_id = envelope.chain_id();
-    tx.nonce = envelope.nonce();
-    tx.gas_limit = envelope.gas_limit();
-    tx.value = envelope.value();
-    tx.data = envelope.input().clone();
-    tx.kind = match envelope.to() {
-        Some(addr) => TxKind::Call(addr),
-        None => TxKind::Create,
-    };
-    // gas_price: prefer the legacy/effective gas price if reported, fall back to
-    // the EIP-1559 max fee per gas (which is `u128`, not `Option<u128>`).
-    tx.gas_price = envelope
-        .gas_price()
-        .unwrap_or_else(|| envelope.max_fee_per_gas());
-    tx
+    TxEnv {
+        caller: signer,
+        chain_id: envelope.chain_id(),
+        nonce: envelope.nonce(),
+        gas_limit: envelope.gas_limit(),
+        value: envelope.value(),
+        data: envelope.input().clone(),
+        kind: match envelope.to() {
+            Some(addr) => TxKind::Call(addr),
+            None => TxKind::Create,
+        },
+        // gas_price: prefer the legacy/effective gas price if reported, fall back to
+        // the EIP-1559 max fee per gas (which is `u128`, not `Option<u128>`).
+        gas_price: envelope
+            .gas_price()
+            .unwrap_or_else(|| envelope.max_fee_per_gas()),
+        ..Default::default()
+    }
 }
 
 /// Execute a transaction and commit state changes to `db`.
@@ -131,5 +137,8 @@ where
         ExecutionResult::Halt { .. } => Bytes::new(),
     };
 
-    Ok(ExecOutput { result, output_bytes })
+    Ok(ExecOutput {
+        result,
+        output_bytes,
+    })
 }

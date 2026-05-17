@@ -155,13 +155,12 @@ fn build_receipt(
             let rpc_logs: Vec<RpcLog> = logs
                 .iter()
                 .enumerate()
-                .map(|(i, log)| {
-                    let mut l = RpcLog::default();
-                    l.inner = log.clone();
-                    l.log_index = Some(i as u64);
-                    l.transaction_hash = Some(tx_hash);
-                    l.block_number = Some(block_number);
-                    l
+                .map(|(i, log)| RpcLog {
+                    inner: log.clone(),
+                    log_index: Some(i as u64),
+                    transaction_hash: Some(tx_hash),
+                    block_number: Some(block_number),
+                    ..Default::default()
                 })
                 .collect();
             (true, gas_used, rpc_logs)
@@ -245,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn call_returns_constant_from_bytecode() {
-        use alloy_primitives::{address, hex, TxKind};
+        use alloy_primitives::{TxKind, address, hex};
         use alloy_rpc_types_eth::TransactionRequest;
 
         // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
@@ -256,12 +255,14 @@ mod tests {
         let node = Node::new(1, &[(caller, U256::from(1_000_000_000u64))]);
         node.insert_code(contract, code).await;
 
-        let mut req = TransactionRequest::default();
-        req.from = Some(caller);
-        req.to = Some(TxKind::Call(contract));
+        let req = TransactionRequest {
+            from: Some(caller),
+            to: Some(TxKind::Call(contract)),
+            ..Default::default()
+        };
 
         let output = node.call(req).await.expect("call ok");
-        let mut expected = vec![0u8; 32];
+        let mut expected = [0u8; 32];
         expected[31] = 0x42;
         assert_eq!(output.as_ref(), &expected[..]);
     }
@@ -292,10 +293,7 @@ mod tests {
         let mut bytes = Vec::new();
         envelope.encode_2718(&mut bytes);
 
-        let node = Node::new(
-            1,
-            &[(from, U256::from(10u64).pow(U256::from(18u64)))],
-        );
+        let node = Node::new(1, &[(from, U256::from(10u64).pow(U256::from(18u64)))]);
         let hash = node
             .submit_raw_transaction(Bytes::from(bytes))
             .await

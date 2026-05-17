@@ -24,8 +24,8 @@ impl From<NodeError> for ErrorObjectOwned {
             | NodeError::SignatureRecovery
             | NodeError::UnknownTransaction(_)
             | NodeError::UnsupportedBlockTag => -32602, // invalid params
-            NodeError::Execution(_) => -32000,          // server error
-            NodeError::Server(_) => -32603,             // internal
+            NodeError::Execution(_) => -32000, // server error
+            NodeError::Server(_) => -32603,    // internal
         };
         ErrorObjectOwned::owned::<()>(code, err.to_string(), None)
     }
