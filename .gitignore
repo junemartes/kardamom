@@ -1,2 +1,5 @@
 target
 docs/superpowers
+contracts/cache/
+contracts/out/
+contracts/lib/
