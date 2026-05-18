@@ -4,7 +4,10 @@
 //! feature, which itself wraps `coins-bip39`. Derivation path is the
 //! standard Ethereum/Anvil m/44'/60'/0'/0/N.
 
-use alloy_signer_local::{MnemonicBuilder, coins_bip39::{English, Mnemonic}};
+use alloy_signer_local::{
+    MnemonicBuilder,
+    coins_bip39::{English, Mnemonic},
+};
 
 use crate::signers::DerivedSigner;
 
@@ -43,8 +46,7 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, address};
 
-    const ANVIL_PHRASE: &str =
-        "test test test test test test test test test test test junk";
+    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
 
     #[test]
     fn generate_12_words_round_trips() {
@@ -64,7 +66,10 @@ mod tests {
 
     #[test]
     fn generate_invalid_word_count_errors() {
-        assert!(generate(13).is_err(), "13 words is not a valid BIP-39 length");
+        assert!(
+            generate(13).is_err(),
+            "13 words is not a valid BIP-39 length"
+        );
     }
 
     #[test]
