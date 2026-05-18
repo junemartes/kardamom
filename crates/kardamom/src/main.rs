@@ -13,6 +13,8 @@ use tracing_subscriber::{EnvFilter, Layer, fmt};
 
 use kardamom_node::{Node, metrics as kmetrics, start_server};
 
+mod chain;
+
 /// `addr=wei` (decimal or `0x…` hex) entry consumed by `--prefund`.
 #[derive(Debug, Clone)]
 struct PrefundEntry {
@@ -150,26 +152,18 @@ async fn main() -> anyhow::Result<()> {
     )
     .set(1.0);
 
-    let mut prefunded: Vec<(Address, U256)> =
-        args.prefund.iter().map(|p| (p.addr, p.balance)).collect();
-
-    if prefunded.is_empty() {
-        let dev_account: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        let dev_balance = U256::from(1_000u64) * U256::from(10u64).pow(U256::from(18u64));
-        prefunded.push((dev_account, dev_balance));
-    }
-
-    let node = Node::new(args.chain_id, &prefunded);
-    for code in &args.insert_code {
-        node.insert_code(code.addr, code.code.clone()).await;
-    }
+    // STOPGAP (replaced in Task 5): build an empty genesis from --chain-id only.
+    let genesis = kardamom_node::Genesis {
+        chain_id: args.chain_id,
+        alloc: std::collections::BTreeMap::new(),
+    };
+    let node = Node::new(&genesis);
 
     tracing::info!(
         rpc = %args.rpc_addr,
         metrics = %args.metrics_addr,
         chain_id = args.chain_id,
-        prefunded = prefunded.len(),
-        contracts = args.insert_code.len(),
+        alloc_entries = genesis.alloc.len(),
         "starting kardamom"
     );
 
