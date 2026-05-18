@@ -39,6 +39,23 @@ pub struct CallsCfg {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct MnemonicCfg {
+    pub phrase: String,
+    pub balance: String,
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContractEntry {
+    pub address: Address,
+    pub code: String,
+    pub nonce: Option<u64>,
+    pub balance: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileConfig {
     pub rpc: Option<String>,
     pub workload: Option<Workload>,
