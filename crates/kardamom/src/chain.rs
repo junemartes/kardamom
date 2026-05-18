@@ -1,8 +1,9 @@
 //! Load a `Genesis` from a TOML file on disk.
 //!
 //! Lives in the binary crate so the node crate doesn't pick up a `toml`
-//! dependency. The `Genesis` struct itself (and all field validation)
-//! lives in `kardamom_node::genesis`.
+//! dependency. The `Genesis` struct itself (and field-level parsing) lives
+//! in `kardamom_node::genesis`; here we just glue `toml::from_str` to the
+//! filesystem and run the post-deserialize `validate()`.
 
 use std::path::Path;
 
@@ -12,8 +13,12 @@ use kardamom_node::Genesis;
 pub fn load(path: &Path) -> anyhow::Result<Genesis> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading genesis file {}", path.display()))?;
-    toml::from_str::<Genesis>(&contents)
-        .with_context(|| format!("parsing genesis file {}", path.display()))
+    let genesis: Genesis = toml::from_str(&contents)
+        .with_context(|| format!("parsing genesis file {}", path.display()))?;
+    genesis
+        .validate()
+        .with_context(|| format!("validating genesis file {}", path.display()))?;
+    Ok(genesis)
 }
 
 #[cfg(test)]
@@ -22,7 +27,13 @@ mod tests {
     use alloy_primitives::{Address, Bytes, U256, address, hex};
 
     fn parse(s: &str) -> anyhow::Result<Genesis> {
-        toml::from_str::<Genesis>(s).map_err(Into::into)
+        let g: Genesis = toml::from_str(s)?;
+        g.validate()?;
+        Ok(g)
+    }
+
+    fn find<'a>(g: &'a Genesis, addr: &Address) -> Option<&'a kardamom_node::AllocEntry> {
+        g.alloc.iter().find(|e| e.address == *addr)
     }
 
     #[test]
@@ -48,8 +59,8 @@ mod tests {
         .expect("parses");
         let a1: Address = address!("0000000000000000000000000000000000000001");
         let a2: Address = address!("0000000000000000000000000000000000000002");
-        assert_eq!(g.alloc[&a1].balance, U256::from(1000u64));
-        assert_eq!(g.alloc[&a2].balance, U256::from(1000u64));
+        assert_eq!(find(&g, &a1).unwrap().balance, U256::from(1000u64));
+        assert_eq!(find(&g, &a2).unwrap().balance, U256::from(1000u64));
     }
 
     #[test]
@@ -63,11 +74,14 @@ mod tests {
         )
         .expect("parses");
         let a: Address = address!("0000000000000000000000000000000000000001");
-        assert_eq!(g.alloc[&a].balance, U256::ZERO);
+        assert_eq!(find(&g, &a).unwrap().balance, U256::ZERO);
     }
 
     #[test]
-    fn code_bearing_entry_defaults_nonce_to_one() {
+    fn omitted_nonce_parses_as_none() {
+        // The conditional nonce default (1 for code-bearing entries, 0
+        // otherwise) lives in `Node::new`, not in the loader. The loader
+        // surfaces what was on disk.
         let g = parse(
             r#"
                 chain_id = 1
@@ -78,28 +92,14 @@ mod tests {
         )
         .expect("parses");
         let a: Address = address!("0000000000000000000000000000000000001234");
+        let entry = find(&g, &a).unwrap();
         let expected_code = Bytes::from(hex!("604260005260206000f3").to_vec());
-        assert_eq!(g.alloc[&a].code.as_ref(), Some(&expected_code));
-        assert_eq!(g.alloc[&a].nonce, 1);
+        assert_eq!(entry.code.as_ref(), Some(&expected_code));
+        assert!(entry.nonce.is_none());
     }
 
     #[test]
-    fn code_less_entry_defaults_nonce_to_zero() {
-        let g = parse(
-            r#"
-                chain_id = 1
-                [[alloc]]
-                address = "0x0000000000000000000000000000000000000001"
-                balance = "1"
-            "#,
-        )
-        .expect("parses");
-        let a: Address = address!("0000000000000000000000000000000000000001");
-        assert_eq!(g.alloc[&a].nonce, 0);
-    }
-
-    #[test]
-    fn explicit_nonce_overrides_default() {
+    fn explicit_nonce_is_parsed() {
         let g = parse(
             r#"
                 chain_id = 1
@@ -111,7 +111,7 @@ mod tests {
         )
         .expect("parses");
         let a: Address = address!("0000000000000000000000000000000000001234");
-        assert_eq!(g.alloc[&a].nonce, 0);
+        assert_eq!(find(&g, &a).unwrap().nonce, Some(0));
     }
 
     #[test]
@@ -237,8 +237,9 @@ mod tests {
         )
         .expect("parses");
         let a: Address = address!("0000000000000000000000000000000000000001");
-        assert!(g.alloc[&a].code.is_none());
-        assert_eq!(g.alloc[&a].nonce, 0);
+        let entry = find(&g, &a).unwrap();
+        assert!(entry.code.is_none());
+        assert!(entry.nonce.is_none());
     }
 
     #[test]
@@ -251,7 +252,8 @@ mod tests {
         assert_eq!(g.chain_id, 412346);
         let dev: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
         let expected = U256::from(1_000u64) * U256::from(10u64).pow(U256::from(18u64));
-        assert_eq!(g.alloc[&dev].balance, expected);
-        assert!(g.alloc[&dev].code.is_none());
+        let entry = find(&g, &dev).expect("dev account present");
+        assert_eq!(entry.balance, expected);
+        assert!(entry.code.is_none());
     }
 }

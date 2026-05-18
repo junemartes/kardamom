@@ -24,27 +24,21 @@ async fn bench_generator_records_samples_against_inprocess_node() {
     let code = Bytes::from(hex!("604260005260206000f3").to_vec());
 
     let one_eth = U256::from(10u64).pow(U256::from(18u64));
-    let mut alloc: std::collections::BTreeMap<Address, AllocEntry> = derived
+    let mut alloc: Vec<AllocEntry> = derived
         .iter()
-        .map(|s| {
-            (
-                s.address,
-                AllocEntry {
-                    balance: one_eth,
-                    code: None,
-                    nonce: 0,
-                },
-            )
+        .map(|s| AllocEntry {
+            address: s.address,
+            balance: one_eth,
+            code: None,
+            nonce: None,
         })
         .collect();
-    alloc.insert(
-        contract,
-        AllocEntry {
-            balance: U256::ZERO,
-            code: Some(code),
-            nonce: 1,
-        },
-    );
+    alloc.push(AllocEntry {
+        address: contract,
+        balance: U256::ZERO,
+        code: Some(code),
+        nonce: None,
+    });
 
     let genesis = Genesis { chain_id, alloc };
     let node = Node::new(&genesis);

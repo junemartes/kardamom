@@ -24,16 +24,12 @@ async fn end_to_end_send_and_query() {
 
     let node = Node::new(&Genesis {
         chain_id,
-        alloc: [(
-            from,
-            AllocEntry {
-                balance: U256::from(10u64).pow(U256::from(18u64)),
-                code: None,
-                nonce: 0,
-            },
-        )]
-        .into_iter()
-        .collect(),
+        alloc: vec![AllocEntry {
+            address: from,
+            balance: U256::from(10u64).pow(U256::from(18u64)),
+            code: None,
+            nonce: None,
+        }],
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

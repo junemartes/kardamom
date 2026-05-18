@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
 
     let genesis = chain::load(&args.chain)?;
     let alloc_entries = genesis.alloc.len();
-    let contracts = genesis.alloc.values().filter(|e| e.code.is_some()).count();
+    let contracts = genesis.alloc.iter().filter(|e| e.code.is_some()).count();
     let chain_id = genesis.chain_id;
     let node = Node::new(&genesis);
 

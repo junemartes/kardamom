@@ -36,7 +36,7 @@ struct NodeState {
 impl Node {
     pub fn new(genesis: &Genesis) -> Self {
         let mut db = CacheDB::new(EmptyDB::default());
-        for (addr, entry) in &genesis.alloc {
+        for entry in &genesis.alloc {
             let (code_hash, code) = match &entry.code {
                 Some(bytes) => {
                     let bytecode = Bytecode::new_raw(bytes.clone());
@@ -44,11 +44,14 @@ impl Node {
                 }
                 None => (KECCAK_EMPTY, None),
             };
+            let nonce = entry
+                .nonce
+                .unwrap_or_else(|| if entry.code.is_some() { 1 } else { 0 });
             db.insert_account_info(
-                *addr,
+                entry.address,
                 AccountInfo {
                     balance: entry.balance,
-                    nonce: entry.nonce,
+                    nonce,
                     code_hash,
                     code,
                     ..Default::default()
@@ -218,26 +221,25 @@ mod tests {
     use super::*;
     use crate::genesis::{AllocEntry, Genesis};
 
-    fn genesis_with(chain_id: u64, entries: Vec<(Address, AllocEntry)>) -> Genesis {
-        Genesis {
-            chain_id,
-            alloc: entries.into_iter().collect(),
-        }
+    fn genesis_with(chain_id: u64, alloc: Vec<AllocEntry>) -> Genesis {
+        Genesis { chain_id, alloc }
     }
 
-    fn funded(balance: U256) -> AllocEntry {
+    fn funded(address: Address, balance: U256) -> AllocEntry {
         AllocEntry {
+            address,
             balance,
             code: None,
-            nonce: 0,
+            nonce: None,
         }
     }
 
-    fn contract(code: Bytes) -> AllocEntry {
+    fn contract(address: Address, code: Bytes) -> AllocEntry {
         AllocEntry {
+            address,
             balance: U256::ZERO,
             code: Some(code),
-            nonce: 1,
+            nonce: None,
         }
     }
 
@@ -250,7 +252,7 @@ mod tests {
     #[tokio::test]
     async fn balance_reflects_prefunded_amount() {
         let addr = Address::from([1u8; 20]);
-        let node = Node::new(&genesis_with(1, vec![(addr, funded(U256::from(1000u64)))]));
+        let node = Node::new(&genesis_with(1, vec![funded(addr, U256::from(1000u64))]));
         assert_eq!(node.balance(addr).await, U256::from(1000u64));
     }
 
@@ -292,8 +294,8 @@ mod tests {
         let node = Node::new(&genesis_with(
             1,
             vec![
-                (caller, funded(U256::from(1_000_000_000u64))),
-                (contract_addr, contract(code)),
+                funded(caller, U256::from(1_000_000_000u64)),
+                contract(contract_addr, code),
             ],
         ));
 
@@ -337,7 +339,7 @@ mod tests {
 
         let node = Node::new(&genesis_with(
             1,
-            vec![(from, funded(U256::from(10u64).pow(U256::from(18u64))))],
+            vec![funded(from, U256::from(10u64).pow(U256::from(18u64)))],
         ));
         let hash = node
             .submit_raw_transaction(Bytes::from(bytes))

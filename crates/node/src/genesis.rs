@@ -1,123 +1,69 @@
 //! Genesis chain config: chain id plus initial account allocation.
 //!
-//! On disk this is kardamom-native TOML (see `chains/dev.toml`). In memory
-//! it is a `BTreeMap<Address, AllocEntry>` for keyed lookup at `Node`
-//! construction time. The conversion happens in this file's custom
-//! `serde::Deserialize` impl.
-
-use std::collections::BTreeMap;
-use std::fmt;
+//! On disk this is kardamom-native TOML (see `chains/dev.toml`). The struct
+//! derives `serde::Deserialize` directly; the only custom serde code lives
+//! on the `balance` and `code` string-parsed fields. Semantic validation
+//! (chain id != 0, duplicate alloc addresses) happens in `Genesis::validate`,
+//! which the TOML loader calls after parsing.
 
 use alloy_primitives::{Address, Bytes, U256, hex};
 use serde::Deserialize;
-use serde::de::{self, Deserializer, MapAccess, Visitor};
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Genesis {
     pub chain_id: u64,
-    pub alloc: BTreeMap<Address, AllocEntry>,
+    #[serde(default)]
+    pub alloc: Vec<AllocEntry>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct AllocEntry {
-    pub balance: U256,
-    pub code: Option<Bytes>,
-    pub nonce: u64,
-}
-
-#[derive(Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawAllocEntry {
-    address: String,
-    balance: Option<String>,
-    code: Option<String>,
-    nonce: Option<u64>,
+pub struct AllocEntry {
+    pub address: Address,
+    #[serde(default, deserialize_with = "deserialize_balance")]
+    pub balance: U256,
+    #[serde(default, deserialize_with = "deserialize_code")]
+    pub code: Option<Bytes>,
+    pub nonce: Option<u64>,
 }
 
-impl<'de> Deserialize<'de> for Genesis {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct GenesisVisitor;
-
-        impl<'de> Visitor<'de> for GenesisVisitor {
-            type Value = Genesis;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                f.write_str("a kardamom genesis table with `chain_id` and optional `alloc`")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Genesis, M::Error>
-            where
-                M: MapAccess<'de>,
-            {
-                let mut chain_id: Option<u64> = None;
-                let mut raw_alloc: Vec<RawAllocEntry> = Vec::new();
-                let mut saw_alloc = false;
-
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "chain_id" => {
-                            if chain_id.is_some() {
-                                return Err(de::Error::duplicate_field("chain_id"));
-                            }
-                            chain_id = Some(map.next_value()?);
-                        }
-                        "alloc" => {
-                            if saw_alloc {
-                                return Err(de::Error::duplicate_field("alloc"));
-                            }
-                            saw_alloc = true;
-                            raw_alloc = map.next_value()?;
-                        }
-                        other => {
-                            return Err(de::Error::unknown_field(other, &["chain_id", "alloc"]));
-                        }
-                    }
-                }
-
-                let chain_id = chain_id.ok_or_else(|| de::Error::missing_field("chain_id"))?;
-                if chain_id == 0 {
-                    return Err(de::Error::custom("chain_id must be > 0"));
-                }
-
-                let mut alloc: BTreeMap<Address, AllocEntry> = BTreeMap::new();
-                for raw in raw_alloc {
-                    let addr = parse_address(&raw.address).map_err(de::Error::custom)?;
-                    let balance = match raw.balance.as_deref() {
-                        None => U256::ZERO,
-                        Some(s) => parse_u256(s).map_err(de::Error::custom)?,
-                    };
-                    let code = match raw.code.as_deref() {
-                        None => None,
-                        Some(s) if s.is_empty() || s.eq_ignore_ascii_case("0x") => None,
-                        Some(s) => Some(parse_hex_bytes(s).map_err(de::Error::custom)?),
-                    };
-                    let nonce = raw.nonce.unwrap_or(if code.is_some() { 1 } else { 0 });
-                    let entry = AllocEntry {
-                        balance,
-                        code,
-                        nonce,
-                    };
-                    if alloc.insert(addr, entry).is_some() {
-                        return Err(de::Error::custom(format!(
-                            "duplicate alloc address: {addr}"
-                        )));
-                    }
-                }
-
-                Ok(Genesis { chain_id, alloc })
+impl Genesis {
+    /// Semantic validation that can't be expressed in the type or derive.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.chain_id == 0 {
+            anyhow::bail!("chain_id must be > 0");
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for entry in &self.alloc {
+            if !seen.insert(entry.address) {
+                anyhow::bail!("duplicate alloc address: {}", entry.address);
             }
         }
-
-        deserializer.deserialize_map(GenesisVisitor)
+        Ok(())
     }
 }
 
-fn parse_address(s: &str) -> Result<Address, String> {
-    s.parse::<Address>()
-        .map_err(|e| format!("invalid address `{s}`: {e}"))
+fn deserialize_balance<'de, D>(d: D) -> Result<U256, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    parse_u256(&s).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_code<'de, D>(d: D) -> Result<Option<Bytes>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    if s.is_empty() || s.eq_ignore_ascii_case("0x") {
+        Ok(None)
+    } else {
+        parse_hex_bytes(&s)
+            .map(Some)
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 fn parse_u256(s: &str) -> Result<U256, String> {
