@@ -94,10 +94,12 @@ impl<'de> Deserialize<'de> for Genesis {
                         Some(s) if s.is_empty() || s.eq_ignore_ascii_case("0x") => None,
                         Some(s) => Some(parse_hex_bytes(s).map_err(de::Error::custom)?),
                     };
-                    let nonce = raw
-                        .nonce
-                        .unwrap_or(if code.is_some() { 1 } else { 0 });
-                    let entry = AllocEntry { balance, code, nonce };
+                    let nonce = raw.nonce.unwrap_or(if code.is_some() { 1 } else { 0 });
+                    let entry = AllocEntry {
+                        balance,
+                        code,
+                        nonce,
+                    };
                     if alloc.insert(addr, entry).is_some() {
                         return Err(de::Error::custom(format!(
                             "duplicate alloc address: {addr}"
@@ -120,11 +122,9 @@ fn parse_address(s: &str) -> Result<Address, String> {
 
 fn parse_u256(s: &str) -> Result<U256, String> {
     if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        U256::from_str_radix(stripped, 16)
-            .map_err(|e| format!("invalid hex balance `{s}`: {e}"))
+        U256::from_str_radix(stripped, 16).map_err(|e| format!("invalid hex balance `{s}`: {e}"))
     } else {
-        U256::from_str_radix(s, 10)
-            .map_err(|e| format!("invalid decimal balance `{s}`: {e}"))
+        U256::from_str_radix(s, 10).map_err(|e| format!("invalid decimal balance `{s}`: {e}"))
     }
 }
 

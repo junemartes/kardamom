@@ -29,13 +29,21 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         .map(|s| {
             (
                 s.address,
-                AllocEntry { balance: one_eth, code: None, nonce: 0 },
+                AllocEntry {
+                    balance: one_eth,
+                    code: None,
+                    nonce: 0,
+                },
             )
         })
         .collect();
     alloc.insert(
         contract,
-        AllocEntry { balance: U256::ZERO, code: Some(code), nonce: 1 },
+        AllocEntry {
+            balance: U256::ZERO,
+            code: Some(code),
+            nonce: 1,
+        },
     );
 
     let genesis = Genesis { chain_id, alloc };

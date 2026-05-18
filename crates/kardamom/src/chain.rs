@@ -156,7 +156,10 @@ mod tests {
         )
         .expect_err("unknown field should fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("garbage") || msg.contains("unknown"), "msg = {msg}");
+        assert!(
+            msg.contains("garbage") || msg.contains("unknown"),
+            "msg = {msg}"
+        );
     }
 
     #[test]
@@ -171,7 +174,10 @@ mod tests {
         )
         .expect_err("unknown alloc field should fail");
         let msg = format!("{err:#}");
-        assert!(msg.contains("storage") || msg.contains("unknown"), "msg = {msg}");
+        assert!(
+            msg.contains("storage") || msg.contains("unknown"),
+            "msg = {msg}"
+        );
     }
 
     #[test]

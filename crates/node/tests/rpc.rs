@@ -11,8 +11,8 @@ use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 
-use kardamom_node::genesis::{AllocEntry, Genesis};
 use kardamom_node::Node;
+use kardamom_node::genesis::{AllocEntry, Genesis};
 use kardamom_node::rpc::EthApiServer;
 
 #[tokio::test]
@@ -24,7 +24,16 @@ async fn end_to_end_send_and_query() {
 
     let node = Node::new(&Genesis {
         chain_id,
-        alloc: [(from, AllocEntry { balance: U256::from(10u64).pow(U256::from(18u64)), code: None, nonce: 0 })].into_iter().collect(),
+        alloc: [(
+            from,
+            AllocEntry {
+                balance: U256::from(10u64).pow(U256::from(18u64)),
+                code: None,
+                nonce: 0,
+            },
+        )]
+        .into_iter()
+        .collect(),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();

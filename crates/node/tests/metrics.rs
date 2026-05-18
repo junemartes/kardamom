@@ -43,7 +43,16 @@ async fn rpc_calls_populate_prometheus_registry() {
 
     let node = Node::new(&Genesis {
         chain_id,
-        alloc: [(from, AllocEntry { balance: U256::from(10u64).pow(U256::from(18u64)), code: None, nonce: 0 })].into_iter().collect(),
+        alloc: [(
+            from,
+            AllocEntry {
+                balance: U256::from(10u64).pow(U256::from(18u64)),
+                code: None,
+                nonce: 0,
+            },
+        )]
+        .into_iter()
+        .collect(),
     });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -118,7 +127,10 @@ async fn rpc_calls_populate_prometheus_registry() {
 async fn err_outcome_label_appears_on_failed_call() {
     let handle = recorder();
 
-    let node = Node::new(&Genesis { chain_id: 1, alloc: Default::default() });
+    let node = Node::new(&Genesis {
+        chain_id: 1,
+        alloc: Default::default(),
+    });
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
         .build(addr)

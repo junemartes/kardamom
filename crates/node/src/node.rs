@@ -154,7 +154,6 @@ impl Node {
         kmetrics::set_block_number(sealed_block);
         Ok(tx_hash)
     }
-
 }
 
 fn build_receipt(
@@ -227,11 +226,19 @@ mod tests {
     }
 
     fn funded(balance: U256) -> AllocEntry {
-        AllocEntry { balance, code: None, nonce: 0 }
+        AllocEntry {
+            balance,
+            code: None,
+            nonce: 0,
+        }
     }
 
     fn contract(code: Bytes) -> AllocEntry {
-        AllocEntry { balance: U256::ZERO, code: Some(code), nonce: 1 }
+        AllocEntry {
+            balance: U256::ZERO,
+            code: Some(code),
+            nonce: 1,
+        }
     }
 
     #[test]
