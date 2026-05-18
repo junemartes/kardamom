@@ -29,11 +29,13 @@ In three terminals:
 # 1. Start the observability stack.
 cd deploy && docker compose up
 
-# 2. Start kardamom. Pre-fund the bench signers and install the
-#    `eth_call`-workload target contract.
-cargo run --release --bin kardamom -- \
-  --prefund 0xC8B1F2C2C45A8FF93E94B7C2FB91D75D8B8B0D5C=10000000000000000000 \
-  --insert-code 0x0000000000000000000000000000000000001234=0x604260005260206000f3
+# 2. Start kardamom with a TOML genesis. `chains/dev.toml` is the
+#    checked-in dev chain (chain_id 412346; prefunds Anvil account #0
+#    with 1000 ETH). For the bench's transfers/mixed workloads you'll
+#    want a genesis that also prefunds the derived signer addresses
+#    and deploys the `eth_call` target contract — see "Pre-funding the
+#    bench signers" below.
+cargo run --release --bin kardamom -- --chain chains/dev.toml
 
 # 3. Drive load.
 cargo run --release --bin kardamom-bench -- \
@@ -55,8 +57,7 @@ up as one fat `execute` block. (For CPU sampling, use `cargo flamegraph` or
 ```sh
 # Run kardamom with the flame layer enabled.
 KARDAMOM_FLAME=./flame.folded \
-  cargo run --release --bin kardamom -- \
-    --prefund 0xC8B1F2C2C45A8FF93E94B7C2FB91D75D8B8B0D5C=10000000000000000000
+  cargo run --release --bin kardamom -- --chain chains/dev.toml
 
 # Drive some load against it, then Ctrl-C the node.
 cargo run --release --bin kardamom-bench -- --config scenarios/mixed.toml
@@ -91,18 +92,43 @@ cargo run --release --bin kardamom-bench -- \
 ### Pre-funding the bench signers
 
 The bench derives `--concurrency` signers deterministically from `--seed`
-(`keccak(seed || u64_le(i))`). To run transfers, pass one `--prefund` to
-kardamom per derived signer:
+(`keccak(seed || u64_le(i))`). For transfers/mixed workloads to actually
+exercise the write path, each derived signer needs balance in the chain
+state. That means writing a custom genesis TOML whose `[[alloc]]` entries
+list every derived address. Today this is manual — write a small Rust
+program that calls `kardamom_bench::signers::derive(seed, concurrency)`
+to enumerate the addresses, then build a `chains/<bench>.toml` with one
+`[[alloc]]` per signer plus an entry for the `eth_call` target contract:
 
-```sh
-cargo run --bin kardamom-bench -- --config scenarios/mixed.toml --print-signers
-# (planned helper, not yet implemented; for now derive addresses manually)
+```toml
+chain_id = 412346
+
+[[alloc]]
+address = "0x..."   # derived signer 0
+balance = "10000000000000000000"
+
+# ... one per signer ...
+
+[[alloc]]
+address = "0x0000000000000000000000000000000000001234"
+code    = "0x604260005260206000f3"
 ```
 
-A quick hack: start kardamom with a generously prefunded "wildcard" address
-that none of the signers will use, then run the bench. Failed transfers show
-up as `outcome="err"` in `kardamom_rpc_requests_total`. To actually exercise
-the write path, ensure each derived signer is in `--prefund`.
+Then start kardamom against that file:
+
+```sh
+cargo run --release --bin kardamom -- --chain chains/your-bench.toml
+```
+
+A quick hack to see the dashboard panels move without writing a custom
+genesis: run the calls-only scenario (`scenarios/calls.toml`) against the
+dev chain plus a one-line edit to deploy the call target. Failed
+transfers in the mixed/transfers scenarios show up as `outcome="err"` in
+`kardamom_rpc_requests_total`.
+
+A library helper that turns a bench config into a Genesis (deriving
+signers from a mnemonic instead of a u64 seed) is on the way — see PR
+#5.
 
 ## Dashboard panels
 
