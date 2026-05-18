@@ -5,5 +5,6 @@
 
 pub mod config;
 pub mod generator;
+pub mod mnemonic;
 pub mod report;
 pub mod signers;
