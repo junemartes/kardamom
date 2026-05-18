@@ -15,15 +15,16 @@ use crate::config::FileConfig;
 use crate::mnemonic;
 
 pub fn from_config(cfg: &FileConfig, chain_id: u64) -> anyhow::Result<Genesis> {
-    let mnem = cfg.mnemonic.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("bench config has no [mnemonic] section")
-    })?;
+    let mnem = cfg
+        .mnemonic
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bench config has no [mnemonic] section"))?;
     let count = mnem
         .count
         .or(cfg.concurrency)
         .ok_or_else(|| anyhow::anyhow!("[mnemonic].count or top-level concurrency must be set"))?;
-    let balance = parse_balance(&mnem.balance)
-        .map_err(|e| anyhow::anyhow!("[mnemonic].balance: {e}"))?;
+    let balance =
+        parse_balance(&mnem.balance).map_err(|e| anyhow::anyhow!("[mnemonic].balance: {e}"))?;
 
     let signers = mnemonic::derive_signers(&mnem.phrase, count)?;
 
@@ -75,11 +76,9 @@ pub fn from_config(cfg: &FileConfig, chain_id: u64) -> anyhow::Result<Genesis> {
 
 fn parse_balance(s: &str) -> Result<U256, String> {
     if let Some(stripped) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        U256::from_str_radix(stripped, 16)
-            .map_err(|e| format!("invalid hex wei `{s}`: {e}"))
+        U256::from_str_radix(stripped, 16).map_err(|e| format!("invalid hex wei `{s}`: {e}"))
     } else {
-        U256::from_str_radix(s, 10)
-            .map_err(|e| format!("invalid decimal wei `{s}`: {e}"))
+        U256::from_str_radix(s, 10).map_err(|e| format!("invalid decimal wei `{s}`: {e}"))
     }
 }
 
@@ -101,8 +100,7 @@ mod tests {
     use crate::config::{ContractEntry, FileConfig, MnemonicCfg};
     use alloy_primitives::address;
 
-    const ANVIL_PHRASE: &str =
-        "test test test test test test test test test test test junk";
+    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
 
     fn minimal_cfg(mnemonic: Option<MnemonicCfg>, contracts: Vec<ContractEntry>) -> FileConfig {
         FileConfig {
@@ -112,7 +110,6 @@ mod tests {
             duration: None,
             concurrency: Some(4),
             warmup: None,
-            seed: None,
             output: None,
             mix: None,
             calls: None,
@@ -218,8 +215,14 @@ mod tests {
         let err = from_config(&cfg, 1).expect_err("should fail");
         let msg = format!("{err:#}");
         assert!(msg.contains(&format!("{contract_addr}")), "msg = {msg}");
-        assert!(msg.contains("more than once in [[contracts]]"), "msg = {msg}");
-        assert!(!msg.contains("mnemonic"), "should not mention mnemonic; msg = {msg}");
+        assert!(
+            msg.contains("more than once in [[contracts]]"),
+            "msg = {msg}"
+        );
+        assert!(
+            !msg.contains("mnemonic"),
+            "should not mention mnemonic; msg = {msg}"
+        );
     }
 
     #[test]

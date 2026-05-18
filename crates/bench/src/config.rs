@@ -65,7 +65,6 @@ pub struct FileConfig {
     pub concurrency: Option<u32>,
     #[serde(default, with = "humantime_serde::option")]
     pub warmup: Option<Duration>,
-    pub seed: Option<u64>,
     pub output: Option<String>,
     #[serde(default)]
     pub mix: Option<MixCfg>,
@@ -85,7 +84,6 @@ pub struct Config {
     pub duration: Duration,
     pub concurrency: u32,
     pub warmup: Duration,
-    pub seed: u64,
     pub output: Option<String>,
     pub mix: MixCfg,
     pub calls: Option<CallsCfg>,
@@ -112,7 +110,6 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         duration: None,
         concurrency: None,
         warmup: None,
-        seed: None,
         output: None,
         mix: None,
         calls: None,
@@ -132,7 +129,6 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         .unwrap_or(Duration::from_secs(10));
     let concurrency = cli.concurrency.or(f.concurrency).unwrap_or(16);
     let warmup = cli.warmup.or(f.warmup).unwrap_or(Duration::from_secs(2));
-    let seed = cli.seed.or(f.seed).unwrap_or(0xC0FFEE);
     let output = cli.output.or(f.output);
     let mix = cli.mix.or(f.mix).unwrap_or_default();
     let calls = cli.calls.or(f.calls);
@@ -144,15 +140,14 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         anyhow::bail!("workload=`mixed` requires a `[calls]` section with a `contract` address");
     }
 
-    let mnemonic = cli.mnemonic.or(f.mnemonic).ok_or_else(|| {
-        anyhow::anyhow!("[mnemonic] is required in the bench config")
-    })?;
+    let mnemonic = cli
+        .mnemonic
+        .or(f.mnemonic)
+        .ok_or_else(|| anyhow::anyhow!("[mnemonic] is required in the bench config"))?;
 
     let count = mnemonic.count.unwrap_or(concurrency);
     if count > 1000 {
-        anyhow::bail!(
-            "[mnemonic].count = {count} exceeds cap of 1000 (likely a typo)"
-        );
+        anyhow::bail!("[mnemonic].count = {count} exceeds cap of 1000 (likely a typo)");
     }
 
     let contracts = if !cli.contracts.is_empty() {
@@ -166,10 +161,7 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         let mut seen = std::collections::BTreeSet::new();
         for c in &contracts {
             if !seen.insert(c.address) {
-                anyhow::bail!(
-                    "[[contracts]] has duplicate address: {}",
-                    c.address
-                );
+                anyhow::bail!("[[contracts]] has duplicate address: {}", c.address);
             }
         }
     }
@@ -194,7 +186,6 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         duration,
         concurrency,
         warmup,
-        seed,
         output,
         mix,
         calls,
@@ -215,7 +206,6 @@ mod resolve_tests {
             duration: None,
             concurrency: None,
             warmup: None,
-            seed: None,
             output: None,
             mix: None,
             calls: None,
@@ -234,9 +224,17 @@ mod resolve_tests {
 
     fn empty_cli() -> FileConfig {
         FileConfig {
-            rpc: None, workload: None, rate: None, duration: None,
-            concurrency: None, warmup: None, seed: None, output: None,
-            mix: None, calls: None, mnemonic: None, contracts: vec![],
+            rpc: None,
+            workload: None,
+            rate: None,
+            duration: None,
+            concurrency: None,
+            warmup: None,
+            output: None,
+            mix: None,
+            calls: None,
+            mnemonic: None,
+            contracts: vec![],
         }
     }
 
@@ -293,8 +291,18 @@ mod resolve_tests {
         let mut f = empty_file();
         f.mnemonic = Some(anvil_mnemonic_cfg());
         f.contracts = vec![
-            ContractEntry { address: contract, code: "0x60".to_string(), nonce: None, balance: None },
-            ContractEntry { address: contract, code: "0x61".to_string(), nonce: None, balance: None },
+            ContractEntry {
+                address: contract,
+                code: "0x60".to_string(),
+                nonce: None,
+                balance: None,
+            },
+            ContractEntry {
+                address: contract,
+                code: "0x61".to_string(),
+                nonce: None,
+                balance: None,
+            },
         ];
         let err = resolve(Some(f), empty_cli()).expect_err("should fail");
         let msg = format!("{err:#}");

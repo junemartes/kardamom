@@ -25,9 +25,11 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         duration: Some(Duration::from_millis(800)),
         concurrency: Some(concurrency),
         warmup: Some(Duration::from_millis(0)),
-        seed: None,
         output: None,
-        mix: Some(MixCfg { transfers: 1, calls: 4 }),
+        mix: Some(MixCfg {
+            transfers: 1,
+            calls: 4,
+        }),
         calls: Some(CallsCfg { contract }),
         mnemonic: Some(MnemonicCfg {
             phrase: "test test test test test test test test test test test junk".to_string(),
@@ -66,19 +68,17 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         duration: None,
         concurrency: None,
         warmup: None,
-        seed: None,
         output: None,
         mix: None,
         calls: None,
         mnemonic: None,
         contracts: vec![],
     };
-    let cfg = kardamom_bench::config::resolve(Some(file_cfg), cli_overrides)
-        .expect("resolve");
+    let cfg = kardamom_bench::config::resolve(Some(file_cfg), cli_overrides).expect("resolve");
 
     // Sanity: signers derive deterministically and the generator will get the same set.
-    let _signers = mnemonic::derive_signers(&cfg.mnemonic.phrase, concurrency)
-        .expect("derive_signers");
+    let _signers =
+        mnemonic::derive_signers(&cfg.mnemonic.phrase, concurrency).expect("derive_signers");
 
     let outputs = generator::run(client, cfg).await.expect("bench ran");
     assert!(outputs.counters.sent > 0, "should have sent some requests");
@@ -89,7 +89,10 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         .get("eth_sendRawTransaction")
         .expect("send hist");
 
-    assert!(!call_hist.is_empty(), "eth_call samples should be non-empty");
+    assert!(
+        !call_hist.is_empty(),
+        "eth_call samples should be non-empty"
+    );
     assert!(
         !send_hist.is_empty(),
         "eth_sendRawTransaction samples should be non-empty"

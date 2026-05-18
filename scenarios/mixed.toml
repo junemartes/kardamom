@@ -4,7 +4,6 @@ rate        = 500
 duration    = "30s"
 concurrency = 16
 warmup      = "2s"
-seed        = 0xC0FFEE
 output      = "results/mixed.json"
 
 [mnemonic]

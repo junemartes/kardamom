@@ -1,35 +1,15 @@
-//! Deterministic signer derivation and pre-signed-transaction queue.
-//!
-//! Keys come from `keccak(seed || u64_le(i))`. The probability of landing
-//! outside the secp256k1 group is astronomically small, so we expect the
-//! conversion to always succeed.
+//! Pre-signed-transaction queue built from mnemonic-derived signers.
 
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_signer_local::PrivateKeySigner;
 
 #[derive(Debug, Clone)]
 pub struct DerivedSigner {
     pub signer: PrivateKeySigner,
     pub address: Address,
-}
-
-/// Derive `n` signers deterministically from a seed.
-pub fn derive(seed: u64, n: usize) -> anyhow::Result<Vec<DerivedSigner>> {
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let mut buf = [0u8; 16];
-        buf[..8].copy_from_slice(&seed.to_le_bytes());
-        buf[8..].copy_from_slice(&(i as u64).to_le_bytes());
-        let h = keccak256(buf);
-        let signer = PrivateKeySigner::from_bytes(&h)
-            .map_err(|e| anyhow::anyhow!("deriving signer {i}: {e}"))?;
-        let address = signer.address();
-        out.push(DerivedSigner { signer, address });
-    }
-    Ok(out)
 }
 
 /// Pre-sign `count` EIP-2718-encoded legacy value transfers, round-robining
@@ -80,26 +60,13 @@ pub fn presign_transfers(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mnemonic;
 
-    #[test]
-    fn derive_is_deterministic_for_seed() {
-        let a = derive(42, 4).unwrap();
-        let b = derive(42, 4).unwrap();
-        for (x, y) in a.iter().zip(b.iter()) {
-            assert_eq!(x.address, y.address);
-        }
-    }
-
-    #[test]
-    fn derive_differs_per_seed() {
-        let a = derive(1, 1).unwrap();
-        let b = derive(2, 1).unwrap();
-        assert_ne!(a[0].address, b[0].address);
-    }
+    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
 
     #[test]
     fn presign_round_robins_across_signers() {
-        let signers = derive(7, 3).unwrap();
+        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 3).unwrap();
         let to = Address::from([0x11u8; 20]);
         let bytes = presign_transfers(&signers, 1, to, U256::from(1u64), 7, 0).unwrap();
         assert_eq!(bytes.len(), 7);
