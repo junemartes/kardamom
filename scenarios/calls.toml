@@ -7,5 +7,13 @@ warmup      = "2s"
 seed        = 0xC0FFEE
 output      = "results/calls.json"
 
+[mnemonic]
+phrase  = "test test test test test test test test test test test junk"
+balance = "1000000000000000000000"   # 1000 ETH
+
 [calls]
 contract = "0x0000000000000000000000000000000000001234"
+
+[[contracts]]
+address = "0x0000000000000000000000000000000000001234"
+code    = "0x604260005260206000f3"

@@ -89,6 +89,8 @@ pub struct Config {
     pub output: Option<String>,
     pub mix: MixCfg,
     pub calls: Option<CallsCfg>,
+    pub mnemonic: MnemonicCfg,
+    pub contracts: Vec<ContractEntry>,
 }
 
 impl FileConfig {
@@ -142,6 +144,49 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         anyhow::bail!("workload=`mixed` requires a `[calls]` section with a `contract` address");
     }
 
+    let mnemonic = cli.mnemonic.or(f.mnemonic).ok_or_else(|| {
+        anyhow::anyhow!("[mnemonic] is required in the bench config")
+    })?;
+
+    let count = mnemonic.count.unwrap_or(concurrency);
+    if count > 1000 {
+        anyhow::bail!(
+            "[mnemonic].count = {count} exceeds cap of 1000 (likely a typo)"
+        );
+    }
+
+    let contracts = if !cli.contracts.is_empty() {
+        cli.contracts
+    } else {
+        f.contracts
+    };
+
+    // No duplicate addresses across [[contracts]] entries.
+    {
+        let mut seen = std::collections::BTreeSet::new();
+        for c in &contracts {
+            if !seen.insert(c.address) {
+                anyhow::bail!(
+                    "[[contracts]] has duplicate address: {}",
+                    c.address
+                );
+            }
+        }
+    }
+
+    // Cross-check: [calls.contract] must be in [[contracts]] for calls/mixed workloads.
+    if matches!(workload, Workload::Calls | Workload::Mixed) {
+        let calls_cfg = calls.as_ref().expect("validated above");
+        let listed = contracts.iter().any(|c| c.address == calls_cfg.contract);
+        if !listed {
+            anyhow::bail!(
+                "[calls.contract] = {} is not listed in [[contracts]]; \
+                 add an entry with that address and its bytecode",
+                calls_cfg.contract
+            );
+        }
+    }
+
     Ok(Config {
         rpc,
         workload,
@@ -153,5 +198,107 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         output,
         mix,
         calls,
+        mnemonic,
+        contracts,
     })
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::*;
+
+    fn empty_file() -> FileConfig {
+        FileConfig {
+            rpc: Some("http://x".to_string()),
+            workload: Some(Workload::Transfers),
+            rate: None,
+            duration: None,
+            concurrency: None,
+            warmup: None,
+            seed: None,
+            output: None,
+            mix: None,
+            calls: None,
+            mnemonic: None,
+            contracts: vec![],
+        }
+    }
+
+    fn anvil_mnemonic_cfg() -> MnemonicCfg {
+        MnemonicCfg {
+            phrase: "test test test test test test test test test test test junk".to_string(),
+            balance: "1000000000000000000000".to_string(),
+            count: None,
+        }
+    }
+
+    fn empty_cli() -> FileConfig {
+        FileConfig {
+            rpc: None, workload: None, rate: None, duration: None,
+            concurrency: None, warmup: None, seed: None, output: None,
+            mix: None, calls: None, mnemonic: None, contracts: vec![],
+        }
+    }
+
+    #[test]
+    fn resolve_errors_without_mnemonic() {
+        let err = resolve(Some(empty_file()), empty_cli()).expect_err("should fail");
+        assert!(format!("{err:#}").contains("[mnemonic]"));
+    }
+
+    #[test]
+    fn resolve_caps_count_at_1000() {
+        let mut f = empty_file();
+        let mut m = anvil_mnemonic_cfg();
+        m.count = Some(1001);
+        f.mnemonic = Some(m);
+        let err = resolve(Some(f), empty_cli()).expect_err("should fail");
+        assert!(format!("{err:#}").contains("1000"));
+    }
+
+    #[test]
+    fn resolve_errors_when_calls_contract_not_in_contracts_list() {
+        let mut f = empty_file();
+        f.workload = Some(Workload::Calls);
+        f.mnemonic = Some(anvil_mnemonic_cfg());
+        f.calls = Some(CallsCfg {
+            contract: alloy_primitives::address!("0000000000000000000000000000000000001234"),
+        });
+        // contracts intentionally empty
+        let err = resolve(Some(f), empty_cli()).expect_err("should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not listed in [[contracts]]"), "msg = {msg}");
+    }
+
+    #[test]
+    fn resolve_accepts_calls_workload_when_contract_listed() {
+        let contract = alloy_primitives::address!("0000000000000000000000000000000000001234");
+        let mut f = empty_file();
+        f.workload = Some(Workload::Calls);
+        f.mnemonic = Some(anvil_mnemonic_cfg());
+        f.calls = Some(CallsCfg { contract });
+        f.contracts = vec![ContractEntry {
+            address: contract,
+            code: "0x60".to_string(),
+            nonce: None,
+            balance: None,
+        }];
+        let cfg = resolve(Some(f), empty_cli()).expect("ok");
+        assert_eq!(cfg.contracts.len(), 1);
+    }
+
+    #[test]
+    fn resolve_rejects_duplicate_contracts() {
+        let contract = alloy_primitives::address!("0000000000000000000000000000000000001234");
+        let mut f = empty_file();
+        f.mnemonic = Some(anvil_mnemonic_cfg());
+        f.contracts = vec![
+            ContractEntry { address: contract, code: "0x60".to_string(), nonce: None, balance: None },
+            ContractEntry { address: contract, code: "0x61".to_string(), nonce: None, balance: None },
+        ];
+        let err = resolve(Some(f), empty_cli()).expect_err("should fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("duplicate address"), "msg = {msg}");
+        assert!(msg.contains(&format!("{contract}")), "msg = {msg}");
+    }
 }

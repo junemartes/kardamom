@@ -71,6 +71,12 @@ async fn bench_generator_records_samples_against_inprocess_node() {
             calls: 4,
         },
         calls: Some(kardamom_bench::config::CallsCfg { contract }),
+        mnemonic: kardamom_bench::config::MnemonicCfg {
+            phrase: "test test test test test test test test test test test junk".to_string(),
+            balance: "1000000000000000000000".to_string(),
+            count: None,
+        },
+        contracts: vec![],
     };
 
     let outputs = generator::run(client, cfg).await.expect("bench ran");
