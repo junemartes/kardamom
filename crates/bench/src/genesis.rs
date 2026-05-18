@@ -6,8 +6,6 @@
 //! chain id; the bench config is the source of truth for accounts and
 //! contracts).
 
-use std::collections::BTreeMap;
-
 use alloy_primitives::{Address, Bytes, U256, hex};
 use kardamom_node::{AllocEntry, Genesis};
 
@@ -28,19 +26,20 @@ pub fn from_config(cfg: &FileConfig, chain_id: u64) -> anyhow::Result<Genesis> {
 
     let signers = mnemonic::derive_signers(&mnem.phrase, count)?;
 
-    let mut alloc: BTreeMap<Address, AllocEntry> = BTreeMap::new();
+    let mut alloc: Vec<AllocEntry> = Vec::with_capacity(signers.len() + cfg.contracts.len());
+    let mut seen: std::collections::HashSet<Address> =
+        std::collections::HashSet::with_capacity(signers.len());
     for s in &signers {
-        alloc.insert(
-            s.address,
-            AllocEntry {
-                balance,
-                code: None,
-                nonce: 0,
-            },
-        );
+        alloc.push(AllocEntry {
+            address: s.address,
+            balance,
+            code: None,
+            nonce: None,
+        });
+        seen.insert(s.address);
     }
 
-    let signer_addrs: std::collections::HashSet<Address> = alloc.keys().copied().collect();
+    let signer_addrs = seen.clone();
 
     for entry in &cfg.contracts {
         let code = parse_code(&entry.code)
@@ -50,13 +49,8 @@ pub fn from_config(cfg: &FileConfig, chain_id: u64) -> anyhow::Result<Genesis> {
             Some(s) => parse_balance(s)
                 .map_err(|e| anyhow::anyhow!("[[contracts]] {}: balance: {e}", entry.address))?,
         };
-        let nonce = entry.nonce.unwrap_or(1);
-        let alloc_entry = AllocEntry {
-            balance: entry_balance,
-            code: Some(code),
-            nonce,
-        };
-        if alloc.insert(entry.address, alloc_entry).is_some() {
+        let nonce = entry.nonce.or(Some(1));
+        if !seen.insert(entry.address) {
             if signer_addrs.contains(&entry.address) {
                 anyhow::bail!(
                     "address {} appears in both [mnemonic]-derived signers and [[contracts]]",
@@ -69,6 +63,12 @@ pub fn from_config(cfg: &FileConfig, chain_id: u64) -> anyhow::Result<Genesis> {
                 );
             }
         }
+        alloc.push(AllocEntry {
+            address: entry.address,
+            balance: entry_balance,
+            code: Some(code),
+            nonce,
+        });
     }
 
     Ok(Genesis { chain_id, alloc })
@@ -126,6 +126,10 @@ mod tests {
         }
     }
 
+    fn find<'a>(g: &'a Genesis, addr: &Address) -> Option<&'a AllocEntry> {
+        g.alloc.iter().find(|e| e.address == *addr)
+    }
+
     #[test]
     fn from_config_produces_concurrency_prefunded_eoas() {
         let cfg = minimal_cfg(Some(anvil_mnemonic()), vec![]);
@@ -134,9 +138,10 @@ mod tests {
         assert_eq!(g.alloc.len(), 4);
         let expected = U256::from(1_000u64) * U256::from(10u64).pow(U256::from(18u64));
         let a0 = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-        assert_eq!(g.alloc[&a0].balance, expected);
-        assert!(g.alloc[&a0].code.is_none());
-        assert_eq!(g.alloc[&a0].nonce, 0);
+        let entry = find(&g, &a0).expect("a0 present");
+        assert_eq!(entry.balance, expected);
+        assert!(entry.code.is_none());
+        assert!(entry.nonce.is_none());
     }
 
     #[test]
@@ -162,9 +167,9 @@ mod tests {
         );
         let g = from_config(&cfg, 1).expect("from_config");
         assert_eq!(g.alloc.len(), 5);
-        let entry = &g.alloc[&contract_addr];
+        let entry = find(&g, &contract_addr).expect("contract present");
         assert!(entry.code.is_some());
-        assert_eq!(entry.nonce, 1);
+        assert_eq!(entry.nonce, Some(1));
         assert_eq!(entry.balance, U256::ZERO);
     }
 
@@ -181,8 +186,9 @@ mod tests {
             }],
         );
         let g = from_config(&cfg, 1).expect("from_config");
-        assert_eq!(g.alloc[&contract_addr].nonce, 7);
-        assert_eq!(g.alloc[&contract_addr].balance, U256::from(0x100u64));
+        let entry = find(&g, &contract_addr).expect("contract present");
+        assert_eq!(entry.nonce, Some(7));
+        assert_eq!(entry.balance, U256::from(0x100u64));
     }
 
     #[test]
