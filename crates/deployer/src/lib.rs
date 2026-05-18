@@ -8,3 +8,6 @@ pub mod addresses;
 pub mod artifacts;
 pub mod ids;
 pub mod spec;
+
+pub use ids::ContractId;
+pub use spec::{Action, DeploymentSpec, Op, build_spec, encode_address_arg, encode_init_calldata};
