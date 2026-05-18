@@ -81,14 +81,16 @@ pub async fn preflight(
             Ok(b) if !b.is_empty() => {}
             Ok(_) => anyhow::bail!(
                 "contract {addr} is not deployed (empty eth_call output). \
-                 Add this entry to your genesis file and restart kardamom:\n\
-                 \n    [[alloc]]\n    address = \"{addr}\"\n    code    = \"0x604260005260206000f3\"\n",
+                 Either restart kardamom with a genesis that includes this entry, \
+                 or add `[[contracts]]` for {addr} in the bench config and regenerate:\n\
+                 \n    [[contracts]]\n    address = \"{addr}\"\n    code    = \"0x604260005260206000f3\"\n",
                 addr = calls_cfg.contract,
             ),
             Err(e) => anyhow::bail!(
                 "eth_call to {addr} failed: {e}. \
-                 Add this entry to your genesis file and restart kardamom:\n\
-                 \n    [[alloc]]\n    address = \"{addr}\"\n    code    = \"0x604260005260206000f3\"\n",
+                 Either restart kardamom with a genesis that includes this entry, \
+                 or add `[[contracts]]` for {addr} in the bench config and regenerate:\n\
+                 \n    [[contracts]]\n    address = \"{addr}\"\n    code    = \"0x604260005260206000f3\"\n",
                 addr = calls_cfg.contract,
             ),
         }
@@ -99,7 +101,8 @@ pub async fn preflight(
 
 /// Drive the workload for `config.warmup + config.duration`.
 pub async fn run(client: HttpClient, config: Config) -> anyhow::Result<Outputs> {
-    let signers = signers::derive(config.seed, config.concurrency as usize)?;
+    let count = config.mnemonic.count.unwrap_or(config.concurrency);
+    let signers = crate::mnemonic::derive_signers(&config.mnemonic.phrase, count)?;
 
     let chain_id = preflight(&client, &config, &signers).await?;
 

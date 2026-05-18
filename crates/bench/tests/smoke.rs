@@ -4,44 +4,46 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use alloy_primitives::{Address, Bytes, U256, address, hex};
+use alloy_primitives::{Address, address};
 use jsonrpsee::http_client::HttpClientBuilder;
 
-use kardamom_bench::generator;
-use kardamom_bench::signers;
-use kardamom_node::{AllocEntry, Genesis, Node, rpc};
+use kardamom_bench::config::{CallsCfg, ContractEntry, FileConfig, MixCfg, MnemonicCfg, Workload};
+use kardamom_bench::{generator, genesis, mnemonic};
+use kardamom_node::{Node, rpc};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bench_generator_records_samples_against_inprocess_node() {
     let chain_id = 1u64;
-    let seed = 0xC0FFEE_u64;
     let concurrency = 4u32;
 
-    let derived = signers::derive(seed, concurrency as usize).unwrap();
-
     let contract: Address = address!("0000000000000000000000000000000000001234");
-    // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
-    let code = Bytes::from(hex!("604260005260206000f3").to_vec());
 
-    let one_eth = U256::from(10u64).pow(U256::from(18u64));
-    let mut alloc: Vec<AllocEntry> = derived
-        .iter()
-        .map(|s| AllocEntry {
-            address: s.address,
-            balance: one_eth,
-            code: None,
+    let file_cfg = FileConfig {
+        rpc: None,
+        workload: Some(Workload::Mixed),
+        rate: Some(100),
+        duration: Some(Duration::from_millis(800)),
+        concurrency: Some(concurrency),
+        warmup: Some(Duration::from_millis(0)),
+        seed: None,
+        output: None,
+        mix: Some(MixCfg { transfers: 1, calls: 4 }),
+        calls: Some(CallsCfg { contract }),
+        mnemonic: Some(MnemonicCfg {
+            phrase: "test test test test test test test test test test test junk".to_string(),
+            balance: "1000000000000000000000".to_string(),
+            count: None,
+        }),
+        contracts: vec![ContractEntry {
+            address: contract,
+            code: "0x604260005260206000f3".to_string(),
             nonce: None,
-        })
-        .collect();
-    alloc.push(AllocEntry {
-        address: contract,
-        balance: U256::ZERO,
-        code: Some(code),
-        nonce: None,
-    });
+            balance: None,
+        }],
+    };
 
-    let genesis = Genesis { chain_id, alloc };
-    let node = Node::new(&genesis);
+    let genesis_value = genesis::from_config(&file_cfg, chain_id).expect("from_config");
+    let node = Node::new(&genesis_value);
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
@@ -57,27 +59,26 @@ async fn bench_generator_records_samples_against_inprocess_node() {
     let url = format!("http://{}", bound);
     let client = HttpClientBuilder::default().build(&url).unwrap();
 
-    let cfg = kardamom_bench::config::Config {
-        rpc: url,
-        workload: kardamom_bench::config::Workload::Mixed,
-        rate: 100,
-        duration: Duration::from_millis(800),
-        concurrency,
-        warmup: Duration::from_millis(0),
-        seed,
+    let cli_overrides = FileConfig {
+        rpc: Some(url.clone()),
+        workload: None,
+        rate: None,
+        duration: None,
+        concurrency: None,
+        warmup: None,
+        seed: None,
         output: None,
-        mix: kardamom_bench::config::MixCfg {
-            transfers: 1,
-            calls: 4,
-        },
-        calls: Some(kardamom_bench::config::CallsCfg { contract }),
-        mnemonic: kardamom_bench::config::MnemonicCfg {
-            phrase: "test test test test test test test test test test test junk".to_string(),
-            balance: "1000000000000000000000".to_string(),
-            count: None,
-        },
+        mix: None,
+        calls: None,
+        mnemonic: None,
         contracts: vec![],
     };
+    let cfg = kardamom_bench::config::resolve(Some(file_cfg), cli_overrides)
+        .expect("resolve");
+
+    // Sanity: signers derive deterministically and the generator will get the same set.
+    let _signers = mnemonic::derive_signers(&cfg.mnemonic.phrase, concurrency)
+        .expect("derive_signers");
 
     let outputs = generator::run(client, cfg).await.expect("bench ran");
     assert!(outputs.counters.sent > 0, "should have sent some requests");
@@ -88,10 +89,7 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         .get("eth_sendRawTransaction")
         .expect("send hist");
 
-    assert!(
-        !call_hist.is_empty(),
-        "eth_call samples should be non-empty"
-    );
+    assert!(!call_hist.is_empty(), "eth_call samples should be non-empty");
     assert!(
         !send_hist.is_empty(),
         "eth_sendRawTransaction samples should be non-empty"
