@@ -4,6 +4,7 @@
 //! drive the generator against an in-process node without exec'ing the bin.
 
 pub mod config;
+pub mod genesis;
 pub mod generator;
 pub mod mnemonic;
 pub mod report;

@@ -71,6 +71,10 @@ pub struct FileConfig {
     pub mix: Option<MixCfg>,
     #[serde(default)]
     pub calls: Option<CallsCfg>,
+    #[serde(default)]
+    pub mnemonic: Option<MnemonicCfg>,
+    #[serde(default)]
+    pub contracts: Vec<ContractEntry>,
 }
 
 #[derive(Debug, Clone)]
@@ -110,6 +114,8 @@ pub fn resolve(file: Option<FileConfig>, cli: FileConfig) -> anyhow::Result<Conf
         output: None,
         mix: None,
         calls: None,
+        mnemonic: None,
+        contracts: vec![],
     });
 
     let rpc = cli

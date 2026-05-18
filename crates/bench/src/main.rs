@@ -101,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
         output: args.output.clone(),
         mix: args.mix_ratio.as_deref().map(parse_mix).transpose()?,
         calls: args.calls_contract.map(|contract| CallsCfg { contract }),
+        mnemonic: None,
+        contracts: vec![],
     };
 
     let cfg = config::resolve(file_config, cli_overrides)?;
