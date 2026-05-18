@@ -10,11 +10,13 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::{Log as RpcLog, TransactionReceipt, TransactionRequest};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::database::{CacheDB, EmptyDB};
+use revm::primitives::KECCAK_EMPTY;
 use revm::state::{AccountInfo, Bytecode};
 use tokio::sync::RwLock;
 
 use crate::error::NodeError;
 use crate::executor::{self, ExecEnv};
+use crate::genesis::Genesis;
 use crate::metrics as kmetrics;
 use crate::{stage, stage_await};
 
@@ -32,14 +34,23 @@ struct NodeState {
 }
 
 impl Node {
-    pub fn new(chain_id: u64, prefunded: &[(Address, U256)]) -> Self {
+    pub fn new(genesis: &Genesis) -> Self {
         let mut db = CacheDB::new(EmptyDB::default());
-        for (addr, balance) in prefunded {
+        for (addr, entry) in &genesis.alloc {
+            let (code_hash, code) = match &entry.code {
+                Some(bytes) => {
+                    let bytecode = Bytecode::new_raw(bytes.clone());
+                    (bytecode.hash_slow(), Some(bytecode))
+                }
+                None => (KECCAK_EMPTY, None),
+            };
             db.insert_account_info(
                 *addr,
                 AccountInfo {
-                    balance: *balance,
-                    nonce: 0,
+                    balance: entry.balance,
+                    nonce: entry.nonce,
+                    code_hash,
+                    code,
                     ..Default::default()
                 },
             );
@@ -50,7 +61,7 @@ impl Node {
                 db,
                 receipts: HashMap::new(),
             })),
-            chain_id,
+            chain_id: genesis.chain_id,
         }
     }
 
@@ -144,23 +155,6 @@ impl Node {
         Ok(tx_hash)
     }
 
-    /// Test/dev helper: install bytecode at an address.
-    #[doc(hidden)]
-    pub async fn insert_code(&self, addr: Address, code: Bytes) {
-        let bytecode = Bytecode::new_raw(code);
-        let code_hash = bytecode.hash_slow();
-        let mut state = self.inner.write().await;
-        state.db.insert_account_info(
-            addr,
-            AccountInfo {
-                balance: U256::ZERO,
-                nonce: 1,
-                code_hash,
-                code: Some(bytecode),
-                ..Default::default()
-            },
-        );
-    }
 }
 
 fn build_receipt(
@@ -223,43 +217,59 @@ fn build_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genesis::{AllocEntry, Genesis};
+
+    fn genesis_with(chain_id: u64, entries: Vec<(Address, AllocEntry)>) -> Genesis {
+        Genesis {
+            chain_id,
+            alloc: entries.into_iter().collect(),
+        }
+    }
+
+    fn funded(balance: U256) -> AllocEntry {
+        AllocEntry { balance, code: None, nonce: 0 }
+    }
+
+    fn contract(code: Bytes) -> AllocEntry {
+        AllocEntry { balance: U256::ZERO, code: Some(code), nonce: 1 }
+    }
 
     #[test]
     fn chain_id_returns_configured_value() {
-        let node = Node::new(412346, &[]);
+        let node = Node::new(&genesis_with(412346, vec![]));
         assert_eq!(node.chain_id(), 412346);
     }
 
     #[tokio::test]
     async fn balance_reflects_prefunded_amount() {
         let addr = Address::from([1u8; 20]);
-        let node = Node::new(1, &[(addr, U256::from(1000u64))]);
+        let node = Node::new(&genesis_with(1, vec![(addr, funded(U256::from(1000u64)))]));
         assert_eq!(node.balance(addr).await, U256::from(1000u64));
     }
 
     #[tokio::test]
     async fn unfunded_account_has_zero_balance() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         let addr = Address::from([2u8; 20]);
         assert_eq!(node.balance(addr).await, U256::ZERO);
     }
 
     #[tokio::test]
     async fn block_number_starts_at_zero() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         assert_eq!(node.block_number().await, 0);
     }
 
     #[tokio::test]
     async fn nonce_starts_at_zero_for_new_account() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         let addr = Address::from([3u8; 20]);
         assert_eq!(node.nonce(addr).await, 0);
     }
 
     #[tokio::test]
     async fn unknown_receipt_returns_none() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         assert!(node.receipt(B256::ZERO).await.is_none());
     }
 
@@ -268,17 +278,21 @@ mod tests {
         use alloy_primitives::{TxKind, address, hex};
         use alloy_rpc_types_eth::TransactionRequest;
 
-        // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
         let code = Bytes::from(hex!("604260005260206000f3").to_vec());
-        let contract = address!("0000000000000000000000000000000000001234");
+        let contract_addr = address!("0000000000000000000000000000000000001234");
         let caller = address!("0000000000000000000000000000000000005678");
 
-        let node = Node::new(1, &[(caller, U256::from(1_000_000_000u64))]);
-        node.insert_code(contract, code).await;
+        let node = Node::new(&genesis_with(
+            1,
+            vec![
+                (caller, funded(U256::from(1_000_000_000u64))),
+                (contract_addr, contract(code)),
+            ],
+        ));
 
         let req = TransactionRequest {
             from: Some(caller),
-            to: Some(TxKind::Call(contract)),
+            to: Some(TxKind::Call(contract_addr)),
             ..Default::default()
         };
 
@@ -314,7 +328,10 @@ mod tests {
         let mut bytes = Vec::new();
         envelope.encode_2718(&mut bytes);
 
-        let node = Node::new(1, &[(from, U256::from(10u64).pow(U256::from(18u64)))]);
+        let node = Node::new(&genesis_with(
+            1,
+            vec![(from, funded(U256::from(10u64).pow(U256::from(18u64))))],
+        ));
         let hash = node
             .submit_raw_transaction(Bytes::from(bytes))
             .await

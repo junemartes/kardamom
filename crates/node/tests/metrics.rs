@@ -15,6 +15,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
+use kardamom_node::genesis::{AllocEntry, Genesis};
 use kardamom_node::metrics as kmetrics;
 use kardamom_node::{Node, rpc};
 
@@ -40,10 +41,10 @@ async fn rpc_calls_populate_prometheus_registry() {
     let to = Address::from([0x22u8; 20]);
     let chain_id = 1;
 
-    let node = Node::new(
+    let node = Node::new(&Genesis {
         chain_id,
-        &[(from, U256::from(10u64).pow(U256::from(18u64)))],
-    );
+        alloc: [(from, AllocEntry { balance: U256::from(10u64).pow(U256::from(18u64)), code: None, nonce: 0 })].into_iter().collect(),
+    });
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
@@ -117,7 +118,7 @@ async fn rpc_calls_populate_prometheus_registry() {
 async fn err_outcome_label_appears_on_failed_call() {
     let handle = recorder();
 
-    let node = Node::new(1, &[]);
+    let node = Node::new(&Genesis { chain_id: 1, alloc: Default::default() });
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
         .build(addr)
