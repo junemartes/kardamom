@@ -102,19 +102,6 @@ pub fn record_method(method: &'static str, ok: bool, elapsed_secs: f64) {
     .record(elapsed_secs);
 }
 
-/// Trait used by `instrument_method!` to classify the handler's result as
-/// ok/err for the outcome label. Implemented for any `Result`.
-pub trait IsOk {
-    fn is_ok_outcome(&self) -> bool;
-}
-
-impl<T, E> IsOk for Result<T, E> {
-    #[inline]
-    fn is_ok_outcome(&self) -> bool {
-        self.is_ok()
-    }
-}
-
 /// Enter a tracing span and record per-stage histogram for the duration of a
 /// sync block. Both `tracing-flame` (via the span) and Prometheus (via the
 /// histogram) observe exactly the same boundaries.
@@ -166,8 +153,8 @@ macro_rules! instrument_method {
         // Wrap the body in an `async {}` so `?` returns from the inner block
         // — not the enclosing handler — and the outcome is observable to the
         // metrics recorder.
-        let result = async $body.await;
-        let ok = $crate::metrics::IsOk::is_ok_outcome(&result);
+        let result: ::std::result::Result<_, _> = async $body.await;
+        let ok = result.is_ok();
         $crate::metrics::record_method($method, ok, _method_timer.elapsed_secs());
         result
     }};
