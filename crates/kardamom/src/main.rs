@@ -115,6 +115,5 @@ async fn main() -> anyhow::Result<()> {
     handle.stop()?;
     handle.stopped().await;
 
-    drop(_flame_guard);
     Ok(())
 }
