@@ -6,8 +6,12 @@
 
 pub mod addresses;
 pub mod artifacts;
+pub mod deployer;
 pub mod ids;
 pub mod spec;
 
+pub use deployer::{
+    DeployError, Deployer, FactoryStatus, RegistryEntry, VerifyMismatch, VerifyReport,
+};
 pub use ids::ContractId;
 pub use spec::{Action, DeploymentSpec, Op, build_spec, encode_address_arg, encode_init_calldata};
