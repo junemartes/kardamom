@@ -80,14 +80,16 @@ pub async fn preflight(
         match result {
             Ok(b) if !b.is_empty() => {}
             Ok(_) => anyhow::bail!(
-                "eth_call to {} returned empty output. Start kardamom with --insert-code {}=0x604260005260206000f3 to provision the bench's expected contract.",
-                calls_cfg.contract,
-                calls_cfg.contract,
+                "contract {addr} is not deployed (empty eth_call output). \
+                 Add this entry to your genesis file and restart kardamom:\n\
+                 \n    [[alloc]]\n    address = \"{addr}\"\n    code    = \"0x604260005260206000f3\"\n",
+                addr = calls_cfg.contract,
             ),
             Err(e) => anyhow::bail!(
-                "eth_call to {} failed: {e}. Start kardamom with --insert-code {}=0x604260005260206000f3 to provision the bench's expected contract.",
-                calls_cfg.contract,
-                calls_cfg.contract,
+                "eth_call to {addr} failed: {e}. \
+                 Add this entry to your genesis file and restart kardamom:\n\
+                 \n    [[alloc]]\n    address = \"{addr}\"\n    code    = \"0x604260005260206000f3\"\n",
+                addr = calls_cfg.contract,
             ),
         }
     }

@@ -2712,6 +2712,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "tokio",
+ "toml",
  "tracing",
  "tracing-flame",
  "tracing-subscriber 0.3.23",

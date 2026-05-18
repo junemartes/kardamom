@@ -9,7 +9,7 @@ use jsonrpsee::http_client::HttpClientBuilder;
 
 use kardamom_bench::generator;
 use kardamom_bench::signers;
-use kardamom_node::{Node, rpc};
+use kardamom_node::{AllocEntry, Genesis, Node, rpc};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn bench_generator_records_samples_against_inprocess_node() {
@@ -18,18 +18,28 @@ async fn bench_generator_records_samples_against_inprocess_node() {
     let concurrency = 4u32;
 
     let derived = signers::derive(seed, concurrency as usize).unwrap();
-    let mut prefunded: Vec<(Address, U256)> = derived
-        .iter()
-        .map(|s| (s.address, U256::from(10u64).pow(U256::from(18u64))))
-        .collect();
 
     let contract: Address = address!("0000000000000000000000000000000000001234");
     // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
     let code = Bytes::from(hex!("604260005260206000f3").to_vec());
-    prefunded.push((Address::ZERO, U256::ZERO));
 
-    let node = Node::new(chain_id, &prefunded);
-    node.insert_code(contract, code).await;
+    let one_eth = U256::from(10u64).pow(U256::from(18u64));
+    let mut alloc: std::collections::BTreeMap<Address, AllocEntry> = derived
+        .iter()
+        .map(|s| {
+            (
+                s.address,
+                AllocEntry { balance: one_eth, code: None, nonce: 0 },
+            )
+        })
+        .collect();
+    alloc.insert(
+        contract,
+        AllocEntry { balance: U256::ZERO, code: Some(code), nonce: 1 },
+    );
+
+    let genesis = Genesis { chain_id, alloc };
+    let node = Node::new(&genesis);
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
@@ -70,7 +80,6 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         .get("eth_sendRawTransaction")
         .expect("send hist");
 
-    // We sent more calls than transfers (mix 1:4), but both should have non-zero samples.
     assert!(
         !call_hist.is_empty(),
         "eth_call samples should be non-empty"
