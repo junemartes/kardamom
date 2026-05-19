@@ -61,3 +61,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --doc --locked
+
+  forge-build:
+    name: forge build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install contract dependencies
+        run: |
+          forge install --no-git --shallow \
+            foundry-rs/forge-std \
+            openzeppelin/openzeppelin-contracts@v5.0.2 \
+            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+      - run: forge build --sizes
