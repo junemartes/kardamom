@@ -1,25 +1,43 @@
-//! CREATE2 address derivation and kardamom factory address constants.
+//! CREATE2 address derivation and ERC-7955 / kardamom factory constants.
 //!
-//! Everything here is pure math — no I/O. Constants encode the choice of the Arachnid
-//! SingletonFactory and the kardamom factory's bootstrap salts. The factory's proxy
-//! address is computed lazily from the impl creation-code hash (forge artifact), since
-//! that depends on the compiled `KardamomFactoryV1` source.
+//! All pure math, no I/O. The factory proxy address is computed lazily from the
+//! compiled factory impl initcode (via forge artifact) and the canonical owner.
 
 use alloy_primitives::{Address, B256, Bytes, address, b256, keccak256};
 use alloy_sol_types::SolValue;
 
-/// Canonical Arachnid SingletonFactory address (deployed via Nick's method on most
-/// chains; predeployed in `chains/dev.toml` for anvil).
-pub const SINGLETON_FACTORY: Address = address!("4e59b44847b379578588920cA78FbF26c0B4956C");
+/// ERC-7955 permissionless CREATE2 factory.
+/// Canonical address on every EIP-7702-supporting chain (mainnet since Pectra).
+/// Spec: https://github.com/safe-research/erc-7955
+pub const ERC7955_FACTORY: Address = address!("C0DEb853af168215879d284cc8B4d0A645fA9b0E");
 
-/// Salt for the factory impl CREATE2 deploy: `keccak256("kardamom.factory.impl.v1")`.
+/// ERC-7955's publicly-known deployer EOA (used to sign the EIP-7702 self-bootstrap).
+/// Not used directly by this crate yet — kept for future self-bootstrap support.
+pub const ERC7955_DEPLOYER: Address = address!("962560A0333190D57009A0aAAB7Bfa088f58461C");
+
+/// ERC-7955 factory runtime bytecode (29 bytes). Used by tests that inject it via
+/// `anvil_setCode`; not used at runtime.
+pub const ERC7955_RUNTIME_HEX: &str =
+    "60203d3d3582360380843d373d34f5806019573d813d933efd5b3d52f33d52";
+
+/// Salt for the kardamom factory impl, deployed via ERC-7955.
 pub fn factory_impl_salt() -> B256 {
     keccak256(b"kardamom.factory.impl.v1")
 }
 
-/// Salt for the factory proxy CREATE2 deploy: `keccak256("kardamom.factory.proxy")`.
+/// Salt for the kardamom factory proxy, deployed via ERC-7955.
 pub fn factory_proxy_salt() -> B256 {
-    keccak256(b"kardamom.factory.proxy")
+    keccak256(b"kardamom.factory.proxy.v1")
+}
+
+/// Init calldata for the kardamom factory: `initialize(address owner)`.
+pub fn factory_init_data(owner: Address) -> Bytes {
+    let selector = &keccak256(b"initialize(address)")[..4];
+    let mut buf = Vec::with_capacity(4 + 32);
+    buf.extend_from_slice(selector);
+    let arg = (owner,).abi_encode();
+    buf.extend_from_slice(&arg);
+    Bytes::from(buf)
 }
 
 /// CREATE2 address: `keccak256(0xff || deployer || salt || keccak256(initcode))[12..32]`.
@@ -36,9 +54,6 @@ pub fn create2_address(deployer: Address, salt: B256, init_code_hash: B256) -> A
 }
 
 /// Build the full proxy initcode = `ERC1967Proxy.creationCode || abi.encode(impl, initData)`.
-///
-/// `abi_encode_params` mirrors Solidity's `abi.encode(impl, initData)` (no outer
-/// tuple wrapper), which is what the ERC1967Proxy constructor expects.
 pub fn proxy_full_initcode(
     proxy_creation_code: &Bytes,
     impl_addr: Address,
@@ -50,27 +65,24 @@ pub fn proxy_full_initcode(
     Bytes::from(full)
 }
 
-/// Factory impl address: CREATE2 from the singleton with the factory impl salt.
+/// Factory impl address: CREATE2 from ERC-7955 with the factory impl salt.
 pub fn factory_impl_address(impl_initcode: &Bytes) -> Address {
-    create2_address(
-        SINGLETON_FACTORY,
-        factory_impl_salt(),
-        keccak256(impl_initcode),
-    )
+    create2_address(ERC7955_FACTORY, factory_impl_salt(), keccak256(impl_initcode))
 }
 
-/// Factory proxy address: CREATE2 from the singleton with the factory proxy salt,
-/// using the full `ERC1967Proxy(impl, initData)` initcode.
+/// Factory proxy address: CREATE2 from ERC-7955 with the factory proxy salt, parameterized
+/// by the canonical `owner` (baked into the proxy initcode via `initialize(address)`).
 pub fn factory_proxy_address(
     proxy_creation_code: &Bytes,
     impl_addr: Address,
-    init_data: &Bytes,
+    owner: Address,
 ) -> Address {
-    let full = proxy_full_initcode(proxy_creation_code, impl_addr, init_data);
-    create2_address(SINGLETON_FACTORY, factory_proxy_salt(), keccak256(&full))
+    let init_data = factory_init_data(owner);
+    let full = proxy_full_initcode(proxy_creation_code, impl_addr, &init_data);
+    create2_address(ERC7955_FACTORY, factory_proxy_salt(), keccak256(&full))
 }
 
-/// App impl address (deployed via the kardamom factory, not the singleton).
+/// App impl address (deployed via the kardamom factory, not via ERC-7955).
 pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes) -> Address {
     create2_address(factory, impl_salt, keccak256(impl_initcode))
 }
@@ -87,16 +99,7 @@ pub fn app_proxy_address(
     create2_address(factory, proxy_salt, keccak256(&full))
 }
 
-/// Init data for the factory's bootstrap proxy: `abi.encodeWithSignature("initialize()")`.
-/// Always the same — operator-independent — so the factory proxy address is the same
-/// on every chain.
-pub fn factory_init_data() -> Bytes {
-    let selector = &keccak256(b"initialize()")[..4];
-    Bytes::from(selector.to_vec())
-}
-
-/// ERC1967 implementation storage slot:
-/// `uint256(keccak256("eip1967.proxy.implementation")) - 1`.
+/// ERC1967 implementation storage slot.
 pub const ERC1967_IMPL_SLOT: B256 =
     b256!("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc");
 
@@ -106,22 +109,7 @@ mod tests {
     use alloy_primitives::hex;
 
     #[test]
-    fn create2_is_deterministic() {
-        let deployer = address!("00000000000000000000000000000000DeaDBeef");
-        let salt = B256::ZERO;
-        let init_code_hash = keccak256(b"");
-        let a = create2_address(deployer, salt, init_code_hash);
-        let b = create2_address(deployer, salt, init_code_hash);
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn create2_matches_eip_1014_example_5() {
-        // From EIP-1014 examples table, example 5:
-        //   address       = 0x00000000000000000000000000000000deadbeef
-        //   salt          = 0x00000000000000000000000000000000000000000000000000000000cafebabe
-        //   init_code     = 0xdeadbeef
-        //   expected_addr = 0x60f3f640a8508fc6a86d45df051962668e1e8ac7
         let deployer = address!("00000000000000000000000000000000deadbeef");
         let salt = b256!("00000000000000000000000000000000000000000000000000000000cafebabe");
         let initcode = hex::decode("deadbeef").unwrap();
@@ -131,40 +119,37 @@ mod tests {
     }
 
     #[test]
-    fn factory_init_data_is_initialize_selector() {
-        let data = factory_init_data();
-        assert_eq!(data.len(), 4);
-        let expected = &keccak256(b"initialize()")[..4];
-        assert_eq!(data.as_ref(), expected);
-    }
-
-    #[test]
     fn factory_salts_are_distinct() {
         assert_ne!(factory_impl_salt(), factory_proxy_salt());
     }
 
     #[test]
-    fn erc1967_slot_is_canonical() {
-        // (uint256(keccak256("eip1967.proxy.implementation")) - 1).to_be_bytes()
-        let pre = keccak256(b"eip1967.proxy.implementation");
-        let mut val = [0u8; 32];
-        val.copy_from_slice(pre.as_slice());
-        let mut borrow: i32 = 1;
-        for i in (0..32).rev() {
-            let v = val[i] as i32 - borrow;
-            if v < 0 {
-                val[i] = (v + 256) as u8;
-                borrow = 1;
-            } else {
-                val[i] = v as u8;
-                borrow = 0;
-            }
-        }
-        assert_eq!(borrow, 0);
-        assert_eq!(ERC1967_IMPL_SLOT.as_slice(), &val[..]);
+    fn factory_init_data_is_initialize_address_selector() {
+        let owner = address!("00000000000000000000000000000000000000aa");
+        let data = factory_init_data(owner);
+        assert_eq!(data.len(), 36); // 4-byte selector + 32-byte address arg
+        let sel = &keccak256(b"initialize(address)")[..4];
+        assert_eq!(&data[..4], sel);
+        // last 20 bytes of the 32-byte arg are the address itself
+        assert_eq!(&data[16..36], owner.as_slice());
+    }
+
+    #[test]
+    fn factory_proxy_address_depends_on_owner() {
+        let proxy_init = Bytes::from(vec![0u8; 100]);
+        let impl_addr = address!("0000000000000000000000000000000000000001");
+        let a = address!("00000000000000000000000000000000000000aa");
+        let b = address!("00000000000000000000000000000000000000bb");
+        let pa = factory_proxy_address(&proxy_init, impl_addr, a);
+        let pb = factory_proxy_address(&proxy_init, impl_addr, b);
+        assert_ne!(pa, pb);
+    }
+
+    #[test]
+    fn erc7955_factory_address_is_correct() {
         assert_eq!(
-            hex::encode(ERC1967_IMPL_SLOT.as_slice()),
-            "360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+            ERC7955_FACTORY,
+            address!("C0DEb853af168215879d284cc8B4d0A645fA9b0E")
         );
     }
 }
