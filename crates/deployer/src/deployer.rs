@@ -10,7 +10,7 @@ use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
 
 use crate::addresses::{
-    ERC1967_IMPL_SLOT, SINGLETON_FACTORY, factory_impl_address, factory_init_data,
+    ERC1967_IMPL_SLOT, ERC7955_FACTORY, factory_impl_address, factory_init_data,
     factory_proxy_address, proxy_full_initcode,
 };
 use crate::artifacts::{ArtifactError, creation_bytecode};
@@ -24,13 +24,14 @@ sol! {
     #[sol(rpc)]
     #[derive(Debug)]
     interface IKardamomFactory {
-        // Mirrors Action enum as uint8 in ABI.
         struct DeploymentSpecAbi {
+            uint256 l2ChainId;
             bytes32 id;
             uint8 action;
             bytes implInitcode;
             bytes initData;
             bytes32 implSalt;
+            address targetImpl;
         }
 
         struct Entry {
@@ -43,9 +44,11 @@ sol! {
         }
 
         function applyDeployments(DeploymentSpecAbi[] calldata specs) external;
-        function entry(bytes32 id) external view returns (Entry memory);
-        function idCount() external view returns (uint256);
-        function idAt(uint256 i) external view returns (bytes32);
+        function entry(uint256 l2ChainId, bytes32 id) external view returns (Entry memory);
+        function l2ChainIdCount() external view returns (uint256);
+        function l2ChainIdAt(uint256 i) external view returns (uint256);
+        function idCount(uint256 l2ChainId) external view returns (uint256);
+        function idAt(uint256 l2ChainId, uint256 i) external view returns (bytes32);
     }
 }
 
@@ -57,8 +60,8 @@ sol! {
 pub enum DeployError {
     #[error("artifact: {0}")]
     Artifact(#[from] ArtifactError),
-    #[error("Arachnid SingletonFactory not deployed at {address}")]
-    SingletonNotDeployed { address: Address },
+    #[error("ERC-7955 CREATE2 factory not deployed at {address}; see https://github.com/safe-research/erc-7955 for bootstrap procedure")]
+    Erc7955FactoryAbsent { address: Address },
     #[error("factory not deployed at expected address {0}; run ensure-factory")]
     FactoryNotDeployed(Address),
     #[error("transaction reverted")]
@@ -91,6 +94,7 @@ pub enum FactoryStatus {
 
 #[derive(Debug, Clone)]
 pub struct RegistryEntry {
+    pub l2_chain_id: u64,
     pub id: B256,
     pub proxy: Address,
     pub current_impl: Address,
@@ -151,20 +155,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // factory_address — pure computation (async for API consistency)
     // -----------------------------------------------------------------------
 
-    /// Derive the factory proxy address from compiled forge artifacts.
-    ///
-    /// This is pure computation: reads `KardamomFactoryV1` and `ERC1967Proxy`
-    /// (falling back to `ProxyArtifact`) creation code, then uses the canonical
-    /// salt derivation.
-    pub async fn factory_address(&self) -> Result<Address, DeployError> {
+    /// Derive the factory proxy address from compiled forge artifacts + the canonical owner.
+    pub async fn factory_address(&self, owner: Address) -> Result<Address, DeployError> {
         let (impl_initcode, proxy_creation_code) = self.read_factory_artifacts()?;
         let impl_addr = factory_impl_address(&impl_initcode);
-        let init_data = factory_init_data();
-        Ok(factory_proxy_address(
-            &proxy_creation_code,
-            impl_addr,
-            &init_data,
-        ))
+        Ok(factory_proxy_address(&proxy_creation_code, impl_addr, owner))
     }
 
     // -----------------------------------------------------------------------
@@ -173,32 +168,26 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
     /// Ensure the kardamom factory is deployed on the connected chain.
     ///
-    /// a. Checks that the Arachnid SingletonFactory is present.
-    /// b. Checks whether the factory proxy already has code (if so, returns
-    ///    `FactoryStatus::AlreadyDeployed`).
-    /// c. Deploys the factory impl via the singleton.
-    /// d. Deploys the factory proxy via the singleton.
-    /// e. Verifies the proxy was deployed; returns `FactoryStatus::Deployed`.
-    pub async fn ensure_factory(&self) -> Result<FactoryStatus, DeployError> {
-        // (a) Check that the Arachnid SingletonFactory is present.
-        let singleton_code = self
+    /// `owner` is the canonical owner for this environment — same owner across L1s
+    /// means same factory address. Anyone with gas can call this; the owner is set
+    /// at initialize time, not by tx.origin.
+    pub async fn ensure_factory(&self, owner: Address) -> Result<FactoryStatus, DeployError> {
+        // (a) ERC-7955 factory must be present.
+        let factory_code = self
             .provider
-            .get_code_at(SINGLETON_FACTORY)
+            .get_code_at(ERC7955_FACTORY)
             .await
             .map_err(|e| DeployError::Provider(e.to_string()))?;
-        if singleton_code.is_empty() {
-            return Err(DeployError::SingletonNotDeployed {
-                address: SINGLETON_FACTORY,
+        if factory_code.is_empty() {
+            return Err(DeployError::Erc7955FactoryAbsent {
+                address: ERC7955_FACTORY,
             });
         }
 
-        // Read artifacts.
         let (factory_impl_initcode, proxy_creation_code) = self.read_factory_artifacts()?;
-
-        // Derive addresses.
         let impl_addr = factory_impl_address(&factory_impl_initcode);
-        let init_data = factory_init_data();
-        let factory_proxy = factory_proxy_address(&proxy_creation_code, impl_addr, &init_data);
+        let init_data = factory_init_data(owner);
+        let factory_proxy = factory_proxy_address(&proxy_creation_code, impl_addr, owner);
 
         // (b) Already deployed?
         let proxy_code = self
@@ -210,18 +199,16 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             return Ok(FactoryStatus::AlreadyDeployed);
         }
 
-        // (c) Deploy factory impl via the singleton.
-        //     Calldata = salt(32 bytes) || initcode.
+        // (c) Deploy impl via ERC-7955.
         let impl_salt = crate::addresses::factory_impl_salt();
-        let impl_calldata = singleton_calldata(impl_salt, &factory_impl_initcode);
-        self.send_singleton_tx(impl_calldata).await?;
+        self.send_erc7955_tx(impl_salt, &factory_impl_initcode)
+            .await?;
 
-        // (d) Deploy factory proxy via the singleton.
-        //     Calldata = salt(32 bytes) || proxy_full_initcode.
+        // (d) Deploy proxy via ERC-7955.
         let proxy_salt = crate::addresses::factory_proxy_salt();
         let full_proxy_initcode = proxy_full_initcode(&proxy_creation_code, impl_addr, &init_data);
-        let proxy_calldata = singleton_calldata(proxy_salt, &full_proxy_initcode);
-        self.send_singleton_tx(proxy_calldata).await?;
+        self.send_erc7955_tx(proxy_salt, &full_proxy_initcode)
+            .await?;
 
         // (e) Verify.
         let proxy_code_after = self
@@ -385,11 +372,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         Ok((factory_impl_initcode, proxy_creation_code))
     }
 
-    /// Send a raw transaction to the Arachnid SingletonFactory.
-    async fn send_singleton_tx(&self, calldata: Bytes) -> Result<TxHash, DeployError> {
+    async fn send_erc7955_tx(&self, salt: B256, initcode: &Bytes) -> Result<TxHash, DeployError> {
+        let calldata = erc7955_calldata(salt, initcode);
         let tx = TransactionRequest::default()
             .with_from(self.operator)
-            .with_to(SINGLETON_FACTORY)
+            .with_to(ERC7955_FACTORY)
             .with_input(calldata);
 
         let receipt = self
@@ -411,8 +398,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 // Free helpers
 // ---------------------------------------------------------------------------
 
-/// Build `salt(32) || initcode` calldata for the Arachnid singleton.
-fn singleton_calldata(salt: B256, initcode: &Bytes) -> Bytes {
+/// Build `salt(32) || initcode` calldata for the ERC-7955 CREATE2 factory.
+fn erc7955_calldata(salt: B256, initcode: &Bytes) -> Bytes {
     let mut buf = Vec::with_capacity(32 + initcode.len());
     buf.extend_from_slice(salt.as_slice());
     buf.extend_from_slice(initcode);
