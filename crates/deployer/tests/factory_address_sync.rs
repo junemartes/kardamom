@@ -1,14 +1,18 @@
 //! Cross-check: the FACTORY constant baked into KardamomUUPSBase.sol matches the
-//! address that addresses::factory_proxy_address(...) computes from the forge
-//! artifact. If either drifts, this test fails — the operator must update the
-//! Solidity source.
+//! address computed by `addresses::factory_proxy_address(...)` for the canonical
+//! dev/test owner. Production owners produce different addresses (and a different
+//! KardamomUUPSBase build); this test pins the address for the dev path used in
+//! local + CI testing.
 
 use std::path::PathBuf;
 
-use kardamom_deployer::addresses::{
-    factory_impl_address, factory_init_data, factory_proxy_address,
-};
+use alloy_primitives::{Address, address};
+use kardamom_deployer::addresses::{factory_impl_address, factory_proxy_address};
 use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
+
+/// Canonical owner used by `deploy_e2e` and any other dev/test deployment. Must match
+/// the owner baked into KardamomUUPSBase.FACTORY.
+const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
 #[test]
 fn factory_constant_in_source_matches_computed_address() {
@@ -21,8 +25,6 @@ fn factory_constant_in_source_matches_computed_address() {
             return;
         }
     };
-    // Prefer the raw ERC1967Proxy artifact (matches what the factory uses internally
-    // for app proxies). Fall back to ProxyArtifact if forge didn't emit it.
     let proxy_initcode = creation_bytecode(&root, "ERC1967Proxy")
         .or_else(|_| creation_bytecode(&root, "ProxyArtifact"))
         .unwrap_or_else(|_| {
@@ -30,15 +32,12 @@ fn factory_constant_in_source_matches_computed_address() {
         });
 
     let impl_addr = factory_impl_address(&factory_initcode);
-    let init_data = factory_init_data();
-    let computed = factory_proxy_address(&proxy_initcode, impl_addr, &init_data);
+    let computed = factory_proxy_address(&proxy_initcode, impl_addr, DEV_OWNER);
 
     let base_path: PathBuf = root.join("src/factory/KardamomUUPSBase.sol");
     let src = std::fs::read_to_string(&base_path)
         .unwrap_or_else(|_| panic!("read {}", base_path.display()));
 
-    // Solidity address literals must match the case-sensitive EIP-55 checksum form,
-    // but the formatter is case-insensitive when comparing. Match in both cases.
     let computed_hex = format!("{computed:#x}");
     let lc = computed_hex.to_lowercase();
     let src_lc = src.to_lowercase();
@@ -46,7 +45,7 @@ fn factory_constant_in_source_matches_computed_address() {
     assert!(
         src_lc.contains(&lc),
         "KardamomUUPSBase.FACTORY does not match computed address {computed:#x}. \
-         Update the FACTORY constant in {}.",
+         Update the FACTORY constant in {} (compute via: cargo run --bin print-factory-address -- --owner {DEV_OWNER:#x}).",
         base_path.display()
     );
 }

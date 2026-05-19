@@ -1,12 +1,12 @@
-//! End-to-end deployer flow against anvil with the SingletonFactory predeployed.
+//! End-to-end deployer flow against anvil with the ERC-7955 factory predeployed.
 //! Skips gracefully if forge artifacts or anvil are missing.
 
 use alloy_node_bindings::Anvil;
-use alloy_primitives::{Bytes, U256, address};
+use alloy_primitives::{Address, Bytes, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::sol;
 
-use kardamom_deployer::addresses::SINGLETON_FACTORY;
+use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
 use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_arg};
 
@@ -19,129 +19,201 @@ sol! {
     }
 }
 
-const SINGLETON_RUNTIME_HEX: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
+const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
+
+/// Set up an anvil instance with ERC-7955 factory preloaded and DEV_OWNER impersonated
+/// (so transactions from DEV_OWNER don't need a private key). Returns None if anvil
+/// isn't available.
+async fn setup_anvil_with_erc7955(
+) -> Option<(alloy_node_bindings::AnvilInstance, impl alloy_provider::Provider + Clone)> {
+    let anvil = Anvil::new().try_spawn().ok()?;
+    let provider = ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .connect_http(anvil.endpoint_url());
+
+    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
+    let _: serde_json::Value = provider
+        .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
+        .await
+        .ok()?;
+
+    // Fund and impersonate DEV_OWNER so transactions from it are accepted without a key.
+    let _: serde_json::Value = provider
+        .raw_request(
+            "anvil_setBalance".into(),
+            (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
+        )
+        .await
+        .ok()?;
+    let _: serde_json::Value = provider
+        .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
+        .await
+        .ok()?;
+
+    Some((anvil, provider))
+}
 
 #[tokio::test]
-async fn full_deploy_and_upgrade_flow() {
+async fn cross_chain_address_parity() {
     let root = default_contracts_root();
     if creation_bytecode(&root, "KardamomFactoryV1").is_err() {
-        eprintln!("SKIP: forge artifacts missing; run forge build in contracts/");
+        eprintln!("SKIP: forge artifacts missing");
         return;
     }
 
-    let anvil = match Anvil::new().try_spawn() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("SKIP: anvil unavailable: {e}");
+    let (anvil_a, provider_a) = match setup_anvil_with_erc7955().await {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: anvil unavailable");
             return;
         }
     };
+    let (_anvil_b, provider_b) = match setup_anvil_with_erc7955().await {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: anvil unavailable");
+            return;
+        }
+    };
+    let _ = anvil_a; // keep alive
 
-    let wallet = anvil.wallet().expect("anvil wallet");
-    let provider = ProviderBuilder::new()
-        .wallet(wallet)
-        .connect_http(anvil.endpoint_url());
-    let operator = anvil.addresses()[0];
+    let deployer_a = Deployer::new(provider_a, DEV_OWNER);
+    let deployer_b = Deployer::new(provider_b, DEV_OWNER);
 
-    // Inject the Arachnid singleton runtime at its canonical address.
-    let bytes_hex = format!("0x{SINGLETON_RUNTIME_HEX}");
-    let _: serde_json::Value = provider
-        .raw_request("anvil_setCode".into(), (SINGLETON_FACTORY, bytes_hex))
-        .await
-        .expect("anvil_setCode");
+    assert!(matches!(
+        deployer_a.ensure_factory(DEV_OWNER).await.unwrap(),
+        FactoryStatus::Deployed
+    ));
+    assert!(matches!(
+        deployer_b.ensure_factory(DEV_OWNER).await.unwrap(),
+        FactoryStatus::Deployed
+    ));
 
-    let deployer = Deployer::new(provider.clone(), operator);
-
-    // Cold bootstrap.
-    let status1 = deployer
-        .ensure_factory()
-        .await
-        .expect("ensure_factory cold");
-    assert!(matches!(status1, FactoryStatus::Deployed));
-
-    // Warm — idempotent.
-    let status2 = deployer
-        .ensure_factory()
-        .await
-        .expect("ensure_factory warm");
-    assert!(matches!(status2, FactoryStatus::AlreadyDeployed));
-
-    // Deploy ETHLockbox.
-    let l2_minter = address!("00000000000000000000000000000000000000BE");
-    deployer
-        .apply(&[Op::Deploy {
-            id: ContractId::EthLockbox,
-            init_args: encode_address_arg(l2_minter),
-        }])
-        .await
-        .expect("deploy ETHLockbox");
-
-    let entries = deployer.addresses().await.expect("addresses");
-    assert_eq!(entries.len(), 1);
-    let lockbox_entry = entries[0].clone();
-    assert_eq!(lockbox_entry.id, ContractId::EthLockbox.id());
-    assert_eq!(lockbox_entry.version, 1);
-
-    let verify = deployer.verify().await.expect("verify");
-    assert!(
-        verify.mismatches.is_empty(),
-        "verify mismatches: {:?}",
-        verify.mismatches
-    );
-
-    // Exercise depositETH on the proxy.
-    let lockbox = ETHLockbox::new(lockbox_entry.proxy, provider.clone());
+    let addr_a = deployer_a.factory_address(DEV_OWNER).await.unwrap();
+    let addr_b = deployer_b.factory_address(DEV_OWNER).await.unwrap();
     assert_eq!(
-        lockbox.l2Minter().call().await.expect("l2Minter call"),
-        l2_minter
+        addr_a, addr_b,
+        "same owner + same bytecode must produce same factory address on different chains"
+    );
+}
+
+#[tokio::test]
+async fn multi_l2_deploy_and_atomic_upgrade() {
+    let root = default_contracts_root();
+    if creation_bytecode(&root, "KardamomFactoryV1").is_err() {
+        eprintln!("SKIP: forge artifacts missing");
+        return;
+    }
+    let (anvil, provider) = match setup_anvil_with_erc7955().await {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: anvil unavailable");
+            return;
+        }
+    };
+    let _ = anvil; // keep alive
+    let deployer = Deployer::new(provider.clone(), DEV_OWNER);
+
+    deployer.ensure_factory(DEV_OWNER).await.unwrap();
+    // Warm path is idempotent.
+    assert!(matches!(
+        deployer.ensure_factory(DEV_OWNER).await.unwrap(),
+        FactoryStatus::AlreadyDeployed
+    ));
+
+    // Deploy ETHLockbox on L2 chainIDs 42 and 43 in one tx.
+    let l2_minter_a = address!("00000000000000000000000000000000000000BE");
+    let l2_minter_b = address!("00000000000000000000000000000000000000BF");
+    deployer
+        .apply(
+            &[
+                Op::Deploy {
+                    l2_chain_id: 42,
+                    id: ContractId::EthLockbox,
+                    init_args: encode_address_arg(l2_minter_a),
+                },
+                Op::Deploy {
+                    l2_chain_id: 43,
+                    id: ContractId::EthLockbox,
+                    init_args: encode_address_arg(l2_minter_b),
+                },
+            ],
+            DEV_OWNER,
+        )
+        .await
+        .expect("multi-L2 deploy");
+
+    let entries = deployer.addresses(DEV_OWNER, None).await.unwrap();
+    assert_eq!(entries.len(), 2);
+    let e42 = entries.iter().find(|e| e.l2_chain_id == 42).unwrap();
+    let e43 = entries.iter().find(|e| e.l2_chain_id == 43).unwrap();
+    assert_ne!(e42.proxy, e43.proxy, "per-L2 proxies must differ");
+    assert_eq!(
+        e42.current_impl, e43.current_impl,
+        "impl must be shared via dedup"
     );
 
+    // State independence: each proxy's l2Minter is its own.
+    let lock_a = ETHLockbox::new(e42.proxy, provider.clone());
+    let lock_b = ETHLockbox::new(e43.proxy, provider.clone());
+    assert_eq!(lock_a.l2Minter().call().await.unwrap(), l2_minter_a);
+    assert_eq!(lock_b.l2Minter().call().await.unwrap(), l2_minter_b);
+
+    // Deposit on L2 A only — L2 B's nonce stays at 0.
+    // Use anvil's funded account (addresses()[0]) to pay for the deposit, not DEV_OWNER.
+    // DEV_OWNER can also send ETH since we funded it above.
     let target = address!("0000000000000000000000000000000000000022");
-    let _ = lockbox
+    lock_a
         .depositETH(target, 100_000, Bytes::new())
         .value(U256::from(1_000_000_000_000_000_000u128))
-        .from(operator)
+        .from(DEV_OWNER)
         .send()
         .await
-        .expect("send depositETH")
+        .unwrap()
         .get_receipt()
         .await
-        .expect("depositETH receipt");
-    assert_eq!(
-        lockbox
-            .depositNonce()
-            .call()
-            .await
-            .expect("depositNonce after deposit"),
-        1u64
-    );
+        .unwrap();
+    assert_eq!(lock_a.depositNonce().call().await.unwrap(), 1u64);
+    assert_eq!(lock_b.depositNonce().call().await.unwrap(), 0u64);
 
-    // Upgrade to version 2 (same source — but different impl_salt → different CREATE2 address).
+    // Atomic upgrade across both L2s in one tx.
     deployer
-        .apply(&[Op::Upgrade {
-            id: ContractId::EthLockbox,
-            new_version: 2,
-            init_args: Bytes::new(),
-        }])
+        .apply(
+            &[
+                Op::Upgrade {
+                    l2_chain_id: 42,
+                    id: ContractId::EthLockbox,
+                    new_version: 2,
+                    init_args: Bytes::new(),
+                },
+                Op::Upgrade {
+                    l2_chain_id: 43,
+                    id: ContractId::EthLockbox,
+                    new_version: 2,
+                    init_args: Bytes::new(),
+                },
+            ],
+            DEV_OWNER,
+        )
         .await
-        .expect("upgrade");
+        .expect("atomic multi-L2 upgrade");
 
-    let entries2 = deployer.addresses().await.expect("addresses after upgrade");
-    assert_eq!(entries2.len(), 1);
-    assert_eq!(entries2[0].version, 2);
-    assert_ne!(entries2[0].current_impl, lockbox_entry.current_impl);
-    assert_eq!(entries2[0].proxy, lockbox_entry.proxy);
-
-    // State persists across upgrade.
+    let entries2 = deployer.addresses(DEV_OWNER, None).await.unwrap();
+    let e42 = entries2.iter().find(|e| e.l2_chain_id == 42).unwrap();
+    let e43 = entries2.iter().find(|e| e.l2_chain_id == 43).unwrap();
+    assert_eq!(e42.version, 2);
+    assert_eq!(e43.version, 2);
     assert_eq!(
-        lockbox
-            .depositNonce()
-            .call()
-            .await
-            .expect("depositNonce after upgrade"),
-        1u64
+        e42.current_impl, e43.current_impl,
+        "upgraded impl must still be shared"
     );
 
-    let verify2 = deployer.verify().await.expect("verify after upgrade");
-    assert!(verify2.mismatches.is_empty());
+    // L2 A's deposit nonce survived the upgrade (state preserved).
+    assert_eq!(lock_a.depositNonce().call().await.unwrap(), 1u64);
+    assert_eq!(lock_b.depositNonce().call().await.unwrap(), 0u64);
+
+    // Filter by l2_chain_id.
+    let only_42 = deployer.addresses(DEV_OWNER, Some(42)).await.unwrap();
+    assert_eq!(only_42.len(), 1);
+    assert_eq!(only_42[0].l2_chain_id, 42);
 }

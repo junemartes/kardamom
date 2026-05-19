@@ -9,7 +9,7 @@ name = "kardamom-deploy"
 path = "src/main.rs"
 
 [[bin]]
-name = "print_factory_address"
+name = "print-factory-address"
 path = "src/bin/print_factory_address.rs"
 
 [dependencies]

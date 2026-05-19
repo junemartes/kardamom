@@ -6,7 +6,7 @@ use alloy_primitives::{Address, Bytes, TxKind, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::sol;
 
-use kardamom_deployer::addresses::SINGLETON_FACTORY;
+use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use kardamom_node::Node;
@@ -20,7 +20,9 @@ sol! {
     }
 }
 
-const SINGLETON_RUNTIME_HEX: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
+/// Must match deployer/tests/factory_address_sync.rs and KardamomUUPSBase.FACTORY.
+const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
+const L2_CHAIN_ID: u64 = 1;
 
 fn encode_deposit(dep: &DepositTx) -> Vec<u8> {
     let mut raw = vec![DEPOSIT_TX_TYPE];
@@ -45,33 +47,51 @@ async fn deposit_e2e_anvil_to_node() {
             return;
         }
     };
-    let wallet = anvil.wallet().expect("anvil wallet");
     let provider = ProviderBuilder::new()
-        .wallet(wallet)
+        .disable_recommended_fillers()
         .connect_http(anvil.endpoint_url());
-    let operator = anvil.addresses()[0];
 
-    // Inject the Arachnid singleton runtime at its canonical address.
-    let bytes_hex = format!("0x{SINGLETON_RUNTIME_HEX}");
+    // Inject the ERC-7955 factory runtime at its canonical address.
+    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
     let _: serde_json::Value = provider
-        .raw_request("anvil_setCode".into(), (SINGLETON_FACTORY, bytes_hex))
+        .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
         .await
         .expect("anvil_setCode");
 
-    let deployer = Deployer::new(provider.clone(), operator);
+    // Fund and impersonate DEV_OWNER so transactions from it are accepted without a key.
+    let _: serde_json::Value = provider
+        .raw_request(
+            "anvil_setBalance".into(),
+            (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
+        )
+        .await
+        .expect("anvil_setBalance");
+    let _: serde_json::Value = provider
+        .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
+        .await
+        .expect("anvil_impersonateAccount");
+
+    let deployer = Deployer::new(provider.clone(), DEV_OWNER);
 
     // Bootstrap factory and deploy ETHLockbox via the new pipeline.
     let l2_minter = Address::from([0xBE; 20]);
-    deployer.ensure_factory().await.expect("ensure_factory");
+    deployer.ensure_factory(DEV_OWNER).await.expect("ensure_factory");
     deployer
-        .apply(&[Op::Deploy {
-            id: ContractId::EthLockbox,
-            init_args: encode_address_arg(l2_minter),
-        }])
+        .apply(
+            &[Op::Deploy {
+                l2_chain_id: L2_CHAIN_ID,
+                id: ContractId::EthLockbox,
+                init_args: encode_address_arg(l2_minter),
+            }],
+            DEV_OWNER,
+        )
         .await
         .expect("deploy ETHLockbox");
 
-    let entries = deployer.addresses().await.expect("addresses");
+    let entries = deployer
+        .addresses(DEV_OWNER, Some(L2_CHAIN_ID))
+        .await
+        .expect("addresses");
     let lockbox_addr = entries
         .iter()
         .find(|e| e.id == ContractId::EthLockbox.id())
@@ -86,7 +106,7 @@ async fn deposit_e2e_anvil_to_node() {
     let receipt = lockbox
         .depositETH(target, 100_000, Bytes::new())
         .value(U256::from(mint_amount))
-        .from(operator)
+        .from(DEV_OWNER)
         .send()
         .await
         .expect("send depositETH")
@@ -105,7 +125,7 @@ async fn deposit_e2e_anvil_to_node() {
 
     let dep = DepositTx {
         source_hash: source_hash(l1_block_hash, l1_log_index),
-        from: alias_l1_address(operator),
+        from: alias_l1_address(DEV_OWNER),
         to: TxKind::Call(target),
         mint: mint_amount,
         value: U256::from(mint_amount),
