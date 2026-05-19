@@ -4,6 +4,12 @@ pub mod error;
 
 pub use error::NodeError;
 
+pub mod metrics;
+
+pub mod genesis;
+
+pub use genesis::{AllocEntry, Genesis};
+
 pub mod node;
 
 pub use node::Node;

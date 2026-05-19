@@ -1,0 +1,8 @@
+rpc         = "http://127.0.0.1:8545"
+workload    = "transfers"
+rate        = 500
+duration    = "30s"
+concurrency = 16
+warmup      = "2s"
+seed        = 0xC0FFEE
+output      = "results/transfers.json"

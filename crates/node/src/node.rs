@@ -10,11 +10,15 @@ use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::{Log as RpcLog, TransactionReceipt, TransactionRequest};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::database::{CacheDB, EmptyDB};
+use revm::primitives::KECCAK_EMPTY;
 use revm::state::{AccountInfo, Bytecode};
 use tokio::sync::RwLock;
 
 use crate::error::NodeError;
 use crate::executor::{self, ExecEnv};
+use crate::genesis::Genesis;
+use crate::metrics as kmetrics;
+use crate::{stage, stage_await};
 
 #[derive(Clone)]
 pub struct Node {
@@ -30,14 +34,26 @@ struct NodeState {
 }
 
 impl Node {
-    pub fn new(chain_id: u64, prefunded: &[(Address, U256)]) -> Self {
+    pub fn new(genesis: &Genesis) -> Self {
         let mut db = CacheDB::new(EmptyDB::default());
-        for (addr, balance) in prefunded {
+        for entry in &genesis.alloc {
+            let (code_hash, code) = match &entry.code {
+                Some(bytes) => {
+                    let bytecode = Bytecode::new_raw(bytes.clone());
+                    (bytecode.hash_slow(), Some(bytecode))
+                }
+                None => (KECCAK_EMPTY, None),
+            };
+            let nonce = entry
+                .nonce
+                .unwrap_or_else(|| if entry.code.is_some() { 1 } else { 0 });
             db.insert_account_info(
-                *addr,
+                entry.address,
                 AccountInfo {
-                    balance: *balance,
-                    nonce: 0,
+                    balance: entry.balance,
+                    nonce,
+                    code_hash,
+                    code,
                     ..Default::default()
                 },
             );
@@ -48,7 +64,7 @@ impl Node {
                 db,
                 receipts: HashMap::new(),
             })),
-            chain_id,
+            chain_id: genesis.chain_id,
         }
     }
 
@@ -87,58 +103,59 @@ impl Node {
     }
 
     pub async fn call(&self, req: TransactionRequest) -> Result<Bytes, NodeError> {
-        let state = self.inner.read().await;
+        const METHOD: &str = "eth_call";
+        let state = stage_await!("acquire_read_lock", method = METHOD, self.inner.read());
+        let tx = stage!("build_tx_env", method = METHOD, {
+            executor::tx_env_from_request(&req)
+        });
         let env = ExecEnv {
             chain_id: self.chain_id,
             block_number: state.block_number,
         };
-        let tx = executor::tx_env_from_request(&req);
-        executor::call(&state.db, env, tx)
+        stage!("execute", method = METHOD, {
+            executor::call(&state.db, env, tx)
+        })
     }
 
     /// Decode an EIP-2718-encoded signed transaction, execute it against the
     /// node's mutable state, store a receipt, and bump the block number.
     pub async fn submit_raw_transaction(&self, bytes: Bytes) -> Result<B256, NodeError> {
-        let envelope = TxEnvelope::decode(&mut bytes.as_ref())
-            .map_err(|e| NodeError::Decode(e.to_string()))?;
-        let signer = envelope
-            .recover_signer()
-            .map_err(|_| NodeError::SignatureRecovery)?;
+        const METHOD: &str = "eth_sendRawTransaction";
+
+        let envelope: TxEnvelope = stage!("decode", method = METHOD, {
+            TxEnvelope::decode(&mut bytes.as_ref()).map_err(|e| NodeError::Decode(e.to_string()))?
+        });
+        let signer = stage!("recover_signer", method = METHOD, {
+            envelope
+                .recover_signer()
+                .map_err(|_| NodeError::SignatureRecovery)?
+        });
         let tx_hash = *envelope.tx_hash();
 
-        let mut state = self.inner.write().await;
+        let mut state = stage_await!("acquire_write_lock", method = METHOD, self.inner.write());
         let sealed_block = state.block_number + 1;
         let env = ExecEnv {
             chain_id: self.chain_id,
             block_number: sealed_block,
         };
-        let tx = executor::tx_env_from_envelope(&envelope, signer);
+        let tx = stage!("build_tx_env", method = METHOD, {
+            executor::tx_env_from_envelope(&envelope, signer)
+        });
 
-        let out = executor::execute(&mut state.db, env, tx)?;
-        let receipt = build_receipt(&envelope, &out.result, signer, tx_hash, sealed_block);
+        let out = stage!("execute", method = METHOD, {
+            executor::execute(&mut state.db, env, tx)?
+        });
+        let receipt = stage!("build_receipt", method = METHOD, {
+            build_receipt(&envelope, &out.result, signer, tx_hash, sealed_block)
+        });
 
-        state.receipts.insert(tx_hash, receipt);
-        state.block_number = sealed_block;
+        stage!("store_receipt", method = METHOD, {
+            state.receipts.insert(tx_hash, receipt);
+            state.block_number = sealed_block;
+        });
 
+        kmetrics::set_block_number(sealed_block);
         Ok(tx_hash)
-    }
-
-    /// Test/dev helper: install bytecode at an address.
-    #[doc(hidden)]
-    pub async fn insert_code(&self, addr: Address, code: Bytes) {
-        let bytecode = Bytecode::new_raw(code);
-        let code_hash = bytecode.hash_slow();
-        let mut state = self.inner.write().await;
-        state.db.insert_account_info(
-            addr,
-            AccountInfo {
-                balance: U256::ZERO,
-                nonce: 1,
-                code_hash,
-                code: Some(bytecode),
-                ..Default::default()
-            },
-        );
     }
 }
 
@@ -202,43 +219,66 @@ fn build_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::genesis::{AllocEntry, Genesis};
+
+    fn genesis_with(chain_id: u64, alloc: Vec<AllocEntry>) -> Genesis {
+        Genesis { chain_id, alloc }
+    }
+
+    fn funded(address: Address, balance: U256) -> AllocEntry {
+        AllocEntry {
+            address,
+            balance,
+            code: None,
+            nonce: None,
+        }
+    }
+
+    fn contract(address: Address, code: Bytes) -> AllocEntry {
+        AllocEntry {
+            address,
+            balance: U256::ZERO,
+            code: Some(code),
+            nonce: None,
+        }
+    }
 
     #[test]
     fn chain_id_returns_configured_value() {
-        let node = Node::new(412346, &[]);
+        let node = Node::new(&genesis_with(412346, vec![]));
         assert_eq!(node.chain_id(), 412346);
     }
 
     #[tokio::test]
     async fn balance_reflects_prefunded_amount() {
         let addr = Address::from([1u8; 20]);
-        let node = Node::new(1, &[(addr, U256::from(1000u64))]);
+        let node = Node::new(&genesis_with(1, vec![funded(addr, U256::from(1000u64))]));
         assert_eq!(node.balance(addr).await, U256::from(1000u64));
     }
 
     #[tokio::test]
     async fn unfunded_account_has_zero_balance() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         let addr = Address::from([2u8; 20]);
         assert_eq!(node.balance(addr).await, U256::ZERO);
     }
 
     #[tokio::test]
     async fn block_number_starts_at_zero() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         assert_eq!(node.block_number().await, 0);
     }
 
     #[tokio::test]
     async fn nonce_starts_at_zero_for_new_account() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         let addr = Address::from([3u8; 20]);
         assert_eq!(node.nonce(addr).await, 0);
     }
 
     #[tokio::test]
     async fn unknown_receipt_returns_none() {
-        let node = Node::new(1, &[]);
+        let node = Node::new(&genesis_with(1, vec![]));
         assert!(node.receipt(B256::ZERO).await.is_none());
     }
 
@@ -247,17 +287,21 @@ mod tests {
         use alloy_primitives::{TxKind, address, hex};
         use alloy_rpc_types_eth::TransactionRequest;
 
-        // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
         let code = Bytes::from(hex!("604260005260206000f3").to_vec());
-        let contract = address!("0000000000000000000000000000000000001234");
+        let contract_addr = address!("0000000000000000000000000000000000001234");
         let caller = address!("0000000000000000000000000000000000005678");
 
-        let node = Node::new(1, &[(caller, U256::from(1_000_000_000u64))]);
-        node.insert_code(contract, code).await;
+        let node = Node::new(&genesis_with(
+            1,
+            vec![
+                funded(caller, U256::from(1_000_000_000u64)),
+                contract(contract_addr, code),
+            ],
+        ));
 
         let req = TransactionRequest {
             from: Some(caller),
-            to: Some(TxKind::Call(contract)),
+            to: Some(TxKind::Call(contract_addr)),
             ..Default::default()
         };
 
@@ -293,7 +337,10 @@ mod tests {
         let mut bytes = Vec::new();
         envelope.encode_2718(&mut bytes);
 
-        let node = Node::new(1, &[(from, U256::from(10u64).pow(U256::from(18u64)))]);
+        let node = Node::new(&genesis_with(
+            1,
+            vec![funded(from, U256::from(10u64).pow(U256::from(18u64)))],
+        ));
         let hash = node
             .submit_raw_transaction(Bytes::from(bytes))
             .await

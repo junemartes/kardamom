@@ -1,0 +1,11 @@
+rpc         = "http://127.0.0.1:8545"
+workload    = "calls"
+rate        = 2000
+duration    = "30s"
+concurrency = 16
+warmup      = "2s"
+seed        = 0xC0FFEE
+output      = "results/calls.json"
+
+[calls]
+contract = "0x0000000000000000000000000000000000001234"
