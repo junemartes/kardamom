@@ -46,10 +46,6 @@ struct Args {
     #[arg(long, value_parser = humantime::parse_duration)]
     warmup: Option<Duration>,
 
-    /// Seed for deterministic signer derivation.
-    #[arg(long)]
-    seed: Option<u64>,
-
     /// Write the report as JSON to this path in addition to printing it.
     #[arg(long)]
     output: Option<String>,
@@ -97,10 +93,11 @@ async fn main() -> anyhow::Result<()> {
         duration: args.duration,
         concurrency: args.concurrency,
         warmup: args.warmup,
-        seed: args.seed,
         output: args.output.clone(),
         mix: args.mix_ratio.as_deref().map(parse_mix).transpose()?,
         calls: args.calls_contract.map(|contract| CallsCfg { contract }),
+        mnemonic: None,
+        contracts: vec![],
     };
 
     let cfg = config::resolve(file_config, cli_overrides)?;
@@ -111,7 +108,6 @@ async fn main() -> anyhow::Result<()> {
         rate = cfg.rate,
         duration = ?cfg.duration,
         concurrency = cfg.concurrency,
-        seed = format!("{:#x}", cfg.seed),
         "starting bench"
     );
 

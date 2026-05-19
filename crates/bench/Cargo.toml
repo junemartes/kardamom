@@ -19,8 +19,9 @@ alloy-consensus.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-eips.workspace = true
-alloy-signer-local.workspace = true
+alloy-signer-local = { workspace = true, features = ["mnemonic"] }
 
+rand = "0.8"
 anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
