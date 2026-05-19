@@ -14,29 +14,34 @@ import {ERC1967Proxy} from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.s
 import {IKardamomFactory} from "./IKardamomFactory.sol";
 
 /// @notice UUPS-upgradeable contract registry and CREATE2 deployer.
-/// Bootstrap pattern: deployed through the Arachnid SingletonFactory so its proxy
-/// address is deterministic across chains. Its `initialize()` takes no arguments and
-/// sets the owner to `tx.origin`, which must be the bootstrap EOA.
+/// Bootstrap pattern: deployed through ERC-7955's permissionless CREATE2 factory so the
+/// proxy address is the same across L1s for a given (compiled bytecode, owner) pair.
+/// The proxy's initcode embeds `initialize(address owner)`, so the canonical address
+/// depends on the owner — different envs (mainnet/testnet/dev) use different owners
+/// and naturally land at different L1 addresses.
 contract KardamomFactoryV1 is
     IKardamomFactory,
     Initializable,
     UUPSUpgradeable,
     Ownable2StepUpgradeable
 {
-    bytes32[] public ids;
-    mapping(bytes32 => Entry) private _registry;
+    // Per-(l2ChainId) discovery.
+    uint256[] public l2ChainIds;
+    mapping(uint256 => bool) private _l2ChainIdSeen;
+
+    // Per-(l2ChainId, contractId) registry.
+    mapping(uint256 => bytes32[]) private _idsByChainId;
+    mapping(uint256 => mapping(bytes32 => Entry)) private _registry;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers();
     }
 
-    /// @notice Bootstrap initializer. Sets the operator to `tx.origin`, which must be
-    /// the EOA that called the SingletonFactory. Encoded into proxy initData as a
-    /// constant `abi.encodeWithSignature("initialize()")`, so the proxy address does
-    /// not depend on which operator deploys.
-    function initialize() external initializer {
-        __Ownable_init(tx.origin);
+    /// @notice Bootstrap initializer. Owner is passed in; the bootstrap caller (whoever
+    /// runs ERC-7955.deploy with this initcode) does not need to be the owner.
+    function initialize(address owner) external initializer {
+        __Ownable_init(owner);
         __Ownable2Step_init();
     }
 
@@ -44,6 +49,8 @@ contract KardamomFactoryV1 is
 
     // ---------- IKardamomFactory ----------
 
+    /// @notice Process specs sequentially. Any single failure reverts the entire batch
+    /// (standard Solidity transaction semantics — there is no partial-success state).
     function applyDeployments(DeploymentSpec[] calldata specs) external onlyOwner {
         uint256 n = specs.length;
         for (uint256 i = 0; i < n; i++) {
@@ -58,20 +65,28 @@ contract KardamomFactoryV1 is
         }
     }
 
-    function entry(bytes32 id) external view returns (Entry memory) {
-        return _registry[id];
+    function entry(uint256 l2ChainId, bytes32 id) external view returns (Entry memory) {
+        return _registry[l2ChainId][id];
     }
 
-    function idCount() external view returns (uint256) {
-        return ids.length;
+    function l2ChainIdCount() external view returns (uint256) {
+        return l2ChainIds.length;
     }
 
-    function idAt(uint256 i) external view returns (bytes32) {
-        return ids[i];
+    function l2ChainIdAt(uint256 i) external view returns (uint256) {
+        return l2ChainIds[i];
     }
 
-    function predictProxyAddress(bytes32 id) external view returns (address) {
-        Entry storage e = _registry[id];
+    function idCount(uint256 l2ChainId) external view returns (uint256) {
+        return _idsByChainId[l2ChainId].length;
+    }
+
+    function idAt(uint256 l2ChainId, uint256 i) external view returns (bytes32) {
+        return _idsByChainId[l2ChainId][i];
+    }
+
+    function predictProxyAddress(uint256 l2ChainId, bytes32 id) external view returns (address) {
+        Entry storage e = _registry[l2ChainId][id];
         return e.exists ? e.proxy : address(0);
     }
 
@@ -86,19 +101,22 @@ contract KardamomFactoryV1 is
     // ---------- internals ----------
 
     function _deployUUPS(DeploymentSpec calldata s) internal {
-        if (_registry[s.id].exists) revert AlreadyDeployed(s.id);
+        if (_registry[s.l2ChainId][s.id].exists) revert AlreadyDeployed(s.l2ChainId, s.id);
 
-        address impl = _create2(s.implInitcode, s.implSalt);
-        if (impl.code.length == 0) revert Create2Failed();
+        address impl = _resolveImpl(s);
 
         bytes memory proxyInitcode =
             abi.encodePacked(type(ERC1967Proxy).creationCode, abi.encode(impl, s.initData));
-        bytes32 proxySalt = keccak256(abi.encode(s.id, "proxy"));
+        bytes32 proxySalt = keccak256(abi.encode(s.l2ChainId, s.id, "proxy"));
         address proxy = _create2(proxyInitcode, proxySalt);
         if (proxy.code.length == 0) revert Create2Failed();
 
-        ids.push(s.id);
-        _registry[s.id] = Entry({
+        if (!_l2ChainIdSeen[s.l2ChainId]) {
+            _l2ChainIdSeen[s.l2ChainId] = true;
+            l2ChainIds.push(s.l2ChainId);
+        }
+        _idsByChainId[s.l2ChainId].push(s.id);
+        _registry[s.l2ChainId][s.id] = Entry({
             proxy: proxy,
             currentImpl: impl,
             version: 1,
@@ -107,15 +125,14 @@ contract KardamomFactoryV1 is
             exists: true
         });
 
-        emit Deployed(s.id, proxy, impl, 1);
+        emit Deployed(s.l2ChainId, s.id, proxy, impl, 1);
     }
 
     function _upgradeUUPS(DeploymentSpec calldata s) internal {
-        Entry storage e = _registry[s.id];
-        if (!e.exists) revert NotRegistered(s.id);
+        Entry storage e = _registry[s.l2ChainId][s.id];
+        if (!e.exists) revert NotRegistered(s.l2ChainId, s.id);
 
-        address newImpl = _create2(s.implInitcode, s.implSalt);
-        if (newImpl.code.length == 0) revert Create2Failed();
+        address newImpl = _resolveImpl(s);
         if (newImpl == e.currentImpl) revert ImplCollision(newImpl);
 
         address oldImpl = e.currentImpl;
@@ -125,7 +142,22 @@ contract KardamomFactoryV1 is
         e.version += 1;
         e.upgradedAt = uint64(block.number);
 
-        emit Upgraded(s.id, oldImpl, newImpl, e.version);
+        emit Upgraded(s.l2ChainId, s.id, oldImpl, newImpl, e.version);
+    }
+
+    /// Resolve the impl: reuse `s.targetImpl` if non-zero (verified to have code),
+    /// otherwise CREATE2 from `s.implInitcode` + `s.implSalt`.
+    function _resolveImpl(DeploymentSpec calldata s) internal returns (address impl) {
+        if (s.targetImpl != address(0)) {
+            if (s.targetImpl.code.length == 0) revert ImplNotDeployed(s.targetImpl);
+            impl = s.targetImpl;
+            return impl;
+        }
+        impl = _create2(s.implInitcode, s.implSalt);
+        // Defense-in-depth: _create2 already reverts on addr==0, but a constructor
+        // that returns no runtime code (e.g. SELFDESTRUCT in constructor) would still
+        // produce a non-zero address with empty code.
+        if (impl.code.length == 0) revert Create2Failed();
     }
 
     function _create2(bytes memory initcode, bytes32 salt) internal returns (address addr) {
