@@ -30,3 +30,4 @@ alloy-provider.workspace = true
 alloy-contract.workspace = true
 alloy-sol-types.workspace = true
 alloy-node-bindings.workspace = true
+kardamom-deployer = { path = "../deployer" }

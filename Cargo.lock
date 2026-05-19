@@ -3108,6 +3108,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "jsonrpsee",
+ "kardamom-deployer",
  "metrics",
  "metrics-exporter-prometheus",
  "op-alloy-consensus",
