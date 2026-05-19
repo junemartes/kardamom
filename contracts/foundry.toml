@@ -1,3 +1,15 @@
+# PINNED SETTINGS — DO NOT CHANGE WITHOUT BUMPING THE FACTORY SALT SUFFIX
+#
+# The kardamom factory proxy address is derived from the compiled bytecode of
+# KardamomFactoryV1 (via ERC-7955 CREATE2 factory + canonical salts). Any change
+# below that affects the produced bytecode WILL shift the factory's canonical
+# address. If you intend to change settings here:
+#   1. Bump the salt suffix in crates/deployer/src/addresses.rs
+#      (e.g. "kardamom.factory.proxy.v1" -> "v2")
+#   2. Regenerate contracts/expected_bytecode_hash.txt
+#   3. Re-run cargo test -p kardamom-deployer --test factory_address_sync and
+#      update KardamomUUPSBase.FACTORY with the new computed address.
+
 [profile.default]
 src = "src"
 test = "test"
