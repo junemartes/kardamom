@@ -36,13 +36,16 @@ pub fn create2_address(deployer: Address, salt: B256, init_code_hash: B256) -> A
 }
 
 /// Build the full proxy initcode = `ERC1967Proxy.creationCode || abi.encode(impl, initData)`.
+///
+/// `abi_encode_params` mirrors Solidity's `abi.encode(impl, initData)` (no outer
+/// tuple wrapper), which is what the ERC1967Proxy constructor expects.
 pub fn proxy_full_initcode(
     proxy_creation_code: &Bytes,
     impl_addr: Address,
     init_data: &Bytes,
 ) -> Bytes {
     let mut full = proxy_creation_code.to_vec();
-    let args = (impl_addr, init_data.clone()).abi_encode();
+    let args = (impl_addr, init_data.clone()).abi_encode_params();
     full.extend_from_slice(&args);
     Bytes::from(full)
 }
