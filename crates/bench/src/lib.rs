@@ -6,6 +6,7 @@
 pub mod config;
 pub mod generator;
 pub mod genesis;
+pub mod harness;
 pub mod mnemonic;
 pub mod report;
 pub mod signers;

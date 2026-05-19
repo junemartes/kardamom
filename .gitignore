@@ -4,3 +4,8 @@ contracts/cache/
 contracts/out/
 contracts/lib/
 contracts/foundry.lock
+
+# benchmark and profiling artifacts
+flame.folded
+flame.svg
+results/
