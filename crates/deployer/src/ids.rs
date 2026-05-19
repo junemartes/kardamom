@@ -27,8 +27,7 @@ impl ContractId {
         }
     }
 
-    /// Solidity signature of the impl's `initialize` method, used to compute the
-    /// 4-byte selector for init calldata.
+    /// Solidity signature of the impl's `initialize` method.
     pub fn init_signature(self) -> &'static str {
         match self {
             ContractId::EthLockbox => "initialize(address)",
@@ -40,13 +39,14 @@ impl ContractId {
         keccak256(self.label().as_bytes())
     }
 
-    /// CREATE2 salt for an app proxy: `keccak256(abi.encode(id, "proxy"))`.
-    pub fn proxy_salt(self) -> B256 {
-        let encoded = (self.id(), "proxy".to_string()).abi_encode();
+    /// Proxy salt — includes l2_chain_id so each L2 gets a distinct proxy address.
+    /// `keccak256(abi.encode(l2ChainId, id, "proxy"))`.
+    pub fn proxy_salt(self, l2_chain_id: u64) -> B256 {
+        let encoded = (l2_chain_id, self.id(), "proxy".to_string()).abi_encode();
         keccak256(encoded)
     }
 
-    /// CREATE2 salt for an app impl at a given version:
+    /// Impl salt — does NOT include l2_chain_id; impl is shared across L2s.
     /// `keccak256(abi.encode(id, "impl", version))`.
     pub fn impl_salt(self, version: u64) -> B256 {
         let encoded = (self.id(), "impl".to_string(), version).abi_encode();
@@ -86,9 +86,26 @@ mod tests {
     }
 
     #[test]
-    fn proxy_salt_is_stable() {
-        let s1 = ContractId::EthLockbox.proxy_salt();
-        let s2 = ContractId::EthLockbox.proxy_salt();
+    fn impl_salt_does_not_depend_on_l2_chain_id() {
+        // Important: this property enables impl-sharing across L2s. Don't accidentally
+        // mix l2_chain_id into impl_salt.
+        let v1 = ContractId::EthLockbox.impl_salt(1);
+        // No chain id input at all — same salt no matter the deployment context.
+        let v1_again = ContractId::EthLockbox.impl_salt(1);
+        assert_eq!(v1, v1_again);
+    }
+
+    #[test]
+    fn proxy_salt_changes_with_l2_chain_id() {
+        let a = ContractId::EthLockbox.proxy_salt(42);
+        let b = ContractId::EthLockbox.proxy_salt(43);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn proxy_salt_is_stable_for_same_inputs() {
+        let s1 = ContractId::EthLockbox.proxy_salt(42);
+        let s2 = ContractId::EthLockbox.proxy_salt(42);
         assert_eq!(s1, s2);
     }
 }
