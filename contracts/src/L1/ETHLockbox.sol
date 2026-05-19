@@ -24,7 +24,6 @@ contract ETHLockbox is KardamomUUPSBase {
     }
 
     function initialize(address _l2Minter) external initializer {
-        __UUPSUpgradeable_init();
         l2Minter = _l2Minter;
     }
 

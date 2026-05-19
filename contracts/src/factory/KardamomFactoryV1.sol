@@ -36,7 +36,6 @@ contract KardamomFactoryV1 is
     /// constant `abi.encodeWithSignature("initialize()")`, so the proxy address does
     /// not depend on which operator deploys.
     function initialize() external initializer {
-        __UUPSUpgradeable_init();
         __Ownable_init(tx.origin);
         __Ownable2Step_init();
     }
