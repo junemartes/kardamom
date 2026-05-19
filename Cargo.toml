@@ -32,6 +32,13 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 hdrhistogram = "7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
+# Deposit bridge: OP wire types plus dev-only e2e helpers.
+op-alloy-consensus = "2"
+alloy-provider = "2.0"
+alloy-contract = "2.0"
+alloy-sol-types = "1.6"
+alloy-node-bindings = "2.0"
+
 [profile.release]
 debug = true
 lto = "thin"

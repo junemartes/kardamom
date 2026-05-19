@@ -2,6 +2,7 @@
 name = "kardamom-node"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [dependencies]
 revm.workspace = true
@@ -10,6 +11,8 @@ alloy-consensus.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rlp.workspace = true
 alloy-network.workspace = true
+alloy-eips.workspace = true
+op-alloy-consensus.workspace = true
 jsonrpsee.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -21,6 +24,9 @@ metrics.workspace = true
 async-trait = "0.1"
 
 [dev-dependencies]
-alloy-eips.workspace = true
 alloy-signer-local.workspace = true
 metrics-exporter-prometheus.workspace = true
+alloy-provider.workspace = true
+alloy-contract.workspace = true
+alloy-sol-types.workspace = true
+alloy-node-bindings.workspace = true

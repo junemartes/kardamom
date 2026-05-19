@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use alloy_consensus::{Transaction, TxEnvelope};
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_rpc_types_eth::TransactionRequest;
@@ -5,10 +7,12 @@ use revm::context::result::{ExecutionResult, HaltReason};
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::database::{DatabaseRef, WrapDatabaseRef};
 use revm::primitives::TxKind;
+use revm::state::Account;
 use revm::{
     Context, Database, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext,
 };
 
+use crate::deposit::DepositTx;
 use crate::error::NodeError;
 
 /// Configuration that does not depend on the transaction being executed.
@@ -88,6 +92,7 @@ fn interpret<H: std::fmt::Debug>(result: ExecutionResult<H>) -> Result<Bytes, No
 }
 
 /// Output of a committed transaction execution.
+#[derive(Debug)]
 pub struct ExecOutput {
     pub result: ExecutionResult<HaltReason>,
     pub output_bytes: Bytes,
@@ -141,4 +146,244 @@ where
         result,
         output_bytes,
     })
+}
+
+/// Build a `TxEnv` from a deposit envelope. Deposits never deduct fees (`gas_price = 0`)
+/// and do not assert chain-id at the envelope layer; the node enforces single-chain coherence
+/// elsewhere. Nonce is left at zero — `execute_deposit` disables the nonce check.
+pub fn tx_env_from_deposit(dep: &DepositTx) -> TxEnv {
+    TxEnv {
+        caller: dep.from,
+        kind: match dep.to {
+            alloy_primitives::TxKind::Call(addr) => TxKind::Call(addr),
+            alloy_primitives::TxKind::Create => TxKind::Create,
+        },
+        value: dep.value,
+        data: dep.input.clone(),
+        gas_limit: dep.gas_limit,
+        gas_price: 0,
+        nonce: 0,
+        chain_id: None,
+        ..Default::default()
+    }
+}
+
+/// Apply a deposit:
+/// 1. Pre-credit `dep.from` with `dep.mint`. This commit happens BEFORE the EVM call,
+///    so a revert inside the inner call does NOT roll it back.
+/// 2. Run a normal EVM call `from → to` with `value`/`data`, fee-free, nonce-check off.
+pub fn execute_deposit<DB>(
+    db: &mut DB,
+    env: ExecEnv,
+    dep: &DepositTx,
+) -> Result<ExecOutput, NodeError>
+where
+    DB: Database + DatabaseCommit,
+    <DB as Database>::Error: std::fmt::Debug,
+{
+    // 1. Mint pre-credit. `dep.mint` is u128; widen to U256 for balance arithmetic.
+    let mut info = db
+        .basic(dep.from)
+        .map_err(|e| NodeError::Execution(format!("{e:?}")))?
+        .unwrap_or_default();
+    info.balance = info
+        .balance
+        .checked_add(U256::from(dep.mint))
+        .ok_or(NodeError::MintOverflow)?;
+
+    // Account::from(info) yields status Loaded; mark_touch() forces commit to apply.
+    let mut acct = Account::from(info);
+    acct.mark_touch();
+    let mut changes = HashMap::new();
+    changes.insert(dep.from, acct);
+    db.commit(changes.into_iter().collect());
+
+    // 2. Inner EVM call. Disable the nonce check — deposits do not carry a nonce.
+    let mut cfg = env.cfg_env();
+    cfg.disable_nonce_check = true;
+
+    let mut evm = Context::mainnet()
+        .with_db(db)
+        .with_block(env.block_env())
+        .with_cfg(cfg)
+        .build_mainnet();
+
+    let result = evm
+        .transact_commit(tx_env_from_deposit(dep))
+        .map_err(|e| NodeError::Execution(format!("{e:?}")))?;
+
+    let output_bytes = match &result {
+        ExecutionResult::Success { output, .. } => output.data().clone(),
+        ExecutionResult::Revert { output, .. } => output.clone(),
+        ExecutionResult::Halt { .. } => Bytes::new(),
+    };
+
+    Ok(ExecOutput {
+        result,
+        output_bytes,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::deposit::DepositTx;
+    use alloy_primitives::{B256, Bytes, TxKind as APTxKind, U256, address, b256};
+    use revm::database::{CacheDB, EmptyDB};
+    use revm::state::{AccountInfo, Bytecode};
+
+    #[test]
+    fn tx_env_from_deposit_call_kind() {
+        let dep = DepositTx {
+            source_hash: b256!("0101010101010101010101010101010101010101010101010101010101010101"),
+            from: address!("00000000000000000000000000000000000000aa"),
+            to: APTxKind::Call(address!("00000000000000000000000000000000000000bb")),
+            mint: 100u128,
+            value: U256::from(50u64),
+            gas_limit: 200_000,
+            is_system_transaction: false,
+            input: Bytes::from(vec![0xde, 0xad]),
+        };
+        let env = tx_env_from_deposit(&dep);
+        assert_eq!(env.caller, dep.from);
+        assert_eq!(
+            env.kind,
+            TxKind::Call(address!("00000000000000000000000000000000000000bb"))
+        );
+        assert_eq!(env.value, U256::from(50u64));
+        assert_eq!(env.data.as_ref(), &[0xde, 0xad]);
+        assert_eq!(env.gas_limit, 200_000);
+        assert_eq!(env.gas_price, 0);
+        assert_eq!(env.chain_id, None);
+    }
+
+    #[test]
+    fn tx_env_from_deposit_create_kind() {
+        let dep = DepositTx {
+            source_hash: B256::ZERO,
+            from: Address::ZERO,
+            to: APTxKind::Create,
+            mint: 0u128,
+            value: U256::ZERO,
+            gas_limit: 100_000,
+            is_system_transaction: false,
+            input: Bytes::new(),
+        };
+        let env = tx_env_from_deposit(&dep);
+        assert_eq!(env.kind, TxKind::Create);
+    }
+
+    fn make_db(prefunded: &[(Address, U256)]) -> CacheDB<EmptyDB> {
+        let mut db = CacheDB::new(EmptyDB::default());
+        for (addr, bal) in prefunded {
+            db.insert_account_info(
+                *addr,
+                AccountInfo {
+                    balance: *bal,
+                    nonce: 0,
+                    ..Default::default()
+                },
+            );
+        }
+        db
+    }
+
+    fn exec_env() -> ExecEnv {
+        ExecEnv {
+            chain_id: 1,
+            block_number: 1,
+        }
+    }
+
+    fn dep(from: Address, to: APTxKind, mint: u128, value: u64, data: Bytes) -> DepositTx {
+        DepositTx {
+            source_hash: B256::ZERO,
+            from,
+            to,
+            mint,
+            value: U256::from(value),
+            gas_limit: 1_000_000,
+            is_system_transaction: false,
+            input: data,
+        }
+    }
+
+    #[test]
+    fn execute_deposit_mints_and_forwards_value() {
+        let from = Address::from([0x11u8; 20]);
+        let to = Address::from([0x22u8; 20]);
+        let mut db = make_db(&[]);
+        let d = dep(from, APTxKind::Call(to), 1_000u128, 400, Bytes::new());
+
+        execute_deposit(&mut db, exec_env(), &d).expect("ok");
+
+        // from = mint - value = 600; to = value = 400. gas_price=0 so no fee deduction.
+        assert_eq!(
+            db.cache.accounts.get(&from).unwrap().info.balance,
+            U256::from(600u64)
+        );
+        assert_eq!(
+            db.cache.accounts.get(&to).unwrap().info.balance,
+            U256::from(400u64)
+        );
+    }
+
+    #[test]
+    fn execute_deposit_mint_survives_inner_revert() {
+        // Inline bytecode: PUSH1 0; PUSH1 0; REVERT (60 00 60 00 fd).
+        let revert_code = Bytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+        let bytecode = Bytecode::new_raw(revert_code);
+        let code_hash = bytecode.hash_slow();
+        let revert_addr = Address::from([0x33u8; 20]);
+
+        let from = Address::from([0x11u8; 20]);
+        let mut db = make_db(&[]);
+        db.insert_account_info(
+            revert_addr,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 1,
+                code_hash,
+                code: Some(bytecode),
+                ..Default::default()
+            },
+        );
+
+        let d = dep(
+            from,
+            APTxKind::Call(revert_addr),
+            1_000u128,
+            200,
+            Bytes::new(),
+        );
+        execute_deposit(&mut db, exec_env(), &d).expect("ok (revert is OK at the executor layer)");
+
+        // Mint pre-credit is OUTSIDE the EVM call: from keeps the full mint.
+        assert_eq!(
+            db.cache.accounts.get(&from).unwrap().info.balance,
+            U256::from(1_000u64),
+            "from must keep full mint after inner revert"
+        );
+        assert_eq!(
+            db.cache.accounts.get(&revert_addr).unwrap().info.balance,
+            U256::ZERO,
+            "revert target must not retain value"
+        );
+    }
+
+    #[test]
+    fn execute_deposit_overflow_returns_mint_overflow() {
+        let from = Address::from([0x11u8; 20]);
+        let mut db = make_db(&[(from, U256::MAX)]);
+        let d = dep(
+            from,
+            APTxKind::Call(Address::from([0x22u8; 20])),
+            1u128,
+            0,
+            Bytes::new(),
+        );
+
+        let err = execute_deposit(&mut db, exec_env(), &d).unwrap_err();
+        assert!(matches!(err, NodeError::MintOverflow), "got {err:?}");
+    }
 }
