@@ -227,10 +227,14 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // apply — send applyDeployments to the factory
     // -----------------------------------------------------------------------
 
-    /// Build `DeploymentSpec[]` from `ops`, encode as `applyDeployments` calldata,
-    /// and send to the factory proxy.  Returns the transaction hash.
-    pub async fn apply(&self, ops: &[Op]) -> Result<TxHash, DeployError> {
-        let factory_proxy = self.factory_address().await?;
+    /// Send one `applyDeployments` tx for the given ops.
+    ///
+    /// Performs impl-dedup grouping: ops sharing the same `(id, version)` produce specs
+    /// where only the first triggers a CREATE2 of the impl; subsequent specs reference
+    /// the (offline-computed) impl address via `target_impl`. This makes "upgrade across
+    /// N L2s to the same new impl" a one-impl-deploy operation instead of N copies.
+    pub async fn apply(&self, ops: &[Op], owner: Address) -> Result<TxHash, DeployError> {
+        let factory_proxy = self.factory_address(owner).await?;
 
         // Verify factory is deployed.
         let code = self
@@ -242,17 +246,36 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
-        // Build specs and convert to ABI types.
-        let specs: Vec<IKardamomFactory::DeploymentSpecAbi> = ops
+        // Build raw specs (each has target_impl = zero).
+        let mut specs: Vec<DeploymentSpec> = ops
             .iter()
-            .map(|op| {
-                let s: DeploymentSpec = build_spec(&self.contracts_root, op)?;
-                Ok(spec_to_abi(s))
-            })
-            .collect::<Result<_, DeployError>>()?;
+            .map(|op| build_spec(&self.contracts_root, op))
+            .collect::<Result<_, ArtifactError>>()?;
 
-        // Encode calldata using the sol!-generated SolCall impl.
-        let call = IKardamomFactory::applyDeploymentsCall { specs };
+        // Dedup pass: within each (id, impl_salt) group, the first spec deploys the impl;
+        // the rest reference it via target_impl. The impl's CREATE2 address is computed
+        // offline using the factory address and the spec's impl_salt + impl_initcode.
+        let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
+            std::collections::HashMap::new();
+        for s in &mut specs {
+            let key = (s.id, s.impl_salt);
+            if let Some(addr) = seen_impl.get(&key) {
+                s.target_impl = *addr;
+            } else {
+                let computed = crate::addresses::app_impl_address(
+                    factory_proxy,
+                    s.impl_salt,
+                    &s.impl_initcode,
+                );
+                seen_impl.insert(key, computed);
+                // First spec in the group keeps target_impl = zero (factory CREATE2's the impl).
+            }
+        }
+
+        // Encode + send.
+        let abi_specs: Vec<IKardamomFactory::DeploymentSpecAbi> =
+            specs.into_iter().map(spec_to_abi).collect();
+        let call = IKardamomFactory::applyDeploymentsCall { specs: abi_specs };
         let calldata = call.abi_encode();
 
         let tx = TransactionRequest::default()
@@ -409,10 +432,70 @@ fn erc7955_calldata(salt: B256, initcode: &Bytes) -> Bytes {
 /// Convert a `crate::spec::DeploymentSpec` into its ABI counterpart.
 fn spec_to_abi(s: DeploymentSpec) -> IKardamomFactory::DeploymentSpecAbi {
     IKardamomFactory::DeploymentSpecAbi {
+        l2ChainId: U256::from(s.l2_chain_id),
         id: s.id,
         action: s.action as u8,
         implInitcode: s.impl_initcode,
         initData: s.init_data,
         implSalt: s.impl_salt,
+        targetImpl: s.target_impl,
+    }
+}
+
+#[cfg(test)]
+mod apply_dedup_tests {
+    use super::*;
+    use alloy_primitives::{Address, B256, Bytes};
+    use crate::spec::{Action, DeploymentSpec};
+
+    fn raw_spec(l2: u64, id_byte: u8, salt_byte: u8) -> DeploymentSpec {
+        let mut id = [0u8; 32];
+        id[0] = id_byte;
+        let mut salt = [0u8; 32];
+        salt[0] = salt_byte;
+        DeploymentSpec {
+            l2_chain_id: l2,
+            id: B256::from(id),
+            action: Action::Deploy,
+            impl_initcode: Bytes::from(vec![0u8; 16]),
+            init_data: Bytes::new(),
+            impl_salt: B256::from(salt),
+            target_impl: Address::ZERO,
+        }
+    }
+
+    /// The dedup logic in `apply` is straightforward enough to unit-test directly by
+    /// reproducing it here against a fake factory address. If `apply`'s logic changes,
+    /// keep this in sync.
+    #[test]
+    fn dedup_picks_first_in_group_for_create2() {
+        let factory = Address::from([0x11; 20]);
+        let mut specs = vec![
+            raw_spec(42, 1, 1),
+            raw_spec(43, 1, 1), // same (id, salt) as #0 — must reuse
+            raw_spec(42, 2, 2), // different id — own group
+            raw_spec(44, 1, 1), // same (id, salt) as #0 — must reuse
+        ];
+
+        let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
+            std::collections::HashMap::new();
+        for s in &mut specs {
+            let key = (s.id, s.impl_salt);
+            if let Some(addr) = seen_impl.get(&key) {
+                s.target_impl = *addr;
+            } else {
+                let computed = crate::addresses::app_impl_address(
+                    factory,
+                    s.impl_salt,
+                    &s.impl_initcode,
+                );
+                seen_impl.insert(key, computed);
+            }
+        }
+
+        assert_eq!(specs[0].target_impl, Address::ZERO, "first in group must CREATE2");
+        assert_ne!(specs[1].target_impl, Address::ZERO, "second in same group reuses");
+        assert_eq!(specs[2].target_impl, Address::ZERO, "different id starts new group");
+        assert_eq!(specs[1].target_impl, specs[3].target_impl, "same group, same target");
     }
 }
