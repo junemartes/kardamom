@@ -19,8 +19,7 @@ sol! {
     }
 }
 
-const SINGLETON_RUNTIME_HEX: &str =
-    "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
+const SINGLETON_RUNTIME_HEX: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
 
 #[tokio::test]
 async fn full_deploy_and_upgrade_flow() {
@@ -54,11 +53,17 @@ async fn full_deploy_and_upgrade_flow() {
     let deployer = Deployer::new(provider.clone(), operator);
 
     // Cold bootstrap.
-    let status1 = deployer.ensure_factory().await.expect("ensure_factory cold");
+    let status1 = deployer
+        .ensure_factory()
+        .await
+        .expect("ensure_factory cold");
     assert!(matches!(status1, FactoryStatus::Deployed));
 
     // Warm — idempotent.
-    let status2 = deployer.ensure_factory().await.expect("ensure_factory warm");
+    let status2 = deployer
+        .ensure_factory()
+        .await
+        .expect("ensure_factory warm");
     assert!(matches!(status2, FactoryStatus::AlreadyDeployed));
 
     // Deploy ETHLockbox.
@@ -78,11 +83,18 @@ async fn full_deploy_and_upgrade_flow() {
     assert_eq!(lockbox_entry.version, 1);
 
     let verify = deployer.verify().await.expect("verify");
-    assert!(verify.mismatches.is_empty(), "verify mismatches: {:?}", verify.mismatches);
+    assert!(
+        verify.mismatches.is_empty(),
+        "verify mismatches: {:?}",
+        verify.mismatches
+    );
 
     // Exercise depositETH on the proxy.
     let lockbox = ETHLockbox::new(lockbox_entry.proxy, provider.clone());
-    assert_eq!(lockbox.l2Minter().call().await.expect("l2Minter call"), l2_minter);
+    assert_eq!(
+        lockbox.l2Minter().call().await.expect("l2Minter call"),
+        l2_minter
+    );
 
     let target = address!("0000000000000000000000000000000000000022");
     let _ = lockbox
@@ -96,7 +108,11 @@ async fn full_deploy_and_upgrade_flow() {
         .await
         .expect("depositETH receipt");
     assert_eq!(
-        lockbox.depositNonce().call().await.expect("depositNonce after deposit"),
+        lockbox
+            .depositNonce()
+            .call()
+            .await
+            .expect("depositNonce after deposit"),
         1u64
     );
 
@@ -118,7 +134,11 @@ async fn full_deploy_and_upgrade_flow() {
 
     // State persists across upgrade.
     assert_eq!(
-        lockbox.depositNonce().call().await.expect("depositNonce after upgrade"),
+        lockbox
+            .depositNonce()
+            .call()
+            .await
+            .expect("depositNonce after upgrade"),
         1u64
     );
 

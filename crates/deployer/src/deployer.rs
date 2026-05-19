@@ -160,7 +160,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let (impl_initcode, proxy_creation_code) = self.read_factory_artifacts()?;
         let impl_addr = factory_impl_address(&impl_initcode);
         let init_data = factory_init_data();
-        Ok(factory_proxy_address(&proxy_creation_code, impl_addr, &init_data))
+        Ok(factory_proxy_address(
+            &proxy_creation_code,
+            impl_addr,
+            &init_data,
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -215,8 +219,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         // (d) Deploy factory proxy via the singleton.
         //     Calldata = salt(32 bytes) || proxy_full_initcode.
         let proxy_salt = crate::addresses::factory_proxy_salt();
-        let full_proxy_initcode =
-            proxy_full_initcode(&proxy_creation_code, impl_addr, &init_data);
+        let full_proxy_initcode = proxy_full_initcode(&proxy_creation_code, impl_addr, &init_data);
         let proxy_calldata = singleton_calldata(proxy_salt, &full_proxy_initcode);
         self.send_singleton_tx(proxy_calldata).await?;
 
@@ -361,7 +364,10 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             }
         }
 
-        Ok(VerifyReport { entries, mismatches })
+        Ok(VerifyReport {
+            entries,
+            mismatches,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -371,8 +377,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// Read `KardamomFactoryV1` and `ERC1967Proxy` (or `ProxyArtifact`) creation
     /// bytecode from forge artifacts.
     fn read_factory_artifacts(&self) -> Result<(Bytes, Bytes), DeployError> {
-        let factory_impl_initcode =
-            creation_bytecode(&self.contracts_root, "KardamomFactoryV1")?;
+        let factory_impl_initcode = creation_bytecode(&self.contracts_root, "KardamomFactoryV1")?;
         let proxy_creation_code = match creation_bytecode(&self.contracts_root, "ERC1967Proxy") {
             Ok(b) => b,
             Err(_) => creation_bytecode(&self.contracts_root, "ProxyArtifact")?,

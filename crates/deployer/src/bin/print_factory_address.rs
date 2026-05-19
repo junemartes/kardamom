@@ -2,7 +2,9 @@
 //! KardamomFactoryV1's compiled initcode and the canonical ERC1967Proxy creation code.
 //! Run once after `forge build`; bake the printed address into KardamomUUPSBase.sol.
 
-use kardamom_deployer::addresses::{factory_impl_address, factory_init_data, factory_proxy_address};
+use kardamom_deployer::addresses::{
+    factory_impl_address, factory_init_data, factory_proxy_address,
+};
 use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
 
 fn main() -> anyhow::Result<()> {

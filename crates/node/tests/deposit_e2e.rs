@@ -20,8 +20,7 @@ sol! {
     }
 }
 
-const SINGLETON_RUNTIME_HEX: &str =
-    "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
+const SINGLETON_RUNTIME_HEX: &str = "7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
 
 fn encode_deposit(dep: &DepositTx) -> Vec<u8> {
     let mut raw = vec![DEPOSIT_TX_TYPE];

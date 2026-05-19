@@ -86,9 +86,8 @@ contract ETHLockboxTest is Test {
     function test_unauthorized_upgrade_reverts() public {
         ETHLockbox newImpl = new ETHLockbox();
         // Not the factory — should revert NotFactory.
-        (bool ok,) = address(lockbox).call(
-            abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), "")
-        );
+        (bool ok,) = address(lockbox)
+            .call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), ""));
         assertFalse(ok, "non-factory upgrade must revert");
     }
 }

@@ -232,8 +232,7 @@ fn require_key(key: Option<String>, cmd: &str) -> Result<String> {
 /// Parse a private key from a hex literal or "env:VAR_NAME".
 fn parse_key(key: &str) -> Result<PrivateKeySigner> {
     let hex = if let Some(var_name) = key.strip_prefix("env:") {
-        std::env::var(var_name)
-            .with_context(|| format!("env var `{var_name}` not set"))?
+        std::env::var(var_name).with_context(|| format!("env var `{var_name}` not set"))?
     } else {
         key.to_string()
     };
@@ -244,9 +243,7 @@ fn parse_key(key: &str) -> Result<PrivateKeySigner> {
 
 /// Parse a list of contract ID strings (case-insensitive).
 fn parse_ids(ids: &[String]) -> Result<Vec<ContractId>> {
-    ids.iter()
-        .map(|s| parse_contract_id(s))
-        .collect()
+    ids.iter().map(|s| parse_contract_id(s)).collect()
 }
 
 /// Parse a single contract ID string (case-insensitive, hyphen-tolerant).

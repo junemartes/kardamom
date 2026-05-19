@@ -40,9 +40,8 @@ pub fn artifact_path(contracts_root: &Path, name: &str) -> PathBuf {
 /// Read creation bytecode (`bytecode.object`) from a forge artifact JSON.
 pub fn creation_bytecode(contracts_root: &Path, name: &str) -> Result<Bytes, ArtifactError> {
     let path = artifact_path(contracts_root, name);
-    let contents = std::fs::read_to_string(&path).map_err(|_| ArtifactError::Missing {
-        path: path.clone(),
-    })?;
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|_| ArtifactError::Missing { path: path.clone() })?;
     let v: serde_json::Value =
         serde_json::from_str(&contents).map_err(|e| ArtifactError::Malformed {
             path: path.clone(),
