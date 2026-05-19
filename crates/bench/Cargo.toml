@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "kardamom-bench"
 path = "src/main.rs"
 
+[[bin]]
+name = "kardamom-bench-harness"
+path = "src/bin/harness.rs"
+
 [dependencies]
 kardamom-node = { path = "../node" }
 
@@ -32,6 +36,7 @@ humantime = "2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-flame.workspace = true
 hdrhistogram.workspace = true
 reqwest.workspace = true
 jsonrpsee = { workspace = true }

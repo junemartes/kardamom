@@ -1,2 +1,7 @@
 target
 docs/superpowers
+
+# benchmark and profiling artifacts
+flame.folded
+flame.svg
+results/
