@@ -7,12 +7,18 @@ interface IKardamomFactory {
         Upgrade
     }
 
+    /// One deployment / upgrade instruction. `targetImpl` lets multiple specs in one
+    /// batch share a single freshly-deployed impl: the first spec for an `(id, implSalt)`
+    /// pair sets `targetImpl = address(0)` (factory CREATE2's the impl); subsequent specs
+    /// set `targetImpl = <that address>` to skip the redundant CREATE2.
     struct DeploymentSpec {
+        uint256 l2ChainId;
         bytes32 id;
         Action action;
         bytes implInitcode;
         bytes initData;
         bytes32 implSalt;
+        address targetImpl;
     }
 
     struct Entry {
@@ -24,20 +30,33 @@ interface IKardamomFactory {
         bool exists;
     }
 
-    event Deployed(bytes32 indexed id, address proxy, address impl, uint64 version);
-    event Upgraded(bytes32 indexed id, address oldImpl, address newImpl, uint64 version);
+    event Deployed(
+        uint256 indexed l2ChainId, bytes32 indexed id, address proxy, address impl, uint64 version
+    );
+    event Upgraded(
+        uint256 indexed l2ChainId,
+        bytes32 indexed id,
+        address oldImpl,
+        address newImpl,
+        uint64 version
+    );
 
-    error AlreadyDeployed(bytes32 id);
-    error NotRegistered(bytes32 id);
+    error AlreadyDeployed(uint256 l2ChainId, bytes32 id);
+    error NotRegistered(uint256 l2ChainId, bytes32 id);
     error Create2Failed();
     error ImplCollision(address impl);
+    error ImplNotDeployed(address targetImpl);
     error UnknownAction();
 
     function applyDeployments(DeploymentSpec[] calldata specs) external;
-    function entry(bytes32 id) external view returns (Entry memory);
-    function idCount() external view returns (uint256);
-    function idAt(uint256 i) external view returns (bytes32);
-    function predictProxyAddress(bytes32 id) external view returns (address);
+    function entry(uint256 l2ChainId, bytes32 id) external view returns (Entry memory);
+
+    function l2ChainIdCount() external view returns (uint256);
+    function l2ChainIdAt(uint256 i) external view returns (uint256);
+    function idCount(uint256 l2ChainId) external view returns (uint256);
+    function idAt(uint256 l2ChainId, uint256 i) external view returns (bytes32);
+
+    function predictProxyAddress(uint256 l2ChainId, bytes32 id) external view returns (address);
     function predictImplAddress(bytes32 implSalt, bytes calldata implInitcode)
         external
         view
