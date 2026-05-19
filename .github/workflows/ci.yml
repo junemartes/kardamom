@@ -80,3 +80,33 @@ jobs:
             openzeppelin/openzeppelin-contracts@v5.0.2 \
             openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
       - run: forge build --sizes
+
+  bytecode-hash:
+    name: factory bytecode hash
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install contract dependencies
+        run: |
+          forge install --no-git --shallow \
+            foundry-rs/forge-std \
+            openzeppelin/openzeppelin-contracts@v5.0.2 \
+            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+      - run: forge build
+      - name: Compare KardamomFactoryV1 runtime bytecode hash
+        run: |
+          ACTUAL=$(jq -r '.deployedBytecode.object' out/KardamomFactoryV1.sol/KardamomFactoryV1.json \
+            | xxd -r -p | sha256sum | cut -d' ' -f1)
+          EXPECTED=$(cat expected_bytecode_hash.txt)
+          echo "actual:   $ACTUAL"
+          echo "expected: $EXPECTED"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::KardamomFactoryV1 runtime bytecode drifted. If intentional, bump the salt suffix in addresses.rs (kardamom.factory.proxy.v1 -> v2) and regenerate expected_bytecode_hash.txt."
+            exit 1
+          fi
