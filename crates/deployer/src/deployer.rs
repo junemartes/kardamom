@@ -301,13 +301,15 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // addresses — read the factory registry
     // -----------------------------------------------------------------------
 
-    /// Read the factory's on-chain registry.
-    ///
-    /// Calls `idCount()`, then for each index calls `idAt(i)` and `entry(id)`.
-    pub async fn addresses(&self) -> Result<Vec<RegistryEntry>, DeployError> {
-        let factory_proxy = self.factory_address().await?;
+    /// Read the factory's on-chain registry. If `l2_chain_id` is `Some`, returns entries
+    /// only for that L2; otherwise returns entries across all registered L2s.
+    pub async fn addresses(
+        &self,
+        owner: Address,
+        l2_chain_id: Option<u64>,
+    ) -> Result<Vec<RegistryEntry>, DeployError> {
+        let factory_proxy = self.factory_address(owner).await?;
 
-        // Verify factory is deployed.
         let code = self
             .provider
             .get_code_at(factory_proxy)
@@ -319,25 +321,38 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
         let factory = IKardamomFactory::new(factory_proxy, &self.provider);
 
-        let count: U256 = factory.idCount().call().await?;
-        let count: u64 = count.to();
+        let l2s: Vec<u64> = if let Some(id) = l2_chain_id {
+            vec![id]
+        } else {
+            let count: U256 = factory.l2ChainIdCount().call().await?;
+            let count: u64 = count.to();
+            let mut out = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let v: U256 = factory.l2ChainIdAt(U256::from(i)).call().await?;
+                out.push(v.to());
+            }
+            out
+        };
 
-        let mut entries = Vec::with_capacity(count as usize);
-
-        for i in 0..count {
-            let id: B256 = factory.idAt(U256::from(i)).call().await?;
-            let e: IKardamomFactory::Entry = factory.entry(id).call().await?;
-
-            entries.push(RegistryEntry {
-                id,
-                proxy: e.proxy,
-                current_impl: e.currentImpl,
-                version: e.version,
-                deployed_at: e.deployedAt,
-                upgraded_at: e.upgradedAt,
-            });
+        let mut entries = Vec::new();
+        for l2 in l2s {
+            let count: U256 = factory.idCount(U256::from(l2)).call().await?;
+            let count: u64 = count.to();
+            for i in 0..count {
+                let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
+                let e: IKardamomFactory::Entry =
+                    factory.entry(U256::from(l2), id).call().await?;
+                entries.push(RegistryEntry {
+                    l2_chain_id: l2,
+                    id,
+                    proxy: e.proxy,
+                    current_impl: e.currentImpl,
+                    version: e.version,
+                    deployed_at: e.deployedAt,
+                    upgraded_at: e.upgradedAt,
+                });
+            }
         }
-
         Ok(entries)
     }
 
@@ -345,13 +360,10 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // verify — cross-check registry vs ERC1967 storage slot
     // -----------------------------------------------------------------------
 
-    /// Verify that every registry entry's `currentImpl` matches the actual
-    /// ERC1967 implementation slot in the proxy.
-    pub async fn verify(&self) -> Result<VerifyReport, DeployError> {
-        let entries = self.addresses().await?;
+    /// Verify every registry entry's `currentImpl` matches the proxy's ERC1967 impl slot.
+    pub async fn verify(&self, owner: Address) -> Result<VerifyReport, DeployError> {
+        let entries = self.addresses(owner, None).await?;
         let mut mismatches = Vec::new();
-
-        // Convert B256 slot constant to U256 (big-endian) for get_storage_at.
         let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
 
         for entry in &entries {
@@ -360,10 +372,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
                 .get_storage_at(entry.proxy, slot_u256)
                 .await
                 .map_err(|e| DeployError::Provider(e.to_string()))?;
-
-            // The impl address is right-aligned in the 32-byte word.
             let erc1967_impl = Address::from_word(B256::from(raw_slot));
-
             if erc1967_impl != entry.current_impl {
                 mismatches.push(VerifyMismatch {
                     id: entry.id,
@@ -373,11 +382,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
                 });
             }
         }
-
-        Ok(VerifyReport {
-            entries,
-            mismatches,
-        })
+        Ok(VerifyReport { entries, mismatches })
     }
 
     // -----------------------------------------------------------------------
