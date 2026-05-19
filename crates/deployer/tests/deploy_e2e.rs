@@ -24,8 +24,10 @@ const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 /// Set up an anvil instance with ERC-7955 factory preloaded and DEV_OWNER impersonated
 /// (so transactions from DEV_OWNER don't need a private key). Returns None if anvil
 /// isn't available.
-async fn setup_anvil_with_erc7955(
-) -> Option<(alloy_node_bindings::AnvilInstance, impl alloy_provider::Provider + Clone)> {
+async fn setup_anvil_with_erc7955() -> Option<(
+    alloy_node_bindings::AnvilInstance,
+    impl alloy_provider::Provider + Clone,
+)> {
     let anvil = Anvil::new().try_spawn().ok()?;
     let provider = ProviderBuilder::new()
         .disable_recommended_fillers()

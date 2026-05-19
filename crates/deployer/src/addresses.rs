@@ -67,7 +67,11 @@ pub fn proxy_full_initcode(
 
 /// Factory impl address: CREATE2 from ERC-7955 with the factory impl salt.
 pub fn factory_impl_address(impl_initcode: &Bytes) -> Address {
-    create2_address(ERC7955_FACTORY, factory_impl_salt(), keccak256(impl_initcode))
+    create2_address(
+        ERC7955_FACTORY,
+        factory_impl_salt(),
+        keccak256(impl_initcode),
+    )
 }
 
 /// Factory proxy address: CREATE2 from ERC-7955 with the factory proxy salt, parameterized

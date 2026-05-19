@@ -99,7 +99,15 @@ async fn main() -> Result<()> {
                 );
             }
             let contract_ids = parse_ids(&ids)?;
-            run_deploy(cli.rpc_url, key, owner, contract_ids, l2_chain_ids, l2_minters).await
+            run_deploy(
+                cli.rpc_url,
+                key,
+                owner,
+                contract_ids,
+                l2_chain_ids,
+                l2_minters,
+            )
+            .await
         }
         Command::Upgrade { ids, l2_chain_ids } => {
             let key = require_key(cli.private_key, "upgrade")?;

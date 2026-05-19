@@ -60,7 +60,9 @@ sol! {
 pub enum DeployError {
     #[error("artifact: {0}")]
     Artifact(#[from] ArtifactError),
-    #[error("ERC-7955 CREATE2 factory not deployed at {address}; see https://github.com/safe-research/erc-7955 for bootstrap procedure")]
+    #[error(
+        "ERC-7955 CREATE2 factory not deployed at {address}; see https://github.com/safe-research/erc-7955 for bootstrap procedure"
+    )]
     Erc7955FactoryAbsent { address: Address },
     #[error("factory not deployed at expected address {0}; run ensure-factory")]
     FactoryNotDeployed(Address),
@@ -159,7 +161,11 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     pub async fn factory_address(&self, owner: Address) -> Result<Address, DeployError> {
         let (impl_initcode, proxy_creation_code) = self.read_factory_artifacts()?;
         let impl_addr = factory_impl_address(&impl_initcode);
-        Ok(factory_proxy_address(&proxy_creation_code, impl_addr, owner))
+        Ok(factory_proxy_address(
+            &proxy_creation_code,
+            impl_addr,
+            owner,
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -340,8 +346,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             let count: u64 = count.to();
             for i in 0..count {
                 let id: B256 = factory.idAt(U256::from(l2), U256::from(i)).call().await?;
-                let e: IKardamomFactory::Entry =
-                    factory.entry(U256::from(l2), id).call().await?;
+                let e: IKardamomFactory::Entry = factory.entry(U256::from(l2), id).call().await?;
                 entries.push(RegistryEntry {
                     l2_chain_id: l2,
                     id,
@@ -382,7 +387,10 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
                 });
             }
         }
-        Ok(VerifyReport { entries, mismatches })
+        Ok(VerifyReport {
+            entries,
+            mismatches,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -449,9 +457,8 @@ fn spec_to_abi(s: DeploymentSpec) -> IKardamomFactory::DeploymentSpecAbi {
 
 #[cfg(test)]
 mod apply_dedup_tests {
-    use super::*;
-    use alloy_primitives::{Address, B256, Bytes};
     use crate::spec::{Action, DeploymentSpec};
+    use alloy_primitives::{Address, B256, Bytes};
 
     fn raw_spec(l2: u64, id_byte: u8, salt_byte: u8) -> DeploymentSpec {
         let mut id = [0u8; 32];
@@ -489,18 +496,30 @@ mod apply_dedup_tests {
             if let Some(addr) = seen_impl.get(&key) {
                 s.target_impl = *addr;
             } else {
-                let computed = crate::addresses::app_impl_address(
-                    factory,
-                    s.impl_salt,
-                    &s.impl_initcode,
-                );
+                let computed =
+                    crate::addresses::app_impl_address(factory, s.impl_salt, &s.impl_initcode);
                 seen_impl.insert(key, computed);
             }
         }
 
-        assert_eq!(specs[0].target_impl, Address::ZERO, "first in group must CREATE2");
-        assert_ne!(specs[1].target_impl, Address::ZERO, "second in same group reuses");
-        assert_eq!(specs[2].target_impl, Address::ZERO, "different id starts new group");
-        assert_eq!(specs[1].target_impl, specs[3].target_impl, "same group, same target");
+        assert_eq!(
+            specs[0].target_impl,
+            Address::ZERO,
+            "first in group must CREATE2"
+        );
+        assert_ne!(
+            specs[1].target_impl,
+            Address::ZERO,
+            "second in same group reuses"
+        );
+        assert_eq!(
+            specs[2].target_impl,
+            Address::ZERO,
+            "different id starts new group"
+        );
+        assert_eq!(
+            specs[1].target_impl, specs[3].target_impl,
+            "same group, same target"
+        );
     }
 }

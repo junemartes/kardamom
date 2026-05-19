@@ -75,7 +75,10 @@ async fn deposit_e2e_anvil_to_node() {
 
     // Bootstrap factory and deploy ETHLockbox via the new pipeline.
     let l2_minter = Address::from([0xBE; 20]);
-    deployer.ensure_factory(DEV_OWNER).await.expect("ensure_factory");
+    deployer
+        .ensure_factory(DEV_OWNER)
+        .await
+        .expect("ensure_factory");
     deployer
         .apply(
             &[Op::Deploy {
