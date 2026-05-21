@@ -1,4 +1,5 @@
 use alloy_primitives::B256;
+use alloy_rpc_types_eth::simulate::SimulateError;
 use jsonrpsee::types::ErrorObjectOwned;
 
 #[derive(Debug, thiserror::Error)]
@@ -15,19 +16,27 @@ pub enum NodeError {
     UnsupportedBlockTag,
     #[error("server error: {0}")]
     Server(String),
+    #[error("simulate: {}", .0.message)]
+    Simulate(SimulateError),
 }
 
 impl From<NodeError> for ErrorObjectOwned {
     fn from(err: NodeError) -> Self {
-        let code = match err {
-            NodeError::Decode(_)
-            | NodeError::SignatureRecovery
-            | NodeError::UnknownTransaction(_)
-            | NodeError::UnsupportedBlockTag => -32602, // invalid params
-            NodeError::Execution(_) => -32000, // server error
-            NodeError::Server(_) => -32603,    // internal
-        };
-        ErrorObjectOwned::owned::<()>(code, err.to_string(), None)
+        match err {
+            NodeError::Simulate(s) => ErrorObjectOwned::owned::<()>(s.code, s.message, None),
+            other => {
+                let code = match other {
+                    NodeError::Decode(_)
+                    | NodeError::SignatureRecovery
+                    | NodeError::UnknownTransaction(_)
+                    | NodeError::UnsupportedBlockTag => -32602, // invalid params
+                    NodeError::Execution(_) => -32000, // server error
+                    NodeError::Server(_) => -32603,    // internal
+                    NodeError::Simulate(_) => unreachable!(),
+                };
+                ErrorObjectOwned::owned::<()>(code, other.to_string(), None)
+            }
+        }
     }
 }
 

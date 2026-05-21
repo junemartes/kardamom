@@ -1,6 +1,7 @@
 use std::net::SocketAddr;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_rpc_types_eth::simulate::{SimulatePayload, SimulatedBlock};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt, TransactionRequest};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
@@ -33,6 +34,13 @@ pub trait EthApi {
 
     #[method(name = "getTransactionReceipt")]
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>>;
+
+    #[method(name = "simulateV1")]
+    async fn simulate_v1(
+        &self,
+        payload: SimulatePayload,
+        block: BlockNumberOrTag,
+    ) -> RpcResult<Vec<SimulatedBlock>>;
 }
 
 pub struct EthHandlers {
@@ -98,6 +106,19 @@ impl EthApiServer for EthHandlers {
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
         instrument_method!("eth_getTransactionReceipt", {
             Ok::<Option<TransactionReceipt>, ErrorObjectOwned>(self.node.receipt(hash).await)
+        })
+    }
+
+    async fn simulate_v1(
+        &self,
+        payload: SimulatePayload,
+        block: BlockNumberOrTag,
+    ) -> RpcResult<Vec<SimulatedBlock>> {
+        instrument_method!("eth_simulateV1", {
+            self.node
+                .simulate(payload, block)
+                .await
+                .map_err(ErrorObjectOwned::from)
         })
     }
 }

@@ -16,6 +16,10 @@ pub use node::Node;
 
 pub mod executor;
 
+pub mod simulate;
+
+pub(crate) mod transfers;
+
 pub mod rpc;
 
 pub use rpc::start_server;

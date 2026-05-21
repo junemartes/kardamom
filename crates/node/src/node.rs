@@ -7,7 +7,10 @@ use alloy_consensus::{
 };
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rlp::Decodable;
-use alloy_rpc_types_eth::{Log as RpcLog, TransactionReceipt, TransactionRequest};
+use alloy_rpc_types_eth::simulate::{SimulatePayload, SimulatedBlock};
+use alloy_rpc_types_eth::{
+    BlockNumberOrTag, Log as RpcLog, TransactionReceipt, TransactionRequest,
+};
 use revm::context::result::{ExecutionResult, HaltReason};
 use revm::database::{CacheDB, EmptyDB};
 use revm::primitives::KECCAK_EMPTY;
@@ -18,6 +21,7 @@ use crate::error::NodeError;
 use crate::executor::{self, ExecEnv};
 use crate::genesis::Genesis;
 use crate::metrics as kmetrics;
+use crate::simulate;
 use crate::{stage, stage_await};
 
 #[derive(Clone)]
@@ -100,6 +104,22 @@ impl Node {
 
     pub async fn receipt(&self, hash: B256) -> Option<TransactionReceipt> {
         self.inner.read().await.receipts.get(&hash).cloned()
+    }
+
+    pub async fn simulate(
+        &self,
+        payload: SimulatePayload,
+        block: BlockNumberOrTag,
+    ) -> Result<Vec<SimulatedBlock>, NodeError> {
+        const METHOD: &str = "eth_simulateV1";
+        if !matches!(block, BlockNumberOrTag::Latest | BlockNumberOrTag::Pending) {
+            return Err(NodeError::UnsupportedBlockTag);
+        }
+        let state = stage_await!("acquire_read_lock", method = METHOD, self.inner.read());
+        stage!("run", method = METHOD, {
+            simulate::run(&payload, state.block_number, &state.db, self.chain_id)
+                .map_err(NodeError::Simulate)
+        })
     }
 
     pub async fn call(&self, req: TransactionRequest) -> Result<Bytes, NodeError> {
