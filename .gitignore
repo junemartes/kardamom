@@ -1,5 +1,6 @@
 target
 docs/superpowers
+docs/agents
 
 # benchmark and profiling artifacts
 flame.folded
