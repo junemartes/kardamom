@@ -1,18 +1,21 @@
-//! `kardamom-bench-harness` — single-process node + bench with a
-//! `tracing-flame` recording scoped to the measurement window.
+//! `kardamom-bench-harness` — single-process node + bench with
+//! `tracing-flame` and optional `pprof` recording scoped to the
+//! measurement window.
 //!
 //! See `kardamom_bench::harness` for the mechanism.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use alloy_primitives::Address;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 
-use kardamom_bench::config::{self, CallsCfg, FileConfig, MixCfg, Workload};
-use kardamom_bench::harness::{HarnessArgs, run_harness};
+use kardamom_bench::config::{
+    DEFAULT_CONCURRENCY, DEFAULT_DURATION_STR, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TXS_PER_TASK,
+    DEFAULT_WARMUP_STR,
+};
+use kardamom_bench::harness::{Harness, run_harness};
+use kardamom_bench::{BenchWorkflow, Benchmark, CallsWorkflow, MixedWorkflow, TransfersWorkflow};
 
-/// Single-process bench harness with scoped flame recording.
 #[derive(Parser, Debug)]
 #[command(
     name = "kardamom-bench-harness",
@@ -24,86 +27,81 @@ struct Args {
     flame_out: PathBuf,
 
     /// Chain ID for the in-process node.
-    #[arg(long, default_value_t = 412346)]
+    #[arg(long, default_value_t = 412_346)]
     chain_id: u64,
 
-    /// Bench config TOML. Must contain a `[mnemonic]` section (and
-    /// `[[contracts]]` if workload requires `eth_call`).
-    #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    /// Test duration (safety timeout; senders also stop when their work
+    /// vec is drained).
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_DURATION_STR)]
+    duration: Duration,
 
-    /// Workload kind (overrides the file).
-    #[arg(long, value_enum)]
-    workload: Option<Workload>,
+    /// Pure sleep gap between `prepare` and `dispatch`. No senders run
+    /// during this window — flame and pprof recordings stay off, and the
+    /// only thing that happens is the OS/CPU settling.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_WARMUP_STR)]
+    warmup: Duration,
 
-    /// Requests per second (target).
-    #[arg(long)]
-    rate: Option<u32>,
+    /// Number of sender tasks (= number of derived signers, one per task).
+    #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
+    concurrency: u32,
 
-    /// Test duration, e.g. `30s`, `2m`.
-    #[arg(long, value_parser = humantime::parse_duration)]
-    duration: Option<Duration>,
+    /// Pre-signed transactions queued per sender task.
+    #[arg(long = "txs-per-task", default_value_t = DEFAULT_TXS_PER_TASK)]
+    txs_per_task: u32,
 
-    /// Number of derived signers (also caps in-flight at `concurrency * 4`).
-    #[arg(long)]
-    concurrency: Option<u32>,
-
-    /// Warm-up window (flame recording disabled during warmup).
-    #[arg(long, value_parser = humantime::parse_duration)]
-    warmup: Option<Duration>,
-
-    /// Transfer/call ratio for `mixed`, e.g. `1:4`.
-    #[arg(long = "mix-ratio")]
-    mix_ratio: Option<String>,
-
-    /// Address of contract to `eth_call` for the calls/mixed workloads.
-    #[arg(long = "calls-contract")]
-    calls_contract: Option<Address>,
+    /// Cap on outstanding requests per sender task.
+    #[arg(long = "max-in-flight", default_value_t = DEFAULT_MAX_IN_FLIGHT)]
+    max_in_flight: u32,
 
     /// Write bench report JSON here in addition to stdout.
     #[arg(long)]
     report_json: Option<PathBuf>,
+
+    /// Path to write a `pprof` CPU flamegraph SVG (sampled at 999Hz over the
+    /// measurement window only).
+    #[arg(long)]
+    pprof_out: Option<PathBuf>,
+
+    #[command(subcommand)]
+    workload: WorkloadCmd,
 }
 
-fn parse_mix(s: &str) -> anyhow::Result<MixCfg> {
-    let (t, c) = s
-        .split_once(':')
-        .ok_or_else(|| anyhow::anyhow!("mix-ratio must be `<transfers>:<calls>`, got `{s}`"))?;
-    let transfers: u32 = t
-        .parse()
-        .map_err(|e| anyhow::anyhow!("bad transfers: {e}"))?;
-    let calls: u32 = c.parse().map_err(|e| anyhow::anyhow!("bad calls: {e}"))?;
-    Ok(MixCfg { transfers, calls })
+#[derive(Subcommand, Debug)]
+enum WorkloadCmd {
+    /// Saturate the node's write path with signed value transfers.
+    Transfers,
+    /// Saturate the node's read path with `eth_call` to a deterministic
+    /// contract.
+    Calls,
+    /// Interleave transfers and calls per a 1:4 ratio.
+    Mixed,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    match args.workload {
+        WorkloadCmd::Transfers => harness_with(TransfersWorkflow::default(), &args).await,
+        WorkloadCmd::Calls => harness_with(CallsWorkflow::default(), &args).await,
+        WorkloadCmd::Mixed => harness_with(MixedWorkflow::default(), &args).await,
+    }
+}
 
-    let file_config = FileConfig::load(&args.config)?;
-
-    let cli_overrides = FileConfig {
-        rpc: Some("in-process".to_string()),
-        workload: args.workload,
-        rate: args.rate,
+async fn harness_with<W: BenchWorkflow>(workflow: W, args: &Args) -> anyhow::Result<()> {
+    let bench = Benchmark {
+        workflow,
         duration: args.duration,
-        concurrency: args.concurrency,
         warmup: args.warmup,
-        output: None,
-        mix: args.mix_ratio.as_deref().map(parse_mix).transpose()?,
-        calls: args.calls_contract.map(|contract| CallsCfg { contract }),
-        mnemonic: None,
-        contracts: vec![],
+        concurrency: args.concurrency,
+        txs_per_task: args.txs_per_task,
+        max_in_flight: args.max_in_flight,
     };
-
-    let config = config::resolve(Some(file_config.clone()), cli_overrides)?;
-
-    run_harness(HarnessArgs {
+    run_harness(Harness {
         chain_id: args.chain_id,
-        file_config,
-        config,
-        flame_out: args.flame_out,
-        report_json: args.report_json,
+        bench,
+        flame_out: args.flame_out.clone(),
+        report_json: args.report_json.clone(),
+        pprof_out: args.pprof_out.clone(),
     })
     .await
 }

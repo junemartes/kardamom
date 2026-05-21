@@ -1,13 +1,13 @@
-//! Smoke test: run the harness for ~800ms against an in-process node and
-//! assert `flame.folded` was written with at least one
+//! Smoke test: run `Harness<TransfersWorkflow>` for ~800ms against an
+//! in-process node and assert `flame.folded` was written with at least one
 //! `kardamom_node::node` span, confirming the gated flame layer flushed
-//! during the measurement window.
+//! during the dispatch window.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kardamom_bench::config::{self, FileConfig, MixCfg, MnemonicCfg, Workload};
-use kardamom_bench::harness::{HarnessArgs, run_harness};
+use kardamom_bench::harness::{Harness, run_harness};
+use kardamom_bench::{Benchmark, TransfersWorkflow};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn harness_writes_flame_with_node_spans() {
@@ -17,49 +17,25 @@ async fn harness_writes_flame_with_node_spans() {
     ));
     let _ = std::fs::remove_file(&flame_out);
 
-    let file_config = FileConfig {
-        rpc: None,
-        workload: Some(Workload::Transfers),
-        rate: Some(100),
-        duration: Some(Duration::from_millis(800)),
-        concurrency: Some(4),
-        warmup: Some(Duration::from_millis(200)),
-        output: None,
-        mix: Some(MixCfg {
-            transfers: 1,
-            calls: 0,
-        }),
-        calls: None,
-        mnemonic: Some(MnemonicCfg {
-            phrase: "test test test test test test test test test test test junk".to_string(),
-            balance: "1000000000000000000000".to_string(),
-            count: None,
-        }),
-        contracts: vec![],
+    let bench = Benchmark {
+        workflow: TransfersWorkflow::default(),
+        // Sized larger than warmup + duration can consume against an
+        // in-process node, so the deadline (not work exhaustion) ends the
+        // dispatch and the flame layer sees the full measurement window.
+        // Kept small enough that debug-build ECDSA presigning is tolerable.
+        txs_per_task: 2_000,
+        max_in_flight: 8,
+        duration: Duration::from_millis(800),
+        concurrency: 4,
+        warmup: Duration::from_millis(200),
     };
 
-    let cli_overrides = FileConfig {
-        rpc: Some("in-process".to_string()),
-        workload: None,
-        rate: None,
-        duration: None,
-        concurrency: None,
-        warmup: None,
-        output: None,
-        mix: None,
-        calls: None,
-        mnemonic: None,
-        contracts: vec![],
-    };
-
-    let config = config::resolve(Some(file_config.clone()), cli_overrides).expect("resolve");
-
-    run_harness(HarnessArgs {
+    run_harness(Harness {
         chain_id: 1,
-        file_config,
-        config,
+        bench,
         flame_out: flame_out.clone(),
         report_json: None,
+        pprof_out: None,
     })
     .await
     .expect("harness ran");

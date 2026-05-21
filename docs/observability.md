@@ -26,38 +26,42 @@ Plus `kardamom_block_number` (gauge) and `kardamom_build_info` (gauge, always
 
 ## Quick start
 
-In three terminals:
+For Grafana exploration against a long-running node:
 
 ```sh
-# 1. Start the observability stack.
+# 1. Observability stack.
 cd deploy && docker compose up
 
-# 2. Start kardamom with a TOML genesis. `chains/dev.toml` is the
-#    checked-in dev chain (chain_id 412346; prefunds Anvil account #0
-#    with 1000 ETH). For the bench's transfers/mixed workloads you'll
-#    want a genesis that also prefunds the derived signer addresses
-#    and deploys the `eth_call` target contract — see "Pre-funding the
-#    bench signers" below.
+# 2. Start kardamom. `chains/dev.toml` only prefunds Anvil account #0 —
+#    fine for hitting the node by hand, but the bench wants N derived
+#    signers prefunded. See "Workflows + signer prefunding" below before
+#    pointing the bench at it.
 cargo run --release --bin kardamom -- --chain chains/dev.toml
 
-# 3. Drive load.
+# 3. Drive load. `mixed` is the 1:4 transfers:calls built-in workflow.
 cargo run --release --bin kardamom-bench -- \
-  --config scenarios/mixed.toml
+  --rpc http://127.0.0.1:8545 \
+  --concurrency 16 --duration 30s \
+  mixed
 ```
 
 Open <http://localhost:3000> (Grafana, `admin` / `kardamom`) → the
 provisioned **Kardamom RPC** dashboard populates within a few seconds.
 
-The bench prints percentile latencies to stdout and (with `output =` set)
+For flame/pprof inspection that doesn't need an external Grafana or a
+hand-tuned genesis, prefer the single-process harness — it builds the
+genesis it needs from the workflow itself. See "Option B" below.
+
+The bench prints percentile latencies to stdout and (with `--output` set)
 writes a JSON report.
 
 ## Flamegraph workflow
 
 `tracing-flame` records a sample any time a span is entered. It does **not**
-sample on-CPU time the way `perf` or `samply` do — anything outside an
-instrumented span (jsonrpsee dispatch, hyper framing, tokio scheduling, revm
-internals) is collapsed onto the bare `ThreadId(N)-tokio-rt-worker` root
-frame. For a deep view past the spans, see "CPU profiling with samply" below.
+sample on-CPU time the way `perf` does — anything outside an instrumented
+span (jsonrpsee dispatch, hyper framing, tokio scheduling, revm internals)
+is collapsed onto the bare `ThreadId(N)-tokio-rt-worker` root frame. For a
+deep view past the spans, see "CPU profiling with pprof" below.
 
 There are two flame-recording paths, for different jobs.
 
@@ -71,11 +75,11 @@ KARDAMOM_FLAME=./flame.folded \
   cargo run --release --bin kardamom -- --chain chains/dev.toml
 
 # Drive load (or hit the node by hand)…
-cargo run --release --bin kardamom-bench -- --config scenarios/mixed.toml
+cargo run --release --bin kardamom-bench -- --rpc http://127.0.0.1:8545 mixed
 # Ctrl-C the node when done.
 
 cargo install inferno          # one-time
-grep ';' flame.folded | inferno-flamegraph > flame.svg
+grep ';' flame.folded | inferno-flamegraph --minwidth 0 --width 2000 > flame.svg
 open flame.svg
 ```
 
@@ -89,215 +93,119 @@ shutdown completes, so the folded file is not truncated.
 
 ### Option B — single-process harness, `kardamom-bench-harness`
 
-For a tight flamegraph scoped exactly to a measurement window, use the
-embedded harness. It boots the node in-process, drives load with the bench
-generator, and gates `tracing-flame` recording to the measurement phase only
-(warmup is excluded via an `AtomicBool`-driven `FilterFn`). No idle node
-lifetime, no warmup, no teardown in the data.
+For a tight flamegraph scoped exactly to the dispatch window, use the
+embedded harness. It boots a kardamom node in-process, derives the
+workflow's signer set, prefunds them in the in-process genesis
+automatically, drives load, and gates `tracing-flame` recording to the
+dispatch phase only (signer derivation, presigning, warmup are all
+excluded via an `AtomicBool`-driven `FilterFn`).
 
 ```sh
 cargo build --release --bin kardamom-bench-harness
 
 ./target/release/kardamom-bench-harness \
-  --config bench.toml \
-  --workload transfers --rate 2000 --duration 10s \
-  --warmup 2s --concurrency 32 \
-  --flame-out /tmp/flame.folded
+  --duration 10s --warmup 2s --concurrency 32 \
+  --flame-out /tmp/flame.folded \
+  transfers
 
-grep ';' /tmp/flame.folded | inferno-flamegraph > /tmp/flame.svg
+grep ';' /tmp/flame.folded | inferno-flamegraph --minwidth 0 --width 40000 > /tmp/flame.svg
 open /tmp/flame.svg
 ```
 
-The bench config's `[mnemonic]` section prefunds the derived signers, so
-`transfers` and `mixed` workloads just work end-to-end. For `mixed`/`calls`,
-pass `--calls-contract <address>` and add the contract to `[[contracts]]` in
-the config so it lands in the in-process genesis alloc.
+The three built-in workloads are subcommands: `transfers`, `calls`,
+`mixed`. Each uses hardcoded defaults (Anvil test mnemonic, deterministic
+`eth_call` target, 1:4 mix ratio).
 
-## CPU profiling with samply
+## CPU profiling with pprof
 
 `tracing-flame` only sees our spans. To see what the *CPU* actually does
-(hyper, jsonrpsee, serde_json, revm internals, ECDSA), record the harness
-under `samply` — a sampling profiler that needs no kernel privileges on
-macOS.
+(hyper, jsonrpsee, serde_json, revm internals, ECDSA), pass `--pprof-out`
+to the harness. It uses [`pprof-rs`](https://crates.io/crates/pprof) to
+sample on-CPU time at 999Hz via `SIGPROF`, scoped to the same dispatch
+window as the `tracing-flame` recording.
 
 ```sh
-cargo install --locked samply       # one-time
-cargo build --release --bin kardamom-bench-harness
-dsymutil ./target/release/kardamom-bench-harness   # generate .dSYM for symbols
+./target/release/kardamom-bench-harness \
+  --duration 10s --warmup 1s --concurrency 128 \
+  --max-in-flight 30 \
+  --flame-out /tmp/flame.folded \
+  --pprof-out /tmp/cpu.svg \
+  transfers
 
-samply record --save-only -o /tmp/profile.json.gz -- \
-  ./target/release/kardamom-bench-harness \
-    --workload transfers --rate 10000 --duration 10s \
-    --warmup 1s --concurrency 128 \
-    --flame-out /tmp/flame.folded
-
-# View interactively in the Firefox Profiler UI:
-samply load /tmp/profile.json.gz
+open /tmp/cpu.svg
 ```
 
-Run `samply load` from the repo root so it can find the `.dSYM` bundle next
-to the binary. If our own frames still show as hex offsets in the UI, the
-dSYM isn't being picked up — check `./target/release/kardamom-bench-harness.dSYM`
-exists. System dylibs (`libsystem_kernel.dylib`, etc.) will remain
-unsymbolicated; their syscall stubs (`__psynch_cvwait`, `mach_msg_trap`)
-are what tokio workers park in when there's no work to do.
+**The pprof report is filtered to stacks containing at least one
+`kardamom_node::*` frame before rendering.** The in-process harness runs
+the node server and the bench client on the same tokio runtime, so the
+raw report mixes node and client work — without the filter the SVG would
+be mostly jsonrpsee client, hyper, and our `send_loop` noise. The harness
+logs the kept/dropped counts (typically ~5% kept against the closed-loop
+write workload — most CPU is on the bench side) so you can see how
+aggressive the filter was.
 
-Quick post-hoc symbolication (if you don't want to open the UI):
+Both outputs are restricted to the dispatch window: neither sees prepare-
+phase ECDSA presigning, warmup sleep, server startup, or shutdown.
+Symbolication is handled in-process by `pprof-rs`, so no `dsymutil` /
+`.dSYM` dance is needed.
+
+## Workflows + signer prefunding
+
+Workloads are Rust `BenchWorkflow` impls (in `crates/bench/src/workflows/`),
+not TOML scenarios. Three are built in and exposed as subcommands of both
+binaries:
+
+| Subcommand | Workflow type        | Notes |
+|------------|---------------------|-------|
+| `transfers`| `TransfersWorkflow` | `eth_sendRawTransaction` only — stresses the write path. The single `RwLock` serializes writes; expect `acquire_write_lock` to dominate at high `--concurrency`. |
+| `calls`    | `CallsWorkflow`     | `eth_call` only against the `PUSH1 0x42 ... RETURN` contract. |
+| `mixed`    | `MixedWorkflow`     | 1:4 transfers:calls — mirrors a typical RPC traffic shape. Default for casual runs. |
+
+All three default to the **Anvil test mnemonic**. Signers are derived
+deterministically (`m/44'/60'/0'/0/i` for `i = 0..concurrency`).
+
+- **`kardamom-bench-harness`** (in-process): the harness asks the workflow
+  for its genesis allocs (`workflow.genesis_alloc(concurrency)`), builds
+  the in-process `Genesis` from them, and starts the node against it. No
+  manual chain config needed — just pick a subcommand.
+
+- **`kardamom-bench`** (standalone, against a remote node): the remote
+  node's chain config must already prefund the signers the workflow will
+  use. For the built-in workflows that means the first N Anvil accounts.
+  `chains/dev.toml` prefunds only account #0 — to bench transfers/mixed
+  against it, extend it with one `[[alloc]]` per Anvil account `0..N` and
+  one `[[alloc]]` for the call target contract:
+
+  ```toml
+  chain_id = 412346
+
+  [[alloc]]
+  address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"  # Anvil #0
+  balance = "1000000000000000000000"
+
+  # ... one per signer 1..N-1 ...
+
+  [[alloc]]
+  address = "0x0000000000000000000000000000000000001234"
+  code    = "0x604260005260206000f3"
+  ```
+
+  Then run kardamom against that file before pointing the bench at it.
+
+### Custom workloads
+
+Implement `BenchWorkflow` for your own type and drive it via the generic
+`Benchmark<W>` / `Harness<W>`. See
+`crates/bench/examples/custom_workflow.rs` for an ~70-line example that
+benches `eth_blockNumber` from outside this crate — no changes to the
+bench crate needed.
 
 ```sh
-# Look up a hex offset from the profile against the dSYM. PIE base is 0x100000000.
-atos -o ./target/release/kardamom-bench-harness.dSYM/Contents/Resources/DWARF/kardamom-bench-harness \
-     -arch arm64 -l 0x100000000 0x1000f6c34
-# → k256::arithmetic::field::FieldElement::square (field.rs:160)
+cargo run --release --example custom_workflow -p kardamom-bench
 ```
 
-## Profiling experiment: which ECDSA backend?
-
-The harness + samply combo makes a concrete cost-vs-benefit experiment
-reproducible in ~5 minutes. The example below identifies signature
-recovery as the dominant on-CPU cost and confirms a fix by re-measuring.
-
-1. **Baseline.** Build and record:
-
-   ```sh
-   cargo build --release --bin kardamom-bench-harness
-   dsymutil ./target/release/kardamom-bench-harness
-
-   samply record --save-only -o /tmp/profile-baseline.json.gz -- \
-     ./target/release/kardamom-bench-harness \
-       --workload transfers --rate 10000 --duration 10s \
-       --warmup 1s --concurrency 128 \
-       --flame-out /tmp/flame-baseline.folded
-   ```
-
-   Note the `ok=<n>` count printed at the end and load
-   `/tmp/profile-baseline.json.gz` in samply. The top non-park leaf frames
-   on the worker threads will be a mix of `k256::*` functions
-   (`FieldElement::square`, `Scalar::mul`, `WideScalar::reduce_impl`,
-   `Scalar::invert_vartime`, etc.) — that's the pure-Rust secp256k1
-   implementation doing signature recovery.
-
-2. **Swap the ECDSA backend.** In `Cargo.toml` (workspace root), change the
-   `alloy-consensus` features:
-
-   ```diff
-   - alloy-consensus = { version = "2.0", features = ["k256"] }
-   + alloy-consensus = { version = "2.0", features = ["secp256k1"] }
-   ```
-
-   This swaps the pure-Rust `k256` crate for the libsecp256k1 C library
-   bindings, used for both signing (bench-side) and recovery (node-side).
-   No code changes needed; `recover_signer` dispatches through
-   alloy-consensus.
-
-3. **Verify and remeasure.**
-
-   ```sh
-   cargo test -p kardamom-node -p kardamom-bench       # everything still passes
-   cargo build --release --bin kardamom-bench-harness
-   dsymutil ./target/release/kardamom-bench-harness    # symbols changed; regenerate
-
-   samply record --save-only -o /tmp/profile-secp.json.gz -- \
-     ./target/release/kardamom-bench-harness \
-       --workload transfers --rate 10000 --duration 10s \
-       --warmup 1s --concurrency 128 \
-       --flame-out /tmp/flame-secp.folded
-   ```
-
-   Compare `ok=<n>` to the baseline. Worker park-share (computed from the
-   profile JSON, see `scripts/` or the snippet in step 4) should rise
-   noticeably as each request finishes faster. The remaining top non-park
-   frames should be `rustsecp256k1_v0_*_*` C-library symbols.
-
-4. **Quick stats from the JSON** (no UI needed):
-
-   ```sh
-   gunzip -c /tmp/profile-secp.json.gz | python3 -c "
-   import json, sys
-   from collections import Counter
-   p = json.load(sys.stdin)
-   libs = [l['name'] for l in p['libs']]
-   park, total = 0, 0
-   for t in p['threads']:
-       if 'tokio-rt-worker' not in t.get('name',''): continue
-       fr=t['frameTable']; fn=t['funcTable']; st=t['stackTable']; res=t['resourceTable']
-       for s_idx in t['samples']['stack']:
-           if s_idx is None: continue
-           total += 1
-           lib_idx = res['lib'][fn['resource'][fr['func'][st['frame'][s_idx]]]]
-           if 'libsystem' in libs[lib_idx]: park += 1
-   print(f'workers: {total} samples, {park} parked = {100*park/total:.1f}%')"
-   ```
-
-   For the harness at 10 000 rps × 128 concurrency on an 8-core M-series
-   machine, the swap typically delivers ~2× more successful tx/s and a
-   ~10-percentage-point increase in worker park-share. Per-request latency
-   is queue-bound at this load, so it does *not* change much; to see
-   per-request latency drop, also run at a sustainable rps where the
-   in-flight semaphore (`concurrency × 4`) doesn't fill.
-
-The same recipe applies for any other backend-swap or hot-path change:
-record before, change one thing, record after, compare `ok` count and the
-top non-park frames.
-
-## Bench scenarios
-
-Starter scenarios live in `scenarios/`:
-
-| File | Workload | Notes |
-|------|----------|-------|
-| `transfers.toml` | `eth_sendRawTransaction` only | Stresses the write path. The single `RwLock` serializes writes; expect `acquire_write_lock` to dominate at higher `concurrency`. |
-| `calls.toml`     | `eth_call` only               | Read-only workload against the `PUSH1 0x42 … RETURN` contract. |
-| `mixed.toml`     | 1:4 transfers:calls           | Default. Mirrors a typical RPC traffic shape. |
-
-CLI flags override individual fields in the config file:
-
-```sh
-cargo run --release --bin kardamom-bench -- \
-  --config scenarios/mixed.toml \
-  --rate 1000 --duration 1m --concurrency 32
-```
-
-### Pre-funding the bench signers
-
-The bench derives `--concurrency` signers deterministically from `--seed`
-(`keccak(seed || u64_le(i))`). For transfers/mixed workloads to actually
-exercise the write path, each derived signer needs balance in the chain
-state. That means writing a custom genesis TOML whose `[[alloc]]` entries
-list every derived address. Today this is manual — write a small Rust
-program that calls `kardamom_bench::signers::derive(seed, concurrency)`
-to enumerate the addresses, then build a `chains/<bench>.toml` with one
-`[[alloc]]` per signer plus an entry for the `eth_call` target contract:
-
-```toml
-chain_id = 412346
-
-[[alloc]]
-address = "0x..."   # derived signer 0
-balance = "10000000000000000000"
-
-# ... one per signer ...
-
-[[alloc]]
-address = "0x0000000000000000000000000000000000001234"
-code    = "0x604260005260206000f3"
-```
-
-Then start kardamom against that file:
-
-```sh
-cargo run --release --bin kardamom -- --chain chains/your-bench.toml
-```
-
-A quick hack to see the dashboard panels move without writing a custom
-genesis: run the calls-only scenario (`scenarios/calls.toml`) against the
-dev chain plus a one-line edit to deploy the call target. Failed
-transfers in the mixed/transfers scenarios show up as `outcome="err"` in
-`kardamom_rpc_requests_total`.
-
-A library helper that turns a bench config into a Genesis (deriving
-signers from a mnemonic instead of a u64 seed) is on the way — see PR
-#5.
+`cargo run --example gen_mnemonic -p kardamom-bench` prints a fresh
+BIP-39 phrase if your custom workflow wants its own signer set.
 
 ## Dashboard panels
 

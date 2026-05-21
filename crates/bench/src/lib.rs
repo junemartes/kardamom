@@ -1,12 +1,18 @@
-//! Library half of `kardamom-bench`. The binary in `src/main.rs` is a thin
-//! wrapper that parses CLI flags and calls `generator::run`. Splitting the
-//! modules into a library keeps the smoke test (`tests/smoke.rs`) able to
-//! drive the generator against an in-process node without exec'ing the bin.
+//! Library half of `kardamom-bench`. Exposes the `BenchWorkflow` trait, the
+//! generic `Benchmark<W>` dispatcher, the in-process `Harness<W>`, three
+//! built-in workflows (transfers/calls/mixed), and a few primitives
+//! (mnemonic derivation, transfer presigning) that workflows reuse.
 
+pub mod benchmark;
 pub mod config;
-pub mod generator;
-pub mod genesis;
 pub mod harness;
 pub mod mnemonic;
 pub mod report;
 pub mod signers;
+pub mod workflow;
+pub mod workflows;
+
+pub use benchmark::{Benchmark, Outputs, Prepared};
+pub use harness::{Harness, run_harness};
+pub use workflow::BenchWorkflow;
+pub use workflows::{CallsWorkflow, MixedWorkflow, TransfersWorkflow};

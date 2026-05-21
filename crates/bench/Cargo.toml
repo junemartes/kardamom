@@ -30,16 +30,18 @@ anyhow.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-toml.workspace = true
-humantime-serde.workspace = true
 humantime = "2"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-flame.workspace = true
 hdrhistogram.workspace = true
-reqwest.workspace = true
 jsonrpsee = { workspace = true }
+# `frame-pointer` is required on macOS arm64: the default unwinder
+# (libunwind via `backtrace`) is not signal-safe and SIGTRAPs under load.
+# Apple Silicon enables frame pointers by default, so no extra rustflags
+# are needed here.
+pprof = { version = "0.14", features = ["flamegraph", "frame-pointer"] }
 
 [dev-dependencies]
 kardamom-node = { path = "../node" }
