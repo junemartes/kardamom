@@ -127,8 +127,11 @@ async fn end_to_end_send_and_query() {
         .unwrap();
     assert_eq!(nonce_after, U256::from(1u64));
 
-    // eth_call against a plain EOA — no code, expect empty output
+    // eth_call against a plain EOA — no code, expect empty output. `from` (the
+    // signer) has nonce 1 after the prior send; the executor disables the
+    // nonce check for `eth_call`, so this still works.
     let call_req = TransactionRequest {
+        from: Some(from),
         to: Some(TxKind::Call(to)),
         ..Default::default()
     };

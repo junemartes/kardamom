@@ -41,34 +41,63 @@ impl ExecEnv {
 }
 
 /// Convert an RPC `TransactionRequest` to a revm `TxEnv` suitable for `eth_call`.
-pub fn tx_env_from_request(req: &TransactionRequest) -> TxEnv {
-    TxEnv {
-        caller: req.from.unwrap_or(Address::ZERO),
-        // Default below the EIP-7825 cap (2^24 = 16_777_216) enforced by Osaka spec.
-        gas_limit: req.gas.unwrap_or(15_000_000),
-        gas_price: req.gas_price.unwrap_or(0),
+///
+/// Every value-bearing field must be supplied explicitly by the caller; a missing
+/// field produces `NodeError::MissingRequestField` rather than silently
+/// defaulting. JSON-RPC-level defaults (e.g. omitted `from`/`gas`/`value` in
+/// an `eth_call` request) must be applied by the caller before invoking this
+/// function — see `Node::call`.
+///
+/// The single exception is `to`: a `None` value is Ethereum's canonical
+/// encoding for contract creation (equivalent to `Some(TxKind::Create)`), not
+/// an unspecified default.
+pub fn tx_env_from_request(req: &TransactionRequest) -> Result<TxEnv, NodeError> {
+    Ok(TxEnv {
+        caller: req.from.ok_or(NodeError::MissingRequestField("from"))?,
+        gas_limit: req.gas.ok_or(NodeError::MissingRequestField("gas"))?,
+        gas_price: req
+            .gas_price
+            .ok_or(NodeError::MissingRequestField("gas_price"))?,
+        // `to: None` is Ethereum's canonical encoding of contract creation
+        // (equivalent to `Some(Create)`), not an unspecified value.
         kind: match req.to {
             Some(alloy_primitives::TxKind::Call(addr)) => TxKind::Call(addr),
             Some(alloy_primitives::TxKind::Create) | None => TxKind::Create,
         },
-        value: req.value.unwrap_or(U256::ZERO),
-        data: req.input.input().cloned().unwrap_or_default(),
-        nonce: req.nonce.unwrap_or(0),
+        value: req.value.ok_or(NodeError::MissingRequestField("value"))?,
+        data: req
+            .input
+            .input()
+            .cloned()
+            .ok_or(NodeError::MissingRequestField("input"))?,
+        nonce: req.nonce.ok_or(NodeError::MissingRequestField("nonce"))?,
         chain_id: req.chain_id,
         ..Default::default()
-    }
+    })
 }
 
 /// Execute a transaction read-only: state changes are discarded.
+///
+/// `eth_call` is a simulation, not a real transaction: we relax the nonce
+/// precondition so callers can probe contract state from any address without
+/// first guessing the right nonce. (Balance and base-fee precondition
+/// relaxations would also be conventional for `eth_call`, but require revm
+/// feature flags that the workspace does not enable today.)
 pub fn call<DB>(db: &DB, env: ExecEnv, tx: TxEnv) -> Result<Bytes, NodeError>
 where
     DB: DatabaseRef,
     DB::Error: std::fmt::Debug,
 {
+    let mut cfg = env.cfg_env();
+    cfg.disable_nonce_check = true;
+    // TODO: also set `disable_balance_check` and `disable_base_fee` once the
+    // workspace enables the `optional_balance_check` / `optional_no_base_fee`
+    // revm cargo features. See the doc comment above for context.
+
     let mut evm = Context::mainnet()
         .with_db(WrapDatabaseRef(db))
         .with_block(env.block_env())
-        .with_cfg(env.cfg_env())
+        .with_cfg(cfg)
         .build_mainnet();
 
     let outcome = evm
@@ -229,8 +258,100 @@ mod tests {
     use super::*;
     use crate::deposit::DepositTx;
     use alloy_primitives::{B256, Bytes, TxKind as APTxKind, U256, address, b256};
+    use alloy_rpc_types_eth::TransactionRequest;
     use revm::database::{CacheDB, EmptyDB};
     use revm::state::{AccountInfo, Bytecode};
+
+    fn fully_populated_request() -> TransactionRequest {
+        TransactionRequest {
+            from: Some(Address::ZERO),
+            to: Some(alloy_primitives::TxKind::Call(Address::ZERO)),
+            gas: Some(21_000),
+            gas_price: Some(0),
+            value: Some(U256::ZERO),
+            input: Bytes::new().into(),
+            nonce: Some(0),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tx_env_from_request_succeeds_when_all_fields_present() {
+        let req = fully_populated_request();
+        let env = tx_env_from_request(&req).expect("ok");
+        assert_eq!(env.caller, Address::ZERO);
+        assert_eq!(env.gas_limit, 21_000);
+    }
+
+    #[test]
+    fn tx_env_from_request_treats_to_none_and_explicit_create_as_create() {
+        let mut req = fully_populated_request();
+        req.to = None;
+        assert_eq!(tx_env_from_request(&req).expect("ok").kind, TxKind::Create);
+
+        req.to = Some(alloy_primitives::TxKind::Create);
+        assert_eq!(tx_env_from_request(&req).expect("ok").kind, TxKind::Create);
+    }
+
+    #[test]
+    fn tx_env_from_request_errors_on_missing_from() {
+        let mut req = fully_populated_request();
+        req.from = None;
+        assert!(matches!(
+            tx_env_from_request(&req),
+            Err(NodeError::MissingRequestField("from"))
+        ));
+    }
+
+    #[test]
+    fn tx_env_from_request_errors_on_missing_gas() {
+        let mut req = fully_populated_request();
+        req.gas = None;
+        assert!(matches!(
+            tx_env_from_request(&req),
+            Err(NodeError::MissingRequestField("gas"))
+        ));
+    }
+
+    #[test]
+    fn tx_env_from_request_errors_on_missing_gas_price() {
+        let mut req = fully_populated_request();
+        req.gas_price = None;
+        assert!(matches!(
+            tx_env_from_request(&req),
+            Err(NodeError::MissingRequestField("gas_price"))
+        ));
+    }
+
+    #[test]
+    fn tx_env_from_request_errors_on_missing_value() {
+        let mut req = fully_populated_request();
+        req.value = None;
+        assert!(matches!(
+            tx_env_from_request(&req),
+            Err(NodeError::MissingRequestField("value"))
+        ));
+    }
+
+    #[test]
+    fn tx_env_from_request_errors_on_missing_input() {
+        let mut req = fully_populated_request();
+        req.input = alloy_rpc_types_eth::TransactionInput::default();
+        assert!(matches!(
+            tx_env_from_request(&req),
+            Err(NodeError::MissingRequestField("input"))
+        ));
+    }
+
+    #[test]
+    fn tx_env_from_request_errors_on_missing_nonce() {
+        let mut req = fully_populated_request();
+        req.nonce = None;
+        assert!(matches!(
+            tx_env_from_request(&req),
+            Err(NodeError::MissingRequestField("nonce"))
+        ));
+    }
 
     #[test]
     fn tx_env_from_deposit_call_kind() {

@@ -21,6 +21,8 @@ pub enum NodeError {
     MintOverflow,
     #[error("invalid deposit envelope: {0}")]
     InvalidDepositEnvelope(String),
+    #[error("missing required transaction request field: {0}")]
+    MissingRequestField(&'static str),
 }
 
 impl From<NodeError> for ErrorObjectOwned {
@@ -31,7 +33,8 @@ impl From<NodeError> for ErrorObjectOwned {
             | NodeError::UnknownTransaction(_)
             | NodeError::UnsupportedBlockTag
             | NodeError::DuplicateDeposit
-            | NodeError::InvalidDepositEnvelope(_) => -32602, // invalid params
+            | NodeError::InvalidDepositEnvelope(_)
+            | NodeError::MissingRequestField(_) => -32602, // invalid params
             NodeError::Execution(_) | NodeError::MintOverflow => -32000, // server error
             NodeError::Server(_) => -32603,                              // internal
         };
@@ -102,6 +105,21 @@ mod tests {
     #[test]
     fn invalid_deposit_envelope_maps_to_invalid_params() {
         let rpc: ErrorObjectOwned = NodeError::InvalidDepositEnvelope("x".into()).into();
+        assert_eq!(rpc.code(), -32602);
+    }
+
+    #[test]
+    fn missing_request_field_displays() {
+        let err = NodeError::MissingRequestField("gas");
+        assert_eq!(
+            err.to_string(),
+            "missing required transaction request field: gas"
+        );
+    }
+
+    #[test]
+    fn missing_request_field_maps_to_invalid_params() {
+        let rpc: ErrorObjectOwned = NodeError::MissingRequestField("gas").into();
         assert_eq!(rpc.code(), -32602);
     }
 }

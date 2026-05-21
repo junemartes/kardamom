@@ -103,12 +103,13 @@ impl Node {
         self.inner.read().await.receipts.get(&hash).cloned()
     }
 
-    pub async fn call(&self, req: TransactionRequest) -> Result<Bytes, NodeError> {
+    pub async fn call(&self, mut req: TransactionRequest) -> Result<Bytes, NodeError> {
         const METHOD: &str = "eth_call";
+        apply_eth_call_defaults(&mut req);
         let state = stage_await!("acquire_read_lock", method = METHOD, self.inner.read());
         let tx = stage!("build_tx_env", method = METHOD, {
             executor::tx_env_from_request(&req)
-        });
+        })?;
         let env = ExecEnv {
             chain_id: self.chain_id,
             block_number: state.block_number,
@@ -206,6 +207,37 @@ impl Node {
         state.block_number = sealed_block;
 
         Ok(tx_hash)
+    }
+}
+
+/// Fill omitted JSON-RPC `eth_call` fields with their standard defaults. The
+/// executor (`tx_env_from_request`) refuses to invent values for missing
+/// fields, so the spec-mandated defaults for `eth_call` (`from`, `gas`,
+/// `gasPrice`, `value`, `input`, `nonce` are all optional per the JSON-RPC
+/// spec) are applied at this boundary, where the choice is deliberate rather
+/// than accidental.
+///
+/// `to: None` is left alone — it is Ethereum's canonical encoding of
+/// contract creation, not an unspecified default.
+fn apply_eth_call_defaults(req: &mut TransactionRequest) {
+    if req.from.is_none() {
+        req.from = Some(Address::ZERO);
+    }
+    if req.gas.is_none() {
+        // Below the EIP-7825 cap (2^24 = 16_777_216) enforced by the Osaka spec.
+        req.gas = Some(15_000_000);
+    }
+    if req.gas_price.is_none() {
+        req.gas_price = Some(0);
+    }
+    if req.value.is_none() {
+        req.value = Some(U256::ZERO);
+    }
+    if req.input.input().is_none() {
+        req.input = Bytes::new().into();
+    }
+    if req.nonce.is_none() {
+        req.nonce = Some(0);
     }
 }
 
