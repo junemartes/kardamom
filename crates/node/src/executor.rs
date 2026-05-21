@@ -38,6 +38,21 @@ impl ExecEnv {
         c.chain_id = self.chain_id;
         c
     }
+
+    /// Config for read-only simulation paths (`eth_call`). Simulations skip
+    /// the preconditions that only make sense for real transactions: nonce,
+    /// caller balance, and base-fee enforcement. The caller pays nothing,
+    /// nothing is committed to state, and the result is purely informational
+    /// — so these checks would only reject otherwise-valid probes (calls from
+    /// unfunded addresses, requests with `gas_price: 0`, stale nonces). This
+    /// matches geth/reth `eth_call` semantics.
+    pub fn simulation_cfg(&self) -> CfgEnv {
+        let mut c = self.cfg_env();
+        c.disable_nonce_check = true;
+        c.disable_balance_check = true;
+        c.disable_base_fee = true;
+        c
+    }
 }
 
 /// Convert an RPC `TransactionRequest` to a revm `TxEnv` suitable for `eth_call`.
@@ -78,26 +93,18 @@ pub fn tx_env_from_request(req: &TransactionRequest) -> Result<TxEnv, NodeError>
 
 /// Execute a transaction read-only: state changes are discarded.
 ///
-/// `eth_call` is a simulation, not a real transaction: we relax the nonce
-/// precondition so callers can probe contract state from any address without
-/// first guessing the right nonce. (Balance and base-fee precondition
-/// relaxations would also be conventional for `eth_call`, but require revm
-/// feature flags that the workspace does not enable today.)
+/// This is the **simulation** path: `ExecEnv::simulation_cfg` is used to
+/// relax the nonce/balance/base-fee preconditions. See its doc for why.
+/// For real transaction execution see `execute` / `execute_deposit`.
 pub fn call<DB>(db: &DB, env: ExecEnv, tx: TxEnv) -> Result<Bytes, NodeError>
 where
     DB: DatabaseRef,
     DB::Error: std::fmt::Debug,
 {
-    let mut cfg = env.cfg_env();
-    cfg.disable_nonce_check = true;
-    // TODO: also set `disable_balance_check` and `disable_base_fee` once the
-    // workspace enables the `optional_balance_check` / `optional_no_base_fee`
-    // revm cargo features. See the doc comment above for context.
-
     let mut evm = Context::mainnet()
         .with_db(WrapDatabaseRef(db))
         .with_block(env.block_env())
-        .with_cfg(cfg)
+        .with_cfg(env.simulation_cfg())
         .build_mainnet();
 
     let outcome = evm
@@ -351,6 +358,78 @@ mod tests {
             tx_env_from_request(&req),
             Err(NodeError::MissingRequestField("nonce"))
         ));
+    }
+
+    #[test]
+    fn simulation_cfg_disables_simulation_only_preconditions() {
+        let env = ExecEnv {
+            chain_id: 7,
+            block_number: 1,
+        };
+        let cfg = env.simulation_cfg();
+        assert_eq!(cfg.chain_id, 7);
+        assert!(cfg.disable_nonce_check);
+        assert!(cfg.disable_balance_check);
+        assert!(cfg.disable_base_fee);
+    }
+
+    #[test]
+    fn cfg_env_does_not_relax_preconditions_for_real_execution() {
+        let env = ExecEnv {
+            chain_id: 7,
+            block_number: 1,
+        };
+        let cfg = env.cfg_env();
+        assert!(!cfg.disable_nonce_check);
+        assert!(!cfg.disable_balance_check);
+        assert!(!cfg.disable_base_fee);
+    }
+
+    #[test]
+    fn call_simulation_succeeds_from_unfunded_caller_with_nonzero_gas_price() {
+        // PUSH1 0x42; PUSH1 0x00; MSTORE; PUSH1 0x20; PUSH1 0x00; RETURN
+        // Returns the 32-byte value 0x42.
+        let code = Bytes::from(vec![
+            0x60, 0x42, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3,
+        ]);
+        let bytecode = Bytecode::new_raw(code);
+        let code_hash = bytecode.hash_slow();
+        let contract = Address::from([0x42u8; 20]);
+
+        let mut db = make_db(&[]);
+        db.insert_account_info(
+            contract,
+            AccountInfo {
+                balance: U256::ZERO,
+                nonce: 0,
+                code_hash,
+                code: Some(bytecode),
+                ..Default::default()
+            },
+        );
+
+        let env = ExecEnv {
+            chain_id: 1,
+            block_number: 1,
+        };
+        // gas_price > 0 forces revm's balance check unless `disable_balance_check`
+        // is in effect — and the caller (Address::ZERO) is unfunded.
+        let tx = TxEnv {
+            caller: Address::ZERO,
+            kind: TxKind::Call(contract),
+            gas_limit: 100_000,
+            gas_price: 1,
+            value: U256::ZERO,
+            data: Bytes::new(),
+            nonce: 0,
+            chain_id: Some(1),
+            ..Default::default()
+        };
+
+        let output = call(&db, env, tx).expect("simulation must succeed from unfunded caller");
+        let mut expected = [0u8; 32];
+        expected[31] = 0x42;
+        assert_eq!(output.as_ref(), &expected[..]);
     }
 
     #[test]
