@@ -211,6 +211,11 @@ fn apply_one_override(
         )));
     }
 
+    // Materialize the account in the overlay, seeding from the live DB if
+    // it isn't cached yet. Without this fallback an override that only sets
+    // one field would silently zero balance/nonce/code from the live state.
+    materialize_account(overlay, address);
+
     let mut info = overlay
         .cache
         .accounts
@@ -255,6 +260,21 @@ fn apply_one_override(
     }
 
     Ok(())
+}
+
+/// Seed the overlay's cache for `address` from the live DB if absent. This
+/// makes subsequent partial overrides (balance-only, nonce-only, etc.)
+/// preserve the live values for unmodified fields.
+fn materialize_account(overlay: &mut CacheDB<&CacheDB<EmptyDB>>, address: Address) {
+    if overlay.cache.accounts.contains_key(&address) {
+        return;
+    }
+    if let Some(live) = overlay.db.cache.accounts.get(&address) {
+        overlay.insert_account_info(address, live.info.clone());
+        if let Some(acc) = overlay.cache.accounts.get_mut(&address) {
+            acc.storage = live.storage.clone();
+        }
+    }
 }
 
 fn run_block(
@@ -815,6 +835,103 @@ mod tests {
         assert_eq!(
             U256::from_be_slice(out[0].calls[0].return_data.as_ref()),
             U256::from(999u64)
+        );
+    }
+
+    #[test]
+    fn state_override_preserves_live_account_fields() {
+        // Live DB: account with balance, nonce, and code. Override only the
+        // balance. The nonce and code must survive.
+        let addr = address!("00000000000000000000000000000000000000aa");
+        let code = Bytes::from(hex!("604260005260206000f3").to_vec());
+        let bytecode = Bytecode::new_raw(code.clone());
+        let code_hash = bytecode.hash_slow();
+        let live = AccountInfo {
+            balance: U256::from(1_000_000u64),
+            nonce: 9,
+            code_hash,
+            code: Some(bytecode),
+            ..Default::default()
+        };
+        let db = db_with(vec![(addr, live)]);
+
+        // Override only the balance.
+        let mut overrides = StateOverride::default();
+        overrides.insert(
+            addr,
+            AccountOverride {
+                balance: Some(U256::from(42u64)),
+                ..Default::default()
+            },
+        );
+        // Probe contract: caller invokes it which returns BALANCE(addr).
+        let probe_addr = address!("00000000000000000000000000000000000000bb");
+        let mut probe_code = vec![0x73u8]; // PUSH20
+        probe_code.extend_from_slice(addr.as_slice());
+        probe_code.extend_from_slice(&[0x31, 0x60, 0x00, 0x52, 0x60, 0x20, 0x60, 0x00, 0xf3]);
+        overrides.insert(
+            probe_addr,
+            AccountOverride {
+                code: Some(Bytes::from(probe_code)),
+                ..Default::default()
+            },
+        );
+
+        let p = SimulatePayload {
+            block_state_calls: vec![SimBlock {
+                state_overrides: Some(overrides),
+                calls: vec![TransactionRequest {
+                    from: Some(Address::ZERO),
+                    to: Some(alloy_primitives::TxKind::Call(probe_addr)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..payload(vec![]).clone()
+        };
+        let out = run(&p, 0, &db, 1).expect("ok");
+        assert_eq!(
+            U256::from_be_slice(out[0].calls[0].return_data.as_ref()),
+            U256::from(42u64),
+            "balance override took effect"
+        );
+
+        // Check the materialized overlay has preserved the live nonce + code.
+        // We can't directly inspect the overlay from the test, but a second
+        // simulation that overrides only `code: None` would re-confirm. Easier:
+        // call `account_nonce` semantics via a CALLER nonce-bumping path is
+        // out-of-scope; instead, we use a tx that requires the original code
+        // to be intact. Call the original `addr` (which has the const-42
+        // contract code from the live DB) and assert the return matches.
+        let p2 = SimulatePayload {
+            block_state_calls: vec![SimBlock {
+                state_overrides: Some({
+                    let mut o = StateOverride::default();
+                    o.insert(
+                        addr,
+                        AccountOverride {
+                            balance: Some(U256::from(42u64)),
+                            ..Default::default()
+                        },
+                    );
+                    o
+                }),
+                calls: vec![TransactionRequest {
+                    from: Some(Address::ZERO),
+                    to: Some(alloy_primitives::TxKind::Call(addr)),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..payload(vec![]).clone()
+        };
+        let out2 = run(&p2, 0, &db, 1).expect("ok");
+        let mut expected_42 = [0u8; 32];
+        expected_42[31] = 0x42;
+        assert_eq!(
+            out2[0].calls[0].return_data.as_ref(),
+            &expected_42[..],
+            "live code must survive a balance-only override"
         );
     }
 

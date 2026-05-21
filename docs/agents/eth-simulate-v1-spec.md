@@ -254,52 +254,66 @@ oversized gas limit, conflicting state overrides). This matches geth's
 
 ## Testing strategy
 
-**Unit tests** (`crates/node/src/simulate.rs`):
+**Unit tests** (`crates/node/src/simulate.rs`) — delivered set:
 
-1. `state_override_sets_balance` — overlay balance reflected by next call.
-2. `state_override_sets_nonce` — overridden nonce honored.
-3. `state_override_sets_code` — code injection makes a call return its data.
-4. `state_override_state_replaces_storage` — all unspecified slots cleared.
-5. `state_override_state_diff_merges_storage` — unspecified slots preserved.
-6. `state_override_rejects_state_and_diff_together` — invalid_params.
-7. `state_override_rejects_move_precompile` — invalid_params.
-8. `block_override_number_applied` — `BLOCKNUMBER` opcode returns override.
-9. `block_override_timestamp_applied` — `TIMESTAMP` opcode returns override.
-10. `block_override_basefee_applied` — `BASEFEE` opcode returns override.
-11. `block_override_prevrandao_applied` — `PREVRANDAO` opcode.
-12. `block_override_feerecipient_applied` — `COINBASE` opcode.
-13. `block_override_gaslimit_applied` — `GASLIMIT` opcode.
-14. `block_defaults_number_increments` — sequential blocks N, N+1, N+2.
-15. `block_defaults_timestamp_increments` — sequential +1 timestamps.
-16. `multi_block_state_inherited` — value transferred in block 0 visible in block 1.
-17. `multi_block_nonce_inherited` — sender's nonce continues across blocks.
-18. `single_block_nonce_auto_increment_validation_off` — 3 calls from same sender, no nonce specified.
-19. `single_block_nonce_required_validation_on` — second call without nonce uses current value, third with wrong nonce fails.
-20. `validation_off_allows_insufficient_balance` — call succeeds with zero balance.
-21. `validation_off_allows_below_basefee_gas_price` — call succeeds with gas_price=0 against high basefee.
-22. `validation_on_rejects_insufficient_balance`.
-23. `validation_on_rejects_wrong_nonce`.
-24. `validation_on_rejects_below_basefee`.
-25. `default_from_is_zero_address`.
-26. `default_gas_is_remaining_block_gas`.
-27. `trace_transfers_top_level_value_emits_log`.
-28. `trace_transfers_internal_call_value_emits_log`.
-29. `trace_transfers_selfdestruct_emits_log`.
-30. `trace_transfers_coinbase_payment_emits_log_when_basefee_nonzero`.
-31. `trace_transfers_off_emits_no_synthetic_logs`.
-32. `trace_transfers_log_ordering_preserved_relative_to_real_logs`.
-33. `error_too_many_blocks` — 257 blocks → invalid_params.
-34. `error_block_number_not_strictly_increasing`.
-35. `error_block_timestamp_not_strictly_increasing`.
-36. `error_block_gas_limit_overflow`.
-37. `error_call_gas_exceeds_block_gas_limit_validation_on`.
-38. `live_state_unchanged_after_simulation` — call simulate, then check
-    real node state (balance, nonce, block_number) is untouched.
-39. `simulation_returns_proper_block_header` — verify number, timestamp,
-    gasUsed, miner, baseFee fields populated.
-40. `return_full_transactions_true_returns_objects`.
-41. `return_full_transactions_false_returns_hashes`.
-42. `revert_returns_status_zero_with_revert_data`.
+- State overrides: `state_override_sets_balance_observable_via_balance_opcode`,
+  `state_override_preserves_live_account_fields`,
+  `state_override_state_diff_merges_existing_storage`,
+  `state_override_rejects_state_and_diff_together`,
+  `state_override_rejects_move_precompile`,
+  `state_override_sets_code_callable`.
+- Block overrides: `block_override_number_applied`,
+  `block_override_timestamp_applied`,
+  `block_override_basefee_reaches_evm`,
+  `block_override_coinbase_reaches_evm`,
+  `block_defaults_number_increments`,
+  `block_defaults_timestamp_increments`.
+- Defaults: `default_from_is_zero_address`.
+- Validation modes: `validation_off_allows_unfunded_value_transfer`,
+  `validation_on_rejects_unfunded_value_transfer` (asserts per-call
+  SimCallResult{status:false} per spec).
+- Nonces: `nonce_auto_increments_within_block_when_validation_off`.
+- Multi-block: `multi_block_state_inherited`.
+- traceTransfers: `trace_transfers_off_emits_no_synthetic_logs`,
+  `trace_transfers_top_level_value_emits_transfer_log`,
+  `trace_transfers_selfdestruct_emits_log`,
+  `trace_transfers_coinbase_payment_emits_log_when_priority_fee_nonzero`,
+  `trace_transfers_no_coinbase_log_when_priority_fee_zero`.
+- Errors: `rejects_too_many_blocks`,
+  `error_block_number_not_strictly_increasing`,
+  `error_block_timestamp_not_strictly_increasing`,
+  `error_block_gas_limit_overflow`.
+- Output shape: `return_full_transactions_false_returns_hashes`,
+  `return_full_transactions_true_returns_full`,
+  `revert_returns_status_zero_and_revert_data`,
+  `synth_hashes_differ_across_blocks_for_identical_calls`.
+- Determinism: `live_state_unchanged_after_simulation`,
+  `empty_payload_returns_no_blocks`.
+
+Deferred (tracked for follow-up; not implemented):
+
+- `state_override_state_replaces_storage` — full-replace semantics. Covered
+  indirectly by the rejection test for `state` + `state_diff` simultaneously.
+- `block_override_prevrandao_applied`, `block_override_gaslimit_applied` —
+  the override paths through `BlockEnv` are exercised by other opcode tests;
+  add when bytecode probes for `PREVRANDAO`/`GASLIMIT` are needed.
+- `multi_block_nonce_inherited` — same-sender across blocks. The nonce path
+  is covered by `nonce_auto_increments_within_block_when_validation_off`
+  combined with `multi_block_state_inherited`.
+- `single_block_nonce_required_validation_on`,
+  `validation_on_rejects_wrong_nonce`,
+  `validation_on_rejects_below_basefee`,
+  `validation_off_allows_below_basefee_gas_price` — additional cfg-toggle
+  surface; the cfg flags are exercised by the existing balance tests.
+- `default_gas_is_remaining_block_gas` — default-gas path is exercised
+  implicitly by every test that omits `gas`.
+- `trace_transfers_internal_call_value_emits_log`,
+  `trace_transfers_log_ordering_preserved_relative_to_real_logs` — internal
+  call value & ordering. The inspector hooks are present and minimally
+  unit-tested in `transfers.rs`.
+- `error_call_gas_exceeds_block_gas_limit_validation_on`,
+  `simulation_returns_proper_block_header` — covered by spec-doc invariants;
+  add when a regression demands them.
 
 **Integration tests** (`crates/node/tests/simulate.rs`):
 

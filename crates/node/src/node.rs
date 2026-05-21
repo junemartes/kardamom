@@ -106,6 +106,11 @@ impl Node {
         self.inner.read().await.receipts.get(&hash).cloned()
     }
 
+    /// Run an `eth_simulateV1` payload against the current head without
+    /// mutating live state. Only the `latest` / `pending` base block tags
+    /// resolve; anything else returns [`NodeError::UnsupportedBlockTag`].
+    /// Holds a read lock for the duration of the simulation, so it serializes
+    /// against `submit_raw_transaction` but runs in parallel with other reads.
     pub async fn simulate(
         &self,
         payload: SimulatePayload,
