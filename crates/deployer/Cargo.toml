@@ -39,3 +39,4 @@ serde_json.workspace = true
 alloy-node-bindings.workspace = true
 kardamom-node = { path = "../node" }
 tempfile = "3"
+toml.workspace = true
