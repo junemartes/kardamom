@@ -19,15 +19,14 @@ async fn harness_writes_flame_with_node_spans() {
 
     let bench = Benchmark {
         workflow: TransfersWorkflow::default(),
-        // Sized larger than warmup + timeout can consume against an
-        // in-process node, so the deadline (not work exhaustion) ends the
-        // dispatch and the flame layer sees the full measurement window.
-        // Kept small enough that debug-build ECDSA presigning is tolerable.
+        // Sized larger than the timeout can consume against an in-process
+        // node, so the deadline (not work exhaustion) ends the dispatch
+        // and the flame layer sees the full measurement window. Kept
+        // small enough that debug-build ECDSA presigning is tolerable.
         txs_per_task: 2_000,
         max_in_flight: 8,
         timeout: Duration::from_millis(800),
         concurrency: 4,
-        warmup: Duration::from_millis(200),
     };
 
     Harness {

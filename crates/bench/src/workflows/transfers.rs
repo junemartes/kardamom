@@ -7,10 +7,11 @@ use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 use kardamom_node::AllocEntry;
 
+use crate::benchmark::Prepared;
 use crate::mnemonic;
 use crate::signers::presign_transfers;
 use crate::workflow::{BenchWorkflow, default_signer_balance};
-use crate::workflows::{ANVIL_MNEMONIC, TRANSFER_SINK};
+use crate::workflows::{ANVIL_MNEMONIC, TRANSFER_SINK, WARMUP_PER_TASK};
 
 const METHOD: &str = "eth_sendRawTransaction";
 
@@ -53,22 +54,37 @@ impl BenchWorkflow for TransfersWorkflow {
         client: &HttpClient,
         n_tasks: u32,
         txs_per_task: u32,
-    ) -> anyhow::Result<Vec<Vec<Self::Item>>> {
+    ) -> anyhow::Result<Prepared<Self::Item>> {
         let chain_id = preflight_chain_id(client).await?;
         let signers = mnemonic::derive_signers(&self.mnemonic, n_tasks)?;
-        let mut tasks: Vec<Vec<Bytes>> = Vec::with_capacity(signers.len());
+        // Warmup: one flat queue, round-robin across all signers for
+        // nonces 0..WARMUP_PER_TASK. The sequential warmup loop preserves
+        // per-signer nonce ordering because each signer's k-th tx is
+        // emitted before any signer's (k+1)-th.
+        let warmup = presign_transfers(
+            &signers,
+            chain_id,
+            TRANSFER_SINK,
+            U256::from(1u64),
+            WARMUP_PER_TASK * signers.len(),
+            0,
+        )?;
+        // Main: per-task chunks, each signer signs its own
+        // `txs_per_task` items starting at nonce WARMUP_PER_TASK so the
+        // sequence picks up where warmup left off.
+        let mut main: Vec<Vec<Bytes>> = Vec::with_capacity(signers.len());
         for s in &signers {
-            let presigned = presign_transfers(
+            let main_chunk = presign_transfers(
                 std::slice::from_ref(s),
                 chain_id,
                 TRANSFER_SINK,
                 U256::from(1u64),
                 txs_per_task as usize,
-                0,
+                WARMUP_PER_TASK as u64,
             )?;
-            tasks.push(presigned);
+            main.push(main_chunk);
         }
-        Ok(tasks)
+        Ok(Prepared { warmup, main })
     }
 
     async fn dispatch(&self, client: &HttpClient, item: Bytes) -> (&'static str, bool) {

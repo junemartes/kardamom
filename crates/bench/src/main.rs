@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 
 use kardamom_bench::config::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_STR, DEFAULT_TXS_PER_TASK,
-    DEFAULT_WARMUP_STR, MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT,
+    MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT,
 };
 use kardamom_bench::report::{self, ReportInputs};
 use kardamom_bench::{
@@ -28,16 +28,11 @@ struct Args {
     #[arg(long)]
     rpc: String,
 
-    /// Safety timeout for the measurement window — senders also stop when
-    /// their work vec is drained, whichever comes first.
+    /// Safety timeout applied to each phase (warmup and dispatch get one
+    /// each). Senders also stop when their work vec is drained, whichever
+    /// comes first.
     #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_TIMEOUT_STR)]
     timeout: Duration,
-
-    /// Pure sleep gap between `prepare` and `dispatch`. No senders run
-    /// during this window — its only purpose is letting OS/CPU caches and
-    /// the JIT settle before the measurement begins.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_WARMUP_STR)]
-    warmup: Duration,
 
     /// Number of sender tasks (= number of derived signers, one per task).
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
@@ -114,7 +109,6 @@ fn bench_with<W: BenchWorkflow>(workflow: W, args: &Args) -> Benchmark<W> {
     Benchmark {
         workflow,
         timeout: args.timeout,
-        warmup: args.warmup,
         concurrency: args.concurrency,
         txs_per_task: args.txs_per_task,
         max_in_flight: args.max_in_flight,

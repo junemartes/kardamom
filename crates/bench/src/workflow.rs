@@ -14,6 +14,8 @@
 use jsonrpsee::http_client::HttpClient;
 use kardamom_node::AllocEntry;
 
+use crate::benchmark::Prepared;
+
 /// One workload definition: genesis state to set up, work-vec preparation
 /// against a live client, and per-item dispatch. Generic plug point for
 /// [`crate::Benchmark`].
@@ -44,15 +46,24 @@ pub trait BenchWorkflow: Clone + Send + Sync + 'static {
     fn genesis_alloc(&self, n_tasks: u32) -> anyhow::Result<Vec<AllocEntry>>;
 
     /// Preflight against a live client and build per-task work vecs. Called
-    /// once before dispatch — all crypto (signing, key derivation), all
-    /// chain-state probes, and all scheduling logic live here. Returns one
-    /// inner `Vec<Self::Item>` per sender task (`n_tasks` outer entries).
+    /// once before warmup + dispatch — all crypto (signing, key derivation),
+    /// all chain-state probes, and all scheduling logic live here.
+    ///
+    /// Returns a [`Prepared`] containing two `n_tasks`-by-* vecs:
+    /// - `warmup` — work items the harness runs unmetered before metering
+    ///   starts (warms the JIT, caches, and any one-shot allocations).
+    /// - `main` — the metered dispatch work; `txs_per_task` items per task.
+    ///
+    /// The workflow chooses its own warmup volume — typically a small
+    /// fixed per-task constant. For workloads where warmup tx state must
+    /// align with main tx state (e.g. transfers consume nonces), the
+    /// workflow must lay them out in the right order itself.
     fn prepare(
         &self,
         client: &HttpClient,
         n_tasks: u32,
         txs_per_task: u32,
-    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Vec<Self::Item>>>> + Send;
+    ) -> impl std::future::Future<Output = anyhow::Result<Prepared<Self::Item>>> + Send;
 
     /// Dispatch one item against the RPC. Returns the histogram bucket key
     /// (must be one of `self.methods()`) and whether the call succeeded.

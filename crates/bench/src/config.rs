@@ -7,13 +7,10 @@
 use std::time::Duration;
 
 /// Default `--timeout` value used by the CLI when the user doesn't set
-/// one. Long enough to cover a meaningful warmup + measurement window
-/// without leaving the bench running unattended for minutes.
+/// one. Applied independently to the warmup and dispatch phases. Long
+/// enough to cover a meaningful measurement window without leaving the
+/// bench running unattended for minutes.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Default `--warmup` window between `prepare` and `dispatch`. Pure sleep
-/// — no senders run. Lets OS / CPU caches settle before measurement.
-pub const DEFAULT_WARMUP: Duration = Duration::from_secs(2);
 
 /// Default number of sender tasks (= one signer per task).
 pub const DEFAULT_CONCURRENCY: u32 = 16;
@@ -28,9 +25,6 @@ pub const DEFAULT_MAX_IN_FLIGHT: u32 = 5;
 /// String form of [`DEFAULT_TIMEOUT`] for `clap`'s `default_value`
 /// (clap needs a `&str` that's then parsed by `humantime::parse_duration`).
 pub const DEFAULT_TIMEOUT_STR: &str = "10s";
-
-/// String form of [`DEFAULT_WARMUP`] for `clap`'s `default_value`.
-pub const DEFAULT_WARMUP_STR: &str = "2s";
 
 /// jsonrpsee client request timeout. Long enough that the slowest
 /// expected in-process call (a contended write-tx) doesn't trip it.

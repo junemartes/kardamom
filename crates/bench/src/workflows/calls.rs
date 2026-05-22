@@ -8,9 +8,12 @@ use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 use kardamom_node::AllocEntry;
 
+use crate::benchmark::Prepared;
 use crate::workflow::{BenchWorkflow, default_signer_balance};
 use crate::workflows::transfers::{preflight_chain_id, prefunded_signer_allocs};
-use crate::workflows::{ANVIL_MNEMONIC, DEFAULT_CALL_CONTRACT, default_call_bytecode};
+use crate::workflows::{
+    ANVIL_MNEMONIC, DEFAULT_CALL_CONTRACT, WARMUP_PER_TASK, default_call_bytecode,
+};
 
 const METHOD: &str = "eth_call";
 
@@ -68,7 +71,7 @@ impl BenchWorkflow for CallsWorkflow {
         client: &HttpClient,
         n_tasks: u32,
         txs_per_task: u32,
-    ) -> anyhow::Result<Vec<Vec<Self::Item>>> {
+    ) -> anyhow::Result<Prepared<Self::Item>> {
         let _chain_id = preflight_chain_id(client).await?;
         // Verify the contract is actually deployed at the expected address.
         let req = TransactionRequest {
@@ -90,11 +93,14 @@ impl BenchWorkflow for CallsWorkflow {
             )
         }
 
-        // Per-task work: just `txs_per_task` empty markers. The actual
-        // request body is built per-iteration in `dispatch` from `self`.
-        Ok((0..n_tasks)
+        // No per-item state for `eth_call` — both warmup and main are just
+        // unit markers; the actual request is built per-iteration in
+        // `dispatch` from `self`.
+        let warmup = vec![(); WARMUP_PER_TASK * n_tasks as usize];
+        let main = (0..n_tasks)
             .map(|_| vec![(); txs_per_task as usize])
-            .collect())
+            .collect();
+        Ok(Prepared { warmup, main })
     }
 
     async fn dispatch(&self, client: &HttpClient, _item: ()) -> (&'static str, bool) {

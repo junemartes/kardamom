@@ -11,7 +11,6 @@ use jsonrpsee::http_client::HttpClient;
 
 use crate::config::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT, DEFAULT_TXS_PER_TASK,
-    DEFAULT_WARMUP,
 };
 use crate::report::Counters;
 use crate::workflow::BenchWorkflow;
@@ -26,13 +25,11 @@ pub struct Benchmark<W: BenchWorkflow> {
     /// Workflow that produces work items and dispatches them. Generic
     /// over [`BenchWorkflow`] so external crates can plug in their own.
     pub workflow: W,
-    /// Safety timeout for the measurement window. The runtime applies
-    /// `tokio::time::timeout(timeout, ...)` per sender task; whichever
-    /// of "vec drained" or "timeout fired" comes first ends the run.
+    /// Safety timeout applied to each phase (warmup and dispatch get one
+    /// each). The runtime applies `tokio::time::timeout(timeout, ...)`
+    /// per sender task; whichever of "vec drained" or "timeout fired"
+    /// comes first ends the phase.
     pub timeout: Duration,
-    /// Pure sleep gap between `prepare` and `dispatch`. No senders run
-    /// during it; it lets OS / CPU caches settle before measurement.
-    pub warmup: Duration,
     /// Number of sender tasks (= number of derived signers, one per
     /// task). Built-in workflows use this to size their alloc set.
     pub concurrency: u32,
@@ -50,7 +47,6 @@ impl<W: BenchWorkflow + Default> Default for Benchmark<W> {
         Self {
             workflow: W::default(),
             timeout: DEFAULT_TIMEOUT,
-            warmup: DEFAULT_WARMUP,
             concurrency: DEFAULT_CONCURRENCY,
             txs_per_task: DEFAULT_TXS_PER_TASK,
             max_in_flight: DEFAULT_MAX_IN_FLIGHT,
@@ -58,19 +54,32 @@ impl<W: BenchWorkflow + Default> Default for Benchmark<W> {
     }
 }
 
-/// Per-task work vecs returned by `prepare`. Opaque to callers; pass back
-/// into `dispatch`.
+/// Work items returned by [`BenchWorkflow::prepare`]. Two phases with
+/// different shapes:
+/// - `warmup` is a single flat queue dispatched **sequentially** by one
+///   sender — no concurrency, no metering.
+/// - `main` is `n_tasks`-by-`txs_per_task` and runs concurrently in the
+///   metered dispatch window.
+///
+/// Workflows that align tx state across phases (e.g. transfers consume
+/// nonces) must lay the warmup queue out so the per-task `main` chunks
+/// pick up at the right nonce.
 pub struct Prepared<I> {
-    tasks: Vec<Vec<I>>,
+    /// Flat warmup queue. Dispatched sequentially by a single sender,
+    /// unmetered.
+    pub warmup: Vec<I>,
+    /// Per-task metered dispatch items — what the report measures.
+    pub main: Vec<Vec<I>>,
 }
 
 impl<I> std::fmt::Debug for Prepared<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Prepared")
-            .field("tasks", &self.tasks.len())
+            .field("warmup_items", &self.warmup.len())
+            .field("tasks", &self.main.len())
             .field(
-                "items_per_task",
-                &self.tasks.first().map_or(0, std::vec::Vec::len),
+                "main_per_task",
+                &self.main.first().map_or(0, std::vec::Vec::len),
             )
             .finish()
     }
@@ -94,7 +103,7 @@ pub struct Outputs {
 impl<W: BenchWorkflow> Benchmark<W> {
     /// Stage 1 — build per-task work vecs against a live client. All
     /// crypto, all signer derivation, all chain-state probes happen here.
-    /// **No measurement.**
+    /// **No measurement.** Returns both warmup and main items per task.
     ///
     /// # Errors
     ///
@@ -110,14 +119,52 @@ impl<W: BenchWorkflow> Benchmark<W> {
         if self.txs_per_task == 0 {
             anyhow::bail!("Benchmark.txs_per_task must be > 0");
         }
-        let tasks = self
-            .workflow
+        self.workflow
             .prepare(client, self.concurrency, self.txs_per_task)
-            .await?;
-        Ok(Prepared { tasks })
+            .await
     }
 
-    /// Stage 2 — the measured window. Spawns one sender task per work vec
+    /// Stage 2 — drain the warmup queue **sequentially** with a single
+    /// in-flight request, unmetered. No histograms, no counters, no
+    /// concurrency — the whole point is to JIT/warm the hot paths and
+    /// stabilize chain state before the metered window. The caller is
+    /// expected to keep flame/pprof recording gates *off* during this call.
+    ///
+    /// Bounded by `self.timeout` total wall-clock; whichever of "queue
+    /// drained" or "timeout fired" comes first ends the phase.
+    ///
+    /// A no-op (returns immediately) when `warmup` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Workflow dispatch errors are intentionally swallowed — warmup is
+    /// best-effort.
+    pub async fn warmup(
+        &self,
+        client: &HttpClient,
+        warmup: Vec<W::Item>,
+    ) -> anyhow::Result<()> {
+        if warmup.is_empty() {
+            return Ok(());
+        }
+        let total = warmup.len();
+        let workflow = self.workflow.clone();
+        let start = Instant::now();
+        let _ = tokio::time::timeout(self.timeout, async {
+            for item in warmup {
+                let _ = workflow.dispatch(client, item).await;
+            }
+        })
+        .await;
+        tracing::info!(
+            items = total,
+            elapsed = ?start.elapsed(),
+            "benchmark: warmup complete"
+        );
+        Ok(())
+    }
+
+    /// Stage 3 — the measured window. Spawns one sender task per work vec
     /// inside a `tokio::time::timeout(self.timeout, ...)`. Each sender
     /// loops serially over its vec (per-task in-flight = 1); the
     /// runtime-wide `max_in_flight` budget is enforced at the HTTP client
@@ -141,7 +188,7 @@ impl<W: BenchWorkflow> Benchmark<W> {
     pub async fn dispatch(
         &self,
         client: HttpClient,
-        prepared: Prepared<W::Item>,
+        main: Vec<Vec<W::Item>>,
     ) -> anyhow::Result<Outputs> {
         let methods = self.workflow.methods();
         let workflow = Arc::new(self.workflow.clone());
@@ -149,9 +196,9 @@ impl<W: BenchWorkflow> Benchmark<W> {
 
         let start = Instant::now();
 
-        let mut accums: Vec<Arc<TaskAccum>> = Vec::with_capacity(prepared.tasks.len());
-        let mut handles = Vec::with_capacity(prepared.tasks.len());
-        for work in prepared.tasks {
+        let mut accums: Vec<Arc<TaskAccum>> = Vec::with_capacity(main.len());
+        let mut handles = Vec::with_capacity(main.len());
+        for work in main {
             let accum = Arc::new(TaskAccum::new(methods)?);
             accums.push(Arc::clone(&accum));
             let client = Arc::clone(&client);
@@ -214,21 +261,19 @@ impl<W: BenchWorkflow> Benchmark<W> {
         })
     }
 
-    /// Convenience: `prepare` → optional `sleep(warmup)` → `dispatch`. The
-    /// warmup is a pure idle gap — no senders run during it. Callers that
-    /// need finer scoping (the in-process harness flips flame/pprof gates
+    /// Convenience: `prepare` → `warmup` → `dispatch`. Callers that need
+    /// finer scoping (the in-process harness flips flame/pprof gates
     /// between warmup and dispatch) should call the stages separately.
     ///
     /// # Errors
     ///
     /// Forwards errors from `workflow.prepare` (chain-state probes,
-    /// signer derivation, presigning) and from `Benchmark::dispatch`.
+    /// signer derivation, presigning), `Benchmark::warmup`, and
+    /// `Benchmark::dispatch`.
     pub async fn run(&self, client: HttpClient) -> anyhow::Result<Outputs> {
         let prepared = self.prepare(&client).await?;
-        if !self.warmup.is_zero() {
-            tokio::time::sleep(self.warmup).await;
-        }
-        self.dispatch(client, prepared).await
+        self.warmup(&client, prepared.warmup).await?;
+        self.dispatch(client, prepared.main).await
     }
 }
 
@@ -297,7 +342,6 @@ mod tests {
         Benchmark {
             workflow: TransfersWorkflow::default(),
             timeout: Duration::from_secs(1),
-            warmup: Duration::ZERO,
             concurrency,
             txs_per_task,
             max_in_flight: 1,

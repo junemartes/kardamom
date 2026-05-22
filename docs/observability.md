@@ -97,14 +97,15 @@ For a tight flamegraph scoped exactly to the dispatch window, use the
 embedded harness. It boots a kardamom node in-process, derives the
 workflow's signer set, prefunds them in the in-process genesis
 automatically, drives load, and gates `tracing-flame` recording to the
-dispatch phase only (signer derivation, presigning, warmup are all
-excluded via an `AtomicBool`-driven `FilterFn`).
+dispatch phase only (signer derivation, presigning, and the workflow's
+own sequential warmup queue are all excluded via an `AtomicBool`-driven
+`FilterFn`).
 
 ```sh
 cargo build --release --bin kardamom-bench-harness
 
 ./target/release/kardamom-bench-harness \
-  --timeout 10s --warmup 2s --concurrency 32 \
+  --timeout 10s --concurrency 32 \
   --flame-out /tmp/flame.folded \
   transfers
 
@@ -126,7 +127,7 @@ window as the `tracing-flame` recording.
 
 ```sh
 ./target/release/kardamom-bench-harness \
-  --timeout 10s --warmup 1s --concurrency 128 \
+  --timeout 10s --concurrency 128 \
   --max-in-flight 30 \
   --flame-out /tmp/flame.folded \
   --pprof-out /tmp/cpu.svg \
@@ -145,7 +146,8 @@ write workload — most CPU is on the bench side) so you can see how
 aggressive the filter was.
 
 Both outputs are restricted to the dispatch window: neither sees prepare-
-phase ECDSA presigning, warmup sleep, server startup, or shutdown.
+phase ECDSA presigning, the workflow's sequential warmup queue, server
+startup, or shutdown.
 Symbolication is handled in-process by `pprof-rs`, so no `dsymutil` /
 `.dSYM` dance is needed.
 

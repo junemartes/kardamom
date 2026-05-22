@@ -16,6 +16,7 @@ use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 
 use kardamom_bench::Benchmark;
+use kardamom_bench::benchmark::Prepared;
 use kardamom_bench::harness::Harness;
 use kardamom_bench::workflow::BenchWorkflow;
 use kardamom_node::AllocEntry;
@@ -46,11 +47,14 @@ impl BenchWorkflow for BlockNumberWorkflow {
         _client: &HttpClient,
         n_tasks: u32,
         txs_per_task: u32,
-    ) -> anyhow::Result<Vec<Vec<()>>> {
-        // Same per-task work for everyone: `txs_per_task` empty markers.
-        Ok((0..n_tasks)
+    ) -> anyhow::Result<Prepared<Self::Item>> {
+        // No real warmup needed for `eth_blockNumber` — but produce a few
+        // unit markers so the harness exercises the warmup path.
+        let warmup = vec![(); 64];
+        let main = (0..n_tasks)
             .map(|_| vec![(); txs_per_task as usize])
-            .collect())
+            .collect();
+        Ok(Prepared { warmup, main })
     }
 
     async fn dispatch(&self, client: &HttpClient, _item: ()) -> (&'static str, bool) {
@@ -67,7 +71,6 @@ async fn main() -> anyhow::Result<()> {
     let bench = Benchmark {
         workflow: BlockNumberWorkflow,
         timeout: Duration::from_secs(3),
-        warmup: Duration::from_millis(500),
         concurrency: 8,
         txs_per_task: 5_000,
         max_in_flight: 8,

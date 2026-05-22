@@ -63,10 +63,11 @@ impl<W: BenchWorkflow> Harness<W> {
     /// Build the node + RPC server and drive a measured dispatch with
     /// flame/pprof recording scoped to the dispatch window.
     ///
-    /// Flow: prepare the workflow against a live client, sleep out the
-    /// warmup gap, then flip the flame/pprof gates on and run the
-    /// dispatch. The recordings see only the dispatch window — no signer
-    /// derivation, no presigning, no warmup.
+    /// Flow: prepare the workflow against a live client, drain the
+    /// workflow's warmup queue sequentially with recordings off, then
+    /// flip the flame/pprof gates on and run the metered dispatch. The
+    /// recordings see only the dispatch window — no signer derivation,
+    /// no presigning, no warmup.
     ///
     /// # Errors
     ///
@@ -90,17 +91,17 @@ impl<W: BenchWorkflow> Harness<W> {
         // flame/pprof gates flip on.
         let prepared = self.bench.prepare(&client).await?;
 
-        // Warmup is a pure sleep gap before dispatch — no senders run
-        // during it. After the sleep we flip the flame gate and build the
-        // pprof guard, then call dispatch, then drop the guard. The
-        // recordings see only the dispatch window.
-        self.warmup_sleep().await;
+        // Drain the warmup queue with the flame/pprof gates still off.
+        // After warmup we build the pprof guard, flip the flame gate, and
+        // run the metered dispatch. The recordings see only the dispatch
+        // window.
+        self.bench.warmup(&client, prepared.warmup).await?;
         let pprof_guard = self.build_pprof_guard()?;
         self.log_dispatch_start();
 
         let outputs = {
             let _scope = ActiveScope::enter(&active);
-            self.bench.dispatch(client, prepared).await?
+            self.bench.dispatch(client, prepared.main).await?
         };
 
         self.write_flame_output(flame_guard)?;
@@ -184,13 +185,6 @@ impl<W: BenchWorkflow> Harness<W> {
             .build(&url)?;
 
         Ok((client, server_handle))
-    }
-
-    async fn warmup_sleep(&self) {
-        if !self.bench.warmup.is_zero() {
-            tracing::info!(duration = ?self.bench.warmup, "harness: warmup sleep");
-            tokio::time::sleep(self.bench.warmup).await;
-        }
     }
 
     fn build_pprof_guard(&self) -> anyhow::Result<Option<pprof::ProfilerGuard<'static>>> {

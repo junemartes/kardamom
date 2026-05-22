@@ -11,7 +11,6 @@ use clap::{Parser, Subcommand};
 
 use kardamom_bench::config::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_STR, DEFAULT_TXS_PER_TASK,
-    DEFAULT_WARMUP_STR,
 };
 use kardamom_bench::harness::Harness;
 use kardamom_bench::{BenchWorkflow, Benchmark, CallsWorkflow, MixedWorkflow, TransfersWorkflow};
@@ -30,16 +29,10 @@ struct Args {
     #[arg(long, default_value_t = 412_346)]
     chain_id: u64,
 
-    /// Safety timeout for the measurement window; senders also stop when
-    /// their work vec is drained.
+    /// Safety timeout applied to each phase (warmup and dispatch get one
+    /// each); senders also stop when their work vec is drained.
     #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_TIMEOUT_STR)]
     timeout: Duration,
-
-    /// Pure sleep gap between `prepare` and `dispatch`. No senders run
-    /// during this window — flame and pprof recordings stay off, and the
-    /// only thing that happens is the OS/CPU settling.
-    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_WARMUP_STR)]
-    warmup: Duration,
 
     /// Number of sender tasks (= number of derived signers, one per task).
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
@@ -91,7 +84,6 @@ async fn harness_with<W: BenchWorkflow>(workflow: W, args: &Args) -> anyhow::Res
     let bench = Benchmark {
         workflow,
         timeout: args.timeout,
-        warmup: args.warmup,
         concurrency: args.concurrency,
         txs_per_task: args.txs_per_task,
         max_in_flight: args.max_in_flight,

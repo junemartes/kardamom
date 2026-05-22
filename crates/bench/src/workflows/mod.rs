@@ -35,3 +35,8 @@ pub(crate) const fn default_call_bytecode() -> Bytes {
 /// mixed workloads. A 20-byte all-`0xBE` sink — non-precompile, doesn't
 /// collide with the signers, doesn't matter where it lives.
 pub(crate) const TRANSFER_SINK: Address = Address::new([0xBEu8; 20]);
+
+/// Number of warmup work items each built-in workflow produces per task.
+/// Sized to JIT-compile revm hot paths and warm jsonrpsee / hyper buffers
+/// without dominating the run wall-clock.
+pub(crate) const WARMUP_PER_TASK: usize = 100;

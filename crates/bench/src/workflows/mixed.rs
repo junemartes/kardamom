@@ -8,12 +8,13 @@ use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 use kardamom_node::AllocEntry;
 
+use crate::benchmark::Prepared;
 use crate::mnemonic;
 use crate::signers::presign_transfers;
 use crate::workflow::{BenchWorkflow, default_signer_balance};
 use crate::workflows::transfers::{preflight_chain_id, prefunded_signer_allocs};
 use crate::workflows::{
-    ANVIL_MNEMONIC, DEFAULT_CALL_CONTRACT, TRANSFER_SINK, default_call_bytecode,
+    ANVIL_MNEMONIC, DEFAULT_CALL_CONTRACT, TRANSFER_SINK, WARMUP_PER_TASK, default_call_bytecode,
 };
 
 const SEND_RAW: &str = "eth_sendRawTransaction";
@@ -86,7 +87,7 @@ impl BenchWorkflow for MixedWorkflow {
         client: &HttpClient,
         n_tasks: u32,
         txs_per_task: u32,
-    ) -> anyhow::Result<Vec<Vec<Self::Item>>> {
+    ) -> anyhow::Result<Prepared<Self::Item>> {
         let cycle_total = self
             .transfers_per_cycle
             .saturating_add(self.calls_per_cycle);
@@ -113,13 +114,38 @@ impl BenchWorkflow for MixedWorkflow {
 
         let signers = mnemonic::derive_signers(&self.mnemonic, n_tasks)?;
 
-        // Per task: (txs_per_task * transfers_per_cycle / cycle_total) transfers,
-        // the rest calls, interleaved in the configured ratio.
+        // Same transfers-per-cap ratio as the original main calculation,
+        // applied to both warmup and main.
         let transfers_per_task = (txs_per_task as usize)
             .saturating_mul(self.transfers_per_cycle as usize)
             / cycle_total as usize;
+        let warmup_transfers_per_task = WARMUP_PER_TASK
+            .saturating_mul(self.transfers_per_cycle as usize)
+            / cycle_total as usize;
 
-        let mut tasks: Vec<Vec<MixedItem>> = Vec::with_capacity(signers.len());
+        // Warmup transfers: round-robin presign across all signers at
+        // nonces 0..warmup_transfers_per_task. Main transfers per signer
+        // resume at that nonce. Interleave each phase into its own queue.
+        let warmup_presigned = if warmup_transfers_per_task > 0 {
+            presign_transfers(
+                &signers,
+                chain_id,
+                TRANSFER_SINK,
+                U256::from(1u64),
+                warmup_transfers_per_task * signers.len(),
+                0,
+            )?
+        } else {
+            Vec::new()
+        };
+        let warmup = interleave(
+            warmup_presigned,
+            WARMUP_PER_TASK * signers.len(),
+            self.transfers_per_cycle as usize,
+            self.calls_per_cycle as usize,
+        );
+
+        let mut main: Vec<Vec<MixedItem>> = Vec::with_capacity(signers.len());
         for s in &signers {
             let presigned = if transfers_per_task > 0 {
                 presign_transfers(
@@ -128,19 +154,19 @@ impl BenchWorkflow for MixedWorkflow {
                     TRANSFER_SINK,
                     U256::from(1u64),
                     transfers_per_task,
-                    0,
+                    warmup_transfers_per_task as u64,
                 )?
             } else {
                 Vec::new()
             };
-            tasks.push(interleave(
+            main.push(interleave(
                 presigned,
                 txs_per_task as usize,
                 self.transfers_per_cycle as usize,
                 self.calls_per_cycle as usize,
             ));
         }
-        Ok(tasks)
+        Ok(Prepared { warmup, main })
     }
 
     async fn dispatch(&self, client: &HttpClient, item: MixedItem) -> (&'static str, bool) {
