@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     Harness {
         chain_id: 412_346,
         bench,
-        flame_out: "/tmp/k-custom-flame.folded".into(),
+        flame_out: "/tmp/k-custom-flame.svg".into(),
         report_json: None,
         pprof_out: None,
     }

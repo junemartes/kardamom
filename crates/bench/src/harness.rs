@@ -48,8 +48,9 @@ pub struct Harness<W: BenchWorkflow> {
     pub chain_id: u64,
     /// The benchmark dispatcher this harness drives.
     pub bench: Benchmark<W>,
-    /// Path to write the `tracing-flame` folded output. Post-processed
-    /// to drop per-worker thread prefixes before being written.
+    /// Path to write the `tracing-flame` SVG. Merged across tokio
+    /// workers and rendered via inferno (no `inferno-flamegraph` CLI
+    /// post-processing required).
     pub flame_out: PathBuf,
     /// If set, write the [`BenchReport`](crate::report::BenchReport) as
     /// pretty JSON to this path in addition to printing to stdout.
@@ -113,6 +114,14 @@ impl<W: BenchWorkflow> Harness<W> {
         Ok(())
     }
 
+    /// Sidecar path next to the SVG output where `tracing-flame` writes
+    /// its raw folded text. Deleted after the SVG is rendered.
+    fn folded_tmp_path(&self) -> PathBuf {
+        let mut p = self.flame_out.clone().into_os_string();
+        p.push(".folded.tmp");
+        PathBuf::from(p)
+    }
+
     /// Install the global tracing subscriber with the gated flame layer.
     /// Returns the active-flag `AtomicBool` (flipped on around the
     /// dispatch window) and the flame layer's flush guard.
@@ -124,7 +133,7 @@ impl<W: BenchWorkflow> Harness<W> {
             .unwrap_or_else(|_| EnvFilter::new("kardamom=info,kardamom_bench=info"));
         let fmt_layer = fmt::layer();
 
-        let (flame, flame_guard) = FlameLayer::with_file(&self.flame_out)?;
+        let (flame, flame_guard) = FlameLayer::with_file(self.folded_tmp_path())?;
         let gated_flame = flame.with_filter(FilterFn::new(move |_meta| {
             active_for_filter.load(Ordering::Relaxed)
         }));
@@ -212,25 +221,34 @@ impl<W: BenchWorkflow> Harness<W> {
         );
     }
 
-    /// Flush the flame layer, then post-process `flame.folded` to drop the
-    /// per-worker thread prefix and bucket identical stacks.
+    /// Flush the flame layer, merge across tokio workers, and render the
+    /// result to an inferno-flamegraph SVG at `self.flame_out`. The raw
+    /// folded sidecar is cleaned up on the way out.
     fn write_flame_output(&self, flame_guard: FlushGuard<BufWriter<File>>) -> anyhow::Result<()> {
         flame_guard
             .flush()
             .map_err(|e| anyhow::anyhow!("flush flamegraph: {e}"))?;
-        // Drop the guard before rewriting the file so no further writes
-        // race with the merge step below.
+        // Drop the guard before reading so no further writes race with us.
         drop(flame_guard);
-        let raw_flame = std::fs::read_to_string(&self.flame_out)
-            .map_err(|e| anyhow::anyhow!("read {}: {e}", self.flame_out.display()))?;
+        let folded_tmp = self.folded_tmp_path();
+        let raw_flame = std::fs::read_to_string(&folded_tmp)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", folded_tmp.display()))?;
         let merged_flame = merge_folded_text(&raw_flame);
-        std::fs::write(&self.flame_out, &merged_flame)
-            .map_err(|e| anyhow::anyhow!("write {}: {e}", self.flame_out.display()))?;
+
+        let svg = File::create(&self.flame_out)
+            .map_err(|e| anyhow::anyhow!("create {}: {e}", self.flame_out.display()))?;
+        let mut opts = flamegraph_options();
+        pprof::flamegraph::from_lines(&mut opts, merged_flame.lines(), svg).map_err(|e| {
+            anyhow::anyhow!("render flame SVG to {}: {e}", self.flame_out.display())
+        })?;
+        // Best-effort cleanup. Leaving the sidecar around isn't fatal,
+        // just untidy.
+        let _ = std::fs::remove_file(&folded_tmp);
         tracing::info!(
             flame_out = %self.flame_out.display(),
             raw_bytes = raw_flame.len(),
             merged_bytes = merged_flame.len(),
-            "harness: merged flame.folded across tokio workers"
+            "harness: rendered tracing-flame SVG (merged across tokio workers)"
         );
         Ok(())
     }
@@ -261,7 +279,7 @@ impl<W: BenchWorkflow> Harness<W> {
         let merged_pprof = merge_folded_text(&pprof_folded);
         let file = File::create(path)
             .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
-        let mut opts = pprof::flamegraph::Options::default();
+        let mut opts = flamegraph_options();
         pprof::flamegraph::from_lines(&mut opts, merged_pprof.lines(), file)
             .map_err(|e| anyhow::anyhow!("render pprof flamegraph to {}: {e}", path.display()))?;
         tracing::info!(
@@ -292,6 +310,17 @@ impl<W: BenchWorkflow> Harness<W> {
         }
         Ok(())
     }
+}
+
+/// Inferno-flamegraph options shared by the tracing-flame and pprof
+/// renderers. `min_width = 0.0` keeps narrow frames visible (matches
+/// `inferno-flamegraph --minwidth 0`); `image_width = 2000` is enough
+/// resolution for the dispatch-window stacks without bloating the SVG.
+fn flamegraph_options() -> pprof::flamegraph::Options<'static> {
+    let mut opts = pprof::flamegraph::Options::default();
+    opts.min_width = 0.0;
+    opts.image_width = Some(2_000);
+    opts
 }
 
 /// Substring matched against demangled symbol names to decide whether a

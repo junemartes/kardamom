@@ -106,12 +106,15 @@ cargo build --release --bin kardamom-bench-harness
 
 ./target/release/kardamom-bench-harness \
   --timeout 10s --concurrency 32 \
-  --flame-out /tmp/flame.folded \
+  --flame-out /tmp/flame.svg \
   transfers
 
-grep ';' /tmp/flame.folded | inferno-flamegraph --minwidth 0 --width 40000 > /tmp/flame.svg
 open /tmp/flame.svg
 ```
+
+The harness merges the per-tokio-worker stacks in memory and renders the
+SVG via inferno itself — no external `inferno-flamegraph` post-processing
+step needed.
 
 The three built-in workloads are subcommands: `transfers`, `calls`,
 `mixed`. Each uses hardcoded defaults (Anvil test mnemonic, deterministic

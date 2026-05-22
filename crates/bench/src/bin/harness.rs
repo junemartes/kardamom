@@ -18,11 +18,12 @@ use kardamom_bench::{BenchWorkflow, Benchmark, CallsWorkflow, MixedWorkflow, Tra
 #[derive(Parser, Debug)]
 #[command(
     name = "kardamom-bench-harness",
-    about = "Run the bench against an in-process kardamom node and write flame.folded for the measurement window only."
+    about = "Run the bench against an in-process kardamom node and write a tracing-flame SVG for the measurement window only."
 )]
 struct Args {
-    /// Path to write `flame.folded`. Render with `inferno-flamegraph`.
-    #[arg(long, default_value = "flame.folded")]
+    /// Path to write the tracing-flame SVG. Ready to open in a browser
+    /// — no `inferno-flamegraph` post-processing needed.
+    #[arg(long, default_value = "flame.svg")]
     flame_out: PathBuf,
 
     /// Chain ID for the in-process node.
