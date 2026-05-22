@@ -21,6 +21,9 @@ sol! {
 
 /// Must match deployer/tests/factory_address_sync.rs and KardamomUUPSBase.FACTORY.
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
+/// Arbitrary L1 EOA that deposits — distinct from DEV_OWNER to prove the
+/// lockbox accepts deposits from any caller, not just the factory owner.
+const DEPOSITOR: Address = address!("000000000000000000000000000000000000C0FE");
 const L2_CHAIN_ID: u64 = 1;
 
 fn encode_deposit(dep: &DepositTx) -> Vec<u8> {
@@ -49,18 +52,22 @@ async fn deposit_e2e_anvil_to_node() {
         .await
         .expect("anvil_setCode");
 
-    // Fund and impersonate DEV_OWNER so transactions from it are accepted without a key.
-    let _: serde_json::Value = provider
-        .raw_request(
-            "anvil_setBalance".into(),
-            (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
-        )
-        .await
-        .expect("anvil_setBalance");
-    let _: serde_json::Value = provider
-        .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
-        .await
-        .expect("anvil_impersonateAccount");
+    // Fund and impersonate both DEV_OWNER (factory bootstrap) and DEPOSITOR
+    // (the L1 EOA that calls depositETH) so transactions from either are
+    // accepted without a private key.
+    for who in [DEV_OWNER, DEPOSITOR] {
+        let _: serde_json::Value = provider
+            .raw_request(
+                "anvil_setBalance".into(),
+                (who, U256::from(1_000_000_000_000_000_000_000u128)),
+            )
+            .await
+            .expect("anvil_setBalance");
+        let _: serde_json::Value = provider
+            .raw_request("anvil_impersonateAccount".into(), (who,))
+            .await
+            .expect("anvil_impersonateAccount");
+    }
 
     let deployer = Deployer::new(provider.clone(), DEV_OWNER);
 
@@ -92,7 +99,8 @@ async fn deposit_e2e_anvil_to_node() {
         .expect("ETHLockbox registered")
         .proxy;
 
-    // Deposit via the proxy.
+    // Deposit via the proxy as DEPOSITOR (distinct from factory owner) — proves
+    // the lockbox is permissionless.
     let lockbox = ETHLockbox::new(lockbox_addr, provider.clone());
     let target = address!("0000000000000000000000000000000000000022");
     let mint_amount: u128 = 1_000_000_000_000_000_000u128;
@@ -100,7 +108,7 @@ async fn deposit_e2e_anvil_to_node() {
     let receipt = lockbox
         .depositETH(target, 100_000, Bytes::new())
         .value(U256::from(mint_amount))
-        .from(DEV_OWNER)
+        .from(DEPOSITOR)
         .send()
         .await
         .expect("send depositETH")
@@ -119,7 +127,7 @@ async fn deposit_e2e_anvil_to_node() {
 
     let dep = DepositTx {
         source_hash: source_hash(l1_block_hash, l1_log_index),
-        from: alias_l1_address(DEV_OWNER),
+        from: alias_l1_address(DEPOSITOR),
         to: TxKind::Call(target),
         mint: mint_amount,
         value: U256::from(mint_amount),
