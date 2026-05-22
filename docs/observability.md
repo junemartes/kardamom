@@ -132,12 +132,16 @@ window as the `tracing-flame` recording.
 ./target/release/kardamom-bench-harness \
   --timeout 10s --concurrency 128 \
   --max-in-flight 30 \
-  --flame-out /tmp/flame.folded \
+  --flame-out /tmp/flame.svg \
   --pprof-out /tmp/cpu.svg \
   transfers
 
-open /tmp/cpu.svg
+open /tmp/flame.svg /tmp/cpu.svg
 ```
+
+Both `--flame-out` and `--pprof-out` are written as ready-to-view SVGs;
+the harness uses inferno internally for both, with shared options
+(`min_width = 0`, `image_width = 2000`).
 
 **The pprof report is filtered to stacks containing at least one
 `kardamom_node::*` frame before rendering.** The in-process harness runs
@@ -211,6 +215,25 @@ cargo run --release --example custom_workflow -p kardamom-bench
 
 `cargo run --example gen_mnemonic -p kardamom-bench` prints a fresh
 BIP-39 phrase if your custom workflow wants its own signer set.
+
+#### Workflow API at a glance
+
+`BenchWorkflow::prepare` returns a `Prepared<Item> { warmup, main }`:
+
+- `warmup: Vec<Item>` — a single flat queue the harness drains
+  **sequentially** with one in-flight request, unmetered, with the
+  flame/pprof gates off. Bounded by `--timeout`. Use this to JIT hot
+  paths, warm jsonrpsee/hyper buffers, and stabilize chain state before
+  the metered window. Built-in workflows produce `WARMUP_PER_TASK = 100`
+  items per task; pick whatever volume suits yours.
+- `main: Vec<Vec<Item>>` — per-task metered work (`n_tasks ×
+  txs_per_task`). Dispatched concurrently in the recording window.
+
+Workflows that align tx state across phases (e.g. transfers consume
+nonces) must lay the warmup queue out so the main per-task chunks pick
+up at the right nonce. See `TransfersWorkflow::prepare` for the pattern:
+round-robin presign across signers for warmup nonces `0..WARMUP`, then
+per-signer presign for main starting at nonce `WARMUP`.
 
 ## Dashboard panels
 
