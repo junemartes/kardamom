@@ -277,8 +277,8 @@ impl<W: BenchWorkflow> Harness<W> {
         //    workers. Same primitive, two sources.
         let pprof_folded = pprof_report_to_folded_text(&filtered.report);
         let merged_pprof = merge_folded_text(&pprof_folded);
-        let file = File::create(path)
-            .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
+        let file =
+            File::create(path).map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
         let mut opts = flamegraph_options();
         pprof::flamegraph::from_lines(&mut opts, merged_pprof.lines(), file)
             .map_err(|e| anyhow::anyhow!("render pprof flamegraph to {}: {e}", path.display()))?;

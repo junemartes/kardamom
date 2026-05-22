@@ -12,10 +12,8 @@ use kardamom_bench::{Benchmark, TransfersWorkflow};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn harness_writes_flame_with_node_spans() {
-    let flame_out: PathBuf = std::env::temp_dir().join(format!(
-        "kardamom-harness-smoke-{}.svg",
-        std::process::id()
-    ));
+    let flame_out: PathBuf =
+        std::env::temp_dir().join(format!("kardamom-harness-smoke-{}.svg", std::process::id()));
     let _ = std::fs::remove_file(&flame_out);
 
     let bench = Benchmark {

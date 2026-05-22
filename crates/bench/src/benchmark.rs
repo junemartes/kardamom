@@ -139,11 +139,7 @@ impl<W: BenchWorkflow> Benchmark<W> {
     ///
     /// Workflow dispatch errors are intentionally swallowed — warmup is
     /// best-effort.
-    pub async fn warmup(
-        &self,
-        client: &HttpClient,
-        warmup: Vec<W::Item>,
-    ) -> anyhow::Result<()> {
+    pub async fn warmup(&self, client: &HttpClient, warmup: Vec<W::Item>) -> anyhow::Result<()> {
         if warmup.is_empty() {
             return Ok(());
         }
