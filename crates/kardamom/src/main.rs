@@ -18,11 +18,13 @@ mod chain;
 #[command(
     name = "kardamom",
     about = "A fast, simple L2 rollup scaffold.",
-    long_about = "Boots an in-memory revm-backed node and exposes a small \
+    long_about = "Boots an MDBX-backed revm node and exposes a small \
 Ethereum JSON-RPC surface.\n\n\
-Pass a TOML genesis file via --chain. For a quick start, use the \
-checked-in dev chain:\n  \
-  kardamom --chain chains/dev.toml\n\n\
+Pass a TOML genesis file via --chain and an MDBX directory via --db-path. \
+A fresh --db-path directory loads genesis on first boot; subsequent boots \
+resume from the last committed block. For a quick start with an ephemeral \
+state directory:\n  \
+  kardamom --chain chains/dev.toml --db-path /tmp/kardamom-dev\n\n\
 The dev chain prefunds the well-known Anvil/Hardhat account #0 with 1000 ETH. \
 Do not use that account on real chains."
 )]
@@ -38,6 +40,12 @@ struct Args {
     /// Address to bind the Prometheus `/metrics` endpoint on.
     #[arg(long, default_value = "127.0.0.1:9000")]
     metrics_addr: SocketAddr,
+
+    /// Directory holding the MDBX state env. Created if absent. A fresh
+    /// directory loads genesis on first boot; existing directories must
+    /// match the chain's `chain_id` and the binary's schema version.
+    #[arg(long = "db-path", value_name = "DIR")]
+    db_path: PathBuf,
 }
 
 fn init_tracing() -> Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>> {
@@ -96,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let alloc_entries = genesis.alloc.len();
     let contracts = genesis.alloc.iter().filter(|e| e.code.is_some()).count();
     let chain_id = genesis.chain_id;
-    let node = Node::new(&genesis);
+    let node = Node::new(&genesis, &args.db_path)?;
 
     tracing::info!(
         rpc = %args.rpc_addr,
@@ -105,6 +113,7 @@ async fn main() -> anyhow::Result<()> {
         alloc_entries,
         contracts,
         chain_file = %args.chain.display(),
+        db_path = %args.db_path.display(),
         "starting kardamom"
     );
 

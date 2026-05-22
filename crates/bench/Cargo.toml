@@ -38,3 +38,4 @@ jsonrpsee = { workspace = true }
 
 [dev-dependencies]
 kardamom-node = { path = "../node" }
+tempfile.workspace = true

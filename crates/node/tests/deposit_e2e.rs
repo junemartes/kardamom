@@ -137,10 +137,15 @@ async fn deposit_e2e_anvil_to_node() {
     };
 
     let raw = encode_deposit(&dep);
-    let node = Node::new(&Genesis {
-        chain_id: 1,
-        alloc: Vec::new(),
-    });
+    let dir = tempfile::TempDir::new().unwrap();
+    let node = Node::new(
+        &Genesis {
+            chain_id: 1,
+            alloc: Vec::new(),
+        },
+        dir.path(),
+    )
+    .unwrap();
     let tx_hash = node
         .submit_deposit_transaction(Bytes::from(raw))
         .await

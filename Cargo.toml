@@ -32,6 +32,10 @@ metrics-exporter-prometheus = { version = "0.18", default-features = false, feat
 hdrhistogram = "7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
 
+# Persistent state store.
+libmdbx = "0.6"
+tempfile = "3"
+
 # Deposit bridge: OP wire types plus dev-only e2e helpers.
 op-alloy-consensus = "2"
 alloy-provider = "2.0"

@@ -5,6 +5,7 @@ edition.workspace = true
 build = "build.rs"
 
 [dependencies]
+kardamom-state = { path = "../state" }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
@@ -24,6 +25,7 @@ metrics.workspace = true
 async-trait = "0.1"
 
 [dev-dependencies]
+tempfile.workspace = true
 alloy-signer-local.workspace = true
 metrics-exporter-prometheus.workspace = true
 alloy-provider.workspace = true

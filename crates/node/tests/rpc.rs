@@ -14,6 +14,7 @@ use jsonrpsee::rpc_params;
 use kardamom_node::Node;
 use kardamom_node::genesis::{AllocEntry, Genesis};
 use kardamom_node::rpc::{EthApiServer, KardamomApiServer};
+use tempfile::TempDir;
 
 #[tokio::test]
 async fn end_to_end_send_and_query() {
@@ -22,15 +23,20 @@ async fn end_to_end_send_and_query() {
     let to = Address::from([0x22u8; 20]);
     let chain_id = 412346;
 
-    let node = Node::new(&Genesis {
-        chain_id,
-        alloc: vec![AllocEntry {
-            address: from,
-            balance: U256::from(10u64).pow(U256::from(18u64)),
-            code: None,
-            nonce: None,
-        }],
-    });
+    let dir = TempDir::new().unwrap();
+    let node = Node::new(
+        &Genesis {
+            chain_id,
+            alloc: vec![AllocEntry {
+                address: from,
+                balance: U256::from(10u64).pow(U256::from(18u64)),
+                code: None,
+                nonce: None,
+            }],
+        },
+        dir.path(),
+    )
+    .unwrap();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
@@ -163,10 +169,15 @@ async fn kardamom_submit_deposit_tx_round_trip() {
     let mut raw = Vec::new();
     envelope.encode_2718(&mut raw);
 
-    let node = Node::new(&Genesis {
-        chain_id: 1,
-        alloc: Vec::new(),
-    });
+    let dir = TempDir::new().unwrap();
+    let node = Node::new(
+        &Genesis {
+            chain_id: 1,
+            alloc: Vec::new(),
+        },
+        dir.path(),
+    )
+    .unwrap();
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
         .build(addr)

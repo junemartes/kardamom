@@ -80,8 +80,8 @@ mod tests {
     #[test]
     fn omitted_nonce_parses_as_none() {
         // The conditional nonce default (1 for code-bearing entries, 0
-        // otherwise) lives in `Node::new`, not in the loader. The loader
-        // surfaces what was on disk.
+        // otherwise) lives in `kardamom_state::State::initialize_genesis`,
+        // not in the loader. The loader surfaces what was on disk.
         let g = parse(
             r#"
                 chain_id = 1

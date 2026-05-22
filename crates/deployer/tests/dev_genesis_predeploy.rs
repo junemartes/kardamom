@@ -19,7 +19,8 @@ async fn dev_genesis_predeploys_erc7955_factory_with_expected_bytecode() {
     let genesis: Genesis = toml::from_str(&raw).expect("dev.toml parses");
     genesis.validate().expect("dev.toml validates");
 
-    let node = Node::new(&genesis);
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let node = Node::new(&genesis, dir.path()).expect("node");
     let code = node.code_at(ERC7955_FACTORY).await;
     let expected = Bytes::from(hex::decode(ERC7955_RUNTIME_HEX).expect("ERC7955_RUNTIME_HEX hex"));
     assert_eq!(

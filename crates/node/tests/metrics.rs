@@ -18,6 +18,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use kardamom_node::genesis::{AllocEntry, Genesis};
 use kardamom_node::metrics as kmetrics;
 use kardamom_node::{Node, rpc};
+use tempfile::TempDir;
 
 /// One global recorder per test process. Subsequent calls return the same
 /// handle so parallel tests don't race on `install_recorder`.
@@ -41,15 +42,20 @@ async fn rpc_calls_populate_prometheus_registry() {
     let to = Address::from([0x22u8; 20]);
     let chain_id = 1;
 
-    let node = Node::new(&Genesis {
-        chain_id,
-        alloc: vec![AllocEntry {
-            address: from,
-            balance: U256::from(10u64).pow(U256::from(18u64)),
-            code: None,
-            nonce: None,
-        }],
-    });
+    let dir = TempDir::new().unwrap();
+    let node = Node::new(
+        &Genesis {
+            chain_id,
+            alloc: vec![AllocEntry {
+                address: from,
+                balance: U256::from(10u64).pow(U256::from(18u64)),
+                code: None,
+                nonce: None,
+            }],
+        },
+        dir.path(),
+    )
+    .unwrap();
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
@@ -123,10 +129,15 @@ async fn rpc_calls_populate_prometheus_registry() {
 async fn err_outcome_label_appears_on_failed_call() {
     let handle = recorder();
 
-    let node = Node::new(&Genesis {
-        chain_id: 1,
-        alloc: Vec::new(),
-    });
+    let dir = TempDir::new().unwrap();
+    let node = Node::new(
+        &Genesis {
+            chain_id: 1,
+            alloc: Vec::new(),
+        },
+        dir.path(),
+    )
+    .unwrap();
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
         .build(addr)

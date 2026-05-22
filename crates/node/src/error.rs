@@ -21,6 +21,8 @@ pub enum NodeError {
     MintOverflow,
     #[error("invalid deposit envelope: {0}")]
     InvalidDepositEnvelope(String),
+    #[error("state: {0}")]
+    State(#[from] kardamom_state::StateError),
 }
 
 impl From<NodeError> for ErrorObjectOwned {
@@ -33,7 +35,7 @@ impl From<NodeError> for ErrorObjectOwned {
             | NodeError::DuplicateDeposit
             | NodeError::InvalidDepositEnvelope(_) => -32602, // invalid params
             NodeError::Execution(_) | NodeError::MintOverflow => -32000, // server error
-            NodeError::Server(_) => -32603,                              // internal
+            NodeError::Server(_) | NodeError::State(_) => -32603,        // internal
         };
         ErrorObjectOwned::owned::<()>(code, err.to_string(), None)
     }

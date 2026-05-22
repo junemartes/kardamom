@@ -45,7 +45,8 @@ async fn bench_generator_records_samples_against_inprocess_node() {
     };
 
     let genesis_value = genesis::from_config(&file_cfg, chain_id).expect("from_config");
-    let node = Node::new(&genesis_value);
+    let dir = tempfile::TempDir::new().unwrap();
+    let node = Node::new(&genesis_value, dir.path()).expect("node");
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
