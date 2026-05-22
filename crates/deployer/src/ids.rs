@@ -4,8 +4,10 @@
 //! canonical label), and an `initialize` signature used to encode init calldata.
 //! Adding a new L1 contract is one new variant + four match-arms — no factory edit.
 
-use alloy_primitives::{B256, keccak256};
+use alloy_primitives::{B256, Bytes, keccak256};
 use alloy_sol_types::SolValue;
+
+use crate::embedded;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContractId {
@@ -13,17 +15,14 @@ pub enum ContractId {
 }
 
 impl ContractId {
+    /// Every variant. The exhaustive match in `creation_bytecode` makes this
+    /// list mandatory-to-update when a new variant is added.
+    pub const ALL: &'static [Self] = &[Self::EthLockbox];
+
     /// Canonical label hashed into the registry key.
     pub fn label(self) -> &'static str {
         match self {
             ContractId::EthLockbox => "kardamom.l1.ETHLockbox",
-        }
-    }
-
-    /// Forge artifact filename stem (matches `Name.sol` under `contracts/src/`).
-    pub fn artifact_name(self) -> &'static str {
-        match self {
-            ContractId::EthLockbox => "ETHLockbox",
         }
     }
 
@@ -57,6 +56,15 @@ impl ContractId {
     pub fn init_selector(self) -> [u8; 4] {
         let h = keccak256(self.init_signature().as_bytes());
         [h[0], h[1], h[2], h[3]]
+    }
+
+    /// Creation bytecode for this contract, embedded at build time. Adding a
+    /// new variant without wiring it through `build.rs` is caught by the
+    /// `every_contract_id_has_nonempty_creation_bytecode` test.
+    pub fn creation_bytecode(self) -> Bytes {
+        match self {
+            ContractId::EthLockbox => embedded::eth_lockbox_creation(),
+        }
     }
 }
 
@@ -107,5 +115,17 @@ mod tests {
         let s1 = ContractId::EthLockbox.proxy_salt(42);
         let s2 = ContractId::EthLockbox.proxy_salt(42);
         assert_eq!(s1, s2);
+    }
+
+    #[test]
+    fn every_contract_id_has_nonempty_creation_bytecode() {
+        // Iterates `ContractId::ALL`; the exhaustive match in `creation_bytecode`
+        // makes the list mandatory-to-update for new variants.
+        for &id in ContractId::ALL {
+            assert!(
+                !id.creation_bytecode().is_empty(),
+                "{id:?} has empty creation bytecode; wire it into build.rs"
+            );
+        }
     }
 }

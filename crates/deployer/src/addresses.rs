@@ -1,7 +1,8 @@
 //! CREATE2 address derivation and ERC-7955 / kardamom factory constants.
 //!
-//! All pure math, no I/O. The factory proxy address is computed lazily from the
-//! compiled factory impl initcode (via forge artifact) and the canonical owner.
+//! All pure math, no I/O. The factory proxy address is computed lazily from
+//! the build-time-embedded factory impl creation bytecode (see [`crate::embedded`])
+//! and the canonical owner.
 
 use alloy_primitives::{Address, B256, Bytes, address, b256, keccak256};
 use alloy_sol_types::SolValue;
@@ -10,10 +11,6 @@ use alloy_sol_types::SolValue;
 /// Canonical address on every EIP-7702-supporting chain (mainnet since Pectra).
 /// Spec: https://github.com/safe-research/erc-7955
 pub const ERC7955_FACTORY: Address = address!("C0DEb853af168215879d284cc8B4d0A645fA9b0E");
-
-/// ERC-7955's publicly-known deployer EOA (used to sign the EIP-7702 self-bootstrap).
-/// Not used directly by this crate yet — kept for future self-bootstrap support.
-pub const ERC7955_DEPLOYER: Address = address!("962560A0333190D57009A0aAAB7Bfa088f58461C");
 
 /// ERC-7955 factory runtime bytecode (29 bytes). Used by tests that inject it via
 /// `anvil_setCode`; not used at runtime.
@@ -40,19 +37,6 @@ pub fn factory_init_data(owner: Address) -> Bytes {
     Bytes::from(buf)
 }
 
-/// CREATE2 address: `keccak256(0xff || deployer || salt || keccak256(initcode))[12..32]`.
-pub fn create2_address(deployer: Address, salt: B256, init_code_hash: B256) -> Address {
-    let mut buf = [0u8; 1 + 20 + 32 + 32];
-    buf[0] = 0xff;
-    buf[1..21].copy_from_slice(deployer.as_slice());
-    buf[21..53].copy_from_slice(salt.as_slice());
-    buf[53..85].copy_from_slice(init_code_hash.as_slice());
-    let h = keccak256(buf);
-    let mut out = [0u8; 20];
-    out.copy_from_slice(&h[12..32]);
-    Address::from(out)
-}
-
 /// Build the full proxy initcode = `ERC1967Proxy.creationCode || abi.encode(impl, initData)`.
 pub fn proxy_full_initcode(
     proxy_creation_code: &Bytes,
@@ -67,11 +51,7 @@ pub fn proxy_full_initcode(
 
 /// Factory impl address: CREATE2 from ERC-7955 with the factory impl salt.
 pub fn factory_impl_address(impl_initcode: &Bytes) -> Address {
-    create2_address(
-        ERC7955_FACTORY,
-        factory_impl_salt(),
-        keccak256(impl_initcode),
-    )
+    ERC7955_FACTORY.create2(factory_impl_salt(), keccak256(impl_initcode))
 }
 
 /// Factory proxy address: CREATE2 from ERC-7955 with the factory proxy salt, parameterized
@@ -83,12 +63,12 @@ pub fn factory_proxy_address(
 ) -> Address {
     let init_data = factory_init_data(owner);
     let full = proxy_full_initcode(proxy_creation_code, impl_addr, &init_data);
-    create2_address(ERC7955_FACTORY, factory_proxy_salt(), keccak256(&full))
+    ERC7955_FACTORY.create2(factory_proxy_salt(), keccak256(&full))
 }
 
 /// App impl address (deployed via the kardamom factory, not via ERC-7955).
 pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes) -> Address {
-    create2_address(factory, impl_salt, keccak256(impl_initcode))
+    factory.create2(impl_salt, keccak256(impl_initcode))
 }
 
 /// App proxy address (deployed via the kardamom factory).
@@ -100,7 +80,7 @@ pub fn app_proxy_address(
     proxy_salt: B256,
 ) -> Address {
     let full = proxy_full_initcode(proxy_creation_code, impl_addr, init_data);
-    create2_address(factory, proxy_salt, keccak256(&full))
+    factory.create2(proxy_salt, keccak256(&full))
 }
 
 /// ERC1967 implementation storage slot.
@@ -110,17 +90,6 @@ pub const ERC1967_IMPL_SLOT: B256 =
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::hex;
-
-    #[test]
-    fn create2_matches_eip_1014_example_5() {
-        let deployer = address!("00000000000000000000000000000000deadbeef");
-        let salt = b256!("00000000000000000000000000000000000000000000000000000000cafebabe");
-        let initcode = hex::decode("deadbeef").unwrap();
-        let h = keccak256(&initcode);
-        let addr = create2_address(deployer, salt, h);
-        assert_eq!(addr, address!("60f3f640a8508fc6a86d45df051962668e1e8ac7"));
-    }
 
     #[test]
     fn factory_salts_are_distinct() {

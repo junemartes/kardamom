@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use alloy_primitives::{Address, address};
 use kardamom_deployer::addresses::{factory_impl_address, factory_proxy_address};
-use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
+use kardamom_deployer::embedded;
 
 /// Canonical owner used by `deploy_e2e` and any other dev/test deployment. Must match
 /// the owner baked into KardamomUUPSBase.FACTORY.
@@ -16,25 +16,14 @@ const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
 #[test]
 fn factory_constant_in_source_matches_computed_address() {
-    let root = default_contracts_root();
-
-    let factory_initcode = match creation_bytecode(&root, "KardamomFactoryV1") {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("SKIP: KardamomFactoryV1 artifact missing; run forge build in contracts/");
-            return;
-        }
-    };
-    let proxy_initcode = creation_bytecode(&root, "ERC1967Proxy")
-        .or_else(|_| creation_bytecode(&root, "ProxyArtifact"))
-        .unwrap_or_else(|_| {
-            panic!("neither ERC1967Proxy.json nor ProxyArtifact.json found; run forge build");
-        });
+    let factory_initcode = embedded::factory_v1_creation();
+    let proxy_initcode = embedded::erc1967_proxy_creation();
 
     let impl_addr = factory_impl_address(&factory_initcode);
     let computed = factory_proxy_address(&proxy_initcode, impl_addr, DEV_OWNER);
 
-    let base_path: PathBuf = root.join("src/factory/KardamomUUPSBase.sol");
+    let base_path: PathBuf = PathBuf::from(env!("CARGO_WORKSPACE_DIR"))
+        .join("contracts/src/factory/KardamomUUPSBase.sol");
     let src = std::fs::read_to_string(&base_path)
         .unwrap_or_else(|_| panic!("read {}", base_path.display()));
 

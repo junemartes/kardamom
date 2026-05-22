@@ -1,11 +1,8 @@
 //! Build `DeploymentSpec` values consumed by `KardamomFactoryV1.applyDeployments`.
 
-use std::path::Path;
-
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
 
-use crate::artifacts::{ArtifactError, creation_bytecode};
 use crate::ids::ContractId;
 
 /// One-to-one with `IKardamomFactory.DeploymentSpec` on the Solidity side.
@@ -72,42 +69,35 @@ impl Op {
 
 /// Build a `DeploymentSpec` for a single `Op`. `target_impl` is always zero here; the
 /// deployer's dedup pass fills it in after grouping by `(id, version)`.
-pub fn build_spec(contracts_root: &Path, op: &Op) -> Result<DeploymentSpec, ArtifactError> {
+pub fn build_spec(op: &Op) -> DeploymentSpec {
     match op {
         Op::Deploy {
             l2_chain_id,
             id,
             init_args,
-        } => {
-            let impl_initcode = creation_bytecode(contracts_root, id.artifact_name())?;
-            let init_data = encode_init_calldata(*id, init_args);
-            Ok(DeploymentSpec {
-                l2_chain_id: *l2_chain_id,
-                id: id.id(),
-                action: Action::Deploy,
-                impl_initcode,
-                init_data,
-                impl_salt: id.impl_salt(1),
-                target_impl: Address::ZERO,
-            })
-        }
+        } => DeploymentSpec {
+            l2_chain_id: *l2_chain_id,
+            id: id.id(),
+            action: Action::Deploy,
+            impl_initcode: id.creation_bytecode(),
+            init_data: encode_init_calldata(*id, init_args),
+            impl_salt: id.impl_salt(1),
+            target_impl: Address::ZERO,
+        },
         Op::Upgrade {
             l2_chain_id,
             id,
             new_version,
             init_args,
-        } => {
-            let impl_initcode = creation_bytecode(contracts_root, id.artifact_name())?;
-            Ok(DeploymentSpec {
-                l2_chain_id: *l2_chain_id,
-                id: id.id(),
-                action: Action::Upgrade,
-                impl_initcode,
-                init_data: init_args.clone(),
-                impl_salt: id.impl_salt(*new_version),
-                target_impl: Address::ZERO,
-            })
-        }
+        } => DeploymentSpec {
+            l2_chain_id: *l2_chain_id,
+            id: id.id(),
+            action: Action::Upgrade,
+            impl_initcode: id.creation_bytecode(),
+            init_data: init_args.clone(),
+            impl_salt: id.impl_salt(*new_version),
+            target_impl: Address::ZERO,
+        },
     }
 }
 

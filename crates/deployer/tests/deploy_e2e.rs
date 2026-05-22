@@ -7,7 +7,6 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::sol;
 
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
-use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
 use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_arg};
 
 sol! {
@@ -57,12 +56,6 @@ async fn setup_anvil_with_erc7955() -> Option<(
 
 #[tokio::test]
 async fn cross_chain_address_parity() {
-    let root = default_contracts_root();
-    if creation_bytecode(&root, "KardamomFactoryV1").is_err() {
-        eprintln!("SKIP: forge artifacts missing");
-        return;
-    }
-
     let (anvil_a, provider_a) = match setup_anvil_with_erc7955().await {
         Some(p) => p,
         None => {
@@ -101,11 +94,6 @@ async fn cross_chain_address_parity() {
 
 #[tokio::test]
 async fn multi_l2_deploy_and_atomic_upgrade() {
-    let root = default_contracts_root();
-    if creation_bytecode(&root, "KardamomFactoryV1").is_err() {
-        eprintln!("SKIP: forge artifacts missing");
-        return;
-    }
     let (anvil, provider) = match setup_anvil_with_erc7955().await {
         Some(p) => p,
         None => {

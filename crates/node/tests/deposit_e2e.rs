@@ -7,7 +7,6 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::sol;
 
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
-use kardamom_deployer::artifacts::{creation_bytecode, default_contracts_root};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use kardamom_node::Node;
 use kardamom_node::deposit::{DEPOSIT_TX_TYPE, DepositTx, alias_l1_address, source_hash};
@@ -32,14 +31,6 @@ fn encode_deposit(dep: &DepositTx) -> Vec<u8> {
 
 #[tokio::test]
 async fn deposit_e2e_anvil_to_node() {
-    let root = default_contracts_root();
-    if creation_bytecode(&root, "KardamomFactoryV1").is_err() {
-        eprintln!(
-            "SKIP: forge artifacts missing; install Foundry and run `forge build` in contracts/."
-        );
-        return;
-    }
-
     let anvil = match Anvil::new().try_spawn() {
         Ok(a) => a,
         Err(e) => {

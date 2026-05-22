@@ -1,8 +1,6 @@
 //! Stateful deployer: wraps a provider + operator address and exposes
 //! high-level `ensure_factory`, `apply`, `addresses`, and `verify` methods.
 
-use std::path::PathBuf;
-
 use alloy_network::{Ethereum, ReceiptResponse, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy_provider::Provider;
@@ -13,44 +11,22 @@ use crate::addresses::{
     ERC1967_IMPL_SLOT, ERC7955_FACTORY, factory_impl_address, factory_init_data,
     factory_proxy_address, proxy_full_initcode,
 };
-use crate::artifacts::{ArtifactError, creation_bytecode};
+use crate::embedded;
 use crate::spec::{DeploymentSpec, Op, build_spec};
 
 // ---------------------------------------------------------------------------
 // Sol! bindings for the kardamom factory
 // ---------------------------------------------------------------------------
 
-sol! {
+sol!(
     #[sol(rpc)]
     #[derive(Debug)]
-    interface IKardamomFactory {
-        struct DeploymentSpecAbi {
-            uint256 l2ChainId;
-            bytes32 id;
-            uint8 action;
-            bytes implInitcode;
-            bytes initData;
-            bytes32 implSalt;
-            address targetImpl;
-        }
-
-        struct Entry {
-            address proxy;
-            address currentImpl;
-            uint64 version;
-            uint64 deployedAt;
-            uint64 upgradedAt;
-            bool exists;
-        }
-
-        function applyDeployments(DeploymentSpecAbi[] calldata specs) external;
-        function entry(uint256 l2ChainId, bytes32 id) external view returns (Entry memory);
-        function l2ChainIdCount() external view returns (uint256);
-        function l2ChainIdAt(uint256 i) external view returns (uint256);
-        function idCount(uint256 l2ChainId) external view returns (uint256);
-        function idAt(uint256 l2ChainId, uint256 i) external view returns (bytes32);
-    }
-}
+    IKardamomFactory,
+    concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/contracts/out/IKardamomFactory.sol/IKardamomFactory.json"
+    )
+);
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -58,8 +34,6 @@ sol! {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DeployError {
-    #[error("artifact: {0}")]
-    Artifact(#[from] ArtifactError),
     #[error(
         "ERC-7955 CREATE2 factory not deployed at {address}; see https://github.com/safe-research/erc-7955 for bootstrap procedure"
     )]
@@ -131,26 +105,11 @@ pub struct Deployer<P> {
     provider: P,
     /// The "from" address used when sending transactions.
     operator: Address,
-    /// Path to the `contracts/` directory (containing `out/`).
-    contracts_root: PathBuf,
 }
 
 impl<P: Provider<Ethereum> + Clone> Deployer<P> {
-    /// Create a new `Deployer`.
-    ///
-    /// `contracts_root` defaults to `crate::artifacts::default_contracts_root()`.
     pub fn new(provider: P, operator: Address) -> Self {
-        Self {
-            provider,
-            operator,
-            contracts_root: crate::artifacts::default_contracts_root(),
-        }
-    }
-
-    /// Override the contracts root (e.g. in tests that compile to a tmpdir).
-    pub fn with_contracts_root(mut self, root: PathBuf) -> Self {
-        self.contracts_root = root;
-        self
+        Self { provider, operator }
     }
 
     // -----------------------------------------------------------------------
@@ -159,7 +118,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
     /// Derive the factory proxy address from compiled forge artifacts + the canonical owner.
     pub async fn factory_address(&self, owner: Address) -> Result<Address, DeployError> {
-        let (impl_initcode, proxy_creation_code) = self.read_factory_artifacts()?;
+        let impl_initcode = embedded::factory_v1_creation();
+        let proxy_creation_code = embedded::erc1967_proxy_creation();
         let impl_addr = factory_impl_address(&impl_initcode);
         Ok(factory_proxy_address(
             &proxy_creation_code,
@@ -190,7 +150,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             });
         }
 
-        let (factory_impl_initcode, proxy_creation_code) = self.read_factory_artifacts()?;
+        let factory_impl_initcode = embedded::factory_v1_creation();
+        let proxy_creation_code = embedded::erc1967_proxy_creation();
         let impl_addr = factory_impl_address(&factory_impl_initcode);
         let init_data = factory_init_data(owner);
         let factory_proxy = factory_proxy_address(&proxy_creation_code, impl_addr, owner);
@@ -253,10 +214,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         }
 
         // Build raw specs (each has target_impl = zero).
-        let mut specs: Vec<DeploymentSpec> = ops
-            .iter()
-            .map(|op| build_spec(&self.contracts_root, op))
-            .collect::<Result<_, ArtifactError>>()?;
+        let mut specs: Vec<DeploymentSpec> = ops.iter().map(build_spec).collect();
 
         // Dedup pass: within each (id, impl_salt) group, the first spec deploys the impl;
         // the rest reference it via target_impl. The impl's CREATE2 address is computed
@@ -279,7 +237,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         }
 
         // Encode + send.
-        let abi_specs: Vec<IKardamomFactory::DeploymentSpecAbi> =
+        let abi_specs: Vec<IKardamomFactory::DeploymentSpec> =
             specs.into_iter().map(spec_to_abi).collect();
         let call = IKardamomFactory::applyDeploymentsCall { specs: abi_specs };
         let calldata = call.abi_encode();
@@ -397,17 +355,6 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    /// Read `KardamomFactoryV1` and `ERC1967Proxy` (or `ProxyArtifact`) creation
-    /// bytecode from forge artifacts.
-    fn read_factory_artifacts(&self) -> Result<(Bytes, Bytes), DeployError> {
-        let factory_impl_initcode = creation_bytecode(&self.contracts_root, "KardamomFactoryV1")?;
-        let proxy_creation_code = match creation_bytecode(&self.contracts_root, "ERC1967Proxy") {
-            Ok(b) => b,
-            Err(_) => creation_bytecode(&self.contracts_root, "ProxyArtifact")?,
-        };
-        Ok((factory_impl_initcode, proxy_creation_code))
-    }
-
     async fn send_erc7955_tx(&self, salt: B256, initcode: &Bytes) -> Result<TxHash, DeployError> {
         let calldata = erc7955_calldata(salt, initcode);
         let tx = TransactionRequest::default()
@@ -443,8 +390,8 @@ fn erc7955_calldata(salt: B256, initcode: &Bytes) -> Bytes {
 }
 
 /// Convert a `crate::spec::DeploymentSpec` into its ABI counterpart.
-fn spec_to_abi(s: DeploymentSpec) -> IKardamomFactory::DeploymentSpecAbi {
-    IKardamomFactory::DeploymentSpecAbi {
+fn spec_to_abi(s: DeploymentSpec) -> IKardamomFactory::DeploymentSpec {
+    IKardamomFactory::DeploymentSpec {
         l2ChainId: U256::from(s.l2_chain_id),
         id: s.id,
         action: s.action as u8,
@@ -474,6 +421,46 @@ mod apply_dedup_tests {
             impl_salt: B256::from(salt),
             target_impl: Address::ZERO,
         }
+    }
+
+    /// Sanity round-trip: build a `DeploymentSpec`, encode + decode through the
+    /// JSON-ABI-derived `IKardamomFactory::applyDeploymentsCall`, and assert every
+    /// field survives. Catches accidental field reshuffling in `spec_to_abi`
+    /// (and would catch a Rust-side struct mismatch, though the JSON ABI itself is
+    /// the source of truth for layout). The cargo↔Solidity layout pin is the
+    /// bytecode-hash CI gate plus the e2e deploy/upgrade integration tests
+    /// against anvil.
+    #[test]
+    fn apply_deployments_calldata_roundtrip() {
+        use super::IKardamomFactory;
+        use alloy_sol_types::{SolCall, SolValue};
+
+        let spec = DeploymentSpec {
+            l2_chain_id: 1234,
+            id: B256::from([0xAB; 32]),
+            action: Action::Upgrade,
+            impl_initcode: Bytes::from(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            init_data: Bytes::from(vec![0x01, 0x02, 0x03]),
+            impl_salt: B256::from([0xCD; 32]),
+            target_impl: Address::from([0x42; 20]),
+        };
+        let abi = super::spec_to_abi(spec.clone());
+        let call = IKardamomFactory::applyDeploymentsCall {
+            specs: vec![abi.clone()],
+        };
+        let encoded = call.abi_encode();
+        let decoded = IKardamomFactory::applyDeploymentsCall::abi_decode(&encoded).unwrap();
+        assert_eq!(decoded.specs.len(), 1);
+        let d = &decoded.specs[0];
+        assert_eq!(d.l2ChainId, alloy_primitives::U256::from(spec.l2_chain_id));
+        assert_eq!(d.id, spec.id);
+        assert_eq!(d.action, spec.action as u8);
+        assert_eq!(d.implInitcode, spec.impl_initcode);
+        assert_eq!(d.initData, spec.init_data);
+        assert_eq!(d.implSalt, spec.impl_salt);
+        assert_eq!(d.targetImpl, spec.target_impl);
+        // Sanity: the abi round-trips byte-for-byte too.
+        assert_eq!(d.abi_encode(), abi.abi_encode());
     }
 
     /// The dedup logic in `apply` is straightforward enough to unit-test directly by
