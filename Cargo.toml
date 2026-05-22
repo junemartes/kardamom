@@ -39,9 +39,6 @@ alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
-# Solidity compilation orchestration for build scripts that need typed artifacts.
-foundry-compilers = { version = "0.21", features = ["svm-solc"] }
-
 [profile.release]
 debug = true
 lto = "thin"

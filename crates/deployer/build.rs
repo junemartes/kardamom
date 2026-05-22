@@ -1,39 +1,19 @@
-//! Compile the Solidity contracts under `<workspace>/contracts/` and emit a
-//! Rust module that exposes the creation bytecode of each artifact the deployer
-//! cares about via `include_bytes!`. After this script runs:
-//!   * `<workspace>/contracts/out/<Name>.sol/<Name>.json` exists (forge-compatible).
-//!   * `$OUT_DIR/embedded_artifacts.rs` exposes `KARDAMOM_FACTORY_V1_CREATION`,
+//! Drive `forge build` to populate `<workspace>/contracts/out/`, then emit a
+//! Rust module that exposes the creation bytecode of each needed artifact via
+//! `include_bytes!`. After this script runs:
+//!   * `<workspace>/contracts/out/<Name>.sol/<Name>.json` exists.
+//!   * `$OUT_DIR/embedded_artifacts.rs` defines `KARDAMOM_FACTORY_V1_CREATION`,
 //!     `ERC1967_PROXY_CREATION`, `ETH_LOCKBOX_CREATION`.
 //!
-//! Settings here mirror `contracts/foundry.toml`. The CI `bytecode-hash` job is
-//! the canary for divergence between this build and `forge build`.
+//! Forge is the single source of truth for contract compilation; this script
+//! just orchestrates it and embeds the result. Requires `forge` on PATH.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
-use foundry_compilers::artifacts::remappings::Remapping;
-use foundry_compilers::artifacts::{BytecodeHash, Optimizer, Settings, SettingsMetadata};
-use foundry_compilers::compilers::solc::{Solc, SolcCompiler, SolcLanguage, SolcSettings};
-use foundry_compilers::{ConfigurableArtifacts, ProjectBuilder, ProjectPathsConfig};
-use semver::Version;
 
-/// Pin solc to match `contracts/foundry.toml`. Bumping here without bumping
-/// there (or vice versa) breaks the `bytecode-hash` CI gate.
-const SOLC_MAJOR: u64 = 0;
-const SOLC_MINOR: u64 = 8;
-const SOLC_PATCH: u64 = 26;
-const OPTIMIZER_RUNS: usize = 200;
-
-/// Artifacts to embed into the deployer binary as `pub const X: &[u8]`.
-/// Each entry is `(rust_const_name, contract_name)`. The artifact file is found at
-/// `contracts/out/<contract_name>.sol/<contract_name>.json`.
-const EMBEDDED_ARTIFACTS: &[(&str, &str)] = &[
-    ("KARDAMOM_FACTORY_V1_CREATION", "KardamomFactoryV1"),
-    ("ERC1967_PROXY_CREATION", "ERC1967Proxy"),
-    ("ETH_LOCKBOX_CREATION", "ETHLockbox"),
-];
-
-/// Solidity dependencies we need under `contracts/lib/`. `(dir_name, forge_install_spec)`.
+/// Solidity dependencies under `contracts/lib/`. `(dir_name, forge_install_spec)`.
 const LIB_DEPS: &[(&str, &str)] = &[
     ("forge-std", "foundry-rs/forge-std"),
     (
@@ -46,6 +26,13 @@ const LIB_DEPS: &[(&str, &str)] = &[
     ),
 ];
 
+/// Artifacts to embed. `(rust_const_name, contract_name)`.
+const EMBEDDED_ARTIFACTS: &[(&str, &str)] = &[
+    ("KARDAMOM_FACTORY_V1_CREATION", "KardamomFactoryV1"),
+    ("ERC1967_PROXY_CREATION", "ERC1967Proxy"),
+    ("ETH_LOCKBOX_CREATION", "ETHLockbox"),
+];
+
 fn main() -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -55,14 +42,26 @@ fn main() -> Result<()> {
         .to_path_buf();
     let contracts_root = workspace_root.join("contracts");
 
+    println!(
+        "cargo:rerun-if-changed={}",
+        contracts_root.join("src").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        contracts_root.join("foundry.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        contracts_root.join("remappings.txt").display()
+    );
+
     ensure_lib_deps(&contracts_root)?;
-    compile(&contracts_root)?;
+    forge_build(&contracts_root)?;
     emit_embedded_module(&contracts_root)?;
     Ok(())
 }
 
 /// `forge install` any missing entries in `LIB_DEPS`. No-op if all present.
-/// Requires `forge` on PATH only when at least one dep is missing.
 fn ensure_lib_deps(contracts_root: &Path) -> Result<()> {
     let lib = contracts_root.join("lib");
     let missing: Vec<&str> = LIB_DEPS
@@ -73,7 +72,7 @@ fn ensure_lib_deps(contracts_root: &Path) -> Result<()> {
     if missing.is_empty() {
         return Ok(());
     }
-    let status = std::process::Command::new("forge")
+    let status = Command::new("forge")
         .arg("install")
         .arg("--no-git")
         .arg("--shallow")
@@ -92,69 +91,18 @@ fn ensure_lib_deps(contracts_root: &Path) -> Result<()> {
     Ok(())
 }
 
-fn compile(contracts_root: &Path) -> Result<()> {
-    let remappings_txt = contracts_root.join("remappings.txt");
-    let remappings: Vec<Remapping> = std::fs::read_to_string(&remappings_txt)
-        .with_context(|| format!("read {}", remappings_txt.display()))?
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim();
-            (!l.is_empty() && !l.starts_with('#')).then(|| l.parse::<Remapping>())
-        })
-        .collect::<Result<_, _>>()
-        .context("parse remappings.txt")?;
-
-    let paths: ProjectPathsConfig<SolcLanguage> = ProjectPathsConfig::builder()
-        .root(contracts_root)
-        .sources(contracts_root.join("src"))
-        .artifacts(contracts_root.join("out"))
-        .lib(contracts_root.join("lib"))
-        .remappings(remappings)
-        .build()
-        .context("build ProjectPathsConfig")?;
-
-    let solc_version = Version::new(SOLC_MAJOR, SOLC_MINOR, SOLC_PATCH);
-    let solc = Solc::find_or_install(&solc_version)
-        .with_context(|| format!("find or install solc {solc_version}"))?;
-
-    let settings = SolcSettings {
-        settings: Settings {
-            optimizer: Optimizer {
-                enabled: Some(true),
-                runs: Some(OPTIMIZER_RUNS),
-                details: None,
-            },
-            metadata: Some(SettingsMetadata {
-                use_literal_content: None,
-                bytecode_hash: Some(BytecodeHash::None),
-                cbor_metadata: None,
-            }),
-            ..Settings::default()
-        },
-        cli_settings: Default::default(),
-    };
-
-    let project = ProjectBuilder::<SolcCompiler, ConfigurableArtifacts>::new(
-        ConfigurableArtifacts::default(),
-    )
-    .paths(paths)
-    .settings(settings)
-    .build(SolcCompiler::Specific(solc))
-    .context("build Project")?;
-
-    project.rerun_if_sources_changed();
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("remappings.txt").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        contracts_root.join("foundry.toml").display()
-    );
-
-    let output = project.compile().context("solc compile")?;
-    if output.has_compiler_errors() {
-        return Err(anyhow!("solc compilation errors:\n{output}"));
+fn forge_build(contracts_root: &Path) -> Result<()> {
+    let status = Command::new("forge")
+        .arg("build")
+        .current_dir(contracts_root)
+        .status()
+        .map_err(|e| {
+            anyhow!(
+                "failed to spawn `forge build`: {e}. Install Foundry from https://getfoundry.sh"
+            )
+        })?;
+    if !status.success() {
+        return Err(anyhow!("`forge build` failed with status {status}"));
     }
     Ok(())
 }
@@ -171,19 +119,16 @@ fn emit_embedded_module(contracts_root: &Path) -> Result<()> {
             .join(format!("{contract_name}.json"));
         let bin_path = write_creation_bin(&artifact_path, &out_dir, contract_name)?;
         body.push_str(&format!(
-            "pub const {const_name}: &[u8] = include_bytes!({:?});\n",
-            bin_path
+            "pub const {const_name}: &[u8] = include_bytes!({bin_path:?});\n"
         ));
     }
     std::fs::write(&out_file, body).with_context(|| format!("write {}", out_file.display()))?;
     Ok(())
 }
 
-/// Reads `bytecode.object` (hex) from `artifact_path`, decodes to raw bytes, and
-/// writes them to `<out_dir>/<contract>.bin`. Returns that path so build.rs can
-/// `include_bytes!` it. Keeps the source-of-truth as the JSON artifact while
-/// giving the include_bytes! a clean binary file (and avoids decoding hex at
-/// runtime).
+/// Read `bytecode.object` (hex) from `artifact_path`, decode to raw bytes, write to
+/// `<out_dir>/<contract>.bin`. Returns that path for `include_bytes!`. Keeps the
+/// source-of-truth as the JSON artifact while letting the consts be raw bytes.
 fn write_creation_bin(
     artifact_path: &Path,
     out_dir: &Path,

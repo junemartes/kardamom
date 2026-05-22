@@ -6,11 +6,8 @@
 # address. If you intend to change settings here:
 #   1. Bump the salt suffix in crates/deployer/src/addresses.rs
 #      (e.g. "kardamom.factory.proxy.v1" -> "v2")
-#   2. Mirror the change in crates/deployer/build.rs (settings passed to
-#      foundry-compilers); the two builders must produce byte-identical output
-#      or the embedded bytecode parity check fails.
-#   3. Regenerate contracts/expected_bytecode_hash.txt
-#   4. Re-run cargo test -p kardamom-deployer --test factory_address_sync and
+#   2. Regenerate contracts/expected_bytecode_hash.txt
+#   3. Re-run cargo test -p kardamom-deployer --test factory_address_sync and
 #      update KardamomUUPSBase.FACTORY with the new computed address.
 
 [profile.default]
@@ -21,11 +18,6 @@ libs = ["lib"]
 solc = "0.8.26"
 optimizer = true
 optimizer_runs = 200
-# bytecode_hash = "none" strips the CBOR metadata trailer so forge build and
-# the cargo `foundry-compilers` invocation in crates/deployer/build.rs produce
-# byte-identical bytecode (the trailer otherwise diverges due to solc path
-# input differences).
-bytecode_hash = "none"
 fuzz = { runs = 256 }
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
