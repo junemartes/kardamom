@@ -33,6 +33,19 @@ const EMBEDDED_ARTIFACTS: &[(&str, &str)] = &[
     ("ETH_LOCKBOX_CREATION", "ETHLockbox"),
 ];
 
+/// Solidity dependencies we need under `contracts/lib/`. `(dir_name, forge_install_spec)`.
+const LIB_DEPS: &[(&str, &str)] = &[
+    ("forge-std", "foundry-rs/forge-std"),
+    (
+        "openzeppelin-contracts",
+        "openzeppelin/openzeppelin-contracts@v5.0.2",
+    ),
+    (
+        "openzeppelin-contracts-upgradeable",
+        "openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2",
+    ),
+];
+
 fn main() -> Result<()> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
@@ -42,8 +55,40 @@ fn main() -> Result<()> {
         .to_path_buf();
     let contracts_root = workspace_root.join("contracts");
 
+    ensure_lib_deps(&contracts_root)?;
     compile(&contracts_root)?;
     emit_embedded_module(&contracts_root)?;
+    Ok(())
+}
+
+/// `forge install` any missing entries in `LIB_DEPS`. No-op if all present.
+/// Requires `forge` on PATH only when at least one dep is missing.
+fn ensure_lib_deps(contracts_root: &Path) -> Result<()> {
+    let lib = contracts_root.join("lib");
+    let missing: Vec<&str> = LIB_DEPS
+        .iter()
+        .filter(|(dir, _)| !lib.join(dir).exists())
+        .map(|(_, spec)| *spec)
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let status = std::process::Command::new("forge")
+        .arg("install")
+        .arg("--no-git")
+        .arg("--shallow")
+        .args(&missing)
+        .current_dir(contracts_root)
+        .status()
+        .map_err(|e| {
+            anyhow!(
+                "failed to spawn `forge install`: {e}. Install Foundry from https://getfoundry.sh \
+                 or pre-populate contracts/lib/ with: {missing:?}"
+            )
+        })?;
+    if !status.success() {
+        return Err(anyhow!("`forge install` failed with status {status}"));
+    }
     Ok(())
 }
 
