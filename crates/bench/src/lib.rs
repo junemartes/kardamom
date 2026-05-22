@@ -13,6 +13,6 @@ pub mod workflow;
 pub mod workflows;
 
 pub use benchmark::{Benchmark, Outputs, Prepared};
-pub use harness::{Harness, run_harness};
+pub use harness::Harness;
 pub use workflow::BenchWorkflow;
 pub use workflows::{CallsWorkflow, MixedWorkflow, TransfersWorkflow};

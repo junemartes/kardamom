@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use kardamom_bench::harness::{Harness, run_harness};
+use kardamom_bench::harness::Harness;
 use kardamom_bench::{Benchmark, TransfersWorkflow};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -19,24 +19,25 @@ async fn harness_writes_flame_with_node_spans() {
 
     let bench = Benchmark {
         workflow: TransfersWorkflow::default(),
-        // Sized larger than warmup + duration can consume against an
+        // Sized larger than warmup + timeout can consume against an
         // in-process node, so the deadline (not work exhaustion) ends the
         // dispatch and the flame layer sees the full measurement window.
         // Kept small enough that debug-build ECDSA presigning is tolerable.
         txs_per_task: 2_000,
         max_in_flight: 8,
-        duration: Duration::from_millis(800),
+        timeout: Duration::from_millis(800),
         concurrency: 4,
         warmup: Duration::from_millis(200),
     };
 
-    run_harness(Harness {
+    Harness {
         chain_id: 1,
         bench,
         flame_out: flame_out.clone(),
         report_json: None,
         pprof_out: None,
-    })
+    }
+    .run()
     .await
     .expect("harness ran");
 

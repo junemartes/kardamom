@@ -41,7 +41,7 @@ cargo run --release --bin kardamom -- --chain chains/dev.toml
 # 3. Drive load. `mixed` is the 1:4 transfers:calls built-in workflow.
 cargo run --release --bin kardamom-bench -- \
   --rpc http://127.0.0.1:8545 \
-  --concurrency 16 --duration 30s \
+  --concurrency 16 --timeout 30s \
   mixed
 ```
 
@@ -104,7 +104,7 @@ excluded via an `AtomicBool`-driven `FilterFn`).
 cargo build --release --bin kardamom-bench-harness
 
 ./target/release/kardamom-bench-harness \
-  --duration 10s --warmup 2s --concurrency 32 \
+  --timeout 10s --warmup 2s --concurrency 32 \
   --flame-out /tmp/flame.folded \
   transfers
 
@@ -126,7 +126,7 @@ window as the `tracing-flame` recording.
 
 ```sh
 ./target/release/kardamom-bench-harness \
-  --duration 10s --warmup 1s --concurrency 128 \
+  --timeout 10s --warmup 1s --concurrency 128 \
   --max-in-flight 30 \
   --flame-out /tmp/flame.folded \
   --pprof-out /tmp/cpu.svg \

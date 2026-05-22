@@ -16,14 +16,16 @@
 //! right after dispatch returns, so the SVG is bounded to the same window
 //! as the `tracing-flame` recording.
 
+use std::fs::File;
+use std::io::BufWriter;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jsonrpsee::http_client::HttpClientBuilder;
-use jsonrpsee::server::Server;
-use tracing_flame::FlameLayer;
+use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use jsonrpsee::server::{Server, ServerHandle};
+use tracing_flame::{FlameLayer, FlushGuard};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::FilterFn;
 use tracing_subscriber::layer::SubscriberExt;
@@ -34,6 +36,7 @@ use kardamom_node::rpc::{EthApiServer, EthHandlers};
 use kardamom_node::{Genesis, Node};
 
 use crate::Benchmark;
+use crate::benchmark::Outputs;
 use crate::config::{MAX_IN_FLIGHT_SLACK, PPROF_HZ, REQUEST_TIMEOUT};
 use crate::report::{self, ReportInputs};
 use crate::workflow::BenchWorkflow;
@@ -56,156 +59,197 @@ pub struct Harness<W: BenchWorkflow> {
     pub pprof_out: Option<PathBuf>,
 }
 
-/// Build the node + RPC server and drive a measured dispatch with
-/// flame/pprof recording scoped to the dispatch window.
-///
-/// Flow: prepare the workflow against a live client, sleep out the
-/// warmup gap, then flip the flame/pprof gates on and run the dispatch.
-/// The recordings see only the dispatch window — no signer derivation,
-/// no presigning, no warmup.
-///
-/// # Errors
-///
-/// Errors if the genesis derived from `workflow.genesis_alloc` is
-/// invalid, the in-process RPC server can't bind, the workflow's
-/// `prepare`/`dispatch` fails, or any of the output files (flame, pprof,
-/// report JSON) can't be written.
-///
-/// # Panics
-///
-/// Panics if the hardcoded loopback bind literal `"127.0.0.1:0"` fails
-/// to parse (impossible). Indirectly, panics if a sender task panics
-/// mid-iteration (poisons the per-task accumulator mutex — see
-/// `Benchmark::dispatch`).
-// Five linear sections, each well-commented: (1) tracing init,
-// (2) node + server + client, (3) prepare + warmup, (4) measured
-// dispatch under flame/pprof gates, (5) post-dispatch rendering +
-// report. Decomposing into helpers would force them to thread eight
-// borrowed values each, which is more noise than the line count saves.
-#[allow(clippy::too_many_lines)]
-pub async fn run_harness<W: BenchWorkflow>(args: Harness<W>) -> anyhow::Result<()> {
-    let active = Arc::new(AtomicBool::new(false));
-    let active_for_filter = Arc::clone(&active);
+impl<W: BenchWorkflow> Harness<W> {
+    /// Build the node + RPC server and drive a measured dispatch with
+    /// flame/pprof recording scoped to the dispatch window.
+    ///
+    /// Flow: prepare the workflow against a live client, sleep out the
+    /// warmup gap, then flip the flame/pprof gates on and run the
+    /// dispatch. The recordings see only the dispatch window — no signer
+    /// derivation, no presigning, no warmup.
+    ///
+    /// # Errors
+    ///
+    /// Errors if the genesis derived from `workflow.genesis_alloc` is
+    /// invalid, the in-process RPC server can't bind, the workflow's
+    /// `prepare`/`dispatch` fails, or any of the output files (flame,
+    /// pprof, report JSON) can't be written.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hardcoded loopback bind literal `"127.0.0.1:0"` fails
+    /// to parse (impossible). Indirectly, panics if a sender task panics
+    /// mid-iteration (poisons the per-task accumulator mutex — see
+    /// `Benchmark::dispatch`).
+    pub async fn run(self) -> anyhow::Result<()> {
+        let (active, flame_guard) = self.init_tracing()?;
+        let (client, server_handle) = self.build_node_and_client().await?;
 
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("kardamom=info,kardamom_bench=info"));
-    let fmt_layer = fmt::layer();
+        // All client-side crypto (signer derivation, presigning) happens
+        // here, before the dispatcher starts and well before the
+        // flame/pprof gates flip on.
+        let prepared = self.bench.prepare(&client).await?;
 
-    let (flame, flame_guard) = FlameLayer::with_file(&args.flame_out)?;
-    let gated_flame = flame.with_filter(FilterFn::new(move |_meta| {
-        active_for_filter.load(Ordering::Relaxed)
-    }));
+        // Warmup is a pure sleep gap before dispatch — no senders run
+        // during it. After the sleep we flip the flame gate and build the
+        // pprof guard, then call dispatch, then drop the guard. The
+        // recordings see only the dispatch window.
+        self.warmup_sleep().await;
+        let pprof_guard = self.build_pprof_guard()?;
+        self.log_dispatch_start();
 
-    // `try_init` fails if a global subscriber was already installed (e.g.
-    // by an enclosing binary or test harness). That's not fatal — the flame
-    // layer just won't receive events. Warn and continue rather than abort.
-    if let Err(e) = tracing_subscriber::registry()
-        .with(env_filter)
-        .with(fmt_layer)
-        .with(gated_flame)
-        .try_init()
-    {
-        eprintln!(
-            "kardamom-bench harness: tracing subscriber already installed; \
-             flame layer will not capture events ({e})"
+        let outputs = {
+            let _scope = ActiveScope::enter(&active);
+            self.bench.dispatch(client, prepared).await?
+        };
+
+        self.write_flame_output(flame_guard)?;
+        self.write_pprof_output(pprof_guard)?;
+        self.emit_report(outputs)?;
+
+        let _ = server_handle.stop();
+        server_handle.stopped().await;
+        Ok(())
+    }
+
+    /// Install the global tracing subscriber with the gated flame layer.
+    /// Returns the active-flag `AtomicBool` (flipped on around the
+    /// dispatch window) and the flame layer's flush guard.
+    fn init_tracing(&self) -> anyhow::Result<(Arc<AtomicBool>, FlushGuard<BufWriter<File>>)> {
+        let active = Arc::new(AtomicBool::new(false));
+        let active_for_filter = Arc::clone(&active);
+
+        let env_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("kardamom=info,kardamom_bench=info"));
+        let fmt_layer = fmt::layer();
+
+        let (flame, flame_guard) = FlameLayer::with_file(&self.flame_out)?;
+        let gated_flame = flame.with_filter(FilterFn::new(move |_meta| {
+            active_for_filter.load(Ordering::Relaxed)
+        }));
+
+        // `try_init` fails if a global subscriber was already installed
+        // (e.g. by an enclosing binary or test harness). That's not fatal
+        // — the flame layer just won't receive events. Warn and continue
+        // rather than abort.
+        if let Err(e) = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(fmt_layer)
+            .with(gated_flame)
+            .try_init()
+        {
+            eprintln!(
+                "kardamom-bench harness: tracing subscriber already installed; \
+                 flame layer will not capture events ({e})"
+            );
+        }
+
+        Ok((active, flame_guard))
+    }
+
+    /// Build the in-process node from the workflow's genesis alloc, bind a
+    /// loopback RPC server to an ephemeral port, and build a jsonrpsee
+    /// client pointed at it.
+    async fn build_node_and_client(&self) -> anyhow::Result<(HttpClient, ServerHandle)> {
+        // Build genesis from the workflow's alloc declaration, then
+        // validate it through the node's own validator (catches duplicate
+        // addresses, chain_id == 0, etc.).
+        let alloc = self.bench.workflow.genesis_alloc(self.bench.concurrency)?;
+        let genesis = Genesis {
+            chain_id: self.chain_id,
+            alloc,
+        };
+        genesis.validate().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid Genesis (chain_id={}, allocs from workflow.genesis_alloc): {e}",
+                self.chain_id
+            )
+        })?;
+        let node = Node::new(&genesis);
+
+        // Hard-coded loopback bind: parse cannot fail on this literal.
+        let bind: SocketAddr = "127.0.0.1:0"
+            .parse()
+            .expect("hardcoded loopback `127.0.0.1:0` is a valid SocketAddr");
+        let server = Server::builder().build(bind).await?;
+        let bound = server.local_addr()?;
+
+        let module = EthHandlers::new(node).into_rpc();
+        let server_handle = server.start(module);
+
+        let url = format!("http://{bound}");
+        let client = HttpClientBuilder::default()
+            .request_timeout(REQUEST_TIMEOUT)
+            .max_concurrent_requests(self.bench.max_in_flight as usize + MAX_IN_FLIGHT_SLACK)
+            .build(&url)?;
+
+        Ok((client, server_handle))
+    }
+
+    async fn warmup_sleep(&self) {
+        if !self.bench.warmup.is_zero() {
+            tracing::info!(duration = ?self.bench.warmup, "harness: warmup sleep");
+            tokio::time::sleep(self.bench.warmup).await;
+        }
+    }
+
+    fn build_pprof_guard(&self) -> anyhow::Result<Option<pprof::ProfilerGuard<'static>>> {
+        if self.pprof_out.is_none() {
+            return Ok(None);
+        }
+        let guard = pprof::ProfilerGuardBuilder::default()
+            .frequency(PPROF_HZ)
+            .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+            .build()
+            .map_err(|e| anyhow::anyhow!("pprof guard build failed: {e}"))?;
+        Ok(Some(guard))
+    }
+
+    fn log_dispatch_start(&self) {
+        tracing::info!(
+            workload = self.bench.workflow.name(),
+            timeout = ?self.bench.timeout,
+            concurrency = self.bench.concurrency,
+            max_in_flight = self.bench.max_in_flight,
+            txs_per_task = self.bench.txs_per_task,
+            flame_out = %self.flame_out.display(),
+            pprof_out = ?self.pprof_out.as_ref().map(|p| p.display().to_string()),
+            "harness: dispatch (flame/pprof on)"
         );
     }
 
-    // Build genesis from the workflow's alloc declaration, then validate
-    // it through the node's own validator (catches duplicate addresses,
-    // chain_id == 0, etc.).
-    let alloc = args.bench.workflow.genesis_alloc(args.bench.concurrency)?;
-    let genesis = Genesis {
-        chain_id: args.chain_id,
-        alloc,
-    };
-    genesis.validate().map_err(|e| {
-        anyhow::anyhow!(
-            "invalid Genesis (chain_id={}, allocs from workflow.genesis_alloc): {e}",
-            args.chain_id
-        )
-    })?;
-    let node = Node::new(&genesis);
-
-    // Hard-coded loopback bind: parse cannot fail on this literal.
-    let bind: SocketAddr = "127.0.0.1:0"
-        .parse()
-        .expect("hardcoded loopback `127.0.0.1:0` is a valid SocketAddr");
-    let server = Server::builder().build(bind).await?;
-    let bound = server.local_addr()?;
-
-    let module = EthHandlers::new(node).into_rpc();
-    let server_handle = server.start(module);
-
-    let url = format!("http://{bound}");
-    let client = HttpClientBuilder::default()
-        .request_timeout(REQUEST_TIMEOUT)
-        .max_concurrent_requests(args.bench.max_in_flight as usize + MAX_IN_FLIGHT_SLACK)
-        .build(&url)?;
-
-    // All client-side crypto (signer derivation, presigning) happens here,
-    // before the dispatcher starts and well before the flame/pprof gates
-    // flip on.
-    let prepared = args.bench.prepare(&client).await?;
-
-    // Warmup is a pure sleep gap before dispatch — no senders are running
-    // during it. After the sleep we flip the flame gate and build the
-    // pprof guard, then call dispatch, then drop the guard. The recordings
-    // see only the dispatch window.
-    if !args.bench.warmup.is_zero() {
-        tracing::info!(duration = ?args.bench.warmup, "harness: warmup sleep");
-        tokio::time::sleep(args.bench.warmup).await;
+    /// Flush the flame layer, then post-process `flame.folded` to drop the
+    /// per-worker thread prefix and bucket identical stacks.
+    fn write_flame_output(&self, flame_guard: FlushGuard<BufWriter<File>>) -> anyhow::Result<()> {
+        flame_guard
+            .flush()
+            .map_err(|e| anyhow::anyhow!("flush flamegraph: {e}"))?;
+        // Drop the guard before rewriting the file so no further writes
+        // race with the merge step below.
+        drop(flame_guard);
+        let raw_flame = std::fs::read_to_string(&self.flame_out)
+            .map_err(|e| anyhow::anyhow!("read {}: {e}", self.flame_out.display()))?;
+        let merged_flame = merge_folded_text(&raw_flame);
+        std::fs::write(&self.flame_out, &merged_flame)
+            .map_err(|e| anyhow::anyhow!("write {}: {e}", self.flame_out.display()))?;
+        tracing::info!(
+            flame_out = %self.flame_out.display(),
+            raw_bytes = raw_flame.len(),
+            merged_bytes = merged_flame.len(),
+            "harness: merged flame.folded across tokio workers"
+        );
+        Ok(())
     }
-    let pprof_guard = if args.pprof_out.is_some() {
-        Some(
-            pprof::ProfilerGuardBuilder::default()
-                .frequency(PPROF_HZ)
-                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                .build()
-                .map_err(|e| anyhow::anyhow!("pprof guard build failed: {e}"))?,
-        )
-    } else {
-        None
-    };
 
-    tracing::info!(
-        workload = args.bench.workflow.name(),
-        duration = ?args.bench.duration,
-        concurrency = args.bench.concurrency,
-        max_in_flight = args.bench.max_in_flight,
-        txs_per_task = args.bench.txs_per_task,
-        flame_out = %args.flame_out.display(),
-        pprof_out = ?args.pprof_out.as_ref().map(|p| p.display().to_string()),
-        "harness: dispatch (flame/pprof on)"
-    );
-
-    let outputs = {
-        let _scope = ActiveScope::enter(&active);
-        args.bench.dispatch(client, prepared).await?
-    };
-
-    flame_guard
-        .flush()
-        .map_err(|e| anyhow::anyhow!("flush flamegraph: {e}"))?;
-    // Drop the guard before rewriting the file so no further writes race
-    // with the merge step below.
-    drop(flame_guard);
-    // Rewrite the tracing-flame folded file: drop the per-worker thread
-    // prefix and bucket by remaining stack. Same `merge_folded_text` we
-    // apply to pprof below, just sourced from a file instead of a Report.
-    let raw_flame = std::fs::read_to_string(&args.flame_out)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", args.flame_out.display()))?;
-    let merged_flame = merge_folded_text(&raw_flame);
-    std::fs::write(&args.flame_out, &merged_flame)
-        .map_err(|e| anyhow::anyhow!("write {}: {e}", args.flame_out.display()))?;
-    tracing::info!(
-        flame_out = %args.flame_out.display(),
-        raw_bytes = raw_flame.len(),
-        merged_bytes = merged_flame.len(),
-        "harness: merged flame.folded across tokio workers"
-    );
-
-    if let (Some(guard), Some(path)) = (pprof_guard, args.pprof_out.as_ref()) {
+    /// Render the pprof CPU sample to an inferno-flamegraph SVG. No-op if
+    /// either the guard or the output path is absent.
+    fn write_pprof_output(
+        &self,
+        pprof_guard: Option<pprof::ProfilerGuard<'static>>,
+    ) -> anyhow::Result<()> {
+        let (Some(guard), Some(path)) = (pprof_guard, self.pprof_out.as_ref()) else {
+            return Ok(());
+        };
         let report = guard
             .report()
             .build()
@@ -216,12 +260,12 @@ pub async fn run_harness<W: BenchWorkflow>(args: Harness<W>) -> anyhow::Result<(
         //    work; the user wants the SVG to show node work only.
         let filtered = filter_to_node(&report);
         // 2. Convert the filtered Report to folded text, then run the same
-        //    `merge_folded_text` we use for tracing-flame above to drop the
-        //    thread-name prefix and sum identical stacks across workers.
-        //    Same primitive, two sources.
+        //    `merge_folded_text` we use for tracing-flame above to drop
+        //    the thread-name prefix and sum identical stacks across
+        //    workers. Same primitive, two sources.
         let pprof_folded = pprof_report_to_folded_text(&filtered.report);
         let merged_pprof = merge_folded_text(&pprof_folded);
-        let file = std::fs::File::create(path)
+        let file = File::create(path)
             .map_err(|e| anyhow::anyhow!("create {}: {e}", path.display()))?;
         let mut opts = pprof::flamegraph::Options::default();
         pprof::flamegraph::from_lines(&mut opts, merged_pprof.lines(), file)
@@ -232,28 +276,28 @@ pub async fn run_harness<W: BenchWorkflow>(args: Harness<W>) -> anyhow::Result<(
             dropped_samples = filtered.dropped_count,
             "harness: wrote pprof flamegraph (filtered to kardamom_node frames, merged across workers)"
         );
+        Ok(())
     }
 
-    let bench_report = report::build_report(
-        ReportInputs {
-            workload_name: args.bench.workflow.name(),
-            txs_per_task: args.bench.txs_per_task,
-            max_in_flight: args.bench.max_in_flight,
-            concurrency: args.bench.concurrency,
-            configured_duration: args.bench.duration,
-        },
-        &outputs.counters,
-        outputs.histograms,
-        outputs.measurement_duration,
-    );
-    report::print_terminal(&bench_report);
-    if let Some(path) = &args.report_json {
-        report::write_json(path, &bench_report)?;
+    fn emit_report(&self, outputs: Outputs) -> anyhow::Result<()> {
+        let bench_report = report::build_report(
+            ReportInputs {
+                workload_name: self.bench.workflow.name(),
+                txs_per_task: self.bench.txs_per_task,
+                max_in_flight: self.bench.max_in_flight,
+                concurrency: self.bench.concurrency,
+                configured_timeout: self.bench.timeout,
+            },
+            &outputs.counters,
+            outputs.histograms,
+            outputs.measurement_duration,
+        );
+        report::print_terminal(&bench_report);
+        if let Some(path) = &self.report_json {
+            report::write_json(path, &bench_report)?;
+        }
+        Ok(())
     }
-
-    let _ = server_handle.stop();
-    server_handle.stopped().await;
-    Ok(())
 }
 
 /// Substring matched against demangled symbol names to decide whether a

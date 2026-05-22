@@ -10,10 +10,10 @@ use std::time::Duration;
 use clap::{Parser, Subcommand};
 
 use kardamom_bench::config::{
-    DEFAULT_CONCURRENCY, DEFAULT_DURATION_STR, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TXS_PER_TASK,
+    DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_STR, DEFAULT_TXS_PER_TASK,
     DEFAULT_WARMUP_STR,
 };
-use kardamom_bench::harness::{Harness, run_harness};
+use kardamom_bench::harness::Harness;
 use kardamom_bench::{BenchWorkflow, Benchmark, CallsWorkflow, MixedWorkflow, TransfersWorkflow};
 
 #[derive(Parser, Debug)]
@@ -30,10 +30,10 @@ struct Args {
     #[arg(long, default_value_t = 412_346)]
     chain_id: u64,
 
-    /// Test duration (safety timeout; senders also stop when their work
-    /// vec is drained).
-    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_DURATION_STR)]
-    duration: Duration,
+    /// Safety timeout for the measurement window; senders also stop when
+    /// their work vec is drained.
+    #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_TIMEOUT_STR)]
+    timeout: Duration,
 
     /// Pure sleep gap between `prepare` and `dispatch`. No senders run
     /// during this window — flame and pprof recordings stay off, and the
@@ -90,18 +90,19 @@ async fn main() -> anyhow::Result<()> {
 async fn harness_with<W: BenchWorkflow>(workflow: W, args: &Args) -> anyhow::Result<()> {
     let bench = Benchmark {
         workflow,
-        duration: args.duration,
+        timeout: args.timeout,
         warmup: args.warmup,
         concurrency: args.concurrency,
         txs_per_task: args.txs_per_task,
         max_in_flight: args.max_in_flight,
     };
-    run_harness(Harness {
+    Harness {
         chain_id: args.chain_id,
         bench,
         flame_out: args.flame_out.clone(),
         report_json: args.report_json.clone(),
         pprof_out: args.pprof_out.clone(),
-    })
+    }
+    .run()
     .await
 }

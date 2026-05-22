@@ -10,7 +10,7 @@ use hdrhistogram::Histogram;
 use jsonrpsee::http_client::HttpClient;
 
 use crate::config::{
-    DEFAULT_CONCURRENCY, DEFAULT_DURATION, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TXS_PER_TASK,
+    DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT, DEFAULT_TXS_PER_TASK,
     DEFAULT_WARMUP,
 };
 use crate::report::Counters;
@@ -27,9 +27,9 @@ pub struct Benchmark<W: BenchWorkflow> {
     /// over [`BenchWorkflow`] so external crates can plug in their own.
     pub workflow: W,
     /// Safety timeout for the measurement window. The runtime applies
-    /// `tokio::time::timeout(duration, ...)` per sender task; whichever
+    /// `tokio::time::timeout(timeout, ...)` per sender task; whichever
     /// of "vec drained" or "timeout fired" comes first ends the run.
-    pub duration: Duration,
+    pub timeout: Duration,
     /// Pure sleep gap between `prepare` and `dispatch`. No senders run
     /// during it; it lets OS / CPU caches settle before measurement.
     pub warmup: Duration,
@@ -49,7 +49,7 @@ impl<W: BenchWorkflow + Default> Default for Benchmark<W> {
     fn default() -> Self {
         Self {
             workflow: W::default(),
-            duration: DEFAULT_DURATION,
+            timeout: DEFAULT_TIMEOUT,
             warmup: DEFAULT_WARMUP,
             concurrency: DEFAULT_CONCURRENCY,
             txs_per_task: DEFAULT_TXS_PER_TASK,
@@ -118,7 +118,7 @@ impl<W: BenchWorkflow> Benchmark<W> {
     }
 
     /// Stage 2 — the measured window. Spawns one sender task per work vec
-    /// inside a `tokio::time::timeout(self.duration, ...)`. Each sender
+    /// inside a `tokio::time::timeout(self.timeout, ...)`. Each sender
     /// loops serially over its vec (per-task in-flight = 1); the
     /// runtime-wide `max_in_flight` budget is enforced at the HTTP client
     /// layer (`max_concurrent_requests = max_in_flight + MAX_IN_FLIGHT_SLACK`),
@@ -156,10 +156,10 @@ impl<W: BenchWorkflow> Benchmark<W> {
             accums.push(Arc::clone(&accum));
             let client = Arc::clone(&client);
             let workflow = Arc::clone(&workflow);
-            let duration = self.duration;
+            let timeout = self.timeout;
             handles.push(tokio::spawn(async move {
                 let _ =
-                    tokio::time::timeout(duration, send_loop(workflow, accum, client, work)).await;
+                    tokio::time::timeout(timeout, send_loop(workflow, accum, client, work)).await;
             }));
         }
 
@@ -296,7 +296,7 @@ mod tests {
     fn dummy_bench(concurrency: u32, txs_per_task: u32) -> Benchmark<TransfersWorkflow> {
         Benchmark {
             workflow: TransfersWorkflow::default(),
-            duration: Duration::from_secs(1),
+            timeout: Duration::from_secs(1),
             warmup: Duration::ZERO,
             concurrency,
             txs_per_task,

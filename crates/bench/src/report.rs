@@ -22,9 +22,9 @@ pub struct ReportInputs<'a> {
     pub max_in_flight: u32,
     /// Number of sender tasks.
     pub concurrency: u32,
-    /// The `--duration` knob the run was configured with (not the measured
+    /// The `--timeout` knob the run was configured with (not the measured
     /// wall clock — that's `measurement_duration` on the outputs).
-    pub configured_duration: Duration,
+    pub configured_timeout: Duration,
 }
 
 /// Per-RPC-method summary in a [`BenchReport`].
@@ -55,9 +55,9 @@ pub struct BenchReport {
     pub txs_per_task: u32,
     /// `max_in_flight` knob the run was configured with.
     pub max_in_flight: u32,
-    /// Configured `--duration` in seconds (the safety timeout, not the
+    /// Configured `--timeout` in seconds (the safety timeout, not the
     /// measured wall clock).
-    pub duration_secs: f64,
+    pub timeout_secs: f64,
     /// Concurrency knob the run was configured with.
     pub concurrency: u32,
     /// Measured throughput: completed requests / measurement wall clock.
@@ -130,7 +130,7 @@ pub fn build_report(
         workload: inputs.workload_name.to_string(),
         txs_per_task: inputs.txs_per_task,
         max_in_flight: inputs.max_in_flight,
-        duration_secs: inputs.configured_duration.as_secs_f64(),
+        timeout_secs: inputs.configured_timeout.as_secs_f64(),
         concurrency: inputs.concurrency,
         throughput_rps,
         measurement_secs,

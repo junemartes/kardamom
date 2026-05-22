@@ -16,7 +16,7 @@ use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 
 use kardamom_bench::Benchmark;
-use kardamom_bench::harness::{Harness, run_harness};
+use kardamom_bench::harness::Harness;
 use kardamom_bench::workflow::BenchWorkflow;
 use kardamom_node::AllocEntry;
 
@@ -61,24 +61,25 @@ impl BenchWorkflow for BlockNumberWorkflow {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // `run_harness` installs its own tracing subscriber (with the flame
+    // `Harness::run` installs its own tracing subscriber (with the flame
     // layer), so we don't init one here.
 
     let bench = Benchmark {
         workflow: BlockNumberWorkflow,
-        duration: Duration::from_secs(3),
+        timeout: Duration::from_secs(3),
         warmup: Duration::from_millis(500),
         concurrency: 8,
         txs_per_task: 5_000,
         max_in_flight: 8,
     };
 
-    run_harness(Harness {
+    Harness {
         chain_id: 412_346,
         bench,
         flame_out: "/tmp/k-custom-flame.folded".into(),
         report_json: None,
         pprof_out: None,
-    })
+    }
+    .run()
     .await
 }

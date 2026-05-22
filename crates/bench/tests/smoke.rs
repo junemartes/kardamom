@@ -39,7 +39,7 @@ async fn bench_records_samples_against_inprocess_node() {
 
     let bench = Benchmark {
         workflow,
-        duration: Duration::from_secs(5),
+        timeout: Duration::from_secs(5),
         warmup: Duration::ZERO,
         concurrency,
         txs_per_task: 50,
