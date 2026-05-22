@@ -19,14 +19,9 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8545", global = true)]
     rpc_url: String,
 
-    /// Hex private key or "env:VAR_NAME". Required for write commands.
-    #[arg(long, global = true)]
-    private_key: Option<String>,
-
     /// Canonical owner address (Safe or EOA). Same owner ⇒ same factory address.
-    /// Required for any command that touches the factory.
-    #[arg(long, global = true)]
-    owner: Option<Address>,
+    #[arg(long, global = true, required = true)]
+    owner: Address,
 
     #[command(subcommand)]
     command: Command,
@@ -36,11 +31,19 @@ struct Cli {
 enum Command {
     /// Bootstrap the factory if absent. Anyone can run this; the resulting factory
     /// is always owned by `--owner`.
-    EnsureFactory,
+    EnsureFactory {
+        /// Hex private key or "env:VAR_NAME". Pays for the bootstrap tx.
+        #[arg(long)]
+        private_key: String,
+    },
 
     /// Deploy one or more contracts in one tx. Implies ensure-factory.
     /// `--l2-chain-id` and `--l2-minter` are positionally paired and repeat together.
     Deploy {
+        /// Hex private key or "env:VAR_NAME".
+        #[arg(long)]
+        private_key: String,
+
         /// Contract IDs to deploy (e.g. ETHLockbox). Same id repeats per L2.
         #[arg(required = true)]
         ids: Vec<String>,
@@ -56,6 +59,10 @@ enum Command {
 
     /// Upgrade contracts to the next version across one or more L2s in one tx.
     Upgrade {
+        /// Hex private key or "env:VAR_NAME".
+        #[arg(long)]
+        private_key: String,
+
         #[arg(required = true)]
         ids: Vec<String>,
 
@@ -79,18 +86,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::EnsureFactory => {
-            let key = require_key(cli.private_key, "ensure-factory")?;
-            let owner = require_owner(cli.owner, "ensure-factory")?;
-            run_ensure_factory(cli.rpc_url, key, owner).await
+        Command::EnsureFactory { private_key } => {
+            run_ensure_factory(cli.rpc_url, private_key, cli.owner).await
         }
         Command::Deploy {
+            private_key,
             ids,
             l2_chain_ids,
             l2_minters,
         } => {
-            let key = require_key(cli.private_key, "deploy")?;
-            let owner = require_owner(cli.owner, "deploy")?;
             if l2_chain_ids.len() != l2_minters.len() {
                 bail!(
                     "--l2-chain-id ({}) and --l2-minter ({}) counts must match",
@@ -101,28 +105,33 @@ async fn main() -> Result<()> {
             let contract_ids = parse_ids(&ids)?;
             run_deploy(
                 cli.rpc_url,
-                key,
-                owner,
+                private_key,
+                cli.owner,
                 contract_ids,
                 l2_chain_ids,
                 l2_minters,
             )
             .await
         }
-        Command::Upgrade { ids, l2_chain_ids } => {
-            let key = require_key(cli.private_key, "upgrade")?;
-            let owner = require_owner(cli.owner, "upgrade")?;
+        Command::Upgrade {
+            private_key,
+            ids,
+            l2_chain_ids,
+        } => {
             let contract_ids = parse_ids(&ids)?;
-            run_upgrade(cli.rpc_url, key, owner, contract_ids, l2_chain_ids).await
+            run_upgrade(
+                cli.rpc_url,
+                private_key,
+                cli.owner,
+                contract_ids,
+                l2_chain_ids,
+            )
+            .await
         }
         Command::Addresses { l2_chain_id } => {
-            let owner = require_owner(cli.owner, "addresses")?;
-            run_addresses(cli.rpc_url, owner, l2_chain_id).await
+            run_addresses(cli.rpc_url, cli.owner, l2_chain_id).await
         }
-        Command::Verify => {
-            let owner = require_owner(cli.owner, "verify")?;
-            run_verify(cli.rpc_url, owner).await
-        }
+        Command::Verify => run_verify(cli.rpc_url, cli.owner).await,
     }
 }
 
@@ -132,9 +141,9 @@ async fn run_ensure_factory(rpc_url: String, private_key: String, owner: Address
     let provider = ProviderBuilder::new()
         .wallet(signer)
         .connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, operator);
-    let factory_addr = deployer.factory_address(owner).await?;
-    match deployer.ensure_factory(owner).await? {
+    let deployer = Deployer::new(provider, owner);
+    let factory_addr = deployer.factory_address();
+    match deployer.ensure_factory(operator).await? {
         FactoryStatus::AlreadyDeployed => {
             println!("factory already deployed at {factory_addr} (owner: {owner})");
         }
@@ -158,9 +167,9 @@ async fn run_deploy(
     let provider = ProviderBuilder::new()
         .wallet(signer)
         .connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, operator);
+    let deployer = Deployer::new(provider, owner);
 
-    deployer.ensure_factory(owner).await?;
+    deployer.ensure_factory(operator).await?;
 
     // For each id × each (l2_chain_id, l2_minter) pair, emit one Op::Deploy.
     let mut ops: Vec<Op> = Vec::new();
@@ -174,10 +183,10 @@ async fn run_deploy(
         }
     }
 
-    let tx = deployer.apply(&ops, owner).await?;
+    let tx = deployer.apply(&ops, operator).await?;
     println!("deployed in tx {tx}");
 
-    let entries = deployer.addresses(owner, None).await?;
+    let entries = deployer.addresses(None).await?;
     for e in &entries {
         print_entry(e);
     }
@@ -196,9 +205,9 @@ async fn run_upgrade(
     let provider = ProviderBuilder::new()
         .wallet(signer)
         .connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, operator);
+    let deployer = Deployer::new(provider, owner);
 
-    let current_entries = deployer.addresses(owner, None).await?;
+    let current_entries = deployer.addresses(None).await?;
 
     let mut ops: Vec<Op> = Vec::new();
     for id in &ids {
@@ -217,10 +226,10 @@ async fn run_upgrade(
         }
     }
 
-    let tx = deployer.apply(&ops, owner).await?;
+    let tx = deployer.apply(&ops, operator).await?;
     println!("upgraded in tx {tx}");
 
-    let entries = deployer.addresses(owner, None).await?;
+    let entries = deployer.addresses(None).await?;
     for e in &entries {
         print_entry(e);
     }
@@ -229,8 +238,8 @@ async fn run_upgrade(
 
 async fn run_addresses(rpc_url: String, owner: Address, l2_chain_id: Option<u64>) -> Result<()> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, Address::ZERO);
-    let entries = deployer.addresses(owner, l2_chain_id).await?;
+    let deployer = Deployer::new(provider, owner);
+    let entries = deployer.addresses(l2_chain_id).await?;
     for e in &entries {
         print_entry(e);
     }
@@ -239,8 +248,8 @@ async fn run_addresses(rpc_url: String, owner: Address, l2_chain_id: Option<u64>
 
 async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
     let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, Address::ZERO);
-    let report = deployer.verify(owner).await?;
+    let deployer = Deployer::new(provider, owner);
+    let report = deployer.verify().await?;
     for e in &report.entries {
         print_entry(e);
     }
@@ -253,14 +262,6 @@ async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
         bail!("verify: {} mismatch(es) found", report.mismatches.len());
     }
     Ok(())
-}
-
-fn require_key(key: Option<String>, cmd: &str) -> Result<String> {
-    key.with_context(|| format!("--private-key is required for `{cmd}`"))
-}
-
-fn require_owner(owner: Option<Address>, cmd: &str) -> Result<Address> {
-    owner.with_context(|| format!("--owner is required for `{cmd}`"))
 }
 
 fn parse_key(key: &str) -> Result<PrivateKeySigner> {

@@ -97,47 +97,47 @@ pub struct VerifyMismatch {
 // Deployer
 // ---------------------------------------------------------------------------
 
-/// Stateful deployer: wraps a provider and operator address.
+/// Stateful deployer: wraps a provider and the canonical factory `owner`.
+///
+/// `owner` is part of the factory's CREATE2 initcode, so it pins the factory
+/// address. Write methods take an `operator` (the tx `from`).
 ///
 /// Generic over the provider so it works with any alloy provider (including
 /// anvil-backed providers in tests).
 pub struct Deployer<P> {
     provider: P,
-    /// The "from" address used when sending transactions.
-    operator: Address,
+    owner: Address,
 }
 
 impl<P: Provider<Ethereum> + Clone> Deployer<P> {
-    pub fn new(provider: P, operator: Address) -> Self {
-        Self { provider, operator }
+    pub fn new(provider: P, owner: Address) -> Self {
+        Self { provider, owner }
+    }
+
+    pub fn owner(&self) -> Address {
+        self.owner
     }
 
     // -----------------------------------------------------------------------
-    // factory_address — pure computation (async for API consistency)
+    // factory_address — pure computation
     // -----------------------------------------------------------------------
 
-    /// Derive the factory proxy address from compiled forge artifacts + the canonical owner.
-    pub async fn factory_address(&self, owner: Address) -> Result<Address, DeployError> {
+    /// Derive the factory proxy address from embedded creation bytecode + the
+    /// configured owner. Pure (no I/O).
+    pub fn factory_address(&self) -> Address {
         let impl_initcode = embedded::factory_v1_creation();
         let proxy_creation_code = embedded::erc1967_proxy_creation();
         let impl_addr = factory_impl_address(&impl_initcode);
-        Ok(factory_proxy_address(
-            &proxy_creation_code,
-            impl_addr,
-            owner,
-        ))
+        factory_proxy_address(&proxy_creation_code, impl_addr, self.owner)
     }
 
     // -----------------------------------------------------------------------
     // ensure_factory — bootstrap workflow
     // -----------------------------------------------------------------------
 
-    /// Ensure the kardamom factory is deployed on the connected chain.
-    ///
-    /// `owner` is the canonical owner for this environment — same owner across L1s
-    /// means same factory address. Anyone with gas can call this; the owner is set
-    /// at initialize time, not by tx.origin.
-    pub async fn ensure_factory(&self, owner: Address) -> Result<FactoryStatus, DeployError> {
+    /// Ensure the kardamom factory is deployed on the connected chain. Anyone
+    /// with gas can call this; the on-chain owner is set at initialize time.
+    pub async fn ensure_factory(&self, operator: Address) -> Result<FactoryStatus, DeployError> {
         // (a) ERC-7955 factory must be present.
         let factory_code = self
             .provider
@@ -153,8 +153,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let factory_impl_initcode = embedded::factory_v1_creation();
         let proxy_creation_code = embedded::erc1967_proxy_creation();
         let impl_addr = factory_impl_address(&factory_impl_initcode);
-        let init_data = factory_init_data(owner);
-        let factory_proxy = factory_proxy_address(&proxy_creation_code, impl_addr, owner);
+        let init_data = factory_init_data(self.owner);
+        let factory_proxy = self.factory_address();
 
         // (b) Already deployed?
         let proxy_code = self
@@ -168,13 +168,13 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 
         // (c) Deploy impl via ERC-7955.
         let impl_salt = crate::addresses::factory_impl_salt();
-        self.send_erc7955_tx(impl_salt, &factory_impl_initcode)
+        self.send_erc7955_tx(operator, impl_salt, &factory_impl_initcode)
             .await?;
 
         // (d) Deploy proxy via ERC-7955.
         let proxy_salt = crate::addresses::factory_proxy_salt();
         let full_proxy_initcode = proxy_full_initcode(&proxy_creation_code, impl_addr, &init_data);
-        self.send_erc7955_tx(proxy_salt, &full_proxy_initcode)
+        self.send_erc7955_tx(operator, proxy_salt, &full_proxy_initcode)
             .await?;
 
         // (e) Verify.
@@ -200,8 +200,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// where only the first triggers a CREATE2 of the impl; subsequent specs reference
     /// the (offline-computed) impl address via `target_impl`. This makes "upgrade across
     /// N L2s to the same new impl" a one-impl-deploy operation instead of N copies.
-    pub async fn apply(&self, ops: &[Op], owner: Address) -> Result<TxHash, DeployError> {
-        let factory_proxy = self.factory_address(owner).await?;
+    pub async fn apply(&self, ops: &[Op], operator: Address) -> Result<TxHash, DeployError> {
+        let factory_proxy = self.factory_address();
 
         // Verify factory is deployed.
         let code = self
@@ -243,7 +243,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let calldata = call.abi_encode();
 
         let tx = TransactionRequest::default()
-            .with_from(self.operator)
+            .with_from(operator)
             .with_to(factory_proxy)
             .with_input(Bytes::from(calldata));
 
@@ -269,10 +269,9 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// only for that L2; otherwise returns entries across all registered L2s.
     pub async fn addresses(
         &self,
-        owner: Address,
         l2_chain_id: Option<u64>,
     ) -> Result<Vec<RegistryEntry>, DeployError> {
-        let factory_proxy = self.factory_address(owner).await?;
+        let factory_proxy = self.factory_address();
 
         let code = self
             .provider
@@ -324,8 +323,8 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // -----------------------------------------------------------------------
 
     /// Verify every registry entry's `currentImpl` matches the proxy's ERC1967 impl slot.
-    pub async fn verify(&self, owner: Address) -> Result<VerifyReport, DeployError> {
-        let entries = self.addresses(owner, None).await?;
+    pub async fn verify(&self) -> Result<VerifyReport, DeployError> {
+        let entries = self.addresses(None).await?;
         let mut mismatches = Vec::new();
         let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
 
@@ -355,10 +354,15 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // Private helpers
     // -----------------------------------------------------------------------
 
-    async fn send_erc7955_tx(&self, salt: B256, initcode: &Bytes) -> Result<TxHash, DeployError> {
+    async fn send_erc7955_tx(
+        &self,
+        operator: Address,
+        salt: B256,
+        initcode: &Bytes,
+    ) -> Result<TxHash, DeployError> {
         let calldata = erc7955_calldata(salt, initcode);
         let tx = TransactionRequest::default()
-            .with_from(self.operator)
+            .with_from(operator)
             .with_to(ERC7955_FACTORY)
             .with_input(calldata);
 

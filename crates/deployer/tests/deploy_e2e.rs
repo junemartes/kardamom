@@ -84,8 +84,8 @@ async fn cross_chain_address_parity() {
         FactoryStatus::Deployed
     ));
 
-    let addr_a = deployer_a.factory_address(DEV_OWNER).await.unwrap();
-    let addr_b = deployer_b.factory_address(DEV_OWNER).await.unwrap();
+    let addr_a = deployer_a.factory_address();
+    let addr_b = deployer_b.factory_address();
     assert_eq!(
         addr_a, addr_b,
         "same owner + same bytecode must produce same factory address on different chains"
@@ -133,7 +133,7 @@ async fn multi_l2_deploy_and_atomic_upgrade() {
         .await
         .expect("multi-L2 deploy");
 
-    let entries = deployer.addresses(DEV_OWNER, None).await.unwrap();
+    let entries = deployer.addresses(None).await.unwrap();
     assert_eq!(entries.len(), 2);
     let e42 = entries.iter().find(|e| e.l2_chain_id == 42).unwrap();
     let e43 = entries.iter().find(|e| e.l2_chain_id == 43).unwrap();
@@ -188,7 +188,7 @@ async fn multi_l2_deploy_and_atomic_upgrade() {
         .await
         .expect("atomic multi-L2 upgrade");
 
-    let entries2 = deployer.addresses(DEV_OWNER, None).await.unwrap();
+    let entries2 = deployer.addresses(None).await.unwrap();
     let e42 = entries2.iter().find(|e| e.l2_chain_id == 42).unwrap();
     let e43 = entries2.iter().find(|e| e.l2_chain_id == 43).unwrap();
     assert_eq!(e42.version, 2);
@@ -203,7 +203,7 @@ async fn multi_l2_deploy_and_atomic_upgrade() {
     assert_eq!(lock_b.depositNonce().call().await.unwrap(), 0u64);
 
     // Filter by l2_chain_id.
-    let only_42 = deployer.addresses(DEV_OWNER, Some(42)).await.unwrap();
+    let only_42 = deployer.addresses(Some(42)).await.unwrap();
     assert_eq!(only_42.len(), 1);
     assert_eq!(only_42[0].l2_chain_id, 42);
 }

@@ -5,7 +5,14 @@
 //! and the canonical owner.
 
 use alloy_primitives::{Address, B256, Bytes, address, b256, keccak256};
-use alloy_sol_types::SolValue;
+use alloy_sol_types::{SolCall, SolValue, sol};
+
+// Local binding for the factory's `initialize(address)`. Lives here (not in
+// IKardamomFactory.sol) because it's on the concrete impl and used only for
+// building bootstrap calldata.
+sol! {
+    function initialize(address owner) external;
+}
 
 /// ERC-7955 permissionless CREATE2 factory.
 /// Canonical address on every EIP-7702-supporting chain (mainnet since Pectra).
@@ -29,12 +36,7 @@ pub fn factory_proxy_salt() -> B256 {
 
 /// Init calldata for the kardamom factory: `initialize(address owner)`.
 pub fn factory_init_data(owner: Address) -> Bytes {
-    let selector = &keccak256(b"initialize(address)")[..4];
-    let mut buf = Vec::with_capacity(4 + 32);
-    buf.extend_from_slice(selector);
-    let arg = (owner,).abi_encode();
-    buf.extend_from_slice(&arg);
-    Bytes::from(buf)
+    Bytes::from(initializeCall { owner }.abi_encode())
 }
 
 /// Build the full proxy initcode = `ERC1967Proxy.creationCode || abi.encode(impl, initData)`.
@@ -63,7 +65,7 @@ pub fn factory_proxy_address(
 ) -> Address {
     let init_data = factory_init_data(owner);
     let full = proxy_full_initcode(proxy_creation_code, impl_addr, &init_data);
-    ERC7955_FACTORY.create2(factory_proxy_salt(), keccak256(&full))
+    ERC7955_FACTORY.create2_from_code(factory_proxy_salt(), &full)
 }
 
 /// App impl address (deployed via the kardamom factory, not via ERC-7955).

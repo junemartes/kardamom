@@ -83,7 +83,7 @@ async fn deposit_e2e_anvil_to_node() {
         .expect("deploy ETHLockbox");
 
     let entries = deployer
-        .addresses(DEV_OWNER, Some(L2_CHAIN_ID))
+        .addresses(Some(L2_CHAIN_ID))
         .await
         .expect("addresses");
     let lockbox_addr = entries
