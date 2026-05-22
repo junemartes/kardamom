@@ -6,16 +6,25 @@ use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_signer_local::PrivateKeySigner;
 
+/// One signer derived from a BIP-39 mnemonic along m/44'/60'/0'/0/N.
 #[derive(Debug, Clone)]
 pub struct DerivedSigner {
+    /// Concrete secp256k1 signer ready to sign transactions.
     pub signer: PrivateKeySigner,
+    /// The signer's Ethereum address. Cached for convenience.
     pub address: Address,
 }
 
-/// Pre-sign `count` EIP-2718-encoded legacy value transfers, round-robining
-/// across `signers`. Each signer's nonces start at `nonce_base` and increase
-/// monotonically. Returns the raw bytes for each tx, ordered for round-robin
-/// dispatch.
+/// Pre-sign `count` EIP-2718-encoded legacy value transfers,
+/// round-robining across `signers`.
+///
+/// Each signer's nonces start at `nonce_base` and increase monotonically.
+/// Returns the raw bytes for each tx, ordered for round-robin dispatch.
+///
+/// # Errors
+///
+/// Errors if `signers` is empty, or if signing any individual transaction
+/// fails (k256 signer error).
 pub fn presign_transfers(
     signers: &[DerivedSigner],
     chain_id: u64,

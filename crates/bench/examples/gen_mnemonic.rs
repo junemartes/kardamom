@@ -1,9 +1,10 @@
-//! Print a fresh BIP-39 mnemonic phrase, suitable for pasting into the
-//! `[mnemonic].phrase` field of a bench scenario TOML file.
+//! Print a fresh BIP-39 mnemonic phrase. Useful for seeding a custom
+//! `BenchWorkflow` impl that doesn't want to share signers with the
+//! built-in Anvil-mnemonic workflows.
 //!
 //! Usage:
-//!   cargo run --example gen_mnemonic -p kardamom-bench
-//!   cargo run --example gen_mnemonic -p kardamom-bench -- 24
+//!   `cargo run --example gen_mnemonic -p kardamom-bench`
+//!   `cargo run --example gen_mnemonic -p kardamom-bench -- 24`
 
 fn main() -> anyhow::Result<()> {
     let word_count: u32 = std::env::args()

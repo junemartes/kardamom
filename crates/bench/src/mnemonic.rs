@@ -14,6 +14,11 @@ use crate::signers::DerivedSigner;
 /// Generate a fresh BIP-39 mnemonic phrase using the English wordlist.
 ///
 /// `word_count` must be one of 12, 15, 18, 21, 24. Other values error.
+///
+/// # Errors
+///
+/// Errors if `word_count` is not a valid BIP-39 word count or if the
+/// underlying RNG fails.
 pub fn generate(word_count: u32) -> anyhow::Result<String> {
     let mut rng = rand::thread_rng();
     let mnemonic = Mnemonic::<English>::new_with_count(&mut rng, word_count as usize)
@@ -23,6 +28,11 @@ pub fn generate(word_count: u32) -> anyhow::Result<String> {
 
 /// Derive `count` signers from `phrase` along m/44'/60'/0'/0/N (the
 /// Anvil/MetaMask default Ethereum derivation path).
+///
+/// # Errors
+///
+/// Errors if `phrase` is not a valid BIP-39 mnemonic or if the BIP-32
+/// derivation chain fails for any of the requested indices.
 pub fn derive_signers(phrase: &str, count: u32) -> anyhow::Result<Vec<DerivedSigner>> {
     let mut out = Vec::with_capacity(count as usize);
     for i in 0..count {

@@ -1,51 +1,27 @@
-//! Smoke test: run the bench's generator against an in-process kardamom node
-//! for ~1s at 10rps, assert per-method histograms are non-empty.
+//! Smoke test: run `Benchmark<MixedWorkflow>` against an in-process kardamom
+//! node for a short window, assert per-method histograms are non-empty.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use alloy_primitives::{Address, address};
 use jsonrpsee::http_client::HttpClientBuilder;
 
-use kardamom_bench::config::{CallsCfg, ContractEntry, FileConfig, MixCfg, MnemonicCfg, Workload};
-use kardamom_bench::{generator, genesis, mnemonic};
-use kardamom_node::{Node, rpc};
+use kardamom_bench::workflow::BenchWorkflow;
+use kardamom_bench::{Benchmark, MixedWorkflow};
+use kardamom_node::{Genesis, Node, rpc};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bench_generator_records_samples_against_inprocess_node() {
+async fn bench_records_samples_against_inprocess_node() {
     let chain_id = 1u64;
     let concurrency = 4u32;
 
-    let contract: Address = address!("0000000000000000000000000000000000001234");
-
-    let file_cfg = FileConfig {
-        rpc: None,
-        workload: Some(Workload::Mixed),
-        rate: Some(100),
-        duration: Some(Duration::from_millis(800)),
-        concurrency: Some(concurrency),
-        warmup: Some(Duration::from_millis(0)),
-        output: None,
-        mix: Some(MixCfg {
-            transfers: 1,
-            calls: 4,
-        }),
-        calls: Some(CallsCfg { contract }),
-        mnemonic: Some(MnemonicCfg {
-            phrase: "test test test test test test test test test test test junk".to_string(),
-            balance: "1000000000000000000000".to_string(),
-            count: None,
-        }),
-        contracts: vec![ContractEntry {
-            address: contract,
-            code: "0x604260005260206000f3".to_string(),
-            nonce: None,
-            balance: None,
-        }],
-    };
-
-    let genesis_value = genesis::from_config(&file_cfg, chain_id).expect("from_config");
-    let node = Node::new(&genesis_value);
+    let workflow = MixedWorkflow::default();
+    let alloc = workflow.genesis_alloc(concurrency).expect("genesis_alloc");
+    let genesis = Genesis { chain_id, alloc };
+    genesis
+        .validate()
+        .expect("valid genesis from workflow.genesis_alloc");
+    let node = Node::new(&genesis);
 
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = jsonrpsee::server::Server::builder()
@@ -58,29 +34,18 @@ async fn bench_generator_records_samples_against_inprocess_node() {
         rpc::EthHandlers::new(node).into_rpc()
     });
 
-    let url = format!("http://{}", bound);
+    let url = format!("http://{bound}");
     let client = HttpClientBuilder::default().build(&url).unwrap();
 
-    let cli_overrides = FileConfig {
-        rpc: Some(url.clone()),
-        workload: None,
-        rate: None,
-        duration: None,
-        concurrency: None,
-        warmup: None,
-        output: None,
-        mix: None,
-        calls: None,
-        mnemonic: None,
-        contracts: vec![],
+    let bench = Benchmark {
+        workflow,
+        timeout: Duration::from_secs(5),
+        concurrency,
+        txs_per_task: 50,
+        max_in_flight: 4,
     };
-    let cfg = kardamom_bench::config::resolve(Some(file_cfg), cli_overrides).expect("resolve");
 
-    // Sanity: signers derive deterministically and the generator will get the same set.
-    let _signers =
-        mnemonic::derive_signers(&cfg.mnemonic.phrase, concurrency).expect("derive_signers");
-
-    let outputs = generator::run(client, cfg).await.expect("bench ran");
+    let outputs = bench.run(client).await.expect("bench ran");
     assert!(outputs.counters.sent > 0, "should have sent some requests");
 
     let call_hist = outputs.histograms.get("eth_call").expect("eth_call hist");
@@ -100,4 +65,24 @@ async fn bench_generator_records_samples_against_inprocess_node() {
 
     let _ = server_handle.stop();
     server_handle.stopped().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workflow_genesis_alloc_propagates_bad_mnemonic() {
+    // C2 regression test: a workflow constructed with a bogus mnemonic
+    // must surface an `Err` from `genesis_alloc`, not panic.
+    let workflow = MixedWorkflow {
+        mnemonic: "this is not a valid bip39 phrase at all".to_string(),
+        ..MixedWorkflow::default()
+    };
+    let err = workflow
+        .genesis_alloc(4)
+        .expect_err("bad mnemonic should produce Err, not panic");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.to_lowercase().contains("mnemonic")
+            || msg.contains("derivation")
+            || msg.contains("bip39"),
+        "error should mention the mnemonic / BIP-39 derivation failure, got: {msg}"
+    );
 }
