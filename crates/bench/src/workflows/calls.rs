@@ -75,19 +75,21 @@ impl BenchWorkflow for CallsWorkflow {
             to: Some(TxKind::Call(self.contract)),
             ..Default::default()
         };
-        let probe: Result<Bytes, _> = client
+
+        if let probe = client
             .request("eth_call", rpc_params![req, BlockNumberOrTag::Latest])
-            .await;
-        match probe {
-            Ok(b) if !b.is_empty() => {}
-            _ => anyhow::bail!(
+            .await
+            && (probe.is_err() || probe.is_ok_and(|b: Bytes| b.is_empty()))
+        {
+            anyhow::bail!(
                 "contract {addr} is not deployed (empty eth_call output). \
                  Check that the workflow's `genesis_alloc()` was used to \
                  build the node, or override `CallsWorkflow.contract` to \
                  point at a real deployment.",
                 addr = self.contract,
-            ),
+            )
         }
+
         // Per-task work: just `txs_per_task` empty markers. The actual
         // request body is built per-iteration in `dispatch` from `self`.
         Ok((0..n_tasks)
