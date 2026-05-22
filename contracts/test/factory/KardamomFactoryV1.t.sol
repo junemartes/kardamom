@@ -59,12 +59,11 @@ contract KardamomFactoryV1Test is Test {
         });
     }
 
-    function _upgradeSpec(
-        uint256 l2ChainId,
-        bytes32 id,
-        uint64 version,
-        address targetImpl
-    ) internal pure returns (IKardamomFactory.DeploymentSpec memory) {
+    function _upgradeSpec(uint256 l2ChainId, bytes32 id, uint64 version, address targetImpl)
+        internal
+        pure
+        returns (IKardamomFactory.DeploymentSpec memory)
+    {
         bytes memory initcode = type(DummyImpl).creationCode;
         bytes32 implSalt = keccak256(abi.encode(id, "impl", version));
         return IKardamomFactory.DeploymentSpec({
@@ -112,8 +111,7 @@ contract KardamomFactoryV1Test is Test {
         specs[1] = _deploySpec(L2_B, ID_DUMMY, 1);
         // Second spec must NOT re-CREATE2 the same impl — share it via targetImpl.
         // Predict the impl address using the factory's helper.
-        address sharedImpl =
-            factory.predictImplAddress(specs[0].implSalt, specs[0].implInitcode);
+        address sharedImpl = factory.predictImplAddress(specs[0].implSalt, specs[0].implInitcode);
         specs[1].targetImpl = sharedImpl;
 
         vm.prank(owner);
@@ -137,7 +135,9 @@ contract KardamomFactoryV1Test is Test {
         // Bogus target (no code).
         specs[0].targetImpl = address(0xDEAD);
 
-        vm.expectRevert(abi.encodeWithSelector(IKardamomFactory.ImplNotDeployed.selector, address(0xDEAD)));
+        vm.expectRevert(
+            abi.encodeWithSelector(IKardamomFactory.ImplNotDeployed.selector, address(0xDEAD))
+        );
         vm.prank(owner);
         factory.applyDeployments(specs);
     }
@@ -147,8 +147,7 @@ contract KardamomFactoryV1Test is Test {
         IKardamomFactory.DeploymentSpec[] memory s1 = new IKardamomFactory.DeploymentSpec[](2);
         s1[0] = _deploySpec(L2_A, ID_DUMMY, 1);
         s1[1] = _deploySpec(L2_B, ID_DUMMY, 1);
-        s1[1].targetImpl =
-            factory.predictImplAddress(s1[0].implSalt, s1[0].implInitcode);
+        s1[1].targetImpl = factory.predictImplAddress(s1[0].implSalt, s1[0].implInitcode);
         vm.prank(owner);
         factory.applyDeployments(s1);
 

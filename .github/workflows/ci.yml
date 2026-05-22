@@ -81,6 +81,77 @@ jobs:
             openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
       - run: forge build --sizes
 
+  forge-test:
+    name: forge test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install contract dependencies
+        run: |
+          forge install --no-git --shallow \
+            foundry-rs/forge-std \
+            openzeppelin/openzeppelin-contracts@v5.0.2 \
+            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+      - run: forge test -vvv
+
+  forge-fmt:
+    name: forge fmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - run: forge fmt --check
+
+  solhint:
+    name: solhint
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install solhint
+        run: npm install -g solhint@5.0.5
+      - name: Lint src
+        run: solhint --max-warnings 0 -c .solhint.json 'src/**/*.sol'
+      - name: Lint tests
+        run: solhint --max-warnings 0 -c test/.solhint.json 'test/**/*.sol'
+
+  slither:
+    name: slither
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Install contract dependencies
+        working-directory: contracts
+        run: |
+          forge install --no-git --shallow \
+            foundry-rs/forge-std \
+            openzeppelin/openzeppelin-contracts@v5.0.2 \
+            openzeppelin/openzeppelin-contracts-upgradeable@v5.0.2
+      - uses: crytic/slither-action@v0.4.0
+        with:
+          target: contracts/
+          slither-config: contracts/slither.config.json
+          fail-on: medium
+
   bytecode-hash:
     name: factory bytecode hash
     runs-on: ubuntu-latest
