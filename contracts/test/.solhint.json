@@ -1,0 +1,18 @@
+{
+  "extends": "solhint:recommended",
+  "rules": {
+    "compiler-version": ["error", "^0.8.26"],
+    "max-line-length": ["error", 100],
+    "no-inline-assembly": "off",
+    "func-visibility": ["error", { "ignoreConstructors": true }],
+    "no-empty-blocks": "off",
+    "gas-custom-errors": "off",
+    "reason-string": "off",
+    "func-name-mixedcase": "off",
+    "var-name-mixedcase": "off",
+    "state-visibility": "off",
+    "no-global-import": "off",
+    "one-contract-per-file": "off",
+    "avoid-low-level-calls": "off"
+  }
+}

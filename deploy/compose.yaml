@@ -27,6 +27,5 @@ services:
       - "3000:3000"
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards-json:ro
     extra_hosts:
       - "host.docker.internal:host-gateway"

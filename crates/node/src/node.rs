@@ -99,6 +99,19 @@ impl Node {
             .unwrap_or(0)
     }
 
+    /// Returns the deployed bytecode at `addr`, or empty if the account has none.
+    pub async fn code_at(&self, addr: Address) -> Bytes {
+        let state = self.inner.read().await;
+        state
+            .db
+            .cache
+            .accounts
+            .get(&addr)
+            .and_then(|a| a.info.code.as_ref())
+            .map(|c| Bytes::from(c.original_bytes().to_vec()))
+            .unwrap_or_default()
+    }
+
     pub async fn receipt(&self, hash: B256) -> Option<TransactionReceipt> {
         self.inner.read().await.receipts.get(&hash).cloned()
     }

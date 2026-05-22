@@ -1,0 +1,10 @@
+{
+  "filter_paths": "lib/|test/|out/|cache/",
+  "exclude_informational": true,
+  "exclude_low": false,
+  "exclude_medium": false,
+  "exclude_high": false,
+  "exclude_optimization": true,
+  "_comment_detectors": "naming-convention/solc-version/assembly/low-level-calls/pragma: style; reentrancy-no-eth: factory.upgradeToAndCall is onlyOwner with a controlled new impl, CEI not warranted",
+  "detectors_to_exclude": "naming-convention,solc-version,assembly,low-level-calls,pragma,reentrancy-no-eth"
+}

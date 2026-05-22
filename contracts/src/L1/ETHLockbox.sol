@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-contract ETHLockbox {
+import {KardamomUUPSBase} from "../factory/KardamomUUPSBase.sol";
+
+contract ETHLockbox is KardamomUUPSBase {
     error ZeroDeposit();
 
     uint64 public depositNonce;
-    address public immutable l2Minter;
+    address public l2Minter;
 
     event DepositInitiated(
         uint64 indexed depositNonce,
@@ -16,7 +18,12 @@ contract ETHLockbox {
         bytes data
     );
 
-    constructor(address _l2Minter) {
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    function initialize(address _l2Minter) external initializer {
         l2Minter = _l2Minter;
     }
 

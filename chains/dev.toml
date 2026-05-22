@@ -10,3 +10,14 @@ chain_id = 412346
 [[alloc]]
 address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
 balance = "1000000000000000000000"   # 1000 ETH
+
+# ERC-7955 permissionless CREATE2 factory
+# (https://github.com/safe-research/erc-7955).
+# Pre-deployed at the canonical cross-chain address so the deployer can CREATE2
+# from it without a separate bootstrap tx. On real chains it's deployed via
+# EIP-7702 self-bootstrap; on anvil/local dev we predeploy via genesis.
+# Bytecode must match kardamom_deployer::addresses::ERC7955_RUNTIME_HEX.
+[[alloc]]
+address = "0xC0DEb853af168215879d284cc8B4d0A645fA9b0E"
+code    = "0x60203d3d3582360380843d373d34f5806019573d813d933efd5b3d52f33d52"
+nonce   = 1
