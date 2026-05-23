@@ -153,17 +153,17 @@ All hot-path components run on the same LAN. Recommended deployment: N=3 recorde
 
 - Aeron stream, multi-publisher (each executor replica). RAM only — no fsync (regenerable from B + libmdbx snapshot).
 - Two message types:
-  - `Receipt { tx_idx, status, gas_used, logs, write_set_hash }`
-  - `BlockBoundary { block_number, end_tx_idx, l2_timestamp, state_root_commitment }` — emitted by executors when they reach a boundary marker on B. (The sealer originates boundaries on B for canonical ordering; executors re-emit on C so that C-only consumers — state writer, L1 batcher — see them inline with receipts.)
-- Consumers: ingress proxies (client response), state writer (libmdbx commits), L1 batcher (posting), monitoring.
+  - `Receipt { tx_idx, tx_hash, status, gas_used, logs, write_set_hash }` — `tx_hash` is carried unchanged from the inbound `TxEnvelope` (computed once by the proxy at sig-verify time).
+  - `BlockBoundary { block_number, end_tx_idx, l2_timestamp }` — emitted by executors when they reach a boundary marker on B. (The sealer originates boundaries on B for canonical ordering; executors re-emit on C so that C-only consumers — state writer, monitoring — see them inline with receipts.) **No state-root commitment**: state-root attestation is a validator concern, deferred (see Out-of-scope).
+- Consumers: ingress proxies (client response), state writer (libmdbx commits), monitoring. The L1 batcher does **not** consume C; it reads B's archive offline (§2.8).
 - Consumers dedupe by `tx_idx`. If two replicas publish receipts for the same `tx_idx` with *different* `write_set_hash`, that is a determinism violation: **panic, alert, halt the chain.**
 
 ### 2.6 Block sealer
 **Responsibility:** define block boundaries; provide deterministic `block.timestamp`.
 
 - Singleton process with hot standby. **Leader election: deterministic by lowest host-id among caught-up recorders.** Avoids an external KV (etcd/Aeron-Cluster) for v1.
-- Every 250ms wall-clock (rounded to the next multiple): read `current_B_position` (an atomic Aeron counter), emit `BlockBoundaryStart { block_number, end_tx_idx, l2_timestamp }` to **channel B** (canonical-ordered with txs). The sealer's marker carries no state root — it just declares the block boundary in canonical order.
-- Executors see the marker in B, finish executing txs up to `end_tx_idx`, compute the post-block state-root commitment, and emit the full `BlockBoundary` (with state root) on channel C.
+- Every 250ms wall-clock (rounded to the next multiple): read `current_B_position` (an atomic Aeron counter), emit `BlockBoundaryStart { block_number, end_tx_idx, l2_timestamp }` to **channel B** (canonical-ordered with txs). The sealer's marker just declares the block boundary in canonical order.
+- Executors see the marker in B, finish executing txs up to `end_tx_idx`, flush the block delta to the state writer, and emit `BlockBoundary { block_number, end_tx_idx, l2_timestamp }` on channel C. No state-root commitment is computed — that is a validator concern, deferred.
 - Sealer failover: the new sealer reads "last boundary was block N at position p" from B's tail, emits N+1 at the next tick.
 
 ### 2.7 State writer
@@ -175,13 +175,15 @@ All hot-path components run on the same LAN. Recommended deployment: N=3 recorde
 - The snapshot underlying MV-memory advances atomically at each block boundary (snapshot swap protocol, §5).
 
 ### 2.8 L1 batcher
-**Responsibility:** post sealed blocks to Ethereum L1.
+**Responsibility:** post raw L2 tx data to Ethereum L1 as a data-availability sink.
 
+- **Decoupled from the live pipeline.** Reads from the on-disk Aeron Archive segment files of channel B (or via the Aeron Archive's standard offline replay protocol). Does **not** subscribe to channel C; does **not** query any live sequencer/executor process; can be down for arbitrary periods without affecting tx flow.
+- Reads B canonically: `TxEnvelope`s and `BlockBoundaryStart` markers (which the sealer publishes onto B per §2.6). Groups txs into per-block batches at boundary markers.
 - Singleton + hot standby (same lease mechanism as sealer).
-- Consumes block boundaries from C and the corresponding raw txs from B (between previous boundary and current).
-- Packs into Ethereum 4844 blobs (max 6 blobs/L1-block, 128KB each ≈ 750KB/L1-block compressed). Cadence: configurable, default every ~10 L1 blocks.
-- Posts to the L2 settlement contract. Integrates with the existing `crates/deployer` and contract groundwork (ETHLockbox, factory).
-- v1 scope does **not** include fraud proofs or validity proofs.
+- Packs batches into Ethereum 4844 blobs (max 6 blobs/L1-block, 128KB each ≈ 750KB/L1-block compressed). Cadence: configurable, default every ~10 L1 blocks.
+- Posts to the L2 settlement contract — **a pure data-availability sink**. The contract records `(block_range, blob_versioned_hashes)` and emits an event. **No state-root commitment is posted**: state-root attestation is a validator concern, deferred to a future validator subsystem.
+- Integrates with the existing `crates/deployer` and contract groundwork (ETHLockbox, ERC-7955 factory).
+- v0 scope does **not** include fraud proofs, validity proofs, or any state-root anchoring.
 
 ---
 
@@ -302,7 +304,7 @@ State DB is the only component that persists derived state. Everything else is c
 - `accounts`: `Address → (nonce, balance, code_hash, storage_root)`
 - `storage`: `(Address, StorageKey) → U256` — flat layout, no per-account trie
 - `code`: `code_hash → Bytecode`
-- `headers`: `block_number → (state_root_commitment, end_tx_idx, l2_timestamp)`
+- `headers`: `block_number → (end_tx_idx, l2_timestamp)` — no state-root commitment (D-Sh11)
 - `receipts` (optional): `tx_idx → encoded Receipt` — can be served from C-archive instead
 - `meta`: durable cursors — `last_committed_block`, `last_committed_end_tx_idx`, `last_fsynced_B_position`
 
@@ -339,8 +341,10 @@ libmdbx is copy-on-write; long-running databases fragment. Schedule `mdbx_env_co
 
 The hardest invariants to preserve are determinism across replicas (I3) and canonical-order-equals-B-position (I1). The strategy prioritizes them.
 
+**Mock vs. real Aeron — strict rule:** unit tests use the `kardamom-log` `testing` feature's in-memory channel fakes (fast, isolated). **End-to-end tests MUST use a real Aeron Media Driver + Aeron Archive running in Docker** — the `kardamom-log` crate ships a `testcontainers`-based harness that every subsystem reuses. Mocks are not acceptable at the e2e layer. CI runs the Docker e2e suite on every PR.
+
 ### Unit
-Standard per-crate tests. The existing bench harness (`crates/bench`) extended per new subsystem.
+Standard per-crate tests using the in-memory `testing` feature. The existing bench harness (`crates/bench`) extended per new subsystem.
 
 ### Determinism conformance
 - Run N executor replicas against the same recorded B archive. Assert byte-identical receipts including `write_set_hash`.
@@ -351,15 +355,15 @@ Standard per-crate tests. The existing bench harness (`crates/bench`) extended p
 - Synthetic workload: N accounts all writing the same storage slot (worst case for STM). Assert correctness; measure re-execution rate.
 - Replay public mainnet blocks with high DEX activity (Uniswap, Curve); verify against geth/reth state roots.
 
-### Chaos
-Each failure mode in §4 gets a deterministic test:
+### Chaos / E2E
+Each failure mode in §4 gets a deterministic test. **All chaos tests run against the Docker Aeron harness** — they exercise real Media Driver / Archive failure modes, not mocked ones.
 - Kill recorder mid-flight; assert acks continue (with quorum still satisfied) and stall once quorum is unmet.
 - Kill sequencer; assert standby takeover; no nonce gaps in B.
 - Inject NVMe stall on fsync; assert proxy parks (doesn't ack) and recovers.
 - Force executor divergence (corrupt one replica's MV-memory); assert receipt-divergence halt fires within bounded latency.
-- Network partition between recorders; assert replication catches up post-heal.
+- Network partition between recorders (via `docker network disconnect`); assert replication catches up post-heal.
 
-Framework: `turmoil` or a custom Tokio-driven harness for deterministic time + I/O.
+Framework: `testcontainers` (Rust) driving the Docker Aeron harness; `turmoil` or a custom Tokio-driven harness for any test that genuinely needs deterministic time + I/O without real network involvement (kept for unit-level chaos tests only).
 
 ### Performance
 - Per-stage metering: ingress sig-verify, sequencer nonce, Aeron pub, Block-STM execute, validate, commit, state-writer burst.
