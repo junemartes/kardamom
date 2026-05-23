@@ -1,0 +1,37 @@
+# Optional: 3-node Aeron Archive cluster for the recorder_cluster e2e test.
+# The simpler single-node case is brought up by `AeronTestCluster::single_node`
+# in Rust, without compose.
+services:
+  aeron-0:
+    build: .
+    container_name: aeron-0
+    shm_size: 256m
+    tmpfs:
+      - /dev/shm
+    ports:
+      - "18010:8010/udp"
+      - "18011:8011/udp"
+      - "18020:8020/udp"
+      - "18021:8021/udp"
+  aeron-1:
+    build: .
+    container_name: aeron-1
+    shm_size: 256m
+    tmpfs:
+      - /dev/shm
+    ports:
+      - "28010:8010/udp"
+      - "28011:8011/udp"
+      - "28020:8020/udp"
+      - "28021:8021/udp"
+  aeron-2:
+    build: .
+    container_name: aeron-2
+    shm_size: 256m
+    tmpfs:
+      - /dev/shm
+    ports:
+      - "38010:8010/udp"
+      - "38011:8011/udp"
+      - "38020:8020/udp"
+      - "38021:8021/udp"
