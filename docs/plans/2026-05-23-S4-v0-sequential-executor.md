@@ -4,9 +4,9 @@
 
 **Goal:** Ship the v0 executor subsystem (S4) — a single-threaded, deterministic, sequential revm executor that consumes Aeron channel B (txs + block boundaries) and publishes receipts + sealed block boundaries to channel C, with a state-snapshot swap protocol that lets the libmdbx writer (S6) advance underneath it.
 
-**Architecture:** A new crate `crates/kardamom-executor` exposes one long-running `Executor` actor: a **reader thread** demuxes channel B (`TxEnvelope` | `BlockBoundaryStart`); a **single execution thread** runs revm against a `Box<dyn StateDatabase>` snapshot, accumulates writes in a per-block `BlockDelta`, computes a deterministic `write_set_hash` per tx; a **commit thread** drains receipts in tx-index order and publishes to channel C. At each `BlockBoundaryStart` the executor drains in-flight work, computes a `state_root_commitment` over the `BlockDelta` (v0 chooses delta-hash, not a full Merkle trie), publishes `BlockBoundary` on C, hands the delta to the state-writer queue, waits for the state writer's "block N committed" signal, briefly pauses the reader to swap the read snapshot, and resumes. Block-STM is **explicitly out of scope** for v0 — S4 v1 will replace the single execution thread with worker threads behind the same channel-B-in / channel-C-out interface.
+**Architecture:** A new crate `crates/kardamom-executor` exposes one long-running `Executor` actor: a **reader thread** demuxes channel B (`TxEnvelope` | `BlockBoundaryStart`); a **single execution thread** runs revm against a `Box<dyn StateDatabase>` snapshot, accumulates writes in a per-block `BlockDelta`, computes a deterministic `write_set_hash` per tx; a **commit thread** drains receipts in tx-index order and publishes to channel C. At each `BlockBoundaryStart` the executor drains in-flight work, publishes a slim `BlockBoundary { block_number, end_tx_idx, l2_timestamp }` on C (no state-root commitment — per S0 D-Sh11, state-root attestation is a validator concern deferred out of v0), hands the delta to the state-writer queue, waits for the state writer's "block N committed" signal, briefly pauses the reader to swap the read snapshot, and resumes. Per-tx determinism is still enforced via `Receipt.write_set_hash`. Block-STM is **explicitly out of scope** for v0 — S4 v1 will replace the single execution thread with worker threads behind the same channel-B-in / channel-C-out interface.
 
-**Tech Stack:** Rust (edition 2024), revm 38, alloy-primitives 1.6, alloy-consensus 2.0, `crossbeam-channel` for in-process queues, `sha3` (via `alloy_primitives::keccak256`) for deterministic hashing, `criterion` for benches, `tempfile` + an in-crate mock `StateDatabase` for tests.
+**Tech Stack:** Rust (edition 2024), revm 38, alloy-primitives 1.6, alloy-consensus 2.0, `crossbeam-channel` for in-process queues, `sha3` (via `alloy_primitives::keccak256`) for deterministic hashing, `rkyv` 0.8 zero-copy wire codec (per S0 D-Sh2; executor consumes `Archived<TxEnvelope>` from channel B zero-copy on the hot path and produces owned `Receipt` values for channel C), `criterion` for benches, `tempfile` + an in-crate mock `StateDatabase` for tests.
 
 **Branch:** `claude/s4-v0-sequential-executor` (branched off `claude/work`).
 
@@ -15,8 +15,9 @@
 **Adapted from:** `crates/node/src/executor.rs` provides the sequential-revm building blocks (`tx_env_from_envelope`, `execute`, `execute_deposit`, `ExecEnv`). The new crate moves that logic into a thread-actor shape; the original module stays in place until S6/S7 wire the new executor in.
 
 **Key dependencies / assumptions:**
-- **S3 (`crates/kardamom-log`)** publishes/consumes Aeron channels B and C. This plan defines the type signatures it must expose (`BPosition`, `BMessage`, `CMessage`, `ChannelBSubscription`, `ChannelCPublication`) and assumes S3's plan adopts them. If S3 ships first with different names, this plan's task 4 includes a one-shot adapter file to bridge.
-- **S6 (`crates/kardamom-state`)** provides a `libmdbx`-backed implementation of the `StateDatabase` trait. The trait lives in **`crates/kardamom-executor`** (this crate) and S6 depends on `kardamom-executor` to implement it — keeps the executor self-contained and the trait close to its only consumer. (Alternative: a separate `kardamom-types` crate. Rejected for v0 because nothing else needs the trait yet; revisit when a third consumer appears.)
+- **`crates/kardamom-types`** (per S0 D-Sh1) owns all shared wire/data types: `BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundaryStart`, `BlockBoundary`, `BlockDelta`, the `StateDatabase` trait, and the `SnapshotSource` trait. The executor **imports** these — it does not define them. (S0 explicitly overrides this plan's earlier choice to host `StateDatabase` in `crates/kardamom-executor/src/state.rs`.)
+- **S3 (`crates/kardamom-log`)** publishes/consumes Aeron channels B and C. The wire-type definitions live in `kardamom-types`; `kardamom-log` exposes only the channel implementations (`ChannelBSubscription`, `ChannelCPublication`) and reads `Archived<T>` zero-copy from Aeron buffers using `rkyv` 0.8 (S0 D-Sh2).
+- **S6 (`crates/kardamom-state`)** provides a `libmdbx`-backed implementation of the `StateDatabase` trait (the trait itself lives in `kardamom-types`, so S6 depends on `kardamom-types`, not on `kardamom-executor`).
 - **S5 (`crates/kardamom-sealer`)** emits `BlockBoundaryStart` *inline* on channel B. The executor never reads a wall clock; `block.timestamp` comes from `BlockBoundaryStart.l2_timestamp` and `block.number` from `BlockBoundaryStart.block_number`.
 
 ---
@@ -29,10 +30,14 @@ New crate `crates/kardamom-executor`:
 crates/kardamom-executor/
 ├── Cargo.toml
 └── src/
-    ├── lib.rs              -- crate root: re-exports public API
-    ├── types.rs            -- BMessage, CMessage, Receipt, BlockBoundary, BPosition, BlockDelta, AccountChange
-    ├── state.rs            -- StateDatabase trait + MockStateDatabase (test fixture)
-    ├── delta.rs            -- BlockDelta accumulator + deterministic write_set_hash + state_root_commitment
+    ├── lib.rs              -- crate root: re-exports public API (most types re-exported from kardamom-types)
+    ├── types.rs            -- BMessage / CMessage enums only (these are executor-internal demux wrappers
+                              around kardamom-types' TxEnvelope / Receipt / BlockBoundary*); no Receipt /
+                              BlockBoundary / TxEnvelope / BPosition definitions — those live in kardamom-types.
+    ├── state.rs            -- MockStateDatabase test fixture only (StateDatabase trait lives in kardamom-types
+                              per S0 D-Sh1; this module imports it).
+    ├── delta.rs            -- per-tx WriteSet accumulator + deterministic write_set_hash. No state-root
+                              computation (per S0 D-Sh11).
     ├── block_env.rs        -- ExecEnv builder: chain_id, block_number, l2_timestamp, prevrandao (deterministic)
     ├── executor.rs         -- sequential revm step function (single-tx); adapted from crates/node/src/executor.rs
     ├── actor.rs            -- Executor struct: reader/exec/commit threads, snapshot-swap loop
@@ -41,7 +46,8 @@ crates/kardamom-executor/
 crates/kardamom-executor/tests/
 ├── replay_integration.rs   -- mocked channels + MockStateDatabase, synthetic N-tx/K-block stream
 ├── determinism.rs          -- two replicas, same input, byte-identical CMessage stream
-└── revm_corpus.rs          -- differential test against revm reference vectors
+├── diff_reference.rs       -- differential test against naive revm reference path
+└── docker_aeron_e2e.rs     -- real-Aeron e2e via S3's testcontainers harness (Task N)
 crates/kardamom-executor/benches/
 └── sequential_throughput.rs -- criterion: transfers + Uniswap-fixture
 ```
@@ -49,19 +55,23 @@ crates/kardamom-executor/benches/
 Files outside the new crate:
 
 ```
-crates/kardamom-log/        -- (not created by this plan; see Task 2 for the placeholder types
-                              if S3 is not yet landed)
+crates/kardamom-types/      -- (S0 D-Sh1) owns BPosition, TxEnvelope, Receipt, BlockBoundary,
+                              BlockBoundaryStart, BlockDelta, StateDatabase trait, SnapshotSource trait.
+                              The executor imports from here; it does NOT redefine these types locally.
+crates/kardamom-log/        -- (S3) channel implementations only; depends on kardamom-types for messages.
 crates/node/src/executor.rs -- UNTOUCHED. Stays as the in-process RPC node's executor until the new
                               executor replaces it in a later integration spec.
 ```
 
 ---
 
-## Self-review checklist (executed after Task 18)
+## Self-review checklist (executed after Task 19)
 
-- Every spec V0-scope item maps to a task: reader/exec/commit threads (Tasks 9–11), boundary handling (Task 12), snapshot swap (Task 13), determinism (Tasks 6, 15), state-root-commitment v0 choice (Task 7), divergence panic (referenced in Task 16; lives in `kardamom-log`).
+- Every spec V0-scope item maps to a task: reader/exec/commit threads (Tasks 9–11), boundary handling (Task 12), snapshot swap (Task 13), determinism (Tasks 6, 15), divergence panic (referenced in Task 16; lives in `kardamom-log`), real-Aeron e2e (Task N).
 - No placeholders. Every code step is complete.
-- Type consistency: `BPosition` is `(term_id: u64, term_offset: u64)` everywhere; `Receipt.tx_idx` is `u64`; `BlockDelta` is the same struct everywhere; `StateDatabase` trait signature is identical in Tasks 3, 9, 14.
+- Type consistency: `BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`, `BlockBoundaryStart`, `BlockDelta`, and `StateDatabase` are all imported from `kardamom-types` (S0 D-Sh1) — no local redefinitions in `kardamom-executor`.
+- **No state-root computation anywhere in the executor** (S0 D-Sh11). `BlockBoundary` carries only `{ block_number, end_tx_idx, l2_timestamp }`. Per-tx determinism is enforced exclusively via `Receipt.write_set_hash`.
+- **`tx_hash` is never computed by the executor** (S0 D-Sh4). The executor copies `tx_hash` directly from `inbound_envelope.tx_hash` into the outbound `Receipt.tx_hash`. The proxy (S1) is the sole producer.
 
 ---
 
@@ -90,6 +100,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+# Per S0 D-Sh1: shared types live in kardamom-types.
+kardamom-types = { path = "../kardamom-types" }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
@@ -99,12 +111,16 @@ thiserror.workspace = true
 crossbeam-channel = "0.5"
 
 [dev-dependencies]
+# Per S0 D-Sh8: real-Aeron e2e tests use S3's testcontainers harness.
+kardamom-log = { path = "../kardamom-log", features = ["testing"] }
 alloy-signer-local.workspace = true
 alloy-network.workspace = true
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 rand_chacha = "0.3"
+testcontainers = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [[bench]]
 name = "sequential_throughput"
@@ -122,7 +138,7 @@ harness = false
 //! execution thread with parallel workers behind the same channel interface.
 //!
 //! See docs/specs/2026-05-23-high-throughput-sequencer-design.md §2.4 and the
-//! V0 scope section.
+//! V0 scope section. Shared types come from `kardamom-types` (S0 D-Sh1).
 
 pub mod actor;
 pub mod block_env;
@@ -134,11 +150,13 @@ pub mod types;
 
 pub use actor::Executor;
 pub use error::ExecutorError;
-pub use state::{StateDatabase, StateDatabaseError};
-pub use types::{
-    AccountChange, BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    Receipt, TxIndex,
+// Re-export shared types from kardamom-types so callers can use this crate's
+// public API without a separate `kardamom-types` import path.
+pub use kardamom_types::{
+    AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt,
+    SnapshotSource, StateDatabase, StateDatabaseError, TxEnvelope,
 };
+pub use types::{BMessage, CMessage, TxIndex};
 ```
 
 - [ ] **Step 4: Create empty module files so `cargo check` succeeds**
@@ -198,34 +216,27 @@ git commit -m "executor: add crate skeleton"
 
 ---
 
-## Task 2: Define `BPosition` and channel message types in `types.rs`
+## Task 2: Define executor-internal `BMessage` / `CMessage` / `TxIndex` in `types.rs`
 
 **Files:**
 - Modify: `crates/kardamom-executor/src/types.rs`
 
-**Context:** S3 (`kardamom-log`) eventually owns these types. Until S3 lands, the executor defines them locally; when S3 ships, the executor will re-export from `kardamom-log` instead. This task documents the assumed shape so the S3 plan can match.
+**Context:** Per S0 D-Sh1, all shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`, `BlockBoundaryStart`, `BlockDelta`, `AccountChange`) live in `kardamom-types`. This module defines only the executor-internal demux enums (`BMessage`, `CMessage`) that wrap those imported types plus the executor-local `TxIndex` newtype. Do **not** redefine any imported type here.
 
 - [ ] **Step 1: Write the type definitions**
 
 ```rust
-//! Channel B / Channel C message types and `BPosition`.
+//! Channel B / Channel C executor-side demux wrappers.
 //!
-//! These are the executor's view of S3's wire types. They are defined here for
-//! v0 self-containment; once S3 (`kardamom-log`) lands, re-export from there
-//! and delete the local definitions.
+//! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
+//! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`) are imported from
+//! `kardamom-types` per S0 D-Sh1; we never redefine them here. The executor's
+//! `ReceiptStatus` enum is a local presentation of revm's execution outcome —
+//! `kardamom-types::Receipt.status` is a single `bool` (success/failure); the
+//! executor converts before publishing.
 
-use alloy_consensus::TxEnvelope;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, Receipt, TxEnvelope};
 use revm::context::result::HaltReason;
-
-/// Position of a record in the Aeron Archive on channel B. Strict total order
-/// across the whole stream (multi-publisher serialized by Aeron). This is the
-/// canonical L2 ordering: `tx_idx` is derived from it (see `TxIndex`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct BPosition {
-    pub term_id: u64,
-    pub term_offset: u64,
-}
 
 /// Monotonically increasing global index of a tx within the canonical channel-B
 /// stream. Derived by the executor's reader from the input order, starting at 0
@@ -242,27 +253,18 @@ impl TxIndex {
 
 /// One canonical-ordered record off channel B. The sealer emits
 /// `BlockBoundaryStart` records inline; the sequencer emits `Tx` records.
+///
+/// `envelope` is `kardamom_types::TxEnvelope`, which already carries the
+/// proxy-populated `sender` and `tx_hash` (S0 D-Sh3, D-Sh4). The executor
+/// trusts those fields unconditionally — no re-recovery, no re-hash.
 #[derive(Debug, Clone)]
 pub enum BMessage {
     Tx {
         position: BPosition,
         tx_idx: TxIndex,
         envelope: TxEnvelope,
-        /// Pre-recovered signer (sequencer/proxy did the secp256k1 work).
-        signer: Address,
     },
     BlockBoundaryStart(BlockBoundaryStart),
-}
-
-/// Sealer-issued boundary marker inlined on channel B (see spec §2.6).
-/// The executor never reads a wall clock — `l2_timestamp` comes from here.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockBoundaryStart {
-    pub block_number: u64,
-    /// Exclusive upper bound: the boundary applies AFTER all `tx_idx <= end_tx_idx`.
-    /// (Inclusive end-of-block. The next block starts at `end_tx_idx + 1`.)
-    pub end_tx_idx: TxIndex,
-    pub l2_timestamp: u64,
 }
 
 /// One published record on channel C — receipts and sealed boundaries.
@@ -272,18 +274,9 @@ pub enum CMessage {
     BlockBoundary(BlockBoundary),
 }
 
-/// Per-tx receipt emitted on channel C. `write_set_hash` is the determinism
-/// witness — divergence between replicas at the same `tx_idx` means a
-/// determinism violation and triggers the chain-halt protocol (spec §4.4).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Receipt {
-    pub tx_idx: TxIndex,
-    pub status: ReceiptStatus,
-    pub gas_used: u64,
-    pub logs: Vec<revm::primitives::Log>,
-    pub write_set_hash: B256,
-}
-
+/// Executor-local presentation of revm's execution outcome. Folded into a
+/// `bool` when materializing `kardamom_types::Receipt.status` (success vs.
+/// failure); the richer Halt reason stays internal for diagnostics/logs only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiptStatus {
     Success,
@@ -291,40 +284,16 @@ pub enum ReceiptStatus {
     Halt(HaltReason),
 }
 
-/// Sealed boundary published on channel C after the executor finishes the
-/// block. Carries the state-root commitment chosen by v0 (delta-hash; see
-/// `delta::block_delta_root`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockBoundary {
-    pub block_number: u64,
-    pub end_tx_idx: TxIndex,
-    pub l2_timestamp: u64,
-    pub state_root_commitment: B256,
-}
-
-/// In-memory accumulated write-set for the current block. Flushed to the state
-/// writer queue at each boundary; reset thereafter.
-#[derive(Debug, Default, Clone)]
-pub struct BlockDelta {
-    pub accounts: std::collections::BTreeMap<Address, AccountChange>,
-    /// (Address, slot) → new value. BTreeMap for determinism.
-    pub storage: std::collections::BTreeMap<(Address, U256), U256>,
-    pub code: std::collections::BTreeMap<B256, Bytes>,
-}
-
-/// Account-level change accumulated during a block.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountChange {
-    pub balance: U256,
-    pub nonce: u64,
-    pub code_hash: B256,
-    /// True iff the account was destroyed (SELFDESTRUCT or empty-after-EIP-161).
-    pub destroyed: bool,
+impl ReceiptStatus {
+    pub fn is_success(self) -> bool {
+        matches!(self, ReceiptStatus::Success)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kardamom_types::BPosition;
 
     #[test]
     fn tx_index_next_increments() {
@@ -333,6 +302,7 @@ mod tests {
 
     #[test]
     fn bposition_orders_by_term_then_offset() {
+        // BPosition comes from kardamom-types; sanity-check the import works.
         let a = BPosition { term_id: 0, term_offset: 100 };
         let b = BPosition { term_id: 1, term_offset: 0 };
         let c = BPosition { term_id: 0, term_offset: 200 };
@@ -342,11 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn block_delta_default_is_empty() {
-        let d = BlockDelta::default();
-        assert!(d.accounts.is_empty());
-        assert!(d.storage.is_empty());
-        assert!(d.code.is_empty());
+    fn receipt_status_is_success_helper() {
+        assert!(ReceiptStatus::Success.is_success());
+        assert!(!ReceiptStatus::Revert.is_success());
     }
 }
 ```
@@ -364,72 +332,39 @@ Expected: 3 tests pass.
 
 ```bash
 git add crates/kardamom-executor/src/types.rs
-git commit -m "executor: define BMessage/CMessage/Receipt/BlockDelta types"
+git commit -m "executor: BMessage/CMessage/TxIndex demux types (shared types from kardamom-types)"
 ```
 
 ---
 
-## Task 3: Define `StateDatabase` trait + in-memory mock in `state.rs`
+## Task 3: Add `MockStateDatabase` in-memory fixture in `state.rs` (trait imported from `kardamom-types`)
 
 **Files:**
 - Modify: `crates/kardamom-executor/src/state.rs`
 
-**Context:** The trait lives in this crate (decision recorded in the Architecture header). S6 will depend on `kardamom-executor` and `impl StateDatabase for MdbxSnapshot`. The mock implementation is used by every integration test and bench in this plan; it is a `CacheDB`-backed `BTreeMap` wrapper so tests have a hermetic, deterministic state source.
+**Context:** Per S0 D-Sh1, the `StateDatabase` trait, the `SnapshotSource` trait, the `StateDatabaseError` type, and the `AccountState` type **all live in `kardamom-types`**. This module **imports** them — it does not redefine them. The only new code here is `MockStateDatabase`, a `BTreeMap`-backed test fixture that `impl`s the imported trait. S6 (state writer) provides the libmdbx-backed impl in its own crate, also against the `kardamom-types` trait.
 
-- [ ] **Step 1: Write the trait + mock**
+- [ ] **Step 1: Write the mock (no trait definition)**
 
 ```rust
-//! State snapshot abstraction consumed by the executor.
+//! `MockStateDatabase`: in-memory fixture implementing the `StateDatabase`
+//! trait defined in `kardamom-types` (per S0 D-Sh1).
 //!
-//! The trait is read-only (the snapshot is immutable for the lifetime of a
-//! single block). Writes accumulate in `BlockDelta`; the state writer (S6)
-//! applies them to libmdbx out-of-band and opens a new snapshot for the next
-//! block. See spec §5 "Snapshot swap protocol".
+//! The trait, `StateDatabaseError`, and `AccountState` are imported from
+//! `kardamom-types`. No trait definition lives in this crate.
 //!
-//! For tests, `MockStateDatabase` is a `BTreeMap`-backed implementation that
-//! supports cheap snapshot cloning (Arc + persistent maps not needed at v0
-//! scale).
+//! `MockStateDatabase` is a `BTreeMap`-backed implementation used by every
+//! integration test and bench in this plan; it supports cheap snapshot cloning
+//! (Arc + persistent maps not needed at v0 scale).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-
-#[derive(Debug, thiserror::Error)]
-pub enum StateDatabaseError {
-    #[error("backend error: {0}")]
-    Backend(String),
-}
-
-/// Minimal read interface required by revm. Implemented by `kardamom-state`
-/// (libmdbx) in production and by `MockStateDatabase` in tests.
-///
-/// All methods return `Result` so the libmdbx implementation can surface I/O
-/// errors; the mock always returns `Ok`.
-pub trait StateDatabase: Send + Sync {
-    fn basic(&self, address: Address) -> Result<Option<AccountState>, StateDatabaseError>;
-
-    fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, StateDatabaseError>;
-
-    fn storage(&self, address: Address, key: U256) -> Result<U256, StateDatabaseError>;
-
-    /// Block hash for a recent ancestor (used by `BLOCKHASH` opcode). v0 returns
-    /// `B256::ZERO` for any block to keep determinism simple; revisit in v1.
-    fn block_hash(&self, _number: u64) -> Result<B256, StateDatabaseError> {
-        Ok(B256::ZERO)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountState {
-    pub balance: U256,
-    pub nonce: u64,
-    pub code_hash: B256,
-}
+use kardamom_types::{AccountState, StateDatabase, StateDatabaseError};
 
 /// Test fixture. Cheap to clone (Arc-internal). Construct via
-/// `MockStateDatabase::default()` then `insert_account` / `insert_storage` /
-/// `insert_code`.
+/// `MockStateDatabase::builder()`.
 #[derive(Debug, Default, Clone)]
 pub struct MockStateDatabase {
     inner: Arc<MockInner>,
@@ -544,7 +479,7 @@ Expected: 4 tests pass.
 
 ```bash
 git add crates/kardamom-executor/src/state.rs
-git commit -m "executor: add StateDatabase trait and MockStateDatabase test fixture"
+git commit -m "executor: MockStateDatabase fixture (StateDatabase trait imported from kardamom-types)"
 ```
 
 ---
@@ -559,8 +494,8 @@ git commit -m "executor: add StateDatabase trait and MockStateDatabase test fixt
 ```rust
 //! Errors raised by the executor actor and its helpers.
 
-use crate::state::StateDatabaseError;
 use crate::types::TxIndex;
+use kardamom_types::StateDatabaseError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
@@ -604,7 +539,7 @@ git commit -m "executor: define ExecutorError"
 
 ---
 
-## Task 5: Write deterministic `write_set_hash` in `delta.rs`
+## Task 5: Write deterministic per-tx `write_set_hash` in `delta.rs`
 
 **Files:**
 - Modify: `crates/kardamom-executor/src/delta.rs`
@@ -615,27 +550,28 @@ git commit -m "executor: define ExecutorError"
 2. Cover both account-level updates (balance/nonce/code_hash/destroyed flag) and storage slots.
 3. Be cheap (a few hundred ns per tx — this is on the critical latency path).
 
-V0 algorithm: sort every (address, kind, key, value) tuple lexicographically, RLP-encode the canonical sequence, keccak256 it.
+V0 algorithm: sort every (address, kind, key, value) tuple lexicographically (free via `BTreeMap`), explicit-width / explicit-endian byte-encode, keccak256.
+
+**No state-root / block-delta-root computation lives in this module** (per S0 D-Sh11). The executor does not produce a state-root commitment at any level; per-tx `write_set_hash` is the only determinism witness, and the sealed `BlockBoundary` published on channel C is slim (`{ block_number, end_tx_idx, l2_timestamp }`).
 
 - [ ] **Step 1: Write the per-tx write-set type + hasher**
 
 ```rust
-//! Block-level write accumulation and deterministic hashing.
+//! Per-tx write-set accumulation and deterministic hashing.
 //!
-//! `WriteSet` is the per-tx unit. `BlockDelta` (in `types.rs`) is the per-block
-//! accumulator that the state writer eventually consumes. The crucial invariant
-//! is that `write_set_hash(ws)` is identical across all executor replicas for
-//! any given tx — see spec §4.4 (divergence panic).
+//! `WriteSet` is the per-tx unit. `kardamom_types::BlockDelta` is the per-block
+//! accumulator the state writer eventually consumes. The crucial invariant is
+//! that `WriteSet::hash()` is identical across all executor replicas for any
+//! given tx — see spec §4.4 (divergence panic).
 //!
-//! For v0 the state-root commitment over the BlockDelta is the keccak256 of
-//! the deterministically-encoded delta (chosen for simplicity; a proper MPT
-//! root is deferred). Documented in `block_delta_root`.
+//! **No state-root computation here** (S0 D-Sh11). The executor never emits a
+//! state-root commitment. Per-tx `write_set_hash` is the sole determinism
+//! witness; block-level attestation is a future validator concern.
 
 use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256, keccak256};
-
-use crate::types::{AccountChange, BlockDelta};
+use kardamom_types::{AccountChange, BlockDelta};
 
 /// One transaction's write effects. `BTreeMap` so iteration is canonical.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -717,29 +653,10 @@ pub fn apply_write_set(delta: &mut BlockDelta, ws: WriteSet) {
     }
 }
 
-/// V0 state-root commitment over a sealed block delta.
-///
-/// **Choice: delta-hash, not a full MPT root.** We hash the same canonical
-/// encoding `WriteSet::hash` uses, applied to the merged `BlockDelta`. This
-/// commits to the writes produced in the block, not the post-block global state.
-///
-/// Rationale: a proper state root requires either (a) maintaining an MPT
-/// alongside libmdbx, or (b) computing one ad-hoc each block — both are large
-/// engineering investments orthogonal to the sequential-executor v0 goal. A
-/// delta-hash is sufficient for the determinism invariant (replicas agree on
-/// the block's effect on state) and for L1-batcher-side reconstruction (replay
-/// channel B from a known checkpoint and re-derive the same delta hashes).
-/// The full state-root computation is explicitly a v1 follow-up; see spec §5
-/// and the "Open questions" section in this plan.
-pub fn block_delta_root(delta: &BlockDelta) -> B256 {
-    // Reuse WriteSet::hash by transcoding — same encoding, different semantics.
-    let ws = WriteSet {
-        accounts: delta.accounts.clone(),
-        storage: delta.storage.clone(),
-        code: delta.code.clone(),
-    };
-    ws.hash()
-}
+// NOTE: No `block_delta_root` / state-root function here. Per S0 D-Sh11 the
+// executor does not compute or publish any state-root commitment. The sealed
+// BlockBoundary on channel C is slim; the state writer flushes the delta to
+// libmdbx, and that's the end of the executor's role in block closure.
 
 #[cfg(test)]
 mod tests {
@@ -838,17 +755,6 @@ mod tests {
         assert_eq!(delta.accounts[&addr].nonce, 2);
         assert_eq!(delta.storage[&(addr, U256::from(1u64))], U256::from(200u64));
     }
-
-    #[test]
-    fn block_delta_root_is_deterministic() {
-        let addr = Address::from([0x11u8; 20]);
-        let mut d = BlockDelta::default();
-        d.accounts.insert(addr, sample_account(99, 3));
-        d.storage.insert((addr, U256::from(7u64)), U256::from(42u64));
-        let r1 = block_delta_root(&d);
-        let r2 = block_delta_root(&d);
-        assert_eq!(r1, r2);
-    }
 }
 ```
 
@@ -858,13 +764,13 @@ mod tests {
 cargo test -p kardamom-executor delta::tests
 ```
 
-Expected: 7 tests pass.
+Expected: 6 tests pass. (One less than the prior draft — the `block_delta_root_is_deterministic` test is removed along with the function it tested, per S0 D-Sh11.)
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add crates/kardamom-executor/src/delta.rs
-git commit -m "executor: write_set_hash + block_delta_root (v0 delta-hash)"
+git commit -m "executor: per-tx write_set_hash (no state-root commitment per S0 D-Sh11)"
 ```
 
 ---
@@ -886,7 +792,7 @@ git commit -m "executor: write_set_hash + block_delta_root (v0 delta-hash)"
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_executor::delta::WriteSet;
-use kardamom_executor::types::AccountChange;
+use kardamom_types::AccountChange;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -1005,9 +911,8 @@ git commit -m "executor(tests): property tests for write_set_hash invariance"
 //! input. No wall clocks, no entropy.
 
 use alloy_primitives::U256;
+use kardamom_types::BlockBoundaryStart;
 use revm::context::{BlockEnv, CfgEnv};
-
-use crate::types::BlockBoundaryStart;
 
 /// Per-block execution context derived from the sealer's BlockBoundaryStart.
 /// Stable for every tx in the block; rebuilt at each boundary.
@@ -1052,11 +957,16 @@ impl ExecEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TxIndex;
+    use kardamom_types::BPosition;
+
+    // Per S0 D-Sh1: BlockBoundaryStart.end_tx_idx is a BPosition (not the
+    // executor-local TxIndex). The sealer publishes the position of the last
+    // record that belongs to the closing block.
+    fn pos(off: i32) -> BPosition { BPosition { term_id: 0, term_offset: off } }
 
     #[test]
     fn exec_env_carries_boundary_fields() {
-        let b = BlockBoundaryStart { block_number: 7, end_tx_idx: TxIndex(42), l2_timestamp: 1_700_000_000 };
+        let b = BlockBoundaryStart { block_number: 7, end_tx_idx: pos(42), l2_timestamp: 1_700_000_000 };
         let e = ExecEnv::new(412346, b);
         assert_eq!(e.chain_id, 412346);
         assert_eq!(e.block_number, 7);
@@ -1065,7 +975,7 @@ mod tests {
 
     #[test]
     fn block_env_uses_boundary_timestamp() {
-        let b = BlockBoundaryStart { block_number: 1, end_tx_idx: TxIndex(0), l2_timestamp: 12345 };
+        let b = BlockBoundaryStart { block_number: 1, end_tx_idx: pos(0), l2_timestamp: 12345 };
         let env = ExecEnv::new(1, b).block_env();
         assert_eq!(env.timestamp, U256::from(12345u64));
         assert_eq!(env.number, U256::from(1u64));
@@ -1073,7 +983,7 @@ mod tests {
 
     #[test]
     fn cfg_env_carries_chain_id() {
-        let b = BlockBoundaryStart { block_number: 1, end_tx_idx: TxIndex(0), l2_timestamp: 0 };
+        let b = BlockBoundaryStart { block_number: 1, end_tx_idx: pos(0), l2_timestamp: 0 };
         let cfg = ExecEnv::new(412346, b).cfg_env();
         assert_eq!(cfg.chain_id, 412346);
     }
@@ -1115,23 +1025,25 @@ git commit -m "executor: deterministic ExecEnv from BlockBoundaryStart"
 //! - Writes are captured into a per-tx `WriteSet` and merged into the running
 //!   `BlockDelta` by the caller (the actor in `actor.rs`).
 //! - No async, no node-level metrics — those layer above the executor.
+//!
+//! Per S0 D-Sh4: this module does **not** compute `tx_hash`. It copies
+//! `tx_hash` (and `sender`) directly from the inbound `kardamom_types::
+//! TxEnvelope`, which the proxy (S1) populated at the system boundary.
 
-use std::sync::Arc;
-
-use alloy_consensus::{Transaction, TxEnvelope};
+use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256, U256};
-use revm::context::result::{ExecutionResult, HaltReason};
+use kardamom_types::{AccountChange, BlockDelta, Receipt, StateDatabase, StateDatabaseError, TxEnvelope};
+use revm::context::result::ExecutionResult;
 use revm::context::TxEnv;
 use revm::database::{CacheDB, DatabaseRef};
 use revm::primitives::{KECCAK_EMPTY, TxKind};
 use revm::state::{AccountInfo, Bytecode};
-use revm::{Context, DatabaseCommit, ExecuteCommitEvm, MainBuilder, MainContext};
+use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use crate::block_env::ExecEnv;
 use crate::delta::WriteSet;
 use crate::error::ExecutorError;
-use crate::state::{StateDatabase, StateDatabaseError};
-use crate::types::{AccountChange, BlockDelta, Receipt, ReceiptStatus, TxIndex};
+use crate::types::{ReceiptStatus, TxIndex};
 
 /// `revm::DatabaseRef` adapter for a `StateDatabase` snapshot. Reads only —
 /// writes go to the layered `CacheDB` built per tx in `execute_tx`.
@@ -1169,22 +1081,34 @@ impl<'a> DatabaseRef for SnapshotRef<'a> {
     }
 }
 
-/// Convert a recovered tx envelope into a `TxEnv`. Same shape as the node-level
-/// `tx_env_from_envelope`; reproduced here to keep the executor crate
-/// self-contained.
-pub fn tx_env_from_envelope(envelope: &TxEnvelope, signer: Address) -> TxEnv {
+/// Decode an `alloy_consensus::TxEnvelope` from the `raw_tx` bytes carried in a
+/// `kardamom_types::TxEnvelope`. The signature is already verified by the proxy
+/// (S1, S0 D-Sh3); we just need the typed accessors to build a revm `TxEnv`.
+fn decode_alloy_envelope(raw_tx: &alloy_primitives::Bytes) -> Result<alloy_consensus::TxEnvelope, ExecutorError> {
+    use alloy_eips::eip2718::Decodable2718;
+    alloy_consensus::TxEnvelope::decode_2718(&mut raw_tx.as_ref())
+        .map_err(|e| ExecutorError::Execution {
+            idx: TxIndex::ZERO,
+            detail: format!("decode raw_tx: {e}"),
+        })
+}
+
+/// Convert a recovered tx envelope into a `TxEnv`. `signer` and `tx_hash` come
+/// from the inbound `kardamom_types::TxEnvelope` — never recomputed here
+/// (S0 D-Sh3 / D-Sh4).
+pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -> TxEnv {
     TxEnv {
         caller: signer,
-        chain_id: envelope.chain_id(),
-        nonce: envelope.nonce(),
-        gas_limit: envelope.gas_limit(),
-        value: envelope.value(),
-        data: envelope.input().clone(),
-        kind: match envelope.to() {
+        chain_id: alloy_env.chain_id(),
+        nonce: alloy_env.nonce(),
+        gas_limit: alloy_env.gas_limit(),
+        value: alloy_env.value(),
+        data: alloy_env.input().clone(),
+        kind: match alloy_env.to() {
             Some(addr) => TxKind::Call(addr),
             None => TxKind::Create,
         },
-        gas_price: envelope.gas_price().unwrap_or_else(|| envelope.max_fee_per_gas()),
+        gas_price: alloy_env.gas_price().unwrap_or_else(|| alloy_env.max_fee_per_gas()),
         ..Default::default()
     }
 }
@@ -1192,14 +1116,22 @@ pub fn tx_env_from_envelope(envelope: &TxEnvelope, signer: Address) -> TxEnv {
 /// Execute one tx against a snapshot + the current BlockDelta. Returns the
 /// receipt plus a fresh per-tx WriteSet. The caller folds the WriteSet into
 /// the BlockDelta before invoking the next tx so later txs see the writes.
+///
+/// `inbound_envelope: &TxEnvelope` is `kardamom_types::TxEnvelope`. Its
+/// `sender` and `tx_hash` are trusted unconditionally — the proxy (S1)
+/// populated them at the system boundary. The executor **never recomputes
+/// `tx_hash`** (S0 D-Sh4) and **never recovers a sender** (S0 D-Sh3); it
+/// copies both fields straight through into the outbound `Receipt`.
 pub fn execute_tx(
     snapshot: &dyn StateDatabase,
     delta: &BlockDelta,
     env: ExecEnv,
     tx_idx: TxIndex,
-    envelope: &TxEnvelope,
-    signer: Address,
+    tx_position: kardamom_types::BPosition,
+    inbound_envelope: &TxEnvelope,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
+    let alloy_env = decode_alloy_envelope(&inbound_envelope.raw_tx)?;
+    let signer = inbound_envelope.sender; // trusted from proxy; no recovery
     // Layer the running delta on top of the snapshot via CacheDB so revm sees
     // writes from earlier txs in the same block.
     let snap_ref = SnapshotRef { inner: snapshot };
@@ -1227,7 +1159,7 @@ pub fn execute_tx(
             })?;
     }
 
-    let tx_env = tx_env_from_envelope(envelope, signer);
+    let tx_env = tx_env_from_alloy(&alloy_env, signer);
     let mut evm = Context::mainnet()
         .with_db(&mut cache)
         .with_block(env.block_env())
@@ -1251,13 +1183,26 @@ pub fn execute_tx(
     let ws = diff_cache(&cache, delta);
 
     let write_set_hash = ws.hash();
+    // Build the outbound kardamom_types::Receipt. CRITICAL (S0 D-Sh4): copy
+    // `tx_hash` straight from the inbound envelope — DO NOT recompute via
+    // keccak256(raw_tx). The proxy (S1) is the canonical hash producer.
+    // CRITICAL (S0 D-Sh11): no state_root_commitment field exists on Receipt
+    // or anywhere else the executor emits — write_set_hash is the only
+    // determinism witness.
+    // `kardamom_types::Receipt.tx_idx` is a `BPosition` (S0 D-Sh1). Pass the
+    // inbound channel-B position straight through. The executor-local
+    // `TxIndex` newtype is kept around for monotonicity bookkeeping and
+    // boundary-alignment checks; it never appears on the wire.
+    let _ = tx_idx;
     let receipt = Receipt {
-        tx_idx,
-        status,
+        tx_idx: tx_position,
+        tx_hash: inbound_envelope.tx_hash,
+        status: status.is_success(),
         gas_used,
         logs,
         write_set_hash,
     };
+    let _ = signer; // silence unused-binding lint; signer is consumed via tx_env.caller above
     Ok((receipt, ws))
 }
 
@@ -1334,21 +1279,30 @@ Append to the same file:
 mod tests {
     use super::*;
     use crate::state::MockStateDatabase;
-    use crate::types::BlockBoundaryStart;
-    use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{Bytes, TxKind as APTxKind, U256, address};
+    use alloy_primitives::{Bytes, TxKind as APTxKind, U256, address, keccak256};
     use alloy_signer_local::PrivateKeySigner;
+    use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope as KtTxEnvelope};
 
     fn boundary(block_number: u64) -> BlockBoundaryStart {
         BlockBoundaryStart {
             block_number,
-            end_tx_idx: TxIndex(0),
+            end_tx_idx: BPosition { term_id: 0, term_offset: 0 },
             l2_timestamp: 0,
         }
     }
 
-    fn signed_transfer(from: &PrivateKeySigner, to: Address, value: u64, nonce: u64) -> TxEnvelope {
+    fn pos(off: i32) -> BPosition {
+        BPosition { term_id: 0, term_offset: off }
+    }
+
+    /// Build a `kardamom_types::TxEnvelope` the way the proxy (S1) would: sign,
+    /// 2718-encode to `raw_tx`, populate `sender` from the signer, populate
+    /// `tx_hash` as keccak256(raw_tx). The executor under test trusts these
+    /// fields blindly — it never recomputes them (S0 D-Sh3 / D-Sh4).
+    fn signed_transfer(from: &PrivateKeySigner, to: Address, value: u64, nonce: u64) -> KtTxEnvelope {
         let mut tx = TxLegacy {
             chain_id: Some(1),
             nonce,
@@ -1359,7 +1313,15 @@ mod tests {
             input: Bytes::new(),
         };
         let sig = from.sign_transaction_sync(&mut tx).expect("sign");
-        tx.into_signed(sig).into()
+        let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+        let raw_tx = Bytes::from(alloy_env.encoded_2718());
+        let tx_hash = keccak256(&raw_tx);
+        KtTxEnvelope {
+            correlation_id: 0,
+            raw_tx,
+            sender: from.address(),
+            tx_hash,
+        }
     }
 
     #[test]
@@ -1375,9 +1337,12 @@ mod tests {
         let env = ExecEnv::new(1, boundary(1));
 
         let env_tx = signed_transfer(&signer, to, 1_000, 0);
-        let (receipt, ws) = execute_tx(&snap, &delta, env, TxIndex(0), &env_tx, from).unwrap();
+        let (receipt, ws) = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx).unwrap();
 
-        assert_eq!(receipt.status, ReceiptStatus::Success);
+        // Per S0 D-Sh4: the receipt's tx_hash MUST equal the inbound envelope's
+        // tx_hash byte-for-byte. No recomputation in the executor.
+        assert_eq!(receipt.tx_hash, env_tx.tx_hash);
+        assert!(receipt.status); // success = bool true (kardamom_types::Receipt)
         assert!(receipt.gas_used >= 21_000);
         // Both accounts touched: sender (balance + nonce) and recipient (balance).
         assert!(ws.accounts.contains_key(&from));
@@ -1402,15 +1367,17 @@ mod tests {
         let mut delta = BlockDelta::default();
         // First transfer.
         let tx1 = signed_transfer(&signer, to, 100, 0);
-        let (r1, ws1) = execute_tx(&snap, &delta, env, TxIndex(0), &tx1, from).unwrap();
-        assert_eq!(r1.status, ReceiptStatus::Success);
+        let (r1, ws1) = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &tx1).unwrap();
+        assert!(r1.status);
+        assert_eq!(r1.tx_hash, tx1.tx_hash); // copied, not recomputed
         crate::delta::apply_write_set(&mut delta, ws1);
 
         // Second transfer from the same sender; nonce must be 1, sender balance
         // must already be debited 100.
         let tx2 = signed_transfer(&signer, to, 50, 1);
-        let (r2, ws2) = execute_tx(&snap, &delta, env, TxIndex(1), &tx2, from).unwrap();
-        assert_eq!(r2.status, ReceiptStatus::Success);
+        let (r2, ws2) = execute_tx(&snap, &delta, env, TxIndex(1), pos(1), &tx2).unwrap();
+        assert!(r2.status);
+        assert_eq!(r2.tx_hash, tx2.tx_hash);
         assert_eq!(ws2.accounts[&to].balance, U256::from(150u64));
         assert_eq!(ws2.accounts[&from].nonce, 2);
     }
@@ -1451,20 +1418,20 @@ git commit -m "executor: per-tx revm step with WriteSet capture"
 //! or a `std::thread::Builder` for stack-size / pinning control).
 
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
-use tracing::{debug, error, info, warn};
+use crossbeam_channel::{Receiver, Sender, bounded};
+use tracing::debug;
+
+use kardamom_types::{
+    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource, StateDatabase,
+};
 
 use crate::block_env::ExecEnv;
-use crate::delta::{apply_write_set, block_delta_root};
+use crate::delta::apply_write_set;
 use crate::error::ExecutorError;
 use crate::executor::execute_tx;
-use crate::state::StateDatabase;
-use crate::types::{
-    BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage, Receipt, TxIndex,
-};
+use crate::types::{BMessage, CMessage, TxIndex};
 
 /// Subscription to channel B. Implementations: real (Aeron) in `kardamom-log`;
 /// test mock in `actor.rs::tests`.
@@ -1487,11 +1454,9 @@ pub trait StateWriterSignal: Send {
     fn wait_committed(&mut self, await_at_least: u64) -> Result<u64, ExecutorError>;
 }
 
-/// Source of read snapshots. The state writer creates a new snapshot after
-/// each block commit; the executor calls `open_at` to swap.
-pub trait SnapshotSource: Send {
-    fn open_at(&mut self, block_number: u64) -> Result<Arc<dyn StateDatabase>, ExecutorError>;
-}
+// NOTE: `SnapshotSource` is the trait from `kardamom-types` (S0 D-Sh1).
+// We do NOT redefine it here. Implementations live in S6 (libmdbx) for
+// production and in this crate's tests for hermetic fixtures.
 
 /// Hand-off queue from executor → state writer. The state writer (S6) consumes
 /// these to apply the block delta to libmdbx.
@@ -1573,14 +1538,18 @@ Replace the body of `Executor::run` and add helpers below it:
 
 ```rust
 /// Internal envelope routed from reader → exec thread.
+///
+/// `envelope` is `kardamom_types::TxEnvelope` (carries `sender` and `tx_hash`
+/// populated by the proxy — S0 D-Sh3 / D-Sh4). No `signer` field separate from
+/// the envelope; the executor reads it directly off `envelope.sender`.
 enum ReaderToExec {
-    Tx { tx_idx: TxIndex, envelope: alloy_consensus::TxEnvelope, signer: alloy_primitives::Address, position: BPosition },
+    Tx { tx_idx: TxIndex, envelope: kardamom_types::TxEnvelope, position: BPosition },
     Boundary(BlockBoundaryStart),
 }
 
 /// Internal envelope routed from exec → commit thread.
 enum ExecToCommit {
-    Receipt(Receipt),
+    Receipt(kardamom_types::Receipt),
     Boundary(BlockBoundary),
 }
 
@@ -1632,12 +1601,12 @@ where
                     Err(e) => return Err(e),
                 };
                 match msg {
-                    BMessage::Tx { position, tx_idx, envelope, signer } => {
+                    BMessage::Tx { position, tx_idx, envelope } => {
                         if tx_idx != expected {
                             return Err(ExecutorError::OutOfOrderTx { got: tx_idx, expected });
                         }
                         expected = expected.next();
-                        if out.send(ReaderToExec::Tx { tx_idx, envelope, signer, position }).is_err() {
+                        if out.send(ReaderToExec::Tx { tx_idx, envelope, position }).is_err() {
                             return Ok(()); // exec thread shutting down
                         }
                     }
@@ -1694,13 +1663,16 @@ Append a test module to `actor.rs`:
 mod reader_tests {
     use super::*;
     use crate::types::TxIndex;
-    use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256};
+    use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, keccak256};
     use alloy_signer_local::PrivateKeySigner;
+    use kardamom_types::TxEnvelope as KtTxEnvelope;
     use std::collections::VecDeque;
 
-    fn legacy_envelope(signer: &PrivateKeySigner, nonce: u64) -> TxEnvelope {
+    /// Build a proxy-style envelope: sign, encode raw_tx, derive tx_hash.
+    fn legacy_envelope(signer: &PrivateKeySigner, nonce: u64) -> KtTxEnvelope {
         let mut tx = TxLegacy {
             chain_id: Some(1),
             nonce,
@@ -1711,7 +1683,15 @@ mod reader_tests {
             input: Bytes::new(),
         };
         let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-        tx.into_signed(sig).into()
+        let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+        let raw_tx = Bytes::from(alloy_env.encoded_2718());
+        let tx_hash = keccak256(&raw_tx);
+        KtTxEnvelope {
+            correlation_id: 0,
+            raw_tx,
+            sender: signer.address(),
+            tx_hash,
+        }
     }
 
     struct VecBSub {
@@ -1733,9 +1713,9 @@ mod reader_tests {
         let pos = |o| BPosition { term_id: 0, term_offset: o };
 
         let queue = VecDeque::from(vec![
-            Ok(BMessage::Tx { position: pos(0), tx_idx: TxIndex(0), envelope: e0, signer: signer.address() }),
+            Ok(BMessage::Tx { position: pos(0), tx_idx: TxIndex(0), envelope: e0 }),
             // Skip 1; emit 2 — must trigger OutOfOrderTx.
-            Ok(BMessage::Tx { position: pos(2), tx_idx: TxIndex(2), envelope: e2, signer: signer.address() }),
+            Ok(BMessage::Tx { position: pos(2), tx_idx: TxIndex(2), envelope: e2 }),
         ]);
         let (tx_r2e, _rx_r2e) = bounded::<ReaderToExec>(4);
         let h = spawn_reader(VecBSub { queue }, tx_r2e);
@@ -1777,19 +1757,19 @@ git commit -m "executor: reader thread + out-of-order tx_idx detection"
 **Context:** Exec thread is the heart of the actor. State machine:
 
 ```
-state = (current_snapshot, current_delta, current_block_number, last_processed_tx_idx)
+state = (current_snapshot, current_delta, current_block_number, last_processed_position)
 loop:
   msg = rx_r2e.recv()
   match msg:
     Tx{...}:
-      (receipt, ws) = execute_tx(snapshot, delta, env, ...)
+      (receipt, ws) = execute_tx(snapshot, delta, env, tx_idx, position, envelope)
       apply_write_set(delta, ws)
       tx_e2c.send(ExecToCommit::Receipt(receipt))
-      last_processed_tx_idx = tx_idx
+      last_processed_position = position
     BlockBoundaryStart{block_number, end_tx_idx, l2_timestamp}:
-      assert last_processed_tx_idx == end_tx_idx (or BoundaryMisaligned)
-      root = block_delta_root(&delta)
-      boundary = BlockBoundary{block_number, end_tx_idx, l2_timestamp, state_root_commitment: root}
+      assert last_processed_position == end_tx_idx (or BoundaryMisaligned)
+      # NO state-root computation (S0 D-Sh11). The BlockBoundary is slim.
+      boundary = BlockBoundary{block_number, end_tx_idx, l2_timestamp}
       tx_e2c.send(ExecToCommit::Boundary(boundary))
       sw_queue.submit(boundary, delta_drained)
       sw_signal.wait_committed(block_number)
@@ -1798,7 +1778,7 @@ loop:
       current_block_number = block_number + 1
 ```
 
-Note `current_block_number` is updated **before** the next tx executes; the next `BlockBoundaryStart` reasserts it.
+Note `current_block_number` is updated **before** the next tx executes; the next `BlockBoundaryStart` reasserts it. The exec thread tracks both the executor-local `TxIndex` (for monotonicity) and the channel-B `BPosition` (for boundary alignment, since `BlockBoundaryStart.end_tx_idx` is a `BPosition` per S0 D-Sh1).
 
 - [ ] **Step 1: Replace the `spawn_exec` stub**
 
@@ -1826,7 +1806,10 @@ where
             // Set after the first boundary observed for `current_block`; used
             // to validate the end_tx_idx alignment.
             let mut current_l2_ts: u64 = 0;
-            let mut last_processed: Option<TxIndex> = None;
+            // We track both the executor-local TxIndex (monotonic counter for
+            // sanity) and the channel-B BPosition (the actual wire identifier
+            // BlockBoundaryStart.end_tx_idx compares against, per S0 D-Sh1).
+            let mut last_processed_position: Option<BPosition> = None;
 
             loop {
                 let msg = match rx.recv() {
@@ -1834,28 +1817,25 @@ where
                     Err(_) => return Ok(()),
                 };
                 match msg {
-                    ReaderToExec::Tx { tx_idx, envelope, signer, position: _ } => {
+                    ReaderToExec::Tx { tx_idx, envelope, position } => {
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
-                        let (receipt, ws) = execute_tx(&*snapshot, &delta, env, tx_idx, &envelope, signer)?;
+                        let (receipt, ws) = execute_tx(&*snapshot, &delta, env, tx_idx, position, &envelope)?;
                         apply_write_set(&mut delta, ws);
-                        last_processed = Some(tx_idx);
+                        last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
                     }
                     ReaderToExec::Boundary(BlockBoundaryStart { block_number, end_tx_idx, l2_timestamp }) => {
-                        // Alignment check: end_tx_idx must equal the last
-                        // tx we processed, or the boundary is empty (no txs
-                        // in this block — end_tx_idx == prev_block_last - 1).
-                        // For v0 we require last_processed == Some(end_tx_idx)
-                        // or that the block is genuinely empty (last_processed
-                        // < end_tx_idx is misaligned; > is impossible thanks
-                        // to the reader's monotonicity check).
-                        if let Some(lp) = last_processed {
+                        // Alignment: BlockBoundaryStart.end_tx_idx is a BPosition
+                        // identifying the LAST channel-B record that belongs to
+                        // the closing block. It must match the executor's most
+                        // recent processed position.
+                        if let Some(lp) = last_processed_position {
                             if lp != end_tx_idx {
                                 return Err(ExecutorError::BoundaryMisaligned {
                                     end: end_tx_idx,
@@ -1864,12 +1844,14 @@ where
                             }
                         }
 
-                        let root = block_delta_root(&delta);
+                        // S0 D-Sh11: NO state-root computation. The sealed
+                        // BlockBoundary on channel C is slim — three fields,
+                        // no commitment. State-root attestation is a future
+                        // validator concern.
                         let boundary = BlockBoundary {
                             block_number,
                             end_tx_idx,
                             l2_timestamp,
-                            state_root_commitment: root,
                         };
 
                         // Drain the delta. We swap it out so the writer owns it.
@@ -1906,14 +1888,18 @@ mod exec_tests {
     use super::*;
     use crate::state::MockStateDatabase;
     use crate::types::TxIndex;
-    use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address};
+    use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address, keccak256};
     use alloy_signer_local::PrivateKeySigner;
+    use kardamom_types::{BPosition, TxEnvelope as KtTxEnvelope};
     use revm::primitives::KECCAK_EMPTY;
     use std::sync::{Arc, Mutex};
 
-    fn legacy(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64) -> TxEnvelope {
+    fn pos(off: i32) -> BPosition { BPosition { term_id: 0, term_offset: off } }
+
+    fn legacy(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64) -> KtTxEnvelope {
         let mut tx = TxLegacy {
             chain_id: Some(1),
             nonce,
@@ -1924,7 +1910,15 @@ mod exec_tests {
             input: Bytes::new(),
         };
         let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-        tx.into_signed(sig).into()
+        let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+        let raw_tx = Bytes::from(alloy_env.encoded_2718());
+        let tx_hash = keccak256(&raw_tx);
+        KtTxEnvelope {
+            correlation_id: 0,
+            raw_tx,
+            sender: signer.address(),
+            tx_hash,
+        }
     }
 
     struct StaticSnap(Arc<MockStateDatabase>);
@@ -1948,7 +1942,7 @@ mod exec_tests {
     }
 
     #[test]
-    fn exec_runs_two_txs_and_emits_boundary_with_root() {
+    fn exec_runs_two_txs_and_emits_slim_boundary() {
         let signer = PrivateKeySigner::random();
         let from = signer.address();
         let to = address!("00000000000000000000000000000000000ABCDE");
@@ -1967,18 +1961,16 @@ mod exec_tests {
         tx_r2e.send(ReaderToExec::Tx {
             tx_idx: TxIndex(0),
             envelope: legacy(&signer, to, 0, 100),
-            signer: from,
-            position: BPosition { term_id: 0, term_offset: 0 },
+            position: pos(0),
         }).unwrap();
         tx_r2e.send(ReaderToExec::Tx {
             tx_idx: TxIndex(1),
             envelope: legacy(&signer, to, 1, 50),
-            signer: from,
-            position: BPosition { term_id: 0, term_offset: 1 },
+            position: pos(1),
         }).unwrap();
         tx_r2e.send(ReaderToExec::Boundary(BlockBoundaryStart {
             block_number: 1,
-            end_tx_idx: TxIndex(1),
+            end_tx_idx: pos(1),
             l2_timestamp: 1_700_000_000,
         })).unwrap();
         drop(tx_r2e);
@@ -2000,17 +1992,18 @@ mod exec_tests {
         assert_eq!(log.len(), 1);
         let (boundary, delta) = &log[0];
         assert_eq!(boundary.block_number, 1);
-        assert_eq!(boundary.end_tx_idx, TxIndex(1));
+        assert_eq!(boundary.end_tx_idx, pos(1));
         assert_eq!(boundary.l2_timestamp, 1_700_000_000);
         // Recipient received 150 across both transfers.
         assert_eq!(delta.accounts[&to].balance, U256::from(150u64));
-        // State root is deterministic & nonzero.
-        assert_ne!(boundary.state_root_commitment, B256::ZERO);
+        // The BlockBoundary type has exactly three fields per S0 D-Sh11:
+        // block_number, end_tx_idx, l2_timestamp. There is no
+        // `state_root_commitment` to assert on; if a future change re-adds one
+        // this test should not compile.
     }
 
     #[test]
     fn exec_rejects_misaligned_boundary() {
-        let snap = Arc::new(MockStateDatabase::default());
         let writer_log = Arc::new(Mutex::new(Vec::new()));
 
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
@@ -2020,12 +2013,11 @@ mod exec_tests {
         tx_r2e.send(ReaderToExec::Tx {
             tx_idx: TxIndex(0),
             envelope: legacy(&signer, Address::from([0x22u8; 20]), 0, 0),
-            signer: signer.address(),
-            position: BPosition { term_id: 0, term_offset: 0 },
+            position: pos(0),
         }).unwrap();
-        // Boundary claims end_tx_idx=5 but we only processed 0.
+        // Boundary claims end_tx_idx at offset 5 but we only processed offset 0.
         tx_r2e.send(ReaderToExec::Boundary(BlockBoundaryStart {
-            block_number: 1, end_tx_idx: TxIndex(5), l2_timestamp: 0,
+            block_number: 1, end_tx_idx: pos(5), l2_timestamp: 0,
         })).unwrap();
         drop(tx_r2e);
 
@@ -2102,7 +2094,8 @@ Append:
 #[cfg(test)]
 mod commit_tests {
     use super::*;
-    use crate::types::{BlockBoundary, Receipt, ReceiptStatus, TxIndex};
+    use alloy_primitives::B256;
+    use kardamom_types::{BPosition, BlockBoundary, Receipt};
     use std::sync::{Arc, Mutex};
 
     struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
@@ -2117,16 +2110,19 @@ mod commit_tests {
     fn commit_thread_preserves_order() {
         let (tx, rx) = bounded::<ExecToCommit>(8);
         let log = Arc::new(Mutex::new(Vec::new()));
+        let pos0 = BPosition { term_id: 0, term_offset: 0 };
 
         tx.send(ExecToCommit::Receipt(Receipt {
-            tx_idx: TxIndex(0),
-            status: ReceiptStatus::Success,
+            tx_idx: pos0,
+            tx_hash: B256::repeat_byte(0xAA),
+            status: true,
             gas_used: 21_000,
             logs: Vec::new(),
             write_set_hash: B256::ZERO,
         })).unwrap();
+        // S0 D-Sh11: BlockBoundary has exactly three fields — no state_root_commitment.
         tx.send(ExecToCommit::Boundary(BlockBoundary {
-            block_number: 1, end_tx_idx: TxIndex(0), l2_timestamp: 100, state_root_commitment: B256::ZERO,
+            block_number: 1, end_tx_idx: pos0, l2_timestamp: 100,
         })).unwrap();
         drop(tx);
 
@@ -2135,7 +2131,7 @@ mod commit_tests {
 
         let l = log.lock().unwrap();
         assert_eq!(l.len(), 2);
-        assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == TxIndex(0)));
+        assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
         assert!(matches!(&l[1], CMessage::BlockBoundary(b) if b.block_number == 1));
     }
 }
@@ -2175,7 +2171,7 @@ git commit -m "executor: commit thread publishes receipts + boundaries on C"
 //! interface (`ChannelBSubscription` / `ChannelCPublication`).
 //!
 //! See `docs/specs/2026-05-23-high-throughput-sequencer-design.md`
-//! §2.4 + V0 scope.
+//! §2.4 + V0 scope. Shared types come from `kardamom-types` (S0 D-Sh1).
 
 pub mod actor;
 pub mod block_env;
@@ -2186,17 +2182,20 @@ pub mod state;
 pub mod types;
 
 pub use actor::{
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, SnapshotSource,
-    StateWriterQueue, StateWriterSignal,
+    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, StateWriterQueue,
+    StateWriterSignal,
 };
 pub use block_env::ExecEnv;
-pub use delta::{WriteSet, apply_write_set, block_delta_root};
+pub use delta::{WriteSet, apply_write_set};
 pub use error::ExecutorError;
-pub use state::{AccountState, MockStateDatabase, StateDatabase, StateDatabaseError};
-pub use types::{
-    AccountChange, BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    Receipt, ReceiptStatus, TxIndex,
+pub use state::MockStateDatabase;
+// Shared types re-exported from kardamom-types so external callers can pull
+// them via `kardamom_executor::*` without a separate dependency line.
+pub use kardamom_types::{
+    AccountChange, AccountState, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta,
+    Receipt, SnapshotSource, StateDatabase, StateDatabaseError, TxEnvelope,
 };
+pub use types::{BMessage, CMessage, ReceiptStatus, TxIndex};
 ```
 
 - [ ] **Step 2: Build the whole crate**
@@ -2232,14 +2231,14 @@ git commit -m "executor: re-export public API"
 //!
 //! No real Aeron, no real libmdbx — mock channels and `MockStateDatabase`.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address};
+use alloy_primitives::{Address, B256, Bytes, TxKind as APTxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
@@ -2247,8 +2246,8 @@ use revm::primitives::KECCAK_EMPTY;
 use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
     ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, Receipt, ReceiptStatus, SnapshotSource, StateDatabase, StateWriterQueue,
-    StateWriterSignal, TxIndex,
+    MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
+    TxEnvelope as KtTxEnvelope, TxIndex,
 };
 
 struct ChanBSub(Receiver<BMessage>);
@@ -2280,7 +2279,8 @@ impl StateWriterQueue for DropQ {
     fn submit(&mut self, _: BlockBoundary, _: BlockDelta) -> Result<(), ExecutorError> { Ok(()) }
 }
 
-fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> TxEnvelope {
+/// Proxy-style envelope builder: sign, encode raw_tx, populate sender + tx_hash.
+fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -2291,7 +2291,10 @@ fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> TxE
         input: Bytes::new(),
     };
     let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    tx.into_signed(sig).into()
+    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+    let raw_tx = Bytes::from(alloy_env.encoded_2718());
+    let tx_hash = keccak256(&raw_tx);
+    KtTxEnvelope { correlation_id: 0, raw_tx, sender: signer.address(), tx_hash }
 }
 
 #[test]
@@ -2312,21 +2315,23 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     // 4 txs → boundary block 1 → 3 txs → boundary block 2 → 3 txs → boundary block 3.
     let mut nonce: u64 = 0;
     let mut tx_idx: u64 = 0;
+    let mut expected_hashes: Vec<B256> = Vec::new();
     let plan = [(4, 1u64), (3, 2), (3, 3)];
     for (n_txs, blk) in plan {
         for _ in 0..n_txs {
+            let env = transfer(&signer, nonce, to, 1);
+            expected_hashes.push(env.tx_hash);
             b_tx.send(BMessage::Tx {
-                position: BPosition { term_id: 0, term_offset: tx_idx },
+                position: BPosition { term_id: 0, term_offset: tx_idx as i32 },
                 tx_idx: TxIndex(tx_idx),
-                envelope: transfer(&signer, nonce, to, 1),
-                signer: from,
+                envelope: env,
             }).unwrap();
             nonce += 1;
             tx_idx += 1;
         }
         b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
             block_number: blk,
-            end_tx_idx: TxIndex(tx_idx - 1),
+            end_tx_idx: BPosition { term_id: 0, term_offset: (tx_idx as i32) - 1 },
             l2_timestamp: 1_700_000_000 + blk,
         })).unwrap();
     }
@@ -2339,24 +2344,29 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
 
     let mut receipts = 0usize;
     let mut boundaries = 0usize;
-    let mut last_root = None;
+    let mut got_hashes: Vec<B256> = Vec::new();
     while let Ok(msg) = c_rx.recv_timeout(Duration::from_secs(5)) {
         match msg {
             CMessage::Receipt(r) => {
-                assert_eq!(r.status, ReceiptStatus::Success);
-                assert_ne!(r.write_set_hash, alloy_primitives::B256::ZERO);
+                assert!(r.status, "tx {receipts} should succeed");
+                assert_ne!(r.write_set_hash, B256::ZERO);
+                got_hashes.push(r.tx_hash);
                 receipts += 1;
             }
             CMessage::BlockBoundary(b) => {
+                // S0 D-Sh11: BlockBoundary has no state_root_commitment field.
+                // We assert only the slim three-field shape.
+                assert!(b.block_number >= 1 && b.block_number <= 3);
                 boundaries += 1;
-                assert_ne!(b.state_root_commitment, alloy_primitives::B256::ZERO);
-                last_root = Some(b.state_root_commitment);
             }
         }
     }
     assert_eq!(receipts, 10);
     assert_eq!(boundaries, 3);
-    assert!(last_root.is_some());
+    // CRITICAL (S0 D-Sh4): every receipt's tx_hash must equal the inbound
+    // envelope's tx_hash, byte-for-byte, in the same order. The executor
+    // never recomputes — it propagates.
+    assert_eq!(got_hashes, expected_hashes);
 
     join.join().expect("no panic").expect("exec ok");
 }
@@ -2390,16 +2400,18 @@ git commit -m "executor(test): end-to-end replay integration"
 
 ```rust
 //! Determinism conformance: two executor instances driven by the same input
-//! must produce byte-identical channel-C output (including every
-//! `write_set_hash` and `state_root_commitment`).
+//! must produce byte-identical channel-C output (every `tx_hash` and every
+//! `write_set_hash` matches). No state-root assertion: the executor does not
+//! emit a state-root commitment (S0 D-Sh11).
 
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address};
+use alloy_primitives::{Bytes, TxKind as APTxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
@@ -2408,7 +2420,7 @@ use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
     ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
-    TxIndex,
+    TxEnvelope as KtTxEnvelope, TxIndex,
 };
 
 struct ChanBSub(Receiver<BMessage>);
@@ -2432,16 +2444,13 @@ impl StateWriterSignal for Imm { fn wait_committed(&mut self, b: u64) -> Result<
 struct DropQ;
 impl StateWriterQueue for DropQ { fn submit(&mut self, _: BlockBoundary, _: BlockDelta) -> Result<(), ExecutorError> { Ok(()) } }
 
-fn build_stream(snap: Arc<MockStateDatabase>) -> (Receiver<BMessage>, Sender<CMessage>, Receiver<CMessage>) {
+fn build_stream(_snap: Arc<MockStateDatabase>) -> (Receiver<BMessage>, Sender<CMessage>, Receiver<CMessage>) {
     let (b_tx, b_rx) = bounded::<BMessage>(128);
     let (c_tx, c_rx) = bounded::<CMessage>(128);
 
     let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0xCD)).unwrap();
     let from = signer.address();
     let to = address!("00000000000000000000000000000000DEAD0001");
-
-    // Ensure the snapshot funds `from`. The caller pre-funds it; we just emit txs.
-    let _ = snap;
 
     let mut tx_idx: u64 = 0;
     let mut nonce: u64 = 0;
@@ -2457,19 +2466,21 @@ fn build_stream(snap: Arc<MockStateDatabase>) -> (Receiver<BMessage>, Sender<CMe
                 input: Bytes::new(),
             };
             let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-            let env: TxEnvelope = tx.into_signed(sig).into();
+            let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+            let raw_tx = Bytes::from(alloy_env.encoded_2718());
+            let tx_hash = keccak256(&raw_tx);
+            let env = KtTxEnvelope { correlation_id: 0, raw_tx, sender: from, tx_hash };
             b_tx.send(BMessage::Tx {
-                position: BPosition { term_id: 0, term_offset: tx_idx },
+                position: BPosition { term_id: 0, term_offset: tx_idx as i32 },
                 tx_idx: TxIndex(tx_idx),
                 envelope: env,
-                signer: from,
             }).unwrap();
             tx_idx += 1;
             nonce += 1;
         }
         b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
             block_number: blk,
-            end_tx_idx: TxIndex(tx_idx - 1),
+            end_tx_idx: BPosition { term_id: 0, term_offset: (tx_idx as i32) - 1 },
             l2_timestamp: 1_700_000_000 + blk,
         })).unwrap();
     }
@@ -2558,16 +2569,17 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, Bytes, TxKind as APTxKind, U256, address};
+use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::context::result::ExecutionResult;
 use revm::context::{BlockEnv, CfgEnv, TxEnv};
 use revm::database::{CacheDB, DatabaseRef};
 use revm::primitives::{KECCAK_EMPTY, TxKind};
-use revm::state::{AccountInfo, Bytecode};
+use revm::state::Bytecode;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use kardamom_executor::executor::SnapshotRef;
@@ -2575,7 +2587,7 @@ use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
     ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
-    TxIndex,
+    TxEnvelope as KtTxEnvelope, TxIndex,
 };
 
 // Minimal: PUSH1 0x42; PUSH1 0x00; SSTORE; STOP
@@ -2601,7 +2613,9 @@ impl StateWriterSignal for Imm { fn wait_committed(&mut self, b: u64) -> Result<
 struct DropQ;
 impl StateWriterQueue for DropQ { fn submit(&mut self, _: BlockBoundary, _: BlockDelta) -> Result<(), ExecutorError> { Ok(()) } }
 
-fn legacy(signer: &PrivateKeySigner, to: APTxKind, nonce: u64, value: u64, data: Bytes, gas: u64) -> TxEnvelope {
+/// Build a proxy-style `kardamom_types::TxEnvelope` (raw_tx, sender, tx_hash
+/// populated). The naïve reference decodes back to alloy for revm.
+fn legacy(signer: &PrivateKeySigner, to: APTxKind, nonce: u64, value: u64, data: Bytes, gas: u64) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -2612,15 +2626,21 @@ fn legacy(signer: &PrivateKeySigner, to: APTxKind, nonce: u64, value: u64, data:
         input: data,
     };
     let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    tx.into_signed(sig).into()
+    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+    let raw_tx = Bytes::from(alloy_env.encoded_2718());
+    let tx_hash = keccak256(&raw_tx);
+    KtTxEnvelope { correlation_id: 0, raw_tx, sender: signer.address(), tx_hash }
 }
 
-fn naive_reference(snap: Arc<MockStateDatabase>, txs: &[(TxEnvelope, Address)]) -> Vec<(bool, u64)> {
+fn naive_reference(snap: Arc<MockStateDatabase>, txs: &[(KtTxEnvelope, Address)]) -> Vec<(bool, u64)> {
+    use alloy_eips::eip2718::Decodable2718;
     let snap_ref = SnapshotRef { inner: &*snap };
     let mut cache: CacheDB<SnapshotRef<'_>> = CacheDB::new(snap_ref);
     let mut out = Vec::new();
-    for (env, signer) in txs {
+    for (kt_env, signer) in txs {
         use alloy_consensus::Transaction;
+        let env = alloy_consensus::TxEnvelope::decode_2718(&mut kt_env.raw_tx.as_ref())
+            .expect("decode raw_tx");
         let tx_env = TxEnv {
             caller: *signer,
             chain_id: env.chain_id(),
@@ -2690,23 +2710,24 @@ fn actor_receipts_match_naive_reference() {
         legacy(&signer, APTxKind::Call(revert_addr), 2, 0, Bytes::new(), 100_000),
     ];
     let signers = vec![from, from, from];
-    let pairs: Vec<(TxEnvelope, Address)> = txs.iter().cloned().zip(signers).collect();
+    let pairs: Vec<(KtTxEnvelope, Address)> = txs.iter().cloned().zip(signers).collect();
 
     let reference = naive_reference(snap.clone(), &pairs);
 
     // Now drive the actor.
     let (b_tx, b_rx) = bounded::<BMessage>(8);
     let (c_tx, c_rx) = bounded::<CMessage>(8);
-    for (i, (env, sg)) in pairs.iter().enumerate() {
+    for (i, (env, _sg)) in pairs.iter().enumerate() {
         b_tx.send(BMessage::Tx {
-            position: BPosition { term_id: 0, term_offset: i as u64 },
+            position: BPosition { term_id: 0, term_offset: i as i32 },
             tx_idx: TxIndex(i as u64),
             envelope: env.clone(),
-            signer: *sg,
         }).unwrap();
     }
     b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
-        block_number: 1, end_tx_idx: TxIndex((pairs.len() - 1) as u64), l2_timestamp: 1_700_000_000,
+        block_number: 1,
+        end_tx_idx: BPosition { term_id: 0, term_offset: (pairs.len() - 1) as i32 },
+        l2_timestamp: 1_700_000_000,
     })).unwrap();
     drop(b_tx);
 
@@ -2720,8 +2741,8 @@ fn actor_receipts_match_naive_reference() {
     let mut actor = Vec::new();
     while let Ok(m) = c_rx.recv_timeout(Duration::from_secs(5)) {
         if let CMessage::Receipt(r) = m {
-            let ok = matches!(r.status, kardamom_executor::ReceiptStatus::Success);
-            actor.push((ok, r.gas_used));
+            // kardamom_types::Receipt.status is a plain bool — success/failure.
+            actor.push((r.status, r.gas_used));
         }
     }
     h.join().expect("no panic").expect("ok");
@@ -2818,9 +2839,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address};
+use alloy_primitives::{Address, Bytes, TxKind as APTxKind, U256, address, keccak256};
 use alloy_signer_local::PrivateKeySigner;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -2833,7 +2855,7 @@ use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
     ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
-    TxIndex, apply_write_set,
+    TxEnvelope as KtTxEnvelope, TxIndex,
 };
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
@@ -2844,7 +2866,13 @@ const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
     0x00,       // STOP
 ];
 
-fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> TxEnvelope {
+fn wrap_envelope(signer: &PrivateKeySigner, alloy_env: alloy_consensus::TxEnvelope) -> KtTxEnvelope {
+    let raw_tx = Bytes::from(alloy_env.encoded_2718());
+    let tx_hash = keccak256(&raw_tx);
+    KtTxEnvelope { correlation_id: 0, raw_tx, sender: signer.address(), tx_hash }
+}
+
+fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -2855,10 +2883,10 @@ fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> TxEnve
         input: Bytes::new(),
     };
     let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    tx.into_signed(sig).into()
+    wrap_envelope(signer, tx.into_signed(sig).into())
 }
 
-fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) -> TxEnvelope {
+fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -2869,8 +2897,10 @@ fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) 
         input: Bytes::new(),
     };
     let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-    tx.into_signed(sig).into()
+    wrap_envelope(signer, tx.into_signed(sig).into())
 }
+
+fn pos(off: i32) -> BPosition { BPosition { term_id: 0, term_offset: off } }
 
 fn bench_transfer_step(c: &mut Criterion) {
     let signer = PrivateKeySigner::random();
@@ -2883,15 +2913,13 @@ fn bench_transfer_step(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("transfer_step");
     group.throughput(Throughput::Elements(1));
-    let envelope = signed_transfer(&signer, to, 0);
     group.bench_function("plain_transfer", |b| {
         let mut nonce: u64 = 0;
         b.iter(|| {
             let delta = BlockDelta::default();
             let env_tx = signed_transfer(&signer, to, nonce);
-            let _ = execute_tx(&snap, &delta, env, TxIndex(0), &env_tx, from).unwrap();
+            let _ = execute_tx(&snap, &delta, env, TxIndex(0), pos(nonce as i32), &env_tx).unwrap();
             nonce += 1;
-            envelope.clone()
         })
     });
     group.finish();
@@ -2917,7 +2945,7 @@ fn bench_sstore_step(c: &mut Criterion) {
         b.iter(|| {
             let delta = BlockDelta::default();
             let env_tx = signed_sstore_call(&signer, contract, nonce);
-            let (_r, ws) = execute_tx(&snap, &delta, env, TxIndex(0), &env_tx, from).unwrap();
+            let (_r, ws) = execute_tx(&snap, &delta, env, TxIndex(0), pos(nonce as i32), &env_tx).unwrap();
             // One storage write expected; the assertion documents the workload.
             assert_eq!(ws.storage.len(), 1);
             nonce += 1;
@@ -2964,16 +2992,19 @@ fn bench_actor_throughput(c: &mut Criterion) {
 
             for i in 0..BATCH {
                 b_tx.send(BMessage::Tx {
-                    position: BPosition { term_id: 0, term_offset: i },
+                    position: BPosition { term_id: 0, term_offset: i as i32 },
                     tx_idx: TxIndex(i),
                     envelope: signed_transfer(&signer, to, i),
-                    signer: from,
                 }).unwrap();
             }
             b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
-                block_number: 1, end_tx_idx: TxIndex(BATCH - 1), l2_timestamp: 0,
+                block_number: 1,
+                end_tx_idx: BPosition { term_id: 0, term_offset: (BATCH as i32) - 1 },
+                l2_timestamp: 0,
             })).unwrap();
             drop(b_tx);
+            // silence unused-binding warning if `from` not consumed elsewhere
+            let _ = from;
 
             let h = thread::spawn(move || {
                 Executor::run(
@@ -3017,7 +3048,245 @@ git commit -m "executor(bench): criterion suite for sequential throughput"
 
 ---
 
-## Task 19: Workspace test sweep + plan close-out
+## Task 19: E2E test against real Aeron in Docker
+
+**Files:**
+- Create: `crates/kardamom-executor/tests/docker_aeron_e2e.rs`
+
+**Context:** Per S0 D-Sh8, every component plan must include an e2e task that runs against a real Aeron Media Driver + Archive in Docker, using the `testcontainers` harness shipped by `kardamom-log` (S3) under the `testing` feature. Mocks are not acceptable at the e2e layer — they hide wire-format / back-pressure / fsync-ordering bugs that only surface against real Aeron.
+
+This test:
+1. Brings up Aeron containers via the `kardamom-log` testcontainers helper.
+2. Publishes a synthetic stream of `TxEnvelope` records and `BlockBoundaryStart` markers onto channel B with rkyv-encoded payloads.
+3. Spawns a real `Executor` subscribing to that channel B and publishing to channel C.
+4. Drains channel C, asserts the receipts match expectation (one per tx, in order, with the expected `tx_hash` and `write_set_hash`), and asserts the slim `BlockBoundary` (no state-root commitment) closes the block.
+5. Tears down the containers.
+
+The test is gated behind `#[cfg(feature = "docker-e2e")]` — actually we leave it on by default but it requires Docker to be available; CI runs it in the Docker-enabled job.
+
+- [ ] **Step 1: Write the test**
+
+```rust
+//! E2E: real Aeron Media Driver + Archive in Docker, real `Executor` actor,
+//! channel-B input + channel-C output. Per S0 D-Sh8 every component plan
+//! ships one of these.
+//!
+//! Requires Docker. Skipped if `DOCKER_HOST` is unset and the default socket
+//! is unavailable — see `harness::docker_available()`.
+
+use std::sync::Arc;
+use std::thread;
+use std::time::Duration;
+
+use alloy_consensus::{SignableTransaction, TxLegacy};
+use alloy_eips::eip2718::Encodable2718;
+use alloy_network::TxSignerSync;
+use alloy_primitives::{Address, B256, Bytes, TxKind as APTxKind, U256, address, keccak256};
+use alloy_signer_local::PrivateKeySigner;
+use revm::primitives::KECCAK_EMPTY;
+
+use kardamom_executor::{
+    BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
+    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
+    TxEnvelope as KtTxEnvelope, TxIndex,
+};
+// From kardamom-log's `testing` feature (S3): the Docker harness + the real
+// Aeron-backed ChannelB/ChannelC adapters that implement the executor's
+// subscription/publication traits.
+use kardamom_log::testing::{
+    docker_available, AeronTestHarness, RealChannelBPublication,
+    RealChannelBSubscription, RealChannelCPublication, RealChannelCSubscription,
+};
+
+/// Build a proxy-style envelope: sign, 2718-encode, populate sender + tx_hash.
+fn build_envelope(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnvelope {
+    let mut tx = TxLegacy {
+        chain_id: Some(1),
+        nonce,
+        gas_price: 0,
+        gas_limit: 21_000,
+        to: APTxKind::Call(to),
+        value: U256::from(1u64),
+        input: Bytes::new(),
+    };
+    let sig = signer.sign_transaction_sync(&mut tx).unwrap();
+    let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+    let raw_tx = Bytes::from(alloy_env.encoded_2718());
+    let tx_hash = keccak256(&raw_tx);
+    KtTxEnvelope { correlation_id: nonce, raw_tx, sender: signer.address(), tx_hash }
+}
+
+// Adapter from the real Aeron-backed channel-B subscription to the executor's
+// trait. `RealChannelBSubscription::poll_next` returns archived rkyv views; we
+// materialize once here for the executor's BMessage demux.
+struct B(RealChannelBSubscription);
+impl ChannelBSubscription for B {
+    fn next(&mut self) -> Result<BMessage, ExecutorError> {
+        loop {
+            match self.0.poll_next_blocking(Duration::from_secs(5)) {
+                Ok(Some(msg)) => return Ok(msg),
+                Ok(None) => return Err(ExecutorError::ChannelBClosed),
+                Err(_) => continue, // transient; retry within the e2e timeout
+            }
+        }
+    }
+}
+
+struct C(RealChannelCPublication);
+impl ChannelCPublication for C {
+    fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        self.0
+            .publish(msg)
+            .map_err(|_| ExecutorError::ChannelCClosed)
+    }
+}
+
+struct StaticSnap(Arc<MockStateDatabase>);
+impl SnapshotSource for StaticSnap {
+    fn open_at(&mut self, _: u64) -> Result<Arc<dyn StateDatabase>, ExecutorError> {
+        Ok(self.0.clone())
+    }
+}
+struct Imm;
+impl StateWriterSignal for Imm {
+    fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> { Ok(b) }
+}
+struct DropQ;
+impl StateWriterQueue for DropQ {
+    fn submit(&mut self, _: BlockBoundary, _: BlockDelta) -> Result<(), ExecutorError> { Ok(()) }
+}
+
+#[test]
+fn executor_consumes_real_aeron_b_publishes_real_aeron_c() {
+    if !docker_available() {
+        eprintln!("docker not available; skipping real-aeron e2e test");
+        return;
+    }
+
+    // 1. Spin up real Aeron Media Driver + Archive in Docker (S3 harness).
+    let harness = AeronTestHarness::start();
+    let channel_b_uri = harness.channel_b_uri();
+    let channel_c_uri = harness.channel_c_uri();
+
+    // 2. Build a publisher onto channel B (the "synthetic sequencer") and a
+    // subscriber on channel C (the "test observer that stands in for the proxy
+    // / state writer / archiver").
+    let mut b_pub: RealChannelBPublication = harness
+        .open_channel_b_publication(&channel_b_uri)
+        .expect("open b pub");
+    let mut c_sub: RealChannelCSubscription = harness
+        .open_channel_c_subscription(&channel_c_uri)
+        .expect("open c sub");
+
+    // The executor's adapters open *its* subscription on B and publication on C.
+    let b_sub_for_exec: RealChannelBSubscription = harness
+        .open_channel_b_subscription(&channel_b_uri)
+        .expect("open b sub for executor");
+    let c_pub_for_exec: RealChannelCPublication = harness
+        .open_channel_c_publication(&channel_c_uri)
+        .expect("open c pub for executor");
+
+    // 3. Pre-fund the synthetic sender so the txs succeed.
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("00000000000000000000000000000000000ABCDE");
+    let snap = Arc::new(
+        MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .build(),
+    );
+
+    // 4. Publish 5 txs + a BlockBoundaryStart onto real channel B.
+    const N: u64 = 5;
+    let mut expected_hashes: Vec<B256> = Vec::with_capacity(N as usize);
+    for nonce in 0..N {
+        let env = build_envelope(&signer, nonce, to);
+        expected_hashes.push(env.tx_hash);
+        let pos = BPosition { term_id: 0, term_offset: nonce as i32 };
+        b_pub
+            .publish(BMessage::Tx { position: pos, tx_idx: TxIndex(nonce), envelope: env })
+            .expect("publish tx onto real aeron B");
+    }
+    b_pub
+        .publish(BMessage::BlockBoundaryStart(BlockBoundaryStart {
+            block_number: 1,
+            end_tx_idx: BPosition { term_id: 0, term_offset: (N as i32) - 1 },
+            l2_timestamp: 1_700_000_000,
+        }))
+        .expect("publish boundary onto real aeron B");
+
+    // 5. Spawn the real executor against real Aeron channels.
+    let exec_handle = thread::spawn(move || {
+        Executor::run(
+            ExecutorConfig { chain_id: 1, receipt_queue_depth: 64 },
+            B(b_sub_for_exec),
+            C(c_pub_for_exec),
+            StaticSnap(snap),
+            Imm,
+            DropQ,
+            0,
+        )
+    });
+
+    // 6. Drain channel C; collect receipts + the slim boundary.
+    let mut got_hashes: Vec<B256> = Vec::new();
+    let mut got_boundary: Option<BlockBoundary> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        match c_sub.poll_next_blocking(Duration::from_millis(500)) {
+            Ok(Some(CMessage::Receipt(r))) => {
+                assert!(r.status, "tx should succeed on real-aeron e2e");
+                assert_ne!(r.write_set_hash, B256::ZERO);
+                got_hashes.push(r.tx_hash);
+            }
+            Ok(Some(CMessage::BlockBoundary(b))) => {
+                got_boundary = Some(b);
+                break; // boundary is the terminator for this test
+            }
+            Ok(None) | Err(_) => continue,
+        }
+    }
+
+    // 7. Assertions.
+    assert_eq!(got_hashes, expected_hashes,
+        "executor's receipts must carry the proxy-populated tx_hash byte-for-byte (S0 D-Sh4)");
+    let b = got_boundary.expect("never observed the BlockBoundary on channel C");
+    assert_eq!(b.block_number, 1);
+    assert_eq!(b.end_tx_idx, BPosition { term_id: 0, term_offset: (N as i32) - 1 });
+    assert_eq!(b.l2_timestamp, 1_700_000_000);
+    // S0 D-Sh11: BlockBoundary has exactly three fields (compile-time evidence).
+    // The struct destructure below will fail to compile if a state-root field
+    // is re-added — keeping a regression guard at the e2e layer too.
+    let BlockBoundary { block_number: _, end_tx_idx: _, l2_timestamp: _ } = b;
+
+    // 8. Clean shutdown of the executor (B publisher dropped => B subscription
+    // EOF => exec loop returns Ok).
+    drop(b_pub);
+    exec_handle.join().expect("no exec panic").expect("exec ok");
+
+    // 9. Harness teardown is RAII via Drop on `AeronTestHarness`.
+}
+```
+
+- [ ] **Step 2: Run the test (requires Docker)**
+
+```bash
+docker info > /dev/null 2>&1 && cargo test -p kardamom-executor --test docker_aeron_e2e -- --nocapture
+```
+
+Expected: pass when Docker is available. The test self-skips with a printed note when Docker is not available, so it does not break local dev on machines without Docker.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/kardamom-executor/tests/docker_aeron_e2e.rs
+git commit -m "executor(e2e): real-Aeron Docker test via S3 testcontainers harness"
+```
+
+---
+
+## Task 20: Workspace test sweep + plan close-out
 
 **Files:** none.
 
@@ -3061,7 +3330,7 @@ If `git status` is clean, skip this step.
 
 ## Open questions (resolve before S4 v1)
 
-1. **State root v1: full MPT vs. incremental commitment.** v0 ships delta-hash. For v1 we need either an MPT alongside libmdbx (large engineering) or an incremental commitment scheme (verkle, sparse-merkle on flat storage). Spike before S4 v1 starts.
+1. **State root: validator subsystem.** v0 does **not** compute a state root anywhere (S0 D-Sh11). The future state-root attestation lives in a separate validator subsystem; spec it out as a follow-up.
 2. **revm-38 `CacheDB` write extraction API.** Task 8's `diff_cache` relies on `entry.account_state.is_touched()` / `entry.storage.<slot>.present_value()`; the actual revm-38 names may differ. Implementer must consult the rustdoc and adjust. If revm doesn't expose touched-bit information at all, replace with a snapshot-vs-cache diff (slower but unambiguous) — document the choice in the commit.
 3. **Snapshot-swap latency budget.** Spec §5 quotes "microseconds" for opening a new mdbx read-txn, but we have not measured it. Once S6 (libmdbx) lands, add a microbenchmark for the swap (open + drop) and confirm it stays inside the 250 ms inter-block window's slack budget.
 
@@ -3069,7 +3338,7 @@ If `git status` is clean, skip this step.
 
 ## Plan summary
 
-- **Tasks:** 19 (skeleton → types → state → error → hashing → invariance property → block env → per-tx step → actor skeleton → reader → exec → commit → re-exports → integration replay → determinism → diff vs naive revm → divergence-doc → criterion bench → workspace sweep).
-- **Files created/modified:** 1 new crate, 8 src files, 4 tests/, 1 bench, 1 Cargo.toml.
+- **Tasks:** 20 (skeleton → types → state → error → hashing → invariance property → block env → per-tx step → actor skeleton → reader → exec → commit → re-exports → integration replay → determinism → diff vs naive revm → divergence-doc → criterion bench → Docker real-Aeron e2e → workspace sweep).
+- **Files created/modified:** 1 new crate, 8 src files, 4 tests/ (including the real-Aeron Docker e2e), 1 bench, 1 Cargo.toml.
 - **No code outside `crates/kardamom-executor/` is touched.** `crates/node/src/executor.rs` stays as the in-process RPC node's executor until a later integration spec wires the new executor in.
 - **Block-STM remains out of scope for v0.** S4 v1 (separate spec + plan) will replace `spawn_exec`'s single-threaded body with parallel Block-STM workers behind the same `ChannelBSubscription` / `ChannelCPublication` / `SnapshotSource` traits — no other component should require changes.

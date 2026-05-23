@@ -4,7 +4,11 @@
 
 **Goal:** Stand up the stateless ingress proxy crate that terminates client connections (JSON-RPC + binary line protocol), batches sig verification, partitions traffic into `ingress[keccak(sender) % M]`, parks responses until the quorum fsync watermark and a matching receipt both arrive, and answers retries from a shared receipt cache.
 
-**Architecture:** New `crates/kardamom-ingress` crate. A single `IngressProxy` struct wires together (a) `jsonrpsee` HTTP+WS server and an optional length-prefixed RLP TCP/UDS listener, (b) per-IP `governor`-backed token-bucket rate limit run before any expensive work, (c) a 64-deep batched `secp256k1` recovery ring with a 50µs flush timer (and a single-sig fallback), (d) an Aeron-publication router keyed on `keccak(sender) % M`, (e) a `pending-receipts` `DashMap<(Address, u64), oneshot::Sender<ReceiptResponse>>` plus a receipt-cache subscriber for idempotent retries, and (f) a watermark watcher that gates response release. All Aeron handles and shared types (`BPosition`, `TxEnvelope` re-export, `Receipt`, `BlockBoundary`, `QuorumWatermark`) are imported from the future `kardamom-log` crate — this plan does **not** redefine them; it stubs them behind a `kardamom_log::testing::MockAeronChannel` trait until S3 lands. Stateless w.r.t. canonical truth — adding or removing a proxy is safe.
+**Architecture:** New `crates/kardamom-ingress` crate. A single `IngressProxy` struct wires together (a) `jsonrpsee` HTTP+WS server and an optional length-prefixed RLP TCP/UDS listener, (b) per-IP `governor`-backed token-bucket rate limit run before any expensive work, (c) a 64-deep batched `secp256k1` recovery ring with a 50µs flush timer (and a single-sig fallback), (d) an Aeron-publication router keyed on `keccak(sender) % M`, (e) a `pending-receipts` `DashMap<(Address, u64), oneshot::Sender<ReceiptResponse>>` plus a receipt-cache subscriber for idempotent retries, and (f) a watermark watcher that gates response release. All Aeron handles and shared types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`, `QuorumWatermark`, `CachedReceipt`) are imported from the `kardamom-types` crate (per S0 D-Sh1), with channel implementations from `kardamom-log` — this plan does **not** redefine them; it stubs them behind a `kardamom_log::testing::MockAeronChannel` trait until S3 lands. Stateless w.r.t. canonical truth — adding or removing a proxy is safe.
+
+**Per S0 D-Sh3 (sender) and D-Sh4 (tx_hash) — the proxy is the *only* place these two fields are computed.** Both are produced together at the sig-verify boundary: secp256k1 recovers `sender: Address` and a single keccak256 pass over `raw_tx` produces `tx_hash: B256`. Both are written into `TxEnvelope.sender` (typed `Address`, **never `Option`**) and `TxEnvelope.tx_hash` (typed `B256`, always populated) before publication onto `ingress[i]`. If recovery fails, the tx is rejected at the RPC boundary (JSON-RPC `-32602` invalid params via `IngressError::SignatureInvalid`) *before* publishing — downstream consumers may trust both fields unconditionally. The receipt produced by S4 propagates `tx_hash` unchanged into `Receipt.tx_hash`, and S6 maintains a `tx_hash_index: tx_hash → BPosition` libmdbx table that the proxy queries from `eth_getTransactionReceipt(hash)`.
+
+**Per S0 D-Sh2 — wire codec is `rkyv` v0.8 (not `bincode`, not `serde`).** All shared types in `kardamom-types` derive `rkyv::Archive, rkyv::Serialize, rkyv::Deserialize`. On the consumer side, the proxy reads `Archived<Receipt>` and `Archived<CachedReceipt>` zero-copy from channel C / receipt-cache Aeron buffers via helpers exposed by `kardamom-log`; we only materialize to owned `T` when handing back to a client. Same applies to `Archived<QuorumWatermark>` on the watermark stream.
 
 **Tech Stack:** Rust 2024 edition, `jsonrpsee = 0.26` (HTTP + WS), `tokio = 1` (multi-thread runtime, `time::interval`, `sync::oneshot`, `net::TcpListener`, `net::UnixListener`), `alloy-consensus = 2.0` (`TxEnvelope`, `SignableTransaction`, `secp256k1` feature for batched recovery), `alloy-primitives = 1.6` (`Address`, `keccak256`, `B256`), `alloy-rlp = 0.3` (length-prefixed binary frame decode), `secp256k1 = 0.31` (batched `ecdsa::RecoverableSignature::recover` — fastest CPU recovery library; `k256` was rejected as ~2x slower per recovery in our context), `governor = 0.10` (lock-free token bucket; `direct::RateLimiter<NotKeyed>` per-IP via DashMap), `dashmap = 6` (pending-receipts shard map), `bytes = 1`, `thiserror = 2`, `tracing = 0.1`, `metrics = 0.24`, `criterion = 0.7` (benches), `proptest = 1` (sig-verify equivalence).
 
@@ -356,11 +360,20 @@ This module stands in for the `kardamom-log` crate (S3). Once S3 lands, swap `us
 - [ ] **Step 1: Write the module**
 
 ```rust
-//! Temporary stand-in for the future `kardamom-log` crate (S3).
+//! Temporary stand-in for the future `kardamom-types` + `kardamom-log` crates (S3).
 //!
 //! All real proxies, tests, and benches in this crate consume these traits/types;
-//! once S3 lands the import path swaps from `crate::log_stub` to `kardamom_log`.
-//! No semantic changes should be required.
+//! once S3 lands the import path swaps to `kardamom_types` for the data types
+//! (`BPosition`, `TxEnvelope`, `Receipt`, `CachedReceipt`, `BlockBoundary`,
+//! `QuorumWatermark`) and `kardamom_log` for the channel impls. No semantic
+//! changes should be required.
+//!
+//! **Per S0 D-Sh2:** real wire types derive `rkyv::Archive, rkyv::Serialize,
+//! rkyv::Deserialize` and are read zero-copy as `Archived<T>` from Aeron buffers.
+//! This stub omits the derives (no Aeron, no zero-copy needed for the mock); the
+//! call sites that read messages are written against owned `T` so the swap is
+//! mechanical — replace `T` with `&Archived<T>` and add a single materialization
+//! step where the proxy returns to a client.
 //!
 //! Gated on `feature = "log-stub"` (default on); when S3 lands the gate flips off
 //! and this module compiles to nothing.
@@ -405,10 +418,17 @@ pub struct QuorumWatermark {
 }
 
 /// Message published by the proxy onto an `ingress[i]` Aeron channel.
+///
+/// Stand-in for `kardamom_types::TxEnvelope`. Per S0 D-Sh1/D-Sh3/D-Sh4, both
+/// `sender: Address` (typed, never `Option`) and `tx_hash: B256` are populated
+/// by the proxy at sig-verify time. Downstream consumers trust both fields
+/// unconditionally. Once `kardamom-types` lands these derive
+/// `rkyv::{Archive, Serialize, Deserialize}` per S0 D-Sh2.
 #[derive(Debug, Clone)]
 pub struct IngressMsg {
     pub correlation_id: u128,
     pub sender: Address,
+    pub tx_hash: B256,
     pub nonce: u64,
     pub raw_tx: Bytes,
 }
@@ -438,6 +458,57 @@ pub trait IngressSubscription: Send + Sync + 'static {
     fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
     fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt>;
+    /// Per S0 D-Sh5: channel-C BlockBoundary stream so the proxy can serve
+    /// `eth_blockNumber` from the highest seen `block_number`.
+    fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary>;
+}
+
+/// Per S0 D-Sh1 + D-Sh4: read-only state DB the proxy queries to serve
+/// `eth_getTransactionReceipt(hash)`. The real impl is provided by S6
+/// (`crates/kardamom-state-writer`), backed by libmdbx with a `tx_hash_index`
+/// table populated on block commit. v0 + tests use the `InMemoryStateDb`
+/// implementation below.
+///
+/// Note: the real trait lives in `kardamom-types` and exposes the broader
+/// `revm::Database` surface plus snapshot semantics; the proxy only needs the
+/// two read paths declared here.
+pub trait StateDatabase: Send + Sync + 'static {
+    /// `tx_hash_index` lookup. Returns `None` if the tx hasn't been committed.
+    fn get_tx_position(&self, tx_hash: alloy_primitives::B256) -> Option<BPosition>;
+    /// Receipt store, keyed by canonical B-position. Returns `None` if not committed.
+    fn get_receipt(&self, position: BPosition) -> Option<Receipt>;
+}
+
+/// In-memory `StateDatabase` for unit tests, integration tests, and the proxy
+/// v0 default until S6 lands. Behind the same trait as the real libmdbx impl
+/// so the swap is mechanical.
+#[derive(Default, Clone)]
+pub struct InMemoryStateDb {
+    pub tx_hash_index: Arc<std::sync::RwLock<std::collections::HashMap<alloy_primitives::B256, BPosition>>>,
+    pub receipts: Arc<std::sync::RwLock<std::collections::HashMap<BPosition, Receipt>>>,
+}
+
+impl InMemoryStateDb {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, tx_hash: alloy_primitives::B256, position: BPosition, receipt: Receipt) {
+        self.tx_hash_index
+            .write()
+            .unwrap()
+            .insert(tx_hash, position);
+        self.receipts.write().unwrap().insert(position, receipt);
+    }
+}
+
+impl StateDatabase for InMemoryStateDb {
+    fn get_tx_position(&self, tx_hash: alloy_primitives::B256) -> Option<BPosition> {
+        self.tx_hash_index.read().unwrap().get(&tx_hash).copied()
+    }
+    fn get_receipt(&self, position: BPosition) -> Option<Receipt> {
+        self.receipts.read().unwrap().get(&position).cloned()
+    }
 }
 
 /// In-process mock of the future Aeron channels. Used in all `tests/` integration
@@ -448,6 +519,7 @@ pub struct MockAeronChannel {
     pub receipt_bus: broadcast::Sender<Receipt>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub receipt_cache_bus: broadcast::Sender<CachedReceipt>,
+    pub block_boundary_bus: broadcast::Sender<BlockBoundary>,
     pub published_cache: Arc<Mutex<Vec<CachedReceipt>>>,
 }
 
@@ -463,12 +535,14 @@ impl MockAeronChannel {
         let (receipt_bus, _) = broadcast::channel(1024);
         let (watermark_bus, _) = broadcast::channel(1024);
         let (receipt_cache_bus, _) = broadcast::channel(1024);
+        let (block_boundary_bus, _) = broadcast::channel(1024);
         (
             Self {
                 ingress_tx: tx_vec,
                 receipt_bus,
                 watermark_bus,
                 receipt_cache_bus,
+                block_boundary_bus,
                 published_cache: Arc::new(Mutex::new(Vec::new())),
             },
             rx_vec,
@@ -503,6 +577,9 @@ impl IngressSubscription for MockAeronChannel {
     fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt> {
         self.receipt_cache_bus.subscribe()
     }
+    fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary> {
+        self.block_boundary_bus.subscribe()
+    }
 }
 
 #[cfg(test)]
@@ -515,6 +592,7 @@ mod tests {
         let msg = IngressMsg {
             correlation_id: 1,
             sender: Address::ZERO,
+            tx_hash: B256::ZERO,
             nonce: 0,
             raw_tx: Bytes::new(),
         };
@@ -736,10 +814,16 @@ git commit -m "ingress: add PerIpLimiter (governor token bucket)"
 
 The single-sig path is the reference: `BatchVerifier` in Task 8 must produce equivalent results.
 
+**Per S0 D-Sh3 + D-Sh4:** both functions return `(Address, B256)` — the recovered sender *and* the canonical `tx_hash = keccak256(raw_tx)`. The keccak pass is essentially free alongside ECDSA recovery, and producing both at the system boundary lets every downstream consumer trust `TxEnvelope.{sender, tx_hash}` unconditionally. Failure to recover ⇒ reject at the RPC boundary (caller returns `IngressError::SignatureInvalid`, which maps to JSON-RPC `-32602`) *before* any publish happens.
+
 - [ ] **Step 1: Write the failing test**
 
 ```rust
-//! secp256k1 ECDSA recovery for transaction sender addresses.
+//! secp256k1 ECDSA recovery for transaction sender addresses + canonical tx_hash.
+//!
+//! Per S0 D-Sh3/D-Sh4: the proxy is the *only* component that computes either
+//! field. Both are produced together (recovery + keccak256 over raw_tx) so
+//! downstream consumers may trust `TxEnvelope.{sender, tx_hash}` unconditionally.
 //!
 //! Two paths:
 //! - `recover_single`: minimal, used when no batching is active or as the
@@ -747,14 +831,22 @@ The single-sig path is the reference: `BatchVerifier` in Task 8 must produce equ
 //! - `BatchVerifier`: 64-deep ring + 50µs flush window (Task 8).
 
 use alloy_consensus::TxEnvelope;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256, Bytes, keccak256};
 
 use crate::error::IngressError;
 
-/// Recover the sender address from a fully-decoded `TxEnvelope`.
-pub fn recover_single(env: &TxEnvelope) -> Result<Address, IngressError> {
-    env.recover_signer()
-        .map_err(|_| IngressError::SignatureInvalid)
+/// Recover the sender address from a fully-decoded `TxEnvelope` and compute
+/// the canonical `tx_hash = keccak256(raw_tx)` in the same pass.
+///
+/// Returns `(sender, tx_hash)`. On recovery failure, returns
+/// `IngressError::SignatureInvalid` — callers MUST reject the tx at the RPC
+/// boundary before publishing.
+pub fn recover_single(env: &TxEnvelope, raw_tx: &Bytes) -> Result<(Address, B256), IngressError> {
+    let sender = env
+        .recover_signer()
+        .map_err(|_| IngressError::SignatureInvalid)?;
+    let tx_hash = keccak256(raw_tx.as_ref());
+    Ok((sender, tx_hash))
 }
 
 #[cfg(test)]
@@ -762,9 +854,10 @@ mod tests {
     use super::*;
     use alloy_consensus::{SignableTransaction, TxLegacy};
     use alloy_primitives::{TxKind, U256};
+    use alloy_rlp::Encodable;
     use alloy_signer_local::PrivateKeySigner;
 
-    fn signed_legacy_envelope() -> (TxEnvelope, Address) {
+    pub(super) fn signed_legacy_envelope() -> (TxEnvelope, Bytes, Address) {
         let signer = PrivateKeySigner::random();
         let addr = signer.address();
         let tx = TxLegacy {
@@ -782,14 +875,19 @@ mod tests {
             .unwrap();
         let alloy_sig = alloy_primitives::Signature::from_signature_and_parity(sig, false);
         let signed = tx.into_signed(alloy_sig);
-        (signed.into(), addr)
+        let env: TxEnvelope = signed.into();
+        let mut buf = Vec::new();
+        env.encode(&mut buf);
+        (env, Bytes::from(buf), addr)
     }
 
     #[test]
-    fn recovers_legacy_sender() {
-        let (env, expected) = signed_legacy_envelope();
-        let recovered = recover_single(&env).unwrap();
+    fn recovers_legacy_sender_and_hash() {
+        let (env, raw, expected) = signed_legacy_envelope();
+        let (recovered, tx_hash) = recover_single(&env, &raw).unwrap();
         assert_eq!(recovered, expected);
+        // tx_hash MUST equal keccak256(raw_tx) — the canonical hash defined by S0 D-Sh4.
+        assert_eq!(tx_hash, keccak256(raw.as_ref()));
     }
 }
 ```
@@ -798,7 +896,7 @@ mod tests {
 
 ```bash
 cd /home/dev/kardamom
-cargo test -p kardamom-ingress sig_verify::tests::recovers_legacy_sender
+cargo test -p kardamom-ingress sig_verify::tests::recovers_legacy_sender_and_hash
 ```
 
 Expected: PASS. (If the parity bit / chain id derivation needs tweaking for the legacy signer, adjust `from_signature_and_parity` per the alloy 2.0 API. The key invariant: `recover_single` must return the same address as the signer used to sign.)
@@ -835,13 +933,19 @@ use tokio::time::Instant;
 /// A request submitted to `BatchVerifier::recover`.
 struct VerifyRequest {
     env: TxEnvelope,
-    respond: oneshot::Sender<Result<Address, IngressError>>,
+    raw_tx: Bytes,
+    respond: oneshot::Sender<Result<(Address, B256), IngressError>>,
 }
 
 /// 64-deep recovery ring with a 50µs flush window.
 ///
 /// Submitted requests park on a oneshot until the ring is flushed: either
 /// because depth is reached, or because the flush timer fires.
+///
+/// Per S0 D-Sh3 + D-Sh4: each `recover` call returns `(sender, tx_hash)`. The
+/// keccak256 over `raw_tx` is computed alongside ECDSA recovery in the same
+/// batch slot (essentially free vs. the ECDSA cost). Failure ⇒ caller rejects
+/// at the RPC boundary.
 pub struct BatchVerifier {
     inner: Arc<Mutex<Vec<VerifyRequest>>>,
     notify: Arc<Notify>,
@@ -880,19 +984,27 @@ impl BatchVerifier {
 
     fn process_batch(batch: Vec<VerifyRequest>) {
         for req in batch {
-            // Per-tx recovery; the "batch" amortizes wakeups, not math.
-            let res = recover_single(&req.env);
+            // Per-tx recovery + keccak; the "batch" amortizes wakeups, not math.
+            let res = recover_single(&req.env, &req.raw_tx);
             let _ = req.respond.send(res);
         }
     }
 
-    /// Submit a tx envelope and await its recovered sender. Flushes immediately
-    /// if the ring fills.
-    pub async fn recover(&self, env: TxEnvelope) -> Result<Address, IngressError> {
+    /// Submit a tx envelope (plus its raw bytes) and await `(sender, tx_hash)`.
+    /// Flushes immediately if the ring fills.
+    pub async fn recover(
+        &self,
+        env: TxEnvelope,
+        raw_tx: Bytes,
+    ) -> Result<(Address, B256), IngressError> {
         let (tx, rx) = oneshot::channel();
         let should_flush_now = {
             let mut g = self.inner.lock().await;
-            g.push(VerifyRequest { env, respond: tx });
+            g.push(VerifyRequest {
+                env,
+                raw_tx,
+                respond: tx,
+            });
             g.len() >= self.depth
         };
         if should_flush_now {
@@ -920,9 +1032,10 @@ mod batch_tests {
         let mut futs = Vec::new();
         let mut expected = Vec::new();
         for _ in 0..100 {
-            let (env, addr) = signed_legacy_envelope();
-            expected.push(addr);
-            futs.push(v.recover(env));
+            let (env, raw, addr) = signed_legacy_envelope();
+            let expected_hash = keccak256(raw.as_ref());
+            expected.push((addr, expected_hash));
+            futs.push(v.recover(env, raw));
         }
         let actual = futures::future::join_all(futs).await;
         for (i, res) in actual.into_iter().enumerate() {
@@ -935,8 +1048,8 @@ mod batch_tests {
         let v = BatchVerifier::new(8, Duration::from_secs(60));
         let mut futs = Vec::new();
         for _ in 0..8 {
-            let (env, _) = signed_legacy_envelope();
-            futs.push(v.recover(env));
+            let (env, raw, _) = signed_legacy_envelope();
+            futs.push(v.recover(env, raw));
         }
         let start = Instant::now();
         let _ = futures::future::join_all(futs).await;
@@ -982,16 +1095,18 @@ git commit -m "ingress: add BatchVerifier (64-deep ring + 50us flush)"
 
 ```rust
 //! Property: for any signed legacy/eip1559 tx, BatchVerifier::recover and
-//! recover_single agree on the sender address.
+//! recover_single agree on `(sender, tx_hash)` — the canonical pair produced
+//! by the proxy at the system boundary per S0 D-Sh3/D-Sh4.
 
 use std::time::Duration;
 
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
-use alloy_primitives::{Address, TxKind, U256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
+use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use kardamom_ingress::sig_verify::{BatchVerifier, recover_single};
 
-fn sign_random_legacy() -> (TxEnvelope, Address) {
+fn sign_random_legacy() -> (TxEnvelope, Bytes, Address) {
     let signer = PrivateKeySigner::random();
     let addr = signer.address();
     let tx = TxLegacy {
@@ -1009,31 +1124,36 @@ fn sign_random_legacy() -> (TxEnvelope, Address) {
         .unwrap();
     let alloy_sig = alloy_primitives::Signature::from_signature_and_parity(sig, false);
     let signed = tx.into_signed(alloy_sig);
-    (signed.into(), addr)
+    let env: TxEnvelope = signed.into();
+    let mut buf = Vec::new();
+    env.encode(&mut buf);
+    (env, Bytes::from(buf), addr)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batched_matches_single_on_1000_txs() {
     let v = BatchVerifier::new(64, Duration::from_micros(50));
-    let mut single_results = Vec::new();
+    let mut single_results: Vec<(Address, B256)> = Vec::new();
     let mut batched_futs = Vec::new();
     let mut expected = Vec::new();
 
     for _ in 0..1000 {
-        let (env, addr) = sign_random_legacy();
+        let (env, raw, addr) = sign_random_legacy();
         expected.push(addr);
-        single_results.push(recover_single(&env).unwrap());
-        batched_futs.push(v.recover(env));
+        single_results.push(recover_single(&env, &raw).unwrap());
+        batched_futs.push(v.recover(env, raw));
     }
 
-    let batched_results: Vec<Address> = futures::future::join_all(batched_futs)
+    let batched_results: Vec<(Address, B256)> = futures::future::join_all(batched_futs)
         .await
         .into_iter()
         .map(|r| r.unwrap())
         .collect();
 
     assert_eq!(batched_results, single_results);
-    assert_eq!(batched_results, expected);
+    for (i, (addr, _)) in batched_results.iter().enumerate() {
+        assert_eq!(*addr, expected[i]);
+    }
 }
 ```
 
@@ -1474,7 +1594,8 @@ use tokio::sync::broadcast;
 use crate::config::IngressConfig;
 use crate::error::IngressError;
 use crate::log_stub::{
-    BPosition, CachedReceipt, IngressMsg, IngressPublication, IngressSubscription, Receipt,
+    BPosition, BlockBoundary, CachedReceipt, IngressMsg, IngressPublication, IngressSubscription,
+    Receipt, StateDatabase,
 };
 use crate::pending::{PendingReceipts, ReceiptResponse};
 use crate::rate_limit::PerIpLimiter;
@@ -1498,6 +1619,15 @@ pub struct IngressProxy<P: IngressPublication + Clone, S: IngressSubscription + 
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
+    /// Per S0 D-Sh5: highest `BlockBoundary.block_number` seen on channel C.
+    /// Read by `eth_blockNumber`. AtomicU64 is plenty — monotonic, single-writer
+    /// (the BlockBoundary watcher), many readers.
+    pub(crate) latest_block_number: Arc<AtomicU64>,
+    /// Per S0 D-Sh4: state-DB handle for `eth_getTransactionReceipt(hash)` via
+    /// `get_tx_position(tx_hash)` → `get_receipt(position)`. S6 owns the
+    /// `tx_hash_index` libmdbx table. v0 + tests use an in-memory impl behind
+    /// the `StateDatabase` trait from `kardamom-types`.
+    pub(crate) state_db: Arc<dyn StateDatabase>,
 }
 
 impl<P, S> IngressProxy<P, S>
@@ -1505,7 +1635,12 @@ where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    pub fn new(cfg: IngressConfig, publication: P, subscription: S) -> Self {
+    pub fn new(
+        cfg: IngressConfig,
+        publication: P,
+        subscription: S,
+        state_db: Arc<dyn StateDatabase>,
+    ) -> Self {
         let rate_limiter = Arc::new(PerIpLimiter::new(
             cfg.rate_limit_per_ip_per_sec,
             cfg.rate_limit_burst,
@@ -1526,10 +1661,48 @@ where
             publication,
             subscription,
             correlation_seq: Arc::new(AtomicU64::new(0)),
+            latest_block_number: Arc::new(AtomicU64::new(0)),
+            state_db,
         };
         me.spawn_receipt_watcher();
         me.spawn_watermark_watcher();
+        me.spawn_block_boundary_watcher();
         me
+    }
+
+    /// Highest `BlockBoundary.block_number` the proxy has observed on channel C.
+    /// Backing field for `eth_blockNumber` per S0 D-Sh5.
+    #[inline]
+    pub fn latest_block_number(&self) -> u64 {
+        self.latest_block_number.load(Ordering::Acquire)
+    }
+
+    /// Lookup a receipt by `tx_hash` via the state-DB `tx_hash_index` table per
+    /// S0 D-Sh4. Returns `None` if the tx has not yet been committed.
+    pub fn lookup_receipt_by_hash(
+        &self,
+        tx_hash: alloy_primitives::B256,
+    ) -> Option<Receipt> {
+        let pos = self.state_db.get_tx_position(tx_hash)?;
+        self.state_db.get_receipt(pos)
+    }
+
+    fn spawn_block_boundary_watcher(&self) {
+        let mut rx: broadcast::Receiver<BlockBoundary> =
+            self.subscription.subscribe_block_boundaries();
+        let latest = self.latest_block_number.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(b) => {
+                        // Monotonic: never go backwards. fetch_max is portable and lock-free.
+                        latest.fetch_max(b.block_number, Ordering::AcqRel);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
     }
 
     fn spawn_receipt_watcher(&self) {
@@ -1601,8 +1774,11 @@ where
             TxEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| IngressError::Decode(e.to_string()))?;
         let nonce = alloy_consensus::Transaction::nonce(&env);
 
-        // 3. Batched sig verify.
-        let sender = self.verifier.recover(env.clone()).await?;
+        // 3. Batched sig verify — produces (sender, tx_hash) together.
+        //    Per S0 D-Sh3 + D-Sh4 the proxy is the *only* place either field is
+        //    computed. Failure here returns IngressError::SignatureInvalid,
+        //    which the RPC layer maps to -32602 BEFORE we publish to Aeron.
+        let (sender, tx_hash) = self.verifier.recover(env.clone(), raw_tx.clone()).await?;
 
         // 4. Cache lookup — idempotent retry?
         if let Some(prev) = self.cache.lookup(sender, nonce) {
@@ -1612,7 +1788,9 @@ where
         // 5. Park before publishing to avoid receipt races.
         let wait = self.pending.register(sender, nonce);
 
-        // 6. Publish to partition.
+        // 6. Publish to partition. IngressMsg carries the canonical tx_hash so
+        //    the executor copies it straight into Receipt.tx_hash (S0 D-Sh4 —
+        //    no recomputation downstream).
         let partition = partition_for(sender, self.cfg.partition_count_m) as usize;
         let correlation_id = self.correlation_seq.fetch_add(1, Ordering::Relaxed) as u128;
         self.publication
@@ -1621,6 +1799,7 @@ where
                 IngressMsg {
                     correlation_id,
                     sender,
+                    tx_hash,
                     nonce,
                     raw_tx,
                 },
@@ -1861,10 +2040,11 @@ where
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        // In v0, the proxy does not maintain a block-number view; this returns
-        // a sentinel U256::ZERO. S5 (sealer) will publish a block-height stream
-        // the proxy subscribes to here.
-        Ok(U256::ZERO)
+        // Per S0 D-Sh5: subscribe to channel C, track the highest
+        // BlockBoundary.block_number seen, serve it here. The proxy's
+        // channel-C watcher (spawned in `IngressProxy::new`) maintains
+        // `latest_block_number: AtomicU64`. Reads are lock-free.
+        Ok(U256::from(self.proxy.latest_block_number()))
     }
 
     async fn balance(&self, _addr: Address, _block: BlockNumberOrTag) -> RpcResult<U256> {
@@ -1891,11 +2071,32 @@ where
         Ok(res.receipt.tx_hash)
     }
 
-    async fn transaction_receipt(&self, _hash: B256) -> RpcResult<Option<TransactionReceipt>> {
-        // V0: receipts are returned synchronously from sendRawTransaction. A
-        // separate by-hash lookup requires the cache to be keyed by tx_hash
-        // as well, deferred to a follow-up.
-        Ok(None)
+    async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
+        // Per S0 D-Sh4: look up via the state-DB `tx_hash_index` table.
+        // S6 owns the table and populates it during block commit. v0 + tests
+        // use the in-memory `StateDatabase` impl; the real proxy gets the
+        // libmdbx-backed impl once S6 lands. Returns `null` (JSON-RPC
+        // convention) if the tx has not yet been committed.
+        Ok(self
+            .proxy
+            .lookup_receipt_by_hash(hash)
+            .map(receipt_to_rpc))
+    }
+}
+
+/// Adapter from our internal `Receipt` to alloy's `TransactionReceipt`. The
+/// internal type carries the canonical B-position and `write_set_hash` that the
+/// public Eth API does not need; this drops them.
+fn receipt_to_rpc(r: crate::log_stub::Receipt) -> TransactionReceipt {
+    // Real implementation populates block_number / block_hash / from / to /
+    // transaction_index from accompanying state-DB tables; v0 fills the bare
+    // minimum and leaves the rest at default. This is wire-shape only — the
+    // calling test asserts presence of the receipt, not field-by-field equality.
+    TransactionReceipt {
+        transaction_hash: r.tx_hash,
+        status: r.status,
+        gas_used: r.gas_used,
+        ..Default::default()
     }
 }
 
@@ -1934,7 +2135,8 @@ mod tests {
             ..IngressConfig::default()
         };
         let (mock, _rx) = MockAeronChannel::new(8);
-        let proxy = IngressProxy::new(cfg.clone(), mock.clone(), mock);
+        let state_db = Arc::new(crate::log_stub::InMemoryStateDb::new());
+        let proxy = IngressProxy::new(cfg.clone(), mock.clone(), mock, state_db);
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let handle = start_jsonrpc_server(proxy, bind).await.unwrap();
         let addr = handle.local_addr().unwrap();
@@ -2004,7 +2206,8 @@ async fn rate_limit_rejects_after_burst() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockAeronChannel::new(8);
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+    let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let handle = start_jsonrpc_server(proxy, bind).await.unwrap();
     let addr = handle.local_addr().unwrap();
@@ -2324,7 +2527,8 @@ mod tests {
     async fn empty_rlp_returns_decode_error() {
         let cfg = IngressConfig::default();
         let (mock, _rx) = MockAeronChannel::new(8);
-        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+        let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2476,7 +2680,8 @@ async fn one_hundred_txs_route_and_receive_receipts() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockAeronChannel::new(m as usize);
-    let proxy = IngressProxy::new(cfg.clone(), mock.clone(), mock.clone());
+    let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg.clone(), mock.clone(), mock.clone(), state_db);
 
     // Spawn fake executor: pulls from each partition, emits a receipt-cache entry.
     let publication_for_exec = mock.clone();
@@ -2565,7 +2770,8 @@ async fn proxy_parks_until_watermark_advances() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockAeronChannel::new(2);
-    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+    let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
 
     // Fake executor that emits receipt-cache BEFORE advancing watermark.
     let pub_h = mock.clone();
@@ -2673,7 +2879,8 @@ async fn third_call_from_same_ip_is_rate_limited() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockAeronChannel::new(8);
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+    let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
 
     let ip = "10.0.0.7".parse().unwrap();
     let garbage = Bytes::from(vec![0xc0u8]);
@@ -2700,7 +2907,8 @@ async fn other_ips_unaffected_by_first_ips_throttle() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockAeronChannel::new(8);
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+    let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
     let garbage = Bytes::from(vec![0xc0u8]);
     let ip_a = "10.0.0.1".parse().unwrap();
     let ip_b = "10.0.0.2".parse().unwrap();
@@ -2787,7 +2995,8 @@ async fn each_tx_lands_on_keccak_partition() {
             ..IngressConfig::default()
         };
         let (mock, mut rx_vec) = MockAeronChannel::new(m as usize);
-        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+        let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
 
         // Side task: for each partition, on arrival, satisfy receipt+watermark.
         let pub_h = mock.clone();
@@ -2924,7 +3133,8 @@ async fn submit_times_out_when_no_executor_responds() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockAeronChannel::new(4);
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
+    let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
 
     let signer = PrivateKeySigner::random();
     let raw = sign_legacy(&signer, 0);
@@ -3012,7 +3222,8 @@ fn bench_e2e_latency(c: &mut Criterion) {
             ..IngressConfig::default()
         };
         let (mock, mut rx_vec) = MockAeronChannel::new(8);
-        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+        let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
         for (i, mut rx) in rx_vec.drain(..).enumerate() {
             let pub_h = mock.clone();
             let wm = mock.watermark_bus.clone();
@@ -3146,7 +3357,8 @@ fn bench_throughput(c: &mut Criterion) {
             ..IngressConfig::default()
         };
         let (mock, mut rx_vec) = MockAeronChannel::new(8);
-        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
+        let state_db = Arc::new(kardamom_ingress::log_stub::InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
         for (i, mut rx) in rx_vec.drain(..).enumerate() {
             let pub_h = mock.clone();
             let wm = mock.watermark_bus.clone();
@@ -3271,7 +3483,245 @@ fi
 
 ---
 
-## Task 24: Push branch and open PR
+## Task 24: E2E test against real Aeron in Docker
+
+**Per S0 D-Sh8:** mock-based integration tests are fine for component isolation, but every subsystem MUST also have an e2e test that runs against a real Aeron Media Driver + Aeron Archive in Docker, brought up via the `testcontainers` harness shipped from S3's `kardamom-log` crate (`kardamom_log::testing::docker`). This task adds that test for the ingress proxy.
+
+**Scope:** spin up real Aeron containers, wire the proxy at one end, a tiny in-process "sequencer mock" (just drains `ingress[*]` and emits matching `CachedReceipt` + `QuorumWatermark` + `BlockBoundary` onto channel C and the receipt-cache channel) at the other end, push 1k signed txs through the proxy's `submit_raw`, and assert every receipt is returned. The point is to exercise the real Aeron transport for messages — sig-verify, partition routing, watermark gating, and receipt-cache idempotence all run unchanged.
+
+**Files:**
+- Create: `crates/kardamom-ingress/tests/docker_e2e.rs`
+- Modify: `crates/kardamom-ingress/Cargo.toml` (gate the test on `feature = "docker-e2e"` to keep CI splits clean; default off)
+
+- [ ] **Step 1: Add the `docker-e2e` feature and `dev-dependencies`**
+
+In `crates/kardamom-ingress/Cargo.toml`:
+
+```toml
+[features]
+# ... existing ...
+# Enables the Docker-backed e2e test in tests/docker_e2e.rs. Off by default
+# so `cargo test -p kardamom-ingress` stays hermetic; CI's docker-e2e job
+# turns it on.
+docker-e2e = []
+
+[dev-dependencies]
+# ... existing ...
+# S3's kardamom-log ships the testcontainers harness; pull it in as a dev-dep
+# behind the docker-e2e feature so dev builds without docker stay fast.
+kardamom-log = { path = "../kardamom-log", features = ["testing", "docker"] }
+testcontainers = "0.20"
+```
+
+- [ ] **Step 2: Write the test**
+
+Create `crates/kardamom-ingress/tests/docker_e2e.rs`:
+
+```rust
+//! E2E test: real Aeron Media Driver + Aeron Archive in Docker, real ingress
+//! proxy, mock sequencer on the consumer side.
+//!
+//! Per S0 D-Sh8 — mock-based unit/integration tests in this crate stay; this
+//! is *additional* coverage that exercises the real Aeron transport so we
+//! catch wire-format, IPC, and back-pressure bugs the mocks can't surface.
+//!
+//! Gated on `feature = "docker-e2e"` because it requires a Docker daemon and
+//! ~30s startup; default `cargo test` skips it.
+
+#![cfg(feature = "docker-e2e")]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
+use alloy_primitives::{Address, Bytes, TxKind, U256};
+use alloy_rlp::Encodable;
+use alloy_signer_local::PrivateKeySigner;
+
+use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::log_stub::InMemoryStateDb;
+use kardamom_ingress::proxy::IngressProxy;
+
+// From S3's kardamom-log testcontainers harness (D-Sh8). Brings up
+// `aeron-media-driver` and `aeron-archive` containers, wires their UDP and
+// IPC endpoints, and hands back a connected `Aeron` client plus the channel
+// URIs the proxy needs.
+use kardamom_log::testing::docker::{AeronCluster, ChannelHandles};
+
+fn sign_legacy(signer: &PrivateKeySigner, nonce: u64) -> Bytes {
+    let tx = TxLegacy {
+        chain_id: Some(1),
+        nonce,
+        gas_price: 1_000_000_000,
+        gas_limit: 21_000,
+        to: TxKind::Call(Address::ZERO),
+        value: U256::ZERO,
+        input: Default::default(),
+    };
+    let sig = signer
+        .credential()
+        .sign_prehash_recoverable(&tx.signature_hash().0)
+        .unwrap();
+    let alloy_sig = alloy_primitives::Signature::from_signature_and_parity(sig, false);
+    let env: TxEnvelope = tx.into_signed(alloy_sig).into();
+    let mut buf = Vec::new();
+    env.encode(&mut buf);
+    Bytes::from(buf)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
+async fn proxy_e2e_real_aeron_1000_txs() {
+    // 1. Spin up real Aeron Media Driver + Archive in Docker. The harness
+    //    creates the standard channels (ingress[0..M], receipt-cache, channel C,
+    //    watermark) and returns Publication/Subscription handles wired to the
+    //    real Aeron client running against the containers.
+    let cluster = AeronCluster::start_default().await.expect("docker start");
+    let ChannelHandles {
+        publication,
+        subscription,
+        // The harness also exposes raw publication handles the test can use to
+        // emit fake sequencer output (receipts, boundaries, watermarks) on the
+        // appropriate Aeron channels.
+        executor_side,
+    } = cluster.channels(/* partitions = */ 8).await.unwrap();
+
+    let cfg = IngressConfig {
+        partition_count_m: 8,
+        pending_receipt_timeout: Duration::from_secs(15),
+        chain_id: 31337,
+        ..IngressConfig::default()
+    };
+    let state_db = Arc::new(InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(
+        cfg,
+        publication,
+        subscription,
+        state_db.clone(),
+    ));
+
+    // 2. Mock sequencer: drains each `ingress[i]` Aeron subscription and emits
+    //    a matching CachedReceipt + QuorumWatermark + BlockBoundary back onto
+    //    the corresponding Aeron channels via `executor_side`. This is the
+    //    smallest possible stand-in for S2/S4/S5 — just enough to close the
+    //    loop so the proxy's pending-receipts release path fires.
+    let exec = executor_side.clone();
+    let mock_sequencer = tokio::spawn(async move {
+        use kardamom_ingress::log_stub::{
+            BPosition, BlockBoundary, CachedReceipt, QuorumWatermark, Receipt,
+        };
+        let mut tx_idx_counter: u64 = 0;
+        let mut block_number: u64 = 0;
+        loop {
+            // Block on the next IngressMsg arriving on any partition.
+            let Some(msg) = exec.next_ingress().await else { break };
+            tx_idx_counter += 1;
+            let pos = BPosition {
+                term_id: 0,
+                term_offset: tx_idx_counter,
+            };
+            let receipt = Receipt {
+                tx_idx: tx_idx_counter,
+                b_position: pos,
+                status: true,
+                gas_used: 21_000,
+                logs: Vec::new(),
+                tx_hash: msg.tx_hash,
+            };
+            // Publish the receipt-cache entry — proxy's receipt watcher
+            // consumes this and releases the parked client.
+            exec.publish_receipt_cache(CachedReceipt {
+                sender: msg.sender,
+                nonce: msg.nonce,
+                receipt: receipt.clone(),
+            })
+            .await
+            .unwrap();
+            // Advance the quorum watermark past the tx's B-position so the
+            // proxy's watermark gate clears.
+            exec.publish_watermark(QuorumWatermark { position: pos })
+                .await
+                .unwrap();
+            // Emit a BlockBoundary every 100 txs so eth_blockNumber moves —
+            // proves D-Sh5 wiring against the real channel C.
+            if tx_idx_counter % 100 == 0 {
+                block_number += 1;
+                exec.publish_block_boundary(BlockBoundary {
+                    block_number,
+                    end_tx_idx: tx_idx_counter,
+                    l2_timestamp: 1_700_000_000 + block_number,
+                })
+                .await
+                .unwrap();
+            }
+        }
+    });
+
+    // 3. Push 1000 signed txs from distinct senders through the proxy. Real
+    //    bytes go over real Aeron channels; the proxy waits on real receipts
+    //    coming back over real channel C.
+    let mut signers = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        signers.push(PrivateKeySigner::random());
+    }
+    let mut futs = Vec::with_capacity(signers.len());
+    for s in &signers {
+        let raw = sign_legacy(s, 0);
+        let p = proxy.clone();
+        futs.push(async move {
+            p.submit_raw("127.0.0.1".parse().unwrap(), raw).await
+        });
+    }
+    let results = futures::future::join_all(futs).await;
+    let ok_count = results.iter().filter(|r| r.is_ok()).count();
+    assert_eq!(ok_count, 1000, "every tx must round-trip over real Aeron");
+
+    // 4. Wait briefly for the last BlockBoundary to be observed, then assert
+    //    `eth_blockNumber` reflects it (D-Sh5).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        proxy.latest_block_number() >= 10,
+        "BlockBoundary watcher should have observed at least 10 blocks; got {}",
+        proxy.latest_block_number()
+    );
+
+    // 5. Idempotent retry through real Aeron must hit the receipt cache.
+    let raw0 = sign_legacy(&signers[0], 0);
+    let again = proxy
+        .submit_raw("127.0.0.1".parse().unwrap(), raw0)
+        .await
+        .expect("retry");
+    assert!(again.receipt.status);
+
+    mock_sequencer.abort();
+    cluster.stop().await;
+}
+```
+
+- [ ] **Step 3: Run (locally with Docker)**
+
+```bash
+cd /home/dev/kardamom
+cargo test -p kardamom-ingress --features docker-e2e --test docker_e2e -- --ignored
+```
+
+Expected: container startup ~10–30s; the test then completes in <30s with all 1000 txs round-tripping. If the test times out, check `docker logs` on the `aeron-archive` container for back-pressure or channel-mismatch errors.
+
+- [ ] **Step 4: Wire CI**
+
+The S3 plan adds a `docker-e2e` GitHub Actions job that runs `cargo test --workspace --features docker-e2e -- --ignored`. This crate's test is picked up by that same job once committed; no per-crate workflow change needed.
+
+- [ ] **Step 5: Commit**
+
+```bash
+cd /home/dev/kardamom
+git add crates/kardamom-ingress/Cargo.toml crates/kardamom-ingress/tests/docker_e2e.rs
+git commit -m "ingress: e2e test against real Aeron in Docker (S0 D-Sh8)"
+```
+
+---
+
+## Task 25: Push branch and open PR
 
 **Files:** none (workflow)
 
@@ -3302,6 +3752,7 @@ gh pr create \
 - [ ] `cargo test -p kardamom-ingress --all-features` — every unit + integration test passes.
 - [ ] `cargo bench -p kardamom-ingress` — latency and throughput benches complete; numbers recorded below.
 - [ ] Manual: smoke-test against the mock harness, send 100 txs from distinct senders, assert each receives a receipt and that a retry hits the cache.
+- [ ] `cargo test -p kardamom-ingress --features docker-e2e --test docker_e2e -- --ignored` — Docker-backed e2e against real Aeron Media Driver + Archive passes (per S0 D-Sh8).
 
 EOF
 )"
@@ -3315,6 +3766,6 @@ Expected output: a GitHub PR URL ending in `/pull/N`.
 
 ## Self-review checklist (run after writing the plan)
 
-1. **Spec coverage:** §2.1 transports — Tasks 13–15. Rate limit — Tasks 6, 18. Batched sig verify — Tasks 7–9. Routing — Tasks 5, 19. Pending receipts + watermark — Tasks 10, 17, 20. Receipt cache — Tasks 11, 17. Failure §4.1 (idempotent retry) — Task 17. V0 deferrals (`getBalance`, `getTransactionCount`) — Task 13 returns explicit errors. Latency budget §3 — Task 21.
+1. **Spec coverage:** §2.1 transports — Tasks 13–15. Rate limit — Tasks 6, 18. Batched sig verify — Tasks 7–9. Routing — Tasks 5, 19. Pending receipts + watermark — Tasks 10, 17, 20. Receipt cache — Tasks 11, 17. Failure §4.1 (idempotent retry) — Task 17. V0 deferrals (`getBalance`, `getTransactionCount`) — Task 13 returns explicit errors. Latency budget §3 — Task 21. S0 D-Sh3/D-Sh4 (typed `sender` + `tx_hash`) — Tasks 7–9, 12. S0 D-Sh5 (`eth_blockNumber` from channel C) — Task 12 BlockBoundary watcher + Task 13 handler. S0 D-Sh4 (`eth_getTransactionReceipt` via state-DB) — Task 13 handler. S0 D-Sh2 (rkyv codec) — log_stub header note + future swap to `kardamom-types`. S0 D-Sh8 (Docker e2e) — Task 24.
 2. **Placeholder scan:** none of "TBD / TODO / implement later" — every step shows code.
-3. **Type consistency:** `IngressMsg`, `Receipt`, `BPosition`, `QuorumWatermark`, `CachedReceipt` are defined once in `log_stub.rs` and used identically across `proxy.rs`, tests, and benches. `partition_for(Address, u32) -> u32` is consistent. `PendingReceipts::on_receipt(Address, Receipt)` and `update_watermark(QuorumWatermark)` match between unit tests and the proxy watcher.
+3. **Type consistency:** `IngressMsg` (with typed `sender: Address` and `tx_hash: B256`, never `Option` — S0 D-Sh3/D-Sh4), `Receipt`, `BPosition`, `QuorumWatermark`, `CachedReceipt`, `BlockBoundary`, `StateDatabase`, `InMemoryStateDb` are defined once in `log_stub.rs` and used identically across `proxy.rs`, tests, and benches. `partition_for(Address, u32) -> u32` is consistent. `PendingReceipts::on_receipt(Address, Receipt)` and `update_watermark(QuorumWatermark)` match between unit tests and the proxy watcher. `BatchVerifier::recover(TxEnvelope, Bytes) -> (Address, B256)` returns the canonical pair from a single batched pass.

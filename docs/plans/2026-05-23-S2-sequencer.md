@@ -4,9 +4,9 @@
 
 **Goal:** Ship the S2 sequencer cluster as a new crate `kardamom-sequencer` — M single-threaded, core-pinned processes that exclusively own a sender slice, maintain per-sender next-nonce state, drain a per-sender future-nonce buffer in order, and publish canonical-ordered raw txs into channel B via Aeron concurrent publication, with a hot-standby tailer that catches up by replaying B and a lease-based takeover on primary failure.
 
-**Architecture:** One process per ingress partition (default M=8), pinned to a CPU core via `core_affinity`. Each owner subscribes to its `ingress[i]` Aeron stream, recovers the sender (cached in envelope by the proxy when available), and runs a small nonce-check state machine: **Match** → publish to B + advance + drain buffer; **Future** → insert into per-sender `BTreeMap<u64, TxEnvelope>` bounded by `max_pending_per_sender` (evict oldest on overflow); **Past** → drop and publish a `duplicate` notification to the receipt-cache Aeron channel. Backpressure on B surfaces as `Err::WouldBlock` to the caller, which the proxy converts to `503`. A sibling **hot-standby** process on a different host subscribes to B and, for senders mapped to this slice via `keccak(sender) % M`, replays nonces to keep its own `pending_nonce` map in lockstep; on lease expiry it acquires the slice and begins publishing to its `ingress[i]`.
+**Architecture:** One process per ingress partition (default M=8), pinned to a CPU core via `core_affinity`. Each owner subscribes to its `ingress[i]` Aeron stream, reads `envelope.sender` directly (always populated by the proxy per D-Sh3 — the sequencer does **no** secp256k1 work), and runs a small nonce-check state machine: **Match** → publish to B + advance + drain buffer; **Future** → insert into per-sender `BTreeMap<u64, TxEnvelope>` bounded by `max_pending_per_sender` (evict oldest on overflow); **Past** → drop and publish a `duplicate` notification to the receipt-cache Aeron channel. Backpressure on B surfaces as `Err::WouldBlock` to the caller, which the proxy converts to `503`. A sibling **hot-standby** process on a different host subscribes to B and, for senders mapped to this slice via `keccak(sender) % M`, replays nonces to keep its own `pending_nonce` map in lockstep; on lease expiry it acquires the slice and begins publishing to its `ingress[i]`.
 
-**Tech Stack:** Rust 2024 edition; `alloy-consensus` `TxEnvelope`; `alloy-primitives` (`Address`, `B256`, `keccak256`); `kardamom-log` (S3 — provides Aeron channel handles, `BPosition`, framing of `TxEnvelope` with `correlation_id` and optional cached sender, and `BlockBoundaryStart` marker type to skip on B-replay); `core_affinity = "0.8"`; `tracing`; `metrics` (Prometheus exporter via the shared workspace stack); `clap` for the CLI binary; `criterion` for benches; `proptest` for state-machine property tests.
+**Tech Stack:** Rust 2024 edition; `alloy-consensus` `TxEnvelope`; `alloy-primitives` (`Address`, `B256`, `keccak256`); `kardamom-log` (S3 — provides Aeron channel handles, `BPosition`, wire framing of `TxEnvelope` with `correlation_id` and always-populated proxy-recovered `sender`, and `BlockBoundaryStart` marker type to skip on B-replay; all wire types derive `rkyv::Archive`/`Serialize`/`Deserialize` per D-Sh2, and the sequencer can consume `Archived<TxEnvelope>` zero-copy off the ingress channel where it helps the hot path); `core_affinity = "0.8"`; `tracing`; `metrics` (Prometheus exporter via the shared workspace stack); `clap` for the CLI binary; `criterion` for benches; `proptest` for state-machine property tests.
 
 **Branch:** `claude/s2-sequencer` (branched off `main`).
 
@@ -18,7 +18,7 @@
 - `kardamom_log::aeron::Publication` — Aeron publication handle with `try_offer(&[u8]) -> Result<Offset, BackpressureError>` (non-blocking) and `offer(&[u8]) -> Result<Offset, AeronError>` (with linear backoff).
 - `kardamom_log::aeron::ConcurrentPublication` — multi-publisher variant for channel B; `try_offer(&[u8]) -> Result<BPosition, BackpressureError>` with claim-and-write semantics.
 - `kardamom_log::BPosition { term_id: i32, term_offset: i32 }` — canonical tx identifier.
-- `kardamom_log::framing::TxFrame` — header `{ correlation_id: [u8; 16], cached_sender: Option<Address>, ingress_partition: u8 }` plus raw `TxEnvelope` bytes (RLP-encoded). Encoder/decoder live in `kardamom_log::framing`.
+- `kardamom_log::framing::TxFrame` — rkyv-archived header `{ correlation_id: [u8; 16], sender: Address, ingress_partition: u8 }` plus raw `TxEnvelope` bytes (RLP-encoded). Encoder/decoder live in `kardamom_log::framing`. `sender` is typed `Address`, **never `Option`** — populated unconditionally by the proxy (D-Sh3). Zero-copy `Archived<TxFrame>` views are available via helpers in `kardamom_log`.
 - `kardamom_log::framing::DuplicateNotification { correlation_id: [u8; 16] }` — published to the receipt-cache channel.
 - `kardamom_log::framing::BlockBoundaryStart { block_number: u64, end_tx_idx: u64, l2_timestamp: u64 }` — emitted on B by the sealer (S5). Sequencers must **decode-and-skip** these messages when replaying B as a hot standby.
 - `kardamom_log::channels::ChannelConfig` — strongly-typed Aeron URIs/stream-ids for `ingress[i]`, `b`, and `receipt_cache`, loadable from a `chains/*.toml` `[aeron]` block.
@@ -38,7 +38,7 @@ crates/kardamom-sequencer/
 ├── src/
 │   ├── lib.rs                  # Public API: re-exports, prelude.
 │   ├── partition.rs            # keccak(sender) % M routing; pure function + tests.
-│   ├── sender.rs               # Sender derivation (cached vs recover-from-sig); pure.
+│   ├── sender.rs               # Sender accessor: reads envelope.sender (always populated by proxy, D-Sh3); pure.
 │   ├── pending.rs              # PendingBuffer (per-sender BTreeMap; bounded + evict).
 │   ├── state.rs                # PartitionState: HashMap<Address, NextNonce> + PendingBuffer per sender. The pure state machine.
 │   ├── outbound.rs             # Trait abstractions over Aeron pubs (BPublisher, ReceiptCachePublisher) + real and mock impls behind a feature-gated `testing` module.
@@ -215,9 +215,6 @@ pub enum SequencerError {
     #[error("ingress source disconnected")]
     IngressDisconnected,
 
-    #[error("failed to recover sender from signature: {0}")]
-    SenderRecovery(String),
-
     #[error("malformed tx frame: {0}")]
     MalformedFrame(String),
 
@@ -378,21 +375,21 @@ git commit -m "sequencer: add partition routing (keccak(sender) % M)"
 
 ---
 
-## Task 4: Implement `sender.rs` — derivation from envelope cache or signature
+## Task 4: Implement `sender.rs` — accessor for the proxy-populated sender
 
 **Files:**
 - Modify: `crates/kardamom-sequencer/src/sender.rs`
-- Create: `crates/kardamom-sequencer/tests/sender_derivation.rs`
+- Create: `crates/kardamom-sequencer/tests/sender_accessor.rs`
 
-**Design choice (locked in here):** the proxy already does batched signature verification (S1 spec §2.1). It will write the recovered sender into the `TxFrame::cached_sender` field of the ingress frame. The sequencer **trusts** the cached sender when present (the proxy is trusted in the CFT model) and falls back to `TxEnvelope::recover_signer()` only when the cache is absent (e.g., older frames, test paths). This keeps the hot-path sequencer free of secp256k1 work, preserving the §3 budget of ≤3µs per nonce check.
+**Design (locked in by D-Sh3):** the proxy (S1) recovers the sender during batched secp256k1 verification and writes it into `TxEnvelope.sender` (typed `Address`, **never `Option`**). The sequencer **trusts** this field unconditionally — there is no fallback path, no `recover_signer()` call, and no `--paranoid-sender-check` mode. The sequencer performs **zero** secp256k1 work, keeping the §3 nonce-check budget at ≤3µs per tx.
 
-- [ ] **Step 1: Write the failing test in `tests/sender_derivation.rs`**
+- [ ] **Step 1: Write the test in `tests/sender_accessor.rs`**
 
 ```rust
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, U256};
 use alloy_signer_local::PrivateKeySigner;
-use kardamom_sequencer::sender::derive_sender;
+use kardamom_sequencer::sender::sender_of;
 
 fn signed_legacy_tx() -> (TxEnvelope, Address) {
     let signer: PrivateKeySigner = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
@@ -416,75 +413,57 @@ fn signed_legacy_tx() -> (TxEnvelope, Address) {
 }
 
 #[test]
-fn uses_cached_sender_when_present() {
-    let (env, real) = signed_legacy_tx();
-    let bogus = Address::repeat_byte(0xAB);
-    let got = derive_sender(&env, Some(bogus)).unwrap();
-    // Cached sender wins — we explicitly trust the proxy.
-    assert_eq!(got, bogus);
-    assert_ne!(got, real);
-}
-
-#[test]
-fn falls_back_to_recovery_when_cache_absent() {
-    let (env, real) = signed_legacy_tx();
-    let got = derive_sender(&env, None).unwrap();
-    assert_eq!(got, real);
+fn sender_is_read_from_proxy_populated_field() {
+    let (env, _real_signer) = signed_legacy_tx();
+    // The proxy populated sender for us — in production this is the recovered
+    // address. In this unit test the IngressMessage carries it alongside the
+    // envelope; sender_of reads it directly with no recovery work.
+    let proxy_populated = Address::repeat_byte(0xAB);
+    let got = sender_of(&env, proxy_populated);
+    // We trust the proxy unconditionally (D-Sh3). The function does not look
+    // at the envelope's signature at all.
+    assert_eq!(got, proxy_populated);
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
-
-```bash
-cargo test -p kardamom-sequencer --test sender_derivation
-```
-
-Expected: fail with "no function `derive_sender`".
-
-- [ ] **Step 3: Implement `sender.rs`**
+- [ ] **Step 2: Implement `sender.rs`**
 
 ```rust
-//! Sender derivation for ingress tx frames.
+//! Sender accessor for ingress tx frames.
 //!
-//! The proxy is trusted under CFT: when `cached_sender` is present in the frame
-//! it was recovered by the proxy's batched k256 verifier, and we use it as-is.
-//! This keeps the sequencer hot path free of secp256k1 work (~3µs nonce-check
-//! budget per §3 of the design spec).
-//!
-//! Fallback to `TxEnvelope::recover_signer()` exists for tests and any code path
-//! that legitimately lacks a cached sender (e.g., re-running an older B archive).
+//! D-Sh3: the proxy (S1) recovers the sender during batched k256 verification
+//! and writes it into `TxEnvelope.sender` / the ingress `TxFrame.sender` field
+//! (typed `Address`, never `Option`). The sequencer trusts this value
+//! unconditionally — no fallback, no `recover_signer()`, no paranoid-check
+//! mode. The sequencer does ZERO secp256k1 work on the hot path, which keeps
+//! the §3 nonce-check budget at ≤3µs per tx.
 
 use alloy_consensus::TxEnvelope;
 use alloy_primitives::Address;
 
-use crate::error::SequencerError;
-
-pub fn derive_sender(
-    envelope: &TxEnvelope,
-    cached: Option<Address>,
-) -> Result<Address, SequencerError> {
-    if let Some(addr) = cached {
-        return Ok(addr);
-    }
-    envelope
-        .recover_signer()
-        .map_err(|e| SequencerError::SenderRecovery(e.to_string()))
+/// Return the sender for an ingress message. The `sender` argument is the
+/// proxy-populated address (always present per D-Sh3). The envelope is taken
+/// alongside it solely to make the call site read naturally; we never inspect
+/// the signature.
+#[inline]
+pub fn sender_of(_envelope: &TxEnvelope, sender: Address) -> Address {
+    sender
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 3: Run tests to verify they pass**
 
 ```bash
-cargo test -p kardamom-sequencer --test sender_derivation
+cargo test -p kardamom-sequencer --test sender_accessor
 ```
 
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
-git add crates/kardamom-sequencer/src/sender.rs crates/kardamom-sequencer/tests/sender_derivation.rs
-git commit -m "sequencer: add sender derivation (cached + recovery fallback)"
+git add crates/kardamom-sequencer/src/sender.rs crates/kardamom-sequencer/tests/sender_accessor.rs
+git commit -m "sequencer: add sender accessor (trusts proxy-populated TxEnvelope.sender)"
 ```
 
 ---
@@ -1185,10 +1164,13 @@ use alloy_primitives::Address;
 use crate::error::SequencerError;
 
 /// A decoded ingress frame: tx + proxy metadata.
+///
+/// `sender` is always populated by the proxy (D-Sh3). The sequencer trusts it
+/// unconditionally and does no signature recovery itself.
 #[derive(Debug, Clone)]
 pub struct IngressMessage {
     pub envelope: TxEnvelope,
-    pub cached_sender: Option<Address>,
+    pub sender: Address,
     pub correlation_id: [u8; 16],
 }
 
@@ -1427,7 +1409,7 @@ fn match_then_publishes_once() {
     let mut ingress = ScriptedIngress::default();
     ingress.queue.push_back(IngressMessage {
         envelope: env,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [0xAB; 16],
     });
     let mut b = InMemoryBPublisher::default();
@@ -1449,12 +1431,12 @@ fn past_nonce_emits_duplicate_notification() {
     let mut ingress = ScriptedIngress::default();
     ingress.queue.push_back(IngressMessage {
         envelope: env0,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [1u8; 16],
     });
     ingress.queue.push_back(IngressMessage {
         envelope: env0_dup,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [2u8; 16],
     });
     let mut b = InMemoryBPublisher::default();
@@ -1479,12 +1461,12 @@ fn future_nonce_is_buffered_then_drained() {
     // Arrive out of order: 1 first.
     ingress.queue.push_back(IngressMessage {
         envelope: env1,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [1u8; 16],
     });
     ingress.queue.push_back(IngressMessage {
         envelope: env0,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [0u8; 16],
     });
     let mut b = InMemoryBPublisher::default();
@@ -1505,7 +1487,7 @@ fn backpressure_is_propagated_when_b_blocks() {
     let mut ingress = ScriptedIngress::default();
     ingress.queue.push_back(IngressMessage {
         envelope: env,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [0xFE; 16],
     });
     let mut b = InMemoryBPublisher::default();
@@ -1550,7 +1532,7 @@ fn wrong_partition_message_is_skipped_silently() {
     let mut ingress = ScriptedIngress::default();
     ingress.queue.push_back(IngressMessage {
         envelope: env,
-        cached_sender: Some(addr),
+        sender: addr,
         correlation_id: [9u8; 16],
     });
     let mut b = InMemoryBPublisher::default();
@@ -1587,15 +1569,24 @@ use crate::inbound::{IngressMessage, IngressSource};
 use crate::metrics;
 use crate::outbound::{BPublisher, ReceiptCachePublisher};
 use crate::partition::partition_for;
-use crate::sender::derive_sender;
+use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction};
 
-/// Local placeholder frame: `correlation_id (16) || RLP(TxEnvelope)`.
-/// Task 16 replaces this with `kardamom_log::framing::TxFrame::encode`.
-fn encode_frame_local(correlation_id: [u8; 16], envelope: &alloy_consensus::TxEnvelope) -> Vec<u8> {
+/// Local placeholder frame: `correlation_id (16) || sender (20) || RLP(TxEnvelope)`.
+/// Includes the proxy-populated sender inline so test consumers don't need to
+/// recover it from the signature (D-Sh3 forbids any secp256k1 work in the
+/// sequencer pipeline, including its tests). Task 16 replaces this with
+/// `kardamom_log::framing::TxFrame::encode`, which carries `sender` in its
+/// rkyv-archived header.
+fn encode_frame_local(
+    correlation_id: [u8; 16],
+    sender: alloy_primitives::Address,
+    envelope: &alloy_consensus::TxEnvelope,
+) -> Vec<u8> {
     use alloy_rlp::Encodable;
-    let mut out = Vec::with_capacity(16 + 256);
+    let mut out = Vec::with_capacity(16 + 20 + 256);
     out.extend_from_slice(&correlation_id);
+    out.extend_from_slice(sender.as_slice());
     envelope.encode(&mut out);
     out
 }
@@ -1635,8 +1626,8 @@ impl PrimarySequencer {
         };
         metrics::record_ingest(self.cfg.partition_index);
 
-        let IngressMessage { envelope, cached_sender, correlation_id } = msg;
-        let sender = derive_sender(&envelope, cached_sender)?;
+        let IngressMessage { envelope, sender, correlation_id } = msg;
+        let sender = sender_of(&envelope, sender);
 
         // Defensive: drop messages routed to the wrong partition (proxy bug or
         // partition_count mismatch). Silently skipped so a misrouted message does
@@ -1652,7 +1643,7 @@ impl PrimarySequencer {
         }
 
         let nonce = envelope.nonce();
-        let bytes = encode_frame_local(correlation_id, &envelope);
+        let bytes = encode_frame_local(correlation_id, sender, &envelope);
         let frame = EncodedFrame { correlation_id, bytes };
 
         // BACKPRESSURE-SAFE: if B is blocked, do NOT advance state. Speculatively
@@ -1901,10 +1892,9 @@ fn integration_1000_txs_100_senders_with_chaos() {
     let mut ingress = ScriptedIngress::default();
     for (i, n) in &stream {
         let env = signed_tx(&signers[*i], *n);
-        let cached = Some(signers[*i].address());
         ingress.queue.push_back(IngressMessage {
             envelope: env,
-            cached_sender: cached,
+            sender: signers[*i].address(),
             correlation_id: [(*i as u8).wrapping_mul(*n as u8 + 1); 16],
         });
     }
@@ -1928,9 +1918,11 @@ fn integration_1000_txs_100_senders_with_chaos() {
     let published = b.published.lock().unwrap().clone();
     let mut per_sender: HashMap<Address, Vec<u64>> = HashMap::new();
     for frame in &published {
-        // Local framing: 16-byte correlation || RLP(TxEnvelope).
-        let env = TxEnvelope::decode(&mut &frame[16..]).expect("decode");
-        let s = env.recover_signer().unwrap();
+        // Local framing: 16-byte correlation || 20-byte sender || RLP(TxEnvelope).
+        // Per D-Sh3 the sequencer (and its tests) never call recover_signer; we
+        // read the proxy-populated sender directly from the frame prefix.
+        let s = Address::from_slice(&frame[16..36]);
+        let env = TxEnvelope::decode(&mut &frame[36..]).expect("decode");
         per_sender.entry(s).or_default().push(env.nonce());
     }
     for (s, nonces) in &per_sender {
@@ -1969,7 +1961,7 @@ fn integration_bounded_buffer_evicts_oldest_for_pathological_sender() {
     for n in 100..110u64 {
         ingress.queue.push_back(IngressMessage {
             envelope: signed_tx(&s, n),
-            cached_sender: Some(s.address()),
+            sender: s.address(),
             correlation_id: [n as u8; 16],
         });
     }
@@ -2559,7 +2551,7 @@ use kardamom_log::framing::TxFrame;
 // ... inside run_once, where the previous code called encode_frame_local:
 let frame_struct = TxFrame {
     correlation_id,
-    cached_sender,
+    sender,
     ingress_partition: self.cfg.partition_index,
     envelope_bytes: {
         use alloy_rlp::Encodable;
@@ -2577,13 +2569,15 @@ let frame = EncodedFrame { correlation_id, bytes };
 Replace:
 
 ```rust
-let env = TxEnvelope::decode(&mut &frame[16..]).expect("decode");
+let s = Address::from_slice(&frame[16..36]);
+let env = TxEnvelope::decode(&mut &frame[36..]).expect("decode");
 ```
 
-with:
+with (zero-copy via the rkyv-archived header per D-Sh2 — `sender` comes from the proxy-populated frame field, never from signature recovery):
 
 ```rust
 let parsed = kardamom_log::framing::TxFrame::decode(frame).expect("decode");
+let s = parsed.sender;
 let env = TxEnvelope::decode(&mut parsed.envelope_bytes.as_slice()).expect("decode");
 ```
 
@@ -2642,11 +2636,12 @@ struct SharedB {
 impl BPublisher for SharedB {
     fn try_publish(&mut self, frame_bytes: &[u8]) -> Result<(), SequencerError> {
         self.frames.lock().unwrap().push(frame_bytes.to_vec());
-        // Decode the tx so the replay side can see (sender, nonce) without
-        // depending on the S3 framing module.
-        let env = TxEnvelope::decode(&mut &frame_bytes[16..])
+        // Local framing: 16-byte correlation || 20-byte sender || RLP(TxEnvelope).
+        // Per D-Sh3 we MUST NOT call recover_signer here; the sender is the
+        // proxy-populated field that the primary copied into the frame prefix.
+        let sender = Address::from_slice(&frame_bytes[16..36]);
+        let env = TxEnvelope::decode(&mut &frame_bytes[36..])
             .map_err(|e| SequencerError::MalformedFrame(e.to_string()))?;
-        let sender = env.recover_signer().map_err(|e| SequencerError::SenderRecovery(e.to_string()))?;
         let nonce = env.nonce();
         self.decoded_for_replay.lock().unwrap().push(BMessage::Tx { sender, nonce });
         Ok(())
@@ -2721,7 +2716,7 @@ fn standby_takes_over_with_no_gap_or_duplicate() {
     for n in 0u64..20 {
         ingress_p.q.push(IngressMessage {
             envelope: signed_tx(&signer1, n),
-            cached_sender: Some(signer1.address()),
+            sender: signer1.address(),
             correlation_id: [n as u8; 16],
         });
     }
@@ -2753,19 +2748,21 @@ fn standby_takes_over_with_no_gap_or_duplicate() {
     for n in 10u64..20 {
         ingress_promoted.q.push(IngressMessage {
             envelope: signed_tx(&signer1, n),
-            cached_sender: Some(signer1.address()),
+            sender: signer1.address(),
             correlation_id: [n as u8; 16],
         });
     }
     while promoted.run_once(&mut ingress_promoted, &mut b_pub, &mut rc).unwrap() {}
 
-    // Assert canonical B: nonces 0..20 in order, no duplicates.
+    // Assert canonical B: nonces 0..20 in order, no duplicates. We read the
+    // sender straight from the local frame prefix (D-Sh3: no recover_signer).
     let frames = shared_b.frames.lock().unwrap();
     let mut nonces: Vec<u64> = frames
         .iter()
         .map(|f| {
-            let env = TxEnvelope::decode(&mut &f[16..]).unwrap();
-            assert_eq!(env.recover_signer().unwrap(), signer1.address());
+            let s = Address::from_slice(&f[16..36]);
+            assert_eq!(s, signer1.address());
+            let env = TxEnvelope::decode(&mut &f[36..]).unwrap();
             env.nonce()
         })
         .collect();
@@ -2964,12 +2961,13 @@ git commit -m "sequencer: implement kardamom-sequencer CLI binary"
 **Files:**
 - Create: `crates/kardamom-sequencer/benches/throughput.rs`
 
-Target per the spec: >100k tx/s on one core for simple sigs (with cached sender — secp256k1 is the proxy's cost).
+Target per the spec: >100k tx/s on one core for simple sigs. Per D-Sh3 the sequencer does **no** secp256k1 work — the sender comes proxy-populated on the `IngressMessage`.
 
 - [ ] **Step 1: Write the bench**
 
 ```rust
-//! Per-sequencer throughput on one core, cached-sender path.
+//! Per-sequencer throughput on one core; sender supplied by proxy (no secp256k1
+//! on this hot path per D-Sh3).
 
 use std::collections::VecDeque;
 
@@ -3005,19 +3003,19 @@ fn signed_tx(s: &PrivateKeySigner, n: u64) -> TxEnvelope {
     tx.into_signed(sig).into()
 }
 
-fn bench_cached_sender_in_order(c: &mut Criterion) {
+fn bench_proxy_populated_sender_in_order(c: &mut Criterion) {
     let signers: Vec<_> = (1..=64u64).map(signer).collect();
     let mut batch: Vec<IngressMessage> = Vec::with_capacity(64 * 16);
     for s in &signers {
         for n in 0u64..16 {
             batch.push(IngressMessage {
                 envelope: signed_tx(s, n),
-                cached_sender: Some(s.address()),
+                sender: s.address(),
                 correlation_id: [(n as u8); 16],
             });
         }
     }
-    c.bench_function("primary_run_once_1024_cached", |b| {
+    c.bench_function("primary_run_once_1024_proxy_sender", |b| {
         b.iter_batched(
             || {
                 (
@@ -3040,7 +3038,7 @@ fn bench_cached_sender_in_order(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_cached_sender_in_order);
+criterion_group!(benches, bench_proxy_populated_sender_in_order);
 criterion_main!(benches);
 ```
 
@@ -3194,7 +3192,8 @@ gh pr create --title "S2 sequencer subsystem (kardamom-sequencer crate)" --body 
 ## Test plan
 - [ ] `cargo test -p kardamom-sequencer --all-features` passes.
 - [ ] Chaos test (`chaos_failover.rs`) demonstrates no gap or duplicate on B across primary→standby takeover.
-- [ ] Criterion bench (`benches/throughput.rs`) reports >100k tx/s per core on cached-sender simple sigs.
+- [ ] Criterion bench (`benches/throughput.rs`) reports >100k tx/s per core (proxy-populated sender path; no secp256k1 in the sequencer per D-Sh3).
+- [ ] Docker e2e (`tests/e2e_docker.rs`, gated on `--features docker-e2e -- --ignored`) brings up real Aeron Media Driver + Archive containers, runs a real sequencer process, and verifies 1000 txs / 100 senders land in canonical nonce order on channel B.
 - [ ] `cargo clippy -p kardamom-sequencer --all-features -- -D warnings` clean.
 EOF
 )"
@@ -3204,10 +3203,236 @@ Return the PR URL.
 
 ---
 
+## Task 23: E2E test against real Aeron in Docker
+
+**Files:**
+- Create: `crates/kardamom-sequencer/tests/e2e_docker.rs`
+- Modify: `crates/kardamom-sequencer/Cargo.toml`
+
+Per D-Sh8 the mock-based tests above stay (they pin the state machine and component behaviour in isolation), but the e2e layer **MUST** use a real Aeron backend running in Docker via the `testcontainers` harness shipped by S3 (`kardamom-log`). This task adds a real e2e test that spins up the S3 Docker harness, runs a real `PrimarySequencer` process against it, drives **N=1000 transactions from M=100 senders** through the live `ingress[0]` Aeron channel, and asserts every tx lands on channel B in correct nonce order per sender.
+
+**Pre-requisites:** S3's `kardamom-log` crate must expose:
+- A `testcontainers`-based harness (`kardamom_log::testing::docker::AeronDocker`) that brings up the Media Driver + Archive containers and returns a `ChannelConfig` pointing at them.
+- Real-Aeron implementations of `IngressSource`, `BPublisher`, `ReceiptCachePublisher`, and `BReplaySource` (the same traits this crate already abstracts over).
+
+Skip this task only if S3 has not yet landed the docker harness. Once it has, this test must pass on every PR via the existing CI Docker job.
+
+- [ ] **Step 1: Add the `testcontainers` re-export dep**
+
+```toml
+[dev-dependencies]
+# ... existing ...
+kardamom-log = { path = "../kardamom-log", features = ["testing", "docker-e2e"] }
+```
+
+The `docker-e2e` feature on `kardamom-log` pulls in `testcontainers` and the harness module.
+
+- [ ] **Step 2: Write the e2e test in `tests/e2e_docker.rs`**
+
+```rust
+//! D-Sh8 e2e test: real Aeron Media Driver + Archive in Docker, real
+//! PrimarySequencer process, real ingress + channel-B publication. This test
+//! complements the mock-based integration test (`primary_integration.rs`) —
+//! the mocks pin component logic, this test pins the wire integration with
+//! S3's Aeron backend.
+//!
+//! Scenario: M = 100 senders, each contributes N/M = 10 in-order nonces
+//! (N = 1000 total). All txs feed the partition-0 ingress channel; the
+//! sequencer's single partition publishes them onto channel B; the test
+//! tails B and asserts canonical-nonce-ascending order per sender.
+//!
+//! Requires Docker. Tagged `#[ignore]` so the default `cargo test` run skips
+//! it; CI runs it explicitly via `cargo test --features docker-e2e -- --ignored`.
+
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
+use alloy_consensus::{SignableTransaction, Transaction as _, TxEnvelope, TxLegacy};
+use alloy_primitives::{Address, U256};
+use alloy_signer_local::PrivateKeySigner;
+
+use kardamom_log::framing::TxFrame;
+use kardamom_log::testing::docker::AeronDocker;
+use kardamom_sequencer::config::{SequencerConfig, SequencerRole};
+use kardamom_sequencer::inbound::IngressMessage;
+use kardamom_sequencer::primary::{PrimarySequencer, Shutdown};
+
+const N_TXS: usize = 1000;
+const M_SENDERS: usize = 100;
+const NONCES_PER_SENDER: u64 = (N_TXS / M_SENDERS) as u64;
+
+fn signer(seed: u64) -> PrivateKeySigner {
+    let mut k = [0u8; 32];
+    k[24..].copy_from_slice(&seed.to_be_bytes());
+    PrivateKeySigner::from_bytes(&k.into()).unwrap()
+}
+
+fn signed_tx(s: &PrivateKeySigner, n: u64) -> TxEnvelope {
+    let tx = TxLegacy {
+        chain_id: Some(1),
+        nonce: n,
+        gas_price: 1_000_000_000,
+        gas_limit: 21_000,
+        to: Address::ZERO.into(),
+        value: U256::ZERO,
+        input: Default::default(),
+    };
+    let sig = s.sign_hash_sync(&tx.signature_hash()).unwrap();
+    tx.into_signed(sig).into()
+}
+
+#[test]
+#[ignore = "requires Docker; run with --ignored or via the CI docker-e2e job"]
+fn real_aeron_1000_txs_100_senders_canonical_order_on_b() {
+    // Bring up real Media Driver + Archive containers (S3 harness).
+    let docker = AeronDocker::start().expect("start aeron docker containers");
+    let chans = docker.channel_config();
+
+    // Sequencer configured as a single partition so every sender lands here.
+    let cfg = SequencerConfig {
+        partition_count: 1,
+        partition_index: 0,
+        max_pending_per_sender: 16,
+        role: SequencerRole::Primary,
+        core_id: None,
+        ..Default::default()
+    };
+
+    // Real Aeron implementations of the IngressSource / BPublisher /
+    // ReceiptCachePublisher / BReplaySource traits this crate abstracts over.
+    let mut ingress = kardamom_log::aeron::sequencer_ingress_source(&chans, 0)
+        .expect("connect ingress[0]");
+    let mut b_pub = kardamom_log::aeron::sequencer_b_publisher(&chans)
+        .expect("connect channel B publisher");
+    let mut rc_pub = kardamom_log::aeron::sequencer_receipt_cache_publisher(&chans)
+        .expect("connect receipt-cache publisher");
+    let mut b_tail = kardamom_log::aeron::sequencer_b_replay_source(&chans)
+        .expect("connect channel B replay source (test consumer)");
+
+    // Spawn the sequencer in its own OS thread (real process boundary except
+    // for the kill signal, which we use to terminate the test cleanly).
+    let shutdown = Shutdown::new();
+    let sd_for_thread = shutdown.clone();
+    let seq_thread = std::thread::spawn(move || {
+        let mut seq = PrimarySequencer::new(cfg);
+        seq.run(&mut ingress, &mut b_pub, &mut rc_pub, sd_for_thread)
+            .expect("sequencer run");
+    });
+
+    // Build the input set: M senders × NONCES_PER_SENDER nonces, in nonce order
+    // per sender, interleaved across senders so arrival order ≠ canonical order.
+    let signers: Vec<_> = (1..=M_SENDERS as u64).map(signer).collect();
+    let mut produced: Vec<IngressMessage> = Vec::with_capacity(N_TXS);
+    for n in 0..NONCES_PER_SENDER {
+        for s in &signers {
+            produced.push(IngressMessage {
+                envelope: signed_tx(s, n),
+                sender: s.address(), // D-Sh3: proxy-populated, never recovered.
+                correlation_id: {
+                    let mut id = [0u8; 16];
+                    id[0..8].copy_from_slice(&n.to_be_bytes());
+                    id[8..16].copy_from_slice(&s.address().as_slice()[..8]);
+                    id
+                },
+            });
+        }
+    }
+    assert_eq!(produced.len(), N_TXS);
+
+    // Inject into the real ingress channel. S3 provides an `ingress_test_publisher`
+    // helper that wraps the framed publication; if not, encode + Publication::offer.
+    let mut ingress_test_pub = kardamom_log::aeron::ingress_test_publisher(&chans, 0)
+        .expect("connect ingress[0] test publisher");
+    for msg in &produced {
+        ingress_test_pub
+            .publish_ingress(msg)
+            .expect("publish to ingress[0]");
+    }
+
+    // Drain channel B from the test side. Time out at 30s — Aeron + 1000 txs
+    // through a single core should complete in well under a second.
+    let mut published: Vec<TxFrame> = Vec::with_capacity(N_TXS);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while published.len() < N_TXS && Instant::now() < deadline {
+        if let Some(frame_bytes) = b_tail.poll_raw().expect("poll B") {
+            // The standby's BMessage::Tx { sender, nonce } projection drops the
+            // envelope; here we want the full frame so we can group by sender
+            // and verify nonce order.
+            let frame = TxFrame::decode(&frame_bytes).expect("decode TxFrame from B");
+            published.push(frame);
+        } else {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert_eq!(
+        published.len(),
+        N_TXS,
+        "timed out waiting for all {N_TXS} txs on channel B"
+    );
+
+    // Group by sender, assert per-sender nonces are 0..NONCES_PER_SENDER in
+    // strict ascending order.
+    let mut per_sender: HashMap<Address, Vec<u64>> = HashMap::new();
+    for frame in &published {
+        // Per D-Sh3 we read sender directly from the TxFrame header (proxy-
+        // populated, propagated by the sequencer). NEVER call recover_signer.
+        let s = frame.sender;
+        let env = TxEnvelope::decode(&mut frame.envelope_bytes.as_slice())
+            .expect("decode envelope");
+        per_sender.entry(s).or_default().push(env.nonce());
+    }
+    assert_eq!(per_sender.len(), M_SENDERS, "expected {M_SENDERS} senders on B");
+    for (s, nonces) in &per_sender {
+        assert_eq!(
+            nonces.len(),
+            NONCES_PER_SENDER as usize,
+            "sender {s}: expected {NONCES_PER_SENDER} nonces, got {}",
+            nonces.len()
+        );
+        for (i, n) in nonces.iter().enumerate() {
+            assert_eq!(
+                *n, i as u64,
+                "sender {s}: nonce[{i}] = {n}, expected {i}; full sequence = {nonces:?}"
+            );
+        }
+    }
+
+    // Cleanly stop the sequencer.
+    shutdown.signal();
+    seq_thread.join().expect("sequencer thread join");
+
+    // Containers tear down when `docker` drops.
+}
+```
+
+- [ ] **Step 3: Update CI to run the docker-e2e test**
+
+The shared CI Docker job (added by S3 per D-Sh8) already runs `cargo test --features docker-e2e -- --ignored` across every crate. Verify this crate's e2e test is picked up by checking the CI logs after the PR opens; if not, add `kardamom-sequencer` to the explicit `-p` list in the workflow file.
+
+- [ ] **Step 4: Run locally (Docker must be available)**
+
+```bash
+cargo test -p kardamom-sequencer --test e2e_docker --features docker-e2e -- --ignored --nocapture
+```
+
+Expected: PASS in <30s on a developer machine with Docker Desktop / Docker Engine running.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/kardamom-sequencer/tests/e2e_docker.rs crates/kardamom-sequencer/Cargo.toml
+git commit -m "sequencer: add real-Aeron Docker e2e test (1000 txs / 100 senders)"
+```
+
+---
+
 ## Self-Review Notes
 
 - **Spec coverage:** every §2.2 bullet (one process per partition, core-pinning, exclusive ownership, match/future/past state machine, future buffer with bounded eviction, duplicate notification, backpressure surfaces as 503, no mempool/RBF) has a task. §4.2 hot-standby + lease takeover is Tasks 14 + 15 + 17. V0-scope requirement that hot standby ship in v0 is satisfied.
-- **S3 dependency:** every code path that touches Aeron is behind a trait with an in-memory fake, so the plan runs to completion in tests even if S3 is incomplete. Real Aeron wiring is gated on Task 16 + Task 18.
+- **S3 dependency:** every code path that touches Aeron is behind a trait with an in-memory fake, so the plan runs to completion in tests even if S3 is incomplete. Real Aeron wiring is gated on Task 16 + Task 18; the Docker-backed e2e (Task 23) requires S3's `kardamom_log::testing::docker::AeronDocker` harness per D-Sh8.
+- **D-Sh3 (sender trust):** the sequencer reads `envelope.sender` / `IngressMessage.sender` directly. No `recover_signer()`, no fallback, no `--paranoid-sender-check` flag. Tests, benches, chaos, and e2e all consume the proxy-populated sender — even the test-side decode paths use the `TxFrame.sender` (or its placeholder prefix) rather than secp256k1.
+- **D-Sh2 (rkyv wire codec):** `kardamom_log::framing::TxFrame` is rkyv-archived; sequencer can consume `Archived<TxFrame>` zero-copy on the ingress hot path. No `bincode` anywhere in this plan.
 - **`reinsert_for_retry` subtlety:** Task 11 fixes the `process` matching branch to prefer the buffered entry, so backpressure retry is exactly-once at the canonical layer.
 - **Sealer marker on B:** standby decodes and skips `BMessage::BlockBoundary`. The framing module owns the encoding (S3).
 - **Bench:** measures `run_once` loop throughput on a single thread; comparable to spec's >100k tx/s/core target. Throughput is not asserted in CI to avoid flake.
+- **Mock vs. real Aeron (D-Sh8):** Tasks 11–17, 19, 20 use the in-memory mocks (fast, unit-style). Task 23 spins up real Aeron Media Driver + Archive in Docker and runs the real sequencer process against them end-to-end; that is the supplementary e2e guarantee required by D-Sh8.

@@ -4,7 +4,7 @@
 
 **Goal:** Ship `crates/kardamom-state` — a libmdbx-backed state DB with a snapshot-swap protocol that lets the S4 executor read state without blocking, plus all schema/recovery/compaction machinery called out in §5 of the sequencer design.
 
-**Architecture:** Single-writer, many-reader libmdbx environment. The writer thread drains the local S4 executor's commit-thread channel (a typed `BlockDelta` message per virtual block boundary) and applies it in one `RW` transaction per block. Reads go through a `StateSnapshot` wrapper around a long-lived `RO` transaction; the executor receives a fresh snapshot through the snapshot-swap protocol after every commit. MVCC horizon is sized so any snapshot the executor may still hold (~4 blocks back) is never page-reused. The trait the executor uses to back `revm::Database` lives in a new shared `crates/kardamom-types` crate so neither `kardamom-executor` nor `kardamom-state` depends on the other.
+**Architecture:** Single-writer, many-reader libmdbx environment. The writer thread drains the local S4 executor's commit-thread channel (a typed `BlockDelta` message per virtual block boundary) and applies it in one `RW` transaction per block. Reads go through a `StateSnapshot` wrapper around a long-lived `RO` transaction; the executor receives a fresh snapshot through the snapshot-swap protocol after every commit. MVCC horizon is sized so any snapshot the executor may still hold (~4 blocks back) is never page-reused. The `StateDatabase` trait that the executor uses to back `revm::Database` is **defined in `crates/kardamom-types`** (per S0 D-Sh1) — this crate only **implements** it for the libmdbx backend.
 
 **Tech Stack:** Rust 2024, `libmdbx = "0.6"` (the `vorot93/libmdbx-rs` binding), `alloy-primitives`, `revm` (consumer only — we expose a `DatabaseRef`-compatible read view), `crossbeam-channel` for the executor↔writer hand-off, `criterion` for benches, `tempfile` for tests.
 
@@ -13,9 +13,10 @@
 **Reference spec:** `docs/specs/2026-05-23-high-throughput-sequencer-design.md` (§1, §2.4, §2.7, §4.6, §5, V0 scope).
 
 **Assumed interfaces (coordination required):**
-- **S3 (`kardamom-log`):** exports `BPosition` (a `(u64 term_id, u32 term_offset)` newtype), an opaque `Receipt` envelope (RLP-encoded body + `tx_idx: u64`), and a `BlockBoundary { block_number: u64, end_tx_idx: u64, l2_timestamp: u64, state_root_commitment: B256 }`. **If S3 does not exist yet, this plan defines all three types locally inside `kardamom-types` with the understanding that S3 will move them out later.** Task 2 below pins those definitions.
-- **S4 (`kardamom-executor`):** emits a `BlockDelta` value (defined in this plan, Task 3) on a `crossbeam::channel::Sender<BlockDelta>` provided by `kardamom-state` at startup. Coordination: S4 imports `kardamom_state::BlockDelta` and uses the channel the state writer creates.
-- **`StateDatabase` trait:** defined in `kardamom-types` (this plan, Task 2). S4 implements `revm::DatabaseRef` on top of it; S6 provides the concrete impl `StateSnapshot`.
+- **S0 / `kardamom-types`:** owns `BPosition`, `Receipt`, `BlockBoundary`, and the `StateDatabase` trait (per D-Sh1). **This plan does not redefine any of those types** — every module imports them via `use kardamom_types::{...}`. The `Receipt` shape is `{ tx_idx: BPosition, tx_hash: B256, status: bool, gas_used: u64, logs: Vec<Log>, write_set_hash: B256 }` (D-Sh1). `BlockBoundary` is `{ block_number, end_tx_idx: BPosition, l2_timestamp }` — **no `state_root_commitment` field** (D-Sh11). `BPosition` is `{ term_id: i32, term_offset: i32 }` (D-Sh1).
+- **S3 (`kardamom-log`):** provides the Aeron channel implementations that ferry `Receipt` and `BlockBoundary` over channel C. This crate's e2e test (Task 25) drives the real Aeron testcontainer harness exported by `kardamom-log`.
+- **S4 (`kardamom-executor`):** emits a `BlockDelta` value (defined in this plan, Task 8) on a `crossbeam::channel::Sender<BlockDelta>` provided by `kardamom-state` at startup. Coordination: S4 imports `kardamom_state::BlockDelta` and uses the channel the state writer creates.
+- **`StateDatabase` trait:** **defined in `kardamom-types`** (per D-Sh1, not in this crate). S6 only provides the concrete `impl StateDatabase for StateSnapshot` for the libmdbx backend. S6 also extends the trait surface with `get_tx_position(tx_hash: B256) -> Option<BPosition>` and `get_receipt(position: BPosition) -> Option<Receipt>` (declared in `kardamom-types`, implemented here) so the S1 proxy can serve `eth_getTransactionReceipt(hash)` (D-Sh4).
 
 ---
 
@@ -52,237 +53,59 @@ crates/kardamom-state/
     └── snapshot_open.rs       # criterion: open RO txn latency
 ```
 
-New crate `crates/kardamom-types/` (shared types only; no logic):
-
-```
-crates/kardamom-types/
-├── Cargo.toml
-└── src/
-    ├── lib.rs                 # re-exports
-    ├── state_database.rs      # StateDatabase trait
-    ├── block.rs               # BlockNumber, BlockBoundary, BPosition (stub until S3)
-    └── receipt.rs             # Receipt envelope (stub until S3)
-```
+**Note on `crates/kardamom-types/`:** this crate is **owned upstream** (foundation crates landed in the S3+S0 PR per D-Sh7). S6 only **consumes** it. The `StateDatabase` trait and the `BPosition` / `Receipt` / `BlockBoundary` types live there — S6 must not redefine them. The two task-level edits required upstream (so S6 can compile) are: (a) add a `get_tx_position(tx_hash: B256) -> Result<Option<BPosition>, StateDatabaseError>` method to the `StateDatabase` trait, (b) add a `get_receipt(position: BPosition) -> Result<Option<Receipt>, StateDatabaseError>` method to the `StateDatabase` trait. Both are declared in `kardamom-types`; the libmdbx impl below (Task 10) provides the bodies. If those methods are not yet on `main`, this PR includes the trait additions as part of the same change set.
 
 ---
 
-## Task 1: Create `kardamom-types` crate skeleton
+## Task 1: Extend the upstream `StateDatabase` trait with receipt-lookup methods
 
 **Files:**
-- Create: `crates/kardamom-types/Cargo.toml`
-- Create: `crates/kardamom-types/src/lib.rs`
+- Modify: `crates/kardamom-types/src/state_database.rs` (upstream — owned by S0/foundation PR)
 
-- [ ] **Step 1: Write `crates/kardamom-types/Cargo.toml`**
+The `StateDatabase` trait and the `BPosition` / `Receipt` / `BlockBoundary` types are **already defined upstream** in `crates/kardamom-types` (per S0 D-Sh1). This plan must not redefine any of them. We only extend the trait with two methods that the S1 proxy needs for `eth_getTransactionReceipt(hash)` (per S0 D-Sh4):
 
-```toml
-[package]
-name = "kardamom-types"
-version.workspace = true
-edition.workspace = true
+- [ ] **Step 1: Add `get_tx_position` and `get_receipt` to the trait declaration**
 
-[dependencies]
-alloy-primitives.workspace = true
-revm.workspace = true
-serde.workspace = true
-thiserror.workspace = true
-```
-
-- [ ] **Step 2: Write `crates/kardamom-types/src/lib.rs`**
+In `crates/kardamom-types/src/state_database.rs`, add to the `StateDatabase` trait:
 
 ```rust
-//! Shared types used across kardamom subsystems.
-//!
-//! This crate exists to break dependency cycles: the executor (`kardamom-executor`)
-//! and the state writer (`kardamom-state`) both need a common `StateDatabase`
-//! trait and shared block/receipt types, but neither should depend on the other.
-//!
-//! Types and traits here are stable boundaries. Implementation details belong
-//! in the owning subsystem crate.
-
-pub mod block;
-pub mod receipt;
-pub mod state_database;
-
-pub use block::{BPosition, BlockBoundary, BlockNumber};
-pub use receipt::Receipt;
-pub use state_database::{StateDatabase, StateDatabaseError};
-```
-
-- [ ] **Step 3: Verify it builds**
-
-```bash
-cd /home/dev/kardamom && cargo build -p kardamom-types
-```
-
-Expected: builds. Missing-module errors are expected only after Task 2's modules are written; placeholder empty files are added in Step 4.
-
-- [ ] **Step 4: Create empty module stubs so Step 3 succeeds**
-
-```bash
-cd /home/dev/kardamom/crates/kardamom-types/src
-echo 'pub struct BlockNumber(pub u64);' > block.rs
-echo 'pub struct Receipt;' > receipt.rs
-echo 'pub trait StateDatabase {}' > state_database.rs
-```
-
-(Real contents land in Task 2; this is just to make the crate compile so the next task can fill it in incrementally.)
-
-Replace `lib.rs` re-exports to match the stubs:
-
-```rust
-//! See full docs in Task 2.
-
-pub mod block;
-pub mod receipt;
-pub mod state_database;
-```
-
-- [ ] **Step 5: Verify build**
-
-```bash
-cd /home/dev/kardamom && cargo build -p kardamom-types
-```
-
-Expected: builds clean (with one warning per stub for unused items).
-
-- [ ] **Step 6: Commit**
-
-```bash
-cd /home/dev/kardamom
-git add crates/kardamom-types/
-git commit -m "types: add kardamom-types crate skeleton"
-```
-
----
-
-## Task 2: Define `StateDatabase` trait and shared types
-
-**Files:**
-- Modify: `crates/kardamom-types/src/state_database.rs`
-- Modify: `crates/kardamom-types/src/block.rs`
-- Modify: `crates/kardamom-types/src/receipt.rs`
-- Modify: `crates/kardamom-types/src/lib.rs`
-
-- [ ] **Step 1: Write `state_database.rs`**
-
-```rust
-//! Read-only state interface used by the executor to back `revm::DatabaseRef`.
-//!
-//! Implementors are concrete snapshots of L2 state at some block boundary.
-//! The trait is intentionally minimal: only the four reads `revm::DatabaseRef`
-//! needs, plus a `block_number()` accessor for diagnostics. All methods are
-//! `&self` — concrete impls (e.g. `kardamom_state::StateSnapshot`) wrap a
-//! libmdbx RO transaction so reads are MVCC-snapshot-isolated.
-
-use alloy_primitives::{Address, B256, U256};
-use revm::primitives::Bytes;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum StateDatabaseError {
-    #[error("storage backend error: {0}")]
-    Backend(String),
-    #[error("decode error in table {table}: {detail}")]
-    Decode { table: &'static str, detail: String },
-    #[error("snapshot exhausted: writer outran the version horizon")]
-    SnapshotExhausted,
-}
-
-/// Account record stored in the `accounts` table.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountRecord {
-    pub nonce: u64,
-    pub balance: U256,
-    pub code_hash: B256,
-    /// `storage_root` is a Merkle commitment recomputed at block boundaries.
-    /// Storage *values* live in the flat `storage` table; this is only used
-    /// when emitting state-root commitments.
-    pub storage_root: B256,
-}
+use alloy_primitives::B256;
+use crate::{BPosition, Receipt};
 
 pub trait StateDatabase: Send + Sync {
-    fn block_number(&self) -> u64;
-    fn account(&self, address: Address) -> Result<Option<AccountRecord>, StateDatabaseError>;
-    fn storage(&self, address: Address, key: U256) -> Result<U256, StateDatabaseError>;
-    fn code_by_hash(&self, code_hash: B256) -> Result<Option<Bytes>, StateDatabaseError>;
+    // ... existing methods (block_number, account, storage, code_by_hash) ...
+
+    /// Resolve a tx hash to its canonical `BPosition`. Returns `Ok(None)` if
+    /// the tx is not yet committed to state (or never was). Backed by the
+    /// libmdbx `tx_hash_index` table (see S6 Task 6 schema).
+    fn get_tx_position(
+        &self,
+        tx_hash: B256,
+    ) -> Result<Option<BPosition>, StateDatabaseError>;
+
+    /// Fetch the `Receipt` previously committed at `position`. Returns
+    /// `Ok(None)` if no receipt exists at that key (e.g. position was a
+    /// system marker, not a tx). Backed by the libmdbx `receipts` table.
+    fn get_receipt(
+        &self,
+        position: BPosition,
+    ) -> Result<Option<Receipt>, StateDatabaseError>;
 }
 ```
 
-- [ ] **Step 2: Write `block.rs`**
-
-```rust
-//! Block and log-position primitives.
-//!
-//! `BlockBoundary` and `BPosition` are stubs until `kardamom-log` (S3) lands;
-//! they are defined here so `kardamom-state` can build standalone. Once S3
-//! ships, S3 re-exports these from `kardamom-types` (the canonical home).
-
-use alloy_primitives::B256;
-use serde::{Deserialize, Serialize};
-
-pub type BlockNumber = u64;
-
-/// Aeron archive position: `(term_id, term_offset)`. Canonical tx identifier.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct BPosition {
-    pub term_id: u64,
-    pub term_offset: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BlockBoundary {
-    pub block_number: BlockNumber,
-    pub end_tx_idx: u64,
-    pub l2_timestamp: u64,
-    pub state_root_commitment: B256,
-}
-```
-
-- [ ] **Step 3: Write `receipt.rs`**
-
-```rust
-//! Stub receipt envelope. The real shape is owned by `kardamom-log` (S3).
-//!
-//! Keep this minimal: `kardamom-state` only writes receipts opaquely
-//! (`code_hash -> bytes` semantics), so we expose a thin newtype around RLP bytes.
-
-use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Receipt {
-    pub tx_idx: u64,
-    pub rlp: Vec<u8>,
-}
-```
-
-- [ ] **Step 4: Update `lib.rs`**
-
-```rust
-//! Shared types used across kardamom subsystems.
-
-pub mod block;
-pub mod receipt;
-pub mod state_database;
-
-pub use block::{BPosition, BlockBoundary, BlockNumber};
-pub use receipt::Receipt;
-pub use state_database::{AccountRecord, StateDatabase, StateDatabaseError};
-```
-
-- [ ] **Step 5: Build**
+- [ ] **Step 2: Build the workspace**
 
 ```bash
 cd /home/dev/kardamom && cargo build -p kardamom-types
 ```
 
-Expected: clean.
+Expected: clean (existing impls in S4's in-memory `StateDatabase` will need stubs returning `Ok(None)` — that's a one-line addition there; do it as part of this commit).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 3: Commit**
 
 ```bash
-cd /home/dev/kardamom
-git add crates/kardamom-types/
-git commit -m "types: define StateDatabase trait and shared block/receipt types"
+git add crates/kardamom-types/src/state_database.rs
+git commit -m "types: extend StateDatabase with get_tx_position/get_receipt for S1 receipt-by-hash lookup"
 ```
 
 ---
@@ -304,20 +127,25 @@ edition.workspace = true
 
 [dependencies]
 kardamom-types = { path = "../kardamom-types" }
+kardamom-log = { path = "../kardamom-log" }            # for the testing harness used by e2e
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
 revm.workspace = true
-serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
 crossbeam-channel = "0.5"
 libmdbx = "0.6"
 metrics.workspace = true
+# rkyv 0.8: receipts are stored as rkyv archives at rest (D-Sh2 also uses rkyv on the wire).
+rkyv = { version = "0.8", features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
+# E2E: real Aeron testcontainer harness exported by kardamom-log under `testing`.
+kardamom-log = { path = "../kardamom-log", features = ["testing"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "write_throughput"
@@ -604,22 +432,26 @@ git commit -m "state: add MVCC horizon sizing constants with doctest"
 - [ ] **Step 1: Write the file**
 
 ```rust
-//! libmdbx schema. Six named tables, each with a fixed key/value encoding.
+//! libmdbx schema. Seven named tables, each with a fixed key/value encoding.
 //!
-//! | Table       | Key                              | Value                                            |
-//! |-------------|----------------------------------|--------------------------------------------------|
-//! | `accounts`  | `Address` (20 B)                 | RLP `(u64 nonce, U256 balance, B256 code_hash, B256 storage_root)` |
-//! | `storage`   | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
-//! | `code`      | `B256 code_hash` (32 B)          | raw bytecode                                     |
-//! | `headers`   | `u64 block_number` (8 B BE)      | RLP `(B256 state_root, u64 end_tx_idx, u64 ts)` |
-//! | `receipts`  | `u64 tx_idx` (8 B BE)            | RLP-encoded `Receipt`                            |
-//! | `meta`      | `&[u8]` (well-known keys, below) | varies — see `meta.rs`                           |
+//! | Table           | Key                              | Value                                            |
+//! |-----------------|----------------------------------|--------------------------------------------------|
+//! | `accounts`      | `Address` (20 B)                 | RLP `(u64 nonce, U256 balance, B256 code_hash, B256 storage_root)` |
+//! | `storage`       | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
+//! | `code`          | `B256 code_hash` (32 B)          | raw bytecode                                     |
+//! | `headers`       | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp)` — **no state root** (D-Sh11) |
+//! | `receipts`      | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
+//! | `tx_hash_index` | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE term_id ++ i32 BE term_offset) — feeds S1 `eth_getTransactionReceipt(hash)` (D-Sh4) |
+//! | `meta`          | `&[u8]` (well-known keys, below) | varies — see `meta.rs`                           |
 //!
-//! BE encoding keeps `block_number` and `tx_idx` ordered correctly under
-//! mdbx's lexicographic cursor; we depend on that for the cold-start scan.
+//! BE encoding on the `headers` key keeps `block_number` ordered under mdbx's
+//! lexicographic cursor; we depend on that for the cold-start scan. `BPosition`
+//! encoding (term_id i32 BE ++ term_offset i32 BE, 8 bytes) is lexicographically
+//! ordered by `(term_id, term_offset)` — same property holds for `receipts`.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
+use kardamom_types::{BPosition, Receipt};
 
 use crate::error::StateError;
 
@@ -628,6 +460,7 @@ pub const TABLE_STORAGE: &str = "storage";
 pub const TABLE_CODE: &str = "code";
 pub const TABLE_HEADERS: &str = "headers";
 pub const TABLE_RECEIPTS: &str = "receipts";
+pub const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
 pub const TABLE_META: &str = "meta";
 
 pub const ALL_TABLES: &[&str] = &[
@@ -636,6 +469,7 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_CODE,
     TABLE_HEADERS,
     TABLE_RECEIPTS,
+    TABLE_TX_HASH_INDEX,
     TABLE_META,
 ];
 
@@ -698,11 +532,15 @@ pub fn encode_code_key(hash: B256) -> [u8; 32] {
 // code value = raw bytes; no codec needed
 
 // ---------- headers ----------
+//
+// Per D-Sh11, headers do NOT carry a state-root commitment. The encoded value
+// is `(end_tx_idx: BPosition, l2_timestamp: u64)`. We use a hand-rolled fixed-
+// width encoding (12 + 8 = 20 bytes) instead of RLP — the row is fixed-size
+// and BPosition is not an RLP-native type.
 
-#[derive(Debug, Clone, PartialEq, Eq, RlpEncodable, RlpDecodable)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderValue {
-    pub state_root_commitment: B256,
-    pub end_tx_idx: u64,
+    pub end_tx_idx: BPosition,
     pub l2_timestamp: u64,
 }
 
@@ -723,22 +561,112 @@ pub fn decode_block_key(bytes: &[u8]) -> Result<u64, StateError> {
     Ok(u64::from_be_bytes(arr))
 }
 
-pub fn encode_header_value(v: &HeaderValue) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(64);
-    v.encode(&mut buf);
-    buf
+pub fn encode_header_value(v: &HeaderValue) -> [u8; 20] {
+    let mut out = [0u8; 20];
+    out[..4].copy_from_slice(&v.end_tx_idx.term_id.to_be_bytes());
+    out[4..8].copy_from_slice(&v.end_tx_idx.term_offset.to_be_bytes());
+    out[8..16].copy_from_slice(&v.l2_timestamp.to_be_bytes());
+    // bytes 16..20 reserved (zero-filled) for forward-compat
+    out
 }
 
 pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
-    HeaderValue::decode(&mut &bytes[..]).map_err(StateError::from)
+    if bytes.len() < 16 {
+        return Err(StateError::BadEncoding {
+            table: TABLE_HEADERS,
+            expected: 16,
+            got: bytes.len(),
+        });
+    }
+    let mut t_id = [0u8; 4];
+    t_id.copy_from_slice(&bytes[..4]);
+    let mut t_off = [0u8; 4];
+    t_off.copy_from_slice(&bytes[4..8]);
+    let mut ts = [0u8; 8];
+    ts.copy_from_slice(&bytes[8..16]);
+    Ok(HeaderValue {
+        end_tx_idx: BPosition {
+            term_id: i32::from_be_bytes(t_id),
+            term_offset: i32::from_be_bytes(t_off),
+        },
+        l2_timestamp: u64::from_be_bytes(ts),
+    })
 }
 
 // ---------- receipts ----------
+//
+// Key: BPosition (8 bytes — i32 BE term_id ++ i32 BE term_offset).
+// Value: rkyv-archived `Receipt` (kardamom-types). At rest we materialize to
+// owned bytes via `rkyv::to_bytes`; reads go through `rkyv::access::<Receipt>`
+// to deserialize zero-copy when called via `get_receipt`.
 
-pub fn encode_tx_key(tx_idx: u64) -> [u8; 8] {
-    tx_idx.to_be_bytes()
+pub fn encode_b_position_key(p: BPosition) -> [u8; 8] {
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&p.term_id.to_be_bytes());
+    out[4..].copy_from_slice(&p.term_offset.to_be_bytes());
+    out
+}
+
+pub fn decode_b_position_key(bytes: &[u8]) -> Result<BPosition, StateError> {
+    if bytes.len() != 8 {
+        return Err(StateError::BadEncoding {
+            table: TABLE_RECEIPTS,
+            expected: 8,
+            got: bytes.len(),
+        });
+    }
+    let mut t_id = [0u8; 4];
+    t_id.copy_from_slice(&bytes[..4]);
+    let mut t_off = [0u8; 4];
+    t_off.copy_from_slice(&bytes[4..]);
+    Ok(BPosition {
+        term_id: i32::from_be_bytes(t_id),
+        term_offset: i32::from_be_bytes(t_off),
+    })
+}
+
+pub fn encode_receipt_value(r: &Receipt) -> Vec<u8> {
+    // `Receipt` derives `rkyv::Archive/Serialize/Deserialize` upstream.
+    rkyv::to_bytes::<rkyv::rancor::Error>(r)
+        .expect("Receipt rkyv serialize is infallible for owned data")
+        .to_vec()
+}
+
+pub fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
+    rkyv::from_bytes::<Receipt, rkyv::rancor::Error>(bytes)
+        .map_err(|e| StateError::BadEncoding {
+            table: TABLE_RECEIPTS,
+            expected: bytes.len(),
+            got: bytes.len(),
+        }
+        .into_with_msg(format!("rkyv: {e}")))
+}
+
+// ---------- tx_hash_index (D-Sh4) ----------
+//
+// Key: `B256 tx_hash` (32 B). Value: `BPosition` (8 B, same layout as
+// `encode_b_position_key`). Populated during block commit (one entry per
+// receipt). Read path: S1 proxy's `eth_getTransactionReceipt(hash)` calls
+// `StateDatabase::get_tx_position(hash)` → `StateDatabase::get_receipt(pos)`.
+
+pub fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
+    hash.into()
+}
+
+pub fn encode_tx_hash_value(pos: BPosition) -> [u8; 8] {
+    encode_b_position_key(pos)
+}
+
+pub fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
+    decode_b_position_key(bytes).map_err(|_| StateError::BadEncoding {
+        table: TABLE_TX_HASH_INDEX,
+        expected: 8,
+        got: bytes.len(),
+    })
 }
 ```
+
+> **Note:** `StateError::into_with_msg` is a small helper to attach a decode message — add it as `impl StateError { pub fn into_with_msg(self, _msg: String) -> Self { self } }` in `error.rs` if it doesn't already exist, or simplify the rkyv error branch to `StateError::BadEncoding { table: TABLE_RECEIPTS, expected: 0, got: bytes.len() }`.
 
 - [ ] **Step 2: Add unit tests at the bottom of the same file**
 
@@ -800,14 +728,35 @@ mod tests {
     }
 
     #[test]
-    fn header_value_roundtrip() {
+    fn header_value_roundtrip_no_state_root() {
+        // D-Sh11: headers carry NO state_root_commitment.
         let v = HeaderValue {
-            state_root_commitment: b256!("ab"),
-            end_tx_idx: 99,
+            end_tx_idx: BPosition { term_id: 3, term_offset: 4096 },
             l2_timestamp: 1_700_000_000,
         };
         let bytes = encode_header_value(&v);
         assert_eq!(decode_header_value(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn tx_hash_index_roundtrip() {
+        // D-Sh4: tx_hash → BPosition lookup table.
+        let hash = b256!("dead");
+        let pos = BPosition { term_id: 7, term_offset: 12345 };
+        let k = encode_tx_hash_key(hash);
+        let v = encode_tx_hash_value(pos);
+        assert_eq!(k.len(), 32);
+        assert_eq!(v.len(), 8);
+        assert_eq!(decode_tx_hash_value(&v).unwrap(), pos);
+    }
+
+    #[test]
+    fn b_position_key_lexicographically_ordered() {
+        let a = encode_b_position_key(BPosition { term_id: 0, term_offset: 1 });
+        let b = encode_b_position_key(BPosition { term_id: 0, term_offset: 2 });
+        let c = encode_b_position_key(BPosition { term_id: 1, term_offset: 0 });
+        assert!(a < b);
+        assert!(b < c);
     }
 }
 ```
@@ -818,7 +767,7 @@ mod tests {
 cd /home/dev/kardamom && cargo test -p kardamom-state schema
 ```
 
-Expected: 7 unit tests pass.
+Expected: 9 unit tests pass.
 
 - [ ] **Step 4: Commit**
 
@@ -843,19 +792,19 @@ git commit -m "state: add libmdbx schema codecs with round-trip tests"
 //! to. The atomic boundary is the mdbx commit; cold-start reads the cursors
 //! to find the post-recovery snapshot point.
 //!
-//! | Key                                 | Value                          |
-//! |-------------------------------------|--------------------------------|
-//! | `last_committed_block`              | `u64 BE`                       |
-//! | `last_committed_end_tx_idx`         | `u64 BE`                       |
-//! | `last_fsynced_b_position`           | `(u64 term_id, u32 offset)`    |
-//! | `schema_version`                    | `u32 BE` (currently 1)         |
+//! | Key                                  | Value                          |
+//! |--------------------------------------|--------------------------------|
+//! | `last_committed_block`               | `u64 BE`                       |
+//! | `last_committed_end_tx_position`     | `BPosition` (8 B, i32 BE + i32 BE) |
+//! | `last_fsynced_b_position`            | `BPosition` (8 B)              |
+//! | `schema_version`                     | `u32 BE` (currently 1)         |
 
 use kardamom_types::BPosition;
 
 use crate::error::StateError;
 
 pub const KEY_LAST_COMMITTED_BLOCK: &[u8] = b"last_committed_block";
-pub const KEY_LAST_COMMITTED_END_TX_IDX: &[u8] = b"last_committed_end_tx_idx";
+pub const KEY_LAST_COMMITTED_END_TX_POSITION: &[u8] = b"last_committed_end_tx_position";
 pub const KEY_LAST_FSYNCED_B_POSITION: &[u8] = b"last_fsynced_b_position";
 pub const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 
@@ -864,7 +813,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DurableCursors {
     pub last_committed_block: u64,
-    pub last_committed_end_tx_idx: u64,
+    pub last_committed_end_tx_position: BPosition,
     pub last_fsynced_b_position: BPosition,
     pub schema_version: u32,
 }
@@ -873,11 +822,8 @@ impl Default for DurableCursors {
     fn default() -> Self {
         Self {
             last_committed_block: 0,
-            last_committed_end_tx_idx: 0,
-            last_fsynced_b_position: BPosition {
-                term_id: 0,
-                term_offset: 0,
-            },
+            last_committed_end_tx_position: BPosition { term_id: 0, term_offset: 0 },
+            last_fsynced_b_position: BPosition { term_id: 0, term_offset: 0 },
             schema_version: SCHEMA_VERSION,
         }
     }
@@ -917,28 +863,29 @@ pub fn decode_u32(bytes: &[u8]) -> Result<u32, StateError> {
     Ok(u32::from_be_bytes(arr))
 }
 
-pub fn encode_b_position(p: BPosition) -> [u8; 12] {
-    let mut out = [0u8; 12];
-    out[..8].copy_from_slice(&p.term_id.to_be_bytes());
-    out[8..].copy_from_slice(&p.term_offset.to_be_bytes());
+pub fn encode_b_position(p: BPosition) -> [u8; 8] {
+    // BPosition is `(i32 term_id, i32 term_offset)` per D-Sh1. 8 bytes total.
+    let mut out = [0u8; 8];
+    out[..4].copy_from_slice(&p.term_id.to_be_bytes());
+    out[4..].copy_from_slice(&p.term_offset.to_be_bytes());
     out
 }
 
 pub fn decode_b_position(bytes: &[u8]) -> Result<BPosition, StateError> {
-    if bytes.len() != 12 {
+    if bytes.len() != 8 {
         return Err(StateError::BadEncoding {
             table: "meta",
-            expected: 12,
+            expected: 8,
             got: bytes.len(),
         });
     }
-    let mut term_id_bytes = [0u8; 8];
-    term_id_bytes.copy_from_slice(&bytes[..8]);
+    let mut term_id_bytes = [0u8; 4];
+    term_id_bytes.copy_from_slice(&bytes[..4]);
     let mut term_offset_bytes = [0u8; 4];
-    term_offset_bytes.copy_from_slice(&bytes[8..]);
+    term_offset_bytes.copy_from_slice(&bytes[4..]);
     Ok(BPosition {
-        term_id: u64::from_be_bytes(term_id_bytes),
-        term_offset: u32::from_be_bytes(term_offset_bytes),
+        term_id: i32::from_be_bytes(term_id_bytes),
+        term_offset: i32::from_be_bytes(term_offset_bytes),
     })
 }
 
@@ -959,7 +906,9 @@ mod tests {
             term_id: 7,
             term_offset: 12345,
         };
-        assert_eq!(decode_b_position(&encode_b_position(p)).unwrap(), p);
+        let bytes = encode_b_position(p);
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(decode_b_position(&bytes).unwrap(), p);
     }
 
     #[test]
@@ -1066,9 +1015,13 @@ impl BlockDelta {
         let acct = self.accounts.0.len() * (20 + 96);
         let stor = self.storage.0.len() * (52 + 32);
         let code: usize = self.code.0.iter().map(|c| 32 + c.bytecode.len()).sum();
-        let receipts: usize = self.receipts.iter().map(|r| 8 + r.rlp.len()).sum();
-        let header = 8 + 64;
-        acct + stor + code + receipts + header
+        // Receipts: 8B key + ~256B estimate per archived Receipt (variable due
+        // to logs); good enough for sizing.
+        let receipts: usize = self.receipts.len() * (8 + 256);
+        // tx_hash_index: 32B key + 8B value per receipt.
+        let tx_index: usize = self.receipts.len() * (32 + 8);
+        let header = 8 + 20;
+        acct + stor + code + receipts + tx_index + header
     }
 }
 ```
@@ -1275,7 +1228,7 @@ git commit -m "state: open mdbx env with v0 geometry; add smoke test"
 use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, U256};
-use kardamom_types::{AccountRecord, StateDatabase, StateDatabaseError};
+use kardamom_types::{AccountRecord, BPosition, Receipt, StateDatabase, StateDatabaseError};
 use libmdbx::{NoWriteMap, RO, Transaction};
 use revm::primitives::Bytes;
 
@@ -1283,8 +1236,10 @@ use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{decode_u64, KEY_LAST_COMMITTED_BLOCK};
 use crate::schema::{
-    decode_account_value, decode_storage_value, encode_account_key, encode_code_key,
-    encode_storage_key, TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_STORAGE,
+    decode_account_value, decode_receipt_value, decode_storage_value, decode_tx_hash_value,
+    encode_account_key, encode_b_position_key, encode_code_key, encode_storage_key,
+    encode_tx_hash_key, TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
+    TABLE_TX_HASH_INDEX,
 };
 
 /// MVCC snapshot of the state DB at exactly one block boundary.
@@ -1384,6 +1339,56 @@ impl StateDatabase for StateSnapshot {
             .get(db.dbi(), &key)
             .map_err(|e| StateDatabaseError::Backend(e.to_string()))?
             .map(|b| Bytes::copy_from_slice(&b)))
+    }
+
+    /// D-Sh4: tx_hash → BPosition lookup. Feeds S1 `eth_getTransactionReceipt`.
+    fn get_tx_position(
+        &self,
+        tx_hash: B256,
+    ) -> Result<Option<BPosition>, StateDatabaseError> {
+        let key = encode_tx_hash_key(tx_hash);
+        let db = self
+            .inner
+            .txn
+            .open_db(Some(TABLE_TX_HASH_INDEX))
+            .map_err(|e| StateDatabaseError::Backend(e.to_string()))?;
+        match self
+            .inner
+            .txn
+            .get(db.dbi(), &key)
+            .map_err(|e| StateDatabaseError::Backend(e.to_string()))?
+        {
+            None => Ok(None),
+            Some(bytes) => decode_tx_hash_value(&bytes)
+                .map(Some)
+                .map_err(StateDatabaseError::from),
+        }
+    }
+
+    /// D-Sh4: load a Receipt by its canonical BPosition. Returns None if no
+    /// receipt was committed at that position (e.g. the position was a system
+    /// marker, or the tx has not yet committed).
+    fn get_receipt(
+        &self,
+        position: BPosition,
+    ) -> Result<Option<Receipt>, StateDatabaseError> {
+        let key = encode_b_position_key(position);
+        let db = self
+            .inner
+            .txn
+            .open_db(Some(TABLE_RECEIPTS))
+            .map_err(|e| StateDatabaseError::Backend(e.to_string()))?;
+        match self
+            .inner
+            .txn
+            .get(db.dbi(), &key)
+            .map_err(|e| StateDatabaseError::Backend(e.to_string()))?
+        {
+            None => Ok(None),
+            Some(bytes) => decode_receipt_value(&bytes)
+                .map(Some)
+                .map_err(StateDatabaseError::from),
+        }
     }
 }
 ```
@@ -1537,14 +1542,15 @@ use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
     encode_b_position, encode_u32, encode_u64, KEY_LAST_COMMITTED_BLOCK,
-    KEY_LAST_COMMITTED_END_TX_IDX, KEY_LAST_FSYNCED_B_POSITION, KEY_SCHEMA_VERSION,
+    KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION, KEY_SCHEMA_VERSION,
     SCHEMA_VERSION,
 };
 use crate::schema::{
-    encode_account_key, encode_account_value, encode_block_key, encode_code_key,
-    encode_header_value, encode_storage_key, encode_storage_value, encode_tx_key, AccountValue,
-    HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS,
-    TABLE_STORAGE,
+    encode_account_key, encode_account_value, encode_b_position_key, encode_block_key,
+    encode_code_key, encode_header_value, encode_receipt_value, encode_storage_key,
+    encode_storage_value, encode_tx_hash_key, encode_tx_hash_value, AccountValue, HeaderValue,
+    TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE,
+    TABLE_TX_HASH_INDEX,
 };
 use crate::snapshot::StateSnapshot;
 use crate::swap::{channel as swap_channel, SnapshotHandle, SnapshotReceiver};
@@ -1648,6 +1654,7 @@ impl StateWriter {
         let code = txn.open_db(Some(TABLE_CODE))?;
         let headers = txn.open_db(Some(TABLE_HEADERS))?;
         let receipts = txn.open_db(Some(TABLE_RECEIPTS))?;
+        let tx_hash_index = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
         let meta = txn.open_db(Some(TABLE_META))?;
 
         // --- accounts ---
@@ -1694,9 +1701,8 @@ impl StateWriter {
             }
         }
 
-        // --- headers ---
+        // --- headers (D-Sh11: no state_root_commitment) ---
         let header = HeaderValue {
-            state_root_commitment: delta.boundary.state_root_commitment,
             end_tx_idx: delta.boundary.end_tx_idx,
             l2_timestamp: delta.boundary.l2_timestamp,
         };
@@ -1707,12 +1713,23 @@ impl StateWriter {
             WriteFlags::UPSERT,
         )?;
 
-        // --- receipts ---
+        // --- receipts + tx_hash_index (D-Sh4) ---
+        // For each receipt: write the receipt at its BPosition key, AND
+        // populate tx_hash_index[receipt.tx_hash] = receipt.tx_idx so the S1
+        // proxy can serve `eth_getTransactionReceipt(hash)` via two reads:
+        //   StateDatabase::get_tx_position(hash) → StateDatabase::get_receipt(pos)
         for r in &delta.receipts {
+            let pos_key = encode_b_position_key(r.tx_idx);
             txn.put(
                 receipts.dbi(),
-                &encode_tx_key(r.tx_idx),
-                &r.rlp,
+                &pos_key,
+                &encode_receipt_value(r),
+                WriteFlags::UPSERT,
+            )?;
+            txn.put(
+                tx_hash_index.dbi(),
+                &encode_tx_hash_key(r.tx_hash),
+                &encode_tx_hash_value(r.tx_idx),
                 WriteFlags::UPSERT,
             )?;
         }
@@ -1724,10 +1741,11 @@ impl StateWriter {
             &encode_u64(delta.boundary.block_number),
             WriteFlags::UPSERT,
         )?;
+        // end_tx_idx is a BPosition (per D-Sh1 BlockBoundary shape), not u64.
         txn.put(
             meta.dbi(),
-            KEY_LAST_COMMITTED_END_TX_IDX,
-            &encode_u64(delta.boundary.end_tx_idx),
+            KEY_LAST_COMMITTED_END_TX_POSITION,
+            &encode_b_position(delta.boundary.end_tx_idx),
             WriteFlags::UPSERT,
         )?;
         txn.put(
@@ -1810,14 +1828,14 @@ use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
     decode_b_position, decode_u64, DurableCursors, KEY_LAST_COMMITTED_BLOCK,
-    KEY_LAST_COMMITTED_END_TX_IDX, KEY_LAST_FSYNCED_B_POSITION,
+    KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION,
 };
 use crate::schema::TABLE_META;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryPoint {
     pub last_committed_block: u64,
-    pub last_committed_end_tx_idx: u64,
+    pub last_committed_end_tx_position: BPosition,
     pub last_fsynced_b_position: BPosition,
 }
 
@@ -1829,21 +1847,19 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
         Some(b) => decode_u64(&b)?,
         None => 0,
     };
-    let last_committed_end_tx_idx = match txn.get(meta.dbi(), KEY_LAST_COMMITTED_END_TX_IDX)? {
-        Some(b) => decode_u64(&b)?,
-        None => 0,
-    };
+    let last_committed_end_tx_position =
+        match txn.get(meta.dbi(), KEY_LAST_COMMITTED_END_TX_POSITION)? {
+            Some(b) => decode_b_position(&b)?,
+            None => BPosition { term_id: 0, term_offset: 0 },
+        };
     let last_fsynced_b_position = match txn.get(meta.dbi(), KEY_LAST_FSYNCED_B_POSITION)? {
         Some(b) => decode_b_position(&b)?,
-        None => BPosition {
-            term_id: 0,
-            term_offset: 0,
-        },
+        None => BPosition { term_id: 0, term_offset: 0 },
     };
 
     Ok(RecoveryPoint {
         last_committed_block,
-        last_committed_end_tx_idx,
+        last_committed_end_tx_position,
         last_fsynced_b_position,
     })
 }
@@ -1852,7 +1868,7 @@ impl From<RecoveryPoint> for DurableCursors {
     fn from(p: RecoveryPoint) -> Self {
         DurableCursors {
             last_committed_block: p.last_committed_block,
-            last_committed_end_tx_idx: p.last_committed_end_tx_idx,
+            last_committed_end_tx_position: p.last_committed_end_tx_position,
             last_fsynced_b_position: p.last_fsynced_b_position,
             schema_version: crate::meta::SCHEMA_VERSION,
         }
@@ -2067,18 +2083,23 @@ pub fn open_tmp_writer() -> (tempfile::TempDir, WriterHandle) {
     (dir, writer)
 }
 
+pub fn bpos(block: u64) -> BPosition {
+    BPosition { term_id: 0, term_offset: (block * 1024) as i32 }
+}
+
 pub fn simple_delta(block: u64, addr: Address, balance: u64, slot: u64, slot_value: u64) -> BlockDelta {
+    let end_pos = bpos(block);
+    // Deterministic per-block tx_hash so tx_hash_index tests can look it up.
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes[24..].copy_from_slice(&block.to_be_bytes());
+    let tx_hash = B256::from(hash_bytes);
     BlockDelta {
         boundary: BlockBoundary {
             block_number: block,
-            end_tx_idx: block * 10,
+            end_tx_idx: end_pos,           // BPosition per D-Sh1 — NO state_root_commitment (D-Sh11)
             l2_timestamp: 1_700_000_000 + block,
-            state_root_commitment: B256::ZERO,
         },
-        end_b_position: BPosition {
-            term_id: 0,
-            term_offset: (block * 1024) as u32,
-        },
+        end_b_position: end_pos,
         accounts: AccountChanges(vec![AccountChange {
             address: addr,
             new_state: Some(NewAccountState {
@@ -2095,8 +2116,12 @@ pub fn simple_delta(block: u64, addr: Address, balance: u64, slot: u64, slot_val
         }]),
         code: CodeChanges(vec![]),
         receipts: vec![Receipt {
-            tx_idx: block * 10,
-            rlp: vec![0xab, 0xcd],
+            tx_idx: end_pos,
+            tx_hash,
+            status: true,
+            gas_used: 21_000,
+            logs: vec![],
+            write_set_hash: B256::ZERO,
         }],
     }
 }
@@ -2565,23 +2590,27 @@ fn big_delta(block: u64) -> BlockDelta {
             }
         })
         .collect();
+    let pos = BPosition { term_id: 0, term_offset: (block * 1024) as i32 };
+    let mut hash_bytes = [0u8; 32];
+    hash_bytes[24..].copy_from_slice(&block.to_be_bytes());
+    let tx_hash = B256::from(hash_bytes);
     BlockDelta {
         boundary: BlockBoundary {
             block_number: block,
-            end_tx_idx: block * 1000,
+            end_tx_idx: pos,                  // D-Sh11: no state_root_commitment
             l2_timestamp: 1_700_000_000 + block,
-            state_root_commitment: B256::ZERO,
         },
-        end_b_position: BPosition {
-            term_id: 0,
-            term_offset: (block * 1024) as u32,
-        },
+        end_b_position: pos,
         accounts: AccountChanges(accounts),
         storage: StorageChanges(vec![]),
         code: CodeChanges(vec![]),
         receipts: vec![Receipt {
-            tx_idx: block * 1000,
-            rlp: vec![],
+            tx_idx: pos,
+            tx_hash,
+            status: true,
+            gas_used: 21_000,
+            logs: vec![],
+            write_set_hash: B256::ZERO,
         }],
     }
 }
@@ -2732,7 +2761,214 @@ Expected: clean. If diffs, run `cargo fmt --all` and amend the offending commit.
 
 - [ ] **Step 5: Open the PR (only after the review step)**
 
-Defer to the user — do not auto-open. The plan ends with all changes committed locally on `claude/s6-state-writer`.
+Defer to the user — do not auto-open. The plan ends with all changes committed locally on `claude/s6-state-writer` after Task 25.
+
+---
+
+## Task 25: E2E test against real Aeron in Docker
+
+**Files:**
+- Create: `crates/kardamom-state/tests/e2e_real_aeron.rs`
+
+Per S0 D-Sh8, every component plan **must** include an e2e test that drives the real Aeron Media Driver + Archive containers (via the `testcontainers`-based harness exported by `kardamom-log` under the `testing` feature). Unit tests with the in-memory fake are fine for logic; e2e MUST be real Aeron — no mocks at this layer.
+
+This test brings up a real Aeron stack, feeds real `Receipt` and `BlockBoundary` messages through channel C, runs a real state-writer process consuming them, and asserts:
+
+1. After all blocks are committed, the libmdbx state matches the expected account / storage / receipt values.
+2. The `tx_hash_index` table correctly resolves every tx hash back to its `BPosition` and a follow-up `get_receipt(position)` returns the same receipt that was sent.
+3. The committed `headers` row contains the right `(end_tx_idx, l2_timestamp)` and **no state-root field** (D-Sh11).
+
+- [ ] **Step 1: Write the test**
+
+```rust
+//! End-to-end: real Aeron (testcontainer) → state writer (real libmdbx) →
+//! assertions on the persisted state, tx_hash_index, and headers.
+
+use std::time::Duration;
+
+use alloy_primitives::{address, B256, U256};
+use kardamom_log::testing::aeron_docker::AeronStack;       // harness from S3 (D-Sh8)
+use kardamom_log::{ChannelC, ChannelCMessage};            // channel C pub/sub on real Aeron
+use kardamom_state::{
+    env::{Durability, StateEnvBuilder},
+    AccountChange, AccountChanges, BlockDelta, CodeChanges, NewAccountState, StateWriter,
+    StorageChange, StorageChanges,
+};
+use kardamom_types::{BPosition, BlockBoundary, Receipt, StateDatabase};
+
+fn bpos(block: u64, offset: u64) -> BPosition {
+    BPosition {
+        term_id: 0,
+        term_offset: ((block * 1000) + offset) as i32,
+    }
+}
+
+fn deterministic_hash(block: u64, idx: u64) -> B256 {
+    let mut b = [0u8; 32];
+    b[16..24].copy_from_slice(&block.to_be_bytes());
+    b[24..].copy_from_slice(&idx.to_be_bytes());
+    B256::from(b)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_aeron_to_state_writer_e2e() {
+    // ---- 1. spin up real Aeron Media Driver + Archive in Docker ----
+    let aeron = AeronStack::start().await.expect("aeron docker stack");
+    let channel_c = ChannelC::connect(aeron.client_config())
+        .await
+        .expect("channel C pub/sub");
+
+    // ---- 2. spin up the real state writer against a fresh libmdbx env ----
+    let dir = tempfile::tempdir().unwrap();
+    let env = StateEnvBuilder::new(dir.path())
+        .durability(Durability::SafeNoSync)
+        .open()
+        .unwrap();
+    let writer = StateWriter::spawn(env.clone()).unwrap();
+
+    // The "state writer process": a single task that subscribes to channel C,
+    // accumulates receipts per virtual block, and forwards a `BlockDelta` to
+    // the writer whenever it sees a `BlockBoundary`. Real Aeron in the middle,
+    // real BlockDelta channel out to libmdbx.
+    let sub = channel_c.subscribe().await.expect("subscribe to C");
+    let delta_tx = writer.delta_tx.clone();
+    let consumer = tokio::spawn(async move {
+        let mut current_block: Option<u64> = None;
+        let mut current_receipts: Vec<Receipt> = Vec::new();
+        let mut current_end_pos = BPosition { term_id: 0, term_offset: 0 };
+        while let Some(msg) = sub.recv().await {
+            match msg {
+                ChannelCMessage::Receipt(r) => {
+                    current_end_pos = r.tx_idx;
+                    current_receipts.push(r);
+                }
+                ChannelCMessage::BlockBoundary(b) => {
+                    let block = b.block_number;
+                    current_block = Some(block);
+                    // Build a delta whose accounts/storage track the receipts.
+                    // For the e2e we apply a deterministic per-block account
+                    // mutation so we can assert state from the receipts alone.
+                    let addr = address!("00000000000000000000000000000000000000aa");
+                    let delta = BlockDelta {
+                        boundary: b, // contains end_tx_idx: BPosition; NO state root
+                        end_b_position: current_end_pos,
+                        accounts: AccountChanges(vec![AccountChange {
+                            address: addr,
+                            new_state: Some(NewAccountState {
+                                nonce: block,
+                                balance: U256::from(1000 + block),
+                                code_hash: B256::ZERO,
+                                storage_root: B256::ZERO,
+                            }),
+                        }]),
+                        storage: StorageChanges(vec![StorageChange {
+                            address: addr,
+                            key: U256::from(7u64),
+                            value: Some(U256::from(block * 100)),
+                        }]),
+                        code: CodeChanges(vec![]),
+                        receipts: std::mem::take(&mut current_receipts),
+                    };
+                    delta_tx.send(delta).expect("forward to writer");
+                }
+            }
+        }
+        current_block
+    });
+
+    // ---- 3. publish real Receipt+BlockBoundary messages onto Aeron ----
+    let pub_handle = channel_c.publication().await.expect("pub handle");
+    // Three blocks, two receipts each.
+    let mut all_hashes: Vec<(u64, u64, B256, BPosition)> = Vec::new();
+    for block in 1u64..=3 {
+        for idx in 0u64..2 {
+            let pos = bpos(block, idx);
+            let hash = deterministic_hash(block, idx);
+            let r = Receipt {
+                tx_idx: pos,
+                tx_hash: hash,
+                status: true,
+                gas_used: 21_000 + idx,
+                logs: vec![],
+                write_set_hash: B256::ZERO,
+            };
+            all_hashes.push((block, idx, hash, pos));
+            pub_handle
+                .send(ChannelCMessage::Receipt(r))
+                .await
+                .expect("publish receipt");
+        }
+        // Boundary closes the block at the position of the last receipt.
+        let last_pos = bpos(block, 1);
+        pub_handle
+            .send(ChannelCMessage::BlockBoundary(BlockBoundary {
+                block_number: block,
+                end_tx_idx: last_pos,
+                l2_timestamp: 1_700_000_000 + block,
+            }))
+            .await
+            .expect("publish boundary");
+    }
+
+    // ---- 4. wait for all 3 post-commit snapshots ----
+    let mut latest = None;
+    for _ in 0..3 {
+        latest = tokio::task::spawn_blocking({
+            let rx = writer.snapshot_rx.clone();
+            move || rx.recv()
+        })
+        .await
+        .unwrap();
+    }
+    let snap = latest.expect("at least one snapshot");
+
+    // ---- 5. assertions: state matches expectation ----
+    assert_eq!(snap.block_number(), 3, "all 3 blocks committed");
+    let addr = address!("00000000000000000000000000000000000000aa");
+    let acct = snap.account(addr).unwrap().expect("account exists");
+    assert_eq!(acct.balance, U256::from(1003u64));
+    assert_eq!(acct.nonce, 3);
+    let slot = snap.storage(addr, U256::from(7u64)).unwrap();
+    assert_eq!(slot, U256::from(300u64), "block 3 slot value");
+
+    // ---- 6. assertions: tx_hash_index resolves every hash correctly ----
+    for (block, idx, hash, expected_pos) in &all_hashes {
+        let pos = snap
+            .get_tx_position(*hash)
+            .expect("tx_hash_index lookup")
+            .unwrap_or_else(|| panic!("missing tx_hash entry for block {block} idx {idx}"));
+        assert_eq!(pos, *expected_pos, "tx_hash_index points at the right BPosition");
+        let r = snap
+            .get_receipt(pos)
+            .expect("receipt fetch")
+            .expect("receipt exists at position");
+        assert_eq!(r.tx_hash, *hash, "receipt at position matches by hash");
+        assert_eq!(r.gas_used, 21_000 + idx, "receipt content round-trips through Aeron + libmdbx");
+    }
+
+    // ---- 7. shutdown ----
+    drop(pub_handle);
+    drop(channel_c);
+    let _ = tokio::time::timeout(Duration::from_secs(2), consumer).await;
+    writer.shutdown().unwrap();
+    aeron.stop().await;
+}
+```
+
+- [ ] **Step 2: Run (Docker required)**
+
+```bash
+cd /home/dev/kardamom && cargo test -p kardamom-state --test e2e_real_aeron -- --nocapture
+```
+
+Expected: passes. CI runs this on every PR (see S3 D-Sh8 CI workflow).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add crates/kardamom-state/tests/e2e_real_aeron.rs
+git commit -m "state(e2e): real Aeron → state writer → libmdbx + tx_hash_index round-trip"
+```
 
 ---
 
@@ -2743,10 +2979,11 @@ Defer to the user — do not auto-open. The plan ends with all changes committed
 | `accounts` table                                            | Task 6 (schema) + Task 12 (writer) |
 | `storage` flat table                                        | Task 6 + Task 12    |
 | `code` content-addressed                                    | Task 6 + Task 12    |
-| `headers`                                                   | Task 6 + Task 12    |
-| `receipts` (optional)                                       | Task 6 + Task 12    |
+| `headers` (D-Sh11: no state root)                           | Task 6 + Task 12    |
+| `receipts`                                                  | Task 6 + Task 12    |
+| `tx_hash_index` (D-Sh4)                                     | Task 6 (schema) + Task 12 (populate) + Task 10 (`get_tx_position`/`get_receipt` impl) |
 | `meta` cursors                                              | Task 7 + Task 12 + Task 13 |
-| `StateDatabase` trait (location decided)                    | Task 2 (in `kardamom-types`) |
+| `StateDatabase` trait — **defined upstream** in `kardamom-types` (D-Sh1); implemented here | Task 1 (extend trait) + Task 10 (`impl`) |
 | RO snapshot impl                                            | Task 10             |
 | Snapshot-swap protocol                                      | Task 11 (channel) + Task 12 (writer publishes) |
 | Write path consuming local executor channel                 | Task 8 (BlockDelta) + Task 12 (writer) |
@@ -2763,10 +3000,11 @@ Defer to the user — do not auto-open. The plan ends with all changes committed
 | Concurrent reader test (4 readers)                          | Task 21             |
 | Bench: write throughput                                     | Task 22             |
 | Bench: snapshot open latency <100 µs                        | Task 23             |
+| **E2E** real Aeron → state writer → libmdbx (D-Sh8)         | **Task 25**         |
 | §4.6 — "fall behind > horizon ⇒ executor sees snapshot exhaustion, halt" | Task 4 (error variant) + Task 5 (horizon doc) + Task 12 (bounded channel == hard backpressure) |
 
 ## Open questions for the user / S4 coordinator
 
-1. **`StateDatabase` trait location.** This plan puts it in a brand-new `kardamom-types` crate (Task 1–2) so neither S4 nor S6 depends on the other. If the S4 plan author already picked a different location, collapse Task 1–2 and re-point Task 10's `impl` block accordingly — no other plan steps change.
-2. **`BPosition` / `BlockBoundary` / `Receipt` source.** This plan stubs them in `kardamom-types` because S3 is also in-flight. Once S3 lands, S3 must move these stubs into a `kardamom-log` re-export with identical field layouts (or we migrate `kardamom-types` to re-export from `kardamom-log`). Task 2 is the canonical site for the field shapes.
-3. **`libmdbx` crate choice.** Plan uses `libmdbx = "0.6"` (vorot93). Alternative is `signet-libmdbx = "0.8"` (init4tech, MIT/Apache-2.0 vs MPL-2.0 — friendlier license, more actively maintained). If the workspace prefers MIT/Apache-only deps for license hygiene, swap the dep and adjust the few `libmdbx::*` import paths in Task 9–14. Behaviour is equivalent.
+1. ~~**`StateDatabase` trait location.**~~ Resolved by S0 D-Sh1: defined in `kardamom-types`, **implemented** here. Task 1 only extends the trait with the two receipt-lookup methods (D-Sh4).
+2. ~~**`BPosition` / `BlockBoundary` / `Receipt` source.**~~ Resolved by S0 D-Sh1: owned by `kardamom-types`. `BlockBoundary` does **not** carry a state-root commitment (D-Sh11). `Receipt` shape (with `tx_idx: BPosition`, `tx_hash: B256`, etc.) is fixed upstream — this plan does not redefine any of it.
+3. **`libmdbx` crate choice.** Plan uses `libmdbx = "0.6"` (vorot93, MPL-2.0). Alternative `signet-libmdbx = "0.8"` (init4tech, MIT/Apache-2.0). See S0 D-Sh9: default is `libmdbx`; if workspace standardizes on MIT/Apache, swap the dep + adjust import paths in Task 9–14. Behaviour equivalent.

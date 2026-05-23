@@ -2,25 +2,33 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the `kardamom-log` crate: the transport-and-durability foundation that every other kardamom subsystem depends on. It owns Aeron channel B (canonical-ordered tx log, fsynced with quorum), Aeron channel C (RAM-only receipt/boundary stream), the per-recorder background `io_uring` fsync worker, and the quorum fsync-watermark aggregator. It also defines the shared message types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary*`, `FsyncWatermark`, `QuorumWatermark`) that S1, S2, S4, S5, S6, S7 import as their interface contract.
+**Goal:** Ship the three foundation crates that every other kardamom subsystem depends on:
+
+1. **`kardamom-types`** — pure data types and traits (BPosition, TxEnvelope, Receipt, BlockBoundaryStart, BlockBoundary, FsyncWatermark, QuorumWatermark, CachedReceipt, BlockDelta, StateDatabase trait, SnapshotSource trait). No Aeron, no libmdbx, no I/O dependencies. All wire types derive `rkyv::{Archive, Serialize, Deserialize}`.
+2. **`kardamom-log`** — Aeron channel implementations (B and C), per-recorder background `io_uring` fsync worker, quorum fsync-watermark aggregator, receipt-cache channel, plus a `testing` feature exposing in-memory pub/sub fakes and a `tests/docker_e2e.rs` testcontainers harness. Depends on `kardamom-types`. Defines **no** wire types of its own.
+3. **`kardamom-leases`** — lease primitive (deterministic lowest-host-id-among-caught-up-recorders, derived from per-recorder `FsyncWatermark` streams). Used by S2 (sequencer hot standby), S5 (sealer leader election), S7 (L1 batcher leader election). Depends on `kardamom-types`.
+
+This split is mandated by **D-Sh1** in `docs/plans/2026-05-23-S0-shared-decisions.md`.
 
 **Architecture:**
 - **Aeron client:** `rusteron-archive` (GSR-maintained Rust wrapper over the Aeron C client), with the Aeron Media Driver and Aeron Archive Java process run out-of-process under a small Rust supervisor. We do not reimplement Aeron; we drive it.
-- **Channel B:** one Aeron stream, concurrent multi-publisher, recorded by N independent `aeron-archive` recorders (one per host). Recording goes through the standard Aeron Archive control protocol so we get `replay-merge` for free during recovery.
+- **Channel B:** one Aeron stream, concurrent multi-publisher, recorded by N independent `aeron-archive` recorders (one per host). Recording goes through the standard Aeron Archive control protocol so we get `replay-merge` for free during recovery. **No custom replay API** — Aeron Archive already exposes the standard replay protocol; offline consumers (e.g. S7) read segment files directly or use Aeron Archive's built-in replay (per D-Sh10).
 - **Continuous fsync:** each recorder host runs a Rust process (the *fsync sidecar*) that opens the active Archive segment file with `O_DIRECT`, watches the recorder's published `recording-position` counter, and pipelines `IORING_OP_WRITE` (mirror-write of the buffer) + `IORING_OP_FSYNC` (`fdatasync` flag) through an `io_uring` SQ. After every completion, it publishes a `FsyncWatermark` on a per-recorder Aeron stream.
 - **Quorum aggregator:** subscribes to all N per-recorder watermark streams, maintains a `[BPosition; N]` array, and publishes the Q-th smallest position as a `QuorumWatermark` on a shared stream that proxies/sequencers subscribe to.
 - **Channel C:** plain Aeron multi-publisher stream, RAM only, no Archive. Same wire codec as B for shared infra.
-- **Wire codec:** `bincode` v2 with fixed-int encoding. Chosen over `alloy-rlp` because all hot-path messages are non-Ethereum-canonical (internal IPC), bincode is ~3× faster on encode and the messages are not externally observable.
-- **Runtime:** `tokio` for the supervisors, control plane, and tests. The fsync hot loop is a dedicated OS thread driving `io_uring` directly (the `io-uring` crate, not `tokio-uring`) — see Task 2 for the justification.
+- **Receipt-cache channel:** plain Aeron multi-publisher stream carrying `CachedReceipt` messages from the executor to short-lived consumers (proxy nonce-cache invalidations etc.). RAM only.
+- **Wire codec:** `rkyv` v0.8 (zero-copy archival serialization). Types in `kardamom-types` derive `rkyv::Archive`, `rkyv::Serialize`, `rkyv::Deserialize`. `kardamom-log` reads `Archived<T>` views straight out of Aeron buffers (no allocation, no decode pass) and only materializes to owned `T` when callers explicitly ask. Per D-Sh2.
+- **Runtime:** `tokio` for the supervisors, control plane, and tests. The fsync hot loop is a dedicated OS thread driving `io_uring` directly (the `io-uring` crate, not `tokio-uring`) — see Task 9 for the justification.
 
 **Tech Stack:**
-- Rust 2024, workspace deps from `/home/dev/kardamom/Cargo.toml` (alloy-primitives 1.6, tokio 1, serde 1, tracing 0.1, thiserror 2)
+- Rust 2024, workspace deps from `/home/dev/kardamom/Cargo.toml` (alloy-primitives 1.6, tokio 1, tracing 0.1, thiserror 2)
+- `rkyv` 0.8 (zero-copy serialization; replaces bincode per D-Sh2)
 - `rusteron-client` and `rusteron-archive` (latest 0.1.x as of 2026-05) — Aeron C bindings, maintained by GSR
 - `io-uring` (the `tokio-rs/io-uring` crate, raw SQ/CQ API) — lowest overhead for the continuous-submission fsync loop
-- `bincode` 2.x with the `serde` feature
+- `testcontainers` v0.20+ (Docker-based Aeron Media Driver + Archive containers for e2e tests)
 - `criterion` 0.5 for benchmarks
 - `tempfile` 3, `tokio-test` for tests
-- Aeron 1.45+ binaries (Media Driver + Archive) installed on the build host; the supervisor `Command`-spawns them
+- Aeron 1.45+ binaries (Media Driver + Archive) installed on the build host *for native tests*; the Docker harness vendors the same versions for e2e tests
 
 **Branch:** `claude/s3-canonical-log` (branched off `main` after PR #12 — the design-spec PR — merges).
 
@@ -57,45 +65,94 @@ We surveyed three options:
 
 ## File Structure
 
-All paths under `/home/dev/kardamom/crates/kardamom-log/`.
+S3 owns three crates: `kardamom-types`, `kardamom-log`, `kardamom-leases`.
+
+### `crates/kardamom-types/` — pure data types
+
+```
+crates/kardamom-types/
+├── Cargo.toml             # deps: alloy-primitives, bytes, rkyv (no I/O crates)
+├── src/
+│   ├── lib.rs             # re-exports
+│   ├── position.rs        # BPosition
+│   ├── envelope.rs        # TxEnvelope
+│   ├── receipt.rs         # Receipt, CachedReceipt
+│   ├── boundary.rs        # BlockBoundaryStart, BlockBoundary
+│   ├── watermark.rs       # FsyncWatermark, QuorumWatermark
+│   ├── delta.rs           # BlockDelta (account/storage/code changes + receipts)
+│   └── state.rs           # StateDatabase trait, SnapshotSource trait
+└── tests/
+    └── rkyv_roundtrip.rs  # archive/deserialize roundtrip for every wire type
+```
+
+### `crates/kardamom-log/` — Aeron channels + recorder + fsync sidecar + watermark aggregator + receipt-cache channel + testing fakes
 
 ```
 crates/kardamom-log/
-├── Cargo.toml
+├── Cargo.toml                  # deps: kardamom-types, rkyv, rusteron-*, io-uring, tokio, ...
+│                               # dev-deps: testcontainers, criterion, tempfile
+│                               # features: ["testing"] gates in-memory fake module
 ├── src/
-│   ├── lib.rs                 # re-exports; crate-level docs
-│   ├── error.rs               # LogError (thiserror)
-│   ├── types.rs               # BPosition, TxEnvelope, Receipt, BlockBoundary*, FsyncWatermark, QuorumWatermark
-│   ├── codec.rs               # bincode encode/decode wrappers
-│   ├── supervisor.rs          # spawns Aeron Media Driver + Archive as child processes
-│   ├── publisher.rs           # ChannelBPublisher, ChannelCPublisher (rusteron wrappers)
-│   ├── subscriber.rs          # ChannelBSubscriber, ChannelCSubscriber (rusteron wrappers)
-│   ├── recorder.rs            # Recorder: drives rusteron-archive recording control
-│   ├── fsync_sidecar.rs       # io_uring O_DIRECT mirror + fdatasync loop
-│   ├── watermark.rs           # FsyncWatermark publisher + QuorumWatermark aggregator
-│   └── config.rs              # LogConfig (channels, paths, N, Q, segment size)
+│   ├── lib.rs                  # re-exports; crate-level docs
+│   ├── error.rs                # LogError (thiserror)
+│   ├── codec.rs                # rkyv encode + zero-copy access<'a, T>
+│   ├── supervisor.rs           # spawns Aeron Media Driver + Archive as child processes
+│   ├── publisher.rs            # ChannelBPublisher, ChannelCPublisher, ReceiptCachePublisher (rusteron wrappers)
+│   ├── subscriber.rs           # ChannelBSubscriber, ChannelCSubscriber, ReceiptCacheSubscriber (rusteron wrappers)
+│   ├── recorder.rs             # Recorder: drives rusteron-archive recording control
+│   ├── fsync_sidecar.rs        # io_uring O_DIRECT mirror + fdatasync loop
+│   ├── watermark.rs            # FsyncWatermark publisher + QuorumWatermark aggregator
+│   ├── receipt_cache.rs        # CachedReceipt pub/sub channel wrapper
+│   ├── testing.rs              # gated `#[cfg(any(test, feature = "testing"))]`:
+│   │                           #   in-memory Publication, Subscription, ConcurrentPublication,
+│   │                           #   FsyncWatermark fakes
+│   └── config.rs               # LogConfig (channels, paths, N, Q, segment size)
+├── docker/
+│   └── aeron/
+│       ├── Dockerfile          # builds Media Driver + Archive Java image
+│       └── docker-compose.yml  # optional multi-container compose for 3-recorder e2e
 ├── tests/
 │   ├── codec_roundtrip.rs
 │   ├── watermark_quorum.rs
 │   ├── publisher_subscriber.rs
 │   ├── fsync_sidecar.rs
-│   └── recorder_cluster.rs    # integration: 3 recorders × 4 publishers × 1000 messages
+│   ├── docker_e2e.rs           # testcontainers-driven real Aeron e2e (D-Sh8)
+│   └── recorder_cluster.rs     # integration: 3 recorders × 4 publishers × 1000 messages
 └── benches/
     ├── publish_throughput.rs
     ├── subscribe_throughput.rs
     └── fsync_watermark_latency.rs
 ```
 
+### `crates/kardamom-leases/` — lease primitive
+
+```
+crates/kardamom-leases/
+├── Cargo.toml             # deps: kardamom-types, tokio, tracing
+│                          # dev-deps: kardamom-log with features = ["testing"]
+├── src/
+│   ├── lib.rs
+│   └── lease.rs           # Lease: deterministic lowest-host-id from FsyncWatermark streams
+└── tests/
+    └── lease.rs           # uses kardamom-log testing fakes to simulate watermark streams
+```
+
 ---
 
-## Task 1: Scaffold the `kardamom-log` crate
+## Task 1: Scaffold the three foundation crates
+
+Per D-Sh1, S3 owns three crates. Scaffold them all in one task so cross-crate deps line up.
 
 **Files:**
+- Create: `crates/kardamom-types/Cargo.toml`
+- Create: `crates/kardamom-types/src/lib.rs`
 - Create: `crates/kardamom-log/Cargo.toml`
 - Create: `crates/kardamom-log/src/lib.rs`
-- Modify: `Cargo.toml` (workspace already globs `crates/*`, so nothing to do there — verify)
+- Create: `crates/kardamom-leases/Cargo.toml`
+- Create: `crates/kardamom-leases/src/lib.rs`
+- Modify: root `Cargo.toml` (workspace deps)
 
-- [ ] **Step 1: Verify the workspace will pick up the new crate**
+- [ ] **Step 1: Verify the workspace will pick up the new crates**
 
 ```bash
 grep -n 'members' /home/dev/kardamom/Cargo.toml
@@ -103,22 +160,85 @@ grep -n 'members' /home/dev/kardamom/Cargo.toml
 
 Expected: shows `members = ["crates/*"]`. No edit needed.
 
-- [ ] **Step 2: Add `bincode`, `io-uring`, `rusteron-client`, `rusteron-archive`, `criterion`, `tempfile` to workspace deps**
+- [ ] **Step 2: Add new workspace deps**
 
 Edit `/home/dev/kardamom/Cargo.toml`, append under `[workspace.dependencies]`:
 
 ```toml
-# S3 canonical-log
-bincode = { version = "2", features = ["serde"] }
+# S3 foundation crates
+kardamom-types = { path = "crates/kardamom-types" }
+kardamom-log = { path = "crates/kardamom-log" }
+kardamom-leases = { path = "crates/kardamom-leases" }
+
+# S3 external deps
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck"] }
 io-uring = "0.7"
 rusteron-client = "0.1"
 rusteron-archive = "0.1"
+testcontainers = "0.20"
 criterion = "0.5"
 tempfile = "3"
 bytes = "1"
+libc = "0.2"
+futures = "0.3"
 ```
 
-- [ ] **Step 3: Write `crates/kardamom-log/Cargo.toml`**
+Note: `serde` and `bincode` are intentionally **not** required by these crates. Wire serialization is rkyv (D-Sh2). `serde` may still appear elsewhere in the workspace for unrelated reasons (config files, etc.).
+
+- [ ] **Step 3: Write `crates/kardamom-types/Cargo.toml`**
+
+```toml
+[package]
+name = "kardamom-types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+bytes.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# rkyv roundtrip tests only — nothing I/O
+```
+
+This crate **must not** depend on Aeron, tokio I/O, libmdbx, alloy-provider, jsonrpsee, rusteron, io-uring, or any other transport/storage crate. Enforce by review.
+
+- [ ] **Step 4: Write `crates/kardamom-types/src/lib.rs` skeleton**
+
+```rust
+//! Pure data types and traits shared across the kardamom subsystems.
+//!
+//! No I/O. No Aeron. No libmdbx. Everything in this crate is `#[no_std]`-
+//! friendly in spirit (we still use `alloc` for `Vec`/`Bytes`).
+//!
+//! Wire types (`TxEnvelope`, `Receipt`, `BlockBoundary*`, `CachedReceipt`,
+//! `FsyncWatermark`, `QuorumWatermark`, `BlockDelta`) derive
+//! `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]`. Consumers
+//! that need zero-copy access use `rkyv::access::<Archived<T>>(bytes)`;
+//! consumers that need an owned value call `rkyv::deserialize`.
+
+pub mod boundary;
+pub mod delta;
+pub mod envelope;
+pub mod position;
+pub mod receipt;
+pub mod state;
+pub mod watermark;
+
+pub use boundary::{BlockBoundary, BlockBoundaryStart};
+pub use delta::BlockDelta;
+pub use envelope::TxEnvelope;
+pub use position::BPosition;
+pub use receipt::{CachedReceipt, Receipt};
+pub use state::{SnapshotSource, StateDatabase};
+pub use watermark::{FsyncWatermark, QuorumWatermark};
+```
+
+Stub each module file with `// stub` until Task 2.
+
+- [ ] **Step 5: Write `crates/kardamom-log/Cargo.toml`**
 
 ```toml
 [package]
@@ -126,14 +246,24 @@ name = "kardamom-log"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+# Exposes in-memory pub/sub fakes that mimic the Aeron-backed channel surface,
+# for other crates' unit tests. Real Aeron is still required for e2e (see
+# tests/docker_e2e.rs).
+testing = []
+
 [dependencies]
 alloy-primitives.workspace = true
-bincode.workspace = true
 bytes.workspace = true
+futures.workspace = true
 io-uring.workspace = true
+kardamom-types.workspace = true
+libc.workspace = true
+rkyv.workspace = true
 rusteron-archive.workspace = true
 rusteron-client.workspace = true
-serde.workspace = true
+serde.workspace = true                  # for `LogConfig` TOML parsing only
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -141,7 +271,10 @@ tracing.workspace = true
 [dev-dependencies]
 criterion.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["test-util"] }
+testcontainers.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+# Enable our own `testing` feature for unit tests inside this crate.
+kardamom-log = { path = ".", features = ["testing"] }
 
 [[bench]]
 name = "publish_throughput"
@@ -156,54 +289,83 @@ name = "fsync_watermark_latency"
 harness = false
 ```
 
-- [ ] **Step 4: Write a skeleton `src/lib.rs`**
+- [ ] **Step 6: Write `crates/kardamom-log/src/lib.rs` skeleton**
 
 ```rust
-//! Kardamom canonical log: Aeron-backed channels B and C, plus the io_uring
-//! fsync sidecar and quorum watermark aggregator that give channel B its
-//! durability guarantee.
+//! Kardamom canonical log: Aeron-backed channels B and C, the receipt-cache
+//! channel, the io_uring fsync sidecar, and the quorum watermark aggregator
+//! that give channel B its durability guarantee.
 //!
-//! This crate defines the *interface types* that the other kardamom subsystems
-//! (S1 ingress, S2 sequencer, S4 executor, S5 sealer, S6 state writer,
-//! S7 batcher) consume. Treat the public API of [`types`] as a stable contract.
+//! This crate owns the **transport implementation** only. Wire data types live
+//! in [`kardamom_types`] (re-exported from there). Do not add new wire types
+//! here — extend `kardamom-types` instead, per D-Sh1.
 
 pub mod codec;
 pub mod config;
 pub mod error;
 pub mod fsync_sidecar;
 pub mod publisher;
+pub mod receipt_cache;
 pub mod recorder;
 pub mod subscriber;
 pub mod supervisor;
-pub mod types;
 pub mod watermark;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 pub use error::LogError;
-pub use types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope,
-};
+// Re-export the shared types so existing call sites can `use kardamom_log::types::*`
+// transparently (they import from kardamom-types under the hood).
+pub mod types {
+    pub use kardamom_types::*;
+}
 ```
 
-- [ ] **Step 5: Stub each module so the crate compiles**
+- [ ] **Step 7: Write `crates/kardamom-leases/Cargo.toml`**
 
-Create each module file with `// stub` comment + no items. Then for each unresolved symbol added in Step 4, create the minimal pub item:
+```toml
+[package]
+name = "kardamom-leases"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kardamom-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kardamom-log = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+```
+
+- [ ] **Step 8: Write `crates/kardamom-leases/src/lib.rs` skeleton**
 
 ```rust
-// crates/kardamom-log/src/types.rs
-use alloy_primitives::B256;
+//! Lease primitive used by sequencer hot-standby (S2), sealer leader election
+//! (S5), and L1 batcher leader election (S7).
+//!
+//! V0 implementation: deterministic *lowest-host-id among caught-up recorders*,
+//! computed from per-recorder `FsyncWatermark` streams. No external KV, no
+//! consensus library. A host "holds the lease" iff it has the lowest id among
+//! recorders whose `FsyncWatermark.position` is within `caught_up_window` of
+//! the quorum watermark.
 
+pub mod lease;
+pub use lease::{Lease, LeaseConfig};
+```
+
+Stub `lease.rs` with `// stub` until a later task implements it.
+
+- [ ] **Step 9: Stub each module so all three crates compile**
+
+For each `// stub` module, add minimal pub items as needed so `cargo build -p <crate>` succeeds. For example:
+
+```rust
+// crates/kardamom-types/src/position.rs
 pub struct BPosition;
-pub struct TxEnvelope;
-pub struct Receipt;
-pub struct BlockBoundary;
-pub struct BlockBoundaryStart;
-pub struct FsyncWatermark;
-pub struct QuorumWatermark;
-
-// Force B256 into the import path so later tasks have it available.
-#[allow(dead_code)]
-const _: Option<B256> = None;
 ```
 
 ```rust
@@ -215,42 +377,75 @@ pub enum LogError {
 }
 ```
 
-Create `codec.rs`, `config.rs`, `fsync_sidecar.rs`, `publisher.rs`, `recorder.rs`, `subscriber.rs`, `supervisor.rs`, `watermark.rs` each containing just `// stub`.
+```rust
+// crates/kardamom-leases/src/lease.rs
+pub struct Lease;
+pub struct LeaseConfig;
+```
 
-- [ ] **Step 6: Build the workspace**
+- [ ] **Step 10: Build the workspace**
 
 ```bash
-cd /home/dev/kardamom && cargo build -p kardamom-log
+cd /home/dev/kardamom && cargo build -p kardamom-types -p kardamom-log -p kardamom-leases
 ```
 
 Expected: builds cleanly. Warnings about unused stubs are OK.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 11: Commit**
 
 ```bash
 cd /home/dev/kardamom
-git add Cargo.toml crates/kardamom-log
-git commit -m "log: scaffold kardamom-log crate"
+git add Cargo.toml crates/kardamom-types crates/kardamom-log crates/kardamom-leases
+git commit -m "log: scaffold kardamom-{types,log,leases} crates"
 ```
 
 ---
 
-## Task 2: Define shared message types
+## Task 2: Define shared message types in `kardamom-types` (rkyv)
+
+These types are the **interface contract** for the other six S-plans. Field names, types, `Ord` semantics, and rkyv derives must not drift after this task lands.
+
+Per D-Sh1: types live in `kardamom-types`, not `kardamom-log`.
+Per D-Sh2: wire codec is rkyv 0.8 zero-copy.
+Per D-Sh1 / D-Sh11: `BlockBoundary` does **not** carry `state_root_commitment`.
+Per D-Sh1 / D-Sh3: `TxEnvelope.sender` and `TxEnvelope.tx_hash` are always populated (no `Option`).
+Per D-Sh1 / D-Sh4: `Receipt.tx_hash` is propagated from the envelope (no recomputation).
 
 **Files:**
-- Modify: `crates/kardamom-log/src/types.rs`
-- Create: `crates/kardamom-log/tests/codec_roundtrip.rs`
+- Modify: `crates/kardamom-types/src/position.rs`
+- Modify: `crates/kardamom-types/src/envelope.rs`
+- Modify: `crates/kardamom-types/src/receipt.rs`
+- Modify: `crates/kardamom-types/src/boundary.rs`
+- Modify: `crates/kardamom-types/src/watermark.rs`
+- Modify: `crates/kardamom-types/src/delta.rs`
+- Modify: `crates/kardamom-types/src/state.rs`
+- Create: `crates/kardamom-types/tests/rkyv_roundtrip.rs`
+- Modify: `crates/kardamom-log/src/codec.rs` (rkyv access helpers)
+- Modify: `crates/kardamom-log/src/error.rs`
 
-These types are the **interface contract** for the other six S-plans. Field names, types, and `Ord` semantics must not drift after this task lands.
-
-- [ ] **Step 1: Write the failing roundtrip test**
+- [ ] **Step 1: Write the failing rkyv roundtrip test in `kardamom-types`**
 
 ```rust
-// crates/kardamom-log/tests/codec_roundtrip.rs
-use alloy_primitives::{B256, Log, LogData};
+// crates/kardamom-types/tests/rkyv_roundtrip.rs
+use alloy_primitives::{Address, B256, Log, LogData};
 use bytes::Bytes;
-use kardamom_log::codec::{decode, encode};
-use kardamom_log::types::*;
+use kardamom_types::*;
+
+fn roundtrip<T>(value: &T) -> T
+where
+    T: rkyv::Archive
+        + for<'a> rkyv::Serialize<
+            rkyv::api::high::HighSerializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'a>,
+                rkyv::rancor::Error,
+            >,
+        >,
+    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>,
+{
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(value).unwrap();
+    rkyv::from_bytes::<T, rkyv::rancor::Error>(&bytes).unwrap()
+}
 
 #[test]
 fn bposition_orders_by_term_then_offset() {
@@ -264,25 +459,30 @@ fn bposition_orders_by_term_then_offset() {
 
 #[test]
 fn tx_envelope_roundtrip() {
-    let v = TxEnvelope { correlation_id: 0xDEAD_BEEF, raw_tx: Bytes::from_static(b"hello") };
-    let bytes = encode(&v).unwrap();
-    let back: TxEnvelope = decode(&bytes).unwrap();
+    let v = TxEnvelope {
+        correlation_id: 0xDEAD_BEEF,
+        raw_tx: Bytes::from_static(b"hello"),
+        sender: Address::repeat_byte(0x11),
+        tx_hash: B256::repeat_byte(0x22),
+    };
+    let back = roundtrip(&v);
     assert_eq!(v.correlation_id, back.correlation_id);
     assert_eq!(v.raw_tx, back.raw_tx);
+    assert_eq!(v.sender, back.sender);
+    assert_eq!(v.tx_hash, back.tx_hash);
 }
 
 #[test]
 fn receipt_roundtrip() {
     let v = Receipt {
         tx_idx: BPosition { term_id: 3, term_offset: 4096 },
+        tx_hash: B256::repeat_byte(0x44),
         status: true,
         gas_used: 21_000,
         logs: vec![Log { address: Default::default(), data: LogData::default() }],
         write_set_hash: B256::repeat_byte(0xAB),
     };
-    let bytes = encode(&v).unwrap();
-    let back: Receipt = decode(&bytes).unwrap();
-    assert_eq!(v, back);
+    assert_eq!(roundtrip(&v), v);
 }
 
 #[test]
@@ -292,59 +492,66 @@ fn boundary_roundtrip() {
         end_tx_idx: BPosition { term_id: 1, term_offset: 999 },
         l2_timestamp: 1_700_000_000,
     };
-    let bytes = encode(&start).unwrap();
-    assert_eq!(decode::<BlockBoundaryStart>(&bytes).unwrap(), start);
+    assert_eq!(roundtrip(&start), start);
 
+    // BlockBoundary has NO state_root_commitment field (D-Sh1 / D-Sh11).
     let end = BlockBoundary {
         block_number: 7,
         end_tx_idx: BPosition { term_id: 1, term_offset: 999 },
         l2_timestamp: 1_700_000_000,
-        state_root_commitment: B256::repeat_byte(0xCD),
     };
-    let bytes = encode(&end).unwrap();
-    assert_eq!(decode::<BlockBoundary>(&bytes).unwrap(), end);
+    assert_eq!(roundtrip(&end), end);
 }
 
 #[test]
 fn watermark_roundtrip() {
     let w = FsyncWatermark { recorder_id: 2, position: BPosition { term_id: 4, term_offset: 1024 } };
-    let bytes = encode(&w).unwrap();
-    assert_eq!(decode::<FsyncWatermark>(&bytes).unwrap(), w);
+    assert_eq!(roundtrip(&w), w);
 
     let q = QuorumWatermark { position: BPosition { term_id: 4, term_offset: 1024 } };
-    let bytes = encode(&q).unwrap();
-    assert_eq!(decode::<QuorumWatermark>(&bytes).unwrap(), q);
+    assert_eq!(roundtrip(&q), q);
+}
+
+#[test]
+fn cached_receipt_roundtrip() {
+    let cr = CachedReceipt {
+        sender: Address::repeat_byte(0x33),
+        nonce: 42,
+        tx_hash: B256::repeat_byte(0x44),
+        receipt: Receipt {
+            tx_idx: BPosition { term_id: 1, term_offset: 0 },
+            tx_hash: B256::repeat_byte(0x44),
+            status: true,
+            gas_used: 21_000,
+            logs: vec![],
+            write_set_hash: B256::ZERO,
+        },
+    };
+    assert_eq!(roundtrip(&cr), cr);
 }
 ```
 
-- [ ] **Step 2: Run the test to confirm it fails**
+- [ ] **Step 2: Run, confirm FAIL** (types are still stubs)
 
 ```bash
-cd /home/dev/kardamom && cargo test -p kardamom-log --test codec_roundtrip
+cd /home/dev/kardamom && cargo test -p kardamom-types --test rkyv_roundtrip
 ```
 
-Expected: FAIL — `BPosition` is a unit struct in the stub, fields don't exist; `encode`/`decode` missing.
-
-- [ ] **Step 3: Implement the real types**
-
-Replace `crates/kardamom-log/src/types.rs`:
+- [ ] **Step 3: Implement `crates/kardamom-types/src/position.rs`**
 
 ```rust
-//! Public message types shared across the kardamom subsystems.
-//!
-//! Layout: every type derives `Clone`, `Debug`, `Eq`, `PartialEq`,
-//! `serde::Serialize`, `serde::Deserialize`. `BPosition` additionally derives
-//! `Ord` and `PartialOrd` — ordering is `(term_id, term_offset)` lexicographic
-//! so that watermark comparisons are a single cmp.
+//! Position in Aeron channel B's recording — the canonical L2 tx identifier.
 
-use alloy_primitives::{B256, Log};
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+use rkyv::{Archive, Deserialize, Serialize};
 
-/// Position in Aeron channel B's recording — the canonical L2 tx identifier.
 /// Aeron's `term_id` is `i32`; `term_offset` is the byte offset within the term
 /// and is always non-negative but typed `i32` to match Aeron's wire format.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+/// Ordering is `(term_id, term_offset)` lexicographic so watermark comparisons
+/// are a single cmp.
+#[derive(
+    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Archive, Serialize, Deserialize,
+)]
+#[rkyv(derive(Debug), compare(PartialEq, PartialOrd))]
 pub struct BPosition {
     pub term_id: i32,
     pub term_offset: i32,
@@ -353,27 +560,80 @@ pub struct BPosition {
 impl BPosition {
     pub const ZERO: Self = Self { term_id: 0, term_offset: 0 };
 }
+```
 
-/// A raw signed Ethereum transaction with the proxy's correlation id attached.
-/// Published on channel B by sequencers.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+- [ ] **Step 4: Implement `crates/kardamom-types/src/envelope.rs`**
+
+```rust
+//! Tx envelope. `sender` and `tx_hash` are *always* populated by the proxy
+//! (D-Sh3, D-Sh4). Downstream code trusts both fields unconditionally.
+
+use alloy_primitives::{Address, B256};
+use bytes::Bytes;
+use rkyv::{Archive, Deserialize, Serialize};
+
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct TxEnvelope {
     pub correlation_id: u64,
     pub raw_tx: Bytes,
+    /// Recovered by the proxy from the secp256k1 signature at decode time.
+    /// CFT trust boundary: every downstream consumer treats this as authoritative.
+    pub sender: Address,
+    /// `keccak256(raw_tx)` computed by the proxy alongside sig verification.
+    /// Never recomputed downstream; propagates unchanged into `Receipt.tx_hash`.
+    pub tx_hash: B256,
 }
+```
+
+- [ ] **Step 5: Implement `crates/kardamom-types/src/receipt.rs`**
+
+```rust
+//! Per-tx execution receipt and the receipt-cache message.
+
+use alloy_primitives::{Address, B256, Log};
+use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::position::BPosition;
 
 /// Per-tx execution receipt. Published on channel C by executor replicas.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct Receipt {
     pub tx_idx: BPosition,
+    /// Copied from `TxEnvelope.tx_hash` — never recomputed by the executor (D-Sh4).
+    pub tx_hash: B256,
     pub status: bool,
     pub gas_used: u64,
     pub logs: Vec<Log>,
     pub write_set_hash: B256,
 }
 
+/// Receipt-cache message: pushed by the executor onto the receipt-cache
+/// channel so consumers (proxy nonce cache, RPC frontends) can invalidate and
+/// repopulate without round-tripping through libmdbx.
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct CachedReceipt {
+    pub sender: Address,
+    pub nonce: u64,
+    pub tx_hash: B256,
+    pub receipt: Receipt,
+}
+```
+
+- [ ] **Step 6: Implement `crates/kardamom-types/src/boundary.rs`**
+
+```rust
+//! Block boundary markers. State root is **not** carried (D-Sh11).
+
+use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::position::BPosition;
+
 /// Block-boundary marker emitted by the sealer onto channel B.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct BlockBoundaryStart {
     pub block_number: u64,
     pub end_tx_idx: BPosition,
@@ -381,17 +641,29 @@ pub struct BlockBoundaryStart {
 }
 
 /// Block-boundary closeout emitted by executors onto channel C once they have
-/// finished executing through `end_tx_idx`.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+/// finished executing through `end_tx_idx`. No `state_root_commitment` field
+/// (D-Sh11 — state-root attestation is a deferred validator concern).
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct BlockBoundary {
     pub block_number: u64,
     pub end_tx_idx: BPosition,
     pub l2_timestamp: u64,
-    pub state_root_commitment: B256,
 }
+```
+
+- [ ] **Step 7: Implement `crates/kardamom-types/src/watermark.rs`**
+
+```rust
+//! Fsync watermark types.
+
+use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::position::BPosition;
 
 /// Single-recorder fsync progress. Published on a per-recorder watermark stream.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct FsyncWatermark {
     pub recorder_id: u8,
     pub position: BPosition,
@@ -399,44 +671,150 @@ pub struct FsyncWatermark {
 
 /// Q-of-N aggregated fsync progress. Published on the shared watermark stream
 /// that proxies subscribe to for the I2 ack guarantee.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct QuorumWatermark {
     pub position: BPosition,
 }
 ```
 
-- [ ] **Step 4: Implement `codec.rs`**
+- [ ] **Step 8: Implement `crates/kardamom-types/src/delta.rs`**
 
 ```rust
-//! Bincode v2 (fixed-int, little-endian) wire codec for log messages.
+//! Block-write payload from executor to state writer.
 //!
-//! Chosen over `alloy-rlp` because all hot-path messages are internal IPC,
-//! never exposed to L1, and bincode is roughly 3× faster on encode for the
-//! per-tx envelope. If we ever need to expose any of these on a public RPC,
-//! mirror types live elsewhere and translate.
+//! Carries the full account / storage / code mutations + receipts produced by
+//! a sealed block, so the S6 state writer can commit them atomically.
 
-use serde::{Deserialize, Serialize};
+use alloy_primitives::{Address, B256, U256};
+use rkyv::{Archive, Deserialize, Serialize};
 
-use crate::error::LogError;
+use crate::receipt::Receipt;
 
-fn config() -> bincode::config::Configuration<bincode::config::LittleEndian, bincode::config::Fixint> {
-    bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding()
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct AccountChange {
+    pub address: Address,
+    pub nonce: u64,
+    pub balance: U256,
+    pub code_hash: B256,
 }
 
-pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>, LogError> {
-    bincode::serde::encode_to_vec(value, config()).map_err(|e| LogError::Codec(e.to_string()))
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct StorageChange {
+    pub address: Address,
+    pub key: B256,
+    pub value: U256,
 }
 
-pub fn decode<T: for<'de> Deserialize<'de>>(bytes: &[u8]) -> Result<T, LogError> {
-    let (v, _): (T, usize) =
-        bincode::serde::decode_from_slice(bytes, config()).map_err(|e| LogError::Codec(e.to_string()))?;
-    Ok(v)
+#[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub struct BlockDelta {
+    pub block_number: u64,
+    pub accounts: Vec<AccountChange>,
+    pub storage: Vec<StorageChange>,
+    pub code: Vec<(B256, Vec<u8>)>,
+    pub receipts: Vec<Receipt>,
 }
 ```
 
-- [ ] **Step 5: Extend `error.rs`**
+- [ ] **Step 9: Implement `crates/kardamom-types/src/state.rs`**
+
+```rust
+//! State-access traits. The `StateDatabase` trait is `revm::Database`-compatible
+//! (in spirit; we do not depend on revm here). S4's executor consumes any
+//! implementor; S6 ships the libmdbx-backed one.
+
+use alloy_primitives::{Address, B256, U256};
+
+use crate::position::BPosition;
+use crate::receipt::Receipt;
+
+/// Errors a state implementation may surface. Concrete crates wrap their own.
+pub trait StateError: std::error::Error + Send + Sync + 'static {}
+
+/// Read-only state access. A "snapshot" is a point-in-time view that does not
+/// observe writes made by later blocks.
+pub trait StateDatabase: Send + Sync {
+    type Error: StateError;
+
+    fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error>;
+    fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error>;
+    fn code_by_hash(&self, code_hash: B256) -> Result<Vec<u8>, Self::Error>;
+
+    /// Receipt lookup by canonical position.
+    fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error>;
+
+    /// tx_hash → BPosition (the `tx_hash_index` table in S6).
+    fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error>;
+}
+
+/// Source of fresh post-block state snapshots. The executor calls
+/// [`SnapshotSource::snapshot_after`] when the state writer signals that a
+/// block is durable.
+pub trait SnapshotSource: Send + Sync {
+    type Db: StateDatabase;
+
+    fn snapshot_after(&self, block_number: u64) -> Self::Db;
+}
+```
+
+- [ ] **Step 10: Implement `crates/kardamom-log/src/codec.rs` — zero-copy access**
+
+```rust
+//! rkyv zero-copy access helpers.
+//!
+//! The hot path reads `Archived<T>` views straight out of Aeron fragment
+//! buffers — no allocation, no decode pass. Convert to an owned `T` only when
+//! the caller explicitly asks (`materialize`), e.g. when they need to outlive
+//! the fragment buffer.
+//!
+//! Per D-Sh2: rkyv v0.8 replaces the earlier bincode choice. Wire types live
+//! in `kardamom-types`; this crate is transport only.
+
+use rkyv::api::high::{HighDeserializer, HighSerializer};
+use rkyv::rancor;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::error::LogError;
+
+/// Encode a wire value to a fresh `AlignedVec` suitable for handing to
+/// `rusteron`'s `offer()`.
+pub fn encode<T>(value: &T) -> Result<AlignedVec, LogError>
+where
+    T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+{
+    rkyv::to_bytes::<rancor::Error>(value).map_err(|e| LogError::Codec(e.to_string()))
+}
+
+/// Zero-copy access: borrow an `&Archived<T>` view of `bytes` without
+/// allocating. Returns an error if the bytes are not a valid rkyv archive
+/// for `T`.
+pub fn access<T>(bytes: &[u8]) -> Result<&T::Archived, LogError>
+where
+    T: Archive,
+    T::Archived: rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'_, rancor::Error>>,
+{
+    rkyv::access::<T::Archived, rancor::Error>(bytes).map_err(|e| LogError::Codec(e.to_string()))
+}
+
+/// Owning decode: copy an `Archived<T>` into an owned `T`. Use when the value
+/// must outlive the fragment buffer or when downstream code needs `T`
+/// directly. Hot-path consumers prefer [`access`] instead.
+pub fn materialize<T>(bytes: &[u8]) -> Result<T, LogError>
+where
+    T: Archive,
+    T::Archived: Deserialize<T, HighDeserializer<rancor::Error>>
+        + rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'_, rancor::Error>>,
+{
+    rkyv::from_bytes::<T, rancor::Error>(bytes).map_err(|e| LogError::Codec(e.to_string()))
+}
+```
+
+- [ ] **Step 11: Extend `crates/kardamom-log/src/error.rs`**
 
 ```rust
 #[derive(Debug, thiserror::Error)]
@@ -458,20 +836,48 @@ pub enum LogError {
 }
 ```
 
-- [ ] **Step 6: Run the test and confirm pass**
+- [ ] **Step 12: Add a thin `kardamom-log` codec roundtrip test**
 
-```bash
-cd /home/dev/kardamom && cargo test -p kardamom-log --test codec_roundtrip
+```rust
+// crates/kardamom-log/tests/codec_roundtrip.rs
+use alloy_primitives::{Address, B256};
+use bytes::Bytes;
+use kardamom_log::codec::{access, encode, materialize};
+use kardamom_types::*;
+
+#[test]
+fn log_codec_access_and_materialize() {
+    let v = TxEnvelope {
+        correlation_id: 7,
+        raw_tx: Bytes::from_static(b"raw"),
+        sender: Address::repeat_byte(0xAA),
+        tx_hash: B256::repeat_byte(0xBB),
+    };
+    let bytes = encode(&v).unwrap();
+
+    // Zero-copy view.
+    let view = access::<TxEnvelope>(&bytes).unwrap();
+    assert_eq!(view.correlation_id, 7);
+
+    // Owning view.
+    let back: TxEnvelope = materialize(&bytes).unwrap();
+    assert_eq!(back, v);
+}
 ```
 
-Expected: all five tests PASS.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 13: Run all tests, confirm PASS**
 
 ```bash
-git add crates/kardamom-log/src/types.rs crates/kardamom-log/src/codec.rs \
+cd /home/dev/kardamom && cargo test -p kardamom-types --test rkyv_roundtrip \
+                       && cargo test -p kardamom-log --test codec_roundtrip
+```
+
+- [ ] **Step 14: Commit**
+
+```bash
+git add crates/kardamom-types crates/kardamom-log/src/codec.rs \
         crates/kardamom-log/src/error.rs crates/kardamom-log/tests/codec_roundtrip.rs
-git commit -m "log: shared message types + bincode codec"
+git commit -m "types: rkyv wire types; log: rkyv access/materialize codec helpers"
 ```
 
 ---
@@ -531,6 +937,11 @@ pub struct ChannelsConfig {
     pub c_channel: String,
     pub c_stream_id: i32,
 
+    /// Receipt-cache channel: `CachedReceipt` messages for proxy/RPC consumers.
+    /// Not recorded.
+    pub receipt_cache_channel: String,
+    pub receipt_cache_stream_id: i32,
+
     /// Per-recorder fsync watermark publication, parameterized by recorder_id.
     /// e.g. "aeron:ipc?alias=fsync-wm-{rid}".
     pub fsync_watermark_channel_template: String,
@@ -578,6 +989,8 @@ impl Default for LogConfig {
                 b_stream_id: 1001,
                 c_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
                 c_stream_id: 1002,
+                receipt_cache_channel: "aeron:udp?endpoint=224.0.1.1:40003".into(),
+                receipt_cache_stream_id: 1003,
                 fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),
                 fsync_watermark_stream_id: 1010,
                 quorum_watermark_channel: "aeron:udp?endpoint=224.0.1.1:40020".into(),
@@ -623,8 +1036,8 @@ The aggregator is the only piece with non-trivial logic that does not touch Aero
 
 ```rust
 // crates/kardamom-log/tests/watermark_quorum.rs
-use kardamom_log::types::{BPosition, FsyncWatermark};
 use kardamom_log::watermark::QuorumState;
+use kardamom_types::{BPosition, FsyncWatermark};
 
 fn pos(t: i32, o: i32) -> BPosition { BPosition { term_id: t, term_offset: o } }
 fn w(rid: u8, t: i32, o: i32) -> FsyncWatermark { FsyncWatermark { recorder_id: rid, position: pos(t, o) } }
@@ -713,7 +1126,7 @@ Replace the stub in `crates/kardamom-log/src/watermark.rs` with:
 //! advancing, and the quorum stalls past it once Q-1 survivors have moved
 //! beyond it. The supervisor is responsible for restarting dead recorders.
 
-use crate::types::{BPosition, FsyncWatermark};
+use kardamom_types::{BPosition, FsyncWatermark};
 
 #[derive(Clone, Debug)]
 pub struct QuorumState {
@@ -953,15 +1366,19 @@ This is the first task that touches `rusteron-archive`. The publisher API is int
 
 use std::sync::Arc;
 
+use rkyv::api::high::HighSerializer;
+use rkyv::rancor;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
 use rusteron_client::Aeron;
-use serde::Serialize;
 use tracing::warn;
 
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use crate::types::{
-    BPosition, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+use kardamom_types::{
+    BPosition, BlockBoundaryStart, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt,
+    TxEnvelope,
 };
 
 /// Channel B: canonical tx log. Concurrent-pub.
@@ -1003,8 +1420,27 @@ impl ChannelCPublisher {
         offer(&self.pub_handle, r)
     }
 
-    pub fn publish_boundary(&self, b: &crate::types::BlockBoundary) -> Result<BPosition, LogError> {
+    pub fn publish_boundary(&self, b: &kardamom_types::BlockBoundary) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, b)
+    }
+}
+
+/// Receipt-cache channel: per-tx `CachedReceipt` messages. RAM only,
+/// consumed by short-lived clients (proxy nonce cache, RPC frontends).
+pub struct ReceiptCachePublisher {
+    pub_handle: rusteron_client::ConcurrentPublication,
+}
+
+impl ReceiptCachePublisher {
+    pub fn open(aeron: &Aeron, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let pub_handle = aeron
+            .add_concurrent_publication(&ch.receipt_cache_channel, ch.receipt_cache_stream_id)
+            .map_err(|e| LogError::Aeron(format!("add_concurrent_publication rc: {e}")))?;
+        Ok(Self { pub_handle })
+    }
+
+    pub fn publish(&self, r: &CachedReceipt) -> Result<BPosition, LogError> {
+        offer(&self.pub_handle, r)
     }
 }
 
@@ -1047,15 +1483,18 @@ impl QuorumPublisher {
     }
 }
 
-fn offer<T: Serialize>(
+fn offer<T>(
     p: &rusteron_client::ConcurrentPublication,
     msg: &T,
-) -> Result<BPosition, LogError> {
-    let bytes = codec::encode(msg)?;
+) -> Result<BPosition, LogError>
+where
+    T: for<'a> rkyv::Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+{
+    let bytes: AlignedVec = codec::encode(msg)?;
     // rusteron::ConcurrentPublication::offer returns the new stream position
     // (or a negative back-pressure code). Retry up to 1024 times on back-pressure.
     for attempt in 0..1024 {
-        let r = p.offer(&bytes);
+        let r = p.offer(bytes.as_slice());
         if r >= 0 {
             return Ok(decode_position(r));
         }
@@ -1116,21 +1555,32 @@ Subscribers poll Aeron `Image`s and decode incoming bytes into typed messages. T
 
 use std::sync::Arc;
 
+use rkyv::api::high::HighDeserializer;
+use rkyv::rancor;
 use rusteron_client::Aeron;
-use serde::de::DeserializeOwned;
 
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use crate::types::{BPosition, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope};
+use kardamom_types::{
+    BPosition, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+};
 
-/// Generic single-stream subscriber over a typed message.
+/// Generic single-stream subscriber over a typed message. Materializes each
+/// fragment into an owned `T` for ergonomics. Hot-path consumers that want
+/// zero-copy use [`Subscribers::b_zero_copy`] (TODO follow-up) which hands
+/// `&Archived<T>` directly to the callback.
 pub struct TypedSubscriber<T> {
     sub: rusteron_client::Subscription,
     _marker: std::marker::PhantomData<T>,
 }
 
-impl<T: DeserializeOwned + 'static> TypedSubscriber<T> {
+impl<T> TypedSubscriber<T>
+where
+    T: rkyv::Archive + 'static,
+    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rancor::Error>>,
+{
     pub fn open(aeron: &Aeron, channel: &str, stream_id: i32) -> Result<Self, LogError> {
         let sub = aeron
             .add_subscription(channel, stream_id)
@@ -1138,15 +1588,35 @@ impl<T: DeserializeOwned + 'static> TypedSubscriber<T> {
         Ok(Self { sub, _marker: std::marker::PhantomData })
     }
 
-    /// Poll once and invoke `f` on every fragment that arrived in this poll
-    /// cycle. Returns the number of fragments processed.
+    /// Poll once and invoke `f` with an owned `T` on every fragment that
+    /// arrived in this poll cycle. Returns the number of fragments processed.
     pub fn poll<F: FnMut(T, BPosition)>(&mut self, mut f: F, fragment_limit: usize) -> usize {
         self.sub.poll(
             |bytes: &[u8], header: rusteron_client::Header| {
-                match codec::decode::<T>(bytes) {
+                match codec::materialize::<T>(bytes) {
                     Ok(v) => f(v, BPosition { term_id: header.term_id(), term_offset: header.term_offset() }),
                     Err(e) => tracing::error!(error = %e, "decode failed"),
                 }
+            },
+            fragment_limit,
+        )
+    }
+
+    /// Zero-copy poll: invoke `f` with a borrowed `&Archived<T>` view that
+    /// lives only for the duration of the callback. Use for hot-path readers
+    /// that don't need ownership.
+    pub fn poll_zero_copy<F: FnMut(&T::Archived, BPosition)>(
+        &mut self,
+        mut f: F,
+        fragment_limit: usize,
+    ) -> usize {
+        self.sub.poll(
+            |bytes: &[u8], header: rusteron_client::Header| match codec::access::<T>(bytes) {
+                Ok(view) => f(view, BPosition {
+                    term_id: header.term_id(),
+                    term_offset: header.term_offset(),
+                }),
+                Err(e) => tracing::error!(error = %e, "access failed"),
             },
             fragment_limit,
         )
@@ -1155,6 +1625,7 @@ impl<T: DeserializeOwned + 'static> TypedSubscriber<T> {
 
 pub type ChannelBSubscriber = TypedSubscriber<TxEnvelope>;
 pub type ChannelCReceiptSubscriber = TypedSubscriber<Receipt>;
+pub type ReceiptCacheSubscriber = TypedSubscriber<CachedReceipt>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
 pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
 
@@ -1171,6 +1642,14 @@ impl Subscribers {
 
     pub fn c_receipts(&self) -> Result<ChannelCReceiptSubscriber, LogError> {
         TypedSubscriber::open(&self.aeron, &self.ch.c_channel, self.ch.c_stream_id)
+    }
+
+    pub fn receipt_cache(&self) -> Result<ReceiptCacheSubscriber, LogError> {
+        TypedSubscriber::open(
+            &self.aeron,
+            &self.ch.receipt_cache_channel,
+            self.ch.receipt_cache_stream_id,
+        )
     }
 
     pub fn watermark(&self, recorder_id: u8) -> Result<WatermarkSubscriber, LogError> {
@@ -1323,7 +1802,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use kardamom_log::fsync_sidecar::{FsyncSidecar, PositionSource};
-use kardamom_log::types::BPosition;
+use kardamom_types::BPosition;
 
 struct FakePosition(Arc<AtomicI64>);
 impl PositionSource for FakePosition {
@@ -1417,7 +1896,7 @@ use io_uring::{opcode, types, IoUring};
 use libc::O_DIRECT;
 
 use crate::error::LogError;
-use crate::types::BPosition;
+use kardamom_types::BPosition;
 
 pub trait PositionSource: Send {
     /// Returns the (monotonically increasing) Aeron stream position in bytes
@@ -1675,7 +2154,7 @@ use crate::config::{ChannelsConfig, QuorumConfig};
 use crate::error::LogError;
 use crate::publisher::QuorumPublisher;
 use crate::subscriber::Subscribers;
-use crate::types::QuorumWatermark;
+use kardamom_types::QuorumWatermark;
 
 /// Tokio task that drains all N per-recorder watermark subscriptions and
 /// republishes the quorum position whenever it advances.
@@ -1758,12 +2237,13 @@ This is the first end-to-end test that boots a real Aeron Media Driver. It is ga
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_log::config::LogConfig;
 use kardamom_log::publisher::ChannelBPublisher;
 use kardamom_log::subscriber::Subscribers;
 use kardamom_log::supervisor::Supervisor;
-use kardamom_log::types::TxEnvelope;
+use kardamom_types::TxEnvelope;
 
 fn aeron_binaries_available() -> bool {
     std::env::var("AERON_MEDIA_DRIVER_BIN").is_ok()
@@ -1806,6 +2286,8 @@ async fn channel_b_publisher_subscriber_roundtrip() {
                 pub_arc.publish_tx(&TxEnvelope {
                     correlation_id: p * 1000 + i,
                     raw_tx: Bytes::from(format!("tx-{p}-{i}").into_bytes()),
+                    sender: Address::repeat_byte(p as u8),
+                    tx_hash: B256::repeat_byte(i as u8),
                 }).unwrap();
             }
         }));
@@ -1873,13 +2355,14 @@ The big one. Three recorders (each a Media Driver + Archive + fsync sidecar), fo
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_log::config::LogConfig;
 use kardamom_log::publisher::{ChannelBPublisher, QuorumPublisher};
 use kardamom_log::subscriber::Subscribers;
 use kardamom_log::supervisor::Supervisor;
-use kardamom_log::types::{BPosition, TxEnvelope};
 use kardamom_log::watermark::QuorumAggregator;
+use kardamom_types::{BPosition, TxEnvelope};
 
 fn aeron_available() -> bool {
     std::env::var("AERON_MEDIA_DRIVER_BIN").is_ok()
@@ -1943,6 +2426,8 @@ async fn three_recorders_quorum_advances_and_tolerates_one_failure() {
                         .publish_tx(&TxEnvelope {
                             correlation_id: p * 1000 + i,
                             raw_tx: Bytes::from(vec![0xCDu8; 256]),
+                            sender: Address::repeat_byte(p as u8),
+                            tx_hash: B256::repeat_byte(i as u8),
                         })
                         .unwrap();
                 }
@@ -1986,7 +2471,12 @@ async fn three_recorders_quorum_advances_and_tolerates_one_failure() {
     let mut after_kill_pos = last_pub_pos;
     for i in 0..100u64 {
         after_kill_pos = pubr
-            .publish_tx(&TxEnvelope { correlation_id: 99_000 + i, raw_tx: Bytes::from_static(b"x") })
+            .publish_tx(&TxEnvelope {
+                correlation_id: 99_000 + i,
+                raw_tx: Bytes::from_static(b"x"),
+                sender: Address::ZERO,
+                tx_hash: B256::repeat_byte(i as u8),
+            })
             .unwrap();
     }
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -2002,7 +2492,12 @@ async fn three_recorders_quorum_advances_and_tolerates_one_failure() {
     let mut stalled = BPosition::ZERO;
     for i in 0..100u64 {
         stalled = pubr
-            .publish_tx(&TxEnvelope { correlation_id: 199_000 + i, raw_tx: Bytes::from_static(b"y") })
+            .publish_tx(&TxEnvelope {
+                correlation_id: 199_000 + i,
+                raw_tx: Bytes::from_static(b"y"),
+                sender: Address::ZERO,
+                tx_hash: B256::repeat_byte(i as u8),
+            })
             .unwrap();
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -2048,12 +2543,13 @@ git commit -m "log: 3-recorder cluster integration test (quorum + failure)"
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kardamom_log::config::LogConfig;
 use kardamom_log::publisher::ChannelBPublisher;
 use kardamom_log::supervisor::Supervisor;
-use kardamom_log::types::TxEnvelope;
+use kardamom_types::TxEnvelope;
 
 fn bench(c: &mut Criterion) {
     if std::env::var("AERON_MEDIA_DRIVER_BIN").is_err() {
@@ -2082,7 +2578,12 @@ fn bench(c: &mut Criterion) {
         let payload = payload.clone();
         let mut i = 0u64;
         b.iter(|| {
-            pubr.publish_tx(&TxEnvelope { correlation_id: i, raw_tx: payload.clone() }).unwrap();
+            pubr.publish_tx(&TxEnvelope {
+                correlation_id: i,
+                raw_tx: payload.clone(),
+                sender: Address::ZERO,
+                tx_hash: B256::ZERO,
+            }).unwrap();
             i += 1;
         });
     });
@@ -2101,13 +2602,14 @@ criterion_main!(benches);
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use kardamom_log::config::LogConfig;
 use kardamom_log::publisher::ChannelBPublisher;
 use kardamom_log::subscriber::Subscribers;
 use kardamom_log::supervisor::Supervisor;
-use kardamom_log::types::TxEnvelope;
+use kardamom_types::TxEnvelope;
 
 fn bench(c: &mut Criterion) {
     if std::env::var("AERON_MEDIA_DRIVER_BIN").is_err() {
@@ -2129,7 +2631,12 @@ fn bench(c: &mut Criterion) {
     let pubr = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
     let payload = Bytes::from(vec![0xAB; 200]);
     for i in 0..100_000u64 {
-        pubr.publish_tx(&TxEnvelope { correlation_id: i, raw_tx: payload.clone() }).unwrap();
+        pubr.publish_tx(&TxEnvelope {
+            correlation_id: i,
+            raw_tx: payload.clone(),
+            sender: Address::ZERO,
+            tx_hash: B256::ZERO,
+        }).unwrap();
     }
 
     let subs = Subscribers { aeron: aeron.clone(), ch: cfg.channels.clone() };
@@ -2211,73 +2718,976 @@ git commit -m "log: criterion benches (publish, subscribe, fsync watermark)"
 
 ---
 
-## Task 15: Crate-level README and final lint pass
+## Task 15: `testing` feature — in-memory pub/sub fakes
+
+Per D-Sh8: every other crate's unit tests reuse a single in-memory channel impl from `kardamom-log`. Real Aeron is reserved for e2e tests (see Task 16). The fakes mimic the surface area of `ChannelBPublisher`, `ChannelBSubscriber`, `ConcurrentPublication`, and `FsyncWatermark` streams so call sites swap the backing without changing logic.
 
 **Files:**
-- Create: `crates/kardamom-log/README.md`
-- Run: `cargo fmt --all`, `cargo clippy -p kardamom-log -- -D warnings`
+- Modify: `crates/kardamom-log/src/testing.rs`
+- Create: `crates/kardamom-log/tests/testing_fakes.rs`
 
-- [ ] **Step 1: Write `README.md`**
+- [ ] **Step 1: Write the fakes**
+
+```rust
+// crates/kardamom-log/src/testing.rs
+//! In-memory pub/sub fakes used by other crates' unit tests.
+//!
+//! Gated behind `#[cfg(any(test, feature = "testing"))]`. Importers add this
+//! crate as `kardamom-log = { workspace = true, features = ["testing"] }`
+//! to `[dev-dependencies]`.
+//!
+//! These fakes are intentionally simple: an `Arc<Mutex<VecDeque<Vec<u8>>>>`
+//! per stream id, no Aeron involvement. They preserve **per-publisher FIFO**
+//! order (sufficient for unit-testing components that consume the channel)
+//! but do not model Aeron's concurrent-pub interleaving. Tests that need to
+//! verify behavior under realistic interleaving go through the real Aeron
+//! Docker harness (Task 16), not these fakes.
+
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use rkyv::api::high::{HighDeserializer, HighSerializer};
+use rkyv::rancor;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
+use rkyv::{Archive, Deserialize, Serialize};
+
+use crate::error::LogError;
+use kardamom_types::{BPosition, FsyncWatermark};
+
+/// In-memory bus shared by all `FakePublication` / `FakeSubscription` handles
+/// that target the same `(channel, stream_id)` pair. Clone is cheap (an `Arc`).
+#[derive(Clone, Default)]
+pub struct FakeBus {
+    streams: Arc<Mutex<HashMap<(String, i32), Arc<Mutex<StreamState>>>>>,
+}
+
+#[derive(Default)]
+struct StreamState {
+    /// Append-only log of (offset, bytes). Subscribers track their read cursor.
+    log: Vec<(i64, AlignedVec)>,
+    /// Next byte offset (mimics Aeron's stream position).
+    next_offset: i64,
+}
+
+impl FakeBus {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn stream(&self, channel: &str, stream_id: i32) -> Arc<Mutex<StreamState>> {
+        let mut g = self.streams.lock().unwrap();
+        g.entry((channel.to_string(), stream_id))
+            .or_insert_with(|| Arc::new(Mutex::new(StreamState::default())))
+            .clone()
+    }
+}
+
+/// Drop-in for `rusteron_client::ConcurrentPublication` in tests.
+pub struct FakeConcurrentPublication {
+    state: Arc<Mutex<StreamState>>,
+}
+
+impl FakeConcurrentPublication {
+    pub fn offer(&self, bytes: &[u8]) -> i64 {
+        let mut g = self.state.lock().unwrap();
+        let off = g.next_offset;
+        let mut copy = AlignedVec::with_capacity(bytes.len());
+        copy.extend_from_slice(bytes);
+        g.log.push((off, copy));
+        g.next_offset += bytes.len() as i64;
+        g.next_offset
+    }
+}
+
+/// Drop-in for `rusteron_client::Subscription` in tests.
+pub struct FakeSubscription {
+    state: Arc<Mutex<StreamState>>,
+    cursor: usize,
+}
+
+impl FakeSubscription {
+    /// Mirrors the real subscriber's `poll(&mut self, callback, fragment_limit)`.
+    pub fn poll<F: FnMut(&[u8], FakeHeader)>(&mut self, mut f: F, fragment_limit: usize) -> usize {
+        let g = self.state.lock().unwrap();
+        let mut delivered = 0;
+        while delivered < fragment_limit && self.cursor < g.log.len() {
+            let (off, ref bytes) = g.log[self.cursor];
+            let header = FakeHeader::from_offset(off);
+            f(bytes.as_slice(), header);
+            self.cursor += 1;
+            delivered += 1;
+        }
+        delivered
+    }
+}
+
+/// Mimics `rusteron_client::Header` enough for our consumers.
+#[derive(Clone, Copy, Debug)]
+pub struct FakeHeader {
+    term_id: i32,
+    term_offset: i32,
+}
+
+impl FakeHeader {
+    pub fn from_offset(off: i64) -> Self {
+        const TERM_LEN: i64 = 16 * 1024 * 1024;
+        Self {
+            term_id: (off / TERM_LEN) as i32,
+            term_offset: (off % TERM_LEN) as i32,
+        }
+    }
+    pub fn term_id(&self) -> i32 {
+        self.term_id
+    }
+    pub fn term_offset(&self) -> i32 {
+        self.term_offset
+    }
+}
+
+/// High-level fake publication that consumers can use in place of
+/// `ChannelBPublisher` / `ChannelCPublisher` / `ReceiptCachePublisher`.
+pub struct FakePublication {
+    pub_handle: FakeConcurrentPublication,
+}
+
+impl FakePublication {
+    pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
+        Self {
+            pub_handle: FakeConcurrentPublication {
+                state: bus.stream(channel, stream_id),
+            },
+        }
+    }
+
+    pub fn publish<T>(&self, msg: &T) -> Result<BPosition, LogError>
+    where
+        T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+    {
+        let bytes = rkyv::to_bytes::<rancor::Error>(msg)
+            .map_err(|e| LogError::Codec(e.to_string()))?;
+        let off = self.pub_handle.offer(bytes.as_slice());
+        let header = FakeHeader::from_offset(off);
+        Ok(BPosition {
+            term_id: header.term_id(),
+            term_offset: header.term_offset(),
+        })
+    }
+}
+
+/// High-level fake subscription for owned-value reads.
+pub struct FakeTypedSubscription<T> {
+    sub: FakeSubscription,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<T> FakeTypedSubscription<T>
+where
+    T: Archive + 'static,
+    T::Archived: Deserialize<T, HighDeserializer<rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rancor::Error>>,
+{
+    pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
+        Self {
+            sub: FakeSubscription {
+                state: bus.stream(channel, stream_id),
+                cursor: 0,
+            },
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn poll<F: FnMut(T, BPosition)>(&mut self, mut f: F, fragment_limit: usize) -> usize {
+        self.sub.poll(
+            |bytes: &[u8], header: FakeHeader| {
+                if let Ok(v) = rkyv::from_bytes::<T, rancor::Error>(bytes) {
+                    f(v, BPosition {
+                        term_id: header.term_id(),
+                        term_offset: header.term_offset(),
+                    });
+                }
+            },
+            fragment_limit,
+        )
+    }
+}
+
+/// In-memory fake fsync-watermark stream: an `Arc<Mutex<VecDeque<FsyncWatermark>>>`
+/// keyed by recorder id. Lease/aggregator tests publish into one of these and
+/// poll on the other side.
+#[derive(Clone, Default)]
+pub struct FakeFsyncWatermarkStream {
+    inner: Arc<Mutex<HashMap<u8, VecDeque<FsyncWatermark>>>>,
+}
+
+impl FakeFsyncWatermarkStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn publish(&self, w: FsyncWatermark) {
+        let mut g = self.inner.lock().unwrap();
+        g.entry(w.recorder_id).or_default().push_back(w);
+    }
+
+    pub fn drain(&self, recorder_id: u8) -> Vec<FsyncWatermark> {
+        let mut g = self.inner.lock().unwrap();
+        g.get_mut(&recorder_id)
+            .map(|q| q.drain(..).collect())
+            .unwrap_or_default()
+    }
+}
+```
+
+- [ ] **Step 2: Smoke-test the fakes from the same crate**
+
+```rust
+// crates/kardamom-log/tests/testing_fakes.rs
+#![cfg(feature = "testing")]
+
+use alloy_primitives::{Address, B256};
+use bytes::Bytes;
+use kardamom_log::testing::{FakeBus, FakeFsyncWatermarkStream, FakePublication, FakeTypedSubscription};
+use kardamom_types::{BPosition, FsyncWatermark, TxEnvelope};
+
+#[test]
+fn fake_pub_sub_roundtrip() {
+    let bus = FakeBus::new();
+    let pubr = FakePublication::open(&bus, "test", 1);
+    let mut sub = FakeTypedSubscription::<TxEnvelope>::open(&bus, "test", 1);
+
+    let env = TxEnvelope {
+        correlation_id: 42,
+        raw_tx: Bytes::from_static(b"abc"),
+        sender: Address::repeat_byte(0x11),
+        tx_hash: B256::repeat_byte(0x22),
+    };
+    pubr.publish(&env).unwrap();
+
+    let mut received: Vec<TxEnvelope> = Vec::new();
+    sub.poll(|t, _| received.push(t), 16);
+    assert_eq!(received, vec![env]);
+}
+
+#[test]
+fn fake_fsync_watermark_stream_per_recorder() {
+    let stream = FakeFsyncWatermarkStream::new();
+    stream.publish(FsyncWatermark { recorder_id: 0, position: BPosition { term_id: 1, term_offset: 100 } });
+    stream.publish(FsyncWatermark { recorder_id: 0, position: BPosition { term_id: 1, term_offset: 200 } });
+    stream.publish(FsyncWatermark { recorder_id: 1, position: BPosition { term_id: 1, term_offset: 50 } });
+
+    assert_eq!(stream.drain(0).len(), 2);
+    assert_eq!(stream.drain(1).len(), 1);
+    assert!(stream.drain(2).is_empty());
+}
+```
+
+- [ ] **Step 3: Run, confirm PASS**
+
+```bash
+cd /home/dev/kardamom && cargo test -p kardamom-log --features testing --test testing_fakes
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/kardamom-log/src/testing.rs crates/kardamom-log/tests/testing_fakes.rs \
+        crates/kardamom-log/Cargo.toml
+git commit -m "log: testing feature — in-memory pub/sub + watermark fakes"
+```
+
+---
+
+## Task 16: Docker Aeron e2e harness (testcontainers)
+
+Per D-Sh8: every e2e test (across S1–S7) **MUST** use a real Aeron backend. We ship the Aeron Media Driver + Aeron Archive as Docker images and expose a reusable `AeronTestCluster` harness driven by `testcontainers`. Other crates reuse this harness from their own e2e tests by depending on `kardamom-log` with `features = ["testing"]`.
+
+**Files:**
+- Create: `crates/kardamom-log/docker/aeron/Dockerfile`
+- Create: `crates/kardamom-log/docker/aeron/docker-compose.yml`
+- Modify: `crates/kardamom-log/src/testing.rs` (extend with `AeronTestCluster`)
+- Create: `crates/kardamom-log/tests/docker_e2e.rs`
+
+- [ ] **Step 1: Write the Dockerfile**
+
+```dockerfile
+# crates/kardamom-log/docker/aeron/Dockerfile
+#
+# Aeron Media Driver + Aeron Archive in a single container image. The
+# entrypoint script starts the Media Driver in the background, waits for the
+# CnC file, then starts the Archive in the foreground (so container lifecycle
+# tracks the Archive).
+#
+# The image vendors Aeron 1.45.0 (matching what `rusteron-archive` 0.1.x
+# targets). Pin the version explicitly — drift in the Aeron wire protocol is
+# a guaranteed source of "works on my laptop" bugs.
+
+FROM eclipse-temurin:21-jre-jammy AS base
+
+ARG AERON_VERSION=1.45.0
+ENV AERON_VERSION=${AERON_VERSION}
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends curl ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /opt/aeron && \
+    curl -L "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_VERSION}/aeron-all-${AERON_VERSION}.jar" \
+        -o /opt/aeron/aeron-all.jar
+
+ENV AERON_DIR=/dev/shm/aeron
+ENV AERON_ARCHIVE_DIR=/var/lib/aeron/archive
+ENV AERON_MEDIA_DRIVER_CLASS=io.aeron.driver.MediaDriver
+ENV AERON_ARCHIVE_CLASS=io.aeron.archive.ArchivingMediaDriver
+
+# Sensible defaults for testing — small term length to keep RSS low.
+ENV AERON_TERM_BUFFER_LENGTH=4194304
+ENV AERON_IPC_TERM_BUFFER_LENGTH=4194304
+
+# Expose Archive control + replication ports.
+EXPOSE 8010/udp 8011/udp 8020/udp 8021/udp
+
+RUN mkdir -p ${AERON_ARCHIVE_DIR} && \
+    chmod -R 777 ${AERON_ARCHIVE_DIR}
+
+COPY entrypoint.sh /opt/aeron/entrypoint.sh
+RUN chmod +x /opt/aeron/entrypoint.sh
+
+ENTRYPOINT ["/opt/aeron/entrypoint.sh"]
+```
+
+```bash
+# crates/kardamom-log/docker/aeron/entrypoint.sh
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ArchivingMediaDriver runs both the Media Driver and the Archive in one JVM,
+# which is the simplest deployment for tests.
+exec java \
+    -Daeron.dir=${AERON_DIR} \
+    -Daeron.archive.dir=${AERON_ARCHIVE_DIR} \
+    -Daeron.term.buffer.length=${AERON_TERM_BUFFER_LENGTH} \
+    -Daeron.ipc.term.buffer.length=${AERON_IPC_TERM_BUFFER_LENGTH} \
+    -Daeron.archive.control.channel=aeron:udp?endpoint=0.0.0.0:8010 \
+    -Daeron.archive.control.response.channel=aeron:udp?endpoint=0.0.0.0:8011 \
+    -Daeron.archive.replication.channel=aeron:udp?endpoint=0.0.0.0:8021 \
+    -cp /opt/aeron/aeron-all.jar \
+    ${AERON_ARCHIVE_CLASS}
+```
+
+- [ ] **Step 2: Write the compose file (used for the 3-recorder e2e variant)**
+
+```yaml
+# crates/kardamom-log/docker/aeron/docker-compose.yml
+# Optional: 3-node Aeron Archive cluster for the recorder_cluster e2e test.
+# The simpler single-node case is brought up by `AeronTestCluster::single_node`
+# in Rust, without compose.
+services:
+  aeron-0:
+    build: .
+    container_name: aeron-0
+    shm_size: 256m
+    tmpfs:
+      - /dev/shm
+    ports:
+      - "18010:8010/udp"
+      - "18011:8011/udp"
+      - "18020:8020/udp"
+      - "18021:8021/udp"
+  aeron-1:
+    build: .
+    container_name: aeron-1
+    shm_size: 256m
+    tmpfs:
+      - /dev/shm
+    ports:
+      - "28010:8010/udp"
+      - "28011:8011/udp"
+      - "28020:8020/udp"
+      - "28021:8021/udp"
+  aeron-2:
+    build: .
+    container_name: aeron-2
+    shm_size: 256m
+    tmpfs:
+      - /dev/shm
+    ports:
+      - "38010:8010/udp"
+      - "38011:8011/udp"
+      - "38020:8020/udp"
+      - "38021:8021/udp"
+```
+
+- [ ] **Step 3: Extend `crates/kardamom-log/src/testing.rs` with `AeronTestCluster`**
+
+Append:
+
+```rust
+// ============================================================================
+// AeronTestCluster — testcontainers-driven real Aeron for e2e tests.
+//
+// Other crates depend on `kardamom-log` with `features = ["testing"]` and
+// reuse this struct from their own `tests/` directory. Public API:
+//
+//   let cluster = AeronTestCluster::single_node().await?;
+//   let endpoint = cluster.archive_control_endpoint(); // "127.0.0.1:18010"
+//   // ... build LogConfig pointing at endpoint, run scenario ...
+//   drop(cluster); // tears down container
+// ============================================================================
+
+#[cfg(feature = "testing")]
+mod docker {
+    use std::time::Duration;
+
+    use testcontainers::core::{ContainerPort, IntoContainerPort, Mount, WaitFor};
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+
+    /// Path to the Aeron image build context, relative to the crate root.
+    /// `testcontainers` builds the image on first use via `docker build`.
+    const AERON_IMAGE: &str = "kardamom-aeron:test";
+
+    /// Reusable Aeron e2e harness. Each instance owns one or more real Aeron
+    /// containers and exposes the host ports the Rust code should connect to.
+    pub struct AeronTestCluster {
+        nodes: Vec<ContainerAsync<GenericImage>>,
+    }
+
+    impl AeronTestCluster {
+        /// Bring up a single Aeron node (Media Driver + Archive in one JVM).
+        /// Used for the common case where the test only needs a working channel.
+        pub async fn single_node() -> Result<Self, Box<dyn std::error::Error>> {
+            ensure_image_built().await?;
+            let image = GenericImage::new("kardamom-aeron", "test")
+                .with_exposed_port(8010_u16.udp())
+                .with_exposed_port(8011_u16.udp())
+                .with_exposed_port(8020_u16.udp())
+                .with_exposed_port(8021_u16.udp())
+                .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"));
+
+            let node = image
+                .with_shm_size(256 * 1024 * 1024) // 256 MiB
+                .start()
+                .await?;
+
+            Ok(Self { nodes: vec![node] })
+        }
+
+        /// Bring up `n` Aeron nodes for multi-recorder tests.
+        pub async fn multi_node(n: usize) -> Result<Self, Box<dyn std::error::Error>> {
+            ensure_image_built().await?;
+            let mut nodes = Vec::with_capacity(n);
+            for _ in 0..n {
+                let image = GenericImage::new("kardamom-aeron", "test")
+                    .with_exposed_port(8010_u16.udp())
+                    .with_exposed_port(8011_u16.udp())
+                    .with_exposed_port(8020_u16.udp())
+                    .with_exposed_port(8021_u16.udp())
+                    .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"));
+                let node = image
+                    .with_shm_size(256 * 1024 * 1024)
+                    .start()
+                    .await?;
+                nodes.push(node);
+            }
+            Ok(Self { nodes })
+        }
+
+        /// "host:port" the test should pass as the Aeron Archive control channel
+        /// endpoint for node `i`.
+        pub async fn archive_control_endpoint(&self, i: usize) -> String {
+            let port = self.nodes[i].get_host_port_ipv4(8010_u16.udp()).await.unwrap();
+            format!("127.0.0.1:{port}")
+        }
+
+        pub async fn archive_response_endpoint(&self, i: usize) -> String {
+            let port = self.nodes[i].get_host_port_ipv4(8011_u16.udp()).await.unwrap();
+            format!("127.0.0.1:{port}")
+        }
+
+        /// Number of nodes currently running.
+        pub fn len(&self) -> usize {
+            self.nodes.len()
+        }
+
+        /// Stop node `i` (simulates recorder failure for quorum tests).
+        pub async fn stop(&mut self, i: usize) -> Result<(), Box<dyn std::error::Error>> {
+            self.nodes[i].stop().await?;
+            Ok(())
+        }
+    }
+
+    /// `docker build`s the Aeron image once per test run, idempotent.
+    /// `testcontainers` doesn't have a built-in "build if missing" — we shell
+    /// out to the docker CLI. Cached layers make this fast on repeat runs.
+    async fn ensure_image_built() -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::process::Command;
+        // Probe: does the image already exist locally?
+        let out = Command::new("docker")
+            .args(["image", "inspect", AERON_IMAGE])
+            .output()
+            .await?;
+        if out.status.success() {
+            return Ok(());
+        }
+        // Build.
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let ctx = format!("{manifest_dir}/docker/aeron");
+        let status = Command::new("docker")
+            .args(["build", "-t", AERON_IMAGE, &ctx])
+            .status()
+            .await?;
+        if !status.success() {
+            return Err(format!("docker build failed (status {status:?})").into());
+        }
+        // Give the daemon a moment to register the new image tag.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "testing")]
+pub use docker::AeronTestCluster;
+```
+
+- [ ] **Step 4: Write the sample e2e test that uses the harness**
+
+```rust
+// crates/kardamom-log/tests/docker_e2e.rs
+//! Real-Aeron e2e: publish + recorder + watermark + subscribe end-to-end via
+//! Docker containers. Other crates' e2e tests (S1, S2, S4, S5, S6, S7) reuse
+//! `AeronTestCluster` from the `kardamom-log::testing` module (gated behind
+//! the `testing` feature).
+//!
+//! Gated on Docker availability: if `docker info` fails (e.g. unprivileged
+//! CI runner), the test prints "skipping" and returns 0. CI runners that
+//! must run e2e configure `DOCKER_HOST` and verify with `docker info`
+//! before invoking `cargo test`.
+
+#![cfg(feature = "testing")]
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use alloy_primitives::{Address, B256};
+use bytes::Bytes;
+use kardamom_log::config::LogConfig;
+use kardamom_log::publisher::ChannelBPublisher;
+use kardamom_log::subscriber::Subscribers;
+use kardamom_log::testing::AeronTestCluster;
+use kardamom_log::watermark::QuorumAggregator;
+use kardamom_types::{BPosition, TxEnvelope};
+
+async fn docker_available() -> bool {
+    use tokio::process::Command;
+    Command::new("docker")
+        .arg("info")
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn aeron_publish_record_watermark_subscribe_e2e() {
+    if !docker_available().await {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+
+    let cluster = AeronTestCluster::single_node()
+        .await
+        .expect("aeron container started");
+
+    let endpoint = cluster.archive_control_endpoint(0).await;
+    eprintln!("aeron archive control: {endpoint}");
+
+    let mut cfg = LogConfig::default();
+    // Point the channels at the containerized Aeron. The exact URI formats
+    // are: control = `aeron:udp?endpoint=<endpoint>`; B = an IPC channel
+    // colocated with the Media Driver process. Tests on the host that need
+    // to reach into the container's Media Driver use UDP into the exposed
+    // port; see the README for the topology diagram.
+    cfg.channels.b_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
+    cfg.channels.b_stream_id = 1001;
+
+    // Connect a host-side Aeron client to the container's Media Driver.
+    // Mounted Aeron dir is exposed via the Archive control channel; we use
+    // the Archive client (rusteron-archive) to drive recording.
+    let aeron = Arc::new(
+        rusteron_client::Aeron::connect_to_endpoint(&endpoint)
+            .expect("aeron connect to container"),
+    );
+
+    let pubr = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
+    let subs = Subscribers { aeron: aeron.clone(), ch: cfg.channels.clone() };
+    let mut sub = subs.b().unwrap();
+
+    // Publish 100 envelopes.
+    let mut last_pos = BPosition::ZERO;
+    for i in 0..100u64 {
+        last_pos = pubr
+            .publish_tx(&TxEnvelope {
+                correlation_id: i,
+                raw_tx: Bytes::from(vec![0xCDu8; 128]),
+                sender: Address::ZERO,
+                tx_hash: B256::repeat_byte(i as u8),
+            })
+            .unwrap();
+    }
+    assert!(last_pos > BPosition::ZERO);
+
+    // Drain.
+    let mut received = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while received < 100 && std::time::Instant::now() < deadline {
+        received += sub.poll(|_t, _pos| (), 256);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(received, 100, "expected 100 messages, got {received}");
+
+    drop(cluster);
+}
+```
+
+- [ ] **Step 5: Run**
+
+```bash
+cd /home/dev/kardamom && cargo test -p kardamom-log --features testing --test docker_e2e -- --nocapture
+```
+
+Expected on a host without Docker: prints "skipping: docker not available", returns 0.
+Expected with Docker: builds the image (~30s first run, cached after), brings up container (~5s), runs scenario (~2s), tears down. PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/kardamom-log/docker crates/kardamom-log/src/testing.rs \
+        crates/kardamom-log/tests/docker_e2e.rs
+git commit -m "log: docker aeron container + AeronTestCluster + e2e test"
+```
+
+---
+
+## Task 17: Receipt-cache channel wrapper
+
+Thin convenience wrapper around the existing publisher/subscriber primitives. Other crates use the channel through `ReceiptCachePublisher` / `ReceiptCacheSubscriber` directly; this module exists as a single point of documentation.
+
+**Files:**
+- Modify: `crates/kardamom-log/src/receipt_cache.rs`
+
+- [ ] **Step 1: Write the module**
+
+```rust
+//! Receipt-cache channel.
+//!
+//! `CachedReceipt` messages flow executor → proxy/RPC frontend over a
+//! dedicated Aeron stream (RAM only, no Archive). Consumers use this channel
+//! to keep a hot nonce cache without round-tripping through libmdbx.
+
+pub use crate::publisher::ReceiptCachePublisher;
+pub use crate::subscriber::ReceiptCacheSubscriber;
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add crates/kardamom-log/src/receipt_cache.rs
+git commit -m "log: receipt-cache channel module"
+```
+
+---
+
+## Task 18: `kardamom-leases` — lease primitive
+
+The lease primitive is consumed by S2 (sequencer hot-standby), S5 (sealer leader), and S7 (L1 batcher leader). V0 implementation: a host holds the lease iff it has the *lowest host id* among recorders whose latest `FsyncWatermark.position` is within `caught_up_window` bytes of the current quorum watermark. This is fully deterministic and requires no external coordination.
+
+**Files:**
+- Modify: `crates/kardamom-leases/src/lease.rs`
+- Create: `crates/kardamom-leases/tests/lease.rs`
+
+- [ ] **Step 1: Implement the lease**
+
+```rust
+// crates/kardamom-leases/src/lease.rs
+//! Deterministic lowest-host-id-among-caught-up-recorders lease.
+
+use std::collections::HashMap;
+
+use kardamom_types::{BPosition, FsyncWatermark, QuorumWatermark};
+
+#[derive(Clone, Debug)]
+pub struct LeaseConfig {
+    /// This host's recorder id.
+    pub self_id: u8,
+    /// All recorder ids in the cluster.
+    pub all_ids: Vec<u8>,
+    /// Bytes of stream lag that still count as "caught up".
+    pub caught_up_window: i64,
+}
+
+/// Lease state machine. Feed it `FsyncWatermark` updates from each recorder
+/// and the current `QuorumWatermark`; call [`Lease::held_by_us`] to learn
+/// whether this host currently holds the lease.
+#[derive(Clone, Debug)]
+pub struct Lease {
+    cfg: LeaseConfig,
+    last_per_recorder: HashMap<u8, BPosition>,
+    last_quorum: Option<BPosition>,
+}
+
+impl Lease {
+    pub fn new(cfg: LeaseConfig) -> Self {
+        Self { cfg, last_per_recorder: HashMap::new(), last_quorum: None }
+    }
+
+    pub fn observe_fsync(&mut self, w: FsyncWatermark) {
+        let prev = self.last_per_recorder.get(&w.recorder_id).copied();
+        if prev.map_or(true, |p| p < w.position) {
+            self.last_per_recorder.insert(w.recorder_id, w.position);
+        }
+    }
+
+    pub fn observe_quorum(&mut self, q: QuorumWatermark) {
+        self.last_quorum = Some(q.position);
+    }
+
+    /// Returns `true` if this host currently holds the lease.
+    pub fn held_by_us(&self) -> bool {
+        let quorum = match self.last_quorum {
+            Some(p) => p,
+            None => return false,
+        };
+        let caught_up_ids: Vec<u8> = self
+            .cfg
+            .all_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.last_per_recorder
+                    .get(id)
+                    .map(|p| within_window(*p, quorum, self.cfg.caught_up_window))
+                    .unwrap_or(false)
+            })
+            .collect();
+        caught_up_ids.iter().min() == Some(&self.cfg.self_id)
+    }
+}
+
+fn within_window(pos: BPosition, quorum: BPosition, window: i64) -> bool {
+    // Convert positions to absolute byte offsets using the same TERM_LEN as
+    // the rest of the system (16 MiB). The exact constant must match the
+    // recorder's `aeron.term.buffer.length`.
+    const TERM_LEN: i64 = 16 * 1024 * 1024;
+    let pos_abs = (pos.term_id as i64) * TERM_LEN + pos.term_offset as i64;
+    let q_abs = (quorum.term_id as i64) * TERM_LEN + quorum.term_offset as i64;
+    (q_abs - pos_abs).abs() <= window
+}
+```
+
+- [ ] **Step 2: Tests**
+
+```rust
+// crates/kardamom-leases/tests/lease.rs
+use kardamom_leases::{Lease, LeaseConfig};
+use kardamom_types::{BPosition, FsyncWatermark, QuorumWatermark};
+
+fn pos(t: i32, o: i32) -> BPosition { BPosition { term_id: t, term_offset: o } }
+
+#[test]
+fn no_quorum_no_lease() {
+    let lease = Lease::new(LeaseConfig {
+        self_id: 0,
+        all_ids: vec![0, 1, 2],
+        caught_up_window: 1024,
+    });
+    assert!(!lease.held_by_us());
+}
+
+#[test]
+fn lowest_caught_up_id_holds_lease() {
+    let mut lease = Lease::new(LeaseConfig {
+        self_id: 0,
+        all_ids: vec![0, 1, 2],
+        caught_up_window: 1024,
+    });
+    lease.observe_quorum(QuorumWatermark { position: pos(1, 1000) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 0, position: pos(1, 900) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 1, position: pos(1, 1000) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 2, position: pos(1, 1000) });
+    assert!(lease.held_by_us(), "id=0 is lowest caught-up");
+}
+
+#[test]
+fn lease_transfers_when_lowest_falls_behind() {
+    let mut lease = Lease::new(LeaseConfig {
+        self_id: 1,
+        all_ids: vec![0, 1, 2],
+        caught_up_window: 1024,
+    });
+    lease.observe_quorum(QuorumWatermark { position: pos(1, 10_000) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 0, position: pos(1, 0) }); // far behind
+    lease.observe_fsync(FsyncWatermark { recorder_id: 1, position: pos(1, 10_000) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 2, position: pos(1, 10_000) });
+    assert!(lease.held_by_us(), "id=1 holds lease because id=0 lags > window");
+}
+
+#[test]
+fn no_one_caught_up_no_lease() {
+    let mut lease = Lease::new(LeaseConfig {
+        self_id: 0,
+        all_ids: vec![0, 1, 2],
+        caught_up_window: 10,
+    });
+    lease.observe_quorum(QuorumWatermark { position: pos(1, 10_000) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 0, position: pos(1, 0) });
+    lease.observe_fsync(FsyncWatermark { recorder_id: 1, position: pos(1, 5_000) });
+    assert!(!lease.held_by_us());
+}
+```
+
+- [ ] **Step 3: Run, confirm PASS**
+
+```bash
+cd /home/dev/kardamom && cargo test -p kardamom-leases
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/kardamom-leases
+git commit -m "leases: deterministic lowest-host-id-among-caught-up lease primitive"
+```
+
+---
+
+## Task 19: Crate-level READMEs and final lint pass
+
+**Files:**
+- Create: `crates/kardamom-types/README.md`
+- Create: `crates/kardamom-log/README.md`
+- Create: `crates/kardamom-leases/README.md`
+- Run: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`
+
+- [ ] **Step 1: Write `crates/kardamom-types/README.md`**
+
+```markdown
+# kardamom-types
+
+Pure data types and traits shared across the kardamom subsystems. Per
+**D-Sh1** in `docs/plans/2026-05-23-S0-shared-decisions.md`, every wire type
+that crosses an Aeron channel or a libmdbx boundary lives here, derives
+`rkyv::{Archive, Serialize, Deserialize}` (D-Sh2), and is consumed by S1, S2,
+S3, S4, S5, S6, S7.
+
+This crate has **no I/O dependencies** — no Aeron, no libmdbx, no
+alloy-provider, no jsonrpsee. If you find yourself wanting to add one,
+you have the wrong crate.
+
+## Owned types
+
+- `BPosition` — canonical L2 tx identifier (Aeron position)
+- `TxEnvelope` — raw tx + correlation id + sender + tx_hash (sender and tx_hash always populated; D-Sh3, D-Sh4)
+- `Receipt` — per-tx execution receipt
+- `CachedReceipt` — receipt-cache channel message
+- `BlockBoundaryStart`, `BlockBoundary` — block markers (no state root; D-Sh11)
+- `FsyncWatermark`, `QuorumWatermark` — durability accounting
+- `BlockDelta` — block-write payload (executor → state writer)
+- `StateDatabase`, `SnapshotSource` — state-access traits
+```
+
+- [ ] **Step 2: Write `crates/kardamom-log/README.md`**
 
 ```markdown
 # kardamom-log
 
-S3 canonical-log subsystem. See `docs/specs/2026-05-23-high-throughput-sequencer-design.md` §2.3 and §2.5.
+S3 canonical-log subsystem. See `docs/specs/2026-05-23-high-throughput-sequencer-design.md` §2.3 and §2.5, and `docs/plans/2026-05-23-S0-shared-decisions.md` D-Sh1 / D-Sh2 / D-Sh8 / D-Sh10.
 
 ## Owned components
 
 - **Channel B** (canonical tx log, recorded, fsync-quorum durable)
 - **Channel C** (receipts + block boundaries, RAM only)
+- **Receipt-cache channel** (`CachedReceipt` stream, RAM only)
 - **Per-recorder fsync sidecar** (io_uring + O_DIRECT mirror)
 - **Per-recorder fsync-watermark stream**
 - **Quorum fsync-watermark aggregator** (Q-of-N smallest position)
+- **`testing` feature** — in-memory pub/sub fakes for other crates' unit tests
+- **`tests/docker_e2e.rs` + `docker/aeron/`** — testcontainers-driven Aeron Docker harness; reusable by other crates' e2e tests
 
 ## Shared types
 
-`kardamom_log::types` defines the public message types that every other
-kardamom subsystem (S1, S2, S4, S5, S6, S7) imports. Treat the field layout
-as a stable interface — changes require coordinated updates to all subsystems.
+Wire types live in `kardamom-types`; this crate re-exports them via `kardamom_log::types::*` for convenience. Do not add new wire types here.
+
+## Wire codec
+
+`rkyv` v0.8 zero-copy archival serialization. Hot-path consumers use `codec::access` for an `&Archived<T>` view; callers needing an owned value call `codec::materialize`.
+
+## Replay
+
+We do **not** ship a custom channel-B replay API. Aeron Archive already exposes the standard replay protocol; offline consumers (S7 L1 batcher) read segment files directly or use Aeron Archive's built-in replay (D-Sh10).
 
 ## Runtime dependencies
 
 - Aeron Media Driver and Aeron Archive binaries (Java) installed on each host.
-  Tests skip when `AERON_MEDIA_DRIVER_BIN` / `AERON_ARCHIVE_BIN` are unset.
+  Native tests skip when `AERON_MEDIA_DRIVER_BIN` / `AERON_ARCHIVE_BIN` are unset.
+- For e2e tests: a working Docker daemon (`docker info` must succeed). The testcontainers harness builds and runs the Aeron image on demand.
 - Mirror file must be on an ext4/xfs/etc. filesystem that supports `O_DIRECT`.
   tmpfs returns `EINVAL` for `O_DIRECT` opens.
-- Recommended: enterprise NVMe with PLP, separate from the OS disk.
+- Recommended for production: enterprise NVMe with PLP, separate from the OS disk.
 ```
 
-- [ ] **Step 2: Format and lint**
+- [ ] **Step 3: Write `crates/kardamom-leases/README.md`**
+
+```markdown
+# kardamom-leases
+
+Lease primitive consumed by S2 (sequencer hot-standby), S5 (sealer leader election), and S7 (L1 batcher leader election). Per **D-Sh1**.
+
+V0 implementation: a host holds the lease iff it has the lowest host id among recorders whose latest `FsyncWatermark.position` is within `caught_up_window` bytes of the current `QuorumWatermark`. Fully deterministic; no external KV or consensus library.
+```
+
+- [ ] **Step 4: Format and lint the whole workspace**
 
 ```bash
 cd /home/dev/kardamom && cargo fmt --all
-cd /home/dev/kardamom && cargo clippy -p kardamom-log --all-targets -- -D warnings
+cd /home/dev/kardamom && cargo clippy -p kardamom-types -p kardamom-log -p kardamom-leases --all-targets --all-features -- -D warnings
 ```
 
 Expected: no warnings.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/kardamom-log/README.md
-git commit -m "log: README + lint clean"
+git add crates/kardamom-types/README.md crates/kardamom-log/README.md crates/kardamom-leases/README.md
+git commit -m "types/log/leases: READMEs + lint clean"
 ```
 
 ---
 
 ## Self-Review Checklist
 
+- **Crate layout (D-Sh1):** three crates — `kardamom-types` (Tasks 1, 2), `kardamom-log` (Tasks 1, 3–17), `kardamom-leases` (Tasks 1, 18). ✓
+- **Wire codec (D-Sh2):** rkyv v0.8 throughout; bincode removed. Wire types derive `rkyv::{Archive, Serialize, Deserialize}` in `kardamom-types`; `kardamom-log` exposes `codec::access` / `codec::materialize`. ✓
+- **TxEnvelope.sender / tx_hash always populated (D-Sh3, D-Sh4):** Task 2 — bare `Address` / `B256`, no `Option`. ✓
+- **Receipt.tx_hash propagated (D-Sh4):** Task 2 — field present, never recomputed downstream. ✓
+- **BlockBoundary has no state_root_commitment (D-Sh11):** Task 2 — field removed from type definition. ✓
 - **Spec §2.3 coverage:** channel B publisher (Task 6), channel B subscriber (Task 7), recorder wrapper (Task 8), io_uring fsync sidecar (Tasks 9–10), per-recorder watermark publisher (Task 6), quorum aggregator (Tasks 4, 11), Q-of-N math (Task 4). ✓
-- **Spec §2.5 coverage:** channel C publisher (Task 6), channel C subscriber (Task 7), shared codec (Task 2). Note: `BlockBoundaryStart` is published on B, `BlockBoundary` on C — both type definitions present in `types.rs`. ✓
+- **Spec §2.5 coverage:** channel C publisher (Task 6), channel C subscriber (Task 7), receipt-cache channel (Tasks 6, 7, 17), shared codec (Task 2). ✓
 - **Spec §3 latency budget:** fsync sidecar uses io_uring + O_DIRECT to keep fsync off the page cache; bench (Task 14) measures per-fsync latency to validate the 25 µs target. ✓
 - **Spec §4.3 recorder failure:** integration test (Task 13) kills 1 of 3 recorders, asserts quorum continues; kills 2 of 3, asserts quorum stalls. ✓
+- **No channel-B replay API (D-Sh10):** removed. Aeron Archive's standard replay protocol is used by offline consumers (S7). ✓
+- **`testing` feature (D-Sh8):** in-memory `FakePublication`, `FakeSubscription`, `FakeConcurrentPublication`, `FakeFsyncWatermarkStream` fakes in Task 15. ✓
+- **Docker e2e harness (D-Sh8):** `docker/aeron/Dockerfile` + `docker-compose.yml` + `AeronTestCluster` + `tests/docker_e2e.rs` in Task 16. Reusable from other crates' e2e tests. ✓
+- **`kardamom-leases` (D-Sh1):** Task 18 ships the lease primitive consumed by S2/S5/S7. ✓
 - **V0 scope:** all features listed are shipped in v0; no deferrals. ✓
-- **Shared interface types:** complete in `types.rs` (Task 2); other plans (S1, S2, S4, S5, S6, S7) consume them as `kardamom_log::types::*`. ✓
 - **Tests required:**
-  - Codec roundtrip + BPosition ordering — Task 2 ✓
+  - rkyv roundtrip + BPosition ordering — Task 2 ✓
   - Watermark aggregator math — Task 4 ✓
   - Fsync sidecar unit test — Task 9 ✓
   - 3-recorder integration test (4 publishers × 1000 messages, kill 1, kill 2) — Task 13 ✓
+  - Docker e2e (real Aeron) — Task 16 ✓
+  - Lease state machine — Task 18 ✓
   - Criterion benches (publish, subscribe, fsync watermark latency) — Task 14 ✓
 - **Placeholder scan:** no `TODO`, no `tbd`, no "implement later" — each step has complete code. The two `rusteron` API-name caveats are explicit ("if upstream differs, adjust"), not placeholders.
-- **Type consistency:** `BPosition`, `FsyncWatermark`, `QuorumWatermark` field names match across types.rs, watermark.rs, fsync_sidecar.rs, subscriber.rs, publisher.rs. `Subscribers::watermark(rid)` and `WatermarkPublisher::open(_, _, rid)` both take `u8`. ✓
+- **Type consistency:** `BPosition`, `FsyncWatermark`, `QuorumWatermark` field names match across all files. `Subscribers::watermark(rid)` and `WatermarkPublisher::open(_, _, rid)` both take `u8`. ✓
