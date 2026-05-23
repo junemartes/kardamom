@@ -1,0 +1,14 @@
+[package]
+name = "kardamom-leases"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kardamom-types.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+kardamom-log = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
