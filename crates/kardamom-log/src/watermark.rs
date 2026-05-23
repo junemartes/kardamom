@@ -2,7 +2,7 @@
 //!
 //! Per-recorder fsync positions arrive on N independent Aeron streams. The
 //! aggregator keeps the latest position per recorder, and on every update
-//! computes the Q-th smallest known position — that is the watermark proxies
+//! computes the Q-th largest known position — that is the watermark proxies
 //! consume for the I2 ack guarantee.
 //!
 //! Liveness is *not* tracked here: a dead recorder's slot simply stops
@@ -63,3 +63,70 @@ impl QuorumState {
         Some(known[known.len() - self.q])
     }
 }
+
+// ---------------------------------------------------------------------------
+// QuorumAggregator runner task (gated behind `aeron-live`)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "aeron-live")]
+mod aggregator {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use tokio::task::JoinHandle;
+
+    use crate::config::QuorumConfig;
+    use crate::error::LogError;
+    use crate::publisher::QuorumPublisher;
+    use crate::subscriber::Subscribers;
+    use kardamom_types::QuorumWatermark;
+
+    use super::QuorumState;
+
+    /// Tokio task that drains all N per-recorder watermark subscriptions and
+    /// republishes the quorum position whenever it advances.
+    pub struct QuorumAggregator {
+        pub handle: JoinHandle<()>,
+    }
+
+    impl QuorumAggregator {
+        pub fn start(
+            subscribers: Subscribers,
+            publisher: Arc<QuorumPublisher>,
+            cfg: QuorumConfig,
+        ) -> Result<Self, LogError> {
+            let mut state = QuorumState::new(cfg.n, cfg.q);
+            let mut subs: Vec<_> = (0..cfg.n)
+                .map(|rid| subscribers.watermark(rid as u8))
+                .collect::<Result<_, _>>()?;
+
+            let handle = tokio::task::spawn_blocking(move || {
+                let mut last_published = None;
+                loop {
+                    let mut any = false;
+                    for sub in subs.iter_mut() {
+                        any |= sub.poll(|w, _| state.observe(w), 64) > 0;
+                    }
+                    if any {
+                        if let Some(p) = state.quorum() {
+                            if last_published != Some(p) {
+                                if let Err(e) = publisher.publish(&QuorumWatermark { position: p }) {
+                                    tracing::error!(error = %e, "quorum publish failed");
+                                } else {
+                                    last_published = Some(p);
+                                }
+                            }
+                        }
+                    }
+                    if !any {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+            });
+            Ok(Self { handle })
+        }
+    }
+}
+
+#[cfg(feature = "aeron-live")]
+pub use aggregator::QuorumAggregator;
