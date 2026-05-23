@@ -22,6 +22,7 @@ pub mod config;
 pub mod error;
 pub mod fsync_sidecar;
 pub mod receipt_cache;
+pub mod supervisor;
 pub mod watermark;
 
 #[cfg(feature = "aeron-live")]
@@ -30,8 +31,6 @@ pub mod publisher;
 pub mod recorder;
 #[cfg(feature = "aeron-live")]
 pub mod subscriber;
-#[cfg(feature = "aeron-live")]
-pub mod supervisor;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
