@@ -406,6 +406,21 @@ The system-level design hands off to 7 subsystem specs. Each is its own brainsto
 
 ---
 
+## V0 scope (initial implementation)
+
+The first implementation cycle (v0) defers the longest-pole research items and ships the full pipeline at a lower performance ceiling. Subsequent versions reintroduce them per the decomposition above.
+
+**V0 deferrals:**
+- **S4 Block-STM is deferred.** V0 executor uses **sequential revm** (adapted from the existing `crates/node::executor`). Replicas remain byte-identically deterministic; parallelism within a replica is set aside.
+- **Throughput target relaxed.** With sequential revm per replica, the realistic ceiling is ~50–100k tx/s per replica on simple transfers, dropping with contract complexity. The 1M+ tx/s and HFT-class workload-mix benchmarks are explicit non-goals for v0; they are the bar S4 v1 must clear.
+- **Latency target preserved.** Sub-millisecond post-execution ack remains in scope — sequential revm is fast enough (~15–45µs per simple tx) that the rest of the budget (sig verify, Aeron IPC, fsync) still adds up to <1ms.
+
+**V0 components ship in dependency order:** S3 → S1 → S2 → S4 (v0 sequential) → S5 → S6 → S7.
+
+**Once v0 is end-to-end:** S4 v1 (Block-STM revm integration) gets its own brainstorm + design spec + plan, and slots in as a drop-in replacement behind the executor's existing channel-B-in / channel-C-out interface. No other component should require changes for the upgrade.
+
+---
+
 ## Out-of-scope / follow-ups
 
 - **State sync / snapshot ingest** for fresh nodes joining a live chain.
