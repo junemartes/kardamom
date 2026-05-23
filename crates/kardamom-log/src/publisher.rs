@@ -128,10 +128,7 @@ pub struct QuorumPublisher {
 impl QuorumPublisher {
     pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
         let pub_handle = aeron
-            .add_concurrent_publication(
-                &ch.quorum_watermark_channel,
-                ch.quorum_watermark_stream_id,
-            )
+            .add_concurrent_publication(&ch.quorum_watermark_channel, ch.quorum_watermark_stream_id)
             .map_err(|e| LogError::Aeron(format!("add_concurrent_publication qwm: {e}")))?;
         Ok(Self { pub_handle })
     }

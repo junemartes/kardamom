@@ -184,8 +184,8 @@ impl FsyncSidecar {
         // its CQE arrives but we only need to ensure the fsync is durable).
         self.ring.submit_and_wait(2).map_err(LogError::Io)?;
 
-        let mut cq = self.ring.completion();
-        while let Some(cqe) = cq.next() {
+        let cq = self.ring.completion();
+        for cqe in cq {
             if cqe.result() < 0 {
                 return Err(LogError::Io(std::io::Error::from_raw_os_error(
                     -cqe.result(),
@@ -196,12 +196,7 @@ impl FsyncSidecar {
     }
 }
 
-fn read_at(
-    f: &std::fs::File,
-    buf: &mut [u8],
-    offset: u64,
-    len: usize,
-) -> Result<usize, LogError> {
+fn read_at(f: &std::fs::File, buf: &mut [u8], offset: u64, len: usize) -> Result<usize, LogError> {
     use std::os::unix::fs::FileExt;
     let n = f.read_at(&mut buf[..len], offset)?;
     Ok(n)
@@ -237,9 +232,9 @@ impl AeronPositionSource {
         aeron: &rusteron_client::Aeron,
         counter_id: i32,
     ) -> Result<Self, crate::error::LogError> {
-        let counter = aeron
-            .counter_for_id(counter_id)
-            .map_err(|e| crate::error::LogError::Aeron(format!("counter_for_id {counter_id}: {e}")))?;
+        let counter = aeron.counter_for_id(counter_id).map_err(|e| {
+            crate::error::LogError::Aeron(format!("counter_for_id {counter_id}: {e}"))
+        })?;
         Ok(Self { counter })
     }
 }

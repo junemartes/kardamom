@@ -110,7 +110,8 @@ mod aggregator {
                     if any {
                         if let Some(p) = state.quorum() {
                             if last_published != Some(p) {
-                                if let Err(e) = publisher.publish(&QuorumWatermark { position: p }) {
+                                if let Err(e) = publisher.publish(&QuorumWatermark { position: p })
+                                {
                                     tracing::error!(error = %e, "quorum publish failed");
                                 } else {
                                     last_published = Some(p);

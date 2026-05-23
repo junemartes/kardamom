@@ -24,11 +24,14 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::error::LogError;
 use kardamom_types::{BPosition, FsyncWatermark};
 
+/// Map from `(channel, stream_id)` to shared per-stream state.
+type StreamMap = HashMap<(String, i32), Arc<Mutex<StreamState>>>;
+
 /// In-memory bus shared by all `FakePublication` / `FakeSubscription` handles
 /// that target the same `(channel, stream_id)` pair. Clone is cheap (an `Arc`).
 #[derive(Clone, Default)]
 pub struct FakeBus {
-    streams: Arc<Mutex<HashMap<(String, i32), Arc<Mutex<StreamState>>>>>,
+    streams: Arc<Mutex<StreamMap>>,
 }
 
 #[derive(Default)]
@@ -131,8 +134,8 @@ impl FakePublication {
     where
         T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
     {
-        let bytes = rkyv::to_bytes::<rancor::Error>(msg)
-            .map_err(|e| LogError::Codec(e.to_string()))?;
+        let bytes =
+            rkyv::to_bytes::<rancor::Error>(msg).map_err(|e| LogError::Codec(e.to_string()))?;
         let off = self.pub_handle.offer(bytes.as_slice());
         let header = FakeHeader::from_offset(off);
         Ok(BPosition {
@@ -251,10 +254,7 @@ mod docker {
                 .with_exposed_port(8021_u16.udp())
                 .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"));
 
-            let node = image
-                .with_shm_size(256 * 1024 * 1024)
-                .start()
-                .await?;
+            let node = image.with_shm_size(256 * 1024 * 1024).start().await?;
 
             Ok(Self { nodes: vec![node] })
         }
@@ -270,10 +270,7 @@ mod docker {
                     .with_exposed_port(8020_u16.udp())
                     .with_exposed_port(8021_u16.udp())
                     .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"));
-                let node = image
-                    .with_shm_size(256 * 1024 * 1024)
-                    .start()
-                    .await?;
+                let node = image.with_shm_size(256 * 1024 * 1024).start().await?;
                 nodes.push(node);
             }
             Ok(Self { nodes })

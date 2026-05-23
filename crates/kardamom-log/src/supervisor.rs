@@ -91,28 +91,22 @@ async fn wait_for_path(path: &std::path::Path, timeout: Duration) -> Result<(), 
 async fn supervise(mut children: Vec<Child>, mut shutdown: oneshot::Receiver<()>) {
     // V0: if any child dies, log loudly and exit. Production-grade restart
     // policy is a follow-up; for now the operator restarts the process.
-    loop {
-        tokio::select! {
-            _ = &mut shutdown => {
-                for c in children.iter_mut() {
-                    let _ = c.start_kill();
-                }
-                break;
+    tokio::select! {
+        _ = &mut shutdown => {
+            for c in children.iter_mut() {
+                let _ = c.start_kill();
             }
-            res = wait_any(&mut children) => {
-                match res {
-                    Ok((i, status)) => warn!(child = i, ?status, "aeron child exited"),
-                    Err(e) => error!(error = %e, "aeron child wait failed"),
-                }
-                break;
+        }
+        res = wait_any(&mut children) => {
+            match res {
+                Ok((i, status)) => warn!(child = i, ?status, "aeron child exited"),
+                Err(e) => error!(error = %e, "aeron child wait failed"),
             }
         }
     }
 }
 
-async fn wait_any(
-    children: &mut [Child],
-) -> std::io::Result<(usize, std::process::ExitStatus)> {
+async fn wait_any(children: &mut [Child]) -> std::io::Result<(usize, std::process::ExitStatus)> {
     let futs: Vec<_> = children
         .iter_mut()
         .enumerate()

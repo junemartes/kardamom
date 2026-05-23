@@ -12,8 +12,7 @@ use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use rancor::Fallible;
 use rkyv::{
-    Archive, Archived, Deserialize, Place, Resolver, Serialize,
-    rancor,
+    Archive, Archived, Deserialize, Place, Resolver, Serialize, rancor,
     with::{ArchiveWith, DeserializeWith, SerializeWith},
 };
 
@@ -91,7 +90,10 @@ where
     D: Fallible + ?Sized,
     Archived<[u8; 32]>: Deserialize<[u8; 32], D>,
 {
-    fn deserialize_with(field: &Archived<[u8; 32]>, deserializer: &mut D) -> Result<B256, D::Error> {
+    fn deserialize_with(
+        field: &Archived<[u8; 32]>,
+        deserializer: &mut D,
+    ) -> Result<B256, D::Error> {
         let bytes: [u8; 32] = field.deserialize(deserializer)?;
         Ok(B256::from(bytes))
     }
@@ -131,7 +133,10 @@ where
     D: Fallible + ?Sized,
     Archived<[u8; 32]>: Deserialize<[u8; 32], D>,
 {
-    fn deserialize_with(field: &Archived<[u8; 32]>, deserializer: &mut D) -> Result<U256, D::Error> {
+    fn deserialize_with(
+        field: &Archived<[u8; 32]>,
+        deserializer: &mut D,
+    ) -> Result<U256, D::Error> {
         let bytes: [u8; 32] = field.deserialize(deserializer)?;
         Ok(U256::from_be_bytes(bytes))
     }
@@ -175,7 +180,10 @@ where
     D: Fallible + ?Sized,
     Archived<Vec<u8>>: Deserialize<Vec<u8>, D>,
 {
-    fn deserialize_with(field: &Archived<Vec<u8>>, deserializer: &mut D) -> Result<Bytes, D::Error> {
+    fn deserialize_with(
+        field: &Archived<Vec<u8>>,
+        deserializer: &mut D,
+    ) -> Result<Bytes, D::Error> {
         let v: Vec<u8> = field.deserialize(deserializer)?;
         Ok(Bytes::from(v))
     }

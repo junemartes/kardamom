@@ -56,7 +56,8 @@ fn sidecar_mirrors_and_fsyncs_appended_bytes() {
     std::fs::write(&source, &buf).unwrap();
 
     let pos = Arc::new(AtomicI64::new(4096));
-    let mut sidecar = FsyncSidecar::open(&source, &mirror, Box::new(FakePosition(pos)), 256).unwrap();
+    let mut sidecar =
+        FsyncSidecar::open(&source, &mirror, Box::new(FakePosition(pos)), 256).unwrap();
 
     let wm = sidecar.tick().unwrap();
     assert_eq!(
@@ -84,7 +85,8 @@ fn sidecar_returns_none_when_no_new_bytes() {
     std::fs::write(&source, b"").unwrap();
 
     let pos = Arc::new(AtomicI64::new(0));
-    let mut sidecar = FsyncSidecar::open(&source, &mirror, Box::new(FakePosition(pos)), 256).unwrap();
+    let mut sidecar =
+        FsyncSidecar::open(&source, &mirror, Box::new(FakePosition(pos)), 256).unwrap();
 
     assert_eq!(sidecar.tick().unwrap(), None);
 }

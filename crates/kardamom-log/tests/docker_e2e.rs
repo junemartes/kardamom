@@ -60,8 +60,7 @@ async fn aeron_publish_record_subscribe_e2e() {
     // TODO: the exact constructor name may differ between rusteron versions;
     // adjust if the test panics on Aeron connect.
     let aeron = Arc::new(
-        rusteron_client::Aeron::connect_to_endpoint(&endpoint)
-            .expect("aeron connect to container"),
+        rusteron_client::Aeron::connect_to_endpoint(&endpoint).expect("aeron connect to container"),
     );
 
     let pubr = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
