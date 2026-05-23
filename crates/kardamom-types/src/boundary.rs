@@ -1,14 +1,23 @@
-// stub: real impl in Task 2.
+//! Block boundary markers. State root is **not** carried (D-Sh11).
+
+use rkyv::{Archive, Deserialize, Serialize};
+
 use crate::position::BPosition;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Block-boundary marker emitted by the sealer onto channel B.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct BlockBoundaryStart {
     pub block_number: u64,
     pub end_tx_idx: BPosition,
     pub l2_timestamp: u64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Block-boundary closeout emitted by executors onto channel C once they have
+/// finished executing through `end_tx_idx`. No `state_root_commitment` field
+/// (D-Sh11 — state-root attestation is a deferred validator concern).
+#[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
 pub struct BlockBoundary {
     pub block_number: u64,
     pub end_tx_idx: BPosition,
