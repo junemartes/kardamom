@@ -58,7 +58,10 @@ fn build(
 }
 
 async fn step(
-    sealers: &mut [(Sealer<MockClock, FakeBoundaryPublisher>, FakeBoundaryPublisher)],
+    sealers: &mut [(
+        Sealer<MockClock, FakeBoundaryPublisher>,
+        FakeBoundaryPublisher,
+    )],
     sealers_view_tx_tail: BPosition,
 ) -> Option<u64> {
     // Reflect the current synthetic tx tail to every publisher so the
