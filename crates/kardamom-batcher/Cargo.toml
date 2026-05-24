@@ -8,7 +8,7 @@ build = "build.rs"
 default = []
 # Pulls the live `rusteron-archive` reader path. Off by default so the crate
 # compiles cleanly on hosts without the Aeron C library installed.
-aeron-live = ["kardamom-log/aeron-live"]
+aeron-live = ["kardamom-log/aeron-live", "dep:rusteron-archive"]
 # Real Aeron container e2e (per S0 D-Sh8). Implies the in-memory testing
 # helpers from kardamom-log because the harness re-uses some of them.
 docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
@@ -38,6 +38,7 @@ alloy-contract.workspace = true
 bytes.workspace = true
 rkyv.workspace = true
 zstd = "0.13"
+rusteron-archive = { workspace = true, optional = true }
 
 anyhow.workspace = true
 thiserror.workspace = true
