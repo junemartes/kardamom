@@ -21,7 +21,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::error;
 
-use crate::aeron_live::AeronRuntime;
+use crate::aeron_live::{AeronRuntime, DeliverFn};
 use crate::codec;
 use crate::error::LogError;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
@@ -59,7 +59,7 @@ pub fn open_replay_subscription(
     replay_stream_id: i32,
 ) -> Result<UnboundedReceiver<(BPosition, ArchiveMessage)>, LogError> {
     let (tx, rx) = unbounded_channel::<(BPosition, ArchiveMessage)>();
-    let deliver = Box::new(move |bytes: &[u8], pos: BPosition| {
+    let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
         // Try TxEnvelope first; on decode failure fall back to BlockBoundaryStart.
         if let Ok(env) = codec::materialize::<TxEnvelope>(bytes) {
             let _ = tx.send((pos, ArchiveMessage::Tx(env)));
@@ -73,7 +73,7 @@ pub fn open_replay_subscription(
             len = bytes.len(),
             "archive replay fragment decoded as neither TxEnvelope nor BlockBoundaryStart"
         );
-    }) as Box<dyn FnMut(&[u8], BPosition) + Send>;
+    });
     // Open a raw subscription against the replay channel — the archive will
     // feed it as a normal Aeron stream once `start_replay` is invoked.
     rt.open_subscription_with_deliver(replay_channel, replay_stream_id, deliver)?;

@@ -71,6 +71,11 @@ type Pub = rusteron_client::AeronPublication;
 type Sub = rusteron_client::AeronSubscription;
 type Header = rusteron_client::AeronHeader;
 
+/// Closure that decodes one Aeron fragment + position and forwards the
+/// decoded value (or its raw bytes) somewhere Send-friendly. Boxed so
+/// different message types can share the subscription registration path.
+pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition) + Send>;
+
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -112,7 +117,7 @@ enum RuntimeCmd {
     OpenSubscription {
         uri: String,
         stream_id: i32,
-        deliver: Box<dyn FnMut(&[u8], BPosition) + Send>,
+        deliver: DeliverFn,
         ack: CbSender<Result<(), LogError>>,
     },
     /// Stop the loop, drop everything.
@@ -125,7 +130,7 @@ struct SubEntry {
     /// Closure that decodes the raw bytes and forwards into the appropriate
     /// mpsc sender. Created on a tokio task (`Send`), then moved to and run
     /// from the Aeron thread.
-    deliver: Box<dyn FnMut(&[u8], BPosition) + Send>,
+    deliver: DeliverFn,
 }
 
 impl AeronRuntime {
@@ -221,7 +226,7 @@ impl AeronRuntime {
         &self,
         uri: &str,
         stream_id: i32,
-        deliver: Box<dyn FnMut(&[u8], BPosition) + Send>,
+        deliver: DeliverFn,
     ) -> Result<(), LogError> {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.cmd_tx
@@ -253,20 +258,19 @@ impl AeronRuntime {
             >,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: Box<dyn FnMut(&[u8], BPosition) + Send> =
-            Box::new(move |bytes: &[u8], pos: BPosition| {
-                match codec::materialize::<T>(bytes) {
-                    Ok(v) => {
-                        if msg_tx.send((pos, v)).is_err() {
-                            // Subscriber dropped its receiver. Aeron thread
-                            // will reap this subscription on next poll.
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "decode failed on subscription delivery");
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
+            match codec::materialize::<T>(bytes) {
+                Ok(v) => {
+                    if msg_tx.send((pos, v)).is_err() {
+                        // Subscriber dropped its receiver. Aeron thread
+                        // will reap this subscription on next poll.
                     }
                 }
-            });
+                Err(e) => {
+                    error!(error = %e, "decode failed on subscription delivery");
+                }
+            }
+        });
         self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         Ok(msg_rx)
     }
@@ -786,28 +790,34 @@ impl QuorumSubscriberHandle {
 
 // ---------------------------------------------------------------------------
 // Send-trait compile-time assertions
+//
+// Bind every public handle to a `static` of type
+// `std::marker::PhantomData<fn() -> ...>` — Rust will refuse to compile if
+// the type isn't `Send + Sync` (since `fn() -> T: Send + Sync` requires T to
+// be `Send + Sync`). Wrapping in `PhantomData` keeps the types zero-sized so
+// the compile-time check has no runtime cost.
 // ---------------------------------------------------------------------------
 
-const _: () = {
-    fn assert_send<T: Send>() {}
-    fn assert_sync<T: Sync>() {}
-    fn _all() {
-        assert_send::<AeronRuntime>();
-        assert_sync::<AeronRuntime>();
-        assert_send::<PubHandle>();
-        assert_sync::<PubHandle>();
-        assert_send::<ChannelBPublisherHandle>();
-        assert_send::<ChannelBSubscriberHandle>();
-        assert_send::<ChannelCPublisherHandle>();
-        assert_send::<ChannelCReceiptSubscriberHandle>();
-        assert_send::<ChannelCBoundarySubscriberHandle>();
-        assert_send::<IngressPublisherHandle>();
-        assert_send::<IngressSubscriberHandle>();
-        assert_send::<ReceiptCachePublisherHandle>();
-        assert_send::<ReceiptCacheSubscriberHandle>();
-        assert_send::<FsyncWatermarkPublisherHandle>();
-        assert_send::<FsyncWatermarkSubscriberHandle>();
-        assert_send::<QuorumPublisherHandle>();
-        assert_send::<QuorumSubscriberHandle>();
-    }
+#[allow(dead_code)]
+fn assert_send_sync<T: Send + Sync>() {}
+
+#[allow(dead_code)]
+fn assert_send<T: Send>() {}
+
+const _: fn() = || {
+    assert_send_sync::<AeronRuntime>();
+    assert_send_sync::<PubHandle>();
+    assert_send_sync::<ChannelBPublisherHandle>();
+    assert_send::<ChannelBSubscriberHandle>();
+    assert_send_sync::<ChannelCPublisherHandle>();
+    assert_send::<ChannelCReceiptSubscriberHandle>();
+    assert_send::<ChannelCBoundarySubscriberHandle>();
+    assert_send_sync::<IngressPublisherHandle>();
+    assert_send::<IngressSubscriberHandle>();
+    assert_send_sync::<ReceiptCachePublisherHandle>();
+    assert_send::<ReceiptCacheSubscriberHandle>();
+    assert_send_sync::<FsyncWatermarkPublisherHandle>();
+    assert_send::<FsyncWatermarkSubscriberHandle>();
+    assert_send_sync::<QuorumPublisherHandle>();
+    assert_send::<QuorumSubscriberHandle>();
 };
