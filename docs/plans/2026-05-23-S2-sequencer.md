@@ -28,6 +28,23 @@
 
 ---
 
+### Divergences from the assumed surface (recorded during implementation)
+
+The actual S1 + S3 surfaces that landed differ from this plan's assumptions. The implementation in `crates/kardamom-sequencer/` follows the actual surface; readers comparing the plan to the code should expect:
+
+- **`TxEnvelope`** is the kardamom-types wire type (NOT `alloy_consensus::TxEnvelope`). Fields are `{ correlation_id: u64, raw_tx: Bytes, sender: Address, tx_hash: B256 }` — `sender` and `tx_hash` are always populated (D-Sh3/D-Sh4). `correlation_id` is `u64`, not `[u8; 16]`. The `nonce` is NOT a field; it is decoded from `raw_tx` (RLP-encoded alloy-consensus envelope).
+- **No `kardamom_log::framing::TxFrame`.** Channel B carries `TxEnvelope` directly, rkyv-archived via `kardamom_log::codec::{encode, access, materialize}`. The sequencer publishes the `TxEnvelope` byte payload onto B; downstream consumers do `kardamom_log::codec::access::<TxEnvelope>(bytes)` for zero-copy reads.
+- **No `kardamom_log::aeron::sequencer_*` builder helpers and no `kardamom_log::channels::ChannelConfig`.** Production wiring uses the `aeron-live` feature with `kardamom_log::{publisher, subscriber}`; testing uses `kardamom_log::testing::{FakeBus, FakePublication, FakeTypedSubscription}`. S2's CLI binary therefore depends on the same `aeron-live` feature gating; until S3 ships the high-level builder helpers a thin wiring layer lives in S2's binary.
+- **`DuplicateNotification` does not exist** in `kardamom-log` or `kardamom-types`. S2 defines a small local `DuplicateNotification { correlation_id: u64, sender: Address, nonce: u64 }` (rkyv-archived) and publishes it on the receipt-cache channel alongside `CachedReceipt`. This may be promoted to `kardamom-types` in a future cross-cutting change.
+- **`partition_for` exists in `kardamom_ingress::routing`** and uses `m: u32`, `keccak256(sender)[..8]` (big-endian u64) `% m`. S2's `partition.rs` matches that algorithm exactly so both producer (proxy) and consumer (sequencer) agree on routing. S2 uses `u32` for `m` to mirror it.
+- **The "ingress channel" between proxy and sequencer is the `IngressPublication` trait** (in `kardamom-ingress::channels`), backed in tests by `MockChannels` (tokio `mpsc::UnboundedReceiver<TxEnvelope>` per partition). In production it will be backed by real Aeron once S3 ships the corresponding publisher; S2's `IngressSource` trait is the consumer side of that same channel and is the unit-of-substitution between fake and real.
+- **`Lease` already exists in `kardamom-leases`** as a deterministic lowest-host-id-among-caught-up-recorders state machine. S2's `lease.rs` is a thin adapter that wraps `kardamom_leases::Lease` plus the shutdown/takeover orchestration.
+- **`AeronTestCluster`** is the actual harness name (not `AeronDocker`); `cluster.archive_control_endpoint(0)` returns the Archive control endpoint string.
+
+These divergences are scoped so the **algorithmic content** of every task (state machine, pending buffer, partition routing, primary/standby logic, lease handoff) is preserved exactly; only the I/O surface names change.
+
+---
+
 ## File Structure
 
 Before the tasks, here's the full layout. Each file has one responsibility.
