@@ -29,6 +29,4 @@ pub mod sender;
 pub mod standby;
 pub mod state;
 
-// Re-exports are added incrementally per Task 2+. The empty modules above
-// compile cleanly as empty Rust files; each task fills one in and may add
-// its own re-export here.
+pub use error::SequencerError;
