@@ -42,25 +42,27 @@ fn bench_pack(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
     group.sample_size(20);
 
-    let block_4mb = vec![make_block(20_000, 200)];
-    group.bench_function("pack_4mb_compressed", |b| {
+    // ~500 KiB of raw txs — fits in ≤6 blobs uncompressed (6 × 126_976 ≈
+    // 745 KiB ceiling, minus framing overhead).
+    let block_600k = vec![make_block(2_400, 200)];
+    group.bench_function("pack_600k_compressed", |b| {
         let cfg = BatcherConfig {
             compress: true,
             ..Default::default()
         };
         b.iter(|| {
-            let out = pack_blocks(&cfg, black_box(&block_4mb)).unwrap();
+            let out = pack_blocks(&cfg, black_box(&block_600k)).unwrap();
             black_box(out.blobs.len());
         });
     });
 
-    group.bench_function("pack_4mb_uncompressed", |b| {
+    group.bench_function("pack_600k_uncompressed", |b| {
         let cfg = BatcherConfig {
             compress: false,
             ..Default::default()
         };
         b.iter(|| {
-            let out = pack_blocks(&cfg, black_box(&block_4mb)).unwrap();
+            let out = pack_blocks(&cfg, black_box(&block_600k)).unwrap();
             black_box(out.blobs.len());
         });
     });
