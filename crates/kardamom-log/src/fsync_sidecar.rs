@@ -219,29 +219,45 @@ pub fn stream_position_to_bposition(pos: i64) -> BPosition {
 // Aeron-backed PositionSource
 // ---------------------------------------------------------------------------
 
-/// `PositionSource` backed by an Aeron counter (the recording-position counter
-/// exposed by the Aeron Archive). Only available with `aeron-live`.
+/// `PositionSource` backed by the Aeron Archive `get_recording_position` call.
+///
+/// Earlier drafts read a counter handle directly from the shared counters
+/// reader; the 0.1.16x `rusteron-archive` bindings don't expose a
+/// "find the recording-position counter id" helper, so we ask the archive
+/// for the position on every tick instead. One control-channel round-trip
+/// per tick is negligible next to the fsync that follows, and it keeps the
+/// abstraction (a trait returning `i64`) intact.
+///
+/// Only available with `aeron-live`.
 #[cfg(feature = "aeron-live")]
 pub struct AeronPositionSource {
-    counter: rusteron_client::AtomicCounter,
+    archive: std::sync::Arc<rusteron_archive::AeronArchive>,
+    recording_id: i64,
 }
 
 #[cfg(feature = "aeron-live")]
 impl AeronPositionSource {
-    pub fn new(
-        aeron: &rusteron_client::Aeron,
-        counter_id: i32,
-    ) -> Result<Self, crate::error::LogError> {
-        let counter = aeron.counter_for_id(counter_id).map_err(|e| {
-            crate::error::LogError::Aeron(format!("counter_for_id {counter_id}: {e}"))
-        })?;
-        Ok(Self { counter })
+    pub fn new(archive: std::sync::Arc<rusteron_archive::AeronArchive>, recording_id: i64) -> Self {
+        Self {
+            archive,
+            recording_id,
+        }
     }
 }
 
 #[cfg(feature = "aeron-live")]
 impl PositionSource for AeronPositionSource {
     fn current(&self) -> i64 {
-        self.counter.get()
+        // On error (e.g. transient archive disconnect) we return the last
+        // known floor of 0 so the sidecar simply stays idle this tick; the
+        // next tick retries. Logging at debug to avoid log spam on slow
+        // archives.
+        match self.archive.get_recording_position(self.recording_id) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(error = %e, "get_recording_position failed; treating as 0");
+                0
+            }
+        }
     }
 }

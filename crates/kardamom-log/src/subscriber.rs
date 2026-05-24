@@ -2,9 +2,13 @@
 //! the aggregated quorum watermark.
 //!
 //! Gated behind the `aeron-live` cargo feature; see `publisher.rs` for the
-//! same caveats around `rusteron-client` API drift.
+//! same caveats around `rusteron-client` API drift. Channel URIs cross the
+//! FFI boundary as `&CStr` (rusteron 0.1.16x) — we own a `CString` per
+//! subscription for the duration of the call.
 
+use std::ffi::CString;
 use std::sync::Arc;
+use std::time::Duration;
 
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
@@ -17,8 +21,11 @@ use kardamom_types::{
 };
 
 type AeronClient = rusteron_client::Aeron;
-type Sub = rusteron_client::Subscription;
-type Header<'a> = rusteron_client::Header<'a>;
+type Sub = rusteron_client::AeronSubscription;
+type Header = rusteron_client::AeronHeader;
+
+/// Mirror of [`crate::publisher::ADD_PUB_TIMEOUT`].
+const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Generic single-stream subscriber over a typed message. Materializes each
 /// fragment into an owned `T` for ergonomics. Hot-path consumers that want
@@ -36,8 +43,19 @@ where
         + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
 {
     pub fn open(aeron: &AeronClient, channel: &str, stream_id: i32) -> Result<Self, LogError> {
+        let c = CString::new(channel)
+            .map_err(|e| LogError::Aeron(format!("channel uri contains NUL: {e}")))?;
+        // `Handlers::no_*` provides the type-erased "None" the bindgen-generated
+        // generic add_subscription requires (a bare `None` cannot infer the
+        // callback generic parameter).
         let sub = aeron
-            .add_subscription(channel, stream_id)
+            .add_subscription(
+                c.as_c_str(),
+                stream_id,
+                rusteron_client::Handlers::no_available_image_handler(),
+                rusteron_client::Handlers::no_unavailable_image_handler(),
+                ADD_SUB_TIMEOUT,
+            )
             .map_err(|e| LogError::Aeron(format!("add_subscription {channel}: {e}")))?;
         Ok(Self {
             sub,
@@ -48,19 +66,18 @@ where
     /// Poll once and invoke `f` with an owned `T` on every fragment that
     /// arrived in this poll cycle. Returns the number of fragments processed.
     pub fn poll<F: FnMut(T, BPosition)>(&mut self, mut f: F, fragment_limit: usize) -> usize {
-        self.sub.poll(
-            |bytes: &[u8], header: Header<'_>| match codec::materialize::<T>(bytes) {
-                Ok(v) => f(
-                    v,
-                    BPosition {
-                        term_id: header.term_id(),
-                        term_offset: header.term_offset(),
-                    },
-                ),
-                Err(e) => tracing::error!(error = %e, "decode failed"),
+        let n = self.sub.poll_once(
+            |bytes: &[u8], header: Header| match (
+                codec::materialize::<T>(bytes),
+                header_pos(&header),
+            ) {
+                (Ok(v), Some(pos)) => f(v, pos),
+                (Err(e), _) => tracing::error!(error = %e, "decode failed"),
+                (Ok(_), None) => tracing::error!("header values unavailable; dropping fragment"),
             },
             fragment_limit,
-        )
+        );
+        n.unwrap_or(0).max(0) as usize
     }
 
     /// Zero-copy poll: invoke `f` with a borrowed `&Archived<T>` view that
@@ -70,20 +87,28 @@ where
         mut f: F,
         fragment_limit: usize,
     ) -> usize {
-        self.sub.poll(
-            |bytes: &[u8], header: Header<'_>| match codec::access::<T>(bytes) {
-                Ok(view) => f(
-                    view,
-                    BPosition {
-                        term_id: header.term_id(),
-                        term_offset: header.term_offset(),
-                    },
-                ),
-                Err(e) => tracing::error!(error = %e, "access failed"),
+        let n = self.sub.poll_once(
+            |bytes: &[u8], header: Header| match (codec::access::<T>(bytes), header_pos(&header)) {
+                (Ok(view), Some(pos)) => f(view, pos),
+                (Err(e), _) => tracing::error!(error = %e, "access failed"),
+                (Ok(_), None) => tracing::error!("header values unavailable; dropping fragment"),
             },
             fragment_limit,
-        )
+        );
+        n.unwrap_or(0).max(0) as usize
     }
+}
+
+/// Extract `(term_id, term_offset)` from an Aeron header. Returns `None` if
+/// the C bindings fail to populate the values struct (should be rare; we log
+/// and skip the fragment in that case).
+fn header_pos(h: &Header) -> Option<BPosition> {
+    let v = h.get_values().ok()?;
+    let frame = v.frame();
+    Some(BPosition {
+        term_id: frame.term_id(),
+        term_offset: frame.term_offset(),
+    })
 }
 
 pub type ChannelBSubscriber = TypedSubscriber<TxEnvelope>;

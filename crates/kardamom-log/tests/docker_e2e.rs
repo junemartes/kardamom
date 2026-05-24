@@ -57,11 +57,17 @@ async fn aeron_publish_record_subscribe_e2e() {
     cfg.channels.b_stream_id = 1001;
 
     // Connect a host-side Aeron client to the container's Media Driver.
-    // TODO: the exact constructor name may differ between rusteron versions;
-    // adjust if the test panics on Aeron connect.
-    let aeron = Arc::new(
-        rusteron_client::Aeron::connect_to_endpoint(&endpoint).expect("aeron connect to container"),
-    );
+    // The rusteron 0.1.16x API is: build an AeronContext, set the aeron
+    // directory (where the container exposes its CnC file via a bind mount —
+    // or, alternatively, a UDP channel URI carries the endpoint and the
+    // client uses the default dir). For the V0 e2e test we use the default
+    // aeron dir and rely on the channel URIs in `cfg.channels` to point at
+    // the container's UDP endpoint; if a future variant needs a bind-mounted
+    // CnC, call `ctx.set_dir(...)` here.
+    let _ = &endpoint;
+    let ctx = rusteron_client::AeronContext::new().expect("aeron context");
+    let aeron = Arc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
+    aeron.start().expect("aeron start");
 
     let pubr = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
     let subs = Subscribers {

@@ -55,7 +55,9 @@ impl FakeBus {
     }
 }
 
-/// Drop-in for `rusteron_client::ConcurrentPublication` in tests.
+/// Drop-in for `rusteron_client::AeronPublication` (the shared / concurrent
+/// variant) in tests. Named `Concurrent` historically — keep the name so
+/// existing test code doesn't churn.
 pub struct FakeConcurrentPublication {
     state: Arc<Mutex<StreamState>>,
 }

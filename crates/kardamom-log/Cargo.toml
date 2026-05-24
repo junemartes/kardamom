@@ -10,8 +10,10 @@ default = []
 # tests/docker_e2e.rs).
 testing = []
 # Gates the Docker-driven e2e test (testcontainers). Off by default so
-# `cargo test` works in environments without a Docker daemon.
-docker-e2e = ["testing"]
+# `cargo test` works in environments without a Docker daemon. Pulls
+# `testcontainers` in as a real (non-dev) dep because the e2e harness in
+# `testing::AeronTestCluster` is reused by other crates' integration tests.
+docker-e2e = ["testing", "dep:testcontainers"]
 # Gates code that depends on the live rusteron Aeron client/archive bindings.
 # Off by default so the crate compiles cleanly on hosts without the Aeron C
 # library installed. Real Aeron deployments and the docker-e2e harness enable
@@ -29,6 +31,7 @@ rkyv.workspace = true
 rusteron-archive = { workspace = true, optional = true }
 rusteron-client = { workspace = true, optional = true }
 serde.workspace = true
+testcontainers = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
