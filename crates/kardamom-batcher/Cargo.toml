@@ -1,0 +1,48 @@
+[package]
+name = "kardamom-batcher"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+# Pulls the live `rusteron-archive` reader path. Off by default so the crate
+# compiles cleanly on hosts without the Aeron C library installed.
+aeron-live = ["kardamom-log/aeron-live"]
+# Real Aeron container e2e (per S0 D-Sh8). Implies the in-memory testing
+# helpers from kardamom-log because the harness re-uses some of them.
+docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
+
+[dependencies]
+kardamom-types.workspace = true
+kardamom-log.workspace = true
+kardamom-leases.workspace = true
+
+alloy-primitives.workspace = true
+alloy-eips.workspace = true
+alloy-consensus.workspace = true
+alloy-network.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace = true
+
+bytes.workspace = true
+rkyv.workspace = true
+zstd = "0.13"
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+kardamom-log = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[[bin]]
+name = "kardamom-batcher"
+path = "src/bin/kardamom-batcher.rs"
