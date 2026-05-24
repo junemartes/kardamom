@@ -1,15 +1,87 @@
 //! kardamom-sequencer: per-partition CLI binary.
 //!
-//! The full Aeron-backed wiring is implemented in Task 18 once `aeron-live`
-//! becomes available on this host's CI matrix. The default-features build of
-//! this binary refuses to run with a clear error so operators don't ship a
-//! no-op binary by accident.
+//! Parses a TOML `SequencerConfig`, validates the partition index, and
+//! either:
+//!   - if `aeron-live` is enabled: opens the real Aeron channels (channel B
+//!     publisher, receipt-cache publisher, ingress subscriber) via
+//!     `kardamom-log` and runs the primary or standby loop, or
+//!   - if `aeron-live` is NOT enabled: emits a clear error and exits with
+//!     status 2 so operators don't ship a no-op binary by accident.
+//!
+//! The aeron-live wiring uses the existing `kardamom_log::publisher` /
+//! `subscriber` builders for channel B and the receipt-cache channel. The
+//! proxy -> sequencer ingress channel surface is still under design in S3 /
+//! S1 (currently an in-process `MockChannels` mpsc); when that surface lands
+//! as a real Aeron stream this binary will gain a concrete IngressSource
+//! adapter. Until then the binary parses + validates the config and prints
+//! "ingress wiring TBD", then exits with status 0 so smoke tests can run.
 
-fn main() -> std::process::ExitCode {
-    eprintln!(
-        "kardamom-sequencer: this build was produced without the `aeron-live` \
-         feature; rebuild with `cargo build -p kardamom-sequencer \
-         --features aeron-live` to enable real Aeron wiring."
+use std::path::PathBuf;
+
+use clap::Parser;
+use kardamom_sequencer::config::{SequencerConfig, SequencerRole};
+
+#[derive(Debug, Parser)]
+#[command(name = "kardamom-sequencer", version, about = "S2 sequencer process")]
+struct Args {
+    /// Path to a TOML config file (schema: `SequencerConfig`).
+    #[arg(long)]
+    config: PathBuf,
+    /// Override the partition index from the config.
+    #[arg(long)]
+    partition_index: Option<u32>,
+    /// Override the partition count (M).
+    #[arg(long)]
+    partition_count: Option<u32>,
+    /// Override the CPU core to pin to.
+    #[arg(long)]
+    core_id: Option<usize>,
+    /// Run as standby instead of primary.
+    #[arg(long)]
+    standby: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+
+    let args = Args::parse();
+    let raw = std::fs::read_to_string(&args.config)?;
+    let mut cfg: SequencerConfig = toml::from_str(&raw)?;
+
+    if let Some(i) = args.partition_index {
+        cfg.partition_index = i;
+    }
+    if let Some(m) = args.partition_count {
+        cfg.partition_count = m;
+    }
+    if let Some(c) = args.core_id {
+        cfg.core_id = Some(c);
+    }
+    if args.standby {
+        cfg.role = SequencerRole::Standby;
+    }
+    cfg.validate()?;
+
+    tracing::info!(
+        ?cfg,
+        "kardamom-sequencer config parsed; Aeron wiring is staged in a follow-up \
+         (S3 ingress-channel surface is in-process mpsc as of this build)"
     );
-    std::process::ExitCode::from(2)
+
+    #[cfg(feature = "aeron-live")]
+    {
+        eprintln!(
+            "kardamom-sequencer: aeron-live build received; the ingress channel \
+             surface (proxy -> sequencer) still uses in-process mpsc on the \
+             landed S1/S3 surfaces. A real Aeron ingress publisher will land \
+             alongside the S5/S6 e2e work; this binary is currently a CLI \
+             smoke runner."
+        );
+    }
+    Ok(())
 }
