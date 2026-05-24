@@ -71,7 +71,8 @@ mod tests {
 
     #[test]
     fn size_lower_below_upper() {
-        assert!(SIZE_LOWER < SIZE_UPPER);
+        // const-block per clippy::assertions_on_constants
+        const _: () = assert!(SIZE_LOWER < SIZE_UPPER);
     }
 
     #[test]
