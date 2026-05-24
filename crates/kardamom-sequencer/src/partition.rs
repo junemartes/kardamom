@@ -25,7 +25,11 @@ pub enum PartitionConfigError {
 }
 
 pub fn validate_partition_count(m: u32) -> Result<(), PartitionConfigError> {
-    if m == 0 { Err(PartitionConfigError::Zero) } else { Ok(()) }
+    if m == 0 {
+        Err(PartitionConfigError::Zero)
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
