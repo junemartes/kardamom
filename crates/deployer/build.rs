@@ -31,6 +31,7 @@ const EMBEDDED_ARTIFACTS: &[(&str, &str)] = &[
     ("KARDAMOM_FACTORY_V1_CREATION", "KardamomFactoryV1"),
     ("ERC1967_PROXY_CREATION", "ERC1967Proxy"),
     ("ETH_LOCKBOX_CREATION", "ETHLockbox"),
+    ("KARDAMOM_L2_SETTLEMENT_CREATION", "KardamomL2Settlement"),
 ];
 
 fn main() -> Result<()> {

@@ -12,17 +12,22 @@ use crate::embedded;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContractId {
     EthLockbox,
+    /// L2 data-availability sink for the S7 L1 batcher. Records
+    /// `(prevBatchIndex, blobHashes, l2BlockStart, l2BlockEnd)` and emits
+    /// `BatchPosted` — no state-root storage (S0 D-Sh11).
+    KardamomL2Settlement,
 }
 
 impl ContractId {
     /// Every variant. The exhaustive match in `creation_bytecode` makes this
     /// list mandatory-to-update when a new variant is added.
-    pub const ALL: &'static [Self] = &[Self::EthLockbox];
+    pub const ALL: &'static [Self] = &[Self::EthLockbox, Self::KardamomL2Settlement];
 
     /// Canonical label hashed into the registry key.
     pub fn label(self) -> &'static str {
         match self {
             ContractId::EthLockbox => "kardamom.l1.ETHLockbox",
+            ContractId::KardamomL2Settlement => "kardamom.l2.KardamomL2Settlement",
         }
     }
 
@@ -30,6 +35,8 @@ impl ContractId {
     pub fn init_signature(self) -> &'static str {
         match self {
             ContractId::EthLockbox => "initialize(address)",
+            // KardamomL2Settlement.initialize(address _l1Batcher)
+            ContractId::KardamomL2Settlement => "initialize(address)",
         }
     }
 
@@ -64,6 +71,7 @@ impl ContractId {
     pub fn creation_bytecode(self) -> Bytes {
         match self {
             ContractId::EthLockbox => embedded::eth_lockbox_creation(),
+            ContractId::KardamomL2Settlement => embedded::kardamom_l2_settlement_creation(),
         }
     }
 }
@@ -127,5 +135,20 @@ mod tests {
                 "{id:?} has empty creation bytecode; wire it into build.rs"
             );
         }
+    }
+
+    #[test]
+    fn kardamom_l2_settlement_id_is_keccak256_of_label() {
+        let id = ContractId::KardamomL2Settlement.id();
+        let expected = keccak256(b"kardamom.l2.KardamomL2Settlement");
+        assert_eq!(id, expected);
+    }
+
+    #[test]
+    fn kardamom_l2_settlement_label_is_distinct_from_eth_lockbox() {
+        assert_ne!(
+            ContractId::KardamomL2Settlement.id(),
+            ContractId::EthLockbox.id()
+        );
     }
 }
