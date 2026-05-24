@@ -3741,6 +3741,7 @@ dependencies = [
  "bytes",
  "criterion 0.5.1",
  "crossbeam-channel",
+ "dashmap",
  "kardamom-log",
  "kardamom-types",
  "rand 0.9.4",

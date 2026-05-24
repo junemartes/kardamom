@@ -1,20 +1,43 @@
-//! Executor actor: reader thread + sequential execution thread + commit thread.
+//! Executor actor: M channel-A reader threads + 1 channel-B reader thread +
+//! sequential execution thread + commit thread.
 //!
-//! Threads communicate via crossbeam-channel queues. The actor itself is
-//! `Send`; spawning is the caller's responsibility (use `std::thread::spawn`
-//! or a `std::thread::Builder` for stack-size / pinning control).
+//! ## Topology change (S4-arch-update, D-Sh12 / spec §2.4)
+//!
+//! Pre-S4-arch-update there was **one** channel-B reader thread that pulled
+//! full `TxEnvelope`s off channel B. Post-D-Sh12 the inbound demux is split:
+//!
+//! - **M channel-A reader threads** (one per sequencer partition) each
+//!   subscribe to their channel A and stream full `TxEnvelope`s into a shared
+//!   **join buffer** keyed by `(sequencer_id, position_a)`.
+//! - **One channel-B reader thread** pulls tiny `ChannelBMessage` records
+//!   (`TxRef | BoundaryStart`) in canonical order. For each `TxRef`, it joins
+//!   against the buffer and hands `(b_position, TxEnvelope)` to the exec
+//!   thread. For each `BoundaryStart`, it forwards verbatim.
+//!
+//! The exec thread, commit thread, state-snapshot swap protocol, write-set
+//! hashing, and channel-C emission are **unchanged** — the executor's
+//! external contract (consume canonical-ordered txs + boundaries, produce
+//! ordered receipts + slim boundaries on channel C) is identical. Only the
+//! inbound demux moves.
+//!
+//! See `reader.rs` for the join-buffer + reader-thread implementation.
 //!
 //! Wiring:
-//!   reader: consumes channel B; forwards (tx, position) or BlockBoundaryStart
-//!     to the exec thread. Validates monotonicity of the executor-local
-//!     `TxIndex` newtype as a sanity guard.
-//!   exec:   runs revm sequentially against a snapshot from `SnapshotSource`,
-//!     captures per-tx `WriteSet`, merges into a `PendingDelta`, emits
-//!     receipts in arrival order. On `BlockBoundaryStart` it asserts boundary
-//!     alignment, drains the delta to the state writer queue, publishes the
-//!     slim `BlockBoundary` (no state-root commitment per S0 D-Sh11),
-//!     waits for the state-writer signal, then swaps to a fresh snapshot.
-//!   commit: forwards receipts and boundaries to channel C in arrival order.
+//! ```text
+//!   channel A[0..M]    channel B
+//!        │                │
+//!        ▼                ▼
+//!   ┌─────────┐     ┌──────────┐
+//!   │M readers│──►  │B reader  │──► exec ──► commit ──► channel C
+//!   │ (insert │join │(lookup+  │
+//!   │ buffer) │buf  │ forward) │
+//!   └─────────┘     └──────────┘
+//! ```
+//!
+//! Each Aeron-touching thread (the M+1 reader threads in production) owns
+//! its own `rusteron_client::Aeron` (`!Send + !Sync`) on a dedicated OS
+//! thread; cross-thread coordination uses the `DashMap` join buffer and
+//! crossbeam channels.
 
 use std::thread::{self, JoinHandle};
 
@@ -27,15 +50,11 @@ use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::executor::execute_tx;
-use crate::types::{BMessage, CMessage, TxIndex};
-
-/// Subscription to channel B. Implementations: real (Aeron) in
-/// `kardamom-log`; test mocks in this crate's tests.
-pub trait ChannelBSubscription: Send {
-    /// Block until the next record is available or return Err when the
-    /// subscription closes.
-    fn next(&mut self) -> Result<BMessage, ExecutorError>;
-}
+use crate::reader::{
+    ChannelASubscription, ChannelBSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
+    spawn_channel_a_reader, spawn_channel_b_reader,
+};
+use crate::types::{CMessage, TxIndex};
 
 /// Publication handle for channel C.
 pub trait ChannelCPublication: Send {
@@ -62,6 +81,9 @@ pub struct ExecutorConfig {
     /// Bound on the receipt queue between exec and commit threads. Larger =
     /// more amortization, more memory.
     pub receipt_queue_depth: usize,
+    /// Reader-layer tunables (join buffer timeout, growth warning
+    /// threshold). See [`ReaderConfig`].
+    pub reader: ReaderConfig,
 }
 
 impl Default for ExecutorConfig {
@@ -69,21 +91,9 @@ impl Default for ExecutorConfig {
         Self {
             chain_id: 1,
             receipt_queue_depth: 1024,
+            reader: ReaderConfig::default(),
         }
     }
-}
-
-/// Internal envelope routed from reader → exec thread. `envelope` is
-/// `kardamom_types::TxEnvelope` (carries `sender` and `tx_hash` populated by
-/// the proxy — S0 D-Sh3 / D-Sh4). No `signer` field separate from the
-/// envelope; the executor reads it directly off `envelope.sender`.
-enum ReaderToExec {
-    Tx {
-        tx_idx: TxIndex,
-        envelope: kardamom_types::TxEnvelope,
-        position: BPosition,
-    },
-    Boundary(BlockBoundaryStart),
 }
 
 /// Internal envelope routed from exec → commit thread.
@@ -92,17 +102,23 @@ enum ExecToCommit {
     Boundary(BlockBoundary),
 }
 
-/// Owns the three threads. `run` blocks until the channel-B subscription
-/// closes or an error occurs.
+/// Owns the M+3 threads (M channel-A readers, 1 channel-B reader, 1 exec, 1
+/// commit). `run` blocks until the channel-B subscription closes or an
+/// error occurs.
 pub struct Executor;
 
 impl Executor {
-    /// Spawn reader, exec, commit threads and join them. Returns when
+    /// Spawn the readers, exec, commit threads and join them. Returns when
     /// channel B closes cleanly or when any thread propagates a fatal
     /// error.
-    pub fn run<B, C, S, Q, P>(
+    ///
+    /// `a_subs` holds one subscription per sequencer partition (M total).
+    /// They may be supplied in any order — each subscription declares its
+    /// own `sequencer_id`.
+    pub fn run<C, S, Q, P>(
         cfg: ExecutorConfig,
-        b_sub: B,
+        a_subs: Vec<Box<dyn ChannelASubscription>>,
+        b_sub: Box<dyn ChannelBSubscription>,
         c_pub: C,
         snapshots: S,
         sw_signal: Q,
@@ -110,16 +126,28 @@ impl Executor {
         initial_block: u64,
     ) -> Result<(), ExecutorError>
     where
-        B: ChannelBSubscription + 'static,
         C: ChannelCPublication + 'static,
         S: SnapshotSource + 'static,
         Q: StateWriterSignal + 'static,
         P: StateWriterQueue + 'static,
     {
+        let buffer = JoinBuffer::new();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth);
 
-        let reader = spawn_reader(b_sub, tx_r2e);
+        // M channel-A reader threads, one per sequencer partition. Each
+        // owns its subscription for the duration; we collect the join
+        // handles to surface any error.
+        let mut a_handles: Vec<JoinHandle<Result<(), ExecutorError>>> =
+            Vec::with_capacity(a_subs.len());
+        for a in a_subs {
+            // The trait object's `next` already advertises sequencer_id.
+            a_handles.push(spawn_channel_a_reader(BoxedASub(a), buffer.clone()));
+        }
+
+        let b_handle =
+            spawn_channel_b_reader(BoxedBSub(b_sub), buffer.clone(), cfg.reader.clone(), tx_r2e);
+
         let exec = spawn_exec(
             cfg.clone(),
             rx_r2e,
@@ -131,62 +159,44 @@ impl Executor {
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
-        // Join in order: reader, exec, commit. The first error wins; the
-        // remaining joins still complete so threads shut down cleanly.
-        let r1 = reader.join().expect("reader panic");
-        let r2 = exec.join().expect("exec panic");
-        let r3 = commit.join().expect("commit panic");
-        r1.and(r2).and(r3)
+        // Join in this order: B reader (closes first when channel B is
+        // exhausted), then exec, then commit, then A readers. Channel-A
+        // subscriptions may keep producing after channel B closes; we let
+        // them drain to clean shutdown. Errors from any thread propagate;
+        // the first error wins but every join still runs so threads tear
+        // down cleanly.
+        let r_b = b_handle.join().expect("channel-b reader panic");
+        let r_exec = exec.join().expect("exec panic");
+        let r_commit = commit.join().expect("commit panic");
+        let mut r_a: Result<(), ExecutorError> = Ok(());
+        for h in a_handles {
+            let res = h.join().expect("channel-a reader panic");
+            if r_a.is_ok() {
+                r_a = res;
+            }
+        }
+        r_b.and(r_exec).and(r_commit).and(r_a)
     }
 }
 
-fn spawn_reader<B>(mut b_sub: B, out: Sender<ReaderToExec>) -> JoinHandle<Result<(), ExecutorError>>
-where
-    B: ChannelBSubscription + 'static,
-{
-    thread::Builder::new()
-        .name("executor-reader".into())
-        .spawn(move || {
-            let mut expected: TxIndex = TxIndex::ZERO;
-            loop {
-                let msg = match b_sub.next() {
-                    Ok(m) => m,
-                    Err(ExecutorError::ChannelBClosed) => return Ok(()),
-                    Err(e) => return Err(e),
-                };
-                match msg {
-                    BMessage::Tx {
-                        position,
-                        tx_idx,
-                        envelope,
-                    } => {
-                        if tx_idx != expected {
-                            return Err(ExecutorError::OutOfOrderTx {
-                                got: tx_idx,
-                                expected,
-                            });
-                        }
-                        expected = expected.next();
-                        if out
-                            .send(ReaderToExec::Tx {
-                                tx_idx,
-                                envelope,
-                                position,
-                            })
-                            .is_err()
-                        {
-                            return Ok(()); // exec thread shutting down
-                        }
-                    }
-                    BMessage::BlockBoundaryStart(b) => {
-                        if out.send(ReaderToExec::Boundary(b)).is_err() {
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-        })
-        .expect("spawn reader")
+// Trait-object adapters so the reader fns (generic on a concrete type) can
+// own a `Box<dyn ChannelASubscription>` / `Box<dyn ChannelBSubscription>`
+// without requiring the caller to monomorphise per-M.
+struct BoxedASub(Box<dyn ChannelASubscription>);
+impl ChannelASubscription for BoxedASub {
+    fn sequencer_id(&self) -> u8 {
+        self.0.sequencer_id()
+    }
+    fn next(&mut self) -> Result<(BPosition, kardamom_types::TxEnvelope), ExecutorError> {
+        self.0.next()
+    }
+}
+
+struct BoxedBSub(Box<dyn ChannelBSubscription>);
+impl ChannelBSubscription for BoxedBSub {
+    fn next(&mut self) -> Result<(BPosition, kardamom_types::ChannelBMessage), ExecutorError> {
+        self.0.next()
+    }
 }
 
 fn spawn_exec<S, Q, P>(
@@ -222,6 +232,8 @@ where
             // receipt. Used to validate alignment with
             // `BlockBoundaryStart.end_tx_idx`.
             let mut last_processed_position: Option<BPosition> = None;
+            // Sanity: tx_idx assigned by the channel-B reader is monotone.
+            let mut expected_tx_idx = TxIndex::ZERO;
 
             loop {
                 let msg = match rx.recv() {
@@ -234,6 +246,13 @@ where
                         envelope,
                         position,
                     } => {
+                        if tx_idx != expected_tx_idx {
+                            return Err(ExecutorError::OutOfOrderTx {
+                                got: tx_idx,
+                                expected: expected_tx_idx,
+                            });
+                        }
+                        expected_tx_idx = expected_tx_idx.next();
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
@@ -340,101 +359,9 @@ where
 }
 
 #[cfg(test)]
-mod reader_tests {
-    use super::*;
-    use crate::types::TxIndex;
-    use alloy_consensus::{SignableTransaction, TxLegacy};
-    use alloy_eips::eip2718::Encodable2718;
-    use alloy_network::TxSignerSync;
-    use alloy_primitives::{Address, Bytes as AlloyBytes, TxKind as APTxKind, U256, keccak256};
-    use alloy_signer_local::PrivateKeySigner;
-    use bytes::Bytes;
-    use kardamom_types::TxEnvelope as KtTxEnvelope;
-    use std::collections::VecDeque;
-
-    fn legacy_envelope(signer: &PrivateKeySigner, nonce: u64) -> KtTxEnvelope {
-        let mut tx = TxLegacy {
-            chain_id: Some(1),
-            nonce,
-            gas_price: 0,
-            gas_limit: 21_000,
-            to: APTxKind::Call(Address::from([0x22u8; 20])),
-            value: U256::from(1u64),
-            input: AlloyBytes::new(),
-        };
-        let sig = signer.sign_transaction_sync(&mut tx).unwrap();
-        let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
-        let raw_tx = Bytes::from(alloy_env.encoded_2718());
-        let tx_hash = keccak256(&raw_tx);
-        KtTxEnvelope {
-            correlation_id: 0,
-            raw_tx,
-            sender: signer.address(),
-            tx_hash,
-        }
-    }
-
-    struct VecBSub {
-        queue: VecDeque<Result<BMessage, ExecutorError>>,
-    }
-    impl ChannelBSubscription for VecBSub {
-        fn next(&mut self) -> Result<BMessage, ExecutorError> {
-            self.queue
-                .pop_front()
-                .unwrap_or(Err(ExecutorError::ChannelBClosed))
-        }
-    }
-
-    fn pos(off: i32) -> BPosition {
-        BPosition {
-            term_id: 0,
-            term_offset: off,
-        }
-    }
-
-    #[test]
-    fn reader_rejects_out_of_order_tx_idx() {
-        let signer = PrivateKeySigner::random();
-        let e0 = legacy_envelope(&signer, 0);
-        let e2 = legacy_envelope(&signer, 1);
-
-        let queue = VecDeque::from(vec![
-            Ok(BMessage::Tx {
-                position: pos(0),
-                tx_idx: TxIndex(0),
-                envelope: e0,
-            }),
-            // Skip 1; emit 2 — must trigger OutOfOrderTx.
-            Ok(BMessage::Tx {
-                position: pos(2),
-                tx_idx: TxIndex(2),
-                envelope: e2,
-            }),
-        ]);
-        let (tx_r2e, _rx_r2e) = bounded::<ReaderToExec>(4);
-        let h = spawn_reader(VecBSub { queue }, tx_r2e);
-        let res = h.join().expect("no panic");
-        assert!(
-            matches!(res, Err(ExecutorError::OutOfOrderTx { got, expected }) if got == TxIndex(2) && expected == TxIndex(1))
-        );
-    }
-
-    #[test]
-    fn reader_clean_close_returns_ok() {
-        let (tx_r2e, _rx_r2e) = bounded::<ReaderToExec>(4);
-        let h = spawn_reader(
-            VecBSub {
-                queue: VecDeque::new(),
-            },
-            tx_r2e,
-        );
-        assert!(h.join().expect("no panic").is_ok());
-    }
-}
-
-#[cfg(test)]
 mod exec_tests {
     use super::*;
+    use crate::reader::ReaderToExec;
     use crate::state::{MockStateDatabase, StaticSnapshotSource};
     use crate::types::TxIndex;
     use alloy_consensus::{SignableTransaction, TxLegacy};
@@ -529,10 +456,7 @@ mod exec_tests {
             .unwrap();
         drop(tx_r2e);
 
-        let cfg = ExecutorConfig {
-            chain_id: 1,
-            receipt_queue_depth: 8,
-        };
+        let cfg = ExecutorConfig::default();
         let h = spawn_exec(
             cfg,
             rx_r2e,
@@ -603,10 +527,7 @@ mod exec_tests {
             )
             .build();
 
-        let cfg = ExecutorConfig {
-            chain_id: 1,
-            receipt_queue_depth: 8,
-        };
+        let cfg = ExecutorConfig::default();
         let h = spawn_exec(
             cfg,
             rx_r2e,
