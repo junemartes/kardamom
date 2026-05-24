@@ -36,8 +36,10 @@ async fn exactly_one_sealer_publishes_per_tick() {
     let bus = FakeBus::new();
     let clock = MockClock::new(1_000);
 
-    let mut all: Vec<(Sealer<MockClock, FakeBoundaryPublisher>, FakeBoundaryPublisher)> =
-        Vec::new();
+    let mut all: Vec<(
+        Sealer<MockClock, FakeBoundaryPublisher>,
+        FakeBoundaryPublisher,
+    )> = Vec::new();
     for hid in [1u8, 2, 3] {
         let pubh = FakeBoundaryPublisher::new(bus.clone(), "ch", 2);
         let view = pubh.clone();

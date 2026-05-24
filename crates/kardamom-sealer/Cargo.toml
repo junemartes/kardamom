@@ -37,7 +37,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
-criterion.workspace = true
+# criterion 0.7 with the async_tokio feature (the workspace pin is 0.5 which
+# doesn't have `b.to_async`); kardamom-ingress already does the same override.
+criterion = { version = "0.7", features = ["async_tokio"] }
 # Re-pull our own `testing` feature so tests under `tests/` always have the
 # in-memory fakes without needing `cargo test --features testing`.
 kardamom-sealer = { path = ".", features = ["testing"] }
