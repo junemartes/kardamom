@@ -29,8 +29,13 @@ struct Entry {
     receipt: Option<Receipt>,
 }
 
+/// Map shard used by both `PendingReceipts` and the `PendingWait` it hands
+/// out. Aliased to keep clippy's type-complexity lint happy and to make the
+/// "shared between caller and consumer" property obvious.
+type PendingMap = Arc<DashMap<(Address, u64), Arc<Mutex<Entry>>>>;
+
 pub struct PendingReceipts {
-    map: Arc<DashMap<(Address, u64), Mutex<Entry>>>,
+    map: PendingMap,
     /// Latest watermark observed. Cached to avoid one-receiver-per-await
     /// fanout.
     latest_watermark: Arc<Mutex<Option<BPosition>>>,
@@ -57,10 +62,10 @@ impl PendingReceipts {
         let (tx, rx) = oneshot::channel();
         self.map.insert(
             (sender, nonce),
-            Mutex::new(Entry {
+            Arc::new(Mutex::new(Entry {
                 responder: Some(tx),
                 receipt: None,
-            }),
+            })),
         );
         PendingWait {
             rx,
@@ -75,10 +80,15 @@ impl PendingReceipts {
     /// `update_watermark`.
     pub async fn on_receipt(&self, sender: Address, nonce: u64, receipt: Receipt) {
         let key = (sender, nonce);
-        let Some(entry_lock) = self.map.get(&key) else {
-            return;
+        // Clone the entry Arc and immediately drop the dashmap ref so we
+        // don't hold the shard lock while awaiting `entry.lock()`.
+        let entry = {
+            let Some(r) = self.map.get(&key) else {
+                return;
+            };
+            r.value().clone()
         };
-        let mut e = entry_lock.lock().await;
+        let mut e = entry.lock().await;
         e.receipt = Some(receipt.clone());
         let latest = *self.latest_watermark.lock().await;
         if Self::watermark_past(&latest, receipt.tx_idx)
@@ -86,7 +96,6 @@ impl PendingReceipts {
         {
             let _ = resp.send(Ok(ReceiptResponse { receipt }));
             drop(e);
-            drop(entry_lock);
             self.map.remove(&key);
         }
     }
@@ -95,11 +104,17 @@ impl PendingReceipts {
     /// parked entry whose stored receipt's B-position is now covered.
     pub async fn update_watermark(&self, wm: QuorumWatermark) {
         *self.latest_watermark.lock().await = Some(wm.position);
-        // Collect releasable keys without holding any DashMap shard lock
-        // during the response-side `.send`.
+        // Snapshot the (key, Arc) pairs so we never hold a dashmap shard
+        // lock while awaiting per-entry locks below.
+        type Snap = Vec<((Address, u64), Arc<Mutex<Entry>>)>;
+        let snapshot: Snap = self
+            .map
+            .iter()
+            .map(|r| (*r.key(), r.value().clone()))
+            .collect();
         let mut to_release: Vec<(Address, u64)> = Vec::new();
-        for entry in self.map.iter() {
-            let mut e = entry.value().lock().await;
+        for (key, entry) in snapshot {
+            let mut e = entry.lock().await;
             let release = e
                 .receipt
                 .as_ref()
@@ -108,7 +123,7 @@ impl PendingReceipts {
             if release && let Some(resp) = e.responder.take() {
                 let receipt = e.receipt.clone().expect("checked is_some above");
                 let _ = resp.send(Ok(ReceiptResponse { receipt }));
-                to_release.push(*entry.key());
+                to_release.push(key);
             }
         }
         for k in to_release {
@@ -139,7 +154,7 @@ impl PendingReceipts {
 pub struct PendingWait {
     rx: oneshot::Receiver<Result<ReceiptResponse, IngressError>>,
     key: (Address, u64),
-    map: Arc<DashMap<(Address, u64), Mutex<Entry>>>,
+    map: PendingMap,
 }
 
 impl PendingWait {
