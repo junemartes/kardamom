@@ -132,30 +132,32 @@ impl AeronRuntime {
     /// Build an Aeron client (using the default `aeron_dir`) and spawn the
     /// dedicated Aeron thread.
     ///
-    /// For more control over `AeronContext` (e.g. pointing at a specific dir
-    /// or registering error / new-image handlers), use [`AeronRuntime::with_aeron`].
+    /// For more control over `AeronContext` (e.g. pointing at a specific dir),
+    /// use [`AeronRuntime::spawn_with`] and supply a closure that builds the
+    /// context on the Aeron thread (the context itself is `!Send`, so it
+    /// cannot be passed across thread boundaries).
     pub fn spawn_default() -> Result<Self, LogError> {
-        let ctx = rusteron_client::AeronContext::new()
-            .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
-        Self::spawn_with_context(ctx)
+        Self::spawn_with(|| {
+            rusteron_client::AeronContext::new()
+                .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))
+        })
     }
 
-    /// Build an Aeron client from a pre-configured context.
-    pub fn spawn_with_context(ctx: rusteron_client::AeronContext) -> Result<Self, LogError> {
+    /// Spawn the Aeron thread, building the `AeronContext` inside the thread
+    /// via the caller-supplied closure. The closure runs on the Aeron thread
+    /// — this is the only way to feed it custom configuration without crossing
+    /// the `!Send + !Sync` boundary that AeronContext sits on.
+    pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
+    where
+        F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
+    {
         let (started_tx, started_rx) = crossbeam_channel::bounded::<Result<(), LogError>>(1);
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<RuntimeCmd>();
 
-        // Subscription registration uses a side channel because the registration
-        // payload itself isn't `Send` (the callback needs the registration cmd
-        // to live on the Aeron thread). For Phase 1 simplicity we register all
-        // publications + subscriptions up-front via [`Builder`], then spawn —
-        // see the [`AeronRuntimeBuilder`] convenience below for that path.
-        // Here we ship the minimal runtime; builder methods add to a queue
-        // before `spawn()` returns.
         let join = std::thread::Builder::new()
             .name("kardamom-aeron".into())
             .spawn(move || {
-                let aeron = match build_aeron(ctx) {
+                let aeron = match make_ctx().and_then(build_aeron) {
                     Ok(a) => a,
                     Err(e) => {
                         let _ = started_tx.send(Err(e));

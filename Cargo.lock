@@ -3776,6 +3776,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-e2e"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bytes",
+ "kardamom-executor",
+ "kardamom-log",
+ "kardamom-state",
+ "kardamom-types",
+ "rkyv",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
 name = "kardamom-executor"
 version = "0.1.0"
 dependencies = [

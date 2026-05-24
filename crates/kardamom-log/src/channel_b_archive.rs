@@ -95,17 +95,34 @@ impl ReplayRange {
     /// Drive a replay by talking to the supplied `AeronArchive` directly.
     /// **Must** be called from the same thread that owns `archive` (rusteron
     /// archive handles are `!Send + !Sync`).
+    ///
+    /// Returns the replay session id assigned by the archive.
     pub fn start(&self, archive: &Archive) -> Result<i64, LogError> {
         use std::ffi::CString;
         let c = CString::new(self.replay_channel.as_str())
             .map_err(|e| LogError::Aeron(format!("replay uri NUL: {e}")))?;
+        // rusteron 0.1.16x: start_replay takes a 6-field ReplayParams struct.
+        // bounding_limit_counter_id = -1 → no bound.
+        // file_io_max_length = 0 → use the archive default I/O chunk size.
+        // replay_token = 0 → no token (used for cluster auth).
+        // subscription_registration_id = -1 → start_replay also publishes a
+        // new replay publication; pass NULL_VALUE (-1) to disable any
+        // subscription-side binding.
+        let params = rusteron_archive::AeronArchiveReplayParams::new(
+            -1,
+            0,
+            self.from_position,
+            self.length,
+            0,
+            -1,
+        )
+        .map_err(|e| LogError::Aeron(format!("ReplayParams::new: {e}")))?;
         archive
             .start_replay(
                 self.recording_id,
-                self.from_position,
-                self.length,
                 c.as_c_str(),
                 self.replay_stream_id,
+                &params,
             )
             .map_err(|e| LogError::Aeron(format!("start_replay: {e}")))
     }
