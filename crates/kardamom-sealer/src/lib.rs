@@ -29,6 +29,7 @@
 pub mod bootstrap;
 pub mod clock;
 pub mod config;
+pub mod election;
 pub mod emitter;
 pub mod sealer;
 pub mod tick;
