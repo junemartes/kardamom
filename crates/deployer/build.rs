@@ -43,6 +43,14 @@ fn main() -> Result<()> {
         .to_path_buf();
     let contracts_root = workspace_root.join("contracts");
 
+    // Emit a rerun trigger for every .sol file recursively so adding a new
+    // contract under contracts/src/<subdir>/ invalidates the cached build.
+    // Cargo's rerun-if-changed on a directory only tracks direct children,
+    // not subdirs — that's why adding contracts/src/L2/ silently didn't
+    // re-trigger build.rs in CI.
+    for entry in walk_sol_files(&contracts_root.join("src")) {
+        println!("cargo:rerun-if-changed={}", entry.display());
+    }
     println!(
         "cargo:rerun-if-changed={}",
         contracts_root.join("src").display()
@@ -169,5 +177,29 @@ fn hex_nibble(c: u8) -> Result<u8> {
         b'a'..=b'f' => Ok(c - b'a' + 10),
         b'A'..=b'F' => Ok(c - b'A' + 10),
         _ => Err(anyhow!("invalid hex char: {}", c as char)),
+    }
+}
+
+/// Yield every `*.sol` file under `dir` recursively. Used to populate
+/// `cargo:rerun-if-changed=...` so the build script invalidates when contracts
+/// are added or removed anywhere in the tree.
+fn walk_sol_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    walk_sol_files_into(dir, &mut out);
+    out
+}
+
+fn walk_sol_files_into(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_sol_files_into(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("sol") {
+            out.push(path);
+        }
     }
 }
