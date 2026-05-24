@@ -8,8 +8,9 @@ default = ["binary-protocol"]
 # Length-prefixed RLP TCP+UDS binary protocol. On by default.
 binary-protocol = []
 # Gates a Docker-backed e2e test (real Aeron via kardamom-log testcontainers
-# harness). Off by default so `cargo test` works without Docker.
-docker-e2e = []
+# harness). Off by default so `cargo test` works without Docker. Implies
+# `kardamom-log/docker-e2e` for the AeronTestCluster harness.
+docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dependencies]
 alloy-primitives.workspace = true
