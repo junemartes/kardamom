@@ -89,18 +89,15 @@ fn run_e2e_throughput(c: &mut Criterion) {
     group.finish();
 
     // Round-trip latency: publish on B, drain on a co-located subscriber,
-    // measure end-to-end with hdrhistogram inside the bench callback.
+    // measure end-to-end. We drive the async recv via the bench-owned
+    // multi-thread tokio runtime's `block_on` rather than `Bencher::to_async`
+    // because the criterion version this workspace pins doesn't expose the
+    // `async_executor` feature.
     let mut group = c.benchmark_group("e2e/channel_b_round_trip_latency");
     let mut subscriber = ChannelBSubscriberHandle::open(&aeron_rt, &cfg.channels)
         .expect("B subscriber for latency bench");
     group.bench_function("single_message", |b| {
-        b.to_async(
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap(),
-        )
-        .iter(|| async {
+        b.iter(|| {
             let env = TxEnvelope {
                 correlation_id: 0,
                 raw_tx: Bytes::from(vec![0u8; 64]),
@@ -108,10 +105,12 @@ fn run_e2e_throughput(c: &mut Criterion) {
                 tx_hash: B256::ZERO,
             };
             publisher.publish_tx(&env).expect("publish");
-            let _ = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
-                .await
-                .expect("round-trip timed out")
-                .expect("subscriber closed");
+            rt.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+                    .await
+                    .expect("round-trip timed out")
+                    .expect("subscriber closed");
+            });
         });
     });
     group.finish();
