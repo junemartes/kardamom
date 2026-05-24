@@ -3682,6 +3682,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-executor"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.4",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer-local",
+ "bytes",
+ "criterion 0.5.1",
+ "crossbeam-channel",
+ "kardamom-log",
+ "kardamom-types",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "revm",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-ingress"
 version = "0.1.0"
 dependencies = [
