@@ -136,7 +136,9 @@ impl<T> PartitionState<T> {
     ///
     /// Used by `PrimarySequencer::run_once` when `BPublisher::try_publish`
     /// returns `Backpressure` — we must NOT advance state for a message that
-    /// did not actually land on B.
+    /// did not actually land on B. Also marks the sender as "drain-pending"
+    /// so a subsequent call to [`Self::drain_pending`] can resume the
+    /// publish without needing fresh ingress.
     pub fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
         // Rewind expected nonce so the retry treats it as a Match.
         self.next.insert(sender, nonce);
@@ -145,6 +147,34 @@ impl<T> PartitionState<T> {
             .entry(sender)
             .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
         let _ = buf.insert(nonce, payload);
+    }
+
+    /// Walk every sender whose pending buffer has an entry at its expected
+    /// next nonce, and emit `Publish` actions for the contiguous run. Used by
+    /// the primary loop to flush backpressured-then-rebuffered payloads
+    /// without needing fresh ingress messages.
+    ///
+    /// Returns the publish actions in canonical order (per sender, ascending
+    /// nonce). Senders are visited in arbitrary order — but within a sender
+    /// the nonces are strictly ascending and dense, which is the only
+    /// ordering the canonical log cares about.
+    pub fn drain_pending(&mut self) -> Vec<(Address, u64, T)> {
+        let mut out = Vec::new();
+        let senders: Vec<Address> = self.pending.keys().copied().collect();
+        for sender in senders {
+            let expected = self.next_nonce(sender);
+            let mut advanced = expected;
+            if let Some(buf) = self.pending.get_mut(&sender) {
+                for (n, p) in buf.drain_consecutive_from(expected) {
+                    out.push((sender, n, p));
+                    advanced = n.saturating_add(1);
+                }
+            }
+            if advanced > expected {
+                self.next.insert(sender, advanced);
+            }
+        }
+        out
     }
 }
 
