@@ -29,4 +29,6 @@ pub mod sender;
 pub mod standby;
 pub mod state;
 
+pub use config::{BackpressurePolicy, SequencerConfig, SequencerRole};
+pub use duplicate::DuplicateNotification;
 pub use error::SequencerError;
