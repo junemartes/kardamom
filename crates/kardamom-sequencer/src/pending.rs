@@ -45,11 +45,15 @@ impl<T> PendingBuffer<T> {
         if self.capacity == 0 {
             return InsertOutcome::DroppedBufferDisabled;
         }
-        if self.inner.contains_key(&nonce) {
+        // We pre-compute these so the subsequent match arms don't need to
+        // re-borrow `self.inner` after taking an entry handle.
+        let already_present = self.inner.contains_key(&nonce);
+        let at_capacity = !already_present && self.inner.len() >= self.capacity;
+        if already_present {
             self.inner.insert(nonce, value);
             return InsertOutcome::Replaced;
         }
-        if self.inner.len() >= self.capacity {
+        if at_capacity {
             let oldest = *self
                 .inner
                 .keys()
