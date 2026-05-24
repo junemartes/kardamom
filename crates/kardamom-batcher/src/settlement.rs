@@ -10,35 +10,15 @@ use alloy_sol_types::sol;
 
 use crate::error::BatcherError;
 
-sol! {
-    /// ABI-only view of `KardamomL2Settlement.sol`. Mirrors the contract; the
-    /// canonical pin is the `forge build` artifact under
-    /// `contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json`,
-    /// which is also embedded into the deployer.
-    #[allow(missing_docs)]
-    interface IKardamomL2Settlement {
-        event BatchPosted(
-            uint64 indexed batchIndex,
-            bytes32[] blobHashes,
-            uint64 l2BlockStart,
-            uint64 l2BlockEnd
-        );
-        error NotBatcher();
-        error StaleBatchIndex();
-        error EmptyBlobs();
-        error BadBlockRange();
-
-        function l1Batcher() external view returns (address);
-        function lastBatchIndex() external view returns (uint64);
-        function initialize(address _l1Batcher) external;
-        function postBatch(
-            uint64 prevBatchIndex,
-            bytes32[] calldata blobVersionedHashes,
-            uint64 l2BlockStart,
-            uint64 l2BlockEnd
-        ) external;
-    }
-}
+sol!(
+    #[sol(rpc)]
+    #[derive(Debug)]
+    IKardamomL2Settlement,
+    concat!(
+        env!("CARGO_WORKSPACE_DIR"),
+        "/contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json"
+    )
+);
 
 /// Compute KZG → versioned-hash for each blob. Used to assemble the contract
 /// calldata. The blob → KZG commitment step requires the trusted setup; in v0
