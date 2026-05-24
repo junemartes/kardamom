@@ -116,6 +116,39 @@ Consequences:
 - S7 plan: source is **B archive only** (segment-file read or Aeron Archive replay protocol). No C subscription. No live coordination with the running sequencer.
 - S3 plan: remove the proposed live "channel-B replay" API from `kardamom-log`. The Aeron Archive itself already exposes the replay protocol; S3 owns the recorder and segment files, not a custom replay API on top.
 
+## D-Sh12: Split data and ordering — persisted channels A + tiny channel B
+
+**Spec reference:** `docs/specs/2026-05-23-high-throughput-sequencer-design.md` D11, §1, §2.2, §2.3, §2.4, §3.
+
+The canonical-log tier splits in two:
+
+- **Channel A** (M of them, one per sequencer): full `TxEnvelope`s; **Aeron exclusive publisher** (no CAS contention; near-`memcpy` speed); persisted via `io_uring` fsync to local NVMe; default single-host durability (no quorum) — operator can opt into per-A mirror replication for stronger safety at +~25µs.
+- **Channel B** (one, the canonical orderer): tiny `TxRef { sequencer_id: u8, position_a: BPosition }` records (~16 B); Aeron **concurrent** multi-publisher; quorum-fsynced across N recorders (default N=3, Q=2). The B-Archive position remains the canonical L2 ordering (I1).
+
+**Why:** Aeron concurrent publication serializes through a CAS cursor; keeping bulk data off that cursor lets per-sequencer data writes run at exclusive-publisher speed and parallelize across hosts. Net effect: throughput scales with M; single-tx latency unchanged. Same conceptual split Kafka uses for partition logs vs cluster metadata.
+
+**Ack durability (I2 updated):** the proxy releases the receipt only when **all three** hold:
+1. Channel A's local fsync watermark has passed the tx's `position_a` on its sequencer's host.
+2. Channel B's quorum fsync watermark has passed the tx's `b_position`.
+3. A receipt has arrived on channel C.
+
+Both fsyncs run in parallel with execution; the slower of them sets the floor (usually channel A — single-NVMe roundtrip ~25µs).
+
+**Wire types** (add to `kardamom-types`):
+```rust
+pub struct TxRef { sequencer_id: u8, position_a: BPosition }
+// channel A still carries TxEnvelope as before
+// channel B now carries TxRef + BlockBoundaryStart records (no full envelopes)
+```
+
+**Affects S2 (sequencer), S3 (canonical log), S4 (executor), S7 (batcher) plans.** Each plan gets a banner pointing here; the inline task content is updated as part of the implementation PR for that component.
+
+**Updates required in the prior plans:**
+- **S2:** sequencer's commit step becomes a **dual write** — full `TxEnvelope` to `channel_a[i]` (exclusive pub), then `TxRef` to channel B (concurrent pub). Both publications return positions; nonce-advance is gated on both completing successfully.
+- **S3:** split the single canonical archive into M per-sequencer exclusive archives + 1 canonical concurrent archive. Each gets its own `io_uring` fsync sidecar; channel B aggregator emits both `fsync_position_a[i]` (per-A) and `quorum_fsync_position_b` (Q-of-N for B). New `kardamom-log` adapter types: `ChannelAPublication` (exclusive) + `ChannelASubscription` per partition + `ChannelBPublication` (concurrent, tiny refs) + `ChannelBSubscription`.
+- **S4:** executor subscribes to **all M channel A's plus channel B**. Maintains an in-RAM buffer indexed by `(sequencer_id, position_a)`. B-reader drives canonical processing; A-buffer hands over the actual `TxEnvelope` when the ref arrives. Buffer eviction by oldest-unreferenced.
+- **S7:** L1 batcher reads channel B for ordering and then reads the corresponding channel A archive for actual tx bytes. Both archives are on-disk segment files; the offline-driven property (D-Sh10) is preserved.
+
 ## D-Sh11: State root is **not** computed by the kardamom node
 
 The spec originally had the executor compute a `state_root_commitment` and emit it in `BlockBoundary`, and the L1 batcher anchor that commitment on L1. **This is removed.**

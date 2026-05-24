@@ -46,6 +46,7 @@ The design is framework-shaped: the same topology should be deployable as a gene
 | D8 | N total recorders with quorum Q (default N=3, Q=2); RAM propagation + continuous background `io_uring` fsync | RAM keeps the pipeline fast; fsync runs in parallel with execution; quorum tolerates N−Q simultaneous failures with no ack stall |
 | D9 | Continuous receipt log + virtual block boundaries every 250ms | Inclusion latency decoupled from block cadence; virtual blocks are snapshot/checkpoint units |
 | D10 | Native Ethereum 4844 blob batcher to fixed L1 settlement contract | One canonical DA path for v1; other DA targets deferred |
+| D11 | Split persistence into **channel A** (M per-sequencer exclusive-publisher archives carrying full tx data) and **channel B** (one canonical concurrent multi-publisher orderer carrying tiny `TxRef`s, ~16 B) | Aeron concurrent publication CAS-contends on the term cursor — keeping bulk data off it lets data writes run at exclusive-publisher (memcpy) speed. Aggregate write bandwidth scales linearly with M sequencers. Ack durability is `max(channel-A fsync, channel-B quorum fsync)`; both run in parallel with execution. Same single-tx latency, ~10× higher sustainable throughput, cleaner conceptual split (data vs. ordering) — same pattern Kafka uses |
 
 ---
 
@@ -62,28 +63,32 @@ The design is framework-shaped: the same topology should be deployable as a gene
    │ Aeron pub → ingress[keccak(sender) % M]
    ▼
 [sequencer cluster: M processes, multi-active]
-   │ exclusive ownership of sender slice
-   │ pending-nonce HashMap (lock-free; single owner)
-   │ Aeron concurrent-pub → channel B (all sequencers → one shared stream)
+   │ exclusive ownership of sender slice; lock-free pending-nonce HashMap
+   │ DUAL WRITE per validated tx:
+   │   1. Full TxEnvelope → its own channel A[i]  (Aeron EXCLUSIVE publisher; one Archive per sequencer host; persisted via io_uring fsync)
+   │   2. Reference TxRef { sequencer_id, position_a } → channel B  (Aeron CONCURRENT multi-publisher; tiny payload; persisted via io_uring fsync; quorum N/Q replicated)
    ▼
-[canonical archive: channel B]
-   │ Aeron multi-publisher; N hosts each running Aeron Archive recorder (default N=3)
-   │ RAM propagation < 10µs LAN
-   │ continuous io_uring fsync thread per recorder (background, parallel)
-   │ quorum fsync-watermark stream (Q-of-N, default Q=2) consumed by proxies
-   ▼
+[channel A cluster: M persisted Archives]   [channel B: canonical orderer]
+   exclusive-publisher per sequencer          concurrent multi-publisher
+   parallel fsync across M NVMe              tiny 16B refs; cheap N/Q quorum fsync
+   ~250 B/msg × M parallel streams           ~16 B/msg × 1 ordered stream
+   │                                          │
+   │       canonical order = B-position       │
+   └─────────────────────────┬────────────────┘
+                             ▼
 [executor cluster: N replicas]
-   │ each replica: 1 reader + W Block-STM workers + 1 commit thread
-   │ MV-memory + read-set replay + scheduler
-   │ deterministic byte-identical receipts across replicas
+   │ each replica: subscribes to ALL M channel A's + channel B
+   │ buffers A messages keyed by (sequencer_id, position_a) until referenced by B
+   │ processes refs from B in canonical order; joins to buffered A entry
+   │ 1 reader + W Block-STM workers + 1 commit thread
    │ Aeron pub → channel C (receipts + block boundaries)
    ▼
-[receipt channel C]   ← block sealer publishes boundary markers into B (not C)
-   │ multi-publisher; RAM only (regenerable from B + state snapshot)
+[receipt channel C]   ← block sealer publishes boundary markers into B (tiny; same channel-B style)
+   │ multi-publisher; RAM only (regenerable from A's + B + state snapshot)
    │
-   ├──► [ingress proxy]    ← matches (sender, nonce); waits for fsync watermark; releases response
+   ├──► [ingress proxy]    ← matches (sender, nonce); waits for BOTH A's fsync watermark (past tx's A-pos) AND B's quorum fsync (past tx's B-pos); releases response
    ├──► [state writer]     ← per-host; burst-applies receipts to libmdbx at block boundaries
-   └──► [L1 batcher]       ← singleton + standby; packs sealed blocks into 4844 blobs
+   └──► [L1 batcher]       ← reads channel A archives (full tx data) + B (ordering); packs sealed blocks into 4844 blobs
             │
             ▼
        [Ethereum L1: settlement contract]
@@ -93,10 +98,15 @@ All hot-path components run on the same LAN. Recommended deployment: N=3 recorde
 
 ### System invariants
 
-- **I1: Canonical order = Aeron Archive position on channel B.** Nothing else is canonical.
-- **I2: Ack iff durable + executed.** The proxy never returns success to the client unless (a) the tx's B-position has reached the *quorum fsync watermark* — fsynced on Q recorders out of N total (§2.3) — AND (b) a receipt for that tx-position has arrived on channel C from at least one executor replica. With the default N=3, Q=2, the quorum guarantees survival of any 1 simultaneous host failure with no ack stall.
-- **I3: Execution is a deterministic function of channel B.** All executor replicas must produce byte-identical receipts. Sources of non-determinism (system time, randomness, network) are forbidden in tx execution; the block-sealer is the sole provider of `block.timestamp`.
-- **I4: State DB is a derived view.** Channel B (plus genesis state) is the source of truth. The state DB is a performance cache, rebuildable by replaying the archive.
+- **I1: Canonical order = Aeron Archive position on channel B.** Nothing else is canonical. Channel B carries tiny `TxRef { sequencer_id, position_a }` records (~16 B); the actual tx data lives in the per-sequencer channel A referenced.
+- **I2: Ack iff fully durable + executed.** The proxy never returns success to the client unless **all three** hold:
+   1. The tx's `position_a` on its channel A has been fsynced on the sequencer's local NVMe (channel A is exclusive-publisher per sequencer, so this is a single-host fsync watermark).
+   2. The tx's B-position has reached the *quorum fsync watermark* — fsynced on Q recorders out of N total (§2.3) — for channel B.
+   3. A receipt for that tx-position has arrived on channel C from at least one executor replica.
+
+  With the default N=3, Q=2, this guarantees survival of any 1 simultaneous channel-B-recorder failure AND any 1 simultaneous channel-A-host failure (different blast radii — see §4.3). In practice, channel A's fsync (~22µs single-NVMe) dominates the durability barrier; channel B's quorum fsync runs in parallel and on smaller payloads.
+- **I3: Execution is a deterministic function of (channel A's data joined by channel B's ordering).** All executor replicas process B's refs in B-position order, look up the data on the appropriate channel A, and must produce byte-identical receipts. Sources of non-determinism (system time, randomness, network) are forbidden in tx execution; the block-sealer is the sole provider of `block.timestamp`.
+- **I4: State DB is a derived view.** Channels A + B (plus genesis state) are the source of truth. The state DB is a performance cache, rebuildable by replaying the archives.
 
 ---
 
@@ -114,39 +124,64 @@ All hot-path components run on the same LAN. Recommended deployment: N=3 recorde
 - Stateless w.r.t. canonical truth; safe to add or remove proxies at any time.
 
 ### 2.2 Sequencer
-**Responsibility:** exclusive ownership of a sender slice; nonce-check; publish into canonical channel B.
+**Responsibility:** exclusive ownership of a sender slice; nonce-check; **dual-write to its own persisted channel A and to the canonical orderer channel B**.
 
-- One process per ingress partition (M total; default M=8, configurable). Pinned to a CPU core. Owns its `HashMap<Address, NextNonce>` exclusively — no locks, no atomics, because no other sequencer can see these addresses.
-- Sender partitioning lives only at this tier. It exists to make pending-nonce state ownership exclusive; it does *not* propagate to the executor (which reads the merged canonical channel B).
+- One process per ingress partition (M total; default M=8, configurable). Pinned to a CPU core. Owns its `HashMap<Address, NextNonce>` exclusively — no locks, no atomics.
+- Sender partitioning exists to make pending-nonce state ownership exclusive; it does *not* propagate to the executor.
 - Pull from `ingress[i]`, deserialize the (already sig-checked) tx envelope, check `tx.nonce` against `pending_nonce[sender]`:
-  - **Match:** publish raw tx bytes (with `correlation_id`) to channel B via Aeron concurrent publication; advance `pending_nonce`.
+  - **Match:** **dual write:**
+    1. Publish full `TxEnvelope` (with `correlation_id`, `sender`, `tx_hash`) to **channel A[i]** via Aeron **exclusive** publication (the sequencer is the only publisher to its own channel A — no CAS contention). Note the assigned `position_a` from the publication.
+    2. Publish `TxRef { sequencer_id: i, position_a }` (~16 bytes) to **channel B** via Aeron **concurrent** multi-publisher. This is the canonical ordering write.
+    3. Advance `pending_nonce`.
   - **Future (`> expected`):** insert into per-sender `BTreeMap<Nonce, Tx>` pending buffer. Drain in order when prior nonces arrive.
   - **Past (`< expected`):** drop, log, push a `correlation_id → "duplicate"` notification back through the receipt-cache channel.
+- **Why split A and B:** channel A is exclusive-publisher (one writer, no CAS contention; near-memcpy speed) and parallelizes fsync across M sequencer hosts; channel B is concurrent multi-publisher but with tiny payloads, so the cross-publisher serialization point is cheap. Aggregate write bandwidth scales linearly with M; canonical-orderer contention stays bounded.
 - **No mempool, no gossip, no replacement-by-fee in v1.** Replacement-by-fee requires same-nonce arbitration and fee escalation rules; deferred to a separate spec.
-- Backpressure: if Aeron publication on B blocks (downstream slow), the sequencer applies pushback to the ingress channel; the proxy then either queues briefly or returns `503` per its rate-limit policy.
+- Backpressure: if channel A or B publication blocks, the sequencer applies pushback to the ingress channel; the proxy then either queues briefly or returns `503`.
 
-### 2.3 Canonical archive (channel B)
-**Responsibility:** source of truth for L2 ordering and durability.
+### 2.3 Canonical archives (channels A and B)
 
-- Aeron stream with concurrent multi-publisher; one `Recorder` process per host. **Total recorders N and quorum Q are independently configurable.** Default deployment: N=3, Q=2 (tolerate 1 failure with no ack stall — standard CFT). Lightweight staging: N=2, Q=2 (any failure stalls acks; safety preserved as long as at least one survives).
-- Recorders run **Aeron Archive replication** — independent recordings on each host kept in lockstep by Aeron's `replay-merge` mechanism. Each recorder owns a local enterprise NVMe with PLP.
-- **In-RAM propagation:** publishers and recorders communicate via Aeron's standard log buffers; messages reach all N recorder RAMs within Aeron-IPC budget (single-digit µs LAN).
-- **Continuous background fsync per recorder:** an `io_uring` thread submits write+`fdatasync` ops as data arrives; pipelined submit-and-complete, no batch interval. Each recorder publishes its own `fsynced_position` on a per-recorder watermark stream.
-- **Quorum fsync watermark.** A small aggregator (one per proxy host, or a side service) consumes all N per-recorder watermark streams and emits the *Q-th smallest* position — i.e., the position fsynced on at least Q recorders. This is the watermark proxies subscribe to for the I2 ack guarantee.
-- **B-position `(term_id, term_offset)`** is the canonical tx identifier used by every downstream component.
+The persistence tier owns **two distinct kinds of Aeron archives**, with different write patterns and different fsync stories.
+
+#### 2.3.1 Channel A archives (M of them, one per sequencer)
+**Responsibility:** durable, per-sequencer storage of full transaction bytes.
+
+- One Aeron stream per sequencer, **exclusive-publisher** (the sequencer process is the only writer). No CAS contention — write speed approaches `memcpy + memory barrier`.
+- One `Recorder` process colocated with each sequencer, recording its channel A to local NVMe.
+- Continuous `io_uring` fsync per recorder (same model as channel B's recorders): pipelined `write + fdatasync`, no batch interval. Each recorder publishes its own `fsynced_position_a[i]` on a per-A watermark stream.
+- **No quorum on channel A by default** — a single sequencer host's NVMe is the durability boundary for its slice. Single-host loss before fsync = bounded data loss for *that sequencer's slice only* (txs in flight on other sequencers are unaffected). Operators can opt into per-A replication (mirror channel A's writes to a sibling host) if cross-host safety is required; off by default to keep fsync latency at single-NVMe roundtrip.
+- **A-position** is `(sequencer_id: u8, term_id: i32, term_offset: i32)`.
+
+#### 2.3.2 Channel B archive (the canonical orderer)
+**Responsibility:** source of truth for L2 ordering across all sequencers.
+
+- One Aeron stream, **concurrent multi-publisher** (M sequencers all push tiny refs). Payload is `TxRef { sequencer_id, position_a }` plus an occasional `BlockBoundaryStart` from the sealer — every record fits in ~16 B.
+- One `Recorder` process per host; **total recorders N and quorum Q are independently configurable.** Default deployment: N=3, Q=2 (tolerate 1 failure with no ack stall — standard CFT). Lightweight staging: N=2, Q=2.
+- Recorders run Aeron Archive replication kept in lockstep via `replay-merge`. Each recorder owns a local enterprise NVMe with PLP.
+- Continuous `io_uring` fsync per recorder; each publishes its own `fsynced_position_b` on a per-recorder watermark stream.
+- **Quorum fsync watermark.** A small aggregator emits the Q-th smallest fsync position across the N recorders. This is what proxies subscribe to.
+- **B-position `(term_id, term_offset)`** is the canonical tx identifier.
+
+#### Why two channel types
+
+Channel B's writers contend on a CAS cursor (Aeron concurrent publication semantics). Putting full tx data on B means every multi-megabyte/sec of throughput drags the publishers through that contended cursor *and* through the same N-replicated recording. Channel A removes the data path from that contention point entirely; each sequencer writes to its own exclusive Archive at near-memcpy speed, in parallel with every other sequencer. Channel B then only carries 16-byte references — fast to CAS, fast to memcpy, cheap to N/Q-replicate.
+
+This is the same separation Kafka uses for partition data vs cluster metadata. For Aeron specifically, switching the bulk-data writes from concurrent to exclusive publication is a measured ~10× per-publisher throughput improvement.
 
 ### 2.4 Executor (replica)
-**Responsibility:** read B, run Block-STM over revm, publish receipts to C.
+**Responsibility:** join B's ordering with A's data, run Block-STM over revm, publish receipts to C.
 
-- Typically one executor replica co-located with each recorder host. Each executor process runs:
-  - One **reader thread** consuming B in order.
+- Typically one executor replica co-located with each channel-B recorder host. Each executor process runs:
+  - **M+1 reader threads** (one per channel A subscription + one for channel B). The A-readers buffer incoming `TxEnvelope`s into per-A queues keyed by `position_a`. The B-reader walks the canonical orderer.
+  - **Channel-A buffer:** in-RAM hashmap `(sequencer_id, position_a) → TxEnvelope`. Bounded by the in-flight window (oldest unreferenced position drives eviction). Typical size: a few thousand entries, < 100 MB.
   - **W Block-STM worker threads** (default `W = num_cores − 2` per host).
-  - One **commit thread** that drains committed receipts in tx-index order and publishes to channel C.
-- **Block-STM scheduler.** Per-tx tasks are `Execute(i)` and `Validate(i)`. Workers pull lowest-pending-idx tasks lock-free. On `Execute(i)`: run revm reading from MV-memory, recording read-set, writing tagged with idx `i`. On `Validate(i)`: replay read-set against current MV-memory; if any value changed, invalidate and re-execute. Conflicts trigger re-execution of the affected tx and re-validation of all dependent txs.
+  - One **commit thread** that drains committed receipts in B-position order and publishes to channel C.
+- **B-to-A join.** B-reader receives `TxRef { sequencer_id, position_a }`. Looks up the buffered envelope from the corresponding A-reader queue. If not yet arrived (rare — A-publish usually races ahead of B), waits briefly with bounded timeout. Hands off `(b_position, TxEnvelope)` to the Block-STM scheduler. Removes the entry from the A-buffer.
+- **Block-STM scheduler.** Per-tx tasks are `Execute(i)` and `Validate(i)` where `i` is the canonical B-index. Workers pull lowest-pending-idx tasks lock-free. On `Execute(i)`: run revm reading from MV-memory, recording read-set, writing tagged with idx `i`. On `Validate(i)`: replay read-set against current MV-memory; if any value changed, invalidate and re-execute.
 - **MV-memory** sits in front of a read-only mdbx snapshot. Reads not satisfied from MV-memory fall through to the snapshot; writes append `(idx, value)` versions.
-- **revm integration:** wrap `revm::Database` with the MV-memory layer; intercept `storage(addr, key)` and `basic(addr)` to record reads and resolve versions; intercept storage writes to append versions. This is the **Block-STM-revm integration** subproject (S4), the longest pole.
-- After 250ms (virtual block window), receive the sealer's `BlockBoundary` marker on B, flush MV-memory delta to the state writer's queue, reset MV-memory.
-- Replicas are byte-identically deterministic by construction (same input log, same algorithm, no clock reads inside execution). Receipts published by multiple replicas to C are duplicates; consumers dedupe by `tx_idx`.
+- **revm integration:** wrap `revm::Database` with the MV-memory layer (subproject S4, the longest pole).
+- After the sealer's `BlockBoundaryStart` arrives on B, finish executing txs up to `end_b_index`, flush MV-memory delta to the state writer's queue, reset MV-memory, and emit `BlockBoundary` on channel C.
+- Replicas are byte-identically deterministic by construction (same B order, same A bytes joined via refs, same algorithm, no clock reads inside execution). Receipts published by multiple replicas to C are duplicates; consumers dedupe by B-position.
 
 ### 2.5 Receipt channel (C)
 **Responsibility:** distribute executed receipts and block boundaries.
@@ -177,8 +212,8 @@ All hot-path components run on the same LAN. Recommended deployment: N=3 recorde
 ### 2.8 L1 batcher
 **Responsibility:** post raw L2 tx data to Ethereum L1 as a data-availability sink.
 
-- **Decoupled from the live pipeline.** Reads from the on-disk Aeron Archive segment files of channel B (or via the Aeron Archive's standard offline replay protocol). Does **not** subscribe to channel C; does **not** query any live sequencer/executor process; can be down for arbitrary periods without affecting tx flow.
-- Reads B canonically: `TxEnvelope`s and `BlockBoundaryStart` markers (which the sealer publishes onto B per §2.6). Groups txs into per-block batches at boundary markers.
+- **Decoupled from the live pipeline.** Reads from the on-disk Aeron Archive segment files of channels A and B (or via the Aeron Archive's standard offline replay protocol). Does **not** subscribe to channel C; does **not** query any live sequencer/executor process; can be down for arbitrary periods without affecting tx flow.
+- Reads **channel B** canonically for the ordering (`TxRef` records + `BlockBoundaryStart` markers from the sealer). For each ref, reads the corresponding **channel A** archive at `position_a` to fetch the actual `TxEnvelope` bytes. Groups txs into per-block batches at boundary markers.
 - Singleton + hot standby (same lease mechanism as sealer).
 - Packs batches into Ethereum 4844 blobs (max 6 blobs/L1-block, 128KB each ≈ 750KB/L1-block compressed). Cadence: configurable, default every ~10 L1 blocks.
 - Posts to the L2 settlement contract — **a pure data-availability sink**. The contract records `(block_range, blob_versioned_hashes)` and emits an event. **No state-root commitment is posted**: state-root attestation is a validator concern, deferred to a future validator subsystem.
@@ -195,30 +230,40 @@ All hot-path components run on the same LAN. Recommended deployment: N=3 recorde
 t=0      Client TX send
 t+50µs   Proxy NIC, decode frame
 t+80µs   Sig enters batch-verify ring
-t+130µs  Batch verify flushes
+t+130µs  Batch verify flushes; (sender, tx_hash) computed
 t+135µs  Aeron pub → ingress[keccak(sender) % M]
 t+140µs  Sequencer[i] dequeues
 t+143µs  Nonce check, advance
-t+145µs  Aeron concurrent-pub → channel B
-t+150µs  Recorders A+B+C ingest in RAM
+t+145µs  Aeron EXCLUSIVE-pub → channel A[i] (full TxEnvelope; no CAS contention)
+t+147µs  Aeron CONCURRENT-pub → channel B (TxRef, 16B)
+t+150µs  Channel-A[i] recorder ingests in RAM; channel-B recorders (N=3) ingest TxRef in RAM
          ├── Execution path:
-         │   Executor reader sees position p
+         │   Executor's B-reader sees TxRef at b_position p
+         │   Joins to channel-A[i] buffer entry for position_a (already buffered, t+150µs)
 t+155µs  │   Worker picks Execute(p)
 t+200µs  │   revm done
 t+205µs  │   Validate(p), no conflict
 t+207µs  │   Commit thread → Receipt on C
 t+210µs  │   Proxy receives Receipt(p)
          │
-         └── Fsync path (parallel, started t+150µs):
-             io_uring submit write+fdatasync to NVMe
-t+175µs      NVMe completion (~25µs enterprise NVMe + PLP)
-             fsync-watermark stream advances past p
+         ├── Channel A fsync path (parallel, started t+145µs):
+         │   io_uring submit write+fdatasync to local NVMe
+t+170µs  │   NVMe completion (~25µs enterprise NVMe + PLP)
+         │   fsync_position_a[i] advances past position_a
+         │
+         └── Channel B quorum-fsync path (parallel, started t+147µs):
+             N recorders' io_uring submit write+fdatasync (16B records — small)
+t+172µs      Q-th NVMe completion (~25µs slowest of Q=2 of N=3 recorders)
+             quorum_fsync_position_b advances past b_position p
 
-t+210µs  Proxy has receipt(p); watermark already past p → release
+t+210µs  Proxy has receipt(p);
+         A fsync past position_a (since t+170µs) ✓
+         B quorum-fsync past b_position p (since t+172µs) ✓
+         release immediately
 t+260µs  Client TCP receives receipt
 ```
 
-Total: ~260µs. The execution path is the binding constraint; fsync overlaps it.
+Total: ~260µs end-to-end. Same overall budget as the prior model — fsync still runs in parallel with execution and only sets a floor. **What changed:** the data fsync (channel A) is now a single-host NVMe roundtrip instead of N-replicated; the quorum fsync (channel B) acts on 16B records and is effectively never on the critical path.
 
 ### Latency budget
 
@@ -228,9 +273,13 @@ Total: ~260µs. The execution path is the binding constraint; fsync overlaps it.
 | Sig verify (batched) | ~5–10µs amortized | yes |
 | Aeron IPC hops (3×) | ~5µs each | yes |
 | Sequencer nonce check | ~3µs | yes |
+| Channel A exclusive-publish (full TxEnvelope) | ~2µs | yes |
+| Channel B concurrent-publish (16B TxRef) | ~2µs | yes |
+| Executor B-to-A join (in-RAM buffer lookup) | ~1µs | yes |
 | Block-STM execute + validate | ~50µs simple; +5–50µs per re-exec | yes |
 | Receipt publish + delivery | ~5µs | yes |
-| Background fsync (RAM→disk) | ~25µs | only if slower than execution |
+| Channel A single-NVMe fsync (RAM→disk) | ~25µs | only if slower than execution |
+| Channel B quorum fsync (Q-of-N) of 16B records | ~25µs | only if slower than execution |
 
 ### What can blow the budget
 - Hot-contract conflicts → re-execution loop, +5–50µs per re-exec
@@ -243,9 +292,11 @@ Total: ~260µs. The execution path is the binding constraint; fsync overlaps it.
 
 ### Throughput math (1M tx/s target)
 
-- Per-tx hot-path CPU: sig verify (amortized) ≈10µs, sequencer ≈3µs, Aeron pubs ≈10µs, revm ≈15–45µs, validate ≈1µs, commit ≈2µs → ~40µs total.
-- 1M tx/s × 40µs = ~40 CPU-seconds per wall-second = ~40 cores busy across all tiers and replicas.
-- Network on each Aeron channel: 1M × ~200B = 200MB/s on B, 1M × ~150B = 150MB/s on C. Fits on 10GbE; comfortable on 25GbE.
+- Per-tx hot-path CPU: sig verify (amortized) ≈10µs, sequencer ≈3µs, Aeron pubs (A exclusive + B concurrent) ≈4µs, revm ≈15–45µs, validate ≈1µs, commit ≈2µs → ~35µs total.
+- 1M tx/s × 35µs = ~35 CPU-seconds per wall-second = ~35 cores busy across all tiers and replicas.
+- **Write parallelism win:** channel A bandwidth scales with M sequencers. At M=8, each channel A carries 1M/8 × ~200B = 25 MB/s; aggregate cluster write throughput = 200 MB/s across 8 hosts in parallel (no CAS contention). Compare to the prior single-channel-B design where 200 MB/s went through ONE concurrent multi-publisher cursor + N-replicated recorder.
+- Channel B carries 1M × 16B = 16 MB/s. Tiny. Q/N replication is essentially free at this rate.
+- Channel C: 1M × ~150B = 150 MB/s. Same as prior (receipts unchanged).
 - libmdbx bursts at 250ms cadence: 250k receipts × ~100B state delta ≈ 25MB per write-txn. NVMe handles in single-digit ms; background, invisible to hot path.
 
 Numbers are aspirational. The bench harness in `crates/bench` is the ground-truth instrument.
@@ -264,10 +315,16 @@ Numbers are aspirational. The bench harness in `crates/bench` is the ground-trut
 - **Recovery:** hot standby for that slice takes ownership. Standby has been tailing B for senders in its slice; pending-nonce state is in lockstep. On takeover it begins publishing to its ingress channel.
 - **User impact:** at most one in-flight tx lost (sequencer crashed before publish) or duplicated (crashed after publish); both resolve via idempotent client retry. Per-sender future-nonce buffer is lost on crash — documented limitation; clients with stranded future-nonce txs must resend.
 
-### 4.3 Recorder failure (channel B host loss)
+### 4.3 Channel B recorder failure
 - **Detection:** Aeron archive replication lag exceeds threshold; survivors observe the lost peer.
 - **Recovery:** survivors continue. With N=3, Q=2, a single recorder loss still satisfies the quorum (2 of 2 survivors fsynced) — acks continue without stall. A replacement catches up via `replay-merge`, concurrent with live ingest.
-- **User impact:** zero unless quorum cannot be assembled (e.g., N=3, Q=2, and 2 recorders fail simultaneously). At that point acks stall until a replacement is up. Operator policy decides whether stalled writes return `503` or simply block.
+- **User impact:** zero unless quorum cannot be assembled. Channel B carries tiny refs, so quorum is cheap and the failure window is small.
+
+### 4.3.1 Channel A recorder failure (sequencer-host NVMe loss)
+- **Detection:** sequencer's local fsync watermark stops advancing; channel A subscribers see the publication pause.
+- **Recovery:** by default each channel A is single-host (no per-A replication for simplicity / latency). A host loss = its slice of in-flight txs is stuck until the sequencer comes back up with its NVMe.
+- **User impact:** clients whose senders hash to the dead sequencer's partition see ack timeouts and 503s until that sequencer's standby (different host) takes over. Other partitions continue unaffected. Senders that were partway through the failed channel A: their in-flight txs without an A-fsync are lost; client retries are idempotent (nonce-based).
+- **Optional hardening:** operators can enable per-A mirror replication to a sibling host (adds an additional fsync on the critical path; default off). With mirroring, channel A loss tolerates a single host failure with no client impact, at the cost of ~25µs more on the critical path.
 
 ### 4.4 Executor replica failure
 - **Detection:** absence of receipts from this replica on C; or health stream lapses.

@@ -2,6 +2,8 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **⚠️ ARCHITECTURE UPDATE — 2026-05-24 (D-Sh12):** the persistence tier ships **two kinds of archives**: (1) M per-sequencer **channel A** archives carrying full `TxEnvelope`s via Aeron *exclusive* publication, each with its own `io_uring` fsync sidecar + `fsynced_position_a[i]` watermark stream; channel A defaults to single-host durability (no quorum) — operators opt into per-A mirroring if they need stronger safety. (2) One canonical **channel B** archive carrying tiny `TxRef { sequencer_id, position_a }` records via Aeron *concurrent* multi-publisher, N/Q-quorum replicated with `quorum_fsync_position_b`. New `kardamom-log` adapters: `ChannelAPublication`/`ChannelASubscription` (exclusive, per-partition); `ChannelBPublication`/`ChannelBSubscription` (concurrent, tiny payloads). See `docs/plans/2026-05-23-S0-shared-decisions.md` D-Sh12 and `docs/specs/2026-05-23-high-throughput-sequencer-design.md` D11 / §2.3 for the full model. Tasks below predate this split — channel-B archive tasks stay; channel-A archive tasks (one per partition) are added at implementation time.
+
 **Goal:** Ship the three foundation crates that every other kardamom subsystem depends on:
 
 1. **`kardamom-types`** — pure data types and traits (BPosition, TxEnvelope, Receipt, BlockBoundaryStart, BlockBoundary, FsyncWatermark, QuorumWatermark, CachedReceipt, BlockDelta, StateDatabase trait, SnapshotSource trait). No Aeron, no libmdbx, no I/O dependencies. All wire types derive `rkyv::{Archive, Serialize, Deserialize}`.
