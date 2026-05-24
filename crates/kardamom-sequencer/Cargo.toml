@@ -43,6 +43,10 @@ tracing-subscriber.workspace = true
 alloy-network.workspace = true
 alloy-signer-local.workspace = true
 criterion.workspace = true
+# Pull in our own `testing` feature so integration tests under `tests/`
+# always have access to the `fakes` modules without needing
+# `cargo test --features testing` (matches the convention CI uses).
+kardamom-sequencer = { path = ".", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
 proptest = "1"
 rand = "0.9"
