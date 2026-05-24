@@ -56,13 +56,7 @@ pub struct BoundaryEmitter<C: WallClock, P: BoundaryPublisher> {
 }
 
 impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
-    pub fn new(
-        publisher: P,
-        clock: C,
-        initial_block: u64,
-        tick_ms: u64,
-        host_id: u8,
-    ) -> Self {
+    pub fn new(publisher: P, clock: C, initial_block: u64, tick_ms: u64, host_id: u8) -> Self {
         Self {
             publisher,
             clock: Arc::new(clock),
@@ -216,12 +210,10 @@ pub mod fakes {
     }
 
     impl BoundaryPublisher for FakeBoundaryPublisher {
-        fn publish(
-            &mut self,
-            msg: &BlockBoundaryStart,
-        ) -> Result<BPosition, PublishError> {
+        fn publish(&mut self, msg: &BlockBoundaryStart) -> Result<BPosition, PublishError> {
             let p = FakePublication::open(&self.bus, &self.channel, self.boundary_stream);
-            p.publish(msg).map_err(|e| PublishError::Fatal(e.to_string()))
+            p.publish(msg)
+                .map_err(|e| PublishError::Fatal(e.to_string()))
         }
 
         fn current_tx_tail(&self) -> BPosition {

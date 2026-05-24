@@ -7,9 +7,7 @@
 //! - **P3 winner satisfies the predicates:** the returned winner is itself
 //!   eligible (sanity: we don't return an ineligible candidate).
 
-use kardamom_sealer::election::{
-    bpos_to_abs, CaughtUpSet, RecorderState, elect,
-};
+use kardamom_sealer::election::{CaughtUpSet, RecorderState, bpos_to_abs, elect};
 use kardamom_types::BPosition;
 use proptest::prelude::*;
 
@@ -38,7 +36,7 @@ proptest! {
         lag in 0u64..1_000_000,
         stale in 0u64..1_000_000,
     ) {
-        let set = CaughtUpSet::from_iter(recs);
+        let set = CaughtUpSet::from_states(recs);
         let cur = BPosition { term_id: cur_term, term_offset: cur_off };
         let a = elect(&set, cur, now_ms, lag, stale);
         let b = elect(&set, cur, now_ms, lag, stale);
@@ -54,7 +52,7 @@ proptest! {
         lag in 0u64..1_000_000,
         stale in 0u64..1_000_000,
     ) {
-        let set = CaughtUpSet::from_iter(recs);
+        let set = CaughtUpSet::from_states(recs);
         let cur = BPosition { term_id: cur_term, term_offset: cur_off };
         if let Some(winner) = elect(&set, cur, now_ms, lag, stale) {
             let cur_abs = bpos_to_abs(cur);

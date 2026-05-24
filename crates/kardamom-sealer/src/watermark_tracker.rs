@@ -51,13 +51,19 @@ impl WatermarkTracker {
     /// Snapshot the current set. Cheap (BTreeMap clone bounded by recorder count).
     pub fn snapshot(&self) -> CaughtUpSet {
         let guard = self.inner.lock().expect("watermark mutex poisoned");
-        CaughtUpSet::from_iter(guard.values().copied())
+        CaughtUpSet::from_states(guard.values().copied())
     }
 
     /// Total observations currently held — primarily a test/observability hook.
     pub fn len(&self) -> usize {
         let guard = self.inner.lock().expect("watermark mutex poisoned");
         guard.len()
+    }
+
+    /// True if no observations have been recorded yet.
+    pub fn is_empty(&self) -> bool {
+        let guard = self.inner.lock().expect("watermark mutex poisoned");
+        guard.is_empty()
     }
 
     /// Convenience accessor that returns the most recent state for a given
