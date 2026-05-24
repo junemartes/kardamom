@@ -17,6 +17,14 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 kardamom-types.workspace = true
 kardamom-log.workspace = true
 kardamom-leases.workspace = true
+# Pulled in as a regular dependency (not just dev-dep) primarily to force
+# build-order: kardamom-deployer's build.rs runs forge install + forge build,
+# populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
+# `contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json` at
+# compile time and cargo guarantees a crate's deps are compiled (and their
+# build scripts run) before the crate itself is compiled. Without this,
+# parallel build-script execution races on forge install.
+kardamom-deployer = { path = "../deployer" }
 
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
@@ -42,7 +50,6 @@ clap.workspace = true
 
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }
-kardamom-deployer = { path = "../deployer" }
 tempfile.workspace = true
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
