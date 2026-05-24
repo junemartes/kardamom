@@ -28,9 +28,10 @@ use revm::state::Bytecode;
 use kardamom_executor::block_env::ExecEnv;
 use kardamom_executor::executor::execute_tx;
 use kardamom_executor::{
-    BMessage, BPosition, BlockBoundaryStart, CMessage, ChannelBSubscription, ChannelCPublication,
-    Executor, ExecutorConfig, ExecutorError, MockStateDatabase, MutatingSnapshotSource,
-    PendingDelta, StateWriterSignal, TxEnvelope as KtTxEnvelope, TxIndex, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
+    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, MutatingSnapshotSource, PendingDelta, StateWriterSignal,
+    TxEnvelope as KtTxEnvelope, TxIndex, TxRef, WriterApplyingQueue,
 };
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
@@ -147,9 +148,23 @@ fn bench_sstore_step(c: &mut Criterion) {
 }
 
 // Actor end-to-end: BATCH txs per iter; reports throughput in tx/s.
-struct ChanBSub(Receiver<BMessage>);
+struct ChanASub {
+    sequencer_id: u8,
+    rx: Receiver<(BPosition, KtTxEnvelope)>,
+}
+impl ChannelASubscription for ChanASub {
+    fn sequencer_id(&self) -> u8 {
+        self.sequencer_id
+    }
+    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
+        self.rx.recv().map_err(|_| ExecutorError::ChannelAClosed {
+            sequencer_id: self.sequencer_id,
+        })
+    }
+}
+struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
 impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<BMessage, ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -182,32 +197,51 @@ fn bench_actor_throughput(c: &mut Criterion) {
             let writer_q = WriterApplyingQueue::new(snap.clone());
             let snapshots = MutatingSnapshotSource(snap);
 
-            let (b_tx, b_rx) = bounded::<BMessage>((BATCH as usize) + 8);
+            // Post-S4-arch-update wiring: pre-load all envelopes onto a
+            // single channel A and all TxRefs onto channel B before the
+            // executor starts. The bench measures end-to-end actor
+            // throughput; the demux split itself adds one extra crossbeam
+            // hop per tx, which should be negligible vs. revm time.
+            let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>((BATCH as usize) + 8);
+            let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>((BATCH as usize) + 8);
             let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
 
             for i in 0..BATCH {
-                b_tx.send(BMessage::Tx {
-                    position: pos(i as i32),
-                    tx_idx: TxIndex(i),
-                    envelope: signed_transfer(&signer, to, i),
-                })
+                let position_a = pos((i as i32) * 200);
+                a_tx.send((position_a, signed_transfer(&signer, to, i)))
+                    .unwrap();
+                b_tx.send((
+                    pos(i as i32),
+                    ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+                ))
                 .unwrap();
             }
-            b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
-                block_number: 1,
-                end_tx_idx: pos((BATCH as i32) - 1),
-                l2_timestamp: 0,
-            }))
+            b_tx.send((
+                pos(BATCH as i32),
+                ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+                    block_number: 1,
+                    end_tx_idx: pos((BATCH as i32) - 1),
+                    l2_timestamp: 0,
+                }),
+            ))
             .unwrap();
+            drop(a_tx);
             drop(b_tx);
 
+            let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+                sequencer_id: 0,
+                rx: a_rx,
+            })];
+            let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
             let h = thread::spawn(move || {
                 Executor::run(
                     ExecutorConfig {
                         chain_id: 1,
                         receipt_queue_depth: 512,
+                        ..Default::default()
                     },
-                    ChanBSub(b_rx),
+                    a_subs,
+                    b_sub,
                     ChanCPub(c_tx),
                     snapshots,
                     Imm,

@@ -115,6 +115,11 @@ impl Executor {
     /// `a_subs` holds one subscription per sequencer partition (M total).
     /// They may be supplied in any order — each subscription declares its
     /// own `sequencer_id`.
+    #[allow(clippy::too_many_arguments)] // 8 args is the natural shape of the
+    // executor's run-once API (config, M A-subs, B-sub, C-pub, snapshots,
+    // state-writer signal, state-writer queue, initial block); packaging
+    // them into a builder struct would shuffle the noise around without
+    // reducing it.
     pub fn run<C, S, Q, P>(
         cfg: ExecutorConfig,
         a_subs: Vec<Box<dyn ChannelASubscription>>,

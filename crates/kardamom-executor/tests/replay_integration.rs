@@ -1,7 +1,12 @@
 //! Integration test: feed a synthetic stream of (txs + boundaries) into an
 //! `Executor` and assert the channel-C output matches expectation.
 //!
-//! No real Aeron, no real libmdbx — mock channels and `MockStateDatabase`.
+//! Post-S4-arch-update wiring (D-Sh12 / spec §2.4): single-sequencer
+//! (M=1) topology. Envelopes are pushed onto a fake channel A; tiny
+//! `TxRef` records + a `BlockBoundaryStart` are pushed onto fake channel
+//! B in the same canonical order. The executor's M+1 readers join the
+//! two streams via the in-process `JoinBuffer`. The expected receipts
+//! and slim boundaries on channel C are unchanged from pre-split.
 
 use std::thread;
 use std::time::Duration;
@@ -18,15 +23,34 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
-    BMessage, BPosition, BlockBoundary, BlockBoundaryStart, CMessage, ChannelBSubscription,
-    ChannelCPublication, Executor, ExecutorConfig, ExecutorError, MockStateDatabase,
-    MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope, TxIndex,
-    WriterApplyingQueue,
+    BPosition, BlockBoundary, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
+    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope,
+    TxRef, WriterApplyingQueue,
 };
 
-struct ChanBSub(Receiver<BMessage>);
+/// Bridge a crossbeam receiver of `(BPosition, TxEnvelope)` into a
+/// `ChannelASubscription`. The `BPosition` we emit is the channel-A
+/// position (the value sequencers publish in `TxRef`); we make it equal
+/// to a synthetic offset for the test.
+struct ChanASub {
+    sequencer_id: u8,
+    rx: Receiver<(BPosition, KtTxEnvelope)>,
+}
+impl ChannelASubscription for ChanASub {
+    fn sequencer_id(&self) -> u8 {
+        self.sequencer_id
+    }
+    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
+        self.rx.recv().map_err(|_| ExecutorError::ChannelAClosed {
+            sequencer_id: self.sequencer_id,
+        })
+    }
+}
+
+struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
 impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<BMessage, ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -68,6 +92,13 @@ fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> KtT
     }
 }
 
+fn bpos(off: i32) -> BPosition {
+    BPosition {
+        term_id: 0,
+        term_offset: off,
+    }
+}
+
 #[test]
 fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     let signer = PrivateKeySigner::random();
@@ -81,52 +112,66 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
 
-    let (b_tx, b_rx) = bounded::<BMessage>(64);
+    // Single-sequencer topology: one channel A, one channel B.
+    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(64);
+    let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>(64);
     let (c_tx, c_rx) = bounded::<CMessage>(64);
 
     // 4 txs → boundary block 1 → 3 txs → boundary block 2 → 3 txs → boundary block 3.
     let mut nonce: u64 = 0;
-    let mut tx_idx: u64 = 0;
+    let mut bpos_off: i32 = 0;
+    let mut a_pos: i32 = 0;
     let mut expected_hashes: Vec<B256> = Vec::new();
     let plan = [(4u64, 1u64), (3, 2), (3, 3)];
     for (n_txs, blk) in plan {
         for _ in 0..n_txs {
             let env = transfer(&signer, nonce, to, 1);
             expected_hashes.push(env.tx_hash);
-            b_tx.send(BMessage::Tx {
-                position: BPosition {
-                    term_id: 0,
-                    term_offset: tx_idx as i32,
-                },
-                tx_idx: TxIndex(tx_idx),
-                envelope: env,
-            })
+            // Publish to channel A[0] at `a_pos`.
+            let position_a = bpos(a_pos);
+            a_tx.send((position_a, env)).unwrap();
+            // Then publish a TxRef onto channel B at canonical position
+            // `bpos_off`. The executor uses the B position as the tx's
+            // canonical id (Receipt.tx_idx).
+            b_tx.send((
+                bpos(bpos_off),
+                ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+            ))
             .unwrap();
             nonce += 1;
-            tx_idx += 1;
+            bpos_off += 1;
+            a_pos += 200;
         }
-        b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
-            block_number: blk,
-            end_tx_idx: BPosition {
-                term_id: 0,
-                term_offset: (tx_idx as i32) - 1,
-            },
-            l2_timestamp: 1_700_000_000 + blk,
-        }))
+        b_tx.send((
+            bpos(bpos_off),
+            ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+                block_number: blk,
+                end_tx_idx: bpos(bpos_off - 1),
+                l2_timestamp: 1_700_000_000 + blk,
+            }),
+        ))
         .unwrap();
     }
+    drop(a_tx);
     drop(b_tx);
 
     let cfg = ExecutorConfig {
         chain_id: 1,
         receipt_queue_depth: 64,
+        ..Default::default()
     };
     let writer_q = WriterApplyingQueue::new(snap.clone());
     let snapshots = MutatingSnapshotSource(snap);
+    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+        sequencer_id: 0,
+        rx: a_rx,
+    })];
+    let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
     let join = thread::spawn(move || {
         Executor::run(
             cfg,
-            ChanBSub(b_rx),
+            a_subs,
+            b_sub,
             ChanCPub(c_tx),
             snapshots,
             Imm,
