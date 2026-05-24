@@ -42,10 +42,18 @@ clap.workspace = true
 
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-deployer = { path = "../deployer" }
 tempfile.workspace = true
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion = { version = "0.7", features = ["html_reports"] }
+alloy-node-bindings.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "kardamom-batcher"
 path = "src/bin/kardamom-batcher.rs"
+
+[[bench]]
+name = "pack_throughput"
+harness = false
