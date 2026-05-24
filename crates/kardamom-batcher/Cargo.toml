@@ -2,6 +2,7 @@
 name = "kardamom-batcher"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [features]
 default = []
