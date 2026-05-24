@@ -40,6 +40,9 @@ mod tests {
             SequencerError::IngressDisconnected.to_string(),
             "ingress source disconnected"
         );
-        assert_eq!(SequencerError::LeaseLost.to_string(), "lease lost during operation");
+        assert_eq!(
+            SequencerError::LeaseLost.to_string(),
+            "lease lost during operation"
+        );
     }
 }
