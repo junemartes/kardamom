@@ -8,6 +8,10 @@ default = []
 # Bench-only feature that exposes a few internal helpers. The workspace builds
 # fine without it.
 bench-internals = []
+# Gates the real-Aeron Docker e2e test (per S0 D-Sh8). Off by default so
+# `cargo test` works in environments without a Docker daemon. CI runs the
+# Docker harness via `--features docker-e2e -- --ignored`.
+docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 
 [dependencies]
 # `rlp` feature enables RlpEncodable/RlpDecodable on Address, B256, U256.
