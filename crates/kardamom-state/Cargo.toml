@@ -35,4 +35,10 @@ tempfile.workspace = true
 criterion = { version = "0.7", features = ["html_reports"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
-# bench targets registered in Tasks 22-23 once their files exist.
+[[bench]]
+name = "write_throughput"
+harness = false
+
+[[bench]]
+name = "snapshot_open"
+harness = false
