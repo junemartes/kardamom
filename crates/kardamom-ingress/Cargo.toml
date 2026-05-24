@@ -44,3 +44,11 @@ kardamom-log = { workspace = true, features = ["testing"] }
 rand = "0.9"
 tracing-subscriber.workspace = true
 
+[[bench]]
+name = "latency"
+harness = false
+
+[[bench]]
+name = "throughput"
+harness = false
+
