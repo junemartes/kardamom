@@ -34,5 +34,5 @@ pub mod sealer;
 pub mod tick;
 pub mod watermark_tracker;
 
-// `pub use config::{ConfigError, SealerConfig};` lands in Task 2.
+pub use config::{ConfigError, SealerConfig};
 // `pub use sealer::Sealer;` lands in Task 9.
