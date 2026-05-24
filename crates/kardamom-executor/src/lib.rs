@@ -38,7 +38,10 @@ pub use actor::{
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet, apply_write_set};
 pub use error::ExecutorError;
-pub use state::{MockStateDatabase, MockStateError, StaticSnapshotSource};
+pub use state::{
+    MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
+    WriterApplyingQueue,
+};
 // Shared types re-exported from kardamom-types so external callers can pull
 // them via `kardamom_executor::*` without a separate dependency line.
 pub use kardamom_types::{
