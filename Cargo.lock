@@ -3695,6 +3695,7 @@ dependencies = [
  "kardamom-leases",
  "kardamom-log",
  "kardamom-types",
+ "metrics",
  "proptest",
  "rkyv",
  "tempfile",
