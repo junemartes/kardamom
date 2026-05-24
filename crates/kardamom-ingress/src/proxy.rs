@@ -99,7 +99,6 @@ where
         ));
         let pending = Arc::new(PendingReceipts::new());
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
-        cache.spawn_consumer(&subscription);
         let me = Self {
             cfg,
             rate_limiter,
