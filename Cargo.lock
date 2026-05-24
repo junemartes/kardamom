@@ -3779,6 +3779,7 @@ name = "kardamom-sequencer"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-network",
  "alloy-primitives",
  "alloy-rlp",
  "alloy-signer-local",
