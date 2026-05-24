@@ -32,7 +32,15 @@ tracing.workspace = true
 # Note: aeron-live and docker-e2e are activated only when the
 # `full-pipeline-e2e` feature is enabled (see [features] above). Plain
 # `cargo test -p kardamom-e2e` does not pull rusteron / cmake / docker.
+criterion.workspace = true
+hdrhistogram.workspace = true
 kardamom-executor = { path = "../kardamom-executor" }
 kardamom-state = { path = "../kardamom-state" }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "e2e_throughput"
+harness = false
+# Bench only compiles when full-pipeline-e2e is enabled (real Aeron + Docker).
+required-features = ["full-pipeline-e2e"]

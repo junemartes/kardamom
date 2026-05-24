@@ -3781,6 +3781,8 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "bytes",
+ "criterion 0.5.1",
+ "hdrhistogram",
  "kardamom-executor",
  "kardamom-log",
  "kardamom-state",
