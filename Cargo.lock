@@ -3902,6 +3902,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-state"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "anyhow",
+ "bytes",
+ "criterion 0.7.0",
+ "crossbeam-channel",
+ "kardamom-log",
+ "kardamom-types",
+ "metrics",
+ "rkyv",
+ "signet-libmdbx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-types"
 version = "0.1.0"
 dependencies = [
@@ -6310,6 +6331,30 @@ checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 dependencies = [
  "digest 0.10.7",
  "rand_core 0.6.4",
+]
+
+[[package]]
+name = "signet-libmdbx"
+version = "0.8.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd334ebaa7603e0ba8c9d701c883b3d264232e539860b6ff751c94aa959f6f0d"
+dependencies = [
+ "bitflags 2.11.1",
+ "byteorder",
+ "parking_lot",
+ "signet-mdbx-sys",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "signet-mdbx-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1edd9fd6e430ce6243327fed2d343da022c4737c158874a632bd00f4cbd1f5f7"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
