@@ -187,6 +187,204 @@ where
     }
 }
 
+// ============================================================================
+// Channel-A and Channel-B typed fakes (D-Sh12 split architecture).
+//
+// Per spec §2.3:
+//   - Channel A[i] is an Aeron *exclusive* publication carrying full
+//     TxEnvelopes. M of them (one per sequencer), each its own stream.
+//   - Channel B is the canonical orderer: Aeron *concurrent* multi-publisher
+//     carrying ChannelBMessage records (TxRef | BoundaryStart), ~16-32 B.
+//
+// At the in-memory-fake level, "exclusive vs concurrent" collapses (we only
+// model one publisher at a time, so there is no CAS-cursor contention to
+// simulate). The distinction is *type-level*: the channel-A pub/sub pair is
+// parameterised by `TxEnvelope` and constructs single-producer streams keyed
+// by `sequencer_id`; the channel-B pub/sub pair is parameterised by
+// `ChannelBMessage` and shares one stream. Tests that need to verify real
+// concurrent-pub interleaving must use the docker e2e harness.
+// ============================================================================
+
+use kardamom_types::{ChannelBMessage, TxEnvelope, TxRef};
+
+/// Channel A[i]: per-sequencer **exclusive** publication of full
+/// `TxEnvelope` bytes. In production this maps to
+/// `Aeron::add_exclusive_publication`; the fake just preserves FIFO.
+///
+/// `FakeChannelAPublication::new` requires the caller to hand in the
+/// `sequencer_id`. The fake keeps the id so callers can build a `TxRef`
+/// pointing at the produced `BPosition` without having to track the id
+/// separately.
+pub struct FakeChannelAPublication {
+    sequencer_id: u8,
+    pub_handle: FakeConcurrentPublication,
+}
+
+impl FakeChannelAPublication {
+    /// Open the channel-A[i] pub on `bus`, using the channel URI/stream-id
+    /// convention "<channel>"/"<stream_id>". A real wiring uses
+    /// `kardamom_log::config::ChannelsConfig::a_channel_template` to derive
+    /// per-sequencer URIs.
+    pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
+        Self {
+            sequencer_id,
+            pub_handle: FakeConcurrentPublication {
+                state: bus.stream(channel, stream_id),
+            },
+        }
+    }
+
+    pub fn sequencer_id(&self) -> u8 {
+        self.sequencer_id
+    }
+
+    /// Publish a `TxEnvelope` and return its `BPosition` on channel A[i].
+    /// Sequencers pass this `BPosition` into [`TxRef::new`] before writing
+    /// to channel B.
+    pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
+        let bytes =
+            rkyv::to_bytes::<rancor::Error>(env).map_err(|e| LogError::Codec(e.to_string()))?;
+        let off = self.pub_handle.offer(bytes.as_slice());
+        // Match the real publisher's "post-offer position" convention: the
+        // position points just past the encoded fragment. The fragment's
+        // *start* position is what executors / batchers reference; we
+        // expose that one (off - len) as the returned `BPosition`.
+        let frag_start = off - bytes.len() as i64;
+        let header = FakeHeader::from_offset(frag_start);
+        Ok(BPosition {
+            term_id: header.term_id(),
+            term_offset: header.term_offset(),
+        })
+    }
+}
+
+/// Channel A[i]: per-sequencer subscription returning `(BPosition, TxEnvelope)`.
+///
+/// Executors run M+1 of these (one per channel A) plus one channel-B
+/// subscription. Per spec §2.4 they buffer A messages keyed by `BPosition`
+/// until the corresponding `TxRef` arrives on channel B.
+pub struct FakeChannelASubscription {
+    sub: FakeSubscription,
+}
+
+impl FakeChannelASubscription {
+    pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
+        Self {
+            sub: FakeSubscription {
+                state: bus.stream(channel, stream_id),
+                cursor: 0,
+            },
+        }
+    }
+
+    /// Poll and invoke `f` with `(BPosition, TxEnvelope)` per fragment.
+    /// `BPosition` is the fragment *start* — the same value a sequencer
+    /// emitted as `TxRef.position_a`.
+    pub fn poll<F: FnMut(BPosition, TxEnvelope)>(
+        &mut self,
+        mut f: F,
+        fragment_limit: usize,
+    ) -> usize {
+        self.sub.poll(
+            |bytes: &[u8], header: FakeHeader| {
+                if let Ok(env) = rkyv::from_bytes::<TxEnvelope, rancor::Error>(bytes) {
+                    f(
+                        BPosition {
+                            term_id: header.term_id(),
+                            term_offset: header.term_offset(),
+                        },
+                        env,
+                    );
+                }
+            },
+            fragment_limit,
+        )
+    }
+}
+
+/// Channel B: canonical orderer, **concurrent** multi-publisher carrying
+/// [`ChannelBMessage`] records (TxRef | BoundaryStart). In production this
+/// maps to `Aeron::add_publication` (the shared / concurrent variant).
+pub struct FakeChannelBPublication {
+    pub_handle: FakeConcurrentPublication,
+}
+
+impl FakeChannelBPublication {
+    pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
+        Self {
+            pub_handle: FakeConcurrentPublication {
+                state: bus.stream(channel, stream_id),
+            },
+        }
+    }
+
+    /// Publish a [`TxRef`] onto channel B. Returns the fragment's start
+    /// position (the canonical B-position).
+    pub fn publish_ref(&self, r: &TxRef) -> Result<BPosition, LogError> {
+        self.publish_message(&ChannelBMessage::TxRef(*r))
+    }
+
+    /// Publish a [`kardamom_types::BlockBoundaryStart`] onto channel B
+    /// (sealer-emitted). Returns the boundary's canonical position.
+    pub fn publish_boundary(
+        &self,
+        b: &kardamom_types::BlockBoundaryStart,
+    ) -> Result<BPosition, LogError> {
+        self.publish_message(&ChannelBMessage::BoundaryStart(b.clone()))
+    }
+
+    fn publish_message(&self, m: &ChannelBMessage) -> Result<BPosition, LogError> {
+        let bytes =
+            rkyv::to_bytes::<rancor::Error>(m).map_err(|e| LogError::Codec(e.to_string()))?;
+        let off = self.pub_handle.offer(bytes.as_slice());
+        let frag_start = off - bytes.len() as i64;
+        let header = FakeHeader::from_offset(frag_start);
+        Ok(BPosition {
+            term_id: header.term_id(),
+            term_offset: header.term_offset(),
+        })
+    }
+}
+
+/// Channel B subscription returning `(BPosition, ChannelBMessage)` per
+/// fragment. The B-position is the canonical L2 tx ordering identifier
+/// (system invariant I1).
+pub struct FakeChannelBSubscription {
+    sub: FakeSubscription,
+}
+
+impl FakeChannelBSubscription {
+    pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
+        Self {
+            sub: FakeSubscription {
+                state: bus.stream(channel, stream_id),
+                cursor: 0,
+            },
+        }
+    }
+
+    pub fn poll<F: FnMut(BPosition, ChannelBMessage)>(
+        &mut self,
+        mut f: F,
+        fragment_limit: usize,
+    ) -> usize {
+        self.sub.poll(
+            |bytes: &[u8], header: FakeHeader| {
+                if let Ok(m) = rkyv::from_bytes::<ChannelBMessage, rancor::Error>(bytes) {
+                    f(
+                        BPosition {
+                            term_id: header.term_id(),
+                            term_offset: header.term_offset(),
+                        },
+                        m,
+                    );
+                }
+            },
+            fragment_limit,
+        )
+    }
+}
+
 /// In-memory fake fsync-watermark stream: an `Arc<Mutex<HashMap<recorder_id, VecDeque>>>`.
 /// Lease/aggregator tests publish into one of these and poll on the other side.
 #[derive(Clone, Default)]
