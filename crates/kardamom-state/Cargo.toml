@@ -10,8 +10,9 @@ default = []
 bench-internals = []
 
 [dependencies]
-alloy-primitives.workspace = true
-alloy-rlp.workspace = true
+# `rlp` feature enables RlpEncodable/RlpDecodable on Address, B256, U256.
+alloy-primitives = { workspace = true, features = ["rlp"] }
+alloy-rlp = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 bytes.workspace = true
 crossbeam-channel = "0.5"
