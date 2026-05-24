@@ -20,13 +20,11 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256};
-use bytes::Bytes;
 use kardamom_log::config::LogConfig;
 use kardamom_log::publisher::ChannelBPublisher;
 use kardamom_log::subscriber::Subscribers;
 use kardamom_log::testing::AeronTestCluster;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, ChannelBMessage, TxRef};
 
 async fn docker_available() -> bool {
     use tokio::process::Command;
@@ -82,14 +80,18 @@ async fn aeron_publish_record_subscribe_e2e() {
     };
     let mut sub = subs.b().unwrap();
 
+    // Channel B now carries TxRefs, not TxEnvelopes (D-Sh12). Publish 100
+    // refs (alternating which sequencer they belong to) and assert the
+    // subscriber sees them all in the canonical order Aeron produced.
     let mut last_pos = BPosition::ZERO;
     for i in 0..100u64 {
         last_pos = pubr
-            .publish_tx(&TxEnvelope {
-                correlation_id: i,
-                raw_tx: Bytes::from(vec![0xCDu8; 128]),
-                sender: Address::ZERO,
-                tx_hash: B256::repeat_byte(i as u8),
+            .publish_ref(&TxRef {
+                sequencer_id: (i % 4) as u8,
+                position_a: BPosition {
+                    term_id: 0,
+                    term_offset: (i as i32) * 64,
+                },
             })
             .unwrap();
     }
@@ -98,10 +100,15 @@ async fn aeron_publish_record_subscribe_e2e() {
     let mut received = 0usize;
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while received < 100 && std::time::Instant::now() < deadline {
-        received += sub.poll(|_t, _pos| (), 256);
+        received += sub.poll(
+            |m, _pos| {
+                assert!(matches!(m, ChannelBMessage::TxRef(_)));
+            },
+            256,
+        );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert_eq!(received, 100, "expected 100 messages, got {received}");
+    assert_eq!(received, 100, "expected 100 refs, got {received}");
 
     drop(cluster);
 }

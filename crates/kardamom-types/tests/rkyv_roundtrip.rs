@@ -145,6 +145,63 @@ fn cached_receipt_roundtrip() {
 }
 
 #[test]
+fn tx_ref_roundtrip() {
+    let r = TxRef {
+        sequencer_id: 5,
+        position_a: BPosition {
+            term_id: 3,
+            term_offset: 4096,
+        },
+    };
+    assert_eq!(roundtrip(&r), r);
+}
+
+#[test]
+fn channel_b_message_tx_ref_roundtrip() {
+    let m = ChannelBMessage::TxRef(TxRef {
+        sequencer_id: 1,
+        position_a: BPosition {
+            term_id: 2,
+            term_offset: 1024,
+        },
+    });
+    assert_eq!(roundtrip(&m), m);
+}
+
+#[test]
+fn channel_b_message_boundary_roundtrip() {
+    let m = ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+        block_number: 11,
+        end_tx_idx: BPosition {
+            term_id: 0,
+            term_offset: 8192,
+        },
+        l2_timestamp: 1_700_000_000,
+    });
+    assert_eq!(roundtrip(&m), m);
+}
+
+#[test]
+fn channel_b_message_helpers() {
+    let r = TxRef {
+        sequencer_id: 7,
+        position_a: BPosition {
+            term_id: 0,
+            term_offset: 16,
+        },
+    };
+    let m: ChannelBMessage = r.into();
+    assert!(m.is_tx_ref());
+    assert!(!m.is_boundary());
+    assert_eq!(m.as_tx_ref(), Some(&r));
+    assert!(m.as_boundary().is_none());
+
+    let b: ChannelBMessage = BlockBoundaryStart::default().into();
+    assert!(b.is_boundary());
+    assert!(!b.is_tx_ref());
+}
+
+#[test]
 fn block_delta_roundtrip() {
     use alloy_primitives::U256;
     use kardamom_types::delta::CodeEntry;
