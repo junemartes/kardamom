@@ -52,7 +52,12 @@ impl CaughtUpSet {
         self.by_id.insert(s.recorder_id, s);
     }
 
-    pub fn from_iter<I: IntoIterator<Item = RecorderState>>(iter: I) -> Self {
+    /// Build a set from an iterator of states. Named `from_states` rather
+    /// than `from_iter` so we don't shadow the std `FromIterator` trait method
+    /// (clippy::should_implement_trait); implementing `FromIterator` itself
+    /// would force every callsite to add a `.collect::<CaughtUpSet>()` turbofish
+    /// which reads worse than the explicit constructor.
+    pub fn from_states<I: IntoIterator<Item = RecorderState>>(iter: I) -> Self {
         let mut s = Self::new();
         for r in iter {
             s.insert(r);
@@ -133,7 +138,7 @@ mod tests {
 
     #[test]
     fn picks_lowest_caught_up_id() {
-        let set = CaughtUpSet::from_iter([
+        let set = CaughtUpSet::from_states([
             RecorderState {
                 recorder_id: 5,
                 fsynced: pos(0, 1_000),
@@ -156,7 +161,7 @@ mod tests {
     #[test]
     fn skips_lagging_recorder() {
         // Recorder 2 is 1 MB behind the tail; threshold is 64 KB; skip.
-        let set = CaughtUpSet::from_iter([
+        let set = CaughtUpSet::from_states([
             RecorderState {
                 recorder_id: 2,
                 fsynced: pos(0, 0),
@@ -176,7 +181,7 @@ mod tests {
 
     #[test]
     fn skips_stale_recorder() {
-        let set = CaughtUpSet::from_iter([
+        let set = CaughtUpSet::from_states([
             RecorderState {
                 recorder_id: 2,
                 fsynced: pos(0, 1_000),
@@ -193,15 +198,12 @@ mod tests {
 
     #[test]
     fn returns_none_when_no_one_caught_up() {
-        let set = CaughtUpSet::from_iter([RecorderState {
+        let set = CaughtUpSet::from_states([RecorderState {
             recorder_id: 2,
             fsynced: pos(0, 0),
             last_seen_ms: 100,
         }]);
-        assert_eq!(
-            elect(&set, pos(0, 1_000_000), 1_100, 64 * 1024, 500),
-            None
-        );
+        assert_eq!(elect(&set, pos(0, 1_000_000), 1_100, 64 * 1024, 500), None);
     }
 
     #[test]
@@ -209,7 +211,7 @@ mod tests {
         // current = (1, 100) → absolute = 16 MiB + 100. recorder 2 at
         // (0, 1_000_000) absolute = 1_000_000. Lag = 16 MiB - 1_000_000 + 100,
         // way above 64 KiB.
-        let set = CaughtUpSet::from_iter([
+        let set = CaughtUpSet::from_states([
             RecorderState {
                 recorder_id: 2,
                 fsynced: pos(0, 1_000_000),

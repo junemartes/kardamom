@@ -44,17 +44,13 @@ pub struct Sealer<C: WallClock + Clone, P: BoundaryPublisher> {
 impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
     /// Construct a sealer from already-prepared parts. The `initial_block` is
     /// what the bootstrap module produced from B's tail.
-    pub fn new(
-        cfg: SealerConfig,
-        clock: C,
-        publisher: P,
-        initial_block: u64,
-    ) -> Result<Self> {
+    pub fn new(cfg: SealerConfig, clock: C, publisher: P, initial_block: u64) -> Result<Self> {
         cfg.validate()?;
         let tracker = Arc::new(WatermarkTracker::new(cfg.recorder_ids.clone()));
         let host_id = cfg.host_id;
         let tick_ms = cfg.tick_interval_ms;
-        let emitter = BoundaryEmitter::new(publisher, clock.clone(), initial_block, tick_ms, host_id);
+        let emitter =
+            BoundaryEmitter::new(publisher, clock.clone(), initial_block, tick_ms, host_id);
         Ok(Self {
             cfg,
             clock,
@@ -103,7 +99,11 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
             "sealer_election_winner",
             "host_id" => self.cfg.host_id.to_string(),
         )
-        .set(if leader == Some(self.cfg.host_id) { 1.0 } else { 0.0 });
+        .set(if leader == Some(self.cfg.host_id) {
+            1.0
+        } else {
+            0.0
+        });
 
         if leader != Some(self.cfg.host_id) {
             return Ok(None);
@@ -112,7 +112,10 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
         // Sync block_number to whatever's been observed on B so flapping
         // leadership can't produce duplicates. `sync_block_number` is a
         // no-op when our local counter is already ahead.
-        let observed_next = self.observed_block.load(Ordering::Relaxed).saturating_add(1);
+        let observed_next = self
+            .observed_block
+            .load(Ordering::Relaxed)
+            .saturating_add(1);
         self.emitter.sync_block_number(observed_next);
         let emitted = self.emitter.run_one_tick().await?;
         // Record our own emission so the next snapshot reflects it.
@@ -135,12 +138,6 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
                 tracing::warn!(error = %e, "tick failed; continuing");
             }
         }
-    }
-
-    /// Test-only accessor for assertions about the tracker contents.
-    #[cfg(test)]
-    pub(crate) fn tracker_len(&self) -> usize {
-        self.tracker.len()
     }
 }
 
@@ -184,9 +181,15 @@ mod tests {
     }
 
     /// One-shot construction helper used by every test below.
-    fn build(host_id: u8, bus: &FakeBus, clock: MockClock, initial: u64)
-        -> (Sealer<MockClock, FakeBoundaryPublisher>, FakeBoundaryPublisher)
-    {
+    fn build(
+        host_id: u8,
+        bus: &FakeBus,
+        clock: MockClock,
+        initial: u64,
+    ) -> (
+        Sealer<MockClock, FakeBoundaryPublisher>,
+        FakeBoundaryPublisher,
+    ) {
         let pubh = FakeBoundaryPublisher::new(bus.clone(), "ch", 2);
         let view = pubh.clone();
         let sealer = Sealer::new(cfg(host_id), clock, pubh, initial).unwrap();
@@ -235,14 +238,14 @@ mod tests {
         for hid in [1u8, 2, 3] {
             s.update_watermark(rs(hid, 1_000));
         }
-        for tick in 0..5 {
+        for tick in 0u64..5 {
             clock.advance(250);
             // Refresh watermarks so they stay fresh.
             for hid in [1u8, 2, 3] {
                 s.update_watermark(rs(hid, 1_000 + (tick + 1) * 250));
             }
             let n = s.tick_once().await.unwrap().unwrap();
-            assert_eq!(n, (tick as u64) + 1);
+            assert_eq!(n, tick + 1);
         }
         let published = view.published();
         for (i, b) in published.iter().enumerate() {
