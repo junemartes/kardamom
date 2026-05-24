@@ -17,18 +17,22 @@
 //! the public type ergonomic (`pub sender: Address`) while making rkyv happy.
 
 pub mod boundary;
+pub mod channel_b;
 pub mod delta;
 pub mod envelope;
 pub mod position;
 pub mod receipt;
 pub mod state;
+pub mod txref;
 pub mod watermark;
 pub mod wire;
 
 pub use boundary::{BlockBoundary, BlockBoundaryStart};
+pub use channel_b::ChannelBMessage;
 pub use delta::{AccountChange, BlockDelta, StorageChange};
 pub use envelope::TxEnvelope;
 pub use position::BPosition;
 pub use receipt::{CachedReceipt, Receipt, WireLog};
 pub use state::{SnapshotSource, StateDatabase, StateError};
+pub use txref::TxRef;
 pub use watermark::{FsyncWatermark, QuorumWatermark};
