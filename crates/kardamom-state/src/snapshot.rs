@@ -1,1 +1,124 @@
-//! See module docs in lib.rs (filled in by S6 plan tasks).
+//! Read-only snapshot: long-lived mdbx RO txn that backs `StateDatabase`.
+//!
+//! The mdbx RO txn is the MVCC anchor. As long as one of these is alive, the
+//! mdbx freelist will not reuse the pages reachable from that snapshot — see
+//! `geometry::HORIZON_BLOCKS` for the bound the writer enforces.
+//!
+//! The snapshot is `Clone` and cheap to share — the inner txn is held in an
+//! `Arc<SnapshotInner>` so multiple consumers (executor, RPC) can read against
+//! the exact same MVCC view without each opening a new txn slot.
+
+use std::sync::Arc;
+
+use alloy_primitives::{Address, B256, U256};
+use bytes::Bytes;
+use kardamom_types::{BPosition, Receipt, StateDatabase};
+use signet_libmdbx::Environment;
+use signet_libmdbx::tx::aliases::RoTxSync;
+
+use crate::env::StateEnv;
+use crate::error::StateError;
+use crate::meta::{KEY_LAST_COMMITTED_BLOCK, decode_u64};
+use crate::schema::{
+    TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
+    decode_account_value, decode_receipt_value, decode_storage_value, decode_tx_hash_value,
+    encode_account_key, encode_b_position_key, encode_code_key, encode_storage_key,
+    encode_tx_hash_key,
+};
+
+/// MVCC snapshot of the state DB at exactly one block boundary.
+///
+/// Holds the underlying RO txn for its full lifetime. Drop it to release the
+/// snapshot — which the writer's horizon check uses to know it can reclaim
+/// older pages.
+#[derive(Clone)]
+pub struct StateSnapshot {
+    inner: Arc<SnapshotInner>,
+}
+
+struct SnapshotInner {
+    txn: RoTxSync,
+    block_number: u64,
+    // Keep the env Arc alive so the env doesn't outlive the snapshot's RO txn.
+    _env: Arc<Environment>,
+}
+
+impl StateSnapshot {
+    /// Open a fresh snapshot anchored at the writer's current
+    /// `last_committed_block` cursor.
+    pub fn open(env: &StateEnv) -> Result<Self, StateError> {
+        let txn = env.raw().begin_ro_sync()?;
+        let meta = txn.open_db(Some(TABLE_META))?;
+        let block_number = match txn.get::<Vec<u8>>(meta.dbi(), KEY_LAST_COMMITTED_BLOCK)? {
+            Some(bytes) => decode_u64(&bytes)?,
+            None => 0,
+        };
+        Ok(Self {
+            inner: Arc::new(SnapshotInner {
+                txn,
+                block_number,
+                _env: env.env.clone(),
+            }),
+        })
+    }
+
+    /// Returns the block number this snapshot is anchored at.
+    pub fn block_number(&self) -> u64 {
+        self.inner.block_number
+    }
+}
+
+impl StateDatabase for StateSnapshot {
+    type Error = StateError;
+
+    fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
+        let key = encode_account_key(address);
+        let db = self.inner.txn.open_db(Some(TABLE_ACCOUNTS))?;
+        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let v = decode_account_value(&bytes)?;
+                Ok(Some((v.nonce, v.balance, v.code_hash)))
+            }
+        }
+    }
+
+    fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error> {
+        let composite = encode_storage_key(address, key);
+        let db = self.inner.txn.open_db(Some(TABLE_STORAGE))?;
+        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &composite)? {
+            None => Ok(U256::ZERO),
+            Some(bytes) => decode_storage_value(&bytes),
+        }
+    }
+
+    fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
+        let key = encode_code_key(code_hash);
+        let db = self.inner.txn.open_db(Some(TABLE_CODE))?;
+        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+            None => Ok(Bytes::new()),
+            Some(b) => Ok(Bytes::from(b)),
+        }
+    }
+
+    /// D-Sh4: load a Receipt by its canonical BPosition. Returns None if no
+    /// receipt was committed at that position.
+    fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
+        let key = encode_b_position_key(pos);
+        let db = self.inner.txn.open_db(Some(TABLE_RECEIPTS))?;
+        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+            None => Ok(None),
+            Some(bytes) => decode_receipt_value(&bytes).map(Some),
+        }
+    }
+
+    /// D-Sh4: tx_hash → BPosition lookup. Feeds S1 `eth_getTransactionReceipt`.
+    fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
+        let key = encode_tx_hash_key(tx_hash);
+        let db = self.inner.txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
+        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+            None => Ok(None),
+            Some(bytes) => decode_tx_hash_value(&bytes).map(Some),
+        }
+    }
+}
