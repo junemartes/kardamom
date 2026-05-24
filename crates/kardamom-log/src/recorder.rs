@@ -1,5 +1,12 @@
-//! Drives an Aeron Archive instance to record channel B and exposes the
-//! current durable position the fsync sidecar tails.
+//! Drives an Aeron Archive instance to record a single stream (channel B
+//! *or* a channel A[i] per D-Sh12) and exposes the current durable position
+//! the fsync sidecar tails.
+//!
+//! Topology after D-Sh12:
+//!   - One `Recorder` with `RecorderKind::B` per channel-B recorder host
+//!     (N total; quorum-fsynced).
+//!   - One `Recorder` with `RecorderKind::A { sequencer_id }` per sequencer
+//!     host (M total; single-host fsync each).
 //!
 //! Gated behind the `aeron-live` cargo feature.
 //!
@@ -43,6 +50,18 @@ use crate::error::LogError;
 
 type Archive = rusteron_archive::AeronArchive;
 
+/// Which logical channel a recorder is tailing. Channel B feeds the
+/// quorum aggregator (N recorders, Q-of-N watermark). Channel A[i] feeds
+/// the per-sequencer single-host fsync (no quorum by default — see D-Sh12
+/// rationale).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecorderKind {
+    /// Per-sequencer channel-A recorder (carries full TxEnvelopes).
+    A { sequencer_id: u8 },
+    /// Channel-B canonical-orderer recorder (carries tiny TxRefs).
+    B,
+}
+
 pub struct Recorder {
     /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
     /// the field is intentionally not exposed as `Arc<Archive>`; instead,
@@ -51,6 +70,7 @@ pub struct Recorder {
     /// Recorder refreshes from its own thread.
     archive: Archive,
     recorder_id: RecorderId,
+    kind: RecorderKind,
     recording_id: i64,
     /// Cached archive directory (where segment files live).
     archive_dir: PathBuf,
@@ -61,26 +81,83 @@ pub struct Recorder {
 }
 
 impl Recorder {
+    /// Start recording channel B on this host. Used by the N channel-B
+    /// recorder hosts that participate in the quorum.
+    pub fn start_b(
+        archive: Archive,
+        ch: &ChannelsConfig,
+        recorder_id: RecorderId,
+        archive_dir: PathBuf,
+    ) -> Result<Self, LogError> {
+        Self::start_inner(
+            archive,
+            &ch.b_channel,
+            ch.b_stream_id,
+            recorder_id,
+            RecorderKind::B,
+            archive_dir,
+            "B",
+        )
+    }
+
+    /// Start recording channel A[sequencer_id]. Per D-Sh12, each sequencer
+    /// host runs one of these recording its own exclusive-publisher stream.
+    pub fn start_a(
+        archive: Archive,
+        ch: &ChannelsConfig,
+        recorder_id: RecorderId,
+        sequencer_id: u8,
+        archive_dir: PathBuf,
+    ) -> Result<Self, LogError> {
+        let channel = ch
+            .a_channel_template
+            .replace("{sid}", &sequencer_id.to_string());
+        let stream_id = ch.a_stream_id_base + sequencer_id as i32;
+        Self::start_inner(
+            archive,
+            &channel,
+            stream_id,
+            recorder_id,
+            RecorderKind::A { sequencer_id },
+            archive_dir,
+            "A",
+        )
+    }
+
+    /// Back-compat alias: original API recorded channel B.
+    #[deprecated(note = "use start_b for channel-B recording or start_a for channel A[i]")]
     pub fn start(
         archive: Archive,
         ch: &ChannelsConfig,
         recorder_id: RecorderId,
         archive_dir: PathBuf,
     ) -> Result<Self, LogError> {
-        let b_channel_c = CString::new(ch.b_channel.as_str())
-            .map_err(|e| LogError::Aeron(format!("b_channel contains NUL: {e}")))?;
+        Self::start_b(archive, ch, recorder_id, archive_dir)
+    }
+
+    fn start_inner(
+        archive: Archive,
+        channel: &str,
+        stream_id: i32,
+        recorder_id: RecorderId,
+        kind: RecorderKind,
+        archive_dir: PathBuf,
+        ctx: &str,
+    ) -> Result<Self, LogError> {
+        let channel_c = CString::new(channel)
+            .map_err(|e| LogError::Aeron(format!("{ctx} channel contains NUL: {e}")))?;
 
         // start_recording: (channel, stream_id, source_location, auto_stop)
         // SOURCE_LOCATION_LOCAL -> we are co-located with the publisher.
         let recording_id = archive
             .start_recording(
-                b_channel_c.as_c_str(),
-                ch.b_stream_id,
+                channel_c.as_c_str(),
+                stream_id,
                 rusteron_archive::SOURCE_LOCATION_LOCAL,
                 false,
             )
-            .map_err(|e| LogError::Aeron(format!("start_recording: {e}")))?;
-        info!(recording_id, "started B recording");
+            .map_err(|e| LogError::Aeron(format!("start_recording {ctx}: {e}")))?;
+        info!(recording_id, ?kind, "started recording");
 
         // Pull the descriptor once at startup so we can compute segment file
         // paths without a control-channel round-trip on every fsync tick.
@@ -90,6 +167,7 @@ impl Recorder {
         Ok(Self {
             archive,
             recorder_id,
+            kind,
             recording_id,
             archive_dir,
             start_position,
@@ -100,6 +178,10 @@ impl Recorder {
 
     pub fn recorder_id(&self) -> RecorderId {
         self.recorder_id
+    }
+
+    pub fn kind(&self) -> RecorderKind {
+        self.kind
     }
 
     pub fn recording_id(&self) -> i64 {

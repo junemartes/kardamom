@@ -37,7 +37,16 @@ pub struct AeronConfig {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelsConfig {
-    /// Channel B: canonical tx log. Recorded.
+    /// Channel A[i]: per-sequencer **exclusive** publisher of full
+    /// `TxEnvelope` bytes (D-Sh12). One stream per sequencer. URI template
+    /// substitutes `{sid}` with the sequencer id (e.g.
+    /// `"aeron:ipc?alias=a-{sid}"`); stream id is
+    /// `a_stream_id_base + sequencer_id`.
+    pub a_channel_template: String,
+    pub a_stream_id_base: i32,
+
+    /// Channel B: canonical orderer carrying tiny `ChannelBMessage`
+    /// records (TxRef + sealer-emitted boundary markers). Recorded.
     pub b_channel: String,
     pub b_stream_id: i32,
 
@@ -50,12 +59,20 @@ pub struct ChannelsConfig {
     pub receipt_cache_channel: String,
     pub receipt_cache_stream_id: i32,
 
-    /// Per-recorder fsync watermark publication, parameterized by recorder_id.
-    /// e.g. "aeron:ipc?alias=fsync-wm-{rid}".
+    /// Channel-B per-recorder fsync watermark publication, parameterized by
+    /// recorder_id. e.g. "aeron:ipc?alias=fsync-wm-b-{rid}".
     pub fsync_watermark_channel_template: String,
     pub fsync_watermark_stream_id: i32,
 
-    /// Aggregated quorum watermark.
+    /// Channel-A per-sequencer fsync watermark publication. D-Sh12: each
+    /// channel A has its own fsync sidecar publishing
+    /// `fsynced_position_a[i]` to its own watermark stream. URI template
+    /// substitutes `{sid}` with the sequencer id. Stream id is
+    /// `fsync_watermark_a_stream_id_base + sequencer_id`.
+    pub fsync_watermark_a_channel_template: String,
+    pub fsync_watermark_a_stream_id_base: i32,
+
+    /// Aggregated quorum watermark (channel B).
     pub quorum_watermark_channel: String,
     pub quorum_watermark_stream_id: i32,
 }
@@ -93,6 +110,8 @@ impl Default for LogConfig {
                 archive_cmd: vec!["aeron-archive".into()],
             },
             channels: ChannelsConfig {
+                a_channel_template: "aeron:ipc?alias=a-{sid}".into(),
+                a_stream_id_base: 2000,
                 b_channel: "aeron:udp?endpoint=224.0.1.1:40001".into(),
                 b_stream_id: 1001,
                 c_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
@@ -101,6 +120,8 @@ impl Default for LogConfig {
                 receipt_cache_stream_id: 1003,
                 fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),
                 fsync_watermark_stream_id: 1010,
+                fsync_watermark_a_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),
+                fsync_watermark_a_stream_id_base: 1030,
                 quorum_watermark_channel: "aeron:udp?endpoint=224.0.1.1:40020".into(),
                 quorum_watermark_stream_id: 1020,
             },
