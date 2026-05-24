@@ -33,3 +33,4 @@ pub use config::{BackpressurePolicy, SequencerConfig, SequencerRole};
 pub use duplicate::DuplicateNotification;
 pub use error::SequencerError;
 pub use primary::{PrimarySequencer, Shutdown};
+pub use standby::HotStandbyTailer;
