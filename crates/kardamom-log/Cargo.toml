@@ -23,6 +23,7 @@ aeron-live = ["dep:rusteron-client", "dep:rusteron-archive"]
 [dependencies]
 alloy-primitives.workspace = true
 bytes.workspace = true
+crossbeam-channel = "0.5"
 futures.workspace = true
 kardamom-types.workspace = true
 rkyv.workspace = true

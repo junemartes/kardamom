@@ -3309,6 +3309,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-uring"
+version = "0.7.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d09b98f7eace8982db770e4408e7470b028ce513ac28fecdc6bf4c30fe92b62"
+dependencies = [
+ "bitflags 2.11.1",
+ "cfg-if",
+ "libc",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3838,8 +3849,12 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "bytes",
+ "criterion 0.5.1",
+ "crossbeam-channel",
  "futures",
+ "io-uring",
  "kardamom-types",
+ "libc",
  "rkyv",
  "rusteron-archive",
  "rusteron-client",
