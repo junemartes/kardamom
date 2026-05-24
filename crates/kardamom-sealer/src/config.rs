@@ -20,8 +20,14 @@ pub struct SealerConfig {
     pub host_id: u8,
     /// Aeron channel URI for channel B (publish + subscribe on the same channel).
     pub channel_b_uri: String,
-    /// Aeron stream id for channel B.
-    pub channel_b_stream_id: i32,
+    /// Aeron stream id carrying `TxEnvelope`s on channel B.
+    pub channel_b_tx_stream_id: i32,
+    /// Aeron stream id carrying `BlockBoundaryStart`s on channel B. Must differ
+    /// from `channel_b_tx_stream_id` so subscribers can demultiplex by type
+    /// without an in-band tag. The two streams share the same underlying
+    /// channel — the sealer is "just another publisher on channel B" per spec
+    /// §2.6, but with its own stream id so consumers can subscribe selectively.
+    pub channel_b_boundary_stream_id: i32,
     /// Aeron channel URI carrying the per-recorder watermark streams.
     pub watermark_channel_uri: String,
     /// Stream id of recorder `host_id` is `watermark_stream_id_base + host_id as i32`.
@@ -55,6 +61,8 @@ pub enum ConfigError {
     BadTick,
     #[error("caught_up_lag_bytes does not fit in i64")]
     LagOverflow,
+    #[error("channel_b_tx_stream_id and channel_b_boundary_stream_id must differ")]
+    SharedStreamId,
 }
 
 impl SealerConfig {
@@ -75,6 +83,9 @@ impl SealerConfig {
         if i64::try_from(self.caught_up_lag_bytes).is_err() {
             return Err(ConfigError::LagOverflow);
         }
+        if self.channel_b_tx_stream_id == self.channel_b_boundary_stream_id {
+            return Err(ConfigError::SharedStreamId);
+        }
         Ok(())
     }
 }
@@ -87,7 +98,8 @@ mod tests {
         SealerConfig {
             host_id: 7,
             channel_b_uri: "x".into(),
-            channel_b_stream_id: 1,
+            channel_b_tx_stream_id: 1,
+            channel_b_boundary_stream_id: 2,
             watermark_channel_uri: "x".into(),
             watermark_stream_id_base: 1,
             recorder_ids: vec![1, 2, 7],
@@ -102,7 +114,8 @@ mod tests {
         let toml = r#"
             host_id = 7
             channel_b_uri = "aeron:udp?endpoint=224.0.0.1:40123"
-            channel_b_stream_id = 1001
+            channel_b_tx_stream_id = 1001
+            channel_b_boundary_stream_id = 1002
             watermark_channel_uri = "aeron:udp?endpoint=224.0.0.1:40124"
             watermark_stream_id_base = 2000
             recorder_ids = [1, 2, 7]
@@ -124,7 +137,8 @@ mod tests {
         let toml = r#"
             host_id = 1
             channel_b_uri = "x"
-            channel_b_stream_id = 1
+            channel_b_tx_stream_id = 1
+            channel_b_boundary_stream_id = 2
             watermark_channel_uri = "x"
             watermark_stream_id_base = 1
             recorder_ids = [1]
@@ -133,6 +147,16 @@ mod tests {
             bogus = "field"
         "#;
         assert!(toml::from_str::<SealerConfig>(toml).is_err());
+    }
+
+    #[test]
+    fn boundary_and_tx_stream_ids_must_differ() {
+        let cfg = SealerConfig {
+            channel_b_tx_stream_id: 5,
+            channel_b_boundary_stream_id: 5,
+            ..good()
+        };
+        assert_eq!(cfg.validate(), Err(ConfigError::SharedStreamId));
     }
 
     #[test]
