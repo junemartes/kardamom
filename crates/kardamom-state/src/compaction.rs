@@ -36,7 +36,11 @@ pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
             dest.display()
         )));
     }
-    std::fs::create_dir_all(dest)?;
+    // Ensure the parent exists; mdbx_env_copy creates the destination
+    // subdirectory itself.
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
     let c_path = CString::new(dest.as_os_str().as_encoded_bytes()).map_err(|_| {
         StateError::Recovery(format!(
