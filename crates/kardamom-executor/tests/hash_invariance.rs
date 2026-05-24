@@ -25,12 +25,10 @@ fn build(
     ws
 }
 
-fn sample(
-    seed: u64,
-) -> (
-    Vec<(Address, (u64, U256, B256))>,
-    Vec<((Address, B256), U256)>,
-) {
+type AccountVec = Vec<(Address, (u64, U256, B256))>;
+type StorageVec = Vec<((Address, B256), U256)>;
+
+fn sample(seed: u64) -> (AccountVec, StorageVec) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     let n_acc: u64 = 32;
     let n_sto: u64 = 128;
@@ -73,7 +71,7 @@ fn flipping_one_storage_value_changes_hash() {
     let (accounts, storage) = sample(42);
     let base = build(&accounts, &storage).hash();
     let mut storage_b = storage.clone();
-    storage_b[0].1 = storage_b[0].1 + U256::from(1u64);
+    storage_b[0].1 += U256::from(1u64);
     assert_ne!(build(&accounts, &storage_b).hash(), base);
 }
 
@@ -82,6 +80,6 @@ fn flipping_one_balance_changes_hash() {
     let (accounts, storage) = sample(99);
     let base = build(&accounts, &storage).hash();
     let mut accounts_b = accounts.clone();
-    accounts_b[0].1.1 = accounts_b[0].1.1 + U256::from(1u64);
+    accounts_b[0].1.1 += U256::from(1u64);
     assert_ne!(build(&accounts_b, &storage).hash(), base);
 }

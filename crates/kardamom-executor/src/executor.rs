@@ -14,8 +14,8 @@
 
 use alloy_consensus::Transaction;
 use alloy_eips::eip2718::Decodable2718;
-use alloy_primitives::{Address, B256, U256};
 use alloy_primitives::Bytes as AlloyBytes;
+use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope, WireLog};
 use revm::context::TxEnv;
