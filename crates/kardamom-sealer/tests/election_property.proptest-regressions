@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4d85f2d6698f36a342d82389fb6c6029ed00a83ad65c6aa78727fe99b0f084de # shrinks to recs = [RecorderState { recorder_id: 15, fsynced: BPosition { term_id: 0, term_offset: 0 }, last_seen_ms: 340282 }, RecorderState { recorder_id: 15, fsynced: BPosition { term_id: 7, term_offset: 0 }, last_seen_ms: 236461 }], cur_term = 1, cur_off = 0, now_ms = 0, lag = 0, stale = 0

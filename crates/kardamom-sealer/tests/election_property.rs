@@ -54,25 +54,23 @@ proptest! {
         lag in 0u64..1_000_000,
         stale in 0u64..1_000_000,
     ) {
-        let set = CaughtUpSet::from_iter(recs.clone());
+        let set = CaughtUpSet::from_iter(recs);
         let cur = BPosition { term_id: cur_term, term_offset: cur_off };
         if let Some(winner) = elect(&set, cur, now_ms, lag, stale) {
             let cur_abs = bpos_to_abs(cur);
-            // Sanity: winner itself must be eligible.
-            let winner_state = recs.iter()
-                .filter(|r| r.recorder_id == winner)
-                .max_by_key(|r| r.last_seen_ms) // BTreeMap kept the last-inserted
+            // The CaughtUpSet only retains one state per recorder_id (the
+            // last one inserted). All assertions must work against `set`,
+            // not the raw input vec.
+            let winner_state = set.states()
+                .find(|r| r.recorder_id == winner)
                 .copied()
-                .unwrap();
+                .expect("winner must be in the set");
             let w_lag = cur_abs - bpos_to_abs(winner_state.fsynced);
             let w_fresh = now_ms.saturating_sub(winner_state.last_seen_ms) <= stale;
             prop_assert!(w_lag <= lag as i64);
             prop_assert!(w_fresh);
 
             // No eligible recorder has a smaller id than the winner.
-            // (BTreeMap keeps only the last inserted state for each id, so
-            // for the "no smaller eligible id" check we evaluate against the
-            // current set's representative for each id.)
             for r in set.states() {
                 if r.recorder_id < winner {
                     let lag_b = cur_abs - bpos_to_abs(r.fsynced);
