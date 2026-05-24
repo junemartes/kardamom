@@ -15,7 +15,7 @@
 //! `cargo test` runs.
 
 use std::ffi::CString;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use rkyv::api::high::HighSerializer;
@@ -200,10 +200,12 @@ fn decode_position(p: i64) -> BPosition {
     }
 }
 
-/// Bundle of all publishers a single host might need.
+/// Bundle of all publishers a single host might need. Uses `Rc` (not `Arc`)
+/// because `AeronClient` is thread-confined (`!Send + !Sync`) and the whole
+/// publisher set lives on one Aeron-client thread by design.
 #[derive(Clone)]
 pub struct Publishers {
-    pub aeron: Arc<AeronClient>,
-    pub b: Arc<ChannelBPublisher>,
-    pub c: Arc<ChannelCPublisher>,
+    pub aeron: Rc<AeronClient>,
+    pub b: Rc<ChannelBPublisher>,
+    pub c: Rc<ChannelCPublisher>,
 }

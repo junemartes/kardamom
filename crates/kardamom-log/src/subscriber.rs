@@ -7,7 +7,7 @@
 //! subscription for the duration of the call.
 
 use std::ffi::CString;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use rkyv::api::high::{HighDeserializer, HighValidator};
@@ -117,9 +117,11 @@ pub type ReceiptCacheSubscriber = TypedSubscriber<CachedReceipt>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
 pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
 
-/// Convenience bundle.
+/// Convenience bundle. Uses `Rc` (not `Arc`) because `AeronClient` is
+/// thread-confined (`!Send + !Sync`) and the entire subscriber stack lives
+/// on one Aeron-client thread by design.
 pub struct Subscribers {
-    pub aeron: Arc<AeronClient>,
+    pub aeron: Rc<AeronClient>,
     pub ch: ChannelsConfig,
 }
 

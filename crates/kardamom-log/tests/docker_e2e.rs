@@ -17,7 +17,7 @@
 
 #![cfg(all(feature = "docker-e2e", feature = "aeron-live"))]
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -38,7 +38,11 @@ async fn docker_available() -> bool {
         .unwrap_or(false)
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// Single-thread runtime: `rusteron_client::Aeron` is `!Send + !Sync` (the
+// C client is thread-confined). With `flavor = "multi_thread"` tokio could
+// move this task across worker threads at await points, which is UB for
+// the `Rc<Aeron>` held below.
+#[tokio::test(flavor = "current_thread")]
 async fn aeron_publish_record_subscribe_e2e() {
     if !docker_available().await {
         eprintln!("skipping: docker not available");
@@ -66,7 +70,9 @@ async fn aeron_publish_record_subscribe_e2e() {
     // CnC, call `ctx.set_dir(...)` here.
     let _ = &endpoint;
     let ctx = rusteron_client::AeronContext::new().expect("aeron context");
-    let aeron = Arc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
+    // `Aeron` is `!Send + !Sync` (the C client is thread-confined). Use
+    // `Rc`, not `Arc`, to share it between the publisher and Subscribers.
+    let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
     aeron.start().expect("aeron start");
 
     let pubr = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
