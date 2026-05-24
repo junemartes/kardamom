@@ -3841,6 +3841,7 @@ dependencies = [
  "ctrlc",
  "kardamom-leases",
  "kardamom-log",
+ "kardamom-sequencer",
  "kardamom-types",
  "metrics",
  "proptest",
