@@ -1,8 +1,8 @@
 //! Continuous io_uring fsync sidecar.
 //!
-//! Polls a [`PositionSource`] (in production: the Aeron Archive
-//! `recording-position` counter). Whenever the source advances past the
-//! mirror's tail, the sidecar:
+//! Polls a [`PositionSource`] (in production: a [`SharedPosition`] atomic
+//! the Recorder thread refreshes from `AeronArchive::get_recording_position`).
+//! Whenever the source advances past the mirror's tail, the sidecar:
 //!
 //!   1. reads the new bytes from the recorder's segment file,
 //!   2. submits an `IORING_OP_WRITE` of those bytes to the mirror file
@@ -219,45 +219,64 @@ pub fn stream_position_to_bposition(pos: i64) -> BPosition {
 // Aeron-backed PositionSource
 // ---------------------------------------------------------------------------
 
-/// `PositionSource` backed by the Aeron Archive `get_recording_position` call.
+/// `PositionSource` backed by a shared `AtomicI64`.
 ///
-/// Earlier drafts read a counter handle directly from the shared counters
-/// reader; the 0.1.16x `rusteron-archive` bindings don't expose a
-/// "find the recording-position counter id" helper, so we ask the archive
-/// for the position on every tick instead. One control-channel round-trip
-/// per tick is negligible next to the fsync that follows, and it keeps the
-/// abstraction (a trait returning `i64`) intact.
+/// Why not hold the [`rusteron_archive::AeronArchive`] handle directly?
+/// `AeronArchive` is built from `Rc` + raw pointers (the C client is
+/// thread-confined) and so is neither `Send` nor `Sync`. The fsync sidecar
+/// runs on its own thread, so it cannot own an `AeronArchive` even via
+/// `Arc`. Instead we have the Recorder thread call
+/// `get_recording_position(recording_id)` on its own cadence and write the
+/// result into an `AtomicI64` shared with the sidecar via this
+/// `SharedPosition` handle. The sidecar's `PositionSource::current` is then
+/// a cheap atomic load. The atomic carries `Send + Sync` naturally.
 ///
-/// Only available with `aeron-live`.
-#[cfg(feature = "aeron-live")]
-pub struct AeronPositionSource {
-    archive: std::sync::Arc<rusteron_archive::AeronArchive>,
-    recording_id: i64,
+/// Only available with `aeron-live`, but the type itself is `cfg`-free
+/// since it doesn't reference rusteron types — that lets future call sites
+/// share positions without pulling in the Aeron build dependencies.
+#[derive(Clone, Default)]
+pub struct SharedPosition {
+    inner: std::sync::Arc<std::sync::atomic::AtomicI64>,
 }
 
-#[cfg(feature = "aeron-live")]
-impl AeronPositionSource {
-    pub fn new(archive: std::sync::Arc<rusteron_archive::AeronArchive>, recording_id: i64) -> Self {
-        Self {
-            archive,
-            recording_id,
-        }
+impl SharedPosition {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn store(&self, pos: i64) {
+        self.inner.store(pos, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn load(&self) -> i64 {
+        self.inner.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
-#[cfg(feature = "aeron-live")]
-impl PositionSource for AeronPositionSource {
+impl PositionSource for SharedPosition {
     fn current(&self) -> i64 {
-        // On error (e.g. transient archive disconnect) we return the last
-        // known floor of 0 so the sidecar simply stays idle this tick; the
-        // next tick retries. Logging at debug to avoid log spam on slow
-        // archives.
-        match self.archive.get_recording_position(self.recording_id) {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::debug!(error = %e, "get_recording_position failed; treating as 0");
-                0
-            }
+        self.load()
+    }
+}
+
+/// Convenience: a recorder-thread helper that polls `get_recording_position`
+/// once and pushes into a [`SharedPosition`]. Returns the value pushed (or
+/// `None` if the archive call failed; the caller logs and retries next
+/// tick).
+#[cfg(feature = "aeron-live")]
+pub fn refresh_from_archive(
+    archive: &rusteron_archive::AeronArchive,
+    recording_id: i64,
+    out: &SharedPosition,
+) -> Option<i64> {
+    match archive.get_recording_position(recording_id) {
+        Ok(p) => {
+            out.store(p);
+            Some(p)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "get_recording_position failed");
+            None
         }
     }
 }

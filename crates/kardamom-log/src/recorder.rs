@@ -12,8 +12,15 @@
 //! [`rusteron_archive::AeronArchive::get_recording_position`], which is
 //! semantically equivalent for our purposes (we poll once per fsync tick;
 //! the overhead of a control-channel round-trip is negligible compared to
-//! the disk fsync that follows). The sidecar holds an `Arc<AeronArchive>`
-//! and calls `get_recording_position(recording_id)` on every tick.
+//! the disk fsync that follows).
+//!
+//! ## Design note: thread confinement
+//!
+//! `AeronArchive` is `!Send + !Sync` (it wraps `Rc` + raw pointers — the C
+//! client is thread-confined). The Recorder owns the archive on its own
+//! thread and refreshes a shared
+//! [`crate::fsync_sidecar::SharedPosition`] atomic that the fsync sidecar
+//! thread reads. See `fsync_sidecar::SharedPosition` / `refresh_from_archive`.
 //!
 //! ## Segment file path
 //!
@@ -24,9 +31,10 @@
 //! `start_position`, `term_buffer_length`, and `segment_file_length` from
 //! the recording descriptor (one call to `list_recording` at startup).
 
+use std::cell::RefCell;
 use std::ffi::CString;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::rc::Rc;
 
 use tracing::info;
 
@@ -36,7 +44,12 @@ use crate::error::LogError;
 type Archive = rusteron_archive::AeronArchive;
 
 pub struct Recorder {
-    archive: Arc<Archive>,
+    /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
+    /// the field is intentionally not exposed as `Arc<Archive>`; instead,
+    /// callers learn the recording position via a
+    /// [`crate::fsync_sidecar::SharedPosition`] (an `AtomicI64`) that the
+    /// Recorder refreshes from its own thread.
+    archive: Archive,
     recorder_id: RecorderId,
     recording_id: i64,
     /// Cached archive directory (where segment files live).
@@ -54,7 +67,6 @@ impl Recorder {
         recorder_id: RecorderId,
         archive_dir: PathBuf,
     ) -> Result<Self, LogError> {
-        let archive = Arc::new(archive);
         let b_channel_c = CString::new(ch.b_channel.as_str())
             .map_err(|e| LogError::Aeron(format!("b_channel contains NUL: {e}")))?;
 
@@ -94,10 +106,12 @@ impl Recorder {
         self.recording_id
     }
 
-    /// Clone the underlying archive handle so the fsync sidecar can poll the
-    /// recording position independently of the recorder.
-    pub fn archive(&self) -> Arc<Archive> {
-        self.archive.clone()
+    /// Borrow the underlying archive handle. The borrow stays on the
+    /// Recorder thread; cross-thread sharing is intentionally not supported
+    /// — see the struct doc and `fsync_sidecar::SharedPosition` for the
+    /// approved cross-thread pattern.
+    pub fn archive(&self) -> &Archive {
+        &self.archive
     }
 
     /// Path to the active segment file on disk. The fsync sidecar mirrors
@@ -131,8 +145,8 @@ impl Recorder {
 
 /// One-shot descriptor fetch via `list_recording`. We implement the
 /// `AeronArchiveRecordingDescriptorConsumerFuncCallback` trait on a small
-/// `Arc<Mutex<Captured>>` shim so the closure-style trait method can stash
-/// the fields we need into shared state the caller reads after the call.
+/// `Rc<RefCell<Captured>>` shim. Single-thread access is enforced by the
+/// fact that `AeronArchive` itself is `!Send + !Sync`.
 fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i32), LogError> {
     use rusteron_archive::{
         AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
@@ -148,7 +162,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
     }
 
     struct Consumer {
-        captured: Arc<Mutex<Captured>>,
+        captured: Rc<RefCell<Captured>>,
     }
 
     impl AeronArchiveRecordingDescriptorConsumerFuncCallback for Consumer {
@@ -156,7 +170,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
             &mut self,
             desc: AeronArchiveRecordingDescriptor,
         ) {
-            let mut g = self.captured.lock().expect("descriptor mutex");
+            let mut g = self.captured.borrow_mut();
             g.start_position = desc.start_position();
             g.term_buffer_length = desc.term_buffer_length();
             g.segment_file_length = desc.segment_file_length();
@@ -164,7 +178,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
         }
     }
 
-    let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Captured::default()));
+    let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
     let handler = Handler::leak(Consumer {
         captured: captured.clone(),
     });
@@ -173,7 +187,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
         .list_recording(recording_id, Some(&handler))
         .map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
 
-    let g = captured.lock().expect("descriptor mutex");
+    let g = captured.borrow();
     if !g.seen {
         return Err(LogError::Aeron(format!(
             "list_recording({recording_id}) returned no descriptor"
