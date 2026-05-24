@@ -87,6 +87,12 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
         self.block_number
     }
 
+    /// Borrow the underlying publisher. Kept `pub(crate)` so the supervisor
+    /// can read the tx-stream tail without taking ownership of the publisher.
+    pub(crate) fn publisher_ref(&self) -> &P {
+        &self.publisher
+    }
+
     /// Emit one boundary at the current wall-clock tick. Returns the block
     /// number that was emitted, or an error if back-pressure persisted past
     /// the retry budget.
