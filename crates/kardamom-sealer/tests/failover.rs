@@ -61,7 +61,10 @@ fn build(
 /// Pump a single tick through every sealer in id order, then propagate any
 /// emission so all other sealers observe it (preventing future duplicates).
 async fn step(
-    sealers: &mut [(Sealer<MockClock, FakeBoundaryPublisher>, FakeBoundaryPublisher)],
+    sealers: &mut [(
+        Sealer<MockClock, FakeBoundaryPublisher>,
+        FakeBoundaryPublisher,
+    )],
 ) -> Option<u64> {
     let mut emitted: Option<u64> = None;
     for i in 0..sealers.len() {
@@ -144,7 +147,11 @@ async fn standby_takes_over_when_leader_stops_publishing_watermarks() {
 
     // Contiguity from 1.
     for (i, b) in published.iter().enumerate() {
-        assert_eq!(b.block_number, (i as u64) + 1, "non-contiguous: {published:?}");
+        assert_eq!(
+            b.block_number,
+            (i as u64) + 1,
+            "non-contiguous: {published:?}"
+        );
     }
 
     // l2_timestamp is the wall-clock at tick time, in 250 ms multiples.

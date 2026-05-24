@@ -3854,7 +3854,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "criterion 0.5.1",
+ "criterion 0.7.0",
  "kardamom-leases",
  "kardamom-log",
  "kardamom-sealer",
