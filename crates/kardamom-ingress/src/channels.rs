@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
 use kardamom_types::{
-    BPosition, BlockBoundary, CachedReceipt, QuorumWatermark, Receipt, TxEnvelope,
+    BPosition, BlockBoundary, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
 };
 
 use crate::error::IngressError;
@@ -51,6 +51,10 @@ pub trait IngressSubscription: Send + Sync + 'static {
     fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
     /// Stream of `QuorumWatermark` snapshots.
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
+    /// Stream of `FsyncWatermark` snapshots from the *local* recorder
+    /// (the per-recorder watermark stream for the host this proxy runs on).
+    /// Used by ack policies that gate on local fsync.
+    fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark>;
     /// Stream of `CachedReceipt` messages (executor → proxy nonce cache).
     fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt>;
     /// Stream of `BlockBoundary` markers on channel C; backs `eth_blockNumber`.
@@ -68,6 +72,7 @@ pub struct MockChannels {
     pub ingress_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
     pub receipt_bus: broadcast::Sender<Receipt>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
+    pub local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub receipt_cache_bus: broadcast::Sender<CachedReceipt>,
     pub block_boundary_bus: broadcast::Sender<BlockBoundary>,
     pub published_cache: Arc<Mutex<Vec<CachedReceipt>>>,
@@ -87,6 +92,7 @@ impl MockChannels {
         }
         let (receipt_bus, _) = broadcast::channel(1024);
         let (watermark_bus, _) = broadcast::channel(1024);
+        let (local_fsync_bus, _) = broadcast::channel(1024);
         let (receipt_cache_bus, _) = broadcast::channel(1024);
         let (block_boundary_bus, _) = broadcast::channel(1024);
         (
@@ -94,6 +100,7 @@ impl MockChannels {
                 ingress_tx: tx_vec,
                 receipt_bus,
                 watermark_bus,
+                local_fsync_bus,
                 receipt_cache_bus,
                 block_boundary_bus,
                 published_cache: Arc::new(Mutex::new(Vec::new())),
@@ -133,6 +140,9 @@ impl IngressSubscription for MockChannels {
     }
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark> {
         self.watermark_bus.subscribe()
+    }
+    fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark> {
+        self.local_fsync_bus.subscribe()
     }
     fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt> {
         self.receipt_cache_bus.subscribe()
