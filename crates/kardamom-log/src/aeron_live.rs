@@ -148,6 +148,27 @@ impl AeronRuntime {
         })
     }
 
+    /// Like [`spawn_default`] but points the Aeron client at a specific
+    /// `aeron.dir` (the Media Driver's shared-memory directory). Used by
+    /// e2e tests that bind-mount the container's aeron.dir into the host.
+    pub fn spawn_with_dir(aeron_dir: impl Into<std::path::PathBuf>) -> Result<Self, LogError> {
+        let aeron_dir = aeron_dir.into();
+        let aeron_dir_str = aeron_dir
+            .to_str()
+            .ok_or_else(|| LogError::Aeron(format!("aeron.dir is not UTF-8: {aeron_dir:?}")))?
+            .to_string();
+        let aeron_dir_c = std::ffi::CString::new(aeron_dir_str.clone()).map_err(|_| {
+            LogError::Aeron(format!("aeron.dir contains a NUL byte: {aeron_dir_str}"))
+        })?;
+        Self::spawn_with(move || {
+            let ctx = rusteron_client::AeronContext::new()
+                .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
+            ctx.set_dir(aeron_dir_c.as_c_str())
+                .map_err(|e| LogError::Aeron(format!("set_dir: {e}")))?;
+            Ok(ctx)
+        })
+    }
+
     /// Spawn the Aeron thread, building the `AeronContext` inside the thread
     /// via the caller-supplied closure. The closure runs on the Aeron thread
     /// — this is the only way to feed it custom configuration without crossing

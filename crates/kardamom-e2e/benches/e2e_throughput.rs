@@ -34,6 +34,9 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 #[cfg(feature = "full-pipeline-e2e")]
 fn run_e2e_throughput(c: &mut Criterion) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use alloy_primitives::{Address, B256};
     use bytes::Bytes;
     use kardamom_log::aeron_live::{
@@ -66,8 +69,32 @@ fn run_e2e_throughput(c: &mut Criterion) {
     cfg.channels.c_channel = "aeron:ipc?alias=bench-c".into();
     cfg.channels.c_stream_id = 9002;
 
-    let aeron_rt = AeronRuntime::spawn_default().expect("aeron runtime");
+    let aeron_rt = AeronRuntime::spawn_with_dir(cluster.aeron_dir_host(0)).expect("aeron runtime");
     let publisher = ChannelBPublisherHandle::open(&aeron_rt, &cfg.channels).expect("B publisher");
+    let mut subscriber =
+        ChannelBSubscriberHandle::open(&aeron_rt, &cfg.channels).expect("B subscriber for drain");
+
+    // Background draining task. Without it, every batch fills the term buffer
+    // and the publisher hits back-pressure. Drains as fast as the subscriber
+    // can deliver — we don't care about the values here, only that they're
+    // consumed so the publisher has room.
+    let drain_stop = Arc::new(AtomicBool::new(false));
+    let drain_stop_for_task = drain_stop.clone();
+    let drain_handle = std::thread::spawn(move || {
+        let local_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("drain runtime");
+        local_rt.block_on(async move {
+            while !drain_stop_for_task.load(Ordering::Relaxed) {
+                match tokio::time::timeout(Duration::from_millis(50), subscriber.recv()).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => break,
+                    Err(_) => {}
+                }
+            }
+        });
+    });
 
     let mut group = c.benchmark_group("e2e/channel_b_publish_throughput");
     for &batch in &[1usize, 64, 1024] {
@@ -88,14 +115,22 @@ fn run_e2e_throughput(c: &mut Criterion) {
     }
     group.finish();
 
-    // Round-trip latency: publish on B, drain on a co-located subscriber,
-    // measure end-to-end. We drive the async recv via the bench-owned
-    // multi-thread tokio runtime's `block_on` rather than `Bencher::to_async`
-    // because the criterion version this workspace pins doesn't expose the
-    // `async_executor` feature.
+    // Round-trip latency: publish on B, drain on a separate subscriber on the
+    // benchmark thread, measure end-to-end. The throughput bench has its own
+    // drainer running; for latency we'd race with it, so we use a fresh
+    // subscriber on a dedicated stream id.
+    drain_stop.store(true, Ordering::Relaxed);
+    drain_handle.join().expect("drain join");
+
+    let mut latency_cfg = cfg.clone();
+    latency_cfg.channels.b_stream_id = 9011;
+    latency_cfg.channels.b_channel = "aeron:ipc?alias=bench-b-latency".into();
+    let latency_pub =
+        ChannelBPublisherHandle::open(&aeron_rt, &latency_cfg.channels).expect("latency publisher");
+    let mut latency_sub = ChannelBSubscriberHandle::open(&aeron_rt, &latency_cfg.channels)
+        .expect("latency subscriber");
+
     let mut group = c.benchmark_group("e2e/channel_b_round_trip_latency");
-    let mut subscriber = ChannelBSubscriberHandle::open(&aeron_rt, &cfg.channels)
-        .expect("B subscriber for latency bench");
     group.bench_function("single_message", |b| {
         b.iter(|| {
             let env = TxEnvelope {
@@ -104,9 +139,9 @@ fn run_e2e_throughput(c: &mut Criterion) {
                 sender: Address::ZERO,
                 tx_hash: B256::ZERO,
             };
-            publisher.publish_tx(&env).expect("publish");
+            latency_pub.publish_tx(&env).expect("publish");
             rt.block_on(async {
-                let _ = tokio::time::timeout(Duration::from_secs(1), subscriber.recv())
+                let _ = tokio::time::timeout(Duration::from_secs(1), latency_sub.recv())
                     .await
                     .expect("round-trip timed out")
                     .expect("subscriber closed");
@@ -115,8 +150,11 @@ fn run_e2e_throughput(c: &mut Criterion) {
     });
     group.finish();
 
+    // Order-of-drop: AeronRuntime holds an Arc<JoinHandle> we want to flush
+    // before testcontainers' async drop reaches for the tokio runtime. Force
+    // testcontainers cleanup INSIDE rt.block_on so Handle::current() resolves.
     drop(aeron_rt);
-    drop(cluster);
+    rt.block_on(async move { drop(cluster) });
     drop(rt);
 }
 

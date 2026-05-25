@@ -46,16 +46,21 @@ async fn aeron_live_send_friendly_round_trip() {
         .await
         .expect("aeron container started");
     let endpoint = cluster.archive_control_endpoint(0).await;
+    let aeron_dir = cluster.aeron_dir_host(0).to_string_lossy().to_string();
     eprintln!("aeron archive control: {endpoint}");
+    eprintln!("aeron.dir (host): {aeron_dir}");
 
     let mut cfg = LogConfig::default();
-    cfg.channels.b_channel = format!("aeron:udp?endpoint={endpoint}|alias=b-live-e2e");
+    // Use IPC over the shared `aeron.dir` (bind-mounted between host and
+    // container) — both processes are clients of the same Media Driver
+    // running inside the container, so no UDP is needed for this single-host
+    // smoke test.
+    cfg.channels.b_channel = "aeron:ipc".to_string();
     cfg.channels.b_stream_id = 4001;
 
-    // Spawn the runtime: an OS thread that owns the Aeron client. The
-    // returned handle is `Send + Sync` and may be moved freely across the
-    // multi-threaded tokio runtime workers.
-    let rt = AeronRuntime::spawn_default().expect("aeron runtime");
+    // Spawn the runtime, pointing AeronContext at the bind-mounted aeron.dir
+    // so the host client joins the container's Media Driver.
+    let rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
 
     let publisher = ChannelBPublisherHandle::open(&rt, &cfg.channels).expect("publisher");
     let mut subscriber = ChannelBSubscriberHandle::open(&rt, &cfg.channels).expect("subscriber");

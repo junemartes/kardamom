@@ -142,7 +142,10 @@ async fn proof_of_pipeline_round_trip() {
     cfg.channels.c_stream_id = 7002;
 
     // 3. Spawn the Aeron runtime (dedicated OS thread; Send-friendly handle).
-    let rt = AeronRuntime::spawn_default().expect("aeron runtime");
+    //    Point the AeronContext at the bind-mounted aeron.dir exposed by the
+    //    test cluster — same absolute path on host and inside the container,
+    //    so cnc.dat's internal references resolve correctly on both sides.
+    let rt = AeronRuntime::spawn_with_dir(cluster.aeron_dir_host(0)).expect("aeron runtime");
 
     // 4. Open the publishers + subscribers.
     let b_publisher = ChannelBPublisherHandle::open(&rt, &cfg.channels).expect("B publisher");
