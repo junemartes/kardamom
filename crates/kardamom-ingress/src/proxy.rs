@@ -13,7 +13,9 @@ use alloy_rlp::Decodable;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use kardamom_types::{BPosition, BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
+use kardamom_types::{
+    BPosition, BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope,
+};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -97,7 +99,7 @@ where
             cfg.sig_verify_batch_depth,
             cfg.sig_verify_flush_window,
         ));
-        let pending = Arc::new(PendingReceipts::new());
+        let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
         let me = Self {
             cfg,
@@ -112,7 +114,13 @@ where
             state_db,
         };
         me.spawn_receipt_cache_watcher();
-        me.spawn_watermark_watcher();
+        // Only subscribe to watermark streams the configured policy needs.
+        if me.cfg.ack_policy.requires_quorum() {
+            me.spawn_quorum_watermark_watcher();
+        }
+        if me.cfg.ack_policy.requires_local_fsync() {
+            me.spawn_local_fsync_watermark_watcher();
+        }
         me.spawn_block_boundary_watcher();
         me
     }
@@ -174,13 +182,27 @@ where
         });
     }
 
-    fn spawn_watermark_watcher(&self) {
+    fn spawn_quorum_watermark_watcher(&self) {
         let mut rx = self.subscription.subscribe_watermark();
         let pending = self.pending.clone();
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(w) => pending.update_watermark(w).await,
+                    Ok(w) => pending.update_quorum_watermark(w).await,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
+
+    fn spawn_local_fsync_watermark_watcher(&self) {
+        let mut rx = self.subscription.subscribe_local_fsync_watermark();
+        let pending = self.pending.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(w) => pending.update_local_watermark(w).await,
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 }
