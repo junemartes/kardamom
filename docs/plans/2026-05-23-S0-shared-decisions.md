@@ -19,12 +19,12 @@ Three foundation crates that everything else depends on:
   - `BlockBoundaryStart { block_number: u64, end_tx_idx: BPosition, l2_timestamp: u64 }`
   - `BlockBoundary { block_number, end_tx_idx, l2_timestamp }` — **no state-root commitment.** State-root attestation is a validator concern, deferred (D-Sh11).
   - `FsyncWatermark { recorder_id: u8, position: BPosition }`
-  - `QuorumWatermark { position: BPosition }`
+  - (Quorum watermark was deleted — see D-Sh13. Ack reads a single recorder's `FsyncWatermark` directly.)
   - `CachedReceipt { sender: Address, nonce: u64, tx_hash: B256, receipt: Receipt }` — receipt-cache message
   - `BlockDelta` — the block-write payload from executor to state writer (account/storage/code changes + receipts)
   - `StateDatabase` trait — `revm::Database`-compatible read interface with snapshot semantics
   - `SnapshotSource` trait — gives executor a fresh post-block snapshot when state writer signals
-- **`crates/kardamom-log`** — Aeron channel implementations + recorder + fsync sidecar + quorum watermark aggregator + receipt-cache channel. Depends on `kardamom-types`. Defines no new wire types — all messages come from `kardamom-types`.
+- **`crates/kardamom-log`** — Aeron channel implementations + recorder + fsync sidecar + per-recorder fsync-watermark stream + receipt-cache channel. Depends on `kardamom-types`. Defines no new wire types — all messages come from `kardamom-types`. (The quorum aggregator was deleted; see D-Sh13.)
 - **`crates/kardamom-leases`** — lease primitive used by sequencer hot-standby (S2), sealer leader election (S5), and L1 batcher leader election (S7). V0 impl: deterministic lowest-host-id-among-caught-up-recorders, derived from per-recorder `FsyncWatermark` streams. No external KV. Future versions may add an Aeron Cluster backend.
 
 **Supersedes:**
@@ -123,13 +123,13 @@ Consequences:
 The canonical-log tier splits in two:
 
 - **Channel A** (M of them, one per sequencer): full `TxEnvelope`s; **Aeron exclusive publisher** (no CAS contention; near-`memcpy` speed); persisted via `io_uring` fsync to local NVMe; default single-host durability (no quorum) — operator can opt into per-A mirror replication for stronger safety at +~25µs.
-- **Channel B** (one, the canonical orderer): tiny `TxRef { sequencer_id: u8, position_a: BPosition }` records (~16 B); Aeron **concurrent** multi-publisher; quorum-fsynced across N recorders (default N=3, Q=2). The B-Archive position remains the canonical L2 ordering (I1).
+- **Channel B** (one, the canonical orderer): tiny `TxRef { sequencer_id: u8, position_a: BPosition }` records (~16 B); Aeron **concurrent** multi-publisher; replicated to N recorders (default N=3) for availability + read-scale; each recorder fsyncs its own copy and emits its own `FsyncWatermark`. **No quorum aggregation on the ack path** — see D-Sh13. The B-Archive position remains the canonical L2 ordering (I1).
 
 **Why:** Aeron concurrent publication serializes through a CAS cursor; keeping bulk data off that cursor lets per-sequencer data writes run at exclusive-publisher speed and parallelize across hosts. Net effect: throughput scales with M; single-tx latency unchanged. Same conceptual split Kafka uses for partition logs vs cluster metadata.
 
 **Ack durability (I2 updated):** the proxy releases the receipt only when **all three** hold:
 1. Channel A's local fsync watermark has passed the tx's `position_a` on its sequencer's host.
-2. Channel B's quorum fsync watermark has passed the tx's `b_position`.
+2. Channel B's per-recorder fsync watermark (any one recorder, typically the proxy's local one) has passed the tx's `b_position`.
 3. A receipt has arrived on channel C.
 
 Both fsyncs run in parallel with execution; the slower of them sets the floor (usually channel A — single-NVMe roundtrip ~25µs).
@@ -145,9 +145,27 @@ pub struct TxRef { sequencer_id: u8, position_a: BPosition }
 
 **Updates required in the prior plans:**
 - **S2:** sequencer's commit step becomes a **dual write** — full `TxEnvelope` to `channel_a[i]` (exclusive pub), then `TxRef` to channel B (concurrent pub). Both publications return positions; nonce-advance is gated on both completing successfully.
-- **S3:** split the single canonical archive into M per-sequencer exclusive archives + 1 canonical concurrent archive. Each gets its own `io_uring` fsync sidecar; channel B aggregator emits both `fsync_position_a[i]` (per-A) and `quorum_fsync_position_b` (Q-of-N for B). New `kardamom-log` adapter types: `ChannelAPublication` (exclusive) + `ChannelASubscription` per partition + `ChannelBPublication` (concurrent, tiny refs) + `ChannelBSubscription`.
+- **S3:** split the single canonical archive into M per-sequencer exclusive archives + 1 canonical concurrent archive. Each gets its own `io_uring` fsync sidecar; each emits a single `FsyncWatermark` stream (no quorum aggregation — see D-Sh13). New `kardamom-log` adapter types: `ChannelAPublication` (exclusive) + `ChannelASubscription` per partition + `ChannelBPublication` (concurrent, tiny refs) + `ChannelBSubscription`.
 - **S4:** executor subscribes to **all M channel A's plus channel B**. Maintains an in-RAM buffer indexed by `(sequencer_id, position_a)`. B-reader drives canonical processing; A-buffer hands over the actual `TxEnvelope` when the ref arrives. Buffer eviction by oldest-unreferenced.
 - **S7:** L1 batcher reads channel B for ordering and then reads the corresponding channel A archive for actual tx bytes. Both archives are on-disk segment files; the offline-driven property (D-Sh10) is preserved.
+
+## D-Sh13: No quorum aggregation on the ack path — single fsync watermark is enough
+
+**Spec reference:** `docs/specs/2026-05-23-high-throughput-sequencer-design.md` D8, I2, §2.3.2, §4.3.
+
+The earlier design (PR #13 and follow-ups) emitted a *quorum fsync watermark* aggregating Q-of-N recorders' per-recorder watermarks before the proxy released acks. This is **deleted**. The proxy releases acks once **any single recorder** has fsynced the tx — typically its co-located recorder's `FsyncWatermark` stream. Other recorders continue to receive and fsync the data in parallel (for availability + read-side scale), but the ack does not wait on them.
+
+**Why:** the quorum dance added (a) latency (waiting for the slowest of Q recorders' NVMe completions), (b) code complexity (the aggregator service, an additional Aeron stream type, dedup logic), and (c) a single-point synchronization service for no benefit at v0's threat model. CFT model is "one trusted operator" — single-host on-disk persistence is durable enough; cluster redundancy is for availability, not for the ack guarantee.
+
+**Implementation impact** (across PRs #13, #22, and the per-component PRs that consumed the watermark):
+- **Delete** `kardamom_types::QuorumWatermark` and the related encoding/decoding.
+- **Delete** the quorum-aggregator module in `kardamom-log` (whatever it's called: `quorum.rs`, `watermark_aggregator.rs`, etc.) and its tests/benches.
+- **Delete** the aggregator's Aeron stream config from `LogConfig` / `ChannelConfig`.
+- **Update** `AeronRuntime`'s typed handles: remove the `QuorumWatermark` subscriber/publisher pair. Per-recorder `FsyncWatermark` streams stay.
+- **Update** ingress proxy (S1) to subscribe to a single `FsyncWatermark` stream (default: its co-located recorder; configurable) rather than the quorum stream. On recorder failure (the one the proxy was watching), re-peg to a live recorder's stream.
+- **Update** tests / chaos: drop the "kill quorum" cases; replace with "kill the watermark-source recorder; assert re-peg works."
+
+This is a strict simplification — no new functionality, just less code. Implementer dispatches one PR on top of `claude/s3-arch-update` (PR #22) and cascades light updates to S1's proxy.
 
 ## D-Sh11: State root is **not** computed by the kardamom node
 
