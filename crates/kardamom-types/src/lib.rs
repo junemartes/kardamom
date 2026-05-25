@@ -16,6 +16,7 @@
 //! `#[rkyv(with = wire::AddressBytes)]` style attributes on fields. This keeps
 //! the public type ergonomic (`pub sender: Address`) while making rkyv happy.
 
+pub mod ack_policy;
 pub mod boundary;
 pub mod channel_b;
 pub mod delta;
@@ -27,6 +28,7 @@ pub mod txref;
 pub mod watermark;
 pub mod wire;
 
+pub use ack_policy::AckPolicy;
 pub use boundary::{BlockBoundary, BlockBoundaryStart};
 pub use channel_b::ChannelBMessage;
 pub use delta::{AccountChange, BlockDelta, StorageChange};
