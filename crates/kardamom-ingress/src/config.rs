@@ -5,6 +5,8 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use kardamom_types::AckPolicy;
+
 /// Static configuration for an `IngressProxy` instance.
 ///
 /// All fields are required; pick a `IngressConfig::default()` for tests.
@@ -33,6 +35,9 @@ pub struct IngressConfig {
     pub chain_id: u64,
     /// Receipt-cache capacity (FIFO-evicted).
     pub receipt_cache_capacity: usize,
+    /// Which durability gate the proxy waits on before acking a tx. See
+    /// [`kardamom_types::AckPolicy`] for the four modes.
+    pub ack_policy: AckPolicy,
 }
 
 impl Default for IngressConfig {
@@ -50,6 +55,7 @@ impl Default for IngressConfig {
             pending_receipt_timeout: Duration::from_secs(30),
             chain_id: 1,
             receipt_cache_capacity: 64 * 1024,
+            ack_policy: AckPolicy::default(),
         }
     }
 }
