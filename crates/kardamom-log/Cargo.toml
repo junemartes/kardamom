@@ -24,9 +24,7 @@ aeron-live = ["dep:rusteron-client", "dep:rusteron-archive"]
 alloy-primitives.workspace = true
 bytes.workspace = true
 futures.workspace = true
-io-uring.workspace = true
 kardamom-types.workspace = true
-libc.workspace = true
 rkyv.workspace = true
 rusteron-archive = { workspace = true, optional = true }
 rusteron-client = { workspace = true, optional = true }
@@ -37,12 +35,6 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-criterion.workspace = true
-libc.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
-
-[[bench]]
-name = "fsync_watermark_latency"
-harness = false

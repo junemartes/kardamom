@@ -7,20 +7,28 @@ S3 canonical-log subsystem. See `docs/specs/2026-05-23-high-throughput-sequencer
 - **Channel B** (canonical tx log, recorded, fsync-quorum durable)
 - **Channel C** (receipts + block boundaries, RAM only)
 - **Receipt-cache channel** (`CachedReceipt` stream, RAM only)
-- **Per-recorder fsync sidecar** (io_uring + O_DIRECT mirror)
-- **Per-recorder fsync-watermark stream**
+- **Per-recorder fsync-watermark stream** (published from the Aeron Archive's recording position, which is byte-durable when the archive runs with `fileSyncLevel=1`)
 - **Quorum fsync-watermark aggregator** (Q-of-N largest position)
 - **`testing` feature** — in-memory pub/sub fakes for other crates' unit tests
 - **`docker-e2e` feature + `docker/aeron/`** — testcontainers-driven Aeron Docker harness; reusable by other crates' e2e tests
-- **`aeron-live` feature** — gates the real rusteron-backed publishers / subscribers / recorder / Aeron position source
+- **`aeron-live` feature** — gates the real rusteron-backed publishers / subscribers / recorder
+
+## Durability model
+
+Channel B durability comes from two things working together:
+
+1. The Aeron Archive daemon is launched with `aeron.archive.file.sync.level=1` (and the same for the catalog file). Every recorded frame is `fdatasync`'d to local storage before the recording position advances past it. The defaults live in [`config::AeronConfig`]; the supervisor exports the value via both the `AERON_ARCHIVE_FILE_SYNC_LEVEL` env var (C archive) and the `-Daeron.archive.file.sync.level` system property (Java archive).
+2. The per-recorder watermark loop polls the archive's recording position and republishes it. N recorders feed the quorum aggregator, which publishes the Q-th largest position as the durability watermark proxies use for the I2 ack guarantee.
+
+For correlated power-loss survival, point `archive_dir` at enterprise NVMe with PLP — without it, `fdatasync` only flushes to the device cache.
 
 ## Feature matrix
 
 | feature       | what it enables                                                   | requires at compile time            |
 |---------------|-------------------------------------------------------------------|-------------------------------------|
-| (default)     | codec, config, fsync sidecar, supervisor, watermark, types        | rust + io-uring (Linux)             |
+| (default)     | codec, config, supervisor, watermark, types                       | rust                                |
 | `testing`     | adds `kardamom_log::testing::Fake*`                               | (none extra)                        |
-| `aeron-live`  | adds `publisher`, `subscriber`, `recorder`, `AeronPositionSource` | cmake + JDK + Aeron C build         |
+| `aeron-live`  | adds `publisher`, `subscriber`, `recorder`                        | cmake + JDK + Aeron C build         |
 | `docker-e2e`  | implies `testing`, adds `AeronTestCluster`                        | docker at *runtime*                 |
 
 ## Shared types
@@ -37,7 +45,6 @@ We do **not** ship a custom channel-B replay API. Aeron Archive already exposes 
 
 ## Runtime dependencies
 
-- Aeron Media Driver and Aeron Archive binaries (Java) installed on each host for production.
+- Aeron Media Driver and Aeron Archive binaries (Java or C) installed on each host for production. The archive must support `fileSyncLevel`.
 - For e2e tests (`docker-e2e` feature): a working Docker daemon (`docker info` must succeed). The testcontainers harness builds and runs the Aeron image on demand.
-- Mirror file must be on an ext4/xfs/etc. filesystem that supports `O_DIRECT`. tmpfs returns `EINVAL` for `O_DIRECT` opens.
-- Recommended for production: enterprise NVMe with PLP, separate from the OS disk.
+- Recommended for production: enterprise NVMe with PLP for `archive_dir`, separate from the OS disk. Without PLP, `fdatasync` only reaches the device write cache.

@@ -1,26 +1,27 @@
 //! Drives an Aeron Archive instance to record channel B and exposes the
-//! current durable position the fsync sidecar tails.
+//! current durable recording position.
 //!
 //! Gated behind the `aeron-live` cargo feature.
 //!
-//! ## Design note: position polling, not counter handle
+//! ## Durability model
 //!
-//! Earlier drafts threaded an Aeron `counter_id` through to the sidecar so
-//! it could read the recording-position via the shared counters reader.
-//! The 0.1.16x `rusteron-archive` bindings don't expose a "find the
-//! recording-position counter id" helper, but they do expose
-//! [`rusteron_archive::AeronArchive::get_recording_position`], which is
-//! semantically equivalent for our purposes (we poll once per fsync tick;
-//! the overhead of a control-channel round-trip is negligible compared to
-//! the disk fsync that follows).
+//! The Aeron Archive daemon is started with `fileSyncLevel=1` (see
+//! [`crate::config::AeronConfig::file_sync_level`] and
+//! [`crate::supervisor`]), which means it calls `fdatasync` on the segment
+//! file after every recorded frame. As a consequence,
+//! [`rusteron_archive::AeronArchive::get_recording_position`] returns a
+//! position that is byte-durable on local storage — no separate fsync
+//! sidecar is required. The per-recorder watermark loop
+//! ([`run_watermark_loop`]) periodically polls this position and republishes
+//! it as a [`kardamom_types::FsyncWatermark`] for the quorum aggregator
+//! ([`crate::watermark::QuorumAggregator`]) to combine.
 //!
 //! ## Design note: thread confinement
 //!
 //! `AeronArchive` is `!Send + !Sync` (it wraps `Rc` + raw pointers — the C
-//! client is thread-confined). The Recorder owns the archive on its own
-//! thread and refreshes a shared
-//! [`crate::fsync_sidecar::SharedPosition`] atomic that the fsync sidecar
-//! thread reads. See `fsync_sidecar::SharedPosition` / `refresh_from_archive`.
+//! client is thread-confined). Both the recording-position poll and the
+//! watermark publish therefore happen on the Recorder thread; cross-thread
+//! sharing of the archive handle is not supported.
 //!
 //! ## Segment file path
 //!
@@ -35,20 +36,22 @@ use std::cell::RefCell;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{ChannelsConfig, RecorderId};
 use crate::error::LogError;
+use crate::publisher::WatermarkPublisher;
+use kardamom_types::FsyncWatermark;
 
 type Archive = rusteron_archive::AeronArchive;
 
 pub struct Recorder {
     /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
-    /// the field is intentionally not exposed as `Arc<Archive>`; instead,
-    /// callers learn the recording position via a
-    /// [`crate::fsync_sidecar::SharedPosition`] (an `AtomicI64`) that the
-    /// Recorder refreshes from its own thread.
+    /// the field is intentionally not exposed as `Arc<Archive>`; the
+    /// recording-position poll and watermark publish in
+    /// [`run_watermark_loop`] both run on this thread.
     archive: Archive,
     recorder_id: RecorderId,
     recording_id: i64,
@@ -114,8 +117,9 @@ impl Recorder {
         &self.archive
     }
 
-    /// Path to the active segment file on disk. The fsync sidecar mirrors
-    /// bytes from here into its `O_DIRECT` file.
+    /// Path to the active segment file on disk. Returned for diagnostics
+    /// and for offline consumers (e.g. the L1 batcher) that prefer to read
+    /// segment files directly instead of via the Archive replay API.
     ///
     /// We rely on Aeron's canonical naming convention:
     ///   `<archive_dir>/<recording_id>-<segmentBasePosition>.rec`
@@ -136,11 +140,60 @@ impl Recorder {
 
     /// Current (committed-to-archive-buffer) position for this recording.
     /// Maps to `aeron_archive_get_recording_position` in the C client.
+    ///
+    /// With `fileSyncLevel=1` configured on the archive daemon, the returned
+    /// position is byte-durable on local storage — every byte up to it has
+    /// been `fdatasync`'d before the position was published.
     pub fn current_position(&self) -> Result<i64, LogError> {
         self.archive
             .get_recording_position(self.recording_id)
             .map_err(|e| LogError::Aeron(format!("get_recording_position: {e}")))
     }
+
+    /// Decompose an absolute Aeron stream position into the
+    /// `(term_id, term_offset)` pair `BPosition` carries, using this
+    /// recording's term buffer length.
+    fn to_bposition(&self, pos: i64) -> kardamom_types::BPosition {
+        let term_len = self.term_buffer_length as i64;
+        kardamom_types::BPosition {
+            term_id: (pos / term_len) as i32,
+            term_offset: (pos % term_len) as i32,
+        }
+    }
+}
+
+/// Poll the archive's recording position on a fixed cadence and republish it
+/// as an `FsyncWatermark` whenever it advances. Runs on the calling thread
+/// because `AeronArchive` and the publisher are both thread-confined.
+///
+/// `poll_interval` controls the watermark cadence — higher = lower CPU, more
+/// tail latency on quorum advancement. 1ms is a reasonable default.
+pub fn run_watermark_loop(
+    recorder: &Recorder,
+    publisher: &WatermarkPublisher,
+    poll_interval: Duration,
+    mut should_stop: impl FnMut() -> bool,
+) -> Result<(), LogError> {
+    let mut last_pos: i64 = -1;
+    while !should_stop() {
+        match recorder.current_position() {
+            Ok(pos) if pos > last_pos => {
+                let wm = FsyncWatermark {
+                    recorder_id: recorder.recorder_id,
+                    position: recorder.to_bposition(pos),
+                };
+                if let Err(e) = publisher.publish(&wm) {
+                    warn!(error = %e, "watermark publish failed");
+                } else {
+                    last_pos = pos;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "get_recording_position failed"),
+        }
+        std::thread::sleep(poll_interval);
+    }
+    Ok(())
 }
 
 /// One-shot descriptor fetch via `list_recording`. We implement the

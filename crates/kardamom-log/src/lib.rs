@@ -1,6 +1,13 @@
 //! Kardamom canonical log: Aeron-backed channels B and C, the receipt-cache
-//! channel, the io_uring fsync sidecar, and the quorum watermark aggregator
-//! that give channel B its durability guarantee.
+//! channel, and the quorum watermark aggregator that give channel B its
+//! durability guarantee.
+//!
+//! Durability model: the Aeron Archive daemon is configured with
+//! `fileSyncLevel=1` so it fdatasyncs each recorded frame inline. The
+//! recorder's `get_recording_position()` therefore returns a position that
+//! is byte-durable on local storage. Per-recorder positions are aggregated
+//! into a Q-of-N quorum watermark — surviving correlated power loss requires
+//! Q nodes to have fsynced past the watermarked position.
 //!
 //! This crate owns the **transport implementation** only. Wire data types live
 //! in [`kardamom_types`] (re-exported from there). Do not add new wire types
@@ -20,7 +27,6 @@
 pub mod codec;
 pub mod config;
 pub mod error;
-pub mod fsync_sidecar;
 pub mod receipt_cache;
 pub mod supervisor;
 pub mod watermark;

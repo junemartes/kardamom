@@ -36,14 +36,19 @@ impl Supervisor {
         std::fs::create_dir_all(&self.cfg.aeron_dir)?;
         std::fs::create_dir_all(&self.cfg.archive_dir)?;
 
-        let md = spawn(&self.cfg.media_driver_cmd, &self.cfg).await?;
+        let md = spawn_media_driver(&self.cfg.media_driver_cmd, &self.cfg).await?;
         info!(pid = md.id(), "media driver started");
 
         // Wait for the Media Driver to create its CnC file before launching the Archive.
         wait_for_path(&self.cfg.aeron_dir.join("cnc.dat"), Duration::from_secs(5)).await?;
 
-        let arch = spawn(&self.cfg.archive_cmd, &self.cfg).await?;
-        info!(pid = arch.id(), "archive started");
+        let arch = spawn_archive(&self.cfg.archive_cmd, &self.cfg).await?;
+        info!(
+            pid = arch.id(),
+            file_sync_level = self.cfg.file_sync_level,
+            catalog_file_sync_level = self.cfg.catalog_file_sync_level,
+            "archive started"
+        );
 
         let (tx, rx) = oneshot::channel();
         self.shutdown_tx = Some(tx);
@@ -58,7 +63,7 @@ impl Supervisor {
     }
 }
 
-async fn spawn(argv: &[String], cfg: &AeronConfig) -> Result<Child, LogError> {
+async fn spawn_media_driver(argv: &[String], cfg: &AeronConfig) -> Result<Child, LogError> {
     let (exe, args) = argv
         .split_first()
         .ok_or_else(|| LogError::Supervisor("empty argv".into()))?;
@@ -66,6 +71,34 @@ async fn spawn(argv: &[String], cfg: &AeronConfig) -> Result<Child, LogError> {
         .args(args)
         .env("AERON_DIR", &cfg.aeron_dir)
         .env("AERON_ARCHIVE_DIR", &cfg.archive_dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| LogError::Supervisor(format!("spawn {exe}: {e}")))
+}
+
+/// Spawn the Aeron Archive daemon, exporting `fileSyncLevel` both as the C
+/// archive's env var (`AERON_ARCHIVE_FILE_SYNC_LEVEL`) and as the Java
+/// archive's system property (`-Daeron.archive.file.sync.level=N`) appended
+/// to argv. This way the same config works whether the operator points
+/// `archive_cmd` at the native binary or `java -jar aeron-archive.jar`.
+async fn spawn_archive(argv: &[String], cfg: &AeronConfig) -> Result<Child, LogError> {
+    let (exe, args) = argv
+        .split_first()
+        .ok_or_else(|| LogError::Supervisor("empty argv".into()))?;
+    let level = cfg.file_sync_level.to_string();
+    let catalog_level = cfg.catalog_file_sync_level.to_string();
+    Command::new(exe)
+        .args(args)
+        .arg(format!("-Daeron.archive.file.sync.level={level}"))
+        .arg(format!(
+            "-Daeron.archive.catalog.file.sync.level={catalog_level}"
+        ))
+        .env("AERON_DIR", &cfg.aeron_dir)
+        .env("AERON_ARCHIVE_DIR", &cfg.archive_dir)
+        .env("AERON_ARCHIVE_FILE_SYNC_LEVEL", &level)
+        .env("AERON_ARCHIVE_CATALOG_FILE_SYNC_LEVEL", &catalog_level)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true)

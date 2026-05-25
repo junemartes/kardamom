@@ -15,7 +15,6 @@ pub struct LogConfig {
     pub recorder_id: RecorderId,
     pub aeron: AeronConfig,
     pub channels: ChannelsConfig,
-    pub fsync: FsyncConfig,
     pub quorum: QuorumConfig,
 }
 
@@ -33,6 +32,16 @@ pub struct AeronConfig {
 
     /// Path to the Aeron Archive runner. Spawned by supervisor.
     pub archive_cmd: Vec<String>,
+
+    /// Aeron Archive `fileSyncLevel` for segment data files.
+    /// 0 = no fsync (page cache only), 1 = fdatasync per frame, 2 = fsync per frame.
+    /// Default 1: per-frame fdatasync gives byte-durable recording positions on
+    /// PLP NVMe, at the cost of a per-frame fdatasync round-trip.
+    pub file_sync_level: u8,
+
+    /// Aeron Archive `catalog.fileSyncLevel` for the recording catalog metadata file.
+    /// Default 1: the catalog is tiny and updated infrequently, so fsync is cheap.
+    pub catalog_file_sync_level: u8,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -61,20 +70,6 @@ pub struct ChannelsConfig {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FsyncConfig {
-    /// `O_DIRECT` mirror file path. Sidecar writes the recorder's bytes here
-    /// and fsyncs this file.
-    pub mirror_path: PathBuf,
-
-    /// io_uring submission queue depth. 256 is a good default for sustained throughput.
-    pub uring_entries: u32,
-
-    /// How often (number of completed fsyncs) to publish a watermark.
-    /// 1 = every fsync; 16 = every 16th. Higher = lower watermark CPU, higher tail latency.
-    pub watermark_publish_every: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QuorumConfig {
     /// Total recorders.
     pub n: usize,
@@ -91,6 +86,8 @@ impl Default for LogConfig {
                 archive_dir: PathBuf::from("/var/lib/kardamom/archive"),
                 media_driver_cmd: vec!["aeron-media-driver".into()],
                 archive_cmd: vec!["aeron-archive".into()],
+                file_sync_level: 1,
+                catalog_file_sync_level: 1,
             },
             channels: ChannelsConfig {
                 b_channel: "aeron:udp?endpoint=224.0.1.1:40001".into(),
@@ -103,11 +100,6 @@ impl Default for LogConfig {
                 fsync_watermark_stream_id: 1010,
                 quorum_watermark_channel: "aeron:udp?endpoint=224.0.1.1:40020".into(),
                 quorum_watermark_stream_id: 1020,
-            },
-            fsync: FsyncConfig {
-                mirror_path: PathBuf::from("/var/lib/kardamom/mirror.bin"),
-                uring_entries: 256,
-                watermark_publish_every: 1,
             },
             quorum: QuorumConfig { n: 3, q: 2 },
         }
