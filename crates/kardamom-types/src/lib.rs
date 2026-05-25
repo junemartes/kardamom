@@ -4,7 +4,7 @@
 //! friendly in spirit (we still use `alloc` for `Vec`/`Bytes`).
 //!
 //! Wire types (`TxEnvelope`, `Receipt`, `BlockBoundary*`, `CachedReceipt`,
-//! `FsyncWatermark`, `QuorumWatermark`, `BlockDelta`) derive
+//! `FsyncWatermark`, `BlockDelta`) derive
 //! `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]`. Consumers
 //! that need zero-copy access use `rkyv::access::<Archived<T>>(bytes)`;
 //! consumers that need an owned value call `rkyv::deserialize`.
@@ -35,4 +35,4 @@ pub use position::BPosition;
 pub use receipt::{CachedReceipt, Receipt, WireLog};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use txref::TxRef;
-pub use watermark::{FsyncWatermark, QuorumWatermark};
+pub use watermark::FsyncWatermark;

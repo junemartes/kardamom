@@ -113,14 +113,6 @@ fn watermark_roundtrip() {
         },
     };
     assert_eq!(roundtrip(&w), w);
-
-    let q = QuorumWatermark {
-        position: BPosition {
-            term_id: 4,
-            term_offset: 1024,
-        },
-    };
-    assert_eq!(roundtrip(&q), q);
 }
 
 #[test]
