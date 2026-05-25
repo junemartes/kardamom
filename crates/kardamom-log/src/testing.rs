@@ -502,7 +502,7 @@ mod docker {
             self.nodes.is_empty()
         }
 
-        /// Stop node `i` (simulates recorder failure for quorum tests).
+        /// Stop node `i` (simulates recorder failure).
         pub async fn stop(&mut self, i: usize) -> Result<(), Box<dyn std::error::Error>> {
             self.nodes[i].stop().await?;
             Ok(())

@@ -2,12 +2,15 @@
 //!
 //! V0 implementation: a host holds the lease iff it has the lowest host id
 //! among recorders whose latest `FsyncWatermark.position` is within
-//! `caught_up_window` bytes of the current `QuorumWatermark`. Fully
-//! deterministic — no external KV, no consensus library.
+//! `caught_up_window` bytes of the most-advanced observed recorder
+//! position. Fully deterministic — no external KV, no consensus library.
+//!
+//! Per D-Sh13 (S0 shared decisions) this lease is derived from per-recorder
+//! `FsyncWatermark` streams only; there is no quorum-aggregated watermark.
 
 use std::collections::HashMap;
 
-use kardamom_types::{BPosition, FsyncWatermark, QuorumWatermark};
+use kardamom_types::{BPosition, FsyncWatermark};
 
 #[derive(Clone, Debug)]
 pub struct LeaseConfig {
@@ -19,14 +22,16 @@ pub struct LeaseConfig {
     pub caught_up_window: i64,
 }
 
-/// Lease state machine. Feed it `FsyncWatermark` updates from each recorder
-/// and the current `QuorumWatermark`; call [`Lease::held_by_us`] to learn
-/// whether this host currently holds the lease.
+/// Lease state machine. Feed it `FsyncWatermark` updates from every
+/// recorder the host observes; call [`Lease::held_by_us`] to learn whether
+/// this host currently holds the lease.
+///
+/// The "reference" position used to decide who is caught up is the
+/// highest position observed across all per-recorder fsync streams.
 #[derive(Clone, Debug)]
 pub struct Lease {
     cfg: LeaseConfig,
     last_per_recorder: HashMap<u8, BPosition>,
-    last_quorum: Option<BPosition>,
 }
 
 impl Lease {
@@ -34,7 +39,6 @@ impl Lease {
         Self {
             cfg,
             last_per_recorder: HashMap::new(),
-            last_quorum: None,
         }
     }
 
@@ -45,13 +49,16 @@ impl Lease {
         }
     }
 
-    pub fn observe_quorum(&mut self, q: QuorumWatermark) {
-        self.last_quorum = Some(q.position);
+    /// The reference position used to decide "caught up". Equals the
+    /// highest position observed across all recorder streams, or `None`
+    /// if no recorder has reported yet.
+    fn reference_position(&self) -> Option<BPosition> {
+        self.last_per_recorder.values().copied().max()
     }
 
     /// Returns `true` if this host currently holds the lease.
     pub fn held_by_us(&self) -> bool {
-        let quorum = match self.last_quorum {
+        let reference = match self.reference_position() {
             Some(p) => p,
             None => return false,
         };
@@ -63,7 +70,7 @@ impl Lease {
             .filter(|id| {
                 self.last_per_recorder
                     .get(id)
-                    .map(|p| within_window(*p, quorum, self.cfg.caught_up_window))
+                    .map(|p| within_window(*p, reference, self.cfg.caught_up_window))
                     .unwrap_or(false)
             })
             .collect();
@@ -71,12 +78,12 @@ impl Lease {
     }
 }
 
-fn within_window(pos: BPosition, quorum: BPosition, window: i64) -> bool {
+fn within_window(pos: BPosition, reference: BPosition, window: i64) -> bool {
     // Convert positions to absolute byte offsets using the same TERM_LEN as
     // the rest of the system (16 MiB). The exact constant must match the
     // recorder's `aeron.term.buffer.length`.
     const TERM_LEN: i64 = 16 * 1024 * 1024;
     let pos_abs = (pos.term_id as i64) * TERM_LEN + pos.term_offset as i64;
-    let q_abs = (quorum.term_id as i64) * TERM_LEN + quorum.term_offset as i64;
-    (q_abs - pos_abs).abs() <= window
+    let r_abs = (reference.term_id as i64) * TERM_LEN + reference.term_offset as i64;
+    (r_abs - pos_abs).abs() <= window
 }

@@ -2,9 +2,10 @@
 //! *or* a channel A[i] per D-Sh12) and exposes the current durable position
 //! the fsync sidecar tails.
 //!
-//! Topology after D-Sh12:
+//! Topology after D-Sh12 (and D-Sh13: no quorum aggregator):
 //!   - One `Recorder` with `RecorderKind::B` per channel-B recorder host
-//!     (N total; quorum-fsynced).
+//!     (N total). Each fsyncs independently; the ack-path consumer (the
+//!     ingress proxy) subscribes to one such recorder's fsync watermark.
 //!   - One `Recorder` with `RecorderKind::A { sequencer_id }` per sequencer
 //!     host (M total; single-host fsync each).
 //!
@@ -50,10 +51,11 @@ use crate::error::LogError;
 
 type Archive = rusteron_archive::AeronArchive;
 
-/// Which logical channel a recorder is tailing. Channel B feeds the
-/// quorum aggregator (N recorders, Q-of-N watermark). Channel A[i] feeds
-/// the per-sequencer single-host fsync (no quorum by default — see D-Sh12
-/// rationale).
+/// Which logical channel a recorder is tailing. Channel B is recorded by
+/// N hosts (each fsyncs independently; D-Sh13 dropped the quorum
+/// aggregator — the ingress proxy reads any single recorder's fsync
+/// watermark to gate acks). Channel A[i] feeds the per-sequencer
+/// single-host fsync (D-Sh12 rationale).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
     /// Per-sequencer channel-A recorder (carries full TxEnvelopes).
@@ -82,7 +84,7 @@ pub struct Recorder {
 
 impl Recorder {
     /// Start recording channel B on this host. Used by the N channel-B
-    /// recorder hosts that participate in the quorum.
+    /// recorder hosts (each fsyncs independently — D-Sh13).
     pub fn start_b(
         archive: Archive,
         ch: &ChannelsConfig,

@@ -33,12 +33,12 @@ use std::rc::Rc;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::publisher::{
-    ChannelAPublisher, ChannelBPublisher, ChannelCPublisher, QuorumPublisher,
-    ReceiptCachePublisher, WatermarkAPublisher, WatermarkPublisher,
+    ChannelAPublisher, ChannelBPublisher, ChannelCPublisher, ReceiptCachePublisher,
+    WatermarkAPublisher, WatermarkPublisher,
 };
 use crate::subscriber::{
-    ChannelASubscriber, ChannelBSubscriber, ChannelCReceiptSubscriber, QuorumSubscriber,
-    ReceiptCacheSubscriber, Subscribers, WatermarkSubscriber,
+    ChannelASubscriber, ChannelBSubscriber, ChannelCReceiptSubscriber, ReceiptCacheSubscriber,
+    Subscribers, WatermarkSubscriber,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -142,7 +142,7 @@ impl AeronRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Channel B fsync watermarks + quorum
+    // Channel B fsync watermarks (per-recorder; no quorum aggregator — D-Sh13)
     // -----------------------------------------------------------------------
 
     pub fn channel_b_watermark_publisher(
@@ -157,14 +157,6 @@ impl AeronRuntime {
         recorder_id: u8,
     ) -> Result<WatermarkSubscriber, LogError> {
         self.subscribers().watermark(recorder_id)
-    }
-
-    pub fn quorum_publisher(&self) -> Result<QuorumPublisher, LogError> {
-        QuorumPublisher::open(&self.aeron, &self.channels)
-    }
-
-    pub fn quorum_subscriber(&self) -> Result<QuorumSubscriber, LogError> {
-        self.subscribers().quorum()
     }
 
     fn subscribers(&self) -> Subscribers {

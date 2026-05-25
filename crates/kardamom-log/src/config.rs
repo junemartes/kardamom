@@ -1,7 +1,7 @@
 //! Configuration types for the log subsystem.
 //!
-//! Loaded from TOML at process start; passed to the supervisor and the
-//! quorum aggregator. No global state.
+//! Loaded from TOML at process start; passed to the supervisor. No global
+//! state.
 
 use std::path::PathBuf;
 
@@ -16,7 +16,6 @@ pub struct LogConfig {
     pub aeron: AeronConfig,
     pub channels: ChannelsConfig,
     pub fsync: FsyncConfig,
-    pub quorum: QuorumConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -71,10 +70,6 @@ pub struct ChannelsConfig {
     /// `fsync_watermark_a_stream_id_base + sequencer_id`.
     pub fsync_watermark_a_channel_template: String,
     pub fsync_watermark_a_stream_id_base: i32,
-
-    /// Aggregated quorum watermark (channel B).
-    pub quorum_watermark_channel: String,
-    pub quorum_watermark_stream_id: i32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,14 +84,6 @@ pub struct FsyncConfig {
     /// How often (number of completed fsyncs) to publish a watermark.
     /// 1 = every fsync; 16 = every 16th. Higher = lower watermark CPU, higher tail latency.
     pub watermark_publish_every: u32,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct QuorumConfig {
-    /// Total recorders.
-    pub n: usize,
-    /// Required for quorum (Q ≤ N). Default Q=2 for N=3.
-    pub q: usize,
 }
 
 impl Default for LogConfig {
@@ -122,15 +109,12 @@ impl Default for LogConfig {
                 fsync_watermark_stream_id: 1010,
                 fsync_watermark_a_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),
                 fsync_watermark_a_stream_id_base: 1030,
-                quorum_watermark_channel: "aeron:udp?endpoint=224.0.1.1:40020".into(),
-                quorum_watermark_stream_id: 1020,
             },
             fsync: FsyncConfig {
                 mirror_path: PathBuf::from("/var/lib/kardamom/mirror.bin"),
                 uring_entries: 256,
                 watermark_publish_every: 1,
             },
-            quorum: QuorumConfig { n: 3, q: 2 },
         }
     }
 }

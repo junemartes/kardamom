@@ -1,5 +1,6 @@
-//! Aeron subscribers for channels B, C, per-recorder watermark streams, and
-//! the aggregated quorum watermark.
+//! Aeron subscribers for channels B, C, and the per-recorder watermark
+//! streams. There is no quorum-aggregated watermark — the ingress proxy
+//! subscribes to a single recorder's `WatermarkSubscriber` (D-Sh13).
 //!
 //! Gated behind the `aeron-live` cargo feature; see `publisher.rs` for the
 //! same caveats around `rusteron-client` API drift. Channel URIs cross the
@@ -17,7 +18,7 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, CachedReceipt, ChannelBMessage, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+    BPosition, CachedReceipt, ChannelBMessage, FsyncWatermark, Receipt, TxEnvelope,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -124,7 +125,6 @@ pub type ChannelBSubscriber = TypedSubscriber<ChannelBMessage>;
 pub type ChannelCReceiptSubscriber = TypedSubscriber<Receipt>;
 pub type ReceiptCacheSubscriber = TypedSubscriber<CachedReceipt>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
-pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
 
 /// Convenience bundle. Uses `Rc` (not `Arc`) because `AeronClient` is
 /// thread-confined (`!Send + !Sync`) and the entire subscriber stack lives
@@ -181,14 +181,6 @@ impl Subscribers {
             &self.aeron,
             &channel,
             self.ch.fsync_watermark_a_stream_id_base + sequencer_id as i32,
-        )
-    }
-
-    pub fn quorum(&self) -> Result<QuorumSubscriber, LogError> {
-        TypedSubscriber::open(
-            &self.aeron,
-            &self.ch.quorum_watermark_channel,
-            self.ch.quorum_watermark_stream_id,
         )
     }
 }

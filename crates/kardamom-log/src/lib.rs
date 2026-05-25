@@ -1,6 +1,9 @@
 //! Kardamom canonical log: Aeron-backed channels B and C, the receipt-cache
-//! channel, the io_uring fsync sidecar, and the quorum watermark aggregator
-//! that give channel B its durability guarantee.
+//! channel, the io_uring fsync sidecar, and the per-recorder fsync-watermark
+//! streams that give channel B its durability guarantee.
+//!
+//! Per D-Sh13 there is no quorum aggregator; the ack-path consumer (the
+//! ingress proxy) subscribes to a single recorder's FsyncWatermark stream.
 //!
 //! This crate owns the **transport implementation** only. Wire data types live
 //! in [`kardamom_types`] (re-exported from there). Do not add new wire types
@@ -23,7 +26,6 @@ pub mod error;
 pub mod fsync_sidecar;
 pub mod receipt_cache;
 pub mod supervisor;
-pub mod watermark;
 
 #[cfg(feature = "aeron-live")]
 pub mod aeron_live;

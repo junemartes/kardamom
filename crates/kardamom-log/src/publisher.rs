@@ -10,7 +10,7 @@
 //!   same Aeron stream; Aeron serialises them into a single byte order, and
 //!   that order *is* the canonical L2 ordering (system invariant I1).
 //! - **Channel C** — receipts + boundaries. RAM only.
-//! - **Watermark / quorum-watermark / receipt-cache** — auxiliary streams.
+//! - **Watermark / receipt-cache** — auxiliary streams.
 //!
 //! Channel URIs in [`crate::config::ChannelsConfig`] are stored as `String`
 //! for ergonomics; we convert to `CString`/`&CStr` at the FFI boundary since
@@ -34,7 +34,7 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, ChannelBMessage, FsyncWatermark,
-    QuorumWatermark, Receipt, TxEnvelope, TxRef,
+    Receipt, TxEnvelope, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
@@ -204,7 +204,8 @@ impl ReceiptCachePublisher {
 }
 
 /// Per-channel-B-recorder fsync-watermark publisher. Each B-recorder host
-/// opens one of these; the quorum aggregator subscribes to all N.
+/// opens one of these; the ingress proxy subscribes to one such stream
+/// (typically its co-located recorder's) to gate ack release (D-Sh13).
 pub struct WatermarkPublisher {
     pub_handle: Pub,
 }
@@ -230,7 +231,7 @@ impl WatermarkPublisher {
 /// Per-channel-A fsync-watermark publisher (D-Sh12). One per sequencer
 /// host; downstream consumers (ack-path coordinator, executor) subscribe
 /// to whichever A-watermarks they care about. Channel A is single-host
-/// durability by default — there is no quorum aggregator for A.
+/// durability by default.
 pub struct WatermarkAPublisher {
     pub_handle: Pub,
 }
@@ -251,27 +252,6 @@ impl WatermarkAPublisher {
 
     pub fn publish(&self, w: &FsyncWatermark) -> Result<(), LogError> {
         offer(&self.pub_handle, w).map(|_| ())
-    }
-}
-
-/// Shared quorum-watermark publisher, used by the aggregator.
-pub struct QuorumPublisher {
-    pub_handle: Pub,
-}
-
-impl QuorumPublisher {
-    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(
-            aeron,
-            &ch.quorum_watermark_channel,
-            ch.quorum_watermark_stream_id,
-            "qwm",
-        )?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish(&self, q: &QuorumWatermark) -> Result<(), LogError> {
-        offer(&self.pub_handle, q).map(|_| ())
     }
 }
 
