@@ -118,22 +118,38 @@ fn write_synthetic_archives(
     append_frame(
         &mut b_buf,
         pos(0),
-        &ChannelBMessage::TxRef(TxRef::new(0, pos(0))),
+        &ChannelBMessage::TxRef(TxRef::new(
+            alloy_primitives::B256::repeat_byte(0x01),
+            0,
+            pos(0),
+        )),
     );
     append_frame(
         &mut b_buf,
         pos(16),
-        &ChannelBMessage::TxRef(TxRef::new(1, pos(0))),
+        &ChannelBMessage::TxRef(TxRef::new(
+            alloy_primitives::B256::repeat_byte(0x02),
+            1,
+            pos(0),
+        )),
     );
     append_frame(
         &mut b_buf,
         pos(32),
-        &ChannelBMessage::TxRef(TxRef::new(0, pos(128))),
+        &ChannelBMessage::TxRef(TxRef::new(
+            alloy_primitives::B256::repeat_byte(0x03),
+            0,
+            pos(128),
+        )),
     );
     append_frame(
         &mut b_buf,
         pos(48),
-        &ChannelBMessage::TxRef(TxRef::new(1, pos(128))),
+        &ChannelBMessage::TxRef(TxRef::new(
+            alloy_primitives::B256::repeat_byte(0x04),
+            1,
+            pos(128),
+        )),
     );
     append_frame(
         &mut b_buf,
