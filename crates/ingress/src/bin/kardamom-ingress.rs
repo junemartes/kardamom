@@ -48,6 +48,35 @@ struct Args {
     /// Number of tx_data shards (M). Defaults to 8.
     #[arg(long, default_value_t = 8)]
     shards: u32,
+    /// Durability gate before acking a submit. Mirrors `AckPolicy`:
+    ///   - `on-offer`: release as soon as the receipt arrives (lowest
+    ///     latency, weakest guarantee).
+    ///   - `on-local-fsync`: wait for this node's recorder fsync watermark.
+    ///   - `on-quorum`: wait for Q-of-N recorders to fsync (default,
+    ///     production-correct).
+    ///   - `on-local-fsync-and-quorum`: both.
+    #[arg(long, default_value = "on-quorum")]
+    ack_policy: AckPolicyArg,
+}
+
+#[derive(Clone, Debug, clap::ValueEnum)]
+#[allow(clippy::enum_variant_names)] // mirrors `types::AckPolicy` 1:1
+enum AckPolicyArg {
+    OnOffer,
+    OnLocalFsync,
+    OnQuorum,
+    OnLocalFsyncAndQuorum,
+}
+
+impl From<AckPolicyArg> for kardamom_types::AckPolicy {
+    fn from(a: AckPolicyArg) -> Self {
+        match a {
+            AckPolicyArg::OnOffer => Self::OnOffer,
+            AckPolicyArg::OnLocalFsync => Self::OnLocalFsync,
+            AckPolicyArg::OnQuorum => Self::OnQuorum,
+            AckPolicyArg::OnLocalFsyncAndQuorum => Self::OnLocalFsyncAndQuorum,
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -64,6 +93,7 @@ async fn main() -> Result<()> {
     let mut cfg = IngressConfig {
         jsonrpc_bind: args.jsonrpc_bind,
         partition_count_m: args.shards,
+        ack_policy: args.ack_policy.into(),
         ..IngressConfig::default()
     };
     // Wipe the binary-protocol binds for the v0 deployment; operators that

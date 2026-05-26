@@ -95,8 +95,8 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg(&sealer_cfg)
             .arg("--aeron-dir")
             .arg(&aeron_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
     );
     let sequencer = ChildGuard::spawn(
         "kardamom-sequencer",
@@ -105,8 +105,8 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg(&sequencer_cfg)
             .arg("--aeron-dir")
             .arg(&aeron_dir)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
     );
     let executor = ChildGuard::spawn(
         "kardamom-executor",
@@ -119,8 +119,8 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg("1")
             .arg("--chain-id")
             .arg(CHAIN_ID.to_string())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
     );
     let ingress = ChildGuard::spawn(
         "kardamom-ingress",
@@ -133,8 +133,12 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg("1")
             .arg("--jsonrpc-bind")
             .arg(format!("127.0.0.1:{JSONRPC_PORT}"))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped()),
+            // No quorum-watermark publisher in this test setup; release
+            // submit_raw waiters as soon as the receipt arrives.
+            .arg("--ack-policy")
+            .arg("on-offer")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
     );
 
     // ----- Wait for the ingress to bind. Each AeronRuntime takes a couple
