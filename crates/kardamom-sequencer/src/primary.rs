@@ -209,7 +209,6 @@ impl PrimarySequencer {
         B: ChannelBRefPublisher,
         R: ReceiptCachePublisher,
     {
-        // Step 1: flush retry-rebuffered entries first.
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
             for (sender, n, payload) in pending {
@@ -226,7 +225,6 @@ impl PrimarySequencer {
             return Ok(true);
         }
 
-        // Step 2: poll ingress.
         let Some(envelope) = ingress.poll()? else {
             return Ok(false);
         };

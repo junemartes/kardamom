@@ -76,6 +76,12 @@ pub mod fakes {
 
     use super::*;
 
+    /// Aeron term-buffer length the in-memory channel-A fake mimics when
+    /// packing `(byte_offset, len)` writes into `(term_id, term_offset)`
+    /// fragment positions. 16 MiB matches the Media Driver default
+    /// (`AERON_TERM_BUFFER_LENGTH_DEFAULT`).
+    const TERM_LEN: i64 = 16 * 1024 * 1024;
+
     /// In-memory channel-A publisher. Records every envelope-bytes write
     /// and returns a monotonically-increasing `BPosition` so the
     /// sequencer's per-A cursor advances exactly as it would on a real
@@ -105,7 +111,6 @@ pub mod fakes {
         /// match any recorded write. Used by integration tests that mirror
         /// the executor's A-lookup path.
         pub fn fetch(&self, position_a: BPosition) -> Option<Vec<u8>> {
-            const TERM_LEN: i64 = 16 * 1024 * 1024;
             let target = (position_a.term_id as i64) * TERM_LEN + position_a.term_offset as i64;
             let mut cur: i64 = 0;
             for bytes in self.published.lock().unwrap().iter() {
@@ -127,7 +132,6 @@ pub mod fakes {
             let start = *off;
             self.published.lock().unwrap().push(envelope_bytes.to_vec());
             *off += envelope_bytes.len() as i64;
-            const TERM_LEN: i64 = 16 * 1024 * 1024;
             Ok(BPosition {
                 term_id: (start / TERM_LEN) as i32,
                 term_offset: (start % TERM_LEN) as i32,

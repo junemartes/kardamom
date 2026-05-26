@@ -162,15 +162,14 @@ impl<T> PartitionState<T> {
     /// ordering the canonical log cares about.
     pub fn drain_pending(&mut self) -> Vec<(Address, u64, T)> {
         let mut out = Vec::new();
-        let senders: Vec<Address> = self.pending.keys().copied().collect();
-        for sender in senders {
-            let expected = self.next_nonce(sender);
+        // Borrow `pending` and `next` as disjoint fields so we don't need to
+        // snapshot the sender list into a `Vec` first.
+        for (&sender, buf) in self.pending.iter_mut() {
+            let expected = self.next.get(&sender).copied().unwrap_or(0);
             let mut advanced = expected;
-            if let Some(buf) = self.pending.get_mut(&sender) {
-                for (n, p) in buf.drain_consecutive_from(expected) {
-                    out.push((sender, n, p));
-                    advanced = n.saturating_add(1);
-                }
+            for (n, p) in buf.drain_consecutive_from(expected) {
+                out.push((sender, n, p));
+                advanced = n.saturating_add(1);
             }
             if advanced > expected {
                 self.next.insert(sender, advanced);
