@@ -40,8 +40,8 @@
 //!   [`FsyncWatermarkPublisherHandle`], [`QuorumPublisherHandle`] —
 //!   `Send + Sync` outbound handles.
 //! - [`ChannelBSubscriberHandle<T>`] et al — `Send + Sync` subscription
-//!   handles that yield `(BPosition, T)` via `recv()` / `try_recv()` /
-//!   `recv_async`.
+//!   handles that yield `(BPosition, T)` via `recv()` (async) and
+//!   `try_recv()` (non-blocking).
 //! - [`ChannelBArchive`] — offline reader of recorded segment files for the
 //!   L1 batcher (D-Sh10). Does **not** require a running Aeron daemon to
 //!   read; segment files live on disk.

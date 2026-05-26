@@ -203,8 +203,14 @@ pub fn fetch_recording_descriptor(
     archive
         .list_recording(recording_id, Some(&handler))
         .map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
-    // Give the C client a tick to invoke the callback if it queues it.
-    std::thread::sleep(Duration::from_millis(10));
+    // The rusteron-archive C client may queue the descriptor callback rather
+    // than fire it synchronously inside `list_recording`. Poll for up to ~50ms
+    // before giving up; on a healthy system the callback runs in well under
+    // 1ms, but a single fixed 10ms sleep would race on slow CI hardware.
+    let deadline = std::time::Instant::now() + Duration::from_millis(50);
+    while !captured.borrow().seen && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_micros(500));
+    }
     let g = captured.borrow();
     if !g.seen {
         return Err(LogError::Aeron(format!(
