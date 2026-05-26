@@ -2,6 +2,10 @@
 //! must produce byte-identical channel-C output (every `tx_hash` and every
 //! `write_set_hash` matches). No state-root assertion: the executor does not
 //! emit a state-root commitment (S0 D-Sh11).
+//!
+//! Post-S4-arch-update wiring: M=1 channel-A + 1 channel-B, refs join via
+//! the executor's `JoinBuffer`. Determinism doesn't depend on the demux
+//! shape — it depends on canonical ordering, which channel B preserves.
 
 use std::thread;
 use std::time::Duration;
@@ -16,14 +20,29 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
-    BMessage, BPosition, BlockBoundaryStart, CMessage, ChannelBSubscription, ChannelCPublication,
-    Executor, ExecutorConfig, ExecutorError, MockStateDatabase, MutatingSnapshotSource,
-    StateWriterSignal, TxEnvelope as KtTxEnvelope, TxIndex, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
+    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope,
+    TxRef, WriterApplyingQueue,
 };
 
-struct ChanBSub(Receiver<BMessage>);
+struct ChanASub {
+    sequencer_id: u8,
+    rx: Receiver<(BPosition, KtTxEnvelope)>,
+}
+impl ChannelASubscription for ChanASub {
+    fn sequencer_id(&self) -> u8 {
+        self.sequencer_id
+    }
+    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
+        self.rx.recv().map_err(|_| ExecutorError::ChannelAClosed {
+            sequencer_id: self.sequencer_id,
+        })
+    }
+}
+struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
 impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<BMessage, ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -40,9 +59,21 @@ impl StateWriterSignal for Imm {
     }
 }
 
-fn populate_b(b_tx: &Sender<BMessage>, signer: &PrivateKeySigner) {
+fn bpos(off: i32) -> BPosition {
+    BPosition {
+        term_id: 0,
+        term_offset: off,
+    }
+}
+
+fn populate(
+    a_tx: &Sender<(BPosition, KtTxEnvelope)>,
+    b_tx: &Sender<(BPosition, ChannelBMessage)>,
+    signer: &PrivateKeySigner,
+) {
     let to = address!("00000000000000000000000000000000DEAD0001");
-    let mut tx_idx: u64 = 0;
+    let mut bpos_off: i32 = 0;
+    let mut a_pos: i32 = 0;
     let mut nonce: u64 = 0;
     for blk in 1..=3u64 {
         for _ in 0..5 {
@@ -65,26 +96,25 @@ fn populate_b(b_tx: &Sender<BMessage>, signer: &PrivateKeySigner) {
                 sender: signer.address(),
                 tx_hash,
             };
-            b_tx.send(BMessage::Tx {
-                position: BPosition {
-                    term_id: 0,
-                    term_offset: tx_idx as i32,
-                },
-                tx_idx: TxIndex(tx_idx),
-                envelope: env,
-            })
+            let position_a = bpos(a_pos);
+            a_tx.send((position_a, env)).unwrap();
+            b_tx.send((
+                bpos(bpos_off),
+                ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+            ))
             .unwrap();
-            tx_idx += 1;
+            bpos_off += 1;
+            a_pos += 200;
             nonce += 1;
         }
-        b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
-            block_number: blk,
-            end_tx_idx: BPosition {
-                term_id: 0,
-                term_offset: (tx_idx as i32) - 1,
-            },
-            l2_timestamp: 1_700_000_000 + blk,
-        }))
+        b_tx.send((
+            bpos(bpos_off),
+            ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+                block_number: blk,
+                end_tx_idx: bpos(bpos_off - 1),
+                l2_timestamp: 1_700_000_000 + blk,
+            }),
+        ))
         .unwrap();
     }
 }
@@ -97,20 +127,29 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
     let writer_q = WriterApplyingQueue::new(snap.clone());
     let snapshots = MutatingSnapshotSource(snap);
 
-    let (b_tx, b_rx) = bounded::<BMessage>(128);
+    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(128);
+    let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>(128);
     let (c_tx, c_rx) = bounded::<CMessage>(128);
 
-    populate_b(&b_tx, &signer);
+    populate(&a_tx, &b_tx, &signer);
+    drop(a_tx);
     drop(b_tx);
 
     let cfg = ExecutorConfig {
         chain_id: 1,
         receipt_queue_depth: 128,
+        ..Default::default()
     };
+    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+        sequencer_id: 0,
+        rx: a_rx,
+    })];
+    let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
     let h = thread::spawn(move || {
         Executor::run(
             cfg,
-            ChanBSub(b_rx),
+            a_subs,
+            b_sub,
             ChanCPub(c_tx),
             snapshots,
             Imm,

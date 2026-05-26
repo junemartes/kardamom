@@ -56,6 +56,11 @@ bytes = "1"
 libc = "0.2"
 futures = "0.3"
 redis = { version = "0.27", default-features = false }
+# Lock-free concurrent map for the executor's channel-A → channel-B join buffer
+# (D-Sh12 / spec §2.4): M channel-A reader threads insert
+# `(sequencer_id, BPosition) → TxEnvelope` entries; the channel-B reader thread
+# pops them as each `TxRef` arrives. Many writers + one reader → DashMap.
+dashmap = "6"
 
 [profile.release]
 debug = true

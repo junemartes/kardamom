@@ -3,6 +3,10 @@
 //!
 //! v0 corpus: transfers, a contract `SSTORE`, a revert. Mainnet-vector
 //! corpus is a v1 follow-up.
+//!
+//! Post-S4-arch-update wiring: M=1 channel-A + 1 channel-B; the demux
+//! doesn't affect determinism but the public Executor::run signature
+//! changed.
 
 use std::thread;
 use std::time::Duration;
@@ -26,9 +30,10 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use kardamom_executor::executor::SnapshotRef;
 use kardamom_executor::{
-    BMessage, BPosition, BlockBoundaryStart, CMessage, ChannelBSubscription, ChannelCPublication,
-    Executor, ExecutorConfig, ExecutorError, MockStateDatabase, MutatingSnapshotSource,
-    StateWriterSignal, TxEnvelope as KtTxEnvelope, TxIndex, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
+    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope,
+    TxRef, WriterApplyingQueue,
 };
 
 // Minimal: PUSH1 0x42; PUSH1 0x00; SSTORE; STOP
@@ -36,10 +41,23 @@ const SSTORE_42_AT_0: [u8; 6] = [0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
 // PUSH1 0x00; PUSH1 0x00; REVERT
 const REVERT_CODE: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
 
-// ChannelBSubscription / ChannelCPublication mocks.
-struct ChanBSub(Receiver<BMessage>);
+struct ChanASub {
+    sequencer_id: u8,
+    rx: Receiver<(BPosition, KtTxEnvelope)>,
+}
+impl ChannelASubscription for ChanASub {
+    fn sequencer_id(&self) -> u8 {
+        self.sequencer_id
+    }
+    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
+        self.rx.recv().map_err(|_| ExecutorError::ChannelAClosed {
+            sequencer_id: self.sequencer_id,
+        })
+    }
+}
+struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
 impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<BMessage, ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -53,6 +71,13 @@ struct Imm;
 impl StateWriterSignal for Imm {
     fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
         Ok(b)
+    }
+}
+
+fn bpos(off: i32) -> BPosition {
+    BPosition {
+        term_id: 0,
+        term_offset: off,
     }
 }
 
@@ -198,39 +223,46 @@ fn actor_receipts_match_naive_reference() {
     let reference = naive_reference(snap_ref, &pairs);
 
     // Now drive the actor.
-    let (b_tx, b_rx) = bounded::<BMessage>(8);
+    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(8);
+    let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>(8);
     let (c_tx, c_rx) = bounded::<CMessage>(8);
     for (i, (env, _sg)) in pairs.iter().enumerate() {
-        b_tx.send(BMessage::Tx {
-            position: BPosition {
-                term_id: 0,
-                term_offset: i as i32,
-            },
-            tx_idx: TxIndex(i as u64),
-            envelope: env.clone(),
-        })
+        let position_a = bpos((i as i32) * 200);
+        a_tx.send((position_a, env.clone())).unwrap();
+        b_tx.send((
+            bpos(i as i32),
+            ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+        ))
         .unwrap();
     }
-    b_tx.send(BMessage::BlockBoundaryStart(BlockBoundaryStart {
-        block_number: 1,
-        end_tx_idx: BPosition {
-            term_id: 0,
-            term_offset: (pairs.len() - 1) as i32,
-        },
-        l2_timestamp: 1_700_000_000,
-    }))
+    b_tx.send((
+        bpos(pairs.len() as i32),
+        ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+            block_number: 1,
+            end_tx_idx: bpos((pairs.len() - 1) as i32),
+            l2_timestamp: 1_700_000_000,
+        }),
+    ))
     .unwrap();
+    drop(a_tx);
     drop(b_tx);
 
     let writer_q = WriterApplyingQueue::new(snap_actor.clone());
     let snapshots = MutatingSnapshotSource(snap_actor);
+    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+        sequencer_id: 0,
+        rx: a_rx,
+    })];
+    let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
     let h = thread::spawn(move || {
         Executor::run(
             ExecutorConfig {
                 chain_id: 1,
                 receipt_queue_depth: 8,
+                ..Default::default()
             },
-            ChanBSub(b_rx),
+            a_subs,
+            b_sub,
             ChanCPub(c_tx),
             snapshots,
             Imm,

@@ -1,18 +1,29 @@
-//! Channel B / Channel C executor-side demux wrappers.
+//! Channel-C executor-side demux wrapper + `TxIndex` newtype.
 //!
 //! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
-//! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`) are imported from
-//! `kardamom-types` per S0 D-Sh1; we never redefine them here. The executor's
-//! `ReceiptStatus` enum is a local presentation of revm's execution outcome —
-//! `kardamom_types::Receipt.status` is a single `bool` (success/failure); the
-//! executor converts before publishing.
+//! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`, `ChannelBMessage`,
+//! `TxRef`) are imported from `kardamom-types` per S0 D-Sh1; we never
+//! redefine them here.
+//!
+//! Pre-S4-arch-update this module also held a `BMessage` enum that was the
+//! executor's internal inbound demux (`Tx | BoundaryStart` with full
+//! envelopes). Post-D-Sh12 the inbound type is `kardamom_types::
+//! ChannelBMessage` (tiny refs + boundaries) plus the per-A `TxEnvelope`
+//! streams; the executor reads them through the `reader.rs` module rather
+//! than a single demux enum.
+//!
+//! The executor's `ReceiptStatus` enum is a local presentation of revm's
+//! execution outcome — `kardamom_types::Receipt.status` is a single `bool`
+//! (success/failure); the executor converts before publishing.
 
-use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, Receipt, TxEnvelope};
+use kardamom_types::{BlockBoundary, Receipt};
 use revm::context::result::HaltReason;
 
-/// Monotonically increasing global index of a tx within the canonical channel-B
-/// stream. Derived by the executor's reader from the input order, starting at 0
-/// for the first tx after genesis.
+/// Monotonically increasing global index of a tx within the canonical
+/// channel-B stream. Derived by the executor's channel-B reader from the
+/// input order, starting at 0 for the first tx after genesis. The
+/// downstream `Receipt.tx_idx` is the `BPosition` (the canonical wire id);
+/// this `TxIndex` is an executor-local sanity counter only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TxIndex(pub u64);
 
@@ -21,22 +32,6 @@ impl TxIndex {
     pub fn next(self) -> TxIndex {
         TxIndex(self.0 + 1)
     }
-}
-
-/// One canonical-ordered record off channel B. The sealer emits
-/// `BlockBoundaryStart` records inline; the sequencer emits `Tx` records.
-///
-/// `envelope` is `kardamom_types::TxEnvelope`, which already carries the
-/// proxy-populated `sender` and `tx_hash` (S0 D-Sh3, D-Sh4). The executor
-/// trusts those fields unconditionally — no re-recovery, no re-hash.
-#[derive(Debug, Clone)]
-pub enum BMessage {
-    Tx {
-        position: BPosition,
-        tx_idx: TxIndex,
-        envelope: TxEnvelope,
-    },
-    BlockBoundaryStart(BlockBoundaryStart),
 }
 
 /// One published record on channel C — receipts and sealed boundaries.
