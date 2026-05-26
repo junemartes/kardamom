@@ -47,6 +47,12 @@ struct Args {
     /// by bumping this.
     #[arg(long, default_value_t = 1)]
     initial_block: u64,
+    /// Genesis allocation: `address:balance_wei`. Repeatable. Seeds the
+    /// in-memory state DB with funded accounts so revm has balance to
+    /// debit. Production deployments load this from a chain spec; for
+    /// the v0 deployable scaffold + e2e tests it's a CLI flag.
+    #[arg(long = "genesis-account", value_name = "ADDRESS:BALANCE_WEI")]
+    genesis_accounts: Vec<String>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -116,7 +122,7 @@ async fn main() -> Result<()> {
     // the snapshot source (read) and the state-writer queue (write) gives
     // the executor a self-consistent view; future revisions plug in
     // `state::StateWriter` here.
-    let db = MockStateDatabase::default();
+    let db = build_genesis_db(&args.genesis_accounts).context("genesis allocation")?;
     let snapshots = MutatingSnapshotSource(db.clone());
     let sw_queue = WriterApplyingQueue::new(db);
     let sw_signal = ImmediateSignal;
@@ -156,6 +162,28 @@ async fn main() -> Result<()> {
         Err(e) => tracing::error!(error = %e, "executor task panicked"),
     }
     Ok(())
+}
+
+/// Parse `--genesis-account ADDRESS:BALANCE_WEI` entries and seed a fresh
+/// `MockStateDatabase`. Every account is created at nonce 0 with empty
+/// code (`code_hash = ZERO`).
+fn build_genesis_db(entries: &[String]) -> Result<MockStateDatabase> {
+    use alloy_primitives::{Address, B256, U256};
+    let mut builder = MockStateDatabase::builder();
+    for entry in entries {
+        let (addr_s, bal_s) = entry.split_once(':').ok_or_else(|| {
+            anyhow::anyhow!("genesis-account `{entry}` missing `address:balance`")
+        })?;
+        let addr: Address = addr_s
+            .parse()
+            .with_context(|| format!("parse address from `{entry}`"))?;
+        let balance: U256 = bal_s
+            .parse()
+            .with_context(|| format!("parse balance (decimal wei) from `{entry}`"))?;
+        tracing::info!(?addr, %balance, "seeding genesis account");
+        builder = builder.account(addr, balance, 0, B256::ZERO);
+    }
+    Ok(builder.build())
 }
 
 // ---------------------------------------------------------------------------

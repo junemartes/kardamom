@@ -86,6 +86,14 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
 
     let target_bin = workspace_target_bin();
 
+    // Genesis allocation: fund Alice so the executor's revm has a balance
+    // to debit during the test's transfers. Bob's address is the recipient.
+    let alice = signer_from_seed(0x11);
+    let alice_addr = alice.address();
+    let bob_addr = Address::repeat_byte(0x22);
+    let alice_balance_wei: U256 = U256::from(1_000_000_000_000_000_000_000u128); // 1000 ETH
+    let alice_genesis = format!("{alice_addr:#x}:{alice_balance_wei}");
+
     // ----- Spawn the four services. SIGTERM order on teardown is reverse:
     // ----- ingress (stops new submissions) → executor → sequencer → sealer.
     let sealer = ChildGuard::spawn(
@@ -119,6 +127,8 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg("1")
             .arg("--chain-id")
             .arg(CHAIN_ID.to_string())
+            .arg("--genesis-account")
+            .arg(&alice_genesis)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit()),
     );
@@ -157,9 +167,8 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
         .build(&rpc_url)
         .expect("http client");
 
-    let alice = signer_from_seed(0x11);
-    let bob_addr = Address::repeat_byte(0x22);
     const N: u64 = 3;
+    let _ = alice_addr;
 
     for nonce in 0..N {
         let raw = signed_transfer(&alice, bob_addr, U256::from(1u64), nonce);
