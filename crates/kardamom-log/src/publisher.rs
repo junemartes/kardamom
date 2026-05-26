@@ -84,9 +84,9 @@ fn add_exclusive_pub(
 /// for the bulk transaction data referenced from channel B.
 ///
 /// Per-A URIs are derived from
-/// [`ChannelsConfig::tx_dattx_dattx_dattx_dattx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
+/// [`ChannelsConfig::tx_dattx_dattx_dattx_dattx_dattx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
 /// with `{sid}` substituted for the sequencer id. Stream ids are derived as
-/// `tx_dattx_dattx_dattx_dattx_data_stream_id_base + sequencer_id` so M parallel channel-A streams can
+/// `tx_dattx_dattx_dattx_dattx_dattx_data_stream_id_base + sequencer_id` so M parallel channel-A streams can
 /// coexist on a shared Media Driver.
 pub struct TxDataPublisher {
     sequencer_id: u8,
