@@ -10,7 +10,7 @@
 //!  * The total ref count equals the total input count (no drops, no
 //!    duplicate publishes in the in-memory backpressure-free harness).
 //!
-//! The in-memory `InMemoryChannelBRefPublisher` is `Clone` and routes
+//! The in-memory `InMemoryTxOrderingRefPublisher` is `Clone` and routes
 //! all handles to one shared `Vec<TxRef>` — modelling the "single
 //! canonical B stream observed in arrival order" semantics Aeron's
 //! concurrent-publisher provides on real channels.
@@ -28,9 +28,9 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedChannelA;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::partition::partition_for;
 use kardamom_sequencer::sequencer::Sequencer;
@@ -83,15 +83,14 @@ fn find_signers_for_partition(target: u32, n: usize, seed_start: u64) -> Vec<Pri
 #[test]
 fn m_eq_4_sequencers_publish_canonical_refs() {
     // Build M sequencers, each subscribed to its own channel A. They all
-    // share one `InMemoryChannelBRefPublisher` (cloning shares the
+    // share one `InMemoryTxOrderingRefPublisher` (cloning shares the
     // underlying Vec — same canonical B stream).
-    let b = InMemoryChannelBRefPublisher::default();
+    let b = InMemoryTxOrderingRefPublisher::default();
     let mut sequencers: Vec<Sequencer<kardamom_sequencer::testing::FakeStateDatabase>> =
         Vec::with_capacity(M as usize);
-    let mut b_pubs: Vec<InMemoryChannelBRefPublisher> = Vec::with_capacity(M as usize);
+    let mut b_pubs: Vec<InMemoryTxOrderingRefPublisher> = Vec::with_capacity(M as usize);
     let mut rcs: Vec<InMemoryReceiptCachePublisher> = Vec::with_capacity(M as usize);
-    let mut channels_a: Vec<ScriptedChannelA> =
-        (0..M).map(|_| ScriptedChannelA::default()).collect();
+    let mut channels_a: Vec<ScriptedTxData> = (0..M).map(|_| ScriptedTxData::default()).collect();
     // sender_at_pos[(shard, pos)] → (sender, nonce). Used to validate the
     // canonical-B refs resolve to expected envelopes.
     let mut sender_at_pos: HashMap<(u8, BPosition), (Address, u64)> = HashMap::new();
@@ -188,12 +187,12 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     }
 
     // Walk the canonical B order, resolve every ref against the scripted
-    // channel-A input by (shard, position_a), and assert per-sender nonce
+    // channel-A input by (shard, tx_data_position), and assert per-sender nonce
     // sequences are strictly ascending and dense from 0.
     let mut per_sender_nonces: HashMap<Address, Vec<u64>> = HashMap::new();
     for r in &refs {
         let (sender, nonce) = sender_at_pos
-            .get(&(r.shard_id, r.position_a))
+            .get(&(r.shard_id, r.tx_data_position))
             .copied()
             .expect("every TxRef must resolve to a scripted (shard, position) input");
 

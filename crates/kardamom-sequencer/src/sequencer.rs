@@ -6,7 +6,7 @@
 //!
 //! Per the MDS topology (D-Sh12 v2 / spec §2.3): the proxy has already
 //! published the envelope onto channel A, so the sequencer's input is
-//! `(position_a, envelope)` — the proxy's Aeron-offer position is the
+//! `(tx_data_position, envelope)` — the proxy's Aeron-offer position is the
 //! lookup key downstream consumers (executor, batcher) use to resolve the
 //! envelope.
 //!
@@ -22,7 +22,7 @@
 //!     - future → buffer (bounded per-sender);
 //!     - past → emit a `DuplicateNotification`.
 //!  4. For each `Publish` action, build
-//!     `TxRef { tx_hash, shard_id, position_a }` and publish to channel B.
+//!     `TxRef { tx_hash, shard_id, tx_data_position }` and publish to channel B.
 //!     If B back-pressures, [`PartitionState::reinsert_for_retry`] rewinds
 //!     so the next loop iteration retries the same `(sender, nonce)`.
 //!
@@ -48,9 +48,9 @@ use tracing::{trace, warn};
 use crate::config::SequencerConfig;
 use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
-use crate::inbound::ChannelASubscriber;
+use crate::inbound::TxDataSubscriber;
 use crate::metrics;
-use crate::outbound::{ChannelBRefPublisher, ReceiptCachePublisher};
+use crate::outbound::{ReceiptCachePublisher, TxOrderingRefPublisher};
 use crate::partition::partition_for;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction};
@@ -70,7 +70,7 @@ struct RefMetadata {
     /// The Aeron-offer position the proxy got back when it published this
     /// envelope onto channel A. Used by downstream consumers to look up
     /// the envelope on the A archive.
-    position_a: BPosition,
+    tx_data_position: BPosition,
 }
 
 /// Cooperative shutdown signal shared with the loop driver. Cloneable so the
@@ -160,21 +160,21 @@ impl<DB: StateDatabase> Sequencer<DB> {
         self.state.seed_next_nonce(sender, n);
     }
 
-    /// Publish a `TxRef` for `meta` to channel B. The `position_a` was
+    /// Publish a `TxRef` for `meta` to channel B. The `tx_data_position` was
     /// observed off the channel-A subscription — the proxy did the actual
     /// envelope write — so this is a single B write, not a dual write.
     /// On B-backpressure the caller reinserts the metadata so the retry
-    /// republishes the same `(tx_hash, shard, position_a)` triple.
+    /// republishes the same `(tx_hash, shard, tx_data_position)` triple.
     fn publish_ref<B>(&self, b: &mut B, meta: &RefMetadata) -> Result<(), SequencerError>
     where
-        B: ChannelBRefPublisher,
+        B: TxOrderingRefPublisher,
     {
         // shard_id under the MDS topology is the address-shard index. The
         // default deployment of K=M, one shard per sequencer pool, lets
         // `cfg.sequencer_id` double as the shard id; production
         // configurations with multiple sequencer pools per shard can set
         // these independently and `sequencer_id` here MUST be the shard.
-        let txref = TxRef::new(meta.tx_hash, self.cfg.sequencer_id, meta.position_a);
+        let txref = TxRef::new(meta.tx_hash, self.cfg.sequencer_id, meta.tx_data_position);
         match b.try_publish_ref(&txref) {
             Ok(()) => {
                 metrics::record_publish(self.cfg.partition_index);
@@ -185,7 +185,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
                 warn!(
                     sequencer_id = self.cfg.sequencer_id,
                     correlation_id = meta.correlation_id,
-                    position_a = ?meta.position_a,
+                    tx_data_position = ?meta.tx_data_position,
                     "B back-pressure; rewinding state machine for retry"
                 );
                 Err(SequencerError::Backpressure)
@@ -211,8 +211,8 @@ impl<DB: StateDatabase> Sequencer<DB> {
         rc: &mut R,
     ) -> Result<bool, SequencerError>
     where
-        I: ChannelASubscriber,
-        B: ChannelBRefPublisher,
+        I: TxDataSubscriber,
+        B: TxOrderingRefPublisher,
         R: ReceiptCachePublisher,
     {
         let pending = self.state.drain_pending();
@@ -231,7 +231,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
             return Ok(true);
         }
 
-        let Some((position_a, envelope)) = channel_a.poll()? else {
+        let Some((tx_data_position, envelope)) = channel_a.poll()? else {
             return Ok(false);
         };
         metrics::record_ingest(self.cfg.partition_index);
@@ -267,7 +267,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
         let meta = RefMetadata {
             correlation_id: envelope.correlation_id,
             tx_hash: envelope.tx_hash,
-            position_a,
+            tx_data_position,
         };
 
         let t0 = std::time::Instant::now();
@@ -334,8 +334,8 @@ impl<DB: StateDatabase> Sequencer<DB> {
         shutdown: Shutdown,
     ) -> Result<(), SequencerError>
     where
-        I: ChannelASubscriber,
-        B: ChannelBRefPublisher,
+        I: TxDataSubscriber,
+        B: TxOrderingRefPublisher,
         R: ReceiptCachePublisher,
     {
         if let Some(core) = self.cfg.core_id {

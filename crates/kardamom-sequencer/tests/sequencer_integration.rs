@@ -3,7 +3,7 @@
 //! (MDS topology — D-Sh12 v2). Asserts:
 //!  * Canonical order on channel B (the `TxRef` sequence) matches a
 //!    per-sender nonce-ascending sequence.
-//!  * Each ref's `position_a` matches the position the proxy supplied
+//!  * Each ref's `tx_data_position` matches the position the proxy supplied
 //!    on the scripted channel-A subscription.
 //!  * Duplicates are dropped and reported on the receipt-cache channel.
 //!  * Future-nonce txs are buffered and drained when the prior arrives.
@@ -21,9 +21,9 @@ use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedChannelA;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
@@ -92,9 +92,9 @@ fn integration_1000_txs_100_senders_with_chaos() {
     }
     stream.shuffle(&mut rng);
 
-    let mut channel_a = ScriptedChannelA::default();
-    // sender_at_pos: position_a → (sender, nonce). Used to validate that
-    // each published TxRef's position_a points back to the expected envelope.
+    let mut channel_a = ScriptedTxData::default();
+    // sender_at_pos: tx_data_position → (sender, nonce). Used to validate that
+    // each published TxRef's tx_data_position points back to the expected envelope.
     let mut sender_at_pos: HashMap<BPosition, (Address, u64)> = HashMap::new();
     for (correlation, (i, n)) in stream.iter().enumerate() {
         let position = pos_n(correlation as u64);
@@ -104,7 +104,7 @@ fn integration_1000_txs_100_senders_with_chaos() {
     }
     let total_input = channel_a.queue.len();
 
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     loop {
         match seq.run_once(&mut channel_a, &mut b, &mut rc) {
@@ -129,9 +129,9 @@ fn integration_1000_txs_100_senders_with_chaos() {
     for r in &refs {
         assert_eq!(r.shard_id, cfg.sequencer_id);
         let (sender, nonce) = sender_at_pos
-            .get(&r.position_a)
+            .get(&r.tx_data_position)
             .copied()
-            .expect("every ref's position_a must match a scripted input");
+            .expect("every ref's tx_data_position must match a scripted input");
         per_sender.entry(sender).or_default().push(nonce);
     }
     assert_eq!(per_sender.len(), signers.len());
@@ -167,7 +167,7 @@ fn integration_duplicates_are_reported() {
         std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
     let s = signer(7);
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     channel_a
         .queue
         .push_back((pos_n(0), signed_envelope(&s, 0, 100)));
@@ -185,7 +185,7 @@ fn integration_duplicates_are_reported() {
         .queue
         .push_back((pos_n(4), signed_envelope(&s, 0, 202)));
 
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     while let Ok(true) = seq.run_once(&mut channel_a, &mut b, &mut rc) {}
 
@@ -215,13 +215,13 @@ fn integration_bounded_buffer_evicts_oldest() {
         std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
     let s = signer(42);
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     for n in 100..110u64 {
         channel_a
             .queue
             .push_back((pos_n(n), signed_envelope(&s, n, n)));
     }
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     while let Ok(true) = seq.run_once(&mut channel_a, &mut b, &mut rc) {}
     assert_eq!(
