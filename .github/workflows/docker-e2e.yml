@@ -41,7 +41,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake uuid-dev libssl-dev pkg-config build-essential
+            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
