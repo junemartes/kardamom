@@ -23,16 +23,18 @@ use kardamom_types::{
 
 use crate::error::IngressError;
 
-/// Publisher surface. The proxy writes `TxEnvelope` to a specific partition's
-/// `ingress[i]` channel and (in the receipt-watcher hot path) republishes
-/// `CachedReceipt` entries to the receipt-cache channel.
+/// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
+/// sender-sharded channel A streams (`partition_for(envelope.sender, K)`
+/// gives the shard index), and republishes `CachedReceipt` entries to the
+/// receipt-cache channel.
 #[async_trait]
 pub trait IngressPublication: Send + Sync + 'static {
-    /// Publish `envelope` to the partition selected by
-    /// `partition_for(envelope.sender, M)`.
-    async fn publish_ingress(
+    /// Publish `envelope` onto `channel_A[shard]`. Multiple proxies can
+    /// concurrently publish to the same shard's A stream — Aeron's shared
+    /// publication semantics serialize them into one canonical byte order.
+    async fn publish_channel_a(
         &self,
-        partition: usize,
+        shard: usize,
         envelope: TxEnvelope,
     ) -> Result<(), IngressError>;
 
@@ -69,7 +71,8 @@ pub trait IngressSubscription: Send + Sync + 'static {
 /// integration test and in the criterion benches.
 #[derive(Clone)]
 pub struct MockChannels {
-    pub ingress_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
+    /// One sender per channel A shard.
+    pub channel_a_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
     pub receipt_bus: broadcast::Sender<Receipt>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub local_fsync_bus: broadcast::Sender<FsyncWatermark>,
@@ -79,13 +82,13 @@ pub struct MockChannels {
 }
 
 impl MockChannels {
-    /// Build a fresh bus with `partitions` independent ingress lanes. Returns
-    /// the bus and a `Vec` of receivers, one per partition (the test's "fake
+    /// Build a fresh bus with `shards` channel A lanes. Returns the bus
+    /// and a `Vec` of receivers, one per shard (the test's "fake
     /// sequencer" drains these).
-    pub fn new(partitions: usize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
-        let mut tx_vec = Vec::with_capacity(partitions);
-        let mut rx_vec = Vec::with_capacity(partitions);
-        for _ in 0..partitions {
+    pub fn new(shards: usize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
+        let mut tx_vec = Vec::with_capacity(shards);
+        let mut rx_vec = Vec::with_capacity(shards);
+        for _ in 0..shards {
             let (tx, rx) = mpsc::unbounded_channel();
             tx_vec.push(tx);
             rx_vec.push(rx);
@@ -97,7 +100,7 @@ impl MockChannels {
         let (block_boundary_bus, _) = broadcast::channel(1024);
         (
             Self {
-                ingress_tx: tx_vec,
+                channel_a_tx: tx_vec,
                 receipt_bus,
                 watermark_bus,
                 local_fsync_bus,
@@ -112,15 +115,15 @@ impl MockChannels {
 
 #[async_trait]
 impl IngressPublication for MockChannels {
-    async fn publish_ingress(
+    async fn publish_channel_a(
         &self,
-        partition: usize,
+        shard: usize,
         envelope: TxEnvelope,
     ) -> Result<(), IngressError> {
-        self.ingress_tx
-            .get(partition)
+        self.channel_a_tx
+            .get(shard)
             .ok_or_else(|| {
-                IngressError::PartitionUnavailable(format!("partition {partition} out of range"))
+                IngressError::PartitionUnavailable(format!("shard {shard} out of range"))
             })?
             .send(envelope)
             .map_err(|e| IngressError::PartitionUnavailable(e.to_string()))
@@ -239,7 +242,7 @@ mod tests {
     use kardamom_types::StateDatabase;
 
     #[tokio::test]
-    async fn mock_routes_to_partition() {
+    async fn mock_routes_to_shard() {
         let (mock, mut rx) = MockChannels::new(4);
         let env = TxEnvelope {
             correlation_id: 1,
@@ -247,10 +250,10 @@ mod tests {
             sender: Address::ZERO,
             tx_hash: B256::ZERO,
         };
-        mock.publish_ingress(2, env.clone()).await.unwrap();
+        mock.publish_channel_a(2, env.clone()).await.unwrap();
         let received = rx[2].recv().await.unwrap();
         assert_eq!(received.correlation_id, 1);
-        // Other partitions stay empty.
+        // Other shards stay empty.
         assert!(rx[0].try_recv().is_err());
     }
 

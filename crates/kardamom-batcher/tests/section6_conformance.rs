@@ -104,17 +104,31 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
     // Canonical order on B: round-robin a0/a1 for 6 refs, then a boundary.
     let mut b_buf = Vec::new();
     let mut b_off = 0i32;
+    // Use distinct tx_hashes per ref so the executor's dedup doesn't
+    // collapse them; this loop drives an offline-reader test so the
+    // executor isn't involved, but keep them distinct for hygiene.
+    let mut hash_seed: u8 = 0;
     for a_pos in &a_positions {
+        hash_seed = hash_seed.wrapping_add(1);
         append_frame(
             &mut b_buf,
             pos(b_off),
-            &ChannelBMessage::TxRef(TxRef::new(0, *a_pos)),
+            &ChannelBMessage::TxRef(TxRef::new(
+                alloy_primitives::B256::repeat_byte(hash_seed),
+                0,
+                *a_pos,
+            )),
         );
         b_off += 16;
+        hash_seed = hash_seed.wrapping_add(1);
         append_frame(
             &mut b_buf,
             pos(b_off),
-            &ChannelBMessage::TxRef(TxRef::new(1, *a_pos)),
+            &ChannelBMessage::TxRef(TxRef::new(
+                alloy_primitives::B256::repeat_byte(hash_seed),
+                1,
+                *a_pos,
+            )),
         );
         b_off += 16;
     }

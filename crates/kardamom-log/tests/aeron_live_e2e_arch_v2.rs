@@ -127,7 +127,8 @@ async fn split_architecture_m_plus_one_e2e() {
     for (sid, pos_a, _corr) in &publish_plan {
         b_pub
             .publish_ref(&TxRef {
-                sequencer_id: *sid,
+                tx_hash: alloy_primitives::B256::ZERO,
+                shard_id: *sid,
                 position_a: *pos_a,
             })
             .unwrap();
@@ -167,7 +168,7 @@ async fn split_architecture_m_plus_one_e2e() {
             |m, _b_pos| {
                 if let ChannelBMessage::TxRef(r) = m {
                     let env = a_buffer
-                        .remove(&(r.sequencer_id, r.position_a))
+                        .remove(&(r.shard_id, r.position_a))
                         .expect("TxRef must hit A-buffer");
                     canonical.push(env.correlation_id);
                 }

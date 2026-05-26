@@ -112,30 +112,15 @@ impl Recorder {
         sequencer_id: u8,
         archive_dir: PathBuf,
     ) -> Result<Self, LogError> {
-        let channel = ch
-            .a_channel_template
-            .replace("{sid}", &sequencer_id.to_string());
-        let stream_id = ch.a_stream_id_base + sequencer_id as i32;
         Self::start_inner(
             archive,
-            &channel,
-            stream_id,
+            &ch.a_channel(sequencer_id),
+            ch.a_stream_id(sequencer_id),
             recorder_id,
             RecorderKind::A { sequencer_id },
             archive_dir,
             "A",
         )
-    }
-
-    /// Back-compat alias: original API recorded channel B.
-    #[deprecated(note = "use start_b for channel-B recording or start_a for channel A[i]")]
-    pub fn start(
-        archive: Archive,
-        ch: &ChannelsConfig,
-        recorder_id: RecorderId,
-        archive_dir: PathBuf,
-    ) -> Result<Self, LogError> {
-        Self::start_b(archive, ch, recorder_id, archive_dir)
     }
 
     fn start_inner(

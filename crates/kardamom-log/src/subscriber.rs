@@ -138,12 +138,11 @@ impl Subscribers {
     /// Open the channel-A subscription for sequencer `sequencer_id`. Run
     /// M of these on each executor host to feed the per-A buffer.
     pub fn a(&self, sequencer_id: u8) -> Result<ChannelASubscriber, LogError> {
-        let channel = self
-            .ch
-            .a_channel_template
-            .replace("{sid}", &sequencer_id.to_string());
-        let stream_id = self.ch.a_stream_id_base + sequencer_id as i32;
-        TypedSubscriber::open(&self.aeron, &channel, stream_id)
+        TypedSubscriber::open(
+            &self.aeron,
+            &self.ch.a_channel(sequencer_id),
+            self.ch.a_stream_id(sequencer_id),
+        )
     }
 
     pub fn b(&self) -> Result<ChannelBSubscriber, LogError> {
@@ -163,24 +162,20 @@ impl Subscribers {
     }
 
     pub fn watermark(&self, recorder_id: u8) -> Result<WatermarkSubscriber, LogError> {
-        let channel = self
-            .ch
-            .fsync_watermark_channel_template
-            .replace("{rid}", &recorder_id.to_string());
-        TypedSubscriber::open(&self.aeron, &channel, self.ch.fsync_watermark_stream_id)
+        TypedSubscriber::open(
+            &self.aeron,
+            &self.ch.fsync_watermark_channel(recorder_id),
+            self.ch.fsync_watermark_stream_id,
+        )
     }
 
     /// Subscribe to a sequencer-local channel-A fsync watermark stream
     /// (one publisher per sequencer; see `fsync_watermark_a_channel_template`).
     pub fn watermark_a(&self, sequencer_id: u8) -> Result<WatermarkSubscriber, LogError> {
-        let channel = self
-            .ch
-            .fsync_watermark_a_channel_template
-            .replace("{sid}", &sequencer_id.to_string());
         TypedSubscriber::open(
             &self.aeron,
-            &channel,
-            self.ch.fsync_watermark_a_stream_id_base + sequencer_id as i32,
+            &self.ch.fsync_watermark_a_channel(sequencer_id),
+            self.ch.fsync_watermark_a_stream_id(sequencer_id),
         )
     }
 

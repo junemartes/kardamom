@@ -155,16 +155,16 @@ impl MultiArchiveReader {
     }
 
     fn resolve(&self, r: &TxRef) -> Result<TxEnvelope, BatcherError> {
-        let idx = self.a_indexes.get(&r.sequencer_id).ok_or_else(|| {
+        let idx = self.a_indexes.get(&r.shard_id).ok_or_else(|| {
             BatcherError::Config(format!(
                 "channel-A archive for sequencer_id={} not configured",
-                r.sequencer_id
+                r.shard_id
             ))
         })?;
         idx.get(&r.position_a).cloned().ok_or_else(|| {
             BatcherError::Frame(format!(
                 "TxRef sequencer_id={} position_a={:?} not found in channel-A index",
-                r.sequencer_id, r.position_a
+                r.shard_id, r.position_a
             ))
         })
     }
@@ -184,7 +184,7 @@ impl Iterator for MultiArchiveReader {
             ChannelBMessage::TxRef(r) => match self.resolve(&r) {
                 Ok(env) => Some(Ok(ResolvedRecord::Tx {
                     position,
-                    sequencer_id: r.sequencer_id,
+                    sequencer_id: r.shard_id,
                     position_a: r.position_a,
                     env,
                 })),

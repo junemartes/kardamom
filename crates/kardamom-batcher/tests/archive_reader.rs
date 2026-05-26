@@ -34,7 +34,7 @@ fn reads_two_interleaved_b_records() {
     append_frame(
         &mut buf,
         pos(0),
-        &ChannelBMessage::TxRef(TxRef::new(3, pos(128))),
+        &ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 3, pos(128))),
     );
     append_frame(
         &mut buf,
@@ -56,7 +56,7 @@ fn reads_two_interleaved_b_records() {
     let ChannelBMessage::TxRef(r) = &records[0].value else {
         panic!("expected ref first");
     };
-    assert_eq!(r.sequencer_id, 3);
+    assert_eq!(r.shard_id, 3);
     assert_eq!(r.position_a, pos(128));
 
     let ChannelBMessage::BoundaryStart(b) = &records[1].value else {

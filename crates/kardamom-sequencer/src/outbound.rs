@@ -173,7 +173,7 @@ pub mod fakes {
 mod tests {
     use super::fakes::*;
     use super::*;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
     use kardamom_types::TxRef;
 
     #[test]
@@ -201,9 +201,9 @@ mod tests {
     #[test]
     fn fake_b_records_refs() {
         let mut p = InMemoryChannelBRefPublisher::default();
-        p.try_publish_ref(&TxRef::new(0, BPosition::default()))
+        p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default()))
             .unwrap();
-        p.try_publish_ref(&TxRef::new(1, BPosition::default()))
+        p.try_publish_ref(&TxRef::new(B256::ZERO, 1, BPosition::default()))
             .unwrap();
         assert_eq!(p.refs.lock().unwrap().len(), 2);
     }
@@ -213,7 +213,7 @@ mod tests {
         let mut p = InMemoryChannelBRefPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            p.try_publish_ref(&TxRef::new(0, BPosition::default())),
+            p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default())),
             Err(SequencerError::Backpressure)
         ));
     }

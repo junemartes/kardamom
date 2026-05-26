@@ -78,10 +78,22 @@ fn happy_path_in_order_resolution() {
         &dir,
         "b.rec",
         &[
-            (pos(0), ChannelBMessage::TxRef(TxRef::new(0, pos(0)))),
-            (pos(16), ChannelBMessage::TxRef(TxRef::new(1, pos(0)))),
-            (pos(32), ChannelBMessage::TxRef(TxRef::new(0, pos(128)))),
-            (pos(48), ChannelBMessage::TxRef(TxRef::new(1, pos(128)))),
+            (
+                pos(0),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
+            ),
+            (
+                pos(16),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(0))),
+            ),
+            (
+                pos(32),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
+            ),
+            (
+                pos(48),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(128))),
+            ),
             (
                 pos(64),
                 ChannelBMessage::BoundaryStart(BlockBoundaryStart {
@@ -158,9 +170,18 @@ fn out_of_order_b_refs_a_positions_still_resolve() {
         &dir,
         "b.rec",
         &[
-            (pos(0), ChannelBMessage::TxRef(TxRef::new(0, pos(256)))),
-            (pos(16), ChannelBMessage::TxRef(TxRef::new(0, pos(128)))),
-            (pos(32), ChannelBMessage::TxRef(TxRef::new(0, pos(0)))),
+            (
+                pos(0),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(256))),
+            ),
+            (
+                pos(16),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
+            ),
+            (
+                pos(32),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
+            ),
             (
                 pos(48),
                 ChannelBMessage::BoundaryStart(BlockBoundaryStart {
@@ -206,7 +227,10 @@ fn missing_a_archive_surfaces_as_config_error() {
     let b = write_segment(
         &dir,
         "b.rec",
-        &[(pos(0), ChannelBMessage::TxRef(TxRef::new(99, pos(0))))],
+        &[(
+            pos(0),
+            ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 99, pos(0))),
+        )],
     );
 
     let reader = MultiArchiveReader::open(&MultiArchiveConfig {
@@ -232,7 +256,10 @@ fn missing_a_position_surfaces_as_frame_error() {
     let b = write_segment(
         &dir,
         "b.rec",
-        &[(pos(0), ChannelBMessage::TxRef(TxRef::new(0, pos(9999))))],
+        &[(
+            pos(0),
+            ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(9999))),
+        )],
     );
 
     let mut a_segments = HashMap::new();

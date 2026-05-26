@@ -190,7 +190,7 @@ fn m_eq_4_sequencers_dual_write_round_trip() {
     // Invariant: each sequencer wrote only refs with its own sequencer_id.
     let mut per_seq_refs: HashMap<u8, usize> = HashMap::new();
     for r in &refs {
-        *per_seq_refs.entry(r.sequencer_id).or_default() += 1;
+        *per_seq_refs.entry(r.shard_id).or_default() += 1;
     }
     for i in 0u8..M as u8 {
         let n = per_seq_refs.get(&i).copied().unwrap_or(0);
@@ -217,7 +217,7 @@ fn m_eq_4_sequencers_dual_write_round_trip() {
     // per-sender nonce sequences are strictly ascending and dense from 0.
     let mut per_sender_nonces: HashMap<Address, Vec<u64>> = HashMap::new();
     for r in &refs {
-        let a = &a_pubs[r.sequencer_id as usize];
+        let a = &a_pubs[r.shard_id as usize];
         let bytes = a
             .fetch(r.position_a)
             .expect("every TxRef must resolve to an envelope on its channel A");
@@ -228,7 +228,7 @@ fn m_eq_4_sequencers_dual_write_round_trip() {
         // router on this sender — cross-sequencer routing correctness.
         assert_eq!(
             partition_for(env.sender, M),
-            r.sequencer_id as u32,
+            r.shard_id as u32,
             "sender's partition must match the referencing sequencer"
         );
 
