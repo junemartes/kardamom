@@ -23,7 +23,7 @@ use rand::seq::SliceRandom;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
@@ -105,7 +105,7 @@ fn integration_1000_txs_100_senders_with_chaos() {
     let total_input = channel_a.queue.len();
 
     let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
     loop {
         match seq.run_once(&mut channel_a, &mut b, &mut rc) {
             Ok(true) => continue,
@@ -186,14 +186,23 @@ fn integration_duplicates_are_reported() {
         .push_back((pos_n(4), signed_envelope(&s, 0, 202)));
 
     let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
     while let Ok(true) = seq.run_once(&mut channel_a, &mut b, &mut rc) {}
 
     assert_eq!(b.refs.lock().unwrap().len(), 2);
-    let dups = rc.duplicates.lock().unwrap();
-    assert_eq!(dups.len(), 3);
-    let correlations: Vec<_> = dups.iter().map(|d| d.correlation_id).collect();
-    assert_eq!(correlations, vec![200, 201, 202]);
+    let errs = rc.errors.lock().unwrap();
+    assert_eq!(errs.len(), 3, "all 3 past-nonce submissions emit a TxError");
+    // All 3 errors are for the same (sender, nonce=0) — they're distinct
+    // submissions but indistinguishable at the TxError layer (correlation_id
+    // was dropped when the receipt-cache channel was retired).
+    for err in errs.iter() {
+        assert_eq!(err.sender, s.address());
+        assert_eq!(err.nonce, 0);
+        assert!(matches!(
+            err.reason,
+            kardamom_sequencer::TxErrorReason::DuplicatedTx { .. }
+        ));
+    }
 }
 
 #[test]
@@ -222,7 +231,7 @@ fn integration_bounded_buffer_evicts_oldest() {
             .push_back((pos_n(n), signed_envelope(&s, n, n)));
     }
     let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
     while let Ok(true) = seq.run_once(&mut channel_a, &mut b, &mut rc) {}
     assert_eq!(
         b.refs.lock().unwrap().len(),

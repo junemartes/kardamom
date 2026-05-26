@@ -20,7 +20,9 @@ use alloy_primitives::Address;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, oneshot};
 
-use kardamom_types::{AckPolicy, BPosition, FsyncWatermark, QuorumWatermark, Receipt};
+use kardamom_types::{
+    AckPolicy, BPosition, FsyncWatermark, QuorumWatermark, Receipt, TxErrorReason,
+};
 
 use crate::error::IngressError;
 
@@ -115,6 +117,29 @@ impl PendingReceipts {
             && let Some(resp) = e.responder.take()
         {
             let _ = resp.send(Ok(ReceiptResponse { receipt }));
+            drop(e);
+            self.map.remove(&key);
+        }
+    }
+
+    /// Called by the tx_errors watcher when the sequencer rejected an
+    /// inbound `(sender, nonce)`. Releases the parked client immediately
+    /// with a JSON-RPC error mapped from `reason`. Returns silently if no
+    /// client is parked for that key (the error is best-effort).
+    pub async fn on_tx_error(&self, sender: Address, nonce: u64, reason: TxErrorReason) {
+        let key = (sender, nonce);
+        let entry = {
+            let Some(r) = self.map.get(&key) else {
+                return;
+            };
+            r.value().clone()
+        };
+        let mut e = entry.lock().await;
+        if let Some(resp) = e.responder.take() {
+            let err = match reason {
+                TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
+            };
+            let _ = resp.send(Err(err));
             drop(e);
             self.map.remove(&key);
         }
@@ -252,6 +277,51 @@ mod tests {
             .await;
         let res = waiter.await.unwrap().unwrap();
         assert_eq!(res.receipt.tx_idx, position);
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn tx_error_releases_parked_client_with_duplicate() {
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnQuorum));
+        let sender = Address::repeat_byte(0x55);
+        let nonce = 3u64;
+
+        let wait = p.register(sender, nonce);
+        let waiter =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        p.on_tx_error(
+            sender,
+            nonce,
+            TxErrorReason::DuplicatedTx { expected_nonce: 9 },
+        )
+        .await;
+
+        let err = waiter
+            .await
+            .expect("join")
+            .expect_err("on_tx_error must release with Err");
+        assert!(
+            matches!(err, IngressError::Duplicate((s, n)) if s == sender && n == nonce),
+            "got {err:?}"
+        );
+        assert_eq!(p.len(), 0, "entry removed on release");
+    }
+
+    #[tokio::test]
+    async fn tx_error_for_unparked_key_is_noop() {
+        // No client parked for this (sender, nonce) → on_tx_error returns
+        // silently without panicking.
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnQuorum));
+        p.on_tx_error(
+            Address::repeat_byte(0x77),
+            42,
+            TxErrorReason::DuplicatedTx {
+                expected_nonce: 100,
+            },
+        )
+        .await;
         assert_eq!(p.len(), 0);
     }
 

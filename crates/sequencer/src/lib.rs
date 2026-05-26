@@ -23,7 +23,6 @@
 //! zero secp256k1 work on the hot path.
 
 pub mod config;
-pub mod duplicate;
 pub mod error;
 pub mod inbound;
 pub mod metrics;
@@ -38,6 +37,9 @@ pub mod state;
 pub mod testing;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
-pub use duplicate::DuplicateNotification;
 pub use error::SequencerError;
 pub use sequencer::{Sequencer, Shutdown};
+
+// Re-export shared types so external callers can write
+// `kardamom_sequencer::TxError` without a separate dependency line.
+pub use ::kardamom_types::{TxError, TxErrorReason};

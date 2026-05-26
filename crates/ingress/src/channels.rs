@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 
 use kardamom_types::{
-    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
 
 use crate::error::IngressError;
@@ -52,6 +52,10 @@ pub trait IngressSubscription: Send + Sync + 'static {
     fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark>;
     /// Stream of `BlockBoundary` markers on tx_receipts; backs `eth_blockNumber`.
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary>;
+    /// Stream of `TxError` records emitted by the sequencer when an inbound
+    /// tx is rejected (e.g. past-nonce / duplicate). Drives early release of
+    /// parked client submissions with a JSON-RPC error.
+    fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError>;
 }
 
 // ============================================================================
@@ -68,6 +72,7 @@ pub struct MockChannels {
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub local_fsync_bus: broadcast::Sender<FsyncWatermark>,
     pub block_boundary_bus: broadcast::Sender<BlockBoundary>,
+    pub tx_error_bus: broadcast::Sender<TxError>,
 }
 
 impl MockChannels {
@@ -86,6 +91,7 @@ impl MockChannels {
         let (watermark_bus, _) = broadcast::channel(1024);
         let (local_fsync_bus, _) = broadcast::channel(1024);
         let (block_boundary_bus, _) = broadcast::channel(1024);
+        let (tx_error_bus, _) = broadcast::channel(1024);
         (
             Self {
                 tx_data_tx: tx_vec,
@@ -93,6 +99,7 @@ impl MockChannels {
                 watermark_bus,
                 local_fsync_bus,
                 block_boundary_bus,
+                tx_error_bus,
             },
             rx_vec,
         )
@@ -128,6 +135,9 @@ impl IngressSubscription for MockChannels {
     }
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary> {
         self.block_boundary_bus.subscribe()
+    }
+    fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
+        self.tx_error_bus.subscribe()
     }
 }
 

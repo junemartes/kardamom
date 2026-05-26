@@ -12,7 +12,7 @@ use alloy_primitives::{B256, Bytes as AlloyBytes};
 use alloy_rlp::Decodable;
 use tokio::sync::broadcast;
 
-use kardamom_types::{BlockBoundary, Receipt, StateDatabase, TxEnvelope};
+use kardamom_types::{BlockBoundary, Receipt, StateDatabase, TxEnvelope, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -129,6 +129,7 @@ where
             state_db,
         };
         me.spawn_tx_receipts_watcher();
+        me.spawn_tx_errors_watcher();
         // Only subscribe to watermark streams the configured policy needs.
         if me.cfg.ack_policy.requires_quorum() {
             me.spawn_quorum_watermark_watcher();
@@ -164,6 +165,22 @@ where
             // `fetch_max` keeps the counter monotonic without a lock.
             async move {
                 latest.fetch_max(b.block_number, Ordering::AcqRel);
+            }
+        });
+    }
+
+    fn spawn_tx_errors_watcher(&self) {
+        // The sequencer emits a `TxError` on the tx_errors channel when it
+        // rejects an inbound tx (duplicate / past-nonce today). Match it
+        // against parked submissions by `(sender, nonce)` and release the
+        // client immediately with a JSON-RPC error rather than letting them
+        // wait for a receipt that will never arrive.
+        let rx = self.subscription.subscribe_tx_errors();
+        let pending = self.pending.clone();
+        spawn_broadcast_watcher(rx, move |err: TxError| {
+            let pending = pending.clone();
+            async move {
+                pending.on_tx_error(err.sender, err.nonce, err.reason).await;
             }
         });
     }

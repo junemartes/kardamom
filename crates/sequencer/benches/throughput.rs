@@ -19,7 +19,7 @@ use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
@@ -87,7 +87,7 @@ fn bench_in_order(c: &mut Criterion) {
                     ),
                     DequeTxData(batch.clone().into_iter().collect()),
                     InMemoryTxOrderingRefPublisher::default(),
-                    InMemoryReceiptCachePublisher::default(),
+                    InMemoryTxErrorPublisher::default(),
                 )
             },
             |(mut seq, mut tx_data, mut bp, mut rc)| {

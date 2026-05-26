@@ -17,7 +17,7 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxOrderingMessage,
+    BPosition, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError, TxOrderingMessage,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -122,6 +122,7 @@ pub type TxDataSubscriber = TypedSubscriber<TxEnvelope>;
 /// fragment's canonical L2 position (system invariant I1).
 pub type TxOrderingSubscriber = TypedSubscriber<TxOrderingMessage>;
 pub type TxReceiptsSubscriber = TypedSubscriber<Receipt>;
+pub type TxErrorsSubscriber = TypedSubscriber<TxError>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
 pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
 
@@ -157,6 +158,14 @@ impl Subscribers {
             &self.aeron,
             &self.ch.tx_receipts_channel,
             self.ch.tx_receipts_stream_id,
+        )
+    }
+
+    pub fn tx_errors(&self) -> Result<TxErrorsSubscriber, LogError> {
+        TypedSubscriber::open(
+            &self.aeron,
+            &self.ch.tx_errors_channel,
+            self.ch.tx_errors_stream_id,
         )
     }
 

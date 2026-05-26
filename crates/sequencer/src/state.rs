@@ -14,7 +14,7 @@ use crate::pending::{InsertOutcome, PendingBuffer};
 #[derive(Debug, PartialEq, Eq)]
 pub enum ProcessAction<T> {
     Publish { nonce: u64, payload: T },
-    ReportDuplicate { nonce: u64 },
+    ReportDuplicate { nonce: u64, expected_nonce: u64 },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -75,7 +75,10 @@ impl<T> PartitionState<T> {
         let expected = self.next_nonce(sender);
         if nonce < expected {
             return ProcessResult {
-                actions: vec![ProcessAction::ReportDuplicate { nonce }],
+                actions: vec![ProcessAction::ReportDuplicate {
+                    nonce,
+                    expected_nonce: expected,
+                }],
                 outcome: NonceOutcome::Past,
             };
         }
@@ -250,7 +253,10 @@ mod tests {
         let out = st.process(s(1), 0, 999);
         assert_eq!(
             out.actions,
-            vec![ProcessAction::ReportDuplicate { nonce: 0 }]
+            vec![ProcessAction::ReportDuplicate {
+                nonce: 0,
+                expected_nonce: 2
+            }]
         );
         assert_eq!(out.outcome, NonceOutcome::Past);
         assert_eq!(st.next_nonce(s(1)), 2);

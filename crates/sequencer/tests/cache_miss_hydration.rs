@@ -15,7 +15,7 @@ use kardamom_types::{BPosition, TxEnvelope};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testing::FakeStateDatabase;
@@ -74,7 +74,7 @@ fn hydrates_committed_nonce_for_established_sender() {
         disconnected: false,
     };
     let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
 
     while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
 
@@ -97,7 +97,7 @@ fn hydrates_zero_for_brand_new_sender() {
         disconnected: false,
     };
     let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
 
     while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
 
@@ -121,7 +121,7 @@ fn hydration_runs_once_per_sender() {
         disconnected: false,
     };
     let mut b = InMemoryTxOrderingRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
 
     while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
 

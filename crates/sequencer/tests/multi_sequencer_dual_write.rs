@@ -30,7 +30,7 @@ use rand::seq::SliceRandom;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+    InMemoryTxErrorPublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::partition::partition_for;
 use kardamom_sequencer::sequencer::Sequencer;
@@ -89,7 +89,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     let mut sequencers: Vec<Sequencer<kardamom_sequencer::testing::FakeStateDatabase>> =
         Vec::with_capacity(M as usize);
     let mut b_pubs: Vec<InMemoryTxOrderingRefPublisher> = Vec::with_capacity(M as usize);
-    let mut rcs: Vec<InMemoryReceiptCachePublisher> = Vec::with_capacity(M as usize);
+    let mut rcs: Vec<InMemoryTxErrorPublisher> = Vec::with_capacity(M as usize);
     let mut channels_a: Vec<ScriptedTxData> = (0..M).map(|_| ScriptedTxData::default()).collect();
     // sender_at_pos[(shard, pos)] → (sender, nonce). Used to validate the
     // canonical-B refs resolve to expected envelopes.
@@ -108,7 +108,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
             std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
         ));
         b_pubs.push(b.clone());
-        rcs.push(InMemoryReceiptCachePublisher::default());
+        rcs.push(InMemoryTxErrorPublisher::default());
     }
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0FFEE);
@@ -240,11 +240,11 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
         );
     }
 
-    // No duplicates were reported (in-order tx_data reads, no past nonces).
+    // No tx_errors were emitted (in-order tx_data reads, no past nonces).
     for (i, rc) in rcs.iter().enumerate() {
         assert!(
-            rc.duplicates.lock().unwrap().is_empty(),
-            "sequencer {i} should not have reported duplicates"
+            rc.errors.lock().unwrap().is_empty(),
+            "sequencer {i} should not have emitted TxErrors"
         );
     }
 }

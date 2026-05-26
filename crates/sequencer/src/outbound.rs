@@ -15,17 +15,18 @@
 //! [`crate::state::PartitionState::reinsert_for_retry`] and the error
 //! bubbles up.
 //!
-//! In addition the sequencer publishes [`DuplicateNotification`]s for
-//! past-nonce txs on the **receipt-cache** channel
-//! ([`ReceiptCachePublisher`]).
+//! In addition the sequencer emits a [`types::TxError`] on the dedicated
+//! `tx_errors` channel ([`TxErrorPublisher`]) when an inbound tx fails the
+//! nonce gate (past-nonce / duplicate today; more variants in the future).
+//! Ingress consumes that channel and releases the parked client immediately
+//! with a JSON-RPC error.
 //!
 //! All surfaces are traits so unit tests can use the in-memory fakes
 //! (no Aeron media driver required); production wiring binds them to the
 //! real `kardamom_log::publisher` types.
 
-use kardamom_types::TxRef;
+use kardamom_types::{TxError, TxRef};
 
-use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
 
 /// TxOrdering publisher contract — the canonical orderer. Publishes tiny
@@ -38,11 +39,12 @@ pub trait TxOrderingRefPublisher: Send {
     fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError>;
 }
 
-/// Receipt-cache channel publisher. Best-effort: errors are logged by the
+/// TxErrors channel publisher. Best-effort: errors are logged by the
 /// caller and not propagated, because the canonical state has already
-/// advanced.
-pub trait ReceiptCachePublisher: Send {
-    fn publish_duplicate(&mut self, notification: DuplicateNotification);
+/// advanced (or the inbound tx was rejected and there's nothing to roll
+/// back).
+pub trait TxErrorPublisher: Send {
+    fn publish_error(&mut self, e: TxError);
 }
 
 // ===========================================================================
@@ -76,13 +78,13 @@ pub mod fakes {
     }
 
     #[derive(Default, Clone)]
-    pub struct InMemoryReceiptCachePublisher {
-        pub duplicates: Arc<Mutex<Vec<DuplicateNotification>>>,
+    pub struct InMemoryTxErrorPublisher {
+        pub errors: Arc<Mutex<Vec<TxError>>>,
     }
 
-    impl ReceiptCachePublisher for InMemoryReceiptCachePublisher {
-        fn publish_duplicate(&mut self, notification: DuplicateNotification) {
-            self.duplicates.lock().unwrap().push(notification);
+    impl TxErrorPublisher for InMemoryTxErrorPublisher {
+        fn publish_error(&mut self, e: TxError) {
+            self.errors.lock().unwrap().push(e);
         }
     }
 }
@@ -92,7 +94,7 @@ mod tests {
     use super::fakes::*;
     use super::*;
     use alloy_primitives::{Address, B256};
-    use kardamom_types::{BPosition, TxRef};
+    use kardamom_types::{BPosition, TxError, TxErrorReason, TxRef};
 
     #[test]
     fn fake_b_records_refs() {
@@ -115,13 +117,13 @@ mod tests {
     }
 
     #[test]
-    fn fake_receipt_cache_records_duplicates() {
-        let mut p = InMemoryReceiptCachePublisher::default();
-        p.publish_duplicate(DuplicateNotification {
-            correlation_id: 42,
+    fn fake_tx_error_records_emissions() {
+        let mut p = InMemoryTxErrorPublisher::default();
+        p.publish_error(TxError {
             sender: Address::repeat_byte(0xAB),
             nonce: 7,
+            reason: TxErrorReason::DuplicatedTx { expected_nonce: 10 },
         });
-        assert_eq!(p.duplicates.lock().unwrap().len(), 1);
+        assert_eq!(p.errors.lock().unwrap().len(), 1);
     }
 }
