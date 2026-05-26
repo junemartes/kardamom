@@ -1,4 +1,4 @@
-//! Position in Aeron channel B's recording — the canonical L2 tx identifier.
+//! Position in Aeron tx_ordering's recording — the canonical L2 tx identifier.
 
 use rkyv::{Archive, Deserialize, Serialize};
 

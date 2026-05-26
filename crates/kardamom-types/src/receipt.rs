@@ -20,7 +20,7 @@ pub struct WireLog {
     pub data: Bytes,
 }
 
-/// Per-tx execution receipt. Published on channel C by executor replicas.
+/// Per-tx execution receipt. Published on tx_receipts by executor replicas.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct Receipt {

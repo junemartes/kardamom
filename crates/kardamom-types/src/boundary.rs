@@ -4,7 +4,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::position::BPosition;
 
-/// Block-boundary marker emitted by the sealer onto channel B.
+/// Block-boundary marker emitted by the sealer onto tx_ordering.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct BlockBoundaryStart {
@@ -13,7 +13,7 @@ pub struct BlockBoundaryStart {
     pub l2_timestamp: u64,
 }
 
-/// Block-boundary closeout emitted by executors onto channel C once they have
+/// Block-boundary closeout emitted by executors onto tx_receipts once they have
 /// finished executing through `end_tx_idx`. No `state_root_commitment` field
 /// (D-Sh11 — state-root attestation is a deferred validator concern).
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
