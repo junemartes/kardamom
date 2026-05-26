@@ -179,7 +179,7 @@ impl Subscribers {
     }
 
     /// Subscribe to a sequencer-local tx_data fsync watermark stream
-    /// (one publisher per sequencer; see `fsync_watermark_tx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template`).
+    /// (one publisher per sequencer; see `fsync_watermark_tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template`).
     pub fn watermark_a(&self, sequencer_id: u8) -> Result<WatermarkSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
