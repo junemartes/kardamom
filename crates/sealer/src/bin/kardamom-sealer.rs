@@ -29,6 +29,11 @@ struct Args {
     /// Path to a TOML config file (schema: `SealerConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Aeron Media Driver directory (`aeron.dir`). If unset, uses the
+    /// default location embedded in the C client (typically
+    /// `/dev/shm/aeron-<user>`).
+    #[arg(long)]
+    aeron_dir: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -51,7 +56,10 @@ async fn main() -> Result<()> {
     channels.tx_ordering_channel = cfg.channel_b_uri.clone();
     channels.tx_ordering_stream_id = cfg.channel_b_boundary_stream_id;
 
-    let rt = AeronRuntime::spawn_default().context("spawn AeronRuntime")?;
+    let rt = match args.aeron_dir.as_ref() {
+        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
+        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
+    };
 
     // Bootstrap: drain the tx_ordering tail and pick `max(block_number) + 1`.
     let initial_block = bootstrap_block_number(&rt, &channels).await?;

@@ -36,6 +36,9 @@ struct Args {
     /// Path to a TOML config file (schema: `SequencerConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Aeron Media Driver directory (`aeron.dir`).
+    #[arg(long)]
+    aeron_dir: Option<PathBuf>,
     /// Override the partition index from the config.
     #[arg(long)]
     partition_index: Option<u32>,
@@ -82,7 +85,10 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let channels: ChannelsConfig = LogConfig::default().channels;
-    let rt = AeronRuntime::spawn_default().context("spawn AeronRuntime")?;
+    let rt = match args.aeron_dir.as_ref() {
+        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
+        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
+    };
 
     let shard_id = cfg.sequencer_id;
     let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)

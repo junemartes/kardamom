@@ -32,6 +32,9 @@ struct Args {
     /// Path to the TOML config file (schema: `ExecutorConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Aeron Media Driver directory (`aeron.dir`).
+    #[arg(long)]
+    aeron_dir: Option<PathBuf>,
     /// Number of tx_data shards to subscribe to (defaults to 8 — matches
     /// the default `partition_count` in the sequencer).
     #[arg(long, default_value_t = 8)]
@@ -64,7 +67,10 @@ async fn main() -> Result<()> {
     );
 
     let channels = LogConfig::default().channels;
-    let rt = AeronRuntime::spawn_default().context("spawn AeronRuntime")?;
+    let rt = match args.aeron_dir.as_ref() {
+        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
+        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
+    };
 
     // M tx_data subscriptions, one per shard. We bridge each handle's
     // async `recv()` to a synchronous `next()` (what the executor's reader

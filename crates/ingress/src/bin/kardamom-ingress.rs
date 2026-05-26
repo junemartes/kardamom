@@ -38,6 +38,9 @@ struct Args {
     /// Path to the TOML config file (schema: `IngressConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Aeron Media Driver directory (`aeron.dir`).
+    #[arg(long)]
+    aeron_dir: Option<PathBuf>,
     /// JSON-RPC bind address. Defaults to 127.0.0.1:8545.
     #[arg(long, default_value = "127.0.0.1:8545")]
     jsonrpc_bind: SocketAddr,
@@ -80,7 +83,10 @@ async fn main() -> Result<()> {
     );
 
     let channels = LogConfig::default().channels;
-    let rt = AeronRuntime::spawn_default().context("spawn AeronRuntime")?;
+    let rt = match args.aeron_dir.as_ref() {
+        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
+        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
+    };
 
     let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
         .context("open IngressPublication")?;
