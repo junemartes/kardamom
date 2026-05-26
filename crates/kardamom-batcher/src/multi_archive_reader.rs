@@ -1,7 +1,7 @@
 //! M-archive offline reader (D-Sh12 / spec D11 / §2.8).
 //!
 //! After D-Sh12 the canonical-ordering archive (channel B) carries only
-//! [`ChannelBMessage`] records — `TxRef` (pointer into channel A[i]) and
+//! [`TxOrderingMessage`] records — `TxRef` (pointer into channel A[i]) and
 //! `BlockBoundaryStart` (sealer). Full [`TxEnvelope`] bytes live on the
 //! per-sequencer channel A archives.
 //!
@@ -12,9 +12,9 @@
 //!    each into a `(BPosition -> TxEnvelope)` map. (For v0 the offline path
 //!    materialises the per-A index in RAM — fine for batch sizes that fit a
 //!    few segment files. Streaming/page-cache modes are a future scale-up.)
-//! 3. Walk channel B in order; for each [`ChannelBMessage::TxRef`] resolve
-//!    `(sequencer_id, position_a)` against the right per-A index; for each
-//!    [`ChannelBMessage::BoundaryStart`] yield the boundary marker.
+//! 3. Walk channel B in order; for each [`TxOrderingMessage::TxRef`] resolve
+//!    `(sequencer_id, tx_data_position)` against the right per-A index; for each
+//!    [`TxOrderingMessage::BoundaryStart`] yield the boundary marker.
 //!
 //! The output is a stream of [`ResolvedRecord`]s — exactly the shape the
 //! existing [`crate::batch::BatchAccumulator`] consumed before D-Sh12. The
@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use kardamom_types::{BPosition, BlockBoundaryStart, ChannelBMessage, TxEnvelope, TxRef};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 
 use crate::archive_reader::{ChannelASegmentReader, ChannelBSegmentReader};
 use crate::error::BatcherError;
@@ -49,7 +49,7 @@ pub enum ResolvedRecord {
         /// for the per-A reader's own bookkeeping. Carried through so test
         /// asserts can verify resolution went to the right A-archive.
         sequencer_id: u8,
-        position_a: BPosition,
+        tx_data_position: BPosition,
         env: TxEnvelope,
     },
     Boundary {
@@ -161,10 +161,10 @@ impl MultiArchiveReader {
                 r.shard_id
             ))
         })?;
-        idx.get(&r.position_a).cloned().ok_or_else(|| {
+        idx.get(&r.tx_data_position).cloned().ok_or_else(|| {
             BatcherError::Frame(format!(
-                "TxRef sequencer_id={} position_a={:?} not found in channel-A index",
-                r.shard_id, r.position_a
+                "TxRef sequencer_id={} tx_data_position={:?} not found in channel-A index",
+                r.shard_id, r.tx_data_position
             ))
         })
     }
@@ -181,16 +181,16 @@ impl Iterator for MultiArchiveReader {
         };
         let position = rec.position;
         match rec.value {
-            ChannelBMessage::TxRef(r) => match self.resolve(&r) {
+            TxOrderingMessage::TxRef(r) => match self.resolve(&r) {
                 Ok(env) => Some(Ok(ResolvedRecord::Tx {
                     position,
                     sequencer_id: r.shard_id,
-                    position_a: r.position_a,
+                    tx_data_position: r.tx_data_position,
                     env,
                 })),
                 Err(e) => Some(Err(e)),
             },
-            ChannelBMessage::BoundaryStart(b) => Some(Ok(ResolvedRecord::Boundary {
+            TxOrderingMessage::BoundaryStart(b) => Some(Ok(ResolvedRecord::Boundary {
                 position,
                 marker: b,
             })),

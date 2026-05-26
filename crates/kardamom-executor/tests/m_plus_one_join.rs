@@ -178,7 +178,7 @@ fn m4_canonical_b_order_drives_receipts() {
 
     let bus = FakeBus::new();
     // Per-sequencer channel-A pub/sub pairs. Channel URI / stream-id match
-    // the `ChannelsConfig::tx_dattx_dattx_data_channel_template` convention.
+    // the `ChannelsConfig::tx_dattx_dattx_dattx_data_channel_template` convention.
     let mut a_pubs: Vec<FakeChannelAPublication> = Vec::with_capacity(M as usize);
     let mut a_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
     for sid in 0..M {

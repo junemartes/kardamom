@@ -10,8 +10,8 @@
 //!
 //! After D-Sh12 the batcher reads from `M + 1` archives, not one:
 //!
-//! - **Channel B archive** carries the canonical orderer payload — only
-//!   `ChannelBMessage` records (`TxRef + BoundaryStart`). Tiny per-record.
+//! - **TxOrdering archive** carries the canonical orderer payload — only
+//!   `TxOrderingMessage` records (`TxRef + BoundaryStart`). Tiny per-record.
 //! - **Per-sequencer channel A archives** carry the bulk `TxEnvelope` bytes.
 //!   One per sequencer; opened on demand by [`multi_archive_reader`].
 //!

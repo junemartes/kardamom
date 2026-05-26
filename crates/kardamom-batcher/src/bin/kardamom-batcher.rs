@@ -30,7 +30,7 @@ use tracing::{info, warn};
 #[command(name = "kardamom-batcher", version)]
 struct Cli {
     /// Path to the channel-B Aeron Archive segment file (.rec) — the
-    /// canonical orderer carrying `ChannelBMessage` records (TxRef + boundary).
+    /// canonical orderer carrying `TxOrderingMessage` records (TxRef + boundary).
     #[arg(long, alias = "segment")]
     channel_b_segment: PathBuf,
 

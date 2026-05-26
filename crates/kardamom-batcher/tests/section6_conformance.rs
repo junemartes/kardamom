@@ -3,7 +3,7 @@
 //! End-to-end exercise of the **new D-Sh12 M+1 archive topology**:
 //!
 //! 1. Build per-sequencer channel-A archives with full `TxEnvelope` bytes.
-//! 2. Build the channel-B archive with the canonical `ChannelBMessage`
+//! 2. Build the channel-B archive with the canonical `TxOrderingMessage`
 //!    record stream (`TxRef + BoundaryStart`).
 //! 3. Drive the offline `MultiArchiveReader` → `BatchAccumulator` →
 //!    `pack_blocks` pipeline to produce the same `PostedBatch` the
@@ -43,7 +43,7 @@ use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use kardamom_leases::{Lease, LeaseConfig};
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, ChannelBMessage, FsyncWatermark, QuorumWatermark, TxEnvelope,
+    BPosition, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, TxEnvelope, TxOrderingMessage,
     TxRef,
 };
 use tempfile::TempDir;
@@ -113,7 +113,7 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
         append_frame(
             &mut b_buf,
             pos(b_off),
-            &ChannelBMessage::TxRef(TxRef::new(
+            &TxOrderingMessage::TxRef(TxRef::new(
                 alloy_primitives::B256::repeat_byte(hash_seed),
                 0,
                 *a_pos,
@@ -124,7 +124,7 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
         append_frame(
             &mut b_buf,
             pos(b_off),
-            &ChannelBMessage::TxRef(TxRef::new(
+            &TxOrderingMessage::TxRef(TxRef::new(
                 alloy_primitives::B256::repeat_byte(hash_seed),
                 1,
                 *a_pos,
@@ -136,7 +136,7 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
     append_frame(
         &mut b_buf,
         boundary_pos,
-        &ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+        &TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 42,
             end_tx_idx: boundary_pos,
             l2_timestamp: 1_700_000_042,

@@ -14,7 +14,7 @@
 //! filesystem path covers the spec and matches the layout the recorder writes.
 //!
 //! After D-Sh12 the batcher resolves a B-archive recording (channel B,
-//! `T = ChannelBMessage`) plus M per-sequencer A-archive recordings
+//! `T = TxOrderingMessage`) plus M per-sequencer A-archive recordings
 //! (channel A[i], `T = TxEnvelope`). This module produces one
 //! `LiveSegmentDescriptor` per recording id — callers compose them into the
 //! [`crate::multi_archive_reader::MultiArchiveReader`].
@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use kardamom_types::{ChannelBMessage, TxEnvelope};
+use kardamom_types::{TxEnvelope, TxOrderingMessage};
 
 use rusteron_archive::{
     AeronArchive, AeronArchiveRecordingDescriptor,
@@ -63,7 +63,7 @@ impl LiveSegmentDescriptor {
             term_buffer_length,
             segment_file_length,
         );
-        let segment_path = TypedSegmentReader::<ChannelBMessage>::segment_path(
+        let segment_path = TypedSegmentReader::<TxOrderingMessage>::segment_path(
             &archive_dir,
             recording_id,
             segment_base,
@@ -79,7 +79,7 @@ impl LiveSegmentDescriptor {
 
     /// Open a channel-B typed reader over this descriptor's segment file.
     pub fn open_b(&self) -> Result<ChannelBSegmentReader, BatcherError> {
-        TypedSegmentReader::<ChannelBMessage>::open(&self.segment_path)
+        TypedSegmentReader::<TxOrderingMessage>::open(&self.segment_path)
     }
 
     /// Open a channel-A typed reader over this descriptor's segment file.

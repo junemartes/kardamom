@@ -12,7 +12,7 @@
 //! **D-Sh12 v0 scope:** brings up the Aeron container, writes synthetic
 //! segment files in the canonical KAR1-internal frame format that the
 //! batcher's offline `TypedSegmentReader` consumes:
-//!   - one **channel-B** archive carrying `ChannelBMessage` records
+//!   - one **channel-B** archive carrying `TxOrderingMessage` records
 //!     (`TxRef + BoundaryStart`); and
 //!   - one or more **per-sequencer channel-A** archives carrying the full
 //!     `TxEnvelope` records the refs point at.
@@ -46,7 +46,7 @@ use kardamom_batcher::recon::reconstruct;
 use kardamom_leases::{Lease, LeaseConfig};
 use kardamom_log::testing::AeronTestCluster;
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, ChannelBMessage, FsyncWatermark, QuorumWatermark, TxEnvelope,
+    BPosition, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, TxEnvelope, TxOrderingMessage,
     TxRef,
 };
 use tempfile::TempDir;
@@ -112,13 +112,13 @@ fn write_synthetic_archives(
         .write_all(&a1_buf)
         .unwrap();
 
-    // Channel B: refs alternate sequencers in the canonical order, then a
+    // TxOrdering: refs alternate sequencers in the canonical order, then a
     // single boundary closes the block.
     let mut b_buf = Vec::new();
     append_frame(
         &mut b_buf,
         pos(0),
-        &ChannelBMessage::TxRef(TxRef::new(
+        &TxOrderingMessage::TxRef(TxRef::new(
             alloy_primitives::B256::repeat_byte(0x01),
             0,
             pos(0),
@@ -127,7 +127,7 @@ fn write_synthetic_archives(
     append_frame(
         &mut b_buf,
         pos(16),
-        &ChannelBMessage::TxRef(TxRef::new(
+        &TxOrderingMessage::TxRef(TxRef::new(
             alloy_primitives::B256::repeat_byte(0x02),
             1,
             pos(0),
@@ -136,7 +136,7 @@ fn write_synthetic_archives(
     append_frame(
         &mut b_buf,
         pos(32),
-        &ChannelBMessage::TxRef(TxRef::new(
+        &TxOrderingMessage::TxRef(TxRef::new(
             alloy_primitives::B256::repeat_byte(0x03),
             0,
             pos(128),
@@ -145,7 +145,7 @@ fn write_synthetic_archives(
     append_frame(
         &mut b_buf,
         pos(48),
-        &ChannelBMessage::TxRef(TxRef::new(
+        &TxOrderingMessage::TxRef(TxRef::new(
             alloy_primitives::B256::repeat_byte(0x04),
             1,
             pos(128),
@@ -154,7 +154,7 @@ fn write_synthetic_archives(
     append_frame(
         &mut b_buf,
         pos(64),
-        &ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+        &TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 1,
             end_tx_idx: pos(64),
             l2_timestamp: 1_700_000_000,

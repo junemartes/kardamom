@@ -7,9 +7,9 @@
 //!
 //! After D-Sh12 the on-disk archives carry **two different payload types**:
 //!
-//! - **Channel B** segments carry [`ChannelBMessage`] records (`TxRef +
+//! - **TxOrdering** segments carry [`TxOrderingMessage`] records (`TxRef +
 //!   BoundaryStart`) — the canonical orderer.
-//! - **Per-sequencer Channel A** segments carry full [`TxEnvelope`] records —
+//! - **Per-sequencer TxData** segments carry full [`TxEnvelope`] records —
 //!   the bulk transaction data.
 //!
 //! The simplified on-disk frame format the batcher uses for v0 is one
@@ -36,7 +36,7 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use kardamom_types::{BPosition, ChannelBMessage, TxEnvelope};
+use kardamom_types::{BPosition, TxEnvelope, TxOrderingMessage};
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
 
@@ -47,7 +47,7 @@ const FRAME_ALIGN: usize = 8;
 
 /// One decoded record from a typed segment file. The position is the
 /// fragment's start position on the originating Aeron stream — for channel A
-/// segments this is the position a sequencer recorded in [`TxRef::position_a`].
+/// segments this is the position a sequencer recorded in [`TxRef::tx_data_position`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedRecord<T> {
     pub position: BPosition,
@@ -56,7 +56,7 @@ pub struct TypedRecord<T> {
 
 /// Generic offline reader over an archive segment file. The type parameter
 /// `T` is the rkyv-archived payload carried by every frame in this segment.
-/// For channel B archives use `T = ChannelBMessage`; for channel A archives
+/// For channel B archives use `T = TxOrderingMessage`; for channel A archives
 /// use `T = TxEnvelope`.
 pub struct TypedSegmentReader<T> {
     bytes: Vec<u8>,
@@ -139,11 +139,11 @@ where
     }
 }
 
-/// Channel B segment reader: yields [`ChannelBMessage`] records (TxRef +
+/// TxOrdering segment reader: yields [`TxOrderingMessage`] records (TxRef +
 /// BoundaryStart) in canonical order.
-pub type ChannelBSegmentReader = TypedSegmentReader<ChannelBMessage>;
+pub type ChannelBSegmentReader = TypedSegmentReader<TxOrderingMessage>;
 
-/// Channel A[i] segment reader: yields full [`TxEnvelope`] records in the
+/// TxData[i] segment reader: yields full [`TxEnvelope`] records in the
 /// order sequencer `i` wrote them.
 pub type ChannelASegmentReader = TypedSegmentReader<TxEnvelope>;
 
@@ -160,7 +160,7 @@ where
 /// adapter; encodes one record in the simplified KAR1-internal segment format.
 ///
 /// The frame is type-agnostic: caller writes the same way for channel A
-/// (T = TxEnvelope) and channel B (T = ChannelBMessage).
+/// (T = TxEnvelope) and channel B (T = TxOrderingMessage).
 pub fn append_frame<T>(out: &mut Vec<u8>, position: BPosition, value: &T)
 where
     T: for<'a> rkyv::Serialize<

@@ -24,7 +24,7 @@ use kardamom_batcher::error::BatcherError;
 use kardamom_batcher::multi_archive_reader::{
     MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
 };
-use kardamom_types::{BPosition, BlockBoundaryStart, ChannelBMessage, TxEnvelope, TxRef};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 use tempfile::TempDir;
 
 fn pos(o: i32) -> BPosition {
@@ -72,7 +72,7 @@ fn happy_path_in_order_resolution() {
     let a0 = write_segment(&dir, "a0.rec", &[(pos(0), tx(10)), (pos(128), tx(11))]);
     let a1 = write_segment(&dir, "a1.rec", &[(pos(0), tx(20)), (pos(128), tx(21))]);
 
-    // Channel B records the canonical order: interleaved refs from both
+    // TxOrdering records the canonical order: interleaved refs from both
     // sequencers, then a boundary.
     let b = write_segment(
         &dir,
@@ -80,23 +80,23 @@ fn happy_path_in_order_resolution() {
         &[
             (
                 pos(0),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
             ),
             (
                 pos(16),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(0))),
             ),
             (
                 pos(32),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
             ),
             (
                 pos(48),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(128))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(128))),
             ),
             (
                 pos(64),
-                ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                     block_number: 1,
                     end_tx_idx: pos(64),
                     l2_timestamp: 1_700_000_000,
@@ -151,7 +151,7 @@ fn happy_path_in_order_resolution() {
 
 #[test]
 fn out_of_order_b_refs_a_positions_still_resolve() {
-    // Channel B carries refs in the canonical order — which may point at
+    // TxOrdering carries refs in the canonical order — which may point at
     // A-positions on different sequencers and in non-monotone A-position
     // order (a sequencer that wrote envelopes to its own A at positions 0,
     // 128, 256 may have those positions appear on B in the order 256, 128,
@@ -172,19 +172,19 @@ fn out_of_order_b_refs_a_positions_still_resolve() {
         &[
             (
                 pos(0),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(256))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(256))),
             ),
             (
                 pos(16),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
             ),
             (
                 pos(32),
-                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
             ),
             (
                 pos(48),
-                ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                     block_number: 7,
                     end_tx_idx: pos(48),
                     l2_timestamp: 1_700_000_007,
@@ -229,7 +229,7 @@ fn missing_a_archive_surfaces_as_config_error() {
         "b.rec",
         &[(
             pos(0),
-            ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 99, pos(0))),
+            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 99, pos(0))),
         )],
     );
 
@@ -258,7 +258,7 @@ fn missing_a_position_surfaces_as_frame_error() {
         "b.rec",
         &[(
             pos(0),
-            ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(9999))),
+            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(9999))),
         )],
     );
 
