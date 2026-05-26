@@ -170,10 +170,10 @@ impl PendingReceipts {
     /// Whether the configured policy is satisfied for `target` given the
     /// currently observed watermarks. An `OnOffer` policy is always satisfied.
     fn gate_satisfied(&self, latest: &Watermarks, target: BPosition) -> bool {
-        let local_ok = !self.policy.requires_local_fsync()
-            || latest.local.is_some_and(|p| p >= target);
-        let quorum_ok = !self.policy.requires_quorum()
-            || latest.quorum.is_some_and(|p| p >= target);
+        let local_ok =
+            !self.policy.requires_local_fsync() || latest.local.is_some_and(|p| p >= target);
+        let quorum_ok =
+            !self.policy.requires_quorum() || latest.quorum.is_some_and(|p| p >= target);
         local_ok && quorum_ok
     }
 
