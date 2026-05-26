@@ -100,7 +100,7 @@ fn populate(
             a_tx.send((position_a, env)).unwrap();
             b_tx.send((
                 bpos(bpos_off),
-                ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+                ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
             ))
             .unwrap();
             bpos_off += 1;
