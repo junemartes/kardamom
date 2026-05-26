@@ -3788,17 +3788,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kardamom-leases"
-version = "0.1.0"
-dependencies = [
- "kardamom-log",
- "kardamom-types",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "kardamom-log"
 version = "0.1.0"
 dependencies = [
