@@ -35,12 +35,12 @@ use std::rc::Rc;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::publisher::{
-    ChannelCPublisher, QuorumPublisher, ReceiptCachePublisher, TxDataPublisher,
-    TxOrderingPublisher, WatermarkAPublisher, WatermarkPublisher,
+    QuorumPublisher, ReceiptCachePublisher, TxDataPublisher, TxOrderingPublisher,
+    TxReceiptsPublisher, WatermarkAPublisher, WatermarkPublisher,
 };
 use crate::subscriber::{
-    ChannelBSubscriber, ChannelCReceiptSubscriber, QuorumSubscriber, ReceiptCacheSubscriber,
-    Subscribers, TxDataSubscriber, WatermarkSubscriber,
+    QuorumSubscriber, ReceiptCacheSubscriber, Subscribers, TxDataSubscriber, TxOrderingSubscriber,
+    TxReceiptsSubscriber, WatermarkSubscriber,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -88,12 +88,12 @@ impl AeronRuntime {
     /// shard (warm cache); executors / batchers open M of these (one per
     /// shard).
     pub fn tx_data_subscriber(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
-        self.subscribers().a(sequencer_id)
+        self.subscribers().tx_data(sequencer_id)
     }
 
     /// Open the per-A fsync watermark publisher. Opened by the proxy host
     /// that owns the tx_data shard.
-    pub fn channel_a_watermark_publisher(
+    pub fn tx_data_watermark_publisher(
         &self,
         sequencer_id: u8,
     ) -> Result<WatermarkAPublisher, LogError> {
@@ -101,7 +101,7 @@ impl AeronRuntime {
     }
 
     /// Subscribe to a per-A fsync watermark.
-    pub fn channel_a_watermark_subscriber(
+    pub fn tx_data_watermark_subscriber(
         &self,
         sequencer_id: u8,
     ) -> Result<WatermarkSubscriber, LogError> {
@@ -116,20 +116,20 @@ impl AeronRuntime {
         TxOrderingPublisher::open(&self.aeron, &self.channels)
     }
 
-    pub fn tx_ordering_subscriber(&self) -> Result<ChannelBSubscriber, LogError> {
-        self.subscribers().b()
+    pub fn tx_ordering_subscriber(&self) -> Result<TxOrderingSubscriber, LogError> {
+        self.subscribers().tx_ordering()
     }
 
     // -----------------------------------------------------------------------
     // TxReceipts (receipts, RAM only)
     // -----------------------------------------------------------------------
 
-    pub fn channel_c_publisher(&self) -> Result<ChannelCPublisher, LogError> {
-        ChannelCPublisher::open(&self.aeron, &self.channels)
+    pub fn tx_receipts_publisher(&self) -> Result<TxReceiptsPublisher, LogError> {
+        TxReceiptsPublisher::open(&self.aeron, &self.channels)
     }
 
-    pub fn channel_c_receipt_subscriber(&self) -> Result<ChannelCReceiptSubscriber, LogError> {
-        self.subscribers().c_receipts()
+    pub fn tx_receipts_subscriber(&self) -> Result<TxReceiptsSubscriber, LogError> {
+        self.subscribers().tx_receipts()
     }
 
     // -----------------------------------------------------------------------
@@ -148,14 +148,14 @@ impl AeronRuntime {
     // TxOrdering fsync watermarks + quorum
     // -----------------------------------------------------------------------
 
-    pub fn channel_b_watermark_publisher(
+    pub fn tx_ordering_watermark_publisher(
         &self,
         recorder_id: u8,
     ) -> Result<WatermarkPublisher, LogError> {
         WatermarkPublisher::open(&self.aeron, &self.channels, recorder_id)
     }
 
-    pub fn channel_b_watermark_subscriber(
+    pub fn tx_ordering_watermark_subscriber(
         &self,
         recorder_id: u8,
     ) -> Result<WatermarkSubscriber, LogError> {

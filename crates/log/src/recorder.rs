@@ -114,8 +114,8 @@ impl Recorder {
     ) -> Result<Self, LogError> {
         Self::start_inner(
             archive,
-            &ch.a_channel(sequencer_id),
-            ch.a_stream_id(sequencer_id),
+            &ch.tx_data_channel(sequencer_id),
+            ch.tx_data_stream_id(sequencer_id),
             recorder_id,
             RecorderKind::TxData { sequencer_id },
             archive_dir,

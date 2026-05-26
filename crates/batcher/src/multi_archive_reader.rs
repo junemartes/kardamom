@@ -7,8 +7,8 @@
 //!
 //! This module ties the two together for the offline batcher pipeline:
 //!
-//! 1. Open one [`ChannelBSegmentReader`] for the canonical orderer.
-//! 2. Open one [`ChannelASegmentReader`] per discovered sequencer; pre-load
+//! 1. Open one [`TxOrderingSegmentReader`] for the canonical orderer.
+//! 2. Open one [`TxDataSegmentReader`] per discovered sequencer; pre-load
 //!    each into a `(BPosition -> TxEnvelope)` map. (For v0 the offline path
 //!    materialises the per-A index in RAM — fine for batch sizes that fit a
 //!    few segment files. Streaming/page-cache modes are a future scale-up.)
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 
-use crate::archive_reader::{ChannelASegmentReader, ChannelBSegmentReader};
+use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader};
 use crate::error::BatcherError;
 
 /// A record resolved from the M+1 archive topology back into the legacy
@@ -109,7 +109,7 @@ type PerASegmentIndex = HashMap<BPosition, TxEnvelope>;
 /// M-archive offline reader. Walks tx_ordering in canonical order, resolving
 /// each `TxRef` against the per-sequencer A indexes.
 pub struct MultiArchiveReader {
-    b_reader: ChannelBSegmentReader,
+    b_reader: TxOrderingSegmentReader,
     /// `sequencer_id -> (BPosition -> TxEnvelope)` index.
     a_indexes: HashMap<u8, PerASegmentIndex>,
 }
@@ -118,7 +118,7 @@ impl MultiArchiveReader {
     /// Open all archives, eagerly load per-A indexes, and return a reader
     /// that can be iterated to yield [`ResolvedRecord`]s in canonical order.
     pub fn open(cfg: &MultiArchiveConfig) -> Result<Self, BatcherError> {
-        let b_reader = ChannelBSegmentReader::open(&cfg.b_segment)?;
+        let b_reader = TxOrderingSegmentReader::open(&cfg.b_segment)?;
         let mut a_indexes = HashMap::with_capacity(cfg.a_segments.len());
         for (sid, path) in &cfg.a_segments {
             let idx = load_a_index(path)?;
@@ -137,7 +137,7 @@ impl MultiArchiveReader {
         b_segment: &Path,
         a_indexes: HashMap<u8, PerASegmentIndex>,
     ) -> Result<Self, BatcherError> {
-        let b_reader = ChannelBSegmentReader::open(b_segment)?;
+        let b_reader = TxOrderingSegmentReader::open(b_segment)?;
         Ok(Self {
             b_reader,
             a_indexes,
@@ -201,7 +201,7 @@ impl Iterator for MultiArchiveReader {
 /// Read a tx_data segment file fully and build the `BPosition ->
 /// TxEnvelope` lookup.
 pub fn load_a_index(path: &Path) -> Result<PerASegmentIndex, BatcherError> {
-    let reader = ChannelASegmentReader::open(path)?;
+    let reader = TxDataSegmentReader::open(path)?;
     let mut idx = HashMap::new();
     for rec in reader {
         let rec = rec?;

@@ -141,11 +141,11 @@ where
 
 /// TxOrdering segment reader: yields [`TxOrderingMessage`] records (TxRef +
 /// BoundaryStart) in canonical order.
-pub type ChannelBSegmentReader = TypedSegmentReader<TxOrderingMessage>;
+pub type TxOrderingSegmentReader = TypedSegmentReader<TxOrderingMessage>;
 
 /// TxData[i] segment reader: yields full [`TxEnvelope`] records in the
 /// order sequencer `i` wrote them.
-pub type ChannelASegmentReader = TypedSegmentReader<TxEnvelope>;
+pub type TxDataSegmentReader = TypedSegmentReader<TxEnvelope>;
 
 fn access_owned<T>(bytes: &[u8]) -> Result<T, BatcherError>
 where

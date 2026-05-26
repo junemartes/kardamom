@@ -23,13 +23,13 @@ pub enum ExecutorError {
     },
 
     #[error("tx_ordering subscription closed")]
-    ChannelBClosed,
+    TxOrderingClosed,
 
     #[error("tx_data[{sequencer_id}] subscription closed")]
-    ChannelAClosed { sequencer_id: u8 },
+    TxDataClosed { sequencer_id: u8 },
 
     #[error("tx_receipts publication closed")]
-    ChannelCClosed,
+    TxReceiptsClosed,
 
     #[error("state-writer signal channel closed")]
     StateWriterClosed,

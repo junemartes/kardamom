@@ -20,9 +20,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use executor::{
-    BPosition, BlockBoundaryStart, CMessage, ChannelCPublication, Executor, ExecutorConfig,
-    ExecutorError, MockStateDatabase, MutatingSnapshotSource, StateWriterSignal,
-    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
+    BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxDataSubscription,
+    TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
     TxRef, WriterApplyingQueue,
 };
 
@@ -35,7 +35,7 @@ impl TxDataSubscription for ChanASub {
         self.sequencer_id
     }
     fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::ChannelAClosed {
+        self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
     }
@@ -43,13 +43,13 @@ impl TxDataSubscription for ChanASub {
 struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
 impl TxOrderingSubscription for ChanBSub {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
+        self.0.recv().map_err(|_| ExecutorError::TxOrderingClosed)
     }
 }
 struct ChanCPub(Sender<CMessage>);
-impl ChannelCPublication for ChanCPub {
+impl TxReceiptsPublication for ChanCPub {
     fn publish(&mut self, m: CMessage) -> Result<(), ExecutorError> {
-        self.0.send(m).map_err(|_| ExecutorError::ChannelCClosed)
+        self.0.send(m).map_err(|_| ExecutorError::TxReceiptsClosed)
     }
 }
 struct Imm;

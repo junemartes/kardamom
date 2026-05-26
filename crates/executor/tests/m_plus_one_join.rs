@@ -37,13 +37,13 @@ use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
 use executor::{
-    BPosition, BlockBoundaryStart, CMessage, ChannelCPublication, Executor, ExecutorConfig,
-    ExecutorError, MockStateDatabase, MutatingSnapshotSource, ReaderConfig, StateWriterSignal,
-    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
+    BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
+    MockStateDatabase, MutatingSnapshotSource, ReaderConfig, StateWriterSignal, TxDataSubscription,
+    TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
     TxRef, WriterApplyingQueue,
 };
 use log::testing::{
-    FakeBus, FakeChannelAPublication, FakeChannelBPublication, FakeTxDataSubscription,
+    FakeBus, FakeTxDataPublication, FakeTxDataSubscription, FakeTxOrderingPublication,
     FakeTxOrderingSubscription,
 };
 
@@ -79,7 +79,7 @@ impl TxDataSubscription for FakeASubAdapter {
                 return Ok(p);
             }
             if self.closed.load(Ordering::Acquire) {
-                return Err(ExecutorError::ChannelAClosed {
+                return Err(ExecutorError::TxDataClosed {
                     sequencer_id: self.sequencer_id,
                 });
             }
@@ -108,7 +108,7 @@ impl TxOrderingSubscription for FakeBSubAdapter {
                 return Ok(p);
             }
             if self.closed.load(Ordering::Acquire) {
-                return Err(ExecutorError::ChannelBClosed);
+                return Err(ExecutorError::TxOrderingClosed);
             }
             thread::sleep(Duration::from_micros(50));
         }
@@ -116,9 +116,11 @@ impl TxOrderingSubscription for FakeBSubAdapter {
 }
 
 struct ChanCPub(Sender<CMessage>);
-impl ChannelCPublication for ChanCPub {
+impl TxReceiptsPublication for ChanCPub {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
-        self.0.send(msg).map_err(|_| ExecutorError::ChannelCClosed)
+        self.0
+            .send(msg)
+            .map_err(|_| ExecutorError::TxReceiptsClosed)
     }
 }
 
@@ -178,16 +180,16 @@ fn m4_canonical_b_order_drives_receipts() {
 
     let bus = FakeBus::new();
     // Per-sequencer tx_data pub/sub pairs. Channel URI / stream-id match
-    // the `ChannelsConfig::tx_dattx_dattx_dattx_dattx_dattx_data_channel_template` convention.
-    let mut a_pubs: Vec<FakeChannelAPublication> = Vec::with_capacity(M as usize);
+    // the `ChannelsConfig::tx_data_channel_template` convention.
+    let mut a_pubs: Vec<FakeTxDataPublication> = Vec::with_capacity(M as usize);
     let mut a_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
     for sid in 0..M {
         let chan = format!("aeron:ipc?alias=a-{sid}");
         let stream_id = 2000 + (sid as i32);
-        a_pubs.push(FakeChannelAPublication::open(&bus, sid, &chan, stream_id));
+        a_pubs.push(FakeTxDataPublication::open(&bus, sid, &chan, stream_id));
         a_sub_handles.push(FakeTxDataSubscription::open(&bus, &chan, stream_id));
     }
-    let b_pub = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
+    let b_pub = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
     let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     // Phase 1: every sequencer publishes its envelopes onto tx_data.
@@ -376,9 +378,9 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         .build();
 
     let bus = FakeBus::new();
-    let a_pub = FakeChannelAPublication::open(&bus, 0, "aeron:ipc?alias=a-0", 2000);
+    let a_pub = FakeTxDataPublication::open(&bus, 0, "aeron:ipc?alias=a-0", 2000);
     let a_sub_handle = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-0", 2000);
-    let b_pub = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
+    let b_pub = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
     let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     let env = transfer(&signer, 0, to);
@@ -390,7 +392,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     let env_clone = env.clone();
     let a_inserter = thread::spawn(move || {
         thread::sleep(Duration::from_millis(30));
-        let _a_pub_late = FakeChannelAPublication::open(&bus_clone, 0, "aeron:ipc?alias=a-0", 2000);
+        let _a_pub_late = FakeTxDataPublication::open(&bus_clone, 0, "aeron:ipc?alias=a-0", 2000);
         // Use the original pub handle captured before; reopening would
         // grab the same underlying stream. Either works.
         let _ = _a_pub_late.publish(&env_clone).expect("publish A late");

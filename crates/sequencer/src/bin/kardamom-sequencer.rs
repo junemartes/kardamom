@@ -69,7 +69,7 @@ fn main() -> anyhow::Result<()> {
         // (without an explicit --sequencer-id or a TOML override) and the
         // TOML left the field at its default of 0, derive the conventional
         // "one sequencer per partition" id automatically. This avoids the
-        // failure mode where every process writes ChannelB refs with
+        // failure mode where every process writes tx_ordering refs with
         // sequencer_id=0 and downstream consumers can't tell them apart.
         cfg.sequencer_id = cfg.partition_index as u8;
         tracing::info!(

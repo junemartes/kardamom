@@ -9,7 +9,7 @@
 //!   per-A buffer indexed by `(sequencer_id, BPosition)`.
 //! - One `TxOrderingPublisher` (concurrent) publishes `TxRef` records into
 //!   tx_ordering in an interleaved canonical order.
-//! - One `ChannelBSubscriber` walks tx_ordering in canonical order, joining
+//! - One `TxOrderingSubscriber` walks tx_ordering in canonical order, joining
 //!   each ref against the A-buffer and asserting the recovered sequence
 //!   matches the canonical order Aeron produced.
 //!
@@ -89,11 +89,9 @@ async fn split_architecture_m_plus_one_e2e() {
     // TxData stays on IPC inside the container's media driver (this test
     // runs the client *against* the container, so the per-A streams need to
     // be reachable from outside too — use UDP with distinct endpoints).
-    cfg.channels
-        .tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template =
+    cfg.channels.tx_data_channel_template =
         format!("aeron:udp?endpoint={endpoint}|alias=a-{{sid}}");
-    cfg.channels
-        .tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_stream_id_base = 2000;
+    cfg.channels.tx_data_stream_id_base = 2000;
 
     let ctx = rusteron_client::AeronContext::new().expect("aeron context");
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
@@ -108,11 +106,11 @@ async fn split_architecture_m_plus_one_e2e() {
     let mut a_subs = Vec::with_capacity(M as usize);
     for sid in 0..M {
         a_pubs.push(TxDataPublisher::open(&aeron, &cfg.channels, sid).unwrap());
-        a_subs.push(subs.a(sid).unwrap());
+        a_subs.push(subs.tx_data(sid).unwrap());
     }
 
     let b_pub = TxOrderingPublisher::open(&aeron, &cfg.channels).unwrap();
-    let mut b_sub = subs.b().unwrap();
+    let mut b_sub = subs.tx_ordering().unwrap();
 
     // Publish TXS_PER_SEQ envelopes per sequencer; remember each
     // (sequencer_id, tx_data_position, expected correlation_id).

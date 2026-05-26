@@ -78,7 +78,7 @@ async fn aeron_publish_record_subscribe_e2e() {
         aeron: aeron.clone(),
         ch: cfg.channels.clone(),
     };
-    let mut sub = subs.b().unwrap();
+    let mut sub = subs.tx_ordering().unwrap();
 
     // TxOrdering now carries TxRefs, not TxEnvelopes. Publish 100
     // refs (alternating which sequencer they belong to) and assert the

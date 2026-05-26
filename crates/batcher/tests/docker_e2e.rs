@@ -24,9 +24,8 @@
 //!
 //! The full path "publish to tx_ordering / tx_data[i] with rusteron →
 //! recorder writes Aeron-native segment frames → batcher decodes via
-//! rusteron-archive replay protocol" lands when the high-level
-//! `ChannelBArchive` / `ChannelAArchive` wrappers ship from `kardamom-log`
-//! (same caveat as S6's docker_e2e). The harness assertion below is the
+//! rusteron-archive replay protocol" lands when the high-level archive
+//! wrappers ship from `log`. The harness assertion below is the
 //! gating proof that this crate's test target can reach the Aeron container,
 //! which is the prerequisite that wrapper landing unblocks.
 
@@ -183,8 +182,8 @@ async fn aeron_cluster_starts_and_batcher_round_trips_the_m_plus_one_topology() 
 
     // 2. Write the M+1 synthetic archives using the batcher's own
     //    KAR1-internal frame writer. The full "publish via Aeron →
-    //    SegmentReader" round-trip waits on the high-level ChannelB/A
-    //    wrappers in kardamom-log.
+    //    SegmentReader" round-trip waits on the high-level tx_ordering /
+    //    tx_data archive wrappers in `log`.
     let dir = TempDir::new().unwrap();
     let (b_segment, a_segments) = write_synthetic_archives(&dir);
 

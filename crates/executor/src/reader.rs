@@ -63,11 +63,11 @@ use crate::exec_types::TxIndex;
 /// One impl per sequencer partition. Implementations:
 /// - in production: `log::TxDataSubscriber` wrapped in a
 ///   per-thread `AeronRuntime` (see `aeron_live.rs`).
-/// - in tests: [`crate::testing::VecChannelASub`] /
+/// - in tests: [`crate::testing::VecTxDataSub`] /
 ///   `FakeTxDataSubscription` from `kardamom-log::testing`.
 ///
 /// The contract: `next` blocks until the next `(tx_data_position, envelope)` is
-/// available; returns `Err(ExecutorError::ChannelAClosed { sequencer_id })`
+/// available; returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
 /// when the underlying subscription closes cleanly.
 pub trait TxDataSubscription: Send {
     /// Sequencer id this subscription is bound to. Used to key the join
@@ -83,8 +83,8 @@ pub trait TxDataSubscription: Send {
 /// tagged with its canonical `BPosition`. The `BPosition` is the system's
 /// canonical L2 tx ordering (invariant I1).
 ///
-/// In production: `log::ChannelBSubscriber` wrapped in a per-thread
-/// `AeronRuntime`. In tests: see [`crate::testing::VecChannelBSub`] or
+/// In production: `log::TxOrderingSubscriber` wrapped in a per-thread
+/// `AeronRuntime`. In tests: see [`crate::testing::VecTxOrderingSub`] or
 /// `kardamom-log::testing::FakeTxOrderingSubscription`.
 pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
@@ -195,7 +195,7 @@ where
             loop {
                 match a_sub.next() {
                     Ok((tx_data_position, env)) => buffer.insert(sid, tx_data_position, env),
-                    Err(ExecutorError::ChannelAClosed { .. }) => return Ok(()),
+                    Err(ExecutorError::TxDataClosed { .. }) => return Ok(()),
                     Err(e) => return Err(e),
                 }
             }
@@ -238,7 +238,7 @@ where
             loop {
                 let (position, msg) = match b_sub.next() {
                     Ok(p) => p,
-                    Err(ExecutorError::ChannelBClosed) => return Ok(()),
+                    Err(ExecutorError::TxOrderingClosed) => return Ok(()),
                     Err(e) => return Err(e),
                 };
                 match msg {
@@ -389,31 +389,31 @@ mod tests {
 
     /// In-memory tx_data subscription: a `VecDeque` of pre-baked
     /// `(BPosition, TxEnvelope)` records.
-    struct VecChannelASub {
+    struct VecTxDataSub {
         sequencer_id: u8,
         queue: VecDeque<Result<(BPosition, TxEnvelope), ExecutorError>>,
     }
-    impl TxDataSubscription for VecChannelASub {
+    impl TxDataSubscription for VecTxDataSub {
         fn sequencer_id(&self) -> u8 {
             self.sequencer_id
         }
         fn next(&mut self) -> Result<(BPosition, TxEnvelope), ExecutorError> {
             self.queue
                 .pop_front()
-                .unwrap_or(Err(ExecutorError::ChannelAClosed {
+                .unwrap_or(Err(ExecutorError::TxDataClosed {
                     sequencer_id: self.sequencer_id,
                 }))
         }
     }
 
-    struct VecChannelBSub {
+    struct VecTxOrderingSub {
         queue: VecDeque<Result<(BPosition, TxOrderingMessage), ExecutorError>>,
     }
-    impl TxOrderingSubscription for VecChannelBSub {
+    impl TxOrderingSubscription for VecTxOrderingSub {
         fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
             self.queue
                 .pop_front()
-                .unwrap_or(Err(ExecutorError::ChannelBClosed))
+                .unwrap_or(Err(ExecutorError::TxOrderingClosed))
         }
     }
 
@@ -421,7 +421,7 @@ mod tests {
     fn channel_a_reader_drains_into_buffer() {
         let signer = PrivateKeySigner::random();
         let buf = JoinBuffer::new();
-        let a = VecChannelASub {
+        let a = VecTxDataSub {
             sequencer_id: 3,
             queue: VecDeque::from(vec![
                 Ok((pos(0), envelope(&signer, 0))),
@@ -443,7 +443,7 @@ mod tests {
         buf.insert(0, pos(0), envelope(&signer, 0));
         buf.insert(1, pos(50), envelope(&signer, 1));
 
-        let b = VecChannelBSub {
+        let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![
                 Ok((
                     pos(0),
@@ -531,7 +531,7 @@ mod tests {
             buf_for_a.insert(2, pos(0), env_clone);
         });
 
-        let b = VecChannelBSub {
+        let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![Ok((
                 pos(0),
                 TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 2, pos(0))),
@@ -563,7 +563,7 @@ mod tests {
             join_poll_interval: Duration::from_millis(5),
             buffer_warn_threshold: 10_000,
         };
-        let b = VecChannelBSub {
+        let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![Ok((
                 pos(0),
                 TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 7, pos(0))),

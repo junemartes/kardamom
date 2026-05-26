@@ -13,13 +13,13 @@
 //! **v0 scope:** brings up the Aeron container, opens a real libmdbx
 //! `StateWriter`, and asserts the harness resolves its host ports + the
 //! writer can apply at least one local batch. The full tx_receipts subscribe
-//! → BlockDelta-build → writer round-trip requires a `ChannelCSubscriber`
-//! adapter wrapping `kardamom-log`'s `aeron-live` tx_receipts async wrapper.
-//! Mirrors S4/S5: the high-level `ChannelC` async wrapper is not yet
-//! shipped by `kardamom-log` (only the low-level rusteron primitives plus
-//! the `testing::AeronTestCluster` harness are exposed). When that wrapper
+//! → BlockDelta-build → writer round-trip requires a `TxReceiptsSubscriber`
+//! adapter wrapping `log`'s `aeron-live` tx_receipts async wrapper.
+//! The high-level tx_receipts async wrapper is not yet shipped by `log`
+//! (only the low-level rusteron primitives plus the
+//! `testing::AeronTestCluster` harness are exposed). When that wrapper
 //! lands, this file gains the full publish → writer → tx_hash_index
-//! round-trip described in the S6 plan Task 25; the harness assertion
+//! round-trip; the harness assertion
 //! below is the gating proof that this crate's test target can reach the
 //! Aeron container, which is the prerequisite the wrapper landing
 //! unblocks.
@@ -60,7 +60,7 @@ async fn aeron_cluster_starts_and_state_writer_applies_batch() {
 
     // 3. Apply one block boundary + delta locally — exercising the writer
     //    end-to-end. The full plumb-through-Aeron flow waits on the high-
-    //    level `ChannelC` wrapper (see module docs above).
+    //    level tx_receipts wrapper (see module docs above).
     let addr = address!("0x00000000000000000000000000000000000000aa");
     writer
         .delta_tx

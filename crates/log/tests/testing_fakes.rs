@@ -5,8 +5,9 @@ use std::collections::HashMap;
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use log::testing::{
-    FakeBus, FakeChannelAPublication, FakeChannelBPublication, FakeFsyncWatermarkStream,
-    FakePublication, FakeTxDataSubscription, FakeTxOrderingSubscription, FakeTypedSubscription,
+    FakeBus, FakeFsyncWatermarkStream, FakePublication, FakeTxDataPublication,
+    FakeTxDataSubscription, FakeTxOrderingPublication, FakeTxOrderingSubscription,
+    FakeTypedSubscription,
 };
 use types::{BPosition, BlockBoundaryStart, FsyncWatermark, TxEnvelope, TxOrderingMessage, TxRef};
 
@@ -75,7 +76,7 @@ fn env(corr: u64, byte: u8) -> TxEnvelope {
 #[test]
 fn channel_a_publish_returns_tx_data_positionnd_subscription_yields_same_position() {
     let bus = FakeBus::new();
-    let pubr = FakeChannelAPublication::open(&bus, /*seq=*/ 2, "aeron:ipc?alias=a-2", 2001);
+    let pubr = FakeTxDataPublication::open(&bus, /*seq=*/ 2, "aeron:ipc?alias=a-2", 2001);
     let mut sub = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-2", 2001);
 
     let p0 = pubr.publish(&env(1, 0x10)).unwrap();
@@ -96,7 +97,7 @@ fn channel_a_publish_returns_tx_data_positionnd_subscription_yields_same_positio
 #[test]
 fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
     let bus = FakeBus::new();
-    let pubr = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
+    let pubr = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
     let mut sub = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     let r1 = TxRef {
@@ -145,9 +146,9 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
 fn b_reader_joins_against_a_buffer_in_canonical_order() {
     let bus = FakeBus::new();
 
-    let a0_pub = FakeChannelAPublication::open(&bus, 0, "aeron:ipc?alias=a-0", 2001);
-    let a1_pub = FakeChannelAPublication::open(&bus, 1, "aeron:ipc?alias=a-1", 2002);
-    let b_pub = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
+    let a0_pub = FakeTxDataPublication::open(&bus, 0, "aeron:ipc?alias=a-0", 2001);
+    let a1_pub = FakeTxDataPublication::open(&bus, 1, "aeron:ipc?alias=a-1", 2002);
+    let b_pub = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
 
     // Two sequencers each publish two txs.
     let p_0a = a0_pub.publish(&env(100, 0x01)).unwrap();

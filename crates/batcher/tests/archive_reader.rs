@@ -4,7 +4,7 @@ use std::io::Write;
 
 use alloy_primitives::{Address, B256};
 use batcher::archive_reader::{
-    ChannelASegmentReader, ChannelBSegmentReader, TypedSegmentReader, append_frame,
+    TxDataSegmentReader, TxOrderingSegmentReader, TypedSegmentReader, append_frame,
 };
 use bytes::Bytes;
 use tempfile::NamedTempFile;
@@ -49,7 +49,7 @@ fn reads_two_interleaved_b_records() {
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(&buf).unwrap();
 
-    let reader = ChannelBSegmentReader::open(f.path()).unwrap();
+    let reader = TxOrderingSegmentReader::open(f.path()).unwrap();
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 2);
 
@@ -75,7 +75,7 @@ fn reads_per_sequencer_a_records() {
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(&buf).unwrap();
 
-    let reader = ChannelASegmentReader::open(f.path()).unwrap();
+    let reader = TxDataSegmentReader::open(f.path()).unwrap();
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].value.correlation_id, 1);
@@ -93,7 +93,7 @@ fn truncated_active_segment_stops_cleanly() {
     let mut f = NamedTempFile::new().unwrap();
     f.write_all(&buf).unwrap();
 
-    let reader = ChannelASegmentReader::open(f.path()).unwrap();
+    let reader = TxDataSegmentReader::open(f.path()).unwrap();
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 1);
 }

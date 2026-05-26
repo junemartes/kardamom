@@ -121,8 +121,8 @@ pub type TxDataSubscriber = TypedSubscriber<TxEnvelope>;
 /// TxOrdering: canonical orderer. Yields [`TxOrderingMessage`] records
 /// (`TxRef | BoundaryStart`). The `BPosition` handed to the callback is the
 /// fragment's canonical L2 position (system invariant I1).
-pub type ChannelBSubscriber = TypedSubscriber<TxOrderingMessage>;
-pub type ChannelCReceiptSubscriber = TypedSubscriber<Receipt>;
+pub type TxOrderingSubscriber = TypedSubscriber<TxOrderingMessage>;
+pub type TxReceiptsSubscriber = TypedSubscriber<Receipt>;
 pub type ReceiptCacheSubscriber = TypedSubscriber<CachedReceipt>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
 pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
@@ -138,15 +138,15 @@ pub struct Subscribers {
 impl Subscribers {
     /// Open the tx_data subscription for sequencer `sequencer_id`. Run
     /// M of these on each executor host to feed the per-A buffer.
-    pub fn a(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
+    pub fn tx_data(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
-            &self.ch.a_channel(sequencer_id),
-            self.ch.a_stream_id(sequencer_id),
+            &self.ch.tx_data_channel(sequencer_id),
+            self.ch.tx_data_stream_id(sequencer_id),
         )
     }
 
-    pub fn b(&self) -> Result<ChannelBSubscriber, LogError> {
+    pub fn tx_ordering(&self) -> Result<TxOrderingSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
             &self.ch.tx_ordering_channel,
@@ -154,7 +154,7 @@ impl Subscribers {
         )
     }
 
-    pub fn c_receipts(&self) -> Result<ChannelCReceiptSubscriber, LogError> {
+    pub fn tx_receipts(&self) -> Result<TxReceiptsSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
             &self.ch.tx_receipts_channel,
@@ -179,12 +179,12 @@ impl Subscribers {
     }
 
     /// Subscribe to a sequencer-local tx_data fsync watermark stream
-    /// (one publisher per sequencer; see `fsync_watermark_tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template`).
+    /// (one publisher per sequencer; see `fsync_watermark_tx_data_channel_template`).
     pub fn watermark_a(&self, sequencer_id: u8) -> Result<WatermarkSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
-            &self.ch.fsync_watermark_a_channel(sequencer_id),
-            self.ch.fsync_watermark_a_stream_id(sequencer_id),
+            &self.ch.fsync_watermark_tx_data_channel(sequencer_id),
+            self.ch.fsync_watermark_tx_data_stream_id(sequencer_id),
         )
     }
 

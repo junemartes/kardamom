@@ -57,7 +57,7 @@ use crate::reader::{
 };
 
 /// Publication handle for tx_receipts.
-pub trait ChannelCPublication: Send {
+pub trait TxReceiptsPublication: Send {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError>;
 }
 
@@ -131,7 +131,7 @@ impl Executor {
         initial_block: u64,
     ) -> Result<(), ExecutorError>
     where
-        C: ChannelCPublication + 'static,
+        C: TxReceiptsPublication + 'static,
         S: SnapshotSource + 'static,
         Q: StateWriterSignal + 'static,
         P: StateWriterQueue + 'static,
@@ -343,7 +343,7 @@ fn spawn_commit<C>(
     rx: Receiver<ExecToCommit>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
-    C: ChannelCPublication + 'static,
+    C: TxReceiptsPublication + 'static,
 {
     thread::Builder::new()
         .name("executor-commit".into())
@@ -555,7 +555,7 @@ mod commit_tests {
     use types::{BPosition, BlockBoundary, Receipt};
 
     struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
-    impl ChannelCPublication for RecordPub {
+    impl TxReceiptsPublication for RecordPub {
         fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
             self.0.lock().unwrap().push(msg);
             Ok(())

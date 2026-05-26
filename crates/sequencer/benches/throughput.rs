@@ -21,8 +21,8 @@ use sequencer::inbound::TxDataSubscriber;
 use sequencer::outbound::fakes::{InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher};
 use sequencer::sequencer::Sequencer;
 
-struct DequeChannelA(VecDeque<(BPosition, TxEnvelope)>);
-impl TxDataSubscriber for DequeChannelA {
+struct DequeTxData(VecDeque<(BPosition, TxEnvelope)>);
+impl TxDataSubscriber for DequeTxData {
     fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
         Ok(self.0.pop_front())
     }
@@ -83,13 +83,13 @@ fn bench_in_order(c: &mut Criterion) {
                         },
                         std::sync::Arc::new(sequencer::testing::FakeStateDatabase::new()),
                     ),
-                    DequeChannelA(batch.clone().into_iter().collect()),
+                    DequeTxData(batch.clone().into_iter().collect()),
                     InMemoryTxOrderingRefPublisher::default(),
                     InMemoryReceiptCachePublisher::default(),
                 )
             },
-            |(mut seq, mut ch_a, mut bp, mut rc)| {
-                while seq.run_once(&mut ch_a, &mut bp, &mut rc).unwrap() {}
+            |(mut seq, mut tx_data, mut bp, mut rc)| {
+                while seq.run_once(&mut tx_data, &mut bp, &mut rc).unwrap() {}
             },
             BatchSize::SmallInput,
         );

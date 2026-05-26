@@ -84,9 +84,9 @@ fn add_exclusive_pub(
 /// for the bulk transaction data referenced from tx_ordering.
 ///
 /// Per-A URIs are derived from
-/// [`ChannelsConfig::tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
+/// [`ChannelsConfig::tx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
 /// with `{sid}` substituted for the sequencer id. Stream ids are derived as
-/// `tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_stream_id_base + sequencer_id` so M parallel tx_data streams can
+/// `tx_data_stream_id_base + sequencer_id` so M parallel tx_data streams can
 /// coexist on a shared Media Driver.
 pub struct TxDataPublisher {
     sequencer_id: u8,
@@ -101,8 +101,8 @@ impl TxDataPublisher {
     ) -> Result<Self, LogError> {
         let pub_handle = add_exclusive_pub(
             aeron,
-            &ch.a_channel(sequencer_id),
-            ch.a_stream_id(sequencer_id),
+            &ch.tx_data_channel(sequencer_id),
+            ch.tx_data_stream_id(sequencer_id),
             "A",
         )?;
         Ok(Self {
@@ -171,11 +171,11 @@ impl TxOrderingPublisher {
 }
 
 /// TxReceipts: receipts + boundaries. RAM only.
-pub struct ChannelCPublisher {
+pub struct TxReceiptsPublisher {
     pub_handle: Pub,
 }
 
-impl ChannelCPublisher {
+impl TxReceiptsPublisher {
     pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
         let pub_handle = add_pub(
             aeron,
@@ -259,8 +259,8 @@ impl WatermarkAPublisher {
     ) -> Result<Self, LogError> {
         let pub_handle = add_pub(
             aeron,
-            &ch.fsync_watermark_a_channel(sequencer_id),
-            ch.fsync_watermark_a_stream_id(sequencer_id),
+            &ch.fsync_watermark_tx_data_channel(sequencer_id),
+            ch.fsync_watermark_tx_data_stream_id(sequencer_id),
             "wm-a",
         )?;
         Ok(Self { pub_handle })
@@ -371,5 +371,5 @@ pub struct Publishers {
     pub aeron: Rc<AeronClient>,
     pub a: Option<Rc<TxDataPublisher>>,
     pub b: Rc<TxOrderingPublisher>,
-    pub c: Rc<ChannelCPublisher>,
+    pub c: Rc<TxReceiptsPublisher>,
 }

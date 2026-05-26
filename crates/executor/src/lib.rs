@@ -5,7 +5,7 @@
 //! reference. Publishes receipts + sealed BlockBoundaries to tx_receipts.
 //! Block-STM is explicitly out of scope for v0; S4 v1 will replace the
 //! single execution thread with parallel workers behind the same
-//! `TxDataSubscription` / `TxOrderingSubscription` / `ChannelCPublication`
+//! `TxDataSubscription` / `TxOrderingSubscription` / `TxReceiptsPublication`
 //! interface.
 //!
 //! ## Wire topology ()
@@ -45,7 +45,7 @@ pub mod reader;
 pub mod state;
 
 pub use actor::{
-    ChannelCPublication, Executor, ExecutorConfig, StateWriterQueue, StateWriterSignal,
+    Executor, ExecutorConfig, StateWriterQueue, StateWriterSignal, TxReceiptsPublication,
 };
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet, apply_write_set};

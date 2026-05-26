@@ -136,7 +136,7 @@ impl FakeSubscription {
 }
 
 /// High-level fake publication that consumers can use in place of
-/// `TxOrderingPublisher` / `ChannelCPublisher` / `ReceiptCachePublisher`.
+/// `TxOrderingPublisher` / `TxReceiptsPublisher` / `ReceiptCachePublisher`.
 pub struct FakePublication {
     pub_handle: FakeConcurrentPublication,
 }
@@ -222,19 +222,19 @@ use types::{TxEnvelope, TxOrderingMessage, TxRef};
 /// `TxEnvelope` bytes. In production this maps to
 /// `Aeron::add_exclusive_publication`; the fake just preserves FIFO.
 ///
-/// `FakeChannelAPublication::new` requires the caller to hand in the
+/// `FakeTxDataPublication::new` requires the caller to hand in the
 /// `sequencer_id`. The fake keeps the id so callers can build a `TxRef`
 /// pointing at the produced `BPosition` without having to track the id
 /// separately.
-pub struct FakeChannelAPublication {
+pub struct FakeTxDataPublication {
     sequencer_id: u8,
     pub_handle: FakeConcurrentPublication,
 }
 
-impl FakeChannelAPublication {
+impl FakeTxDataPublication {
     /// Open the tx_data[i] pub on `bus`, using the channel URI/stream-id
     /// convention "<channel>"/"<stream_id>". A real wiring uses
-    /// `log::config::ChannelsConfig::tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template` to derive
+    /// `log::config::ChannelsConfig::tx_data_channel_template` to derive
     /// per-sequencer URIs.
     pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
         Self {
@@ -304,11 +304,11 @@ impl FakeTxDataSubscription {
 /// TxOrdering: canonical orderer, **concurrent** multi-publisher carrying
 /// [`TxOrderingMessage`] records (TxRef | BoundaryStart). In production this
 /// maps to `Aeron::add_publication` (the shared / concurrent variant).
-pub struct FakeChannelBPublication {
+pub struct FakeTxOrderingPublication {
     pub_handle: FakeConcurrentPublication,
 }
 
-impl FakeChannelBPublication {
+impl FakeTxOrderingPublication {
     pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
         Self {
             pub_handle: FakeConcurrentPublication {

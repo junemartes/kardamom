@@ -30,7 +30,7 @@ use rusteron_archive::{
     AeronArchiveRecordingDescriptorConsumerFuncCallback, Handler,
 };
 
-use crate::archive_reader::{ChannelASegmentReader, ChannelBSegmentReader, TypedSegmentReader};
+use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader, TypedSegmentReader};
 use crate::error::BatcherError;
 
 /// Resolved on-disk location of a live recording's active segment file,
@@ -78,14 +78,14 @@ impl LiveSegmentDescriptor {
     }
 
     /// Open a tx_ordering typed reader over this descriptor's segment file.
-    pub fn open_b(&self) -> Result<ChannelBSegmentReader, BatcherError> {
+    pub fn open_tx_ordering(&self) -> Result<TxOrderingSegmentReader, BatcherError> {
         TypedSegmentReader::<TxOrderingMessage>::open(&self.segment_path)
     }
 
     /// Open a tx_data typed reader over this descriptor's segment file.
     /// The caller is responsible for ensuring the underlying recording is
     /// in fact a tx_data recording for some sequencer.
-    pub fn open_a(&self) -> Result<ChannelASegmentReader, BatcherError> {
+    pub fn open_tx_data(&self) -> Result<TxDataSegmentReader, BatcherError> {
         TypedSegmentReader::<TxEnvelope>::open(&self.segment_path)
     }
 }
