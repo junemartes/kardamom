@@ -40,11 +40,11 @@ pub enum ExecutorError {
     /// or the sequencer published a ref pointing at a position it never
     /// actually wrote. Both are upstream bugs.
     #[error(
-        "join timeout: TxRef(sequencer_id={sequencer_id}, position_a={position_a:?}) not found within {timeout_ms} ms"
+        "join timeout: TxRef(sequencer_id={sequencer_id}, tx_data_position={tx_data_position:?}) not found within {timeout_ms} ms"
     )]
     JoinTimeout {
         sequencer_id: u8,
-        position_a: BPosition,
+        tx_data_position: BPosition,
         timeout_ms: u64,
     },
 }

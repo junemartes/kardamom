@@ -1,14 +1,14 @@
 //! Channel-C executor-side demux wrapper + `TxIndex` newtype.
 //!
 //! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
-//! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`, `ChannelBMessage`,
+//! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`, `TxOrderingMessage`,
 //! `TxRef`) are imported from `kardamom-types` per S0 D-Sh1; we never
 //! redefine them here.
 //!
 //! Pre-S4-arch-update this module also held a `BMessage` enum that was the
 //! executor's internal inbound demux (`Tx | BoundaryStart` with full
 //! envelopes). Post-D-Sh12 the inbound type is `kardamom_types::
-//! ChannelBMessage` (tiny refs + boundaries) plus the per-A `TxEnvelope`
+//! TxOrderingMessage` (tiny refs + boundaries) plus the per-A `TxEnvelope`
 //! streams; the executor reads them through the `reader.rs` module rather
 //! than a single demux enum.
 //!

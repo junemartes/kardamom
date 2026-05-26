@@ -23,21 +23,21 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
-    BPosition, BlockBoundary, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope,
+    BPosition, BlockBoundary, BlockBoundaryStart, CMessage, ChannelCPublication, Executor,
+    ExecutorConfig, ExecutorError, MockStateDatabase, MutatingSnapshotSource, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
     TxRef, WriterApplyingQueue,
 };
 
 /// Bridge a crossbeam receiver of `(BPosition, TxEnvelope)` into a
-/// `ChannelASubscription`. The `BPosition` we emit is the channel-A
+/// `TxDataSubscription`. The `BPosition` we emit is the channel-A
 /// position (the value sequencers publish in `TxRef`); we make it equal
 /// to a synthetic offset for the test.
 struct ChanASub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
 }
-impl ChannelASubscription for ChanASub {
+impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -48,9 +48,9 @@ impl ChannelASubscription for ChanASub {
     }
 }
 
-struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
-impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
+struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
+impl TxOrderingSubscription for ChanBSub {
+    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -114,7 +114,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
 
     // Single-sequencer topology: one channel A, one channel B.
     let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(64);
-    let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>(64);
+    let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(64);
     let (c_tx, c_rx) = bounded::<CMessage>(64);
 
     // 4 txs → boundary block 1 → 3 txs → boundary block 2 → 3 txs → boundary block 3.
@@ -129,14 +129,14 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             let tx_hash = env.tx_hash;
             expected_hashes.push(tx_hash);
             // Publish to channel A[0] at `a_pos`.
-            let position_a = bpos(a_pos);
-            a_tx.send((position_a, env)).unwrap();
+            let tx_data_position = bpos(a_pos);
+            a_tx.send((tx_data_position, env)).unwrap();
             // Then publish a TxRef onto channel B at canonical position
             // `bpos_off`. The executor uses the B position as the tx's
             // canonical id (Receipt.tx_idx).
             b_tx.send((
                 bpos(bpos_off),
-                ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
+                TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position)),
             ))
             .unwrap();
             nonce += 1;
@@ -145,7 +145,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
         }
         b_tx.send((
             bpos(bpos_off),
-            ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+            TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                 block_number: blk,
                 end_tx_idx: bpos(bpos_off - 1),
                 l2_timestamp: 1_700_000_000 + blk,
@@ -163,11 +163,11 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     };
     let writer_q = WriterApplyingQueue::new(snap.clone());
     let snapshots = MutatingSnapshotSource(snap);
-    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+    let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(ChanASub {
         sequencer_id: 0,
         rx: a_rx,
     })];
-    let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(ChanBSub(b_rx));
     let join = thread::spawn(move || {
         Executor::run(
             cfg,

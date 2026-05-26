@@ -12,9 +12,9 @@ use bytes::Bytes;
 use kardamom_types::{BPosition, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedChannelA;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 
@@ -70,9 +70,9 @@ fn pos(offset: i32) -> BPosition {
 fn match_publishes_ref() {
     let s = signer(1);
     let env = signed_tx_envelope(&s, 0, 7);
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     channel_a.queue.push_back((pos(0), env));
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
@@ -83,7 +83,7 @@ fn match_publishes_ref() {
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].shard_id, 0);
-    assert_eq!(refs[0].position_a, pos(0));
+    assert_eq!(refs[0].tx_data_position, pos(0));
     assert!(rc.duplicates.lock().unwrap().is_empty());
 }
 
@@ -92,10 +92,10 @@ fn past_nonce_emits_duplicate_notification() {
     let s = signer(2);
     let env0 = signed_tx_envelope(&s, 0, 100);
     let env0_dup = signed_tx_envelope(&s, 0, 200);
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     channel_a.queue.push_back((pos(0), env0));
     channel_a.queue.push_back((pos(64), env0_dup));
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
@@ -122,11 +122,11 @@ fn future_nonce_buffered_then_drained() {
     let s = signer(3);
     let env0 = signed_tx_envelope(&s, 0, 100);
     let env1 = signed_tx_envelope(&s, 1, 101);
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     // Out of order: nonce 1 first.
     channel_a.queue.push_back((pos(0), env1));
     channel_a.queue.push_back((pos(64), env0));
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
@@ -140,17 +140,17 @@ fn future_nonce_buffered_then_drained() {
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 2, "nonce 0 publishes + drains buffered nonce 1");
     // Both refs land in nonce order: nonce 0 at pos(64), nonce 1 at pos(0).
-    assert_eq!(refs[0].position_a, pos(64));
-    assert_eq!(refs[1].position_a, pos(0));
+    assert_eq!(refs[0].tx_data_position, pos(64));
+    assert_eq!(refs[1].tx_data_position, pos(0));
 }
 
 #[test]
 fn b_backpressure_rewinds_state_and_retry_succeeds() {
     let s = signer(4);
     let env = signed_tx_envelope(&s, 0, 100);
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     channel_a.queue.push_back((pos(0), env));
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     *b.fail_with_backpressure.lock().unwrap() = true;
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
@@ -170,13 +170,13 @@ fn b_backpressure_rewinds_state_and_retry_succeeds() {
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 1, "drain-pending republishes the rewound ref");
-    assert_eq!(refs[0].position_a, pos(0));
+    assert_eq!(refs[0].tx_data_position, pos(0));
 }
 
 #[test]
 fn run_once_returns_false_when_empty() {
-    let mut channel_a = ScriptedChannelA::default();
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut channel_a = ScriptedTxData::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
@@ -209,9 +209,9 @@ fn wrong_shard_message_skipped() {
         seed += 1;
     };
 
-    let mut channel_a = ScriptedChannelA::default();
+    let mut channel_a = ScriptedTxData::default();
     channel_a.queue.push_back((pos(0), env));
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     assert_eq!(
@@ -228,8 +228,8 @@ fn run_loops_until_shutdown_signaled() {
         cfg,
         Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
-    let mut channel_a = ScriptedChannelA::default();
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut channel_a = ScriptedTxData::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let shutdown = Shutdown::from_atomic(Arc::new(AtomicBool::new(true)));
     let result = seq.run(&mut channel_a, &mut b, &mut rc, shutdown);
@@ -243,11 +243,11 @@ fn run_returns_when_channel_a_disconnected() {
         cfg,
         Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
-    let mut channel_a = ScriptedChannelA {
+    let mut channel_a = ScriptedTxData {
         disconnected: true,
         ..Default::default()
     };
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let shutdown = Shutdown::new();
     let result = seq.run(&mut channel_a, &mut b, &mut rc, shutdown);

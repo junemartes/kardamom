@@ -14,7 +14,7 @@
 //! requires a `BoundaryPublisher` adapter wrapping `kardamom-log`'s
 //! `aeron-live` channel-B concurrent publisher. The current
 //! `kardamom-log` exposes the low-level rusteron primitives but not yet
-//! a high-level `ChannelBPublisher` async wrapper (see
+//! a high-level `TxOrderingPublisher` async wrapper (see
 //! crates/kardamom-log/src/publisher.rs); building that wrapper is a
 //! cross-component task tracked in the executor branch's Task 19
 //! ("pending S3 channel wrappers"). When the wrapper lands, this file

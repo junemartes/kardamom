@@ -32,11 +32,8 @@ pub trait IngressPublication: Send + Sync + 'static {
     /// Publish `envelope` onto `channel_A[shard]`. Multiple proxies can
     /// concurrently publish to the same shard's A stream — Aeron's shared
     /// publication semantics serialize them into one canonical byte order.
-    async fn publish_channel_a(
-        &self,
-        shard: usize,
-        envelope: TxEnvelope,
-    ) -> Result<(), IngressError>;
+    async fn publish_tx_data(&self, shard: usize, envelope: TxEnvelope)
+    -> Result<(), IngressError>;
 
     /// Publish a `CachedReceipt` onto the receipt-cache channel.
     async fn publish_receipt_cache(&self, cached: CachedReceipt) -> Result<(), IngressError>;
@@ -72,7 +69,7 @@ pub trait IngressSubscription: Send + Sync + 'static {
 #[derive(Clone)]
 pub struct MockChannels {
     /// One sender per channel A shard.
-    pub channel_a_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
+    pub tx_data_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
     pub receipt_bus: broadcast::Sender<Receipt>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub local_fsync_bus: broadcast::Sender<FsyncWatermark>,
@@ -100,7 +97,7 @@ impl MockChannels {
         let (block_boundary_bus, _) = broadcast::channel(1024);
         (
             Self {
-                channel_a_tx: tx_vec,
+                tx_data_tx: tx_vec,
                 receipt_bus,
                 watermark_bus,
                 local_fsync_bus,
@@ -115,12 +112,12 @@ impl MockChannels {
 
 #[async_trait]
 impl IngressPublication for MockChannels {
-    async fn publish_channel_a(
+    async fn publish_tx_data(
         &self,
         shard: usize,
         envelope: TxEnvelope,
     ) -> Result<(), IngressError> {
-        self.channel_a_tx
+        self.tx_data_tx
             .get(shard)
             .ok_or_else(|| {
                 IngressError::PartitionUnavailable(format!("shard {shard} out of range"))
@@ -250,7 +247,7 @@ mod tests {
             sender: Address::ZERO,
             tx_hash: B256::ZERO,
         };
-        mock.publish_channel_a(2, env.clone()).await.unwrap();
+        mock.publish_tx_data(2, env.clone()).await.unwrap();
         let received = rx[2].recv().await.unwrap();
         assert_eq!(received.correlation_id, 1);
         // Other shards stay empty.

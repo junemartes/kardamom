@@ -20,9 +20,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
-    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope,
+    BPosition, BlockBoundaryStart, CMessage, ChannelCPublication, Executor, ExecutorConfig,
+    ExecutorError, MockStateDatabase, MutatingSnapshotSource, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
     TxRef, WriterApplyingQueue,
 };
 
@@ -30,7 +30,7 @@ struct ChanASub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
 }
-impl ChannelASubscription for ChanASub {
+impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -40,9 +40,9 @@ impl ChannelASubscription for ChanASub {
         })
     }
 }
-struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
-impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
+struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
+impl TxOrderingSubscription for ChanBSub {
+    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -68,7 +68,7 @@ fn bpos(off: i32) -> BPosition {
 
 fn populate(
     a_tx: &Sender<(BPosition, KtTxEnvelope)>,
-    b_tx: &Sender<(BPosition, ChannelBMessage)>,
+    b_tx: &Sender<(BPosition, TxOrderingMessage)>,
     signer: &PrivateKeySigner,
 ) {
     let to = address!("00000000000000000000000000000000DEAD0001");
@@ -96,11 +96,11 @@ fn populate(
                 sender: signer.address(),
                 tx_hash,
             };
-            let position_a = bpos(a_pos);
-            a_tx.send((position_a, env)).unwrap();
+            let tx_data_position = bpos(a_pos);
+            a_tx.send((tx_data_position, env)).unwrap();
             b_tx.send((
                 bpos(bpos_off),
-                ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
+                TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position)),
             ))
             .unwrap();
             bpos_off += 1;
@@ -109,7 +109,7 @@ fn populate(
         }
         b_tx.send((
             bpos(bpos_off),
-            ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+            TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                 block_number: blk,
                 end_tx_idx: bpos(bpos_off - 1),
                 l2_timestamp: 1_700_000_000 + blk,
@@ -128,7 +128,7 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
     let snapshots = MutatingSnapshotSource(snap);
 
     let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(128);
-    let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>(128);
+    let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(128);
     let (c_tx, c_rx) = bounded::<CMessage>(128);
 
     populate(&a_tx, &b_tx, &signer);
@@ -140,11 +140,11 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
         receipt_queue_depth: 128,
         ..Default::default()
     };
-    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+    let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(ChanASub {
         sequencer_id: 0,
         rx: a_rx,
     })];
-    let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(ChanBSub(b_rx));
     let h = thread::spawn(move || {
         Executor::run(
             cfg,

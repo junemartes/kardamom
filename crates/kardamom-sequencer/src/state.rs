@@ -143,7 +143,7 @@ impl<T> PartitionState<T> {
     /// rewinds `next_nonce` so the retry sees `nonce == expected`.
     ///
     /// Used by `PrimarySequencer::run_once` when the dual-write
-    /// (`ChannelAPublisher::try_publish` + `ChannelBRefPublisher::try_publish_ref`)
+    /// (`TxDataPublisher::try_publish` + `TxOrderingRefPublisher::try_publish_ref`)
     /// returns `Backpressure` from either side — we must NOT advance state
     /// for a message whose canonical `TxRef` did not actually land on B.
     /// Also marks the sender as "drain-pending" so a subsequent call to
