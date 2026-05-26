@@ -88,7 +88,7 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
 
     // ----- Spawn the four services. SIGTERM order on teardown is reverse:
     // ----- ingress (stops new submissions) → executor → sequencer → sealer.
-    let mut sealer = ChildGuard::spawn(
+    let sealer = ChildGuard::spawn(
         "kardamom-sealer",
         Command::new(target_bin.join("kardamom-sealer"))
             .arg("--config")
@@ -98,7 +98,7 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    let mut sequencer = ChildGuard::spawn(
+    let sequencer = ChildGuard::spawn(
         "kardamom-sequencer",
         Command::new(target_bin.join("kardamom-sequencer"))
             .arg("--config")
@@ -108,7 +108,7 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    let mut executor = ChildGuard::spawn(
+    let executor = ChildGuard::spawn(
         "kardamom-executor",
         Command::new(target_bin.join("kardamom-executor"))
             .arg("--config")
@@ -122,7 +122,7 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped()),
     );
-    let mut ingress = ChildGuard::spawn(
+    let ingress = ChildGuard::spawn(
         "kardamom-ingress",
         Command::new(target_bin.join("kardamom-ingress"))
             .arg("--config")
