@@ -22,21 +22,21 @@ pub enum ExecutorError {
         last_seen: BPosition,
     },
 
-    #[error("channel-B subscription closed")]
+    #[error("tx_ordering subscription closed")]
     ChannelBClosed,
 
-    #[error("channel-A[{sequencer_id}] subscription closed")]
+    #[error("tx_data[{sequencer_id}] subscription closed")]
     ChannelAClosed { sequencer_id: u8 },
 
-    #[error("channel-C publication closed")]
+    #[error("tx_receipts publication closed")]
     ChannelCClosed,
 
     #[error("state-writer signal channel closed")]
     StateWriterClosed,
 
-    /// The channel-B reader pulled a [`kardamom_types::TxRef`] but the
-    /// referenced envelope never appeared on its channel A within the
-    /// configured join timeout. Either the channel-A publisher fell over,
+    /// The tx_ordering reader pulled a [`kardamom_types::TxRef`] but the
+    /// referenced envelope never appeared on its tx_data within the
+    /// configured join timeout. Either the tx_data publisher fell over,
     /// or the sequencer published a ref pointing at a position it never
     /// actually wrote. Both are upstream bugs.
     #[error(

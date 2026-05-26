@@ -8,7 +8,7 @@
 
 **Per S0 D-Sh3 (sender) and D-Sh4 (tx_hash) — the proxy is the *only* place these two fields are computed.** Both are produced together at the sig-verify boundary: secp256k1 recovers `sender: Address` and a single keccak256 pass over `raw_tx` produces `tx_hash: B256`. Both are written into `TxEnvelope.sender` (typed `Address`, **never `Option`**) and `TxEnvelope.tx_hash` (typed `B256`, always populated) before publication onto `ingress[i]`. If recovery fails, the tx is rejected at the RPC boundary (JSON-RPC `-32602` invalid params via `IngressError::SignatureInvalid`) *before* publishing — downstream consumers may trust both fields unconditionally. The receipt produced by S4 propagates `tx_hash` unchanged into `Receipt.tx_hash`, and S6 maintains a `tx_hash_index: tx_hash → BPosition` libmdbx table that the proxy queries from `eth_getTransactionReceipt(hash)`.
 
-**Per S0 D-Sh2 — wire codec is `rkyv` v0.8 (not `bincode`, not `serde`).** All shared types in `kardamom-types` derive `rkyv::Archive, rkyv::Serialize, rkyv::Deserialize`. On the consumer side, the proxy reads `Archived<Receipt>` and `Archived<CachedReceipt>` zero-copy from channel C / receipt-cache Aeron buffers via helpers exposed by `kardamom-log`; we only materialize to owned `T` when handing back to a client. Same applies to `Archived<QuorumWatermark>` on the watermark stream.
+**Per S0 D-Sh2 — wire codec is `rkyv` v0.8 (not `bincode`, not `serde`).** All shared types in `kardamom-types` derive `rkyv::Archive, rkyv::Serialize, rkyv::Deserialize`. On the consumer side, the proxy reads `Archived<Receipt>` and `Archived<CachedReceipt>` zero-copy from tx_receipts / receipt-cache Aeron buffers via helpers exposed by `kardamom-log`; we only materialize to owned `T` when handing back to a client. Same applies to `Archived<QuorumWatermark>` on the watermark stream.
 
 **Tech Stack:** Rust 2024 edition, `jsonrpsee = 0.26` (HTTP + WS), `tokio = 1` (multi-thread runtime, `time::interval`, `sync::oneshot`, `net::TcpListener`, `net::UnixListener`), `alloy-consensus = 2.0` (`TxEnvelope`, `SignableTransaction`, `secp256k1` feature for batched recovery), `alloy-primitives = 1.6` (`Address`, `keccak256`, `B256`), `alloy-rlp = 0.3` (length-prefixed binary frame decode), `secp256k1 = 0.31` (batched `ecdsa::RecoverableSignature::recover` — fastest CPU recovery library; `k256` was rejected as ~2x slower per recovery in our context), `governor = 0.10` (lock-free token bucket; `direct::RateLimiter<NotKeyed>` per-IP via DashMap), `dashmap = 6` (pending-receipts shard map), `bytes = 1`, `thiserror = 2`, `tracing = 0.1`, `metrics = 0.24`, `criterion = 0.7` (benches), `proptest = 1` (sig-verify equivalence).
 
@@ -125,7 +125,7 @@ touch crates/kardamom-ingress/src/log_stub.rs
 ```rust
 //! Ingress proxy: terminates client connections, sig-verifies, partition-routes,
 //! and parks responses until both (a) the quorum fsync watermark advances past
-//! the tx's B-position and (b) a matching receipt arrives on channel C.
+//! the tx's B-position and (b) a matching receipt arrives on tx_receipts.
 //!
 //! Stateless w.r.t. canonical truth — proxies can be added or removed at any time.
 
@@ -403,7 +403,7 @@ pub struct Receipt {
     pub tx_hash: B256,
 }
 
-/// Boundary marker emitted by executors onto channel C.
+/// Boundary marker emitted by executors onto tx_receipts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockBoundary {
     pub block_number: u64,
@@ -458,7 +458,7 @@ pub trait IngressSubscription: Send + Sync + 'static {
     fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
     fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt>;
-    /// Per S0 D-Sh5: channel-C BlockBoundary stream so the proxy can serve
+    /// Per S0 D-Sh5: tx_receipts BlockBoundary stream so the proxy can serve
     /// `eth_blockNumber` from the highest seen `block_number`.
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary>;
 }
@@ -1195,7 +1195,7 @@ git commit -m "ingress: property test batched vs single sig verify on 1k txs"
 
 ```rust
 //! Pending-receipts map: parks a client `oneshot` until both
-//! (a) a `Receipt` for `(sender, nonce)` arrives on channel C, and
+//! (a) a `Receipt` for `(sender, nonce)` arrives on tx_receipts, and
 //! (b) the quorum fsync watermark on B has reached `receipt.b_position`.
 //!
 //! Both conditions are required by invariant I2 (spec §1).
@@ -1266,7 +1266,7 @@ impl PendingReceipts {
         }
     }
 
-    /// Called when a receipt arrives on channel C. If the watermark has already
+    /// Called when a receipt arrives on tx_receipts. If the watermark has already
     /// advanced past the receipt's B-position, releases the client immediately;
     /// otherwise stores the receipt and waits for `update_watermark`.
     pub async fn on_receipt(&self, sender: Address, receipt: Receipt) {
@@ -1619,7 +1619,7 @@ pub struct IngressProxy<P: IngressPublication + Clone, S: IngressSubscription + 
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
-    /// Per S0 D-Sh5: highest `BlockBoundary.block_number` seen on channel C.
+    /// Per S0 D-Sh5: highest `BlockBoundary.block_number` seen on tx_receipts.
     /// Read by `eth_blockNumber`. AtomicU64 is plenty — monotonic, single-writer
     /// (the BlockBoundary watcher), many readers.
     pub(crate) latest_block_number: Arc<AtomicU64>,
@@ -1670,7 +1670,7 @@ where
         me
     }
 
-    /// Highest `BlockBoundary.block_number` the proxy has observed on channel C.
+    /// Highest `BlockBoundary.block_number` the proxy has observed on tx_receipts.
     /// Backing field for `eth_blockNumber` per S0 D-Sh5.
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
@@ -1716,7 +1716,7 @@ where
                     Ok(r) => {
                         // We don't know the sender here; the spec relies on the
                         // executor putting (sender, nonce) on the cache channel,
-                        // but channel C carries `tx_hash` + `tx_idx`. The proxy
+                        // but tx_receipts carries `tx_hash` + `tx_idx`. The proxy
                         // remembers the sender via its own pending-map keying.
                         // Use tx_hash as the cross-reference: pending map holds
                         // (sender, tx_idx) entries; the executor must publish a
@@ -1920,7 +1920,7 @@ Update `submit_raw` in `proxy.rs` so the watcher can dispatch — between steps 
 
 ```rust
 fn spawn_receipt_watcher(&self) {
-    // The executor publishes receipts on channel C (which contains tx_hash but
+    // The executor publishes receipts on tx_receipts (which contains tx_hash but
     // not sender). The same executor commit thread also publishes a
     // CachedReceipt { sender, nonce, receipt } on the receipt-cache channel,
     // and that is the channel the proxy uses to drive client release. The raw
@@ -1970,7 +1970,7 @@ git commit -m "ingress: add IngressProxy orchestrator wiring all subsystems"
 **Files:**
 - Modify: `crates/kardamom-ingress/src/json_rpc.rs`
 
-The minimal viable Ethereum subset for v0: `eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_blockNumber`, `eth_chainId`, `eth_getBalance`, `eth_getTransactionCount`. `getBalance` and `getTransactionCount` proxy through to channel-C-side state queries — in v0 the proxy returns `IngressError::Internal("state queries deferred to S6")` for those; they are wired into the trait so clients see a clear error rather than a "method not found".
+The minimal viable Ethereum subset for v0: `eth_sendRawTransaction`, `eth_getTransactionReceipt`, `eth_blockNumber`, `eth_chainId`, `eth_getBalance`, `eth_getTransactionCount`. `getBalance` and `getTransactionCount` proxy through to tx_receipts-side state queries — in v0 the proxy returns `IngressError::Internal("state queries deferred to S6")` for those; they are wired into the trait so clients see a clear error rather than a "method not found".
 
 - [ ] **Step 1: Write the file**
 
@@ -2040,9 +2040,9 @@ where
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        // Per S0 D-Sh5: subscribe to channel C, track the highest
+        // Per S0 D-Sh5: subscribe to tx_receipts, track the highest
         // BlockBoundary.block_number seen, serve it here. The proxy's
-        // channel-C watcher (spawned in `IngressProxy::new`) maintains
+        // tx_receipts watcher (spawned in `IngressProxy::new`) maintains
         // `latest_block_number: AtomicU64`. Reads are lock-free.
         Ok(U256::from(self.proxy.latest_block_number()))
     }
@@ -3487,7 +3487,7 @@ fi
 
 **Per S0 D-Sh8:** mock-based integration tests are fine for component isolation, but every subsystem MUST also have an e2e test that runs against a real Aeron Media Driver + Aeron Archive in Docker, brought up via the `testcontainers` harness shipped from S3's `kardamom-log` crate (`kardamom_log::testing::docker`). This task adds that test for the ingress proxy.
 
-**Scope:** spin up real Aeron containers, wire the proxy at one end, a tiny in-process "sequencer mock" (just drains `ingress[*]` and emits matching `CachedReceipt` + `QuorumWatermark` + `BlockBoundary` onto channel C and the receipt-cache channel) at the other end, push 1k signed txs through the proxy's `submit_raw`, and assert every receipt is returned. The point is to exercise the real Aeron transport for messages — sig-verify, partition routing, watermark gating, and receipt-cache idempotence all run unchanged.
+**Scope:** spin up real Aeron containers, wire the proxy at one end, a tiny in-process "sequencer mock" (just drains `ingress[*]` and emits matching `CachedReceipt` + `QuorumWatermark` + `BlockBoundary` onto tx_receipts and the receipt-cache channel) at the other end, push 1k signed txs through the proxy's `submit_raw`, and assert every receipt is returned. The point is to exercise the real Aeron transport for messages — sig-verify, partition routing, watermark gating, and receipt-cache idempotence all run unchanged.
 
 **Files:**
 - Create: `crates/kardamom-ingress/tests/docker_e2e.rs`
@@ -3573,7 +3573,7 @@ fn sign_legacy(signer: &PrivateKeySigner, nonce: u64) -> Bytes {
 #[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]
 async fn proxy_e2e_real_aeron_1000_txs() {
     // 1. Spin up real Aeron Media Driver + Archive in Docker. The harness
-    //    creates the standard channels (ingress[0..M], receipt-cache, channel C,
+    //    creates the standard channels (ingress[0..M], receipt-cache, tx_receipts,
     //    watermark) and returns Publication/Subscription handles wired to the
     //    real Aeron client running against the containers.
     let cluster = AeronCluster::start_default().await.expect("docker start");
@@ -3643,7 +3643,7 @@ async fn proxy_e2e_real_aeron_1000_txs() {
                 .await
                 .unwrap();
             // Emit a BlockBoundary every 100 txs so eth_blockNumber moves —
-            // proves D-Sh5 wiring against the real channel C.
+            // proves D-Sh5 wiring against the real tx_receipts.
             if tx_idx_counter % 100 == 0 {
                 block_number += 1;
                 exec.publish_block_boundary(BlockBoundary {
@@ -3659,7 +3659,7 @@ async fn proxy_e2e_real_aeron_1000_txs() {
 
     // 3. Push 1000 signed txs from distinct senders through the proxy. Real
     //    bytes go over real Aeron channels; the proxy waits on real receipts
-    //    coming back over real channel C.
+    //    coming back over real tx_receipts.
     let mut signers = Vec::with_capacity(1000);
     for _ in 0..1000 {
         signers.push(PrivateKeySigner::random());
@@ -3745,7 +3745,7 @@ gh pr create \
 - Per-IP `governor` token bucket runs before any expensive work.
 - 64-deep secp256k1 recovery ring with 50µs flush window and single-sig fallback; property-tested to match the single-sig reference on 1k random txs.
 - Routes to `ingress[keccak(sender) % M]` via abstract `IngressPublication` (mocked here behind `log_stub`; swapped for real Aeron when S3 lands).
-- `PendingReceipts` parks the response until both the quorum fsync watermark advances past the tx's B-position AND a matching receipt arrives on channel C; idempotent retries served from the receipt-cache channel.
+- `PendingReceipts` parks the response until both the quorum fsync watermark advances past the tx's B-position AND a matching receipt arrives on tx_receipts; idempotent retries served from the receipt-cache channel.
 - Criterion benches for end-to-end latency and sustained throughput.
 
 ## Test plan
@@ -3766,6 +3766,6 @@ Expected output: a GitHub PR URL ending in `/pull/N`.
 
 ## Self-review checklist (run after writing the plan)
 
-1. **Spec coverage:** §2.1 transports — Tasks 13–15. Rate limit — Tasks 6, 18. Batched sig verify — Tasks 7–9. Routing — Tasks 5, 19. Pending receipts + watermark — Tasks 10, 17, 20. Receipt cache — Tasks 11, 17. Failure §4.1 (idempotent retry) — Task 17. V0 deferrals (`getBalance`, `getTransactionCount`) — Task 13 returns explicit errors. Latency budget §3 — Task 21. S0 D-Sh3/D-Sh4 (typed `sender` + `tx_hash`) — Tasks 7–9, 12. S0 D-Sh5 (`eth_blockNumber` from channel C) — Task 12 BlockBoundary watcher + Task 13 handler. S0 D-Sh4 (`eth_getTransactionReceipt` via state-DB) — Task 13 handler. S0 D-Sh2 (rkyv codec) — log_stub header note + future swap to `kardamom-types`. S0 D-Sh8 (Docker e2e) — Task 24.
+1. **Spec coverage:** §2.1 transports — Tasks 13–15. Rate limit — Tasks 6, 18. Batched sig verify — Tasks 7–9. Routing — Tasks 5, 19. Pending receipts + watermark — Tasks 10, 17, 20. Receipt cache — Tasks 11, 17. Failure §4.1 (idempotent retry) — Task 17. V0 deferrals (`getBalance`, `getTransactionCount`) — Task 13 returns explicit errors. Latency budget §3 — Task 21. S0 D-Sh3/D-Sh4 (typed `sender` + `tx_hash`) — Tasks 7–9, 12. S0 D-Sh5 (`eth_blockNumber` from tx_receipts) — Task 12 BlockBoundary watcher + Task 13 handler. S0 D-Sh4 (`eth_getTransactionReceipt` via state-DB) — Task 13 handler. S0 D-Sh2 (rkyv codec) — log_stub header note + future swap to `kardamom-types`. S0 D-Sh8 (Docker e2e) — Task 24.
 2. **Placeholder scan:** none of "TBD / TODO / implement later" — every step shows code.
 3. **Type consistency:** `IngressMsg` (with typed `sender: Address` and `tx_hash: B256`, never `Option` — S0 D-Sh3/D-Sh4), `Receipt`, `BPosition`, `QuorumWatermark`, `CachedReceipt`, `BlockBoundary`, `StateDatabase`, `InMemoryStateDb` are defined once in `log_stub.rs` and used identically across `proxy.rs`, tests, and benches. `partition_for(Address, u32) -> u32` is consistent. `PendingReceipts::on_receipt(Address, Receipt)` and `update_watermark(QuorumWatermark)` match between unit tests and the proxy watcher. `BatchVerifier::recover(TxEnvelope, Bytes) -> (Address, B256)` returns the canonical pair from a single batched pass.

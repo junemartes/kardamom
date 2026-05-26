@@ -1,24 +1,24 @@
 //! Real-Aeron Docker e2e for the executor.
 //!
 //! Status: **deferred to a follow-up PR** pending S3 publishing the
-//! channel-B/C wrappers under the `aeron-live` + `testing` features of
+//! tx_ordering/C wrappers under the `aeron-live` + `testing` features of
 //! `kardamom-log`. Today S3 only ships:
 //!
 //! - `kardamom_log::testing::AeronTestCluster` (testcontainers harness),
 //! - `kardamom_log::testing::Fake*` in-memory pub/sub stand-ins,
 //! - `kardamom_log::codec::{encode, access, materialize}` for rkyv ↔ bytes.
 //!
-//! The channel-B/C publishers and subscribers that wrap the real rusteron
+//! The tx_ordering/C publishers and subscribers that wrap the real rusteron
 //! handles into `TxOrderingSubscription` / `ChannelCPublication` adapters are
 //! still TBD in `kardamom-log`. Once those land, the e2e test follows the
 //! Task 19 outline in `docs/plans/2026-05-23-S4-v0-sequential-executor.md`:
 //!
 //! 1. `AeronTestCluster::single_node().await?`
-//! 2. Open a publisher on channel B, a subscriber on channel C.
+//! 2. Open a publisher on tx_ordering, a subscriber on tx_receipts.
 //! 3. Publish N rkyv-encoded `TxEnvelope`s + a `BlockBoundaryStart`.
 //! 4. Wire the executor's `TxOrderingSubscription` / `ChannelCPublication`
 //!    adapters and run.
-//! 5. Drain channel C, assert receipts and the slim boundary.
+//! 5. Drain tx_receipts, assert receipts and the slim boundary.
 //!
 //! Tracking: S3 follow-up PR to expose `RealChannelBPublication`,
 //! `RealTxOrderingSubscription`, `RealChannelCPublication`,

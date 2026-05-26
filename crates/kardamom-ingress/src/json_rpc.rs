@@ -2,7 +2,7 @@
 //!
 //! Method set is the minimal v0 Ethereum subset:
 //! - `eth_chainId`
-//! - `eth_blockNumber` (per S0 D-Sh5: served from the channel-C
+//! - `eth_blockNumber` (per S0 D-Sh5: served from the tx_receipts
 //!   `BlockBoundary` watcher in the proxy)
 //! - `eth_sendRawTransaction`
 //! - `eth_getTransactionReceipt` (per S0 D-Sh4: state-DB `tx_hash_index`
@@ -83,7 +83,7 @@ where
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        // Per S0 D-Sh5: the proxy's channel-C watcher (spawned in
+        // Per S0 D-Sh5: the proxy's tx_receipts watcher (spawned in
         // `IngressProxy::new`) maintains `latest_block_number: AtomicU64`.
         Ok(U256::from(self.proxy.latest_block_number()))
     }

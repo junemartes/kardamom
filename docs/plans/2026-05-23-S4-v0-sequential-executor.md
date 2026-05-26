@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the v0 executor subsystem (S4) — a single-threaded, deterministic, sequential revm executor that consumes Aeron channel B (txs + block boundaries) and publishes receipts + sealed block boundaries to channel C, with a state-snapshot swap protocol that lets the libmdbx writer (S6) advance underneath it.
+**Goal:** Ship the v0 executor subsystem (S4) — a single-threaded, deterministic, sequential revm executor that consumes Aeron tx_ordering (txs + block boundaries) and publishes receipts + sealed block boundaries to tx_receipts, with a state-snapshot swap protocol that lets the libmdbx writer (S6) advance underneath it.
 
-**Architecture:** A new crate `crates/kardamom-executor` exposes one long-running `Executor` actor: a **reader thread** demuxes channel B (`TxEnvelope` | `BlockBoundaryStart`); a **single execution thread** runs revm against a `Box<dyn StateDatabase>` snapshot, accumulates writes in a per-block `BlockDelta`, computes a deterministic `write_set_hash` per tx; a **commit thread** drains receipts in tx-index order and publishes to channel C. At each `BlockBoundaryStart` the executor drains in-flight work, publishes a slim `BlockBoundary { block_number, end_tx_idx, l2_timestamp }` on C (no state-root commitment — per S0 D-Sh11, state-root attestation is a validator concern deferred out of v0), hands the delta to the state-writer queue, waits for the state writer's "block N committed" signal, briefly pauses the reader to swap the read snapshot, and resumes. Per-tx determinism is still enforced via `Receipt.write_set_hash`. Block-STM is **explicitly out of scope** for v0 — S4 v1 will replace the single execution thread with worker threads behind the same channel-B-in / channel-C-out interface.
+**Architecture:** A new crate `crates/kardamom-executor` exposes one long-running `Executor` actor: a **reader thread** demuxes tx_ordering (`TxEnvelope` | `BlockBoundaryStart`); a **single execution thread** runs revm against a `Box<dyn StateDatabase>` snapshot, accumulates writes in a per-block `BlockDelta`, computes a deterministic `write_set_hash` per tx; a **commit thread** drains receipts in tx-index order and publishes to tx_receipts. At each `BlockBoundaryStart` the executor drains in-flight work, publishes a slim `BlockBoundary { block_number, end_tx_idx, l2_timestamp }` on C (no state-root commitment — per S0 D-Sh11, state-root attestation is a validator concern deferred out of v0), hands the delta to the state-writer queue, waits for the state writer's "block N committed" signal, briefly pauses the reader to swap the read snapshot, and resumes. Per-tx determinism is still enforced via `Receipt.write_set_hash`. Block-STM is **explicitly out of scope** for v0 — S4 v1 will replace the single execution thread with worker threads behind the same tx_ordering-in / tx_receipts-out interface.
 
-**Tech Stack:** Rust (edition 2024), revm 38, alloy-primitives 1.6, alloy-consensus 2.0, `crossbeam-channel` for in-process queues, `sha3` (via `alloy_primitives::keccak256`) for deterministic hashing, `rkyv` 0.8 zero-copy wire codec (per S0 D-Sh2; executor consumes `Archived<TxEnvelope>` from channel B zero-copy on the hot path and produces owned `Receipt` values for channel C), `criterion` for benches, `tempfile` + an in-crate mock `StateDatabase` for tests.
+**Tech Stack:** Rust (edition 2024), revm 38, alloy-primitives 1.6, alloy-consensus 2.0, `crossbeam-channel` for in-process queues, `sha3` (via `alloy_primitives::keccak256`) for deterministic hashing, `rkyv` 0.8 zero-copy wire codec (per S0 D-Sh2; executor consumes `Archived<TxEnvelope>` from tx_ordering zero-copy on the hot path and produces owned `Receipt` values for tx_receipts), `criterion` for benches, `tempfile` + an in-crate mock `StateDatabase` for tests.
 
 **Branch:** `claude/s4-v0-sequential-executor` (branched off `claude/work`).
 
@@ -18,7 +18,7 @@
 - **`crates/kardamom-types`** (per S0 D-Sh1) owns all shared wire/data types: `BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundaryStart`, `BlockBoundary`, `BlockDelta`, the `StateDatabase` trait, and the `SnapshotSource` trait. The executor **imports** these — it does not define them. (S0 explicitly overrides this plan's earlier choice to host `StateDatabase` in `crates/kardamom-executor/src/state.rs`.)
 - **S3 (`crates/kardamom-log`)** publishes/consumes Aeron channels B and C. The wire-type definitions live in `kardamom-types`; `kardamom-log` exposes only the channel implementations (`TxOrderingSubscription`, `ChannelCPublication`) and reads `Archived<T>` zero-copy from Aeron buffers using `rkyv` 0.8 (S0 D-Sh2).
 - **S6 (`crates/kardamom-state`)** provides a `libmdbx`-backed implementation of the `StateDatabase` trait (the trait itself lives in `kardamom-types`, so S6 depends on `kardamom-types`, not on `kardamom-executor`).
-- **S5 (`crates/kardamom-sealer`)** emits `BlockBoundaryStart` *inline* on channel B. The executor never reads a wall clock; `block.timestamp` comes from `BlockBoundaryStart.l2_timestamp` and `block.number` from `BlockBoundaryStart.block_number`.
+- **S5 (`crates/kardamom-sealer`)** emits `BlockBoundaryStart` *inline* on tx_ordering. The executor never reads a wall clock; `block.timestamp` comes from `BlockBoundaryStart.l2_timestamp` and `block.number` from `BlockBoundaryStart.block_number`.
 
 ---
 
@@ -132,9 +132,9 @@ harness = false
 ```rust
 //! Kardamom S4 v0 sequential executor.
 //!
-//! Single-threaded revm executor that consumes Aeron channel B (txs + block
+//! Single-threaded revm executor that consumes Aeron tx_ordering (txs + block
 //! boundaries from the sealer) and publishes receipts + sealed boundaries to
-//! channel C. Block-STM is out of scope for v0; S4 v1 will replace the single
+//! tx_receipts. Block-STM is out of scope for v0; S4 v1 will replace the single
 //! execution thread with parallel workers behind the same channel interface.
 //!
 //! See docs/specs/2026-05-23-high-throughput-sequencer-design.md §2.4 and the
@@ -226,7 +226,7 @@ git commit -m "executor: add crate skeleton"
 - [ ] **Step 1: Write the type definitions**
 
 ```rust
-//! TxOrdering / Channel C executor-side demux wrappers.
+//! TxOrdering / TxReceipts executor-side demux wrappers.
 //!
 //! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
 //! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`) are imported from
@@ -238,7 +238,7 @@ git commit -m "executor: add crate skeleton"
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, Receipt, TxEnvelope};
 use revm::context::result::HaltReason;
 
-/// Monotonically increasing global index of a tx within the canonical channel-B
+/// Monotonically increasing global index of a tx within the canonical tx_ordering
 /// stream. Derived by the executor's reader from the input order, starting at 0
 /// for the first tx after genesis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -251,7 +251,7 @@ impl TxIndex {
     }
 }
 
-/// One canonical-ordered record off channel B. The sealer emits
+/// One canonical-ordered record off tx_ordering. The sealer emits
 /// `BlockBoundaryStart` records inline; the sequencer emits `Tx` records.
 ///
 /// `envelope` is `kardamom_types::TxEnvelope`, which already carries the
@@ -267,7 +267,7 @@ pub enum BMessage {
     BlockBoundaryStart(BlockBoundaryStart),
 }
 
-/// One published record on channel C — receipts and sealed boundaries.
+/// One published record on tx_receipts — receipts and sealed boundaries.
 #[derive(Debug, Clone)]
 pub enum CMessage {
     Receipt(Receipt),
@@ -511,10 +511,10 @@ pub enum ExecutorError {
     #[error("block boundary closes before observed end_tx_idx: end={end:?} last_seen={last_seen:?}")]
     BoundaryMisaligned { end: TxIndex, last_seen: TxIndex },
 
-    #[error("channel-B subscription closed")]
+    #[error("tx_ordering subscription closed")]
     ChannelBClosed,
 
-    #[error("channel-C publication closed")]
+    #[error("tx_receipts publication closed")]
     ChannelCClosed,
 
     #[error("state-writer signal channel closed")]
@@ -552,7 +552,7 @@ git commit -m "executor: define ExecutorError"
 
 V0 algorithm: sort every (address, kind, key, value) tuple lexicographically (free via `BTreeMap`), explicit-width / explicit-endian byte-encode, keccak256.
 
-**No state-root / block-delta-root computation lives in this module** (per S0 D-Sh11). The executor does not produce a state-root commitment at any level; per-tx `write_set_hash` is the only determinism witness, and the sealed `BlockBoundary` published on channel C is slim (`{ block_number, end_tx_idx, l2_timestamp }`).
+**No state-root / block-delta-root computation lives in this module** (per S0 D-Sh11). The executor does not produce a state-root commitment at any level; per-tx `write_set_hash` is the only determinism witness, and the sealed `BlockBoundary` published on tx_receipts is slim (`{ block_number, end_tx_idx, l2_timestamp }`).
 
 - [ ] **Step 1: Write the per-tx write-set type + hasher**
 
@@ -655,7 +655,7 @@ pub fn apply_write_set(delta: &mut BlockDelta, ws: WriteSet) {
 
 // NOTE: No `block_delta_root` / state-root function here. Per S0 D-Sh11 the
 // executor does not compute or publish any state-root commitment. The sealed
-// BlockBoundary on channel C is slim; the state writer flushes the delta to
+// BlockBoundary on tx_receipts is slim; the state writer flushes the delta to
 // libmdbx, and that's the end of the executor's role in block closure.
 
 #[cfg(test)]
@@ -896,7 +896,7 @@ git commit -m "executor(tests): property tests for write_set_hash invariance"
 **Files:**
 - Modify: `crates/kardamom-executor/src/block_env.rs`
 
-**Context:** Determinism (spec invariant I3) requires that every field revm reads from the block context is a pure function of the canonical input (channel B). No wall clocks, no randomness.
+**Context:** Determinism (spec invariant I3) requires that every field revm reads from the block context is a pure function of the canonical input (tx_ordering). No wall clocks, no randomness.
 
 - v0 choice for `prevrandao`/`difficulty`: **constant `B256::ZERO`**. A hash-chain over `(prev_root, block_number)` is the v1 plan; for v0 the value just must be deterministic.
 - `basefee`: 0. The L2 has no fee market in v0.
@@ -907,7 +907,7 @@ git commit -m "executor(tests): property tests for write_set_hash invariance"
 ```rust
 //! Build a deterministic revm `BlockEnv` / `CfgEnv` for a single executed tx.
 //!
-//! Spec invariant I3: every field is a pure function of the canonical channel-B
+//! Spec invariant I3: every field is a pure function of the canonical tx_ordering
 //! input. No wall clocks, no entropy.
 
 use alloy_primitives::U256;
@@ -1190,7 +1190,7 @@ pub fn execute_tx(
     // or anywhere else the executor emits — write_set_hash is the only
     // determinism witness.
     // `kardamom_types::Receipt.tx_idx` is a `BPosition` (S0 D-Sh1). Pass the
-    // inbound channel-B position straight through. The executor-local
+    // inbound tx_ordering position straight through. The executor-local
     // `TxIndex` newtype is kept around for monotonicity bookkeeping and
     // boundary-alignment checks; it never appears on the wire.
     let _ = tx_idx;
@@ -1406,9 +1406,9 @@ git commit -m "executor: per-tx revm step with WriteSet capture"
 **Files:**
 - Modify: `crates/kardamom-executor/src/actor.rs`
 
-**Context:** The actor wires three threads. This task lays in the struct + configuration + the inbound channel-B trait the reader consumes; the next task adds the reader loop, then the exec loop, then the commit loop.
+**Context:** The actor wires three threads. This task lays in the struct + configuration + the inbound tx_ordering trait the reader consumes; the next task adds the reader loop, then the exec loop, then the commit loop.
 
-- [ ] **Step 1: Define the channel-B subscription trait**
+- [ ] **Step 1: Define the tx_ordering subscription trait**
 
 ```rust
 //! Executor actor: reader thread + sequential execution thread + commit thread.
@@ -1433,7 +1433,7 @@ use crate::error::ExecutorError;
 use crate::executor::execute_tx;
 use crate::types::{BMessage, CMessage, TxIndex};
 
-/// Subscription to channel B. Implementations: real (Aeron) in `kardamom-log`;
+/// Subscription to tx_ordering. Implementations: real (Aeron) in `kardamom-log`;
 /// test mock in `actor.rs::tests`.
 pub trait TxOrderingSubscription: Send {
     /// Block until the next record is available or return Err when the
@@ -1441,7 +1441,7 @@ pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<BMessage, ExecutorError>;
 }
 
-/// Publication handle for channel C.
+/// Publication handle for tx_receipts.
 pub trait ChannelCPublication: Send {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError>;
 }
@@ -1478,12 +1478,12 @@ impl Default for ExecutorConfig {
     }
 }
 
-/// Owns the three threads. `run` blocks until the channel-B subscription
+/// Owns the three threads. `run` blocks until the tx_ordering subscription
 /// closes or an error occurs.
 pub struct Executor;
 
 impl Executor {
-    /// Spawn reader, exec, commit threads and join them. Returns when channel B
+    /// Spawn reader, exec, commit threads and join them. Returns when tx_ordering
     /// closes cleanly or when any thread propagates a fatal error.
     pub fn run<B, C, S, Q, P>(
         cfg: ExecutorConfig,
@@ -1530,7 +1530,7 @@ git commit -m "executor: actor module skeleton (config + channel traits)"
 **Files:**
 - Modify: `crates/kardamom-executor/src/actor.rs`
 
-**Context:** The reader thread is single-purpose: pull `BMessage` from the channel-B subscription, validate `tx_idx` monotonicity (one off-by-one bug here is a determinism violation), forward to the exec thread.
+**Context:** The reader thread is single-purpose: pull `BMessage` from the tx_ordering subscription, validate `tx_idx` monotonicity (one off-by-one bug here is a determinism violation), forward to the exec thread.
 
 - [ ] **Step 1: Add the reader loop**
 
@@ -1778,7 +1778,7 @@ loop:
       current_block_number = block_number + 1
 ```
 
-Note `current_block_number` is updated **before** the next tx executes; the next `BlockBoundaryStart` reasserts it. The exec thread tracks both the executor-local `TxIndex` (for monotonicity) and the channel-B `BPosition` (for boundary alignment, since `BlockBoundaryStart.end_tx_idx` is a `BPosition` per S0 D-Sh1).
+Note `current_block_number` is updated **before** the next tx executes; the next `BlockBoundaryStart` reasserts it. The exec thread tracks both the executor-local `TxIndex` (for monotonicity) and the tx_ordering `BPosition` (for boundary alignment, since `BlockBoundaryStart.end_tx_idx` is a `BPosition` per S0 D-Sh1).
 
 - [ ] **Step 1: Replace the `spawn_exec` stub**
 
@@ -1807,7 +1807,7 @@ where
             // to validate the end_tx_idx alignment.
             let mut current_l2_ts: u64 = 0;
             // We track both the executor-local TxIndex (monotonic counter for
-            // sanity) and the channel-B BPosition (the actual wire identifier
+            // sanity) and the tx_ordering BPosition (the actual wire identifier
             // BlockBoundaryStart.end_tx_idx compares against, per S0 D-Sh1).
             let mut last_processed_position: Option<BPosition> = None;
 
@@ -1832,7 +1832,7 @@ where
                     }
                     ReaderToExec::Boundary(BlockBoundaryStart { block_number, end_tx_idx, l2_timestamp }) => {
                         // Alignment: BlockBoundaryStart.end_tx_idx is a BPosition
-                        // identifying the LAST channel-B record that belongs to
+                        // identifying the LAST tx_ordering record that belongs to
                         // the closing block. It must match the executor's most
                         // recent processed position.
                         if let Some(lp) = last_processed_position {
@@ -1845,7 +1845,7 @@ where
                         }
 
                         // S0 D-Sh11: NO state-root computation. The sealed
-                        // BlockBoundary on channel C is slim — three fields,
+                        // BlockBoundary on tx_receipts is slim — three fields,
                         // no commitment. State-root attestation is a future
                         // validator concern.
                         let boundary = BlockBoundary {
@@ -2058,7 +2058,7 @@ git commit -m "executor: exec thread (per-tx revm + boundary + snapshot swap)"
 **Files:**
 - Modify: `crates/kardamom-executor/src/actor.rs`
 
-**Context:** The commit thread is intentionally tiny: pull from the receipt queue in arrival order (which is tx_idx order by construction — exec is sequential and queues are FIFO), republish to channel C. Boundaries pass through the same queue inline so consumers of C see receipts and boundaries in canonical order.
+**Context:** The commit thread is intentionally tiny: pull from the receipt queue in arrival order (which is tx_idx order by construction — exec is sequential and queues are FIFO), republish to tx_receipts. Boundaries pass through the same queue inline so consumers of C see receipts and boundaries in canonical order.
 
 - [ ] **Step 1: Replace the `spawn_commit` stub**
 
@@ -2164,9 +2164,9 @@ git commit -m "executor: commit thread publishes receipts + boundaries on C"
 ```rust
 //! Kardamom S4 v0 sequential executor.
 //!
-//! Single-threaded revm executor consuming Aeron channel B (txs +
+//! Single-threaded revm executor consuming Aeron tx_ordering (txs +
 //! BlockBoundaryStart) and publishing receipts + sealed BlockBoundaries to
-//! channel C. Block-STM is explicitly out of scope for v0; S4 v1 will replace
+//! tx_receipts. Block-STM is explicitly out of scope for v0; S4 v1 will replace
 //! the single execution thread with parallel workers behind the same channel
 //! interface (`TxOrderingSubscription` / `ChannelCPublication`).
 //!
@@ -2221,13 +2221,13 @@ git commit -m "executor: re-export public API"
 **Files:**
 - Create: `crates/kardamom-executor/tests/replay_integration.rs`
 
-**Context:** Drives the full Executor via mocked channels; asserts the channel-C output matches expectation for a known synthetic stream.
+**Context:** Drives the full Executor via mocked channels; asserts the tx_receipts output matches expectation for a known synthetic stream.
 
 - [ ] **Step 1: Write the test**
 
 ```rust
 //! Integration test: feed a synthetic stream of (txs + boundaries) into an
-//! `Executor` and assert the channel-C output matches expectation.
+//! `Executor` and assert the tx_receipts output matches expectation.
 //!
 //! No real Aeron, no real libmdbx — mock channels and `MockStateDatabase`.
 
@@ -2394,13 +2394,13 @@ git commit -m "executor(test): end-to-end replay integration"
 **Files:**
 - Create: `crates/kardamom-executor/tests/determinism.rs`
 
-**Context:** Spec invariant I3: replicas are byte-identical given the same channel-B input. Drive two `Executor` instances against the same synthetic stream and assert their channel-C output sequences are equal.
+**Context:** Spec invariant I3: replicas are byte-identical given the same tx_ordering input. Drive two `Executor` instances against the same synthetic stream and assert their tx_receipts output sequences are equal.
 
 - [ ] **Step 1: Write the test**
 
 ```rust
 //! Determinism conformance: two executor instances driven by the same input
-//! must produce byte-identical channel-C output (every `tx_hash` and every
+//! must produce byte-identical tx_receipts output (every `tx_hash` and every
 //! `write_set_hash` matches). No state-root assertion: the executor does not
 //! emit a state-root commitment (S0 D-Sh11).
 
@@ -2791,7 +2791,7 @@ At the bottom of `crates/kardamom-executor/src/lib.rs`, before the `pub mod` dec
 //! Spec §4.4 mandates that two replicas publishing a `Receipt` with the same
 //! `tx_idx` but different `write_set_hash` halt the chain. The executor
 //! cannot detect this from its own output — it has no visibility into peer
-//! replicas. The detection point is the **channel-C consumer** that dedupes
+//! replicas. The detection point is the **tx_receipts consumer** that dedupes
 //! by `tx_idx`; that consumer panics on hash mismatch.
 //!
 //! That consumer lives in the `kardamom-log` crate (S3). The chaos test
@@ -3057,9 +3057,9 @@ git commit -m "executor(bench): criterion suite for sequential throughput"
 
 This test:
 1. Brings up Aeron containers via the `kardamom-log` testcontainers helper.
-2. Publishes a synthetic stream of `TxEnvelope` records and `BlockBoundaryStart` markers onto channel B with rkyv-encoded payloads.
-3. Spawns a real `Executor` subscribing to that channel B and publishing to channel C.
-4. Drains channel C, asserts the receipts match expectation (one per tx, in order, with the expected `tx_hash` and `write_set_hash`), and asserts the slim `BlockBoundary` (no state-root commitment) closes the block.
+2. Publishes a synthetic stream of `TxEnvelope` records and `BlockBoundaryStart` markers onto tx_ordering with rkyv-encoded payloads.
+3. Spawns a real `Executor` subscribing to that tx_ordering and publishing to tx_receipts.
+4. Drains tx_receipts, asserts the receipts match expectation (one per tx, in order, with the expected `tx_hash` and `write_set_hash`), and asserts the slim `BlockBoundary` (no state-root commitment) closes the block.
 5. Tears down the containers.
 
 The test is gated behind `#[cfg(feature = "docker-e2e")]` — actually we leave it on by default but it requires Docker to be available; CI runs it in the Docker-enabled job.
@@ -3068,7 +3068,7 @@ The test is gated behind `#[cfg(feature = "docker-e2e")]` — actually we leave 
 
 ```rust
 //! E2E: real Aeron Media Driver + Archive in Docker, real `Executor` actor,
-//! channel-B input + channel-C output. Per S0 D-Sh8 every component plan
+//! tx_ordering input + tx_receipts output. Per S0 D-Sh8 every component plan
 //! ships one of these.
 //!
 //! Requires Docker. Skipped if `DOCKER_HOST` is unset and the default socket
@@ -3117,7 +3117,7 @@ fn build_envelope(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnv
     KtTxEnvelope { correlation_id: nonce, raw_tx, sender: signer.address(), tx_hash }
 }
 
-// Adapter from the real Aeron-backed channel-B subscription to the executor's
+// Adapter from the real Aeron-backed tx_ordering subscription to the executor's
 // trait. `RealTxOrderingSubscription::poll_next` returns archived rkyv views; we
 // materialize once here for the executor's BMessage demux.
 struct B(RealTxOrderingSubscription);
@@ -3169,8 +3169,8 @@ fn executor_consumes_real_aeron_b_publishes_real_aeron_c() {
     let channel_b_uri = harness.channel_b_uri();
     let channel_c_uri = harness.channel_c_uri();
 
-    // 2. Build a publisher onto channel B (the "synthetic sequencer") and a
-    // subscriber on channel C (the "test observer that stands in for the proxy
+    // 2. Build a publisher onto tx_ordering (the "synthetic sequencer") and a
+    // subscriber on tx_receipts (the "test observer that stands in for the proxy
     // / state writer / archiver").
     let mut b_pub: RealChannelBPublication = harness
         .open_channel_b_publication(&channel_b_uri)
@@ -3197,7 +3197,7 @@ fn executor_consumes_real_aeron_b_publishes_real_aeron_c() {
             .build(),
     );
 
-    // 4. Publish 5 txs + a BlockBoundaryStart onto real channel B.
+    // 4. Publish 5 txs + a BlockBoundaryStart onto real tx_ordering.
     const N: u64 = 5;
     let mut expected_hashes: Vec<B256> = Vec::with_capacity(N as usize);
     for nonce in 0..N {
@@ -3229,7 +3229,7 @@ fn executor_consumes_real_aeron_b_publishes_real_aeron_c() {
         )
     });
 
-    // 6. Drain channel C; collect receipts + the slim boundary.
+    // 6. Drain tx_receipts; collect receipts + the slim boundary.
     let mut got_hashes: Vec<B256> = Vec::new();
     let mut got_boundary: Option<BlockBoundary> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -3251,7 +3251,7 @@ fn executor_consumes_real_aeron_b_publishes_real_aeron_c() {
     // 7. Assertions.
     assert_eq!(got_hashes, expected_hashes,
         "executor's receipts must carry the proxy-populated tx_hash byte-for-byte (S0 D-Sh4)");
-    let b = got_boundary.expect("never observed the BlockBoundary on channel C");
+    let b = got_boundary.expect("never observed the BlockBoundary on tx_receipts");
     assert_eq!(b.block_number, 1);
     assert_eq!(b.end_tx_idx, BPosition { term_id: 0, term_offset: (N as i32) - 1 });
     assert_eq!(b.l2_timestamp, 1_700_000_000);

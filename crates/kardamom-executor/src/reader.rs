@@ -1,37 +1,37 @@
-//! Channel-A / channel-B reader threads + join buffer (S4-arch-update,
+//! TxData / tx_ordering reader threads + join buffer (S4-arch-update,
 //! D-Sh12, spec §2.4).
 //!
-//! Before S4-arch-update the executor had **one** channel-B reader thread that
-//! pulled full [`TxEnvelope`]s off channel B and handed them downstream. After
-//! the split-architecture refactor (D-Sh12 / spec D11) channel B carries only
+//! Before S4-arch-update the executor had **one** tx_ordering reader thread that
+//! pulled full [`TxEnvelope`]s off tx_ordering and handed them downstream. After
+//! the split-architecture refactor (D-Sh12 / spec D11) tx_ordering carries only
 //! ~16-32 B [`TxOrderingMessage`] records (`TxRef | BoundaryStart`); the full
-//! envelope bytes live on M per-sequencer **channel A** archives.
+//! envelope bytes live on M per-sequencer **tx_data** archives.
 //!
 //! This module owns the M+1 reader thread topology:
 //!
 //! ```text
 //!   ┌────────────────┐
-//!   │ channel A[0]   │──┐                                 ┌────────────┐
+//!   │ tx_data[0]   │──┐                                 ┌────────────┐
 //!   │ reader thread  │  │   DashMap<(sid,tx_data_position),     │ exec thread│
 //!   ├────────────────┤  │     TxEnvelope> "join buffer"   │ (revm)     │
-//!   │ channel A[1]   │──┤◄────insert────────────────────► │            │
+//!   │ tx_data[1]   │──┤◄────insert────────────────────► │            │
 //!   │ reader thread  │  │              ▲                  └────────────┘
 //!   ├────────────────┤  │              │ lookup+remove          ▲
 //!   │      …         │  │              │                        │ (BPosition,
 //!   ├────────────────┤  │       ┌──────┴──────────┐             │  TxEnvelope)
-//!   │ channel A[M-1] │──┘       │ channel B reader│─────────────┘
+//!   │ tx_data[M-1] │──┘       │ tx_ordering reader│─────────────┘
 //!   └────────────────┘          │     thread      │ (also forwards
 //!                               └─────────────────┘  BlockBoundaryStart
 //!                                                    inline)
 //! ```
 //!
-//! Each channel-A reader thread is dedicated to one Aeron subscription
-//! (channel A[i]); see `aeron_live.rs` in `kardamom-log` for the
+//! Each tx_data reader thread is dedicated to one Aeron subscription
+//! (tx_data[i]); see `aeron_live.rs` in `kardamom-log` for the
 //! Send-safety pattern (`rusteron_client::Aeron` is `!Send + !Sync`, so each
 //! subscription must own its own Aeron client on its own OS thread). The
 //! reader simply inserts every fragment into the shared [`JoinBuffer`].
 //!
-//! The single channel-B reader pulls [`TxOrderingMessage`] records in canonical
+//! The single tx_ordering reader pulls [`TxOrderingMessage`] records in canonical
 //! order (system invariant I1). For each:
 //!
 //! - `TxRef`: look up `(sequencer_id, tx_data_position)` in the join buffer; if
@@ -41,8 +41,8 @@
 //!   JoinTimeout`] — something is wrong upstream.
 //! - `BoundaryStart`: forward verbatim.
 //!
-//! `BPosition` handed to exec is the **channel-B** position (the canonical L2
-//! position), not the channel-A position. Downstream consumers continue to
+//! `BPosition` handed to exec is the **tx_ordering** position (the canonical L2
+//! position), not the tx_data position. Downstream consumers continue to
 //! key on this.
 
 use std::sync::Arc;
@@ -58,7 +58,7 @@ use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessag
 use crate::error::ExecutorError;
 use crate::types::TxIndex;
 
-/// Subscription to one **channel A[i]**.
+/// Subscription to one **tx_data[i]**.
 ///
 /// One impl per sequencer partition. Implementations:
 /// - in production: `kardamom_log::TxDataSubscriber` wrapped in a
@@ -77,7 +77,7 @@ pub trait TxDataSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxEnvelope), ExecutorError>;
 }
 
-/// Subscription to **channel B** (the canonical orderer).
+/// Subscription to **tx_ordering** (the canonical orderer).
 ///
 /// Yields tiny [`TxOrderingMessage`] records (`TxRef | BoundaryStart`) each
 /// tagged with its canonical `BPosition`. The `BPosition` is the system's
@@ -92,8 +92,8 @@ pub trait TxOrderingSubscription: Send {
 
 /// Lookup-and-remove join buffer keyed by `(sequencer_id, tx_data_position)`.
 ///
-/// Channel-A reader threads insert via [`JoinBuffer::insert`]. The
-/// channel-B reader pulls via [`JoinBuffer::take`] (remove-on-hit). Bounded
+/// TxData reader threads insert via [`JoinBuffer::insert`]. The
+/// tx_ordering reader pulls via [`JoinBuffer::take`] (remove-on-hit). Bounded
 /// by the in-flight window — typically a few thousand entries (~100 MB at
 /// envelope-sized values).
 ///
@@ -123,7 +123,7 @@ impl JoinBuffer {
     }
 
     /// Current entry count. Exposed for tests and the periodic
-    /// growth-monitor warning emitted by the channel-B reader.
+    /// growth-monitor warning emitted by the tx_ordering reader.
     pub fn len(&self) -> usize {
         self.inner.len()
     }
@@ -136,8 +136,8 @@ impl JoinBuffer {
 /// Tunables for the reader / join layer.
 #[derive(Clone, Debug)]
 pub struct ReaderConfig {
-    /// Upper bound on how long the channel-B reader will wait for a
-    /// `TxRef`'s envelope to land on its channel A. 100 ms matches the
+    /// Upper bound on how long the tx_ordering reader will wait for a
+    /// `TxRef`'s envelope to land on its tx_data. 100 ms matches the
     /// "few µs of A-publisher lag is fine, anything more is upstream
     /// failure" comment in the S4-arch-update plan.
     pub join_timeout: Duration,
@@ -160,10 +160,10 @@ impl Default for ReaderConfig {
     }
 }
 
-/// Message routed from the channel-B reader to the executor's exec thread.
+/// Message routed from the tx_ordering reader to the executor's exec thread.
 ///
 /// `tx_idx` is the **executor-local** monotone counter assigned in
-/// canonical (B-position) arrival order; `position` is the channel-B
+/// canonical (B-position) arrival order; `position` is the tx_ordering
 /// `BPosition` (the wire-level canonical id). The exec thread uses both:
 /// `tx_idx` as a sanity-check newtype, `position` as the
 /// downstream-published `Receipt.tx_idx`.
@@ -177,7 +177,7 @@ pub enum ReaderToExec {
     Boundary(BlockBoundaryStart),
 }
 
-/// Spawn one channel-A reader thread for `a_sub`. Inserts every
+/// Spawn one tx_data reader thread for `a_sub`. Inserts every
 /// `(tx_data_position, envelope)` into `buffer` keyed by
 /// `(a_sub.sequencer_id(), tx_data_position)`. Returns when the subscription
 /// closes cleanly (`Ok(())`) or propagates the first error.
@@ -200,10 +200,10 @@ where
                 }
             }
         })
-        .expect("spawn channel-a reader")
+        .expect("spawn tx_data reader")
 }
 
-/// Spawn the single channel-B reader thread. Pulls
+/// Spawn the single tx_ordering reader thread. Pulls
 /// [`TxOrderingMessage`] records in canonical order; for each
 /// `TxRef`, joins against `buffer` (with a bounded wait) and forwards
 /// `(position, envelope)` to `exec_out`. For each `BoundaryStart`, forwards
@@ -224,7 +224,7 @@ where
             let mut last_warn_len: usize = 0;
             // tx_hash dedup. Under the MDS topology the P sequencers per
             // shard each republish the same `(tx_hash, shard, tx_data_position)`
-            // TxRef onto channel B, so this reader sees P duplicates per
+            // TxRef onto tx_ordering, so this reader sees P duplicates per
             // logical tx. Only the first occurrence drives a join-buffer
             // take + exec dispatch; the rest are silently dropped.
             //
@@ -267,7 +267,7 @@ where
                                     sequencer_id = tx_ref.shard_id,
                                     tx_data_position = ?tx_ref.tx_data_position,
                                     timeout_ms = cfg.join_timeout.as_millis() as u64,
-                                    "join timeout: TxRef has no envelope on channel A; aborting"
+                                    "join timeout: TxRef has no envelope on tx_data; aborting"
                                 );
                                 return Err(ExecutorError::JoinTimeout {
                                     sequencer_id: tx_ref.shard_id,
@@ -318,7 +318,7 @@ where
                 }
             }
         })
-        .expect("spawn channel-b reader")
+        .expect("spawn tx_ordering reader")
 }
 
 /// Spin-wait for `(sequencer_id, tx_data_position)` to appear in `buffer`,
@@ -387,7 +387,7 @@ mod tests {
         }
     }
 
-    /// In-memory channel-A subscription: a `VecDeque` of pre-baked
+    /// In-memory tx_data subscription: a `VecDeque` of pre-baked
     /// `(BPosition, TxEnvelope)` records.
     struct VecChannelASub {
         sequencer_id: u8,
@@ -522,7 +522,7 @@ mod tests {
             buffer_warn_threshold: 10_000,
         };
 
-        // Channel-B has the ref ready immediately. TxData's insert is
+        // TxOrdering has the ref ready immediately. TxData's insert is
         // delayed by a background thread.
         let buf_for_a = buf.clone();
         let env_clone = env.clone();
@@ -553,7 +553,7 @@ mod tests {
         }
     }
 
-    /// If the envelope never arrives, the channel-B reader propagates
+    /// If the envelope never arrives, the tx_ordering reader propagates
     /// `JoinTimeout`.
     #[test]
     fn channel_b_reader_join_timeout_aborts() {

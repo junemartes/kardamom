@@ -1,5 +1,5 @@
 //! S4-arch-update (D-Sh12 / spec §2.4) integration tests for the M+1
-//! channel-A/channel-B reader topology + join-by-ref semantics.
+//! tx_data/tx_ordering reader topology + join-by-ref semantics.
 //!
 //! Uses the `kardamom-log::testing::Fake*` in-memory pub/sub fakes so we
 //! exercise the exact wire types (`TxEnvelope`, `TxOrderingMessage`,
@@ -9,12 +9,12 @@
 //!
 //! Tests:
 //! - `m4_canonical_b_order_drives_receipts`: M=4 sequencer fakes each
-//!   publish 50 envelopes onto their channel A; channel B publishes the
+//!   publish 50 envelopes onto their tx_data; tx_ordering publishes the
 //!   refs in an arbitrary interleaving. Assert the executor processes
 //!   all 200 txs in B's canonical order and emits 200 receipts in the
 //!   same order.
 //! - `tx_ref_arriving_before_envelope_still_joins`: race test —
-//!   simulates A-publisher lag of ~30 ms; the channel-B reader must
+//!   simulates A-publisher lag of ~30 ms; the tx_ordering reader must
 //!   spin and pick up the envelope once it lands.
 
 use std::sync::Arc;
@@ -160,7 +160,7 @@ fn m4_canonical_b_order_drives_receipts() {
     // M signers, one per sequencer. Each publishes its own nonce-stream
     // of transfers — no inter-signer dependencies, so the executor's
     // sequential revm path can re-order them freely. The constraint we
-    // assert is: receipts come out in **channel-B canonical order**.
+    // assert is: receipts come out in **tx_ordering canonical order**.
     let signers: Vec<PrivateKeySigner> = (0..M)
         .map(|i| {
             PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0xA0 + i)).unwrap()
@@ -177,7 +177,7 @@ fn m4_canonical_b_order_drives_receipts() {
     let snap = snap_builder.build();
 
     let bus = FakeBus::new();
-    // Per-sequencer channel-A pub/sub pairs. Channel URI / stream-id match
+    // Per-sequencer tx_data pub/sub pairs. Channel URI / stream-id match
     // the `ChannelsConfig::tx_dattx_data_channel_template` convention.
     let mut a_pubs: Vec<FakeChannelAPublication> = Vec::with_capacity(M as usize);
     let mut a_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
@@ -190,7 +190,7 @@ fn m4_canonical_b_order_drives_receipts() {
     let b_pub = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
     let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
-    // Phase 1: every sequencer publishes its envelopes onto channel A.
+    // Phase 1: every sequencer publishes its envelopes onto tx_data.
     // Record (sid, tx_data_position, tx_hash) so we can assert canonical order.
     let mut plan: Vec<(u8, BPosition, alloy_primitives::B256)> = Vec::new();
     let mut by_sid_nonce: Vec<u64> = vec![0; M as usize];
@@ -209,8 +209,8 @@ fn m4_canonical_b_order_drives_receipts() {
     assert_eq!(plan.len(), TOTAL as usize);
 
     // Phase 2: interleave the per-A plan into an arbitrary canonical
-    // order and publish refs onto channel B. Per-sequencer FIFO must be
-    // preserved (channel A is exclusive per publisher, refs land on B
+    // order and publish refs onto tx_ordering. Per-sequencer FIFO must be
+    // preserved (tx_data is exclusive per publisher, refs land on B
     // in A-publish order — see spec §2.3), so the interleaving is a
     // **merge** of M ordered queues, not a global shuffle. Inter-stream
     // interleaving is chosen at random.
@@ -353,14 +353,14 @@ fn m4_canonical_b_order_drives_receipts() {
     let expected: Vec<alloy_primitives::B256> = shuffled.iter().map(|(_, _, h)| *h).collect();
     assert_eq!(
         got_hashes, expected,
-        "receipts must be in channel-B canonical order"
+        "receipts must be in tx_ordering canonical order"
     );
 }
 
 #[test]
 fn tx_ref_arriving_before_envelope_still_joins() {
-    // Single-sequencer mini-scenario: publish the ref onto channel B
-    // immediately; delay the envelope on channel A by ~30 ms. The join
+    // Single-sequencer mini-scenario: publish the ref onto tx_ordering
+    // immediately; delay the envelope on tx_data by ~30 ms. The join
     // buffer's bounded wait should pick it up well within the default
     // 100 ms timeout.
 
@@ -384,7 +384,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     let env = transfer(&signer, 0, to);
     let expected_hash = env.tx_hash;
 
-    // Schedule the channel-A publish on a background thread so the
+    // Schedule the tx_data publish on a background thread so the
     // ref-then-envelope order is genuine.
     let bus_clone = bus.clone();
     let env_clone = env.clone();
@@ -457,7 +457,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         b_closed_signaler.store(true, Ordering::Release);
     });
 
-    // Give the channel-B reader's join wait enough headroom even on slow CI.
+    // Give the tx_ordering reader's join wait enough headroom even on slow CI.
     let cfg = ExecutorConfig {
         chain_id: 1,
         receipt_queue_depth: 8,

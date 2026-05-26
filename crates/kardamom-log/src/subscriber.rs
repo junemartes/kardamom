@@ -115,7 +115,7 @@ fn header_pos(h: &Header) -> Option<BPosition> {
 /// TxData[i]: per-sequencer subscription of full `TxEnvelope` bytes.
 /// Executors run M of these (one per sequencer); the per-A reader buffers
 /// envelopes keyed by `BPosition` until the corresponding `TxRef` arrives
-/// on channel B (spec §2.4).
+/// on tx_ordering (spec §2.4).
 pub type TxDataSubscriber = TypedSubscriber<TxEnvelope>;
 
 /// TxOrdering: canonical orderer. Yields [`TxOrderingMessage`] records
@@ -136,7 +136,7 @@ pub struct Subscribers {
 }
 
 impl Subscribers {
-    /// Open the channel-A subscription for sequencer `sequencer_id`. Run
+    /// Open the tx_data subscription for sequencer `sequencer_id`. Run
     /// M of these on each executor host to feed the per-A buffer.
     pub fn a(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         TypedSubscriber::open(
@@ -155,7 +155,11 @@ impl Subscribers {
     }
 
     pub fn c_receipts(&self) -> Result<ChannelCReceiptSubscriber, LogError> {
-        TypedSubscriber::open(&self.aeron, &self.ch.c_channel, self.ch.c_stream_id)
+        TypedSubscriber::open(
+            &self.aeron,
+            &self.ch.tx_receipts_channel,
+            self.ch.tx_receipts_stream_id,
+        )
     }
 
     pub fn receipt_cache(&self) -> Result<ReceiptCacheSubscriber, LogError> {
@@ -174,7 +178,7 @@ impl Subscribers {
         )
     }
 
-    /// Subscribe to a sequencer-local channel-A fsync watermark stream
+    /// Subscribe to a sequencer-local tx_data fsync watermark stream
     /// (one publisher per sequencer; see `fsync_watermark_tx_dattx_dattx_dattx_dattx_data_channel_template`).
     pub fn watermark_a(&self, sequencer_id: u8) -> Result<WatermarkSubscriber, LogError> {
         TypedSubscriber::open(
