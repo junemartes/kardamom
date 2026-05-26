@@ -13,9 +13,6 @@ pub enum SequencerError {
     #[error("malformed tx frame: {0}")]
     MalformedFrame(String),
 
-    #[error("lease lost during operation")]
-    LeaseLost,
-
     #[error("kardamom-log error: {0}")]
     Log(String),
 }
@@ -39,10 +36,6 @@ mod tests {
         assert_eq!(
             SequencerError::IngressDisconnected.to_string(),
             "ingress source disconnected"
-        );
-        assert_eq!(
-            SequencerError::LeaseLost.to_string(),
-            "lease lost during operation"
         );
     }
 }

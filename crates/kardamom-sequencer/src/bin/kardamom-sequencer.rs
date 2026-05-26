@@ -4,7 +4,7 @@
 //! either:
 //!   - if `aeron-live` is enabled: opens the real Aeron channels (channel B
 //!     publisher, receipt-cache publisher, ingress subscriber) via
-//!     `kardamom-log` and runs the primary or standby loop, or
+//!     `kardamom-log` and runs the sequencer loop, or
 //!   - if `aeron-live` is NOT enabled: emits a clear error and exits with
 //!     status 2 so operators don't ship a no-op binary by accident.
 //!
@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use kardamom_sequencer::config::{SequencerConfig, SequencerRole};
+use kardamom_sequencer::config::SequencerConfig;
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-sequencer", version, about = "S2 sequencer process")]
@@ -42,9 +42,6 @@ struct Args {
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
-    /// Run as standby instead of primary.
-    #[arg(long)]
-    standby: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,9 +80,6 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(c) = args.core_id {
         cfg.core_id = Some(c);
-    }
-    if args.standby {
-        cfg.role = SequencerRole::Standby;
     }
     cfg.validate()?;
 

@@ -28,7 +28,6 @@ clap.workspace = true
 core_affinity = "0.8"
 ctrlc = { version = "3", features = ["termination"] }
 kardamom-log = { workspace = true, features = ["testing"] }
-kardamom-nonce-registry.workspace = true
 kardamom-types.workspace = true
 metrics.workspace = true
 rkyv.workspace = true
