@@ -3682,7 +3682,6 @@ dependencies = [
  "clap",
  "criterion 0.7.0",
  "kardamom-deployer",
- "kardamom-leases",
  "kardamom-log",
  "kardamom-types",
  "metrics",
@@ -3810,17 +3809,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kardamom-leases"
-version = "0.1.0"
-dependencies = [
- "kardamom-log",
- "kardamom-types",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "kardamom-log"
 version = "0.1.0"
 dependencies = [
@@ -3876,7 +3864,6 @@ dependencies = [
  "anyhow",
  "clap",
  "criterion 0.7.0",
- "kardamom-leases",
  "kardamom-log",
  "kardamom-sealer",
  "kardamom-types",

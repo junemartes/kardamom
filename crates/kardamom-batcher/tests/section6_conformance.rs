@@ -41,11 +41,7 @@ use kardamom_batcher::recon::reconstruct;
 use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
-use kardamom_leases::{Lease, LeaseConfig};
-use kardamom_types::{
-    BPosition, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, TxEnvelope, TxOrderingMessage,
-    TxRef,
-};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 use tempfile::TempDir;
 
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
@@ -203,18 +199,6 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
     // ----- Stage 2: drive the batcher pipeline. -----
     let cfg = BatcherConfig::default();
     let mut batcher = Batcher::new(cfg.clone(), MockSender::default());
-    let all_ids = vec![0u8];
-    let mut lease = Lease::new(LeaseConfig {
-        self_id: 0,
-        all_ids,
-        caught_up_window: 1024 * 1024,
-    });
-    lease.observe_quorum(QuorumWatermark { position: pos(0) });
-    lease.observe_fsync(FsyncWatermark {
-        recorder_id: 0,
-        position: pos(0),
-    });
-    assert!(lease.held_by_us(), "single host always holds the lease");
 
     let reader = MultiArchiveReader::open(&MultiArchiveConfig {
         b_segment,
@@ -255,7 +239,7 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
                 }
 
                 produced_batches.push(pack.clone());
-                batcher.on_closed_block(closed, &lease).expect("on_closed");
+                batcher.on_closed_block(closed).expect("on_closed");
             }
         }
     }

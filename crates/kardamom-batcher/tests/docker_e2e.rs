@@ -43,12 +43,8 @@ use kardamom_batcher::multi_archive_reader::{
     MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
 };
 use kardamom_batcher::recon::reconstruct;
-use kardamom_leases::{Lease, LeaseConfig};
 use kardamom_log::testing::AeronTestCluster;
-use kardamom_types::{
-    BPosition, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, TxEnvelope, TxOrderingMessage,
-    TxRef,
-};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 use tempfile::TempDir;
 
 fn pos(o: i32) -> BPosition {
@@ -200,19 +196,6 @@ async fn aeron_cluster_starts_and_batcher_round_trips_the_m_plus_one_topology() 
     let cfg = BatcherConfig::default();
     let mut batcher = Batcher::new(cfg.clone(), MockSender::default());
 
-    let all_ids = vec![0u8];
-    let mut lease = Lease::new(LeaseConfig {
-        self_id: 0,
-        all_ids: all_ids.clone(),
-        caught_up_window: 1024 * 1024,
-    });
-    lease.observe_quorum(QuorumWatermark { position: pos(0) });
-    lease.observe_fsync(FsyncWatermark {
-        recorder_id: 0,
-        position: pos(0),
-    });
-    assert!(lease.held_by_us(), "single host always holds the lease");
-
     let reader = MultiArchiveReader::open(&MultiArchiveConfig {
         b_segment,
         a_segments,
@@ -242,7 +225,7 @@ async fn aeron_cluster_starts_and_batcher_round_trips_the_m_plus_one_topology() 
                 for (i, tx) in reconstructed[0].txs.iter().enumerate() {
                     assert_eq!(tx.correlation_id, want[i]);
                 }
-                batcher.on_closed_block(closed, &lease).expect("post");
+                batcher.on_closed_block(closed).expect("post");
             }
         }
     }

@@ -1,39 +1,30 @@
-//! S5 block sealer.
+//! Block sealer.
 //!
 //! Emits [`kardamom_types::BlockBoundaryStart`] markers every 250 ms wall-clock
-//! onto tx_ordering. Singleton with hot standbys; leader is the lowest-recorder-id
-//! sealer whose recorder peer is caught up to the current B tail. Election is
-//! driven by [`kardamom_leases::Lease`] — the same primitive the S2 sequencer
-//! uses — so all three subsystems share one deterministic election rule.
+//! onto tx_ordering. Single-instance for v1: there is no election, no
+//! standby, no failover. If the sealer process dies the L2 stops producing
+//! blocks until an operator restarts it — acceptable for v1 because the
+//! sealer is off the transaction hot path.
 //!
-//! All sealer state is reconstructable from B's tail; failover is mechanical.
-//! On takeover the new leader reads the most recent `BlockBoundaryStart` from
-//! B and emits `block_number + 1` at the next aligned 250 ms tick.
+//! On restart, [`bootstrap`] reads the most recent `BlockBoundaryStart` from
+//! tx_ordering's tail to resume `block_number` without gaps.
 //!
 //! ## Crate layout
 //!
 //! - [`config`] — `SealerConfig` (TOML loader + validation).
 //! - [`clock`] — `WallClock` trait + `SystemClock` + `MockClock` for tests.
 //! - [`tick`] — wall-clock tick alignment helpers (`floor_to_tick`, `next_tick`).
-//! - [`bootstrap`] — read the most recent `BlockBoundaryStart` from B's tail to
-//!   seed `block_number`.
-//! - [`emitter`] — leader-side publish loop.
-//! - [`watermark_tracker`] — per-recorder freshness window feeding the lease.
-//! - [`sealer`] — top-level supervisor: ties election + emitter together.
-//!
-//! The actual leader election lives in [`kardamom_leases::Lease`]. The
-//! [`watermark_tracker`] module wraps the lease, feeds it `FsyncWatermark`
-//! observations from each recorder, and synthesises a `QuorumWatermark` from
-//! the current B publication position.
+//! - [`bootstrap`] — read the most recent `BlockBoundaryStart` from tx_ordering's
+//!   tail to seed `block_number`.
+//! - [`emitter`] — publish loop.
+//! - [`sealer`] — top-level supervisor wrapping the emitter on a tick loop.
 
 pub mod bootstrap;
 pub mod clock;
 pub mod config;
-pub mod election;
 pub mod emitter;
 pub mod sealer;
 pub mod tick;
-pub mod watermark_tracker;
 
 pub use config::{ConfigError, SealerConfig};
 pub use sealer::Sealer;

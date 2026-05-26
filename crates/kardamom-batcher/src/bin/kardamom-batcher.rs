@@ -22,8 +22,6 @@ use kardamom_batcher::batcher::{Batcher, BatcherConfig, MockSender};
 use kardamom_batcher::multi_archive_reader::{
     MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
 };
-use kardamom_leases::{Lease, LeaseConfig};
-use kardamom_types::{BPosition, FsyncWatermark, QuorumWatermark};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]
@@ -52,18 +50,6 @@ struct Cli {
     /// Skip L1 broadcast; only inspect the archive.
     #[arg(long, default_value_t = true)]
     dry_run: bool,
-
-    /// Recorder host id for this batcher (used by the lease).
-    #[arg(long, default_value_t = 0u8)]
-    self_id: u8,
-
-    /// Comma-separated list of all recorder host ids in the cluster.
-    #[arg(long, value_delimiter = ',', default_value = "0")]
-    all_ids: Vec<u8>,
-
-    /// Bytes of stream lag that still count as "caught up" for lease purposes.
-    #[arg(long, default_value_t = 16 * 1024 * 1024i64)]
-    caught_up_window: i64,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -93,20 +79,6 @@ fn main() -> anyhow::Result<()> {
         MockSender::default(),
     );
 
-    // Self-elect a lease so we exercise the production code path even in dry-run.
-    let mut lease = Lease::new(LeaseConfig {
-        self_id: cli.self_id,
-        all_ids: cli.all_ids.clone(),
-        caught_up_window: cli.caught_up_window,
-    });
-    lease.observe_fsync(FsyncWatermark {
-        recorder_id: cli.self_id,
-        position: BPosition::ZERO,
-    });
-    lease.observe_quorum(QuorumWatermark {
-        position: BPosition::ZERO,
-    });
-
     let mut tx_count: u64 = 0;
     let mut block_count: u64 = 0;
     for rec in reader {
@@ -118,7 +90,7 @@ fn main() -> anyhow::Result<()> {
             ResolvedRecord::Boundary { marker, .. } => {
                 block_count += 1;
                 let closed = batcher.accumulator().observe_boundary(marker);
-                batcher.on_closed_block(closed, &lease)?;
+                batcher.on_closed_block(closed)?;
             }
         }
     }

@@ -24,7 +24,6 @@ docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-kardamom-leases.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-types.workspace = true
 metrics.workspace = true

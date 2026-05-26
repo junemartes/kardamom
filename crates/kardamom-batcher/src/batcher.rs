@@ -5,14 +5,12 @@
 //!   `BlockBoundaryStart`.
 //! - For each closed block (or group of blocks — configurable via
 //!   `blocks_per_batch`), encodes KAR1, optionally zstd-compresses, packs into
-//!   blobs, and (only when this host holds the lease) hands the packed batch
-//!   to a [`Sender`] for L1 broadcast.
+//!   blobs, and hands the packed batch to a [`Sender`] for L1 broadcast.
 //!
-//! Standby instances still drive the reader + accumulator so their internal
-//! state matches the leader's; they just skip the `Sender::post` call.
+//! Single-instance for v1: there is no election or standby. If the batcher
+//! process dies the L2 stops settling blocks until an operator restarts it.
 
 use alloy_eips::eip4844::Blob;
-use kardamom_leases::Lease;
 use metrics::counter;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
@@ -24,14 +22,9 @@ use crate::frame::{BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
 /// Metric names. Use `metrics::Recorder` to scrape; the runtime wires up a
 /// Prometheus exporter via `metrics-exporter-prometheus`.
 pub mod metric_names {
-    /// Closed blocks observed (lease-holder or standby).
     pub const BLOCKS_OBSERVED: &str = "batcher.blocks_observed_total";
-    /// Batches actually posted (lease-holder only).
     pub const BATCHES_POSTED: &str = "batcher.batches_posted_total";
-    /// Blobs in the posted batches (running total).
     pub const BLOBS_POSTED: &str = "batcher.blobs_posted_total";
-    /// Batches skipped because we are not the lease holder.
-    pub const BATCHES_SKIPPED_STANDBY: &str = "batcher.batches_skipped_standby_total";
 }
 
 /// Configuration for the batching loop.
@@ -111,24 +104,15 @@ impl<S: Sender> Batcher<S> {
     }
 
     /// Called by the reader thread whenever a `ClosedBlock` becomes available.
-    /// If the lease is held and we have enough blocks to form a batch, builds
-    /// the blobs and forwards to the sender.
-    pub fn on_closed_block(
-        &mut self,
-        block: ClosedBlock,
-        lease: &Lease,
-    ) -> Result<(), BatcherError> {
+    /// If we have enough blocks to form a batch, builds the blobs and forwards
+    /// to the sender.
+    pub fn on_closed_block(&mut self, block: ClosedBlock) -> Result<(), BatcherError> {
         counter!(metric_names::BLOCKS_OBSERVED).increment(1);
         self.pending_blocks.push(block);
         if self.pending_blocks.len() < self.cfg.blocks_per_batch {
             return Ok(());
         }
         let group = std::mem::take(&mut self.pending_blocks);
-        if !lease.held_by_us() {
-            // Standby: still advance state, but do not post.
-            counter!(metric_names::BATCHES_SKIPPED_STANDBY).increment(1);
-            return Ok(());
-        }
         let batch = pack_blocks(&self.cfg, &group)?;
         let blob_count = batch.blobs.len() as u64;
         self.sender.post(batch)?;

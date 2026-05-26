@@ -1,19 +1,13 @@
-//! kardamom-sealer: S5 block sealer CLI.
+//! kardamom-sealer: block sealer CLI.
 //!
 //! Loads a TOML `SealerConfig`, validates it, and either:
 //!
-//!   - With `aeron-live` enabled: opens the tx_ordering publisher + per-recorder
-//!     watermark subscribers via `kardamom-log` and runs the sealer's
-//!     `run_forever` loop. (Wiring lands alongside the cross-component
-//!     real-Aeron e2e work; see the spec §"Implementation order".)
+//!   - With `aeron-live` enabled: opens the tx_ordering publisher via
+//!     `kardamom-log` and runs the sealer's `run_forever` loop.
 //!
 //!   - Without `aeron-live`: parses + validates the config, prints a clear
 //!     "aeron-live build required" message, and exits with status 0 so smoke
 //!     tests can exercise the CLI surface without an Aeron environment.
-//!
-//! This mirrors the convention already established by the S2
-//! `kardamom-sequencer` binary: the CLI smoke-tests the config in any
-//! environment; production wiring is gated on the `aeron-live` feature.
 
 use std::path::PathBuf;
 
@@ -44,7 +38,6 @@ fn main() -> Result<()> {
 
     tracing::info!(
         host_id = cfg.host_id,
-        recorder_ids = ?cfg.recorder_ids,
         tick_interval_ms = cfg.tick_interval_ms,
         "kardamom-sealer config parsed"
     );
@@ -53,9 +46,9 @@ fn main() -> Result<()> {
     {
         eprintln!(
             "kardamom-sealer: built without the aeron-live feature; the live \
-             tx_ordering publisher and per-recorder watermark subscribers \
-             require it. Re-build with `--features aeron-live` to run \
-             against real Aeron. Exiting 0 (config validated)."
+             tx_ordering publisher requires it. Re-build with \
+             `--features aeron-live` to run against real Aeron. \
+             Exiting 0 (config validated)."
         );
         Ok(())
     }

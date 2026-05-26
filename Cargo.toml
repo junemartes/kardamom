@@ -39,17 +39,10 @@ alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
-# S3 foundation crates
 kardamom-types = { path = "crates/kardamom-types" }
 kardamom-log = { path = "crates/kardamom-log" }
 
-# Re-introduced in S5 (block sealer election + S7 batcher election).
-# Originally lived in s3-canonical-log; moved here so it sits at the layer
-# of its first remaining consumer after the sequencer was rewired onto
-# kardamom-nonce-registry.
-kardamom-leases = { path = "crates/kardamom-leases" }
 
-# S3 external deps
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
 io-uring = "0.7"
 rusteron-client = "0.1"

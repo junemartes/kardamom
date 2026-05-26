@@ -16,7 +16,6 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 [dependencies]
 kardamom-types.workspace = true
 kardamom-log.workspace = true
-kardamom-leases.workspace = true
 # Pulled in as a regular dependency (not just dev-dep) primarily to force
 # build-order: kardamom-deployer's build.rs runs forge install + forge build,
 # populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
