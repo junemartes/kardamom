@@ -87,7 +87,8 @@ async fn aeron_publish_record_subscribe_e2e() {
     for i in 0..100u64 {
         last_pos = pubr
             .publish_ref(&TxRef {
-                sequencer_id: (i % 4) as u8,
+                tx_hash: alloy_primitives::B256::ZERO,
+                shard_id: (i % 4) as u8,
                 position_a: BPosition {
                     term_id: 0,
                     term_offset: (i as i32) * 64,
