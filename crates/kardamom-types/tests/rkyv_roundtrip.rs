@@ -147,7 +147,8 @@ fn cached_receipt_roundtrip() {
 #[test]
 fn tx_ref_roundtrip() {
     let r = TxRef {
-        sequencer_id: 5,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 5,
         position_a: BPosition {
             term_id: 3,
             term_offset: 4096,
@@ -159,7 +160,8 @@ fn tx_ref_roundtrip() {
 #[test]
 fn channel_b_message_tx_ref_roundtrip() {
     let m = ChannelBMessage::TxRef(TxRef {
-        sequencer_id: 1,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 1,
         position_a: BPosition {
             term_id: 2,
             term_offset: 1024,
@@ -184,7 +186,8 @@ fn channel_b_message_boundary_roundtrip() {
 #[test]
 fn channel_b_message_helpers() {
     let r = TxRef {
-        sequencer_id: 7,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 7,
         position_a: BPosition {
             term_id: 0,
             term_offset: 16,
