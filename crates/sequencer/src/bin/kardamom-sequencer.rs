@@ -1,20 +1,10 @@
-//! kardamom-sequencer: per-partition CLI binary.
+//! kardamom-sequencer: per-partition sequencer process.
 //!
-//! Parses a TOML `SequencerConfig`, validates the partition index, and
-//! either:
-//!   - if `aeron-live` is enabled: opens the real Aeron channels (tx_ordering
-//!     publisher, receipt-cache publisher, ingress subscriber) via
-//!     `kardamom-log` and runs the sequencer loop, or
-//!   - if `aeron-live` is NOT enabled: emits a clear error and exits with
-//!     status 2 so operators don't ship a no-op binary by accident.
-//!
-//! The aeron-live wiring uses the existing `kardamom_log::publisher` /
-//! `subscriber` builders for tx_ordering and the receipt-cache channel. The
-//! proxy -> sequencer ingress channel surface is still under design in S3 /
-//! S1 (currently an in-process `MockChannels` mpsc); when that surface lands
-//! as a real Aeron stream this binary will gain a concrete IngressSource
-//! adapter. Until then the binary parses + validates the config and prints
-//! "ingress wiring TBD", then exits with status 0 so smoke tests can run.
+//! Parses a TOML `SequencerConfig`, validates it, and idles until SIGTERM /
+//! Ctrl-C. The tx_data subscriber + tx_ordering publisher + sequencer main
+//! loop are wired in a follow-up; today this binary parses + validates the
+//! config and keeps the process alive so ansible / nomad can manage it as
+//! a long-running service.
 
 use std::path::PathBuf;
 
@@ -44,7 +34,8 @@ struct Args {
     core_id: Option<usize>,
 }
 
-fn main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -83,12 +74,37 @@ fn main() -> anyhow::Result<()> {
     }
     cfg.validate()?;
 
-    tracing::info!(?cfg, "kardamom-sequencer config parsed; Aeron wiring TBD");
-    eprintln!(
-        "kardamom-sequencer: config validated. The ingress channel surface \
-         (proxy -> sequencer) still uses in-process mpsc as of this build; \
-         a real Aeron ingress publisher lands alongside the cross-component \
-         e2e. This binary is currently a CLI smoke runner."
+    tracing::info!(
+        ?cfg,
+        "kardamom-sequencer: config parsed; main loop wiring TBD; idling until shutdown signal"
     );
+
+    wait_for_shutdown().await;
+    tracing::info!("kardamom-sequencer: shutdown signal received; exiting cleanly");
     Ok(())
+}
+
+/// Wait for SIGTERM or Ctrl-C, whichever arrives first.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl-C received");
+    }
 }

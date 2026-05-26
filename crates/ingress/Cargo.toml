@@ -18,8 +18,10 @@ alloy-primitives.workspace = true
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
+anyhow.workspace = true
 async-trait = "0.1"
 bytes.workspace = true
+clap.workspace = true
 dashmap = "6"
 governor = "0.10"
 hyper = { version = "1", features = ["http1", "server"] }
@@ -35,6 +37,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tower = { version = "0.5", features = ["util"] }
 tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "kardamom-ingress"
+path = "src/bin/kardamom-ingress.rs"
 
 [dev-dependencies]
 alloy-signer-local.workspace = true
