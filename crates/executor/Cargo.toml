@@ -7,6 +7,7 @@ edition.workspace = true
 [dependencies]
 # : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
+kardamom-log = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
