@@ -5,6 +5,7 @@ edition.workspace = true
 build = "build.rs"
 
 [dependencies]
+kardamom-types.workspace = true
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true

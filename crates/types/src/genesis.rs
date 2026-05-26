@@ -30,18 +30,26 @@ pub struct AllocEntry {
 
 impl Genesis {
     /// Semantic validation that can't be expressed in the type or derive.
-    pub fn validate(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> Result<(), GenesisError> {
         if self.chain_id == 0 {
-            anyhow::bail!("chain_id must be > 0");
+            return Err(GenesisError::ZeroChainId);
         }
         let mut seen = std::collections::BTreeSet::new();
         for entry in &self.alloc {
             if !seen.insert(entry.address) {
-                anyhow::bail!("duplicate alloc address: {}", entry.address);
+                return Err(GenesisError::DuplicateAlloc(entry.address));
             }
         }
         Ok(())
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GenesisError {
+    #[error("chain_id must be > 0")]
+    ZeroChainId,
+    #[error("duplicate alloc address: {0}")]
+    DuplicateAlloc(Address),
 }
 
 fn deserialize_balance<'de, D>(d: D) -> Result<U256, D::Error>

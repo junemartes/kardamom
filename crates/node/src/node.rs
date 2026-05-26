@@ -16,9 +16,9 @@ use tokio::sync::RwLock;
 
 use crate::error::NodeError;
 use crate::executor::{self, ExecEnv};
-use crate::genesis::Genesis;
 use crate::metrics as kmetrics;
 use crate::{stage, stage_await};
+use kardamom_types::Genesis;
 
 #[derive(Clone)]
 pub struct Node {
@@ -334,7 +334,7 @@ fn build_deposit_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::genesis::{AllocEntry, Genesis};
+    use kardamom_types::{AllocEntry, Genesis};
 
     fn genesis_with(chain_id: u64, alloc: Vec<AllocEntry>) -> Genesis {
         Genesis { chain_id, alloc }

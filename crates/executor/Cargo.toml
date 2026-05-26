@@ -8,10 +8,6 @@ edition.workspace = true
 # : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
-# Pulled in solely so the kardamom-executor bin can reuse the
-# `kardamom_node::Genesis` TOML loader to seed its in-memory state DB
-# at startup. The lib code does not touch node.
-kardamom-node = { path = "../node" }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true

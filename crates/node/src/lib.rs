@@ -6,9 +6,16 @@ pub use error::NodeError;
 
 pub mod metrics;
 
-pub mod genesis;
+// Genesis lives in `kardamom-types` so the executor bin can load it
+// without pulling in the node's heavier deps. Re-exported here under the
+// same names + module path so the kardamom top-level binary's existing
+// `kardamom_node::{Genesis, ...}` and `kardamom_node::genesis::*`
+// imports keep working.
+pub use kardamom_types::{AllocEntry, Genesis, GenesisError};
 
-pub use genesis::{AllocEntry, Genesis};
+pub mod genesis {
+    pub use kardamom_types::{AllocEntry, Genesis, GenesisError};
+}
 
 pub mod node;
 

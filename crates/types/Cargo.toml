@@ -5,9 +5,10 @@ edition.workspace = true
 
 
 [dependencies]
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
 bytes.workspace = true
 rkyv.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

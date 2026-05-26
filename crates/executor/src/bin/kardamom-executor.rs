@@ -47,7 +47,7 @@ struct Args {
     /// by bumping this.
     #[arg(long, default_value_t = 1)]
     initial_block: u64,
-    /// Path to a genesis TOML (schema: `kardamom_node::Genesis`). The
+    /// Path to a genesis TOML (schema: `kardamom_types::Genesis`). The
     /// chain id is taken from this file (must match `--chain-id` if both
     /// are set), and every `[[alloc]]` entry seeds the in-memory state
     /// DB with the listed balance / nonce / code so revm has account
@@ -188,9 +188,9 @@ async fn main() -> Result<()> {
 
 /// Load a kardamom genesis TOML and run its semantic validation
 /// (chain_id != 0, no duplicate alloc addresses).
-fn load_genesis(path: &std::path::Path) -> Result<kardamom_node::Genesis> {
+fn load_genesis(path: &std::path::Path) -> Result<kardamom_types::Genesis> {
     let raw = std::fs::read_to_string(path).context("read genesis TOML")?;
-    let genesis: kardamom_node::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
+    let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
     genesis.validate().context("validate genesis")?;
     Ok(genesis)
 }
@@ -200,7 +200,7 @@ fn load_genesis(path: &std::path::Path) -> Result<kardamom_node::Genesis> {
 /// declared balance, nonce, and code (if any). The code's keccak256 hash is
 /// stored as the account's `code_hash` and the code bytes are made
 /// retrievable via `code_by_hash`.
-fn build_genesis_db(genesis: Option<&kardamom_node::Genesis>) -> MockStateDatabase {
+fn build_genesis_db(genesis: Option<&kardamom_types::Genesis>) -> MockStateDatabase {
     use alloy_primitives::{B256, keccak256};
     let mut builder = MockStateDatabase::builder();
     let Some(g) = genesis else {
