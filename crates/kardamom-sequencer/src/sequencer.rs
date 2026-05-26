@@ -1,6 +1,6 @@
-//! Primary sequencer event step + loop.
+//! Sequencer event step + loop.
 //!
-//! [`PrimarySequencer::run_once`] polls the ingress source for at most one
+//! [`Sequencer::run_once`] polls the ingress source for at most one
 //! message, drives the state machine, and performs the **dual-write**
 //! defined by the D-Sh12 split architecture (spec §2.3):
 //!
@@ -33,7 +33,7 @@ use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
 use kardamom_log::codec;
-use kardamom_types::{TxEnvelope, TxRef};
+use kardamom_types::{StateDatabase, TxEnvelope, TxRef};
 use tracing::{trace, warn};
 
 use crate::config::SequencerConfig;
@@ -101,36 +101,58 @@ impl Default for Shutdown {
     }
 }
 
-pub struct PrimarySequencer {
+pub struct Sequencer<DB: StateDatabase> {
     cfg: SequencerConfig,
     state: PartitionState<EncodedFrame>,
+    /// Canonical state source for cache-miss hydration. When a tx arrives
+    /// for a sender this sequencer has never seen, we consult `state_db`
+    /// once to seed the in-memory `next_nonce` map with the committed
+    /// canonical nonce. Subsequent txs from that sender hit the in-memory
+    /// path.
+    state_db: Arc<DB>,
 }
 
-impl PrimarySequencer {
-    pub fn new(cfg: SequencerConfig) -> Self {
+impl<DB: StateDatabase> Sequencer<DB> {
+    pub fn new(cfg: SequencerConfig, state_db: Arc<DB>) -> Self {
         cfg.validate().expect("validated config");
         let cap = cfg.max_pending_per_sender;
         Self {
             cfg,
             state: PartitionState::new(cap),
+            state_db,
         }
-    }
-
-    /// Construct a primary that inherits the next-nonce map from a hot-standby
-    /// tailer's `into_state()`. Per spec §4.2 the pending future-nonce buffers
-    /// are *not* carried over (those entries did not land on B and the new
-    /// primary will see them again via fresh ingress messages).
-    pub fn with_state(cfg: SequencerConfig, inherited: PartitionState<()>) -> Self {
-        cfg.validate().expect("validated config");
-        let mut state = PartitionState::new(cfg.max_pending_per_sender);
-        for (addr, n) in inherited.iter_next_nonces() {
-            state.seed_next_nonce(addr, n);
-        }
-        Self { cfg, state }
     }
 
     pub fn config(&self) -> &SequencerConfig {
         &self.cfg
+    }
+
+    /// Cache-miss hydration: if the sender's next-nonce is unknown locally,
+    /// fetch the canonical nonce from the state DB and seed the partition
+    /// state. New senders (no on-chain account) hydrate at nonce 0; senders
+    /// that already have on-chain activity hydrate at their committed nonce
+    /// so the executor accepts the next tx without a future-nonce rejection.
+    fn hydrate_if_unknown(&mut self, sender: alloy_primitives::Address) {
+        if self.state.next_nonce_known(sender).is_some() {
+            return;
+        }
+        let n = match self.state_db.basic(sender) {
+            Ok(Some((nonce, _, _))) => nonce,
+            Ok(None) => 0,
+            Err(e) => {
+                // State DB query failed (transient I/O, etc.). Fall back to
+                // nonce 0; if the tx is from an established sender it'll
+                // get rejected by the executor and the client will retry.
+                // Better than dropping or stalling on a soft failure here.
+                warn!(
+                    sender = ?sender,
+                    error = %e,
+                    "state DB cache-miss lookup failed; hydrating with nonce 0"
+                );
+                0
+            }
+        };
+        self.state.seed_next_nonce(sender, n);
     }
 
     /// Dual-write helper: publish `payload.bytes` to channel A, then
@@ -209,7 +231,6 @@ impl PrimarySequencer {
         B: ChannelBRefPublisher,
         R: ReceiptCachePublisher,
     {
-        // Step 1: flush retry-rebuffered entries first.
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
             for (sender, n, payload) in pending {
@@ -226,7 +247,6 @@ impl PrimarySequencer {
             return Ok(true);
         }
 
-        // Step 2: poll ingress.
         let Some(envelope) = ingress.poll()? else {
             return Ok(false);
         };
@@ -252,6 +272,11 @@ impl PrimarySequencer {
         // state-machine arithmetic; the result is discarded after the nonce
         // is read. We never call `recover_signer()` on it (D-Sh3).
         let nonce = decode_nonce(&envelope.raw_tx)?;
+
+        // Cache-miss hydration: first time we see this sender, fetch the
+        // canonical nonce from the state DB and seed the in-memory map.
+        // Cheap on cold senders; no-op (one HashMap::contains_key) on warm.
+        self.hydrate_if_unknown(sender);
 
         let bytes = encode_envelope_for_a(&envelope)?;
         let frame = EncodedFrame {
