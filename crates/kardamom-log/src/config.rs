@@ -59,29 +59,29 @@ pub struct ChannelsConfig {
     pub tx_ordering_channel: String,
     pub tx_ordering_stream_id: i32,
 
-    /// Channel C: receipts + block boundaries. Not recorded.
-    pub c_channel: String,
-    pub c_stream_id: i32,
+    /// TxReceipts: receipts + block boundaries. Not recorded.
+    pub tx_receipts_channel: String,
+    pub tx_receipts_stream_id: i32,
 
     /// Receipt-cache channel: `CachedReceipt` messages for proxy/RPC consumers.
     /// Not recorded.
     pub receipt_cache_channel: String,
     pub receipt_cache_stream_id: i32,
 
-    /// Channel-B per-recorder fsync watermark publication, parameterized by
+    /// TxOrdering per-recorder fsync watermark publication, parameterized by
     /// recorder_id. e.g. "aeron:ipc?alias=fsync-wm-b-{rid}".
     pub fsync_watermark_channel_template: String,
     pub fsync_watermark_stream_id: i32,
 
-    /// Channel-A per-sequencer fsync watermark publication. D-Sh12: each
-    /// channel A has its own fsync sidecar publishing
+    /// TxData per-sequencer fsync watermark publication. D-Sh12: each
+    /// tx_data has its own fsync sidecar publishing
     /// `fsynced_tx_data_position[i]` to its own watermark stream. URI template
     /// substitutes `{sid}` with the sequencer id. Stream id is
     /// `fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id`.
     pub fsync_watermark_tx_dattx_dattx_dattx_data_channel_template: String,
     pub fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base: i32,
 
-    /// Aggregated quorum watermark (channel B).
+    /// Aggregated quorum watermark (tx_ordering).
     pub quorum_watermark_channel: String,
     pub quorum_watermark_stream_id: i32,
 }
@@ -98,19 +98,19 @@ impl ChannelsConfig {
         self.tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id as i32
     }
 
-    /// Per-recorder channel-B fsync watermark URI (`{rid}` substituted).
+    /// Per-recorder tx_ordering fsync watermark URI (`{rid}` substituted).
     pub fn fsync_watermark_channel(&self, recorder_id: u8) -> String {
         self.fsync_watermark_channel_template
             .replace("{rid}", &recorder_id.to_string())
     }
 
-    /// Per-sequencer channel-A fsync watermark URI (`{sid}` substituted).
+    /// Per-sequencer tx_data fsync watermark URI (`{sid}` substituted).
     pub fn fsync_watermark_a_channel(&self, sequencer_id: u8) -> String {
         self.fsync_watermark_tx_dattx_dattx_dattx_data_channel_template
             .replace("{sid}", &sequencer_id.to_string())
     }
 
-    /// Per-sequencer channel-A fsync watermark stream id.
+    /// Per-sequencer tx_data fsync watermark stream id.
     pub fn fsync_watermark_a_stream_id(&self, sequencer_id: u8) -> i32 {
         self.fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id as i32
     }
@@ -141,8 +141,8 @@ impl Default for LogConfig {
                 tx_dattx_dattx_dattx_data_stream_id_base: 2000,
                 tx_ordering_channel: "aeron:udp?endpoint=224.0.1.1:40001".into(),
                 tx_ordering_stream_id: 1001,
-                c_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
-                c_stream_id: 1002,
+                tx_receipts_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
+                tx_receipts_stream_id: 1002,
                 receipt_cache_channel: "aeron:udp?endpoint=224.0.1.1:40003".into(),
                 receipt_cache_stream_id: 1003,
                 fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),

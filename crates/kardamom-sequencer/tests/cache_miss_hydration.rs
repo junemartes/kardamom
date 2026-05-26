@@ -62,7 +62,7 @@ fn pos(offset: i32) -> BPosition {
 fn hydrates_committed_nonce_for_established_sender() {
     // Sender already has on-chain activity: state DB reports their next
     // nonce is 5. The sequencer must hydrate at 5, not 0, so the first
-    // channel-A tx (nonce 5) lands on the matched path instead of being
+    // tx_data tx (nonce 5) lands on the matched path instead of being
     // buffered as a future nonce.
     let signer = PrivateKeySigner::random();
     let db = Arc::new(FakeStateDatabase::new());

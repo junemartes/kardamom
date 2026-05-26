@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship the S2 sequencer cluster as a new crate `kardamom-sequencer` — M single-threaded, core-pinned processes that exclusively own a sender slice, maintain per-sender next-nonce state, drain a per-sender future-nonce buffer in order, and publish canonical-ordered raw txs into channel B via Aeron concurrent publication, with a hot-standby tailer that catches up by replaying B and a lease-based takeover on primary failure.
+**Goal:** Ship the S2 sequencer cluster as a new crate `kardamom-sequencer` — M single-threaded, core-pinned processes that exclusively own a sender slice, maintain per-sender next-nonce state, drain a per-sender future-nonce buffer in order, and publish canonical-ordered raw txs into tx_ordering via Aeron concurrent publication, with a hot-standby tailer that catches up by replaying B and a lease-based takeover on primary failure.
 
 **Architecture:** One process per ingress partition (default M=8), pinned to a CPU core via `core_affinity`. Each owner subscribes to its `ingress[i]` Aeron stream, reads `envelope.sender` directly (always populated by the proxy per D-Sh3 — the sequencer does **no** secp256k1 work), and runs a small nonce-check state machine: **Match** → publish to B + advance + drain buffer; **Future** → insert into per-sender `BTreeMap<u64, TxEnvelope>` bounded by `max_pending_per_sender` (evict oldest on overflow); **Past** → drop and publish a `duplicate` notification to the receipt-cache Aeron channel. Backpressure on B surfaces as `Err::WouldBlock` to the caller, which the proxy converts to `503`. A sibling **hot-standby** process on a different host subscribes to B and, for senders mapped to this slice via `keccak(sender) % M`, replays nonces to keep its own `pending_nonce` map in lockstep; on lease expiry it acquires the slice and begins publishing to its `ingress[i]`.
 
@@ -16,7 +16,7 @@
 
 - `kardamom_log::aeron::Subscription` — Aeron subscription handle with `poll(&mut handler) -> usize` and `is_connected() -> bool`.
 - `kardamom_log::aeron::Publication` — Aeron publication handle with `try_offer(&[u8]) -> Result<Offset, BackpressureError>` (non-blocking) and `offer(&[u8]) -> Result<Offset, AeronError>` (with linear backoff).
-- `kardamom_log::aeron::ConcurrentPublication` — multi-publisher variant for channel B; `try_offer(&[u8]) -> Result<BPosition, BackpressureError>` with claim-and-write semantics.
+- `kardamom_log::aeron::ConcurrentPublication` — multi-publisher variant for tx_ordering; `try_offer(&[u8]) -> Result<BPosition, BackpressureError>` with claim-and-write semantics.
 - `kardamom_log::BPosition { term_id: i32, term_offset: i32 }` — canonical tx identifier.
 - `kardamom_log::framing::TxFrame` — rkyv-archived header `{ correlation_id: [u8; 16], sender: Address, ingress_partition: u8 }` plus raw `TxEnvelope` bytes (RLP-encoded). Encoder/decoder live in `kardamom_log::framing`. `sender` is typed `Address`, **never `Option`** — populated unconditionally by the proxy (D-Sh3). Zero-copy `Archived<TxFrame>` views are available via helpers in `kardamom_log`.
 - `kardamom_log::framing::DuplicateNotification { correlation_id: [u8; 16] }` — published to the receipt-cache channel.
@@ -138,7 +138,7 @@ harness = false
 //!
 //! One process per ingress partition. Each process exclusively owns a sender slice
 //! (`keccak(sender) % M`), maintains per-sender next-nonce state, and publishes
-//! canonical-ordered raw txs into Aeron channel B. A hot-standby sibling tails B
+//! canonical-ordered raw txs into Aeron tx_ordering. A hot-standby sibling tails B
 //! and takes over on lease expiry.
 
 pub mod config;
@@ -226,7 +226,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SequencerError {
-    #[error("backpressure: channel B publication blocked")]
+    #[error("backpressure: tx_ordering publication blocked")]
     Backpressure,
 
     #[error("ingress source disconnected")]
@@ -250,7 +250,7 @@ mod tests {
     fn display_strings_are_stable() {
         assert_eq!(
             SequencerError::Backpressure.to_string(),
-            "backpressure: channel B publication blocked"
+            "backpressure: tx_ordering publication blocked"
         );
         assert_eq!(
             SequencerError::IngressDisconnected.to_string(),
@@ -923,7 +923,7 @@ pub struct SequencerConfig {
     pub max_pending_per_sender: usize,
     /// Optional CPU core to pin this process to. None = no pin.
     pub core_id: Option<usize>,
-    /// Backpressure behaviour when channel B blocks.
+    /// Backpressure behaviour when tx_ordering blocks.
     pub backpressure_policy: BackpressurePolicy,
     /// Role: primary owns the slice; standby tails B and waits for lease takeover.
     pub role: SequencerRole,
@@ -1041,7 +1041,7 @@ Append to `crates/kardamom-sequencer/src/outbound.rs`:
 ```rust
 //! Outbound channel abstractions.
 //!
-//! The sequencer publishes to two Aeron streams: canonical channel B (the source
+//! The sequencer publishes to two Aeron streams: canonical tx_ordering (the source
 //! of truth) and the receipt-cache channel (so proxies can answer "what was the
 //! receipt for (sender, nonce)?" idempotently — see spec §2.1). Both are
 //! abstracted behind traits so tests can use in-memory fakes without an Aeron
@@ -1050,7 +1050,7 @@ Append to `crates/kardamom-sequencer/src/outbound.rs`:
 use crate::error::SequencerError;
 
 pub trait BPublisher: Send {
-    /// Try to publish a raw tx frame to channel B. Returns Ok on success.
+    /// Try to publish a raw tx frame to tx_ordering. Returns Ok on success.
     /// Returns Err(Backpressure) if the underlying Aeron publication is blocked.
     fn try_publish(&mut self, frame_bytes: &[u8]) -> Result<(), SequencerError>;
 }
@@ -1166,7 +1166,7 @@ git commit -m "sequencer: add outbound publisher traits + in-memory fakes"
 **Files:**
 - Modify: `crates/kardamom-sequencer/src/inbound.rs`
 
-`IngressSource` abstracts the partition's Aeron subscription on `ingress[i]`. `BReplaySource` abstracts a read-only subscription on channel B (used by the hot-standby tailer).
+`IngressSource` abstracts the partition's Aeron subscription on `ingress[i]`. `BReplaySource` abstracts a read-only subscription on tx_ordering (used by the hot-standby tailer).
 
 - [ ] **Step 1: Write the failing test inline**
 
@@ -1573,7 +1573,7 @@ Expected: fails with "no `PrimarySequencer::new`".
 //! Primary sequencer event step.
 //!
 //! `run_once` polls the ingress source for at most one message, drives the state
-//! machine, and publishes resulting actions to channel B and the receipt cache.
+//! machine, and publishes resulting actions to tx_ordering and the receipt cache.
 //! The caller wraps it in a hot loop. Backpressure on B is returned to the caller
 //! WITHOUT advancing PartitionState — retry is safe.
 
@@ -2222,7 +2222,7 @@ Expected: fail with "no `HotStandbyTailer`".
 ```rust
 //! Hot-standby tailer.
 //!
-//! Subscribes to channel B and replays each in-slice tx's nonce into a local
+//! Subscribes to tx_ordering and replays each in-slice tx's nonce into a local
 //! `PartitionState`. Block-boundary markers are decoded and skipped. On lease
 //! takeover, `into_state()` hands the populated state to a new `PrimarySequencer`
 //! so it can begin publishing to its ingress channel without restarting from
@@ -3210,7 +3210,7 @@ gh pr create --title "S2 sequencer subsystem (kardamom-sequencer crate)" --body 
 - [ ] `cargo test -p kardamom-sequencer --all-features` passes.
 - [ ] Chaos test (`chaos_failover.rs`) demonstrates no gap or duplicate on B across primary→standby takeover.
 - [ ] Criterion bench (`benches/throughput.rs`) reports >100k tx/s per core (proxy-populated sender path; no secp256k1 in the sequencer per D-Sh3).
-- [ ] Docker e2e (`tests/e2e_docker.rs`, gated on `--features docker-e2e -- --ignored`) brings up real Aeron Media Driver + Archive containers, runs a real sequencer process, and verifies 1000 txs / 100 senders land in canonical nonce order on channel B.
+- [ ] Docker e2e (`tests/e2e_docker.rs`, gated on `--features docker-e2e -- --ignored`) brings up real Aeron Media Driver + Archive containers, runs a real sequencer process, and verifies 1000 txs / 100 senders land in canonical nonce order on tx_ordering.
 - [ ] `cargo clippy -p kardamom-sequencer --all-features -- -D warnings` clean.
 EOF
 )"
@@ -3226,7 +3226,7 @@ Return the PR URL.
 - Create: `crates/kardamom-sequencer/tests/e2e_docker.rs`
 - Modify: `crates/kardamom-sequencer/Cargo.toml`
 
-Per D-Sh8 the mock-based tests above stay (they pin the state machine and component behaviour in isolation), but the e2e layer **MUST** use a real Aeron backend running in Docker via the `testcontainers` harness shipped by S3 (`kardamom-log`). This task adds a real e2e test that spins up the S3 Docker harness, runs a real `PrimarySequencer` process against it, drives **N=1000 transactions from M=100 senders** through the live `ingress[0]` Aeron channel, and asserts every tx lands on channel B in correct nonce order per sender.
+Per D-Sh8 the mock-based tests above stay (they pin the state machine and component behaviour in isolation), but the e2e layer **MUST** use a real Aeron backend running in Docker via the `testcontainers` harness shipped by S3 (`kardamom-log`). This task adds a real e2e test that spins up the S3 Docker harness, runs a real `PrimarySequencer` process against it, drives **N=1000 transactions from M=100 senders** through the live `ingress[0]` Aeron channel, and asserts every tx lands on tx_ordering in correct nonce order per sender.
 
 **Pre-requisites:** S3's `kardamom-log` crate must expose:
 - A `testcontainers`-based harness (`kardamom_log::testing::docker::AeronDocker`) that brings up the Media Driver + Archive containers and returns a `ChannelConfig` pointing at them.
@@ -3248,14 +3248,14 @@ The `docker-e2e` feature on `kardamom-log` pulls in `testcontainers` and the har
 
 ```rust
 //! D-Sh8 e2e test: real Aeron Media Driver + Archive in Docker, real
-//! PrimarySequencer process, real ingress + channel-B publication. This test
+//! PrimarySequencer process, real ingress + tx_ordering publication. This test
 //! complements the mock-based integration test (`primary_integration.rs`) —
 //! the mocks pin component logic, this test pins the wire integration with
 //! S3's Aeron backend.
 //!
 //! Scenario: M = 100 senders, each contributes N/M = 10 in-order nonces
 //! (N = 1000 total). All txs feed the partition-0 ingress channel; the
-//! sequencer's single partition publishes them onto channel B; the test
+//! sequencer's single partition publishes them onto tx_ordering; the test
 //! tails B and asserts canonical-nonce-ascending order per sender.
 //!
 //! Requires Docker. Tagged `#[ignore]` so the default `cargo test` run skips
@@ -3320,11 +3320,11 @@ fn real_aeron_1000_txs_100_senders_canonical_order_on_b() {
     let mut ingress = kardamom_log::aeron::sequencer_ingress_source(&chans, 0)
         .expect("connect ingress[0]");
     let mut b_pub = kardamom_log::aeron::sequencer_b_publisher(&chans)
-        .expect("connect channel B publisher");
+        .expect("connect tx_ordering publisher");
     let mut rc_pub = kardamom_log::aeron::sequencer_receipt_cache_publisher(&chans)
         .expect("connect receipt-cache publisher");
     let mut b_tail = kardamom_log::aeron::sequencer_b_replay_source(&chans)
-        .expect("connect channel B replay source (test consumer)");
+        .expect("connect tx_ordering replay source (test consumer)");
 
     // Spawn the sequencer in its own OS thread (real process boundary except
     // for the kill signal, which we use to terminate the test cleanly).
@@ -3366,7 +3366,7 @@ fn real_aeron_1000_txs_100_senders_canonical_order_on_b() {
             .expect("publish to ingress[0]");
     }
 
-    // Drain channel B from the test side. Time out at 30s — Aeron + 1000 txs
+    // Drain tx_ordering from the test side. Time out at 30s — Aeron + 1000 txs
     // through a single core should complete in well under a second.
     let mut published: Vec<TxFrame> = Vec::with_capacity(N_TXS);
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -3384,7 +3384,7 @@ fn real_aeron_1000_txs_100_senders_canonical_order_on_b() {
     assert_eq!(
         published.len(),
         N_TXS,
-        "timed out waiting for all {N_TXS} txs on channel B"
+        "timed out waiting for all {N_TXS} txs on tx_ordering"
     );
 
     // Group by sender, assert per-sender nonces are 0..NONCES_PER_SENDER in

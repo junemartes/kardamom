@@ -55,7 +55,7 @@ fn log_codec_tx_ref_roundtrip() {
 }
 
 #[test]
-fn log_codec_channel_b_message_roundtrip() {
+fn log_codetx_receipts_channel_b_message_roundtrip() {
     let m = TxOrderingMessage::TxRef(TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 3,

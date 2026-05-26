@@ -2,7 +2,7 @@
 //!
 //! Stateless sequencer: in-memory `next_nonce` map is treated as a cache,
 //! reconstructable from canonical sources (state DB for cold senders, plus
-//! channel-A tail for warm steady-state visibility — the latter is a
+//! tx_data tail for warm steady-state visibility — the latter is a
 //! follow-up; today the sequencer falls back to state DB on cache miss).
 //!
 //! Topology:
