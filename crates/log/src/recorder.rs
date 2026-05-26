@@ -61,9 +61,9 @@ type Archive = rusteron_archive::AeronArchive;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
     /// Per-sequencer tx_data recorder (carries full TxEnvelopes).
-    A { sequencer_id: u8 },
+    TxData { sequencer_id: u8 },
     /// TxOrdering canonical-orderer recorder (carries tiny TxRefs).
-    B,
+    TxOrdering,
 }
 
 pub struct Recorder {
