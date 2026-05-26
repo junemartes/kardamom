@@ -59,7 +59,7 @@ jobs:
       - name: cargo build (docker-e2e feature)
         run: |
           cargo build \
-            -p log \
+            -p log@0.1.0 \
             -p e2e \
             --features 'log/docker-e2e,e2e/full-pipeline-e2e' \
             --tests
@@ -78,10 +78,10 @@ jobs:
       - name: per-component docker_e2e smoke
         run: |
           cargo test \
-            -p log \
+            -p log@0.1.0 \
             --features 'docker-e2e' \
             --test docker_e2e -- --ignored --nocapture
           cargo test \
-            -p log \
+            -p log@0.1.0 \
             --features 'docker-e2e' \
             --test aeron_live_e2e -- --ignored --nocapture
