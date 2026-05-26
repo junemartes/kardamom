@@ -13,19 +13,19 @@ use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use kardamom_types::TxEnvelope;
+use kardamom_types::{BPosition, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
-use kardamom_sequencer::inbound::IngressSource;
+use kardamom_sequencer::inbound::ChannelASubscriber;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
-struct DequeIngress(VecDeque<TxEnvelope>);
-impl IngressSource for DequeIngress {
-    fn poll(&mut self) -> Result<Option<TxEnvelope>, SequencerError> {
+struct DequeChannelA(VecDeque<(BPosition, TxEnvelope)>);
+impl ChannelASubscriber for DequeChannelA {
+    fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
         Ok(self.0.pop_front())
     }
 }
@@ -60,13 +60,18 @@ fn signed_envelope(s: &PrivateKeySigner, n: u64, correlation_id: u64) -> TxEnvel
 
 fn bench_in_order(c: &mut Criterion) {
     let signers: Vec<_> = (1..=64u64).map(signer).collect();
-    let mut batch: Vec<TxEnvelope> = Vec::with_capacity(64 * 16);
+    let mut batch: Vec<(BPosition, TxEnvelope)> = Vec::with_capacity(64 * 16);
     for (i, s) in signers.iter().enumerate() {
         for n in 0u64..16 {
-            batch.push(signed_envelope(s, n, (i * 16 + n as usize) as u64));
+            let correlation = (i * 16 + n as usize) as u64;
+            let position = BPosition {
+                term_id: 0,
+                term_offset: (correlation as i32) * 64,
+            };
+            batch.push((position, signed_envelope(s, n, correlation)));
         }
     }
-    c.bench_function("primary_run_once_1024_proxy_sender", |b| {
+    c.bench_function("sequencer_run_once_1024_proxy_sender", |b| {
         b.iter_batched(
             || {
                 (
@@ -80,14 +85,13 @@ fn bench_in_order(c: &mut Criterion) {
                         },
                         std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
                     ),
-                    DequeIngress(batch.clone().into_iter().collect()),
-                    InMemoryChannelAPublisher::new(0),
+                    DequeChannelA(batch.clone().into_iter().collect()),
                     InMemoryChannelBRefPublisher::default(),
                     InMemoryReceiptCachePublisher::default(),
                 )
             },
-            |(mut seq, mut ing, mut ap, mut bp, mut rc)| {
-                while seq.run_once(&mut ing, &mut ap, &mut bp, &mut rc).unwrap() {}
+            |(mut seq, mut ch_a, mut bp, mut rc)| {
+                while seq.run_once(&mut ch_a, &mut bp, &mut rc).unwrap() {}
             },
             BatchSize::SmallInput,
         );
