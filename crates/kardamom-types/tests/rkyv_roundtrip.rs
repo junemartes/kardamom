@@ -149,7 +149,7 @@ fn tx_ref_roundtrip() {
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 5,
-        position_a: BPosition {
+        tx_data_position: BPosition {
             term_id: 3,
             term_offset: 4096,
         },
@@ -159,10 +159,10 @@ fn tx_ref_roundtrip() {
 
 #[test]
 fn channel_b_message_tx_ref_roundtrip() {
-    let m = ChannelBMessage::TxRef(TxRef {
+    let m = TxOrderingMessage::TxRef(TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 1,
-        position_a: BPosition {
+        tx_data_position: BPosition {
             term_id: 2,
             term_offset: 1024,
         },
@@ -172,7 +172,7 @@ fn channel_b_message_tx_ref_roundtrip() {
 
 #[test]
 fn channel_b_message_boundary_roundtrip() {
-    let m = ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+    let m = TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
         block_number: 11,
         end_tx_idx: BPosition {
             term_id: 0,
@@ -188,18 +188,18 @@ fn channel_b_message_helpers() {
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 7,
-        position_a: BPosition {
+        tx_data_position: BPosition {
             term_id: 0,
             term_offset: 16,
         },
     };
-    let m: ChannelBMessage = r.into();
+    let m: TxOrderingMessage = r.into();
     assert!(m.is_tx_ref());
     assert!(!m.is_boundary());
     assert_eq!(m.as_tx_ref(), Some(&r));
     assert!(m.as_boundary().is_none());
 
-    let b: ChannelBMessage = BlockBoundaryStart::default().into();
+    let b: TxOrderingMessage = BlockBoundaryStart::default().into();
     assert!(b.is_boundary());
     assert!(!b.is_tx_ref());
 }

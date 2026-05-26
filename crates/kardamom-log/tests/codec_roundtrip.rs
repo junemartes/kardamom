@@ -24,13 +24,13 @@ fn log_codec_access_and_materialize() {
 
 #[test]
 fn log_codec_tx_ref_roundtrip() {
-    // Channel A still carries full TxEnvelopes (above). Channel B carries
+    // TxData still carries full TxEnvelopes (above). TxOrdering carries
     // tiny TxRef-based messages (D-Sh12). Verify both wire shapes encode
     // through the shared codec helpers.
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 2,
-        position_a: BPosition {
+        tx_data_position: BPosition {
             term_id: 4,
             term_offset: 8192,
         },
@@ -50,25 +50,25 @@ fn log_codec_tx_ref_roundtrip() {
 
     let view = access::<TxRef>(&bytes).unwrap();
     assert_eq!(view.shard_id, 2);
-    assert_eq!(view.position_a.term_id, 4);
-    assert_eq!(view.position_a.term_offset, 8192);
+    assert_eq!(view.tx_data_position.term_id, 4);
+    assert_eq!(view.tx_data_position.term_offset, 8192);
 }
 
 #[test]
 fn log_codec_channel_b_message_roundtrip() {
-    let m = ChannelBMessage::TxRef(TxRef {
+    let m = TxOrderingMessage::TxRef(TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
         shard_id: 3,
-        position_a: BPosition {
+        tx_data_position: BPosition {
             term_id: 1,
             term_offset: 4096,
         },
     });
     let bytes = encode(&m).unwrap();
-    let back: ChannelBMessage = materialize(&bytes).unwrap();
+    let back: TxOrderingMessage = materialize(&bytes).unwrap();
     assert_eq!(back, m);
 
-    let b = ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+    let b = TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
         block_number: 17,
         end_tx_idx: BPosition {
             term_id: 1,
@@ -77,6 +77,6 @@ fn log_codec_channel_b_message_roundtrip() {
         l2_timestamp: 1_700_000_000,
     });
     let bytes_b = encode(&b).unwrap();
-    let back_b: ChannelBMessage = materialize(&bytes_b).unwrap();
+    let back_b: TxOrderingMessage = materialize(&bytes_b).unwrap();
     assert_eq!(back_b, b);
 }

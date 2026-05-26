@@ -3,9 +3,9 @@
 //! recording position.
 //!
 //! Topology after D-Sh12:
-//!   - One `Recorder` with `RecorderKind::B` per channel-B recorder host
+//!   - One `Recorder` with `RecorderKind::TxOrdering` per channel-B recorder host
 //!     (N total; quorum-fsynced via the `QuorumAggregator`).
-//!   - One `Recorder` with `RecorderKind::A { sequencer_id }` per sequencer
+//!   - One `Recorder` with `RecorderKind::TxData { sequencer_id }` per sequencer
 //!     host (M total; single-host fsync each).
 //!
 //! Gated behind the `aeron-live` cargo feature.
@@ -54,8 +54,8 @@ use kardamom_types::FsyncWatermark;
 
 type Archive = rusteron_archive::AeronArchive;
 
-/// Which logical channel a recorder is tailing. Channel B feeds the
-/// quorum aggregator (N recorders, Q-of-N watermark). Channel A[i] feeds
+/// Which logical tx_data recorder is tailing. TxOrdering feeds the
+/// quorum aggregator (N recorders, Q-of-N watermark). TxData[i] feeds
 /// the per-sequencer single-host fsync (no quorum by default — see D-Sh12
 /// rationale).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,10 +94,10 @@ impl Recorder {
     ) -> Result<Self, LogError> {
         Self::start_inner(
             archive,
-            &ch.b_channel,
-            ch.b_stream_id,
+            &ch.tx_ordering_channel,
+            ch.tx_ordering_stream_id,
             recorder_id,
-            RecorderKind::B,
+            RecorderKind::TxOrdering,
             archive_dir,
             "B",
         )
@@ -117,7 +117,7 @@ impl Recorder {
             &ch.a_channel(sequencer_id),
             ch.a_stream_id(sequencer_id),
             recorder_id,
-            RecorderKind::A { sequencer_id },
+            RecorderKind::TxData { sequencer_id },
             archive_dir,
             "A",
         )
