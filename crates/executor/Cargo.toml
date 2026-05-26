@@ -1,0 +1,35 @@
+[package]
+name = "executor"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# : shared types live in kardamom-types.
+types = { workspace = true }
+revm.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-rlp.workspace = true
+bytes.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+crossbeam-channel = "0.5"
+dashmap = { workspace = true }
+
+[dev-dependencies]
+# : hermetic unit tests use kardamom-log's in-memory fakes.
+# Real-Aeron e2e tests pull `docker-e2e` to bring in the testcontainers harness.
+log = { workspace = true, features = ["testing"] }
+alloy-signer-local.workspace = true
+alloy-network.workspace = true
+alloy-eips.workspace = true
+tempfile = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
+rand = "0.9"
+rand_chacha = "0.9"
+tokio = { workspace = true }
+
+[[bench]]
+name = "sequential_throughput"
+harness = false

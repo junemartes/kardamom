@@ -1,0 +1,13 @@
+[package]
+name = "types"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+bytes.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+# rkyv roundtrip tests only — nothing I/O

@@ -1,0 +1,66 @@
+[package]
+name = "batcher"
+version.workspace = true
+edition.workspace = true
+build = "build.rs"
+
+[features]
+default = []
+# Pulls the live `rusteron-archive` reader path. Off by default so the crate
+# compiles cleanly on hosts without the Aeron C library installed.
+aeron-live = ["log/aeron-live", "dep:rusteron-archive"]
+# Real Aeron container e2e (). Implies the in-memory testing
+# helpers from kardamom-log because the harness re-uses some of them.
+docker-e2e = ["log/docker-e2e", "log/testing"]
+
+[dependencies]
+types.workspace = true
+log.workspace = true
+# Pulled in as a regular dependency (not just dev-dep) primarily to force
+# build-order: kardamom-deployer's build.rs runs forge install + forge build,
+# populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
+# `contracts/out/KardamomL2Settlement.sol/KardamomL2Settlement.json` at
+# compile time and cargo guarantees a crate's deps are compiled (and their
+# build scripts run) before the crate itself is compiled. Without this,
+# parallel build-script execution races on forge install.
+kardamom-deployer = { path = "../deployer" }
+
+alloy-primitives.workspace = true
+alloy-eips.workspace = true
+alloy-consensus.workspace = true
+alloy-network.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-sol-types.workspace = true
+alloy-contract.workspace = true
+
+bytes.workspace = true
+rkyv.workspace = true
+zstd = "0.13"
+rusteron-archive = { workspace = true, optional = true }
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+metrics.workspace = true
+
+tokio.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+log = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+proptest = "1"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+criterion = { version = "0.7", features = ["html_reports"] }
+alloy-node-bindings.workspace = true
+serde_json.workspace = true
+
+[[bin]]
+name = "kardamom-batcher"
+path = "src/bin/kardamom-batcher.rs"
+
+[[bench]]
+name = "pack_throughput"
+harness = false

@@ -39,8 +39,8 @@ alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
-kardamom-types = { path = "crates/kardamom-types" }
-kardamom-log = { path = "crates/kardamom-log" }
+types = { path = "crates/types" }
+log = { path = "crates/log" }
 
 
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
