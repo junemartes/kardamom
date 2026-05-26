@@ -9,6 +9,18 @@ pub struct SequencerConfig {
     pub partition_count: u32,
     /// This process's partition index (`0..partition_count`).
     pub partition_index: u32,
+    /// Stable identifier for this sequencer process. Embedded in every
+    /// [`kardamom_types::TxRef`] this sequencer writes onto channel B so
+    /// downstream consumers can route the ref back to the correct
+    /// per-sequencer channel A archive (D-Sh12 / spec §2.3).
+    ///
+    /// **Invariant:** `sequencer_id` matches `partition_index` for the
+    /// default M=8 deployment (one sequencer per partition). The field is
+    /// kept separate so a future asymmetric layout (e.g. multiple
+    /// sequencers per partition for hot-standby pre-allocation) can change
+    /// it without affecting the partition router. The CLI/TOML may omit
+    /// it; if absent, it defaults to `partition_index as u8`.
+    pub sequencer_id: u8,
     /// Per-sender future-nonce buffer capacity. Default 16.
     pub max_pending_per_sender: usize,
     /// Optional CPU core to pin this process to. `None` = no pin.
@@ -41,6 +53,7 @@ impl Default for SequencerConfig {
         Self {
             partition_count: 8,
             partition_index: 0,
+            sequencer_id: 0,
             max_pending_per_sender: 16,
             core_id: None,
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
@@ -61,6 +74,14 @@ impl SequencerConfig {
             });
         }
         Ok(())
+    }
+
+    /// Derive a default `sequencer_id` from `partition_index` when the
+    /// caller wants the conventional "one sequencer per partition"
+    /// layout. Helpful for CLI overrides and tests.
+    pub fn with_sequencer_id_from_partition(mut self) -> Self {
+        self.sequencer_id = self.partition_index as u8;
+        self
     }
 }
 
@@ -91,6 +112,17 @@ mod tests {
             cfg.validate(),
             Err(ConfigError::IndexOutOfRange { .. })
         ));
+    }
+
+    #[test]
+    fn with_sequencer_id_from_partition_overrides() {
+        let cfg = SequencerConfig {
+            partition_index: 3,
+            sequencer_id: 0,
+            ..Default::default()
+        }
+        .with_sequencer_id_from_partition();
+        assert_eq!(cfg.sequencer_id, 3);
     }
 
     #[test]
