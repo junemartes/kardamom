@@ -1,26 +1,36 @@
 //! Sequencer event step + loop.
 //!
-//! [`Sequencer::run_once`] polls the ingress source for at most one
-//! message, drives the state machine, and performs the **dual-write**
-//! defined by the D-Sh12 split architecture (spec §2.3):
+//! [`Sequencer::run_once`] polls the shard's channel-A subscription for at
+//! most one fragment and republishes a canonical-order `TxRef` onto
+//! channel B.
 //!
-//!  1. Full `TxEnvelope` bytes → the sequencer's own per-A
-//!     [`ChannelAPublisher`] (exclusive, ~memcpy speed). Returns the
-//!     fragment's `BPosition` on the A-stream.
-//!  2. Tiny [`kardamom_types::TxRef`]`{ sequencer_id, position_a }` →
-//!     the canonical orderer [`ChannelBRefPublisher`] (concurrent
-//!     multi-publisher).
+//! Per the MDS topology (D-Sh12 v2 / spec §2.3): the proxy has already
+//! published the envelope onto channel A, so the sequencer's input is
+//! `(position_a, envelope)` — the proxy's Aeron-offer position is the
+//! lookup key downstream consumers (executor, batcher) use to resolve the
+//! envelope.
 //!
-//! State (pending-nonce map, drain buffer) is advanced **only after both
-//! publications succeed**. If *either* fails — e.g. an A or B back-pressure
-//! signal — the state machine is rewound via
-//! [`PartitionState::reinsert_for_retry`] and the error bubbles up so the
-//! loop can apply its retry policy. On a B-backpressure retry, the
-//! previously-A-published envelope becomes an orphan on the A-stream (no
-//! ref on B points at it). Downstream consumers must tolerate
-//! unreferenced A entries; this is the agreed cost of dual writes in the
-//! split architecture (the canonical layer's exactly-once guarantee is on
-//! channel B, by `TxRef` arrival).
+//! For each observed envelope:
+//!
+//!  1. Decode the nonce out of the envelope (the proxy already verified
+//!     the signature and populated `sender` + `tx_hash`).
+//!  2. Hydrate `next_nonce` from the state DB if this is the first time
+//!     we've seen the sender (cache-miss path).
+//!  3. Feed `(sender, nonce, RefMetadata)` to [`PartitionState::process`]:
+//!     - match → emit a publish action for this nonce + drain any
+//!       buffered higher nonces that newly become contiguous;
+//!     - future → buffer (bounded per-sender);
+//!     - past → emit a `DuplicateNotification`.
+//!  4. For each `Publish` action, build
+//!     `TxRef { tx_hash, shard_id, position_a }` and publish to channel B.
+//!     If B back-pressures, [`PartitionState::reinsert_for_retry`] rewinds
+//!     so the next loop iteration retries the same `(sender, nonce)`.
+//!
+//! Warm cache: because every observed envelope advances `next_nonce` on a
+//! match, the in-memory map is naturally populated by the channel-A read
+//! stream itself — no separate prefetch thread needed. Cold senders (no
+//! activity since startup) hit the state-DB cache-miss path the first
+//! time they're observed.
 //!
 //! See also [`crate::outbound`] for the trait surface and in-memory fakes
 //! used by tests.
@@ -32,43 +42,35 @@ use std::time::Duration;
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
-use kardamom_log::codec;
-use kardamom_types::{StateDatabase, TxEnvelope, TxRef};
+use kardamom_types::{BPosition, StateDatabase, TxRef};
 use tracing::{trace, warn};
 
 use crate::config::SequencerConfig;
 use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
-use crate::inbound::IngressSource;
+use crate::inbound::ChannelASubscriber;
 use crate::metrics;
-use crate::outbound::{ChannelAPublisher, ChannelBRefPublisher, ReceiptCachePublisher};
+use crate::outbound::{ChannelBRefPublisher, ReceiptCachePublisher};
 use crate::partition::partition_for;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction};
 
-/// A canonical-ordered payload ready to dual-write (A + B) for a sender.
+/// Metadata needed to (re-)publish a `TxRef` for a buffered or just-arrived
+/// envelope. Stored inside `PartitionState<RefMetadata>` so that
+/// [`PartitionState::reinsert_for_retry`] puts a complete, ready-to-resend
+/// record back in the pending buffer on B-backpressure rewind.
 ///
-/// Stored inside `PartitionState<EncodedFrame>` so that
-/// `reinsert_for_retry` puts a complete, ready-to-resend record back in the
-/// pending buffer (instead of forcing a re-decode + re-encode on the retry
-/// path). The B-side ref is constructed *after* the A publish succeeds
-/// because the ref's `position_a` is the A publisher's return value.
+/// We no longer carry the envelope bytes — the proxy already wrote them
+/// onto channel A; the sequencer only republishes the ref.
 #[derive(Debug, Clone)]
-struct EncodedFrame {
+struct RefMetadata {
     correlation_id: u64,
-    /// Carries through to `TxRef.tx_hash` so the downstream B publish
-    /// includes the canonical hash without re-decoding the envelope.
+    /// Carries through to `TxRef.tx_hash`.
     tx_hash: alloy_primitives::B256,
-    bytes: Vec<u8>,
-}
-
-/// Encode a `TxEnvelope` for channel A using `kardamom_log::codec::encode`
-/// (rkyv archival). The same encoding is consumed by downstream
-/// `channel_a_subscriber()` calls via `codec::access` / `codec::materialize`.
-fn encode_envelope_for_a(env: &TxEnvelope) -> Result<Vec<u8>, SequencerError> {
-    codec::encode(env)
-        .map(|av| av.into_vec())
-        .map_err(SequencerError::from)
+    /// The Aeron-offer position the proxy got back when it published this
+    /// envelope onto channel A. Used by downstream consumers to look up
+    /// the envelope on the A archive.
+    position_a: BPosition,
 }
 
 /// Cooperative shutdown signal shared with the loop driver. Cloneable so the
@@ -106,7 +108,7 @@ impl Default for Shutdown {
 
 pub struct Sequencer<DB: StateDatabase> {
     cfg: SequencerConfig,
-    state: PartitionState<EncodedFrame>,
+    state: PartitionState<RefMetadata>,
     /// Canonical state source for cache-miss hydration. When a tx arrives
     /// for a sender this sequencer has never seen, we consult `state_db`
     /// once to seed the in-memory `next_nonce` map with the committed
@@ -158,44 +160,21 @@ impl<DB: StateDatabase> Sequencer<DB> {
         self.state.seed_next_nonce(sender, n);
     }
 
-    /// Dual-write helper: publish `payload.bytes` to channel A, then
-    /// build a `TxRef` from the returned `BPosition` and publish to
-    /// channel B. Returns `Ok(())` only if **both** writes succeeded.
-    ///
-    /// On A backpressure: nothing landed; the caller reinserts the payload
-    /// at this nonce.
-    ///
-    /// On B backpressure: the envelope is already on the A archive but no
-    /// `TxRef` ever points to it; this is an acceptable orphan per the
-    /// split-architecture contract. The caller still reinserts so the
-    /// retry produces a *fresh* A entry and a (this time matching) B ref.
-    fn dual_publish<A, B>(
-        &self,
-        a: &mut A,
-        b: &mut B,
-        payload: &EncodedFrame,
-    ) -> Result<(), SequencerError>
+    /// Publish a `TxRef` for `meta` to channel B. The `position_a` was
+    /// observed off the channel-A subscription — the proxy did the actual
+    /// envelope write — so this is a single B write, not a dual write.
+    /// On B-backpressure the caller reinserts the metadata so the retry
+    /// republishes the same `(tx_hash, shard, position_a)` triple.
+    fn publish_ref<B>(&self, b: &mut B, meta: &RefMetadata) -> Result<(), SequencerError>
     where
-        A: ChannelAPublisher,
         B: ChannelBRefPublisher,
     {
-        // 1. Channel A — full envelope bytes. Bubble back on backpressure.
-        let position_a = match a.try_publish(&payload.bytes) {
-            Ok(pos) => pos,
-            Err(SequencerError::Backpressure) => {
-                metrics::record_backpressure(self.cfg.partition_index);
-                return Err(SequencerError::Backpressure);
-            }
-            Err(e) => return Err(e),
-        };
-
-        // 2. Channel B — tiny TxRef carrying tx_hash + shard + A-position.
-        //    `tx_hash` lets downstream consumers (executor/batcher) dedup
-        //    the P duplicate refs racing sequencers will produce under the
-        //    MDS topology. `sequencer_id` doubles as the shard index in the
-        //    one-sequencer-per-shard default deployment. If this
-        //    back-pressures the A entry is an orphan (documented).
-        let txref = TxRef::new(payload.tx_hash, self.cfg.sequencer_id, position_a);
+        // shard_id under the MDS topology is the address-shard index. The
+        // default deployment of K=M, one shard per sequencer pool, lets
+        // `cfg.sequencer_id` double as the shard id; production
+        // configurations with multiple sequencer pools per shard can set
+        // these independently and `sequencer_id` here MUST be the shard.
+        let txref = TxRef::new(meta.tx_hash, self.cfg.sequencer_id, meta.position_a);
         match b.try_publish_ref(&txref) {
             Ok(()) => {
                 metrics::record_publish(self.cfg.partition_index);
@@ -205,9 +184,9 @@ impl<DB: StateDatabase> Sequencer<DB> {
                 metrics::record_backpressure(self.cfg.partition_index);
                 warn!(
                     sequencer_id = self.cfg.sequencer_id,
-                    correlation_id = payload.correlation_id,
-                    ?position_a,
-                    "B back-pressure after A publish; A entry will be orphaned on retry"
+                    correlation_id = meta.correlation_id,
+                    position_a = ?meta.position_a,
+                    "B back-pressure; rewinding state machine for retry"
                 );
                 Err(SequencerError::Backpressure)
             }
@@ -217,51 +196,49 @@ impl<DB: StateDatabase> Sequencer<DB> {
 
     /// Drive one ingress message through the state machine. Returns
     /// `Ok(true)` if work was done, `Ok(false)` if both the retry-drain and
-    /// the ingress poll were empty.
+    /// the channel-A poll were empty.
     ///
     /// Order of operations:
-    ///  1. First flush any payloads sitting at `pending[next_nonce]` (these
-    ///     are the rebuffered-after-backpressure entries). If either
-    ///     dual-write side blocks again, we re-rewind and return
-    ///     `Backpressure` without touching ingress.
-    ///  2. Then poll ingress for the next inbound envelope and process it.
-    pub fn run_once<I, A, B, R>(
+    ///  1. First flush any metadata sitting at `pending[next_nonce]` (these
+    ///     are the rebuffered-after-backpressure entries). If the B publish
+    ///     blocks again, re-rewind and return `Backpressure` without
+    ///     touching channel A.
+    ///  2. Then poll channel A for the next observed envelope and process it.
+    pub fn run_once<I, B, R>(
         &mut self,
-        ingress: &mut I,
-        a: &mut A,
+        channel_a: &mut I,
         b: &mut B,
         rc: &mut R,
     ) -> Result<bool, SequencerError>
     where
-        I: IngressSource,
-        A: ChannelAPublisher,
+        I: ChannelASubscriber,
         B: ChannelBRefPublisher,
         R: ReceiptCachePublisher,
     {
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
-            for (sender, n, payload) in pending {
-                if let Err(SequencerError::Backpressure) = self.dual_publish(a, b, &payload) {
-                    self.state.reinsert_for_retry(sender, n, payload);
+            for (sender, n, meta) in pending {
+                if let Err(SequencerError::Backpressure) = self.publish_ref(b, &meta) {
+                    self.state.reinsert_for_retry(sender, n, meta);
                     return Err(SequencerError::Backpressure);
                 }
                 trace!(
                     nonce = n,
-                    correlation_id = payload.correlation_id,
-                    "dual-published (drain-pending)"
+                    correlation_id = meta.correlation_id,
+                    "published ref (drain-pending)"
                 );
             }
             return Ok(true);
         }
 
-        let Some(envelope) = ingress.poll()? else {
+        let Some((position_a, envelope)) = channel_a.poll()? else {
             return Ok(false);
         };
         metrics::record_ingest(self.cfg.partition_index);
 
         let sender = sender_of(&envelope);
 
-        // Defensive: drop messages routed to the wrong partition. Routing
+        // Defensive: drop messages routed to the wrong shard. Routing
         // disagreement between proxy and sequencer would otherwise silently
         // corrupt nonce state.
         let part = partition_for(sender, self.cfg.partition_count);
@@ -269,7 +246,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
             warn!(
                 expected = self.cfg.partition_index,
                 got = part,
-                "ingress message for wrong partition; skipping"
+                "channel-A envelope for wrong shard; skipping"
             );
             return Ok(true);
         }
@@ -283,18 +260,18 @@ impl<DB: StateDatabase> Sequencer<DB> {
         // Cache-miss hydration: first time we see this sender, fetch the
         // canonical nonce from the state DB and seed the in-memory map.
         // Cheap on cold senders; no-op (one HashMap::contains_key) on warm.
+        // Steady-state: every observed envelope advances next_nonce on a
+        // match, so the warm cache is intrinsic — no separate prefetch.
         self.hydrate_if_unknown(sender);
 
-        let tx_hash = envelope.tx_hash;
-        let bytes = encode_envelope_for_a(&envelope)?;
-        let frame = EncodedFrame {
+        let meta = RefMetadata {
             correlation_id: envelope.correlation_id,
-            tx_hash,
-            bytes,
+            tx_hash: envelope.tx_hash,
+            position_a,
         };
 
         let t0 = std::time::Instant::now();
-        let result = self.state.process(sender, nonce, frame);
+        let result = self.state.process(sender, nonce, meta);
         let elapsed_us = t0.elapsed().as_micros() as f64;
         metrics::record_nonce_check_latency(self.cfg.partition_index, elapsed_us);
 
@@ -316,19 +293,19 @@ impl<DB: StateDatabase> Sequencer<DB> {
         for action in result.actions {
             match action {
                 ProcessAction::Publish { nonce: n, payload } => {
-                    match self.dual_publish(a, b, &payload) {
+                    match self.publish_ref(b, &payload) {
                         Ok(()) => {
                             trace!(
                                 nonce = n,
                                 correlation_id = payload.correlation_id,
-                                "dual-published"
+                                "published ref"
                             );
                         }
                         Err(SequencerError::Backpressure) => {
                             // Roll back: the state machine had advanced for
                             // this tx but the canonical ref never landed on
-                            // B. The reinsert also re-buffers the payload
-                            // so the retry replays it verbatim.
+                            // B. The reinsert re-buffers the metadata so the
+                            // retry replays the same publish.
                             self.state.reinsert_for_retry(sender, n, payload);
                             return Err(SequencerError::Backpressure);
                         }
@@ -349,17 +326,15 @@ impl<DB: StateDatabase> Sequencer<DB> {
 
     /// Pin this thread to the configured core (if any) and loop until
     /// shutdown.
-    pub fn run<I, A, B, R>(
+    pub fn run<I, B, R>(
         &mut self,
-        ingress: &mut I,
-        a: &mut A,
+        channel_a: &mut I,
         b: &mut B,
         rc: &mut R,
         shutdown: Shutdown,
     ) -> Result<(), SequencerError>
     where
-        I: IngressSource,
-        A: ChannelAPublisher,
+        I: ChannelASubscriber,
         B: ChannelBRefPublisher,
         R: ReceiptCachePublisher,
     {
@@ -374,7 +349,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
             if shutdown.is_signaled() {
                 return Ok(());
             }
-            match self.run_once(ingress, a, b, rc) {
+            match self.run_once(channel_a, b, rc) {
                 Ok(true) => backoff_us = 1,
                 Ok(false) => {
                     std::thread::sleep(Duration::from_micros(backoff_us));
