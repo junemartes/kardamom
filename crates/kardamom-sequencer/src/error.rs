@@ -4,7 +4,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum SequencerError {
-    #[error("backpressure: channel B publication blocked")]
+    #[error("backpressure: tx_ordering publication blocked")]
     Backpressure,
 
     #[error("ingress source disconnected")]
@@ -31,7 +31,7 @@ mod tests {
     fn display_strings_are_stable() {
         assert_eq!(
             SequencerError::Backpressure.to_string(),
-            "backpressure: channel B publication blocked"
+            "backpressure: tx_ordering publication blocked"
         );
         assert_eq!(
             SequencerError::IngressDisconnected.to_string(),

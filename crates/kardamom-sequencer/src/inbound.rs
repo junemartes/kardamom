@@ -1,10 +1,10 @@
-//! Inbound channel-A subscription.
+//! Inbound tx_data subscription.
 //!
-//! Under the MDS topology the sequencer subscribes to ONE channel A
+//! Under the MDS topology the sequencer subscribes to ONE tx_data
 //! (the one for its address shard) and observes every `TxEnvelope` that
 //! any proxy published there, paired with the Aeron `BPosition` of that
 //! fragment. The sequencer's job is to reorder by per-sender nonce and
-//! republish a `TxRef { tx_hash, shard_id, tx_data_position }` onto channel B.
+//! republish a `TxRef { tx_hash, shard_id, tx_data_position }` onto tx_ordering.
 //!
 //! Per D-Sh3 / D-Sh4 the inbound `TxEnvelope` already has `sender` and
 //! `tx_hash` populated by the proxy — no recovery or hashing happens here.
@@ -12,9 +12,9 @@
 use crate::error::SequencerError;
 use kardamom_types::{BPosition, TxEnvelope};
 
-/// Subscription to one channel A stream. Yields `(tx_data_position, envelope)`
+/// Subscription to one tx_data stream. Yields `(tx_data_position, envelope)`
 /// per Aeron fragment. Production implementations wrap a
-/// `kardamom_log` channel-A subscriber; tests use [`fakes::ScriptedTxData`].
+/// `kardamom_log` tx_data subscriber; tests use [`fakes::ScriptedTxData`].
 ///
 /// Same shape as the executor's `TxDataSubscription` trait; the
 /// difference is the sequencer is one of P concurrent subscribers per
@@ -39,7 +39,7 @@ pub mod fakes {
 
     use super::*;
 
-    /// In-memory channel-A subscription scripted with `(position, envelope)`
+    /// In-memory tx_data subscription scripted with `(position, envelope)`
     /// pairs in arrival order. Tests typically prepare a vector of envelopes
     /// and synthesize monotonically increasing positions before driving
     /// `Sequencer::run_once`.

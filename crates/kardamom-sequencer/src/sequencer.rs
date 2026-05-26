@@ -1,11 +1,11 @@
 //! Sequencer event step + loop.
 //!
-//! [`Sequencer::run_once`] polls the shard's channel-A subscription for at
+//! [`Sequencer::run_once`] polls the shard's tx_data subscription for at
 //! most one fragment and republishes a canonical-order `TxRef` onto
-//! channel B.
+//! tx_ordering.
 //!
 //! Per the MDS topology (D-Sh12 v2 / spec §2.3): the proxy has already
-//! published the envelope onto channel A, so the sequencer's input is
+//! published the envelope onto tx_data, so the sequencer's input is
 //! `(tx_data_position, envelope)` — the proxy's Aeron-offer position is the
 //! lookup key downstream consumers (executor, batcher) use to resolve the
 //! envelope.
@@ -22,12 +22,12 @@
 //!     - future → buffer (bounded per-sender);
 //!     - past → emit a `DuplicateNotification`.
 //!  4. For each `Publish` action, build
-//!     `TxRef { tx_hash, shard_id, tx_data_position }` and publish to channel B.
+//!     `TxRef { tx_hash, shard_id, tx_data_position }` and publish to tx_ordering.
 //!     If B back-pressures, [`PartitionState::reinsert_for_retry`] rewinds
 //!     so the next loop iteration retries the same `(sender, nonce)`.
 //!
 //! Warm cache: because every observed envelope advances `next_nonce` on a
-//! match, the in-memory map is naturally populated by the channel-A read
+//! match, the in-memory map is naturally populated by the tx_data read
 //! stream itself — no separate prefetch thread needed. Cold senders (no
 //! activity since startup) hit the state-DB cache-miss path the first
 //! time they're observed.
@@ -61,14 +61,14 @@ use crate::state::{NonceOutcome, PartitionState, ProcessAction};
 /// record back in the pending buffer on B-backpressure rewind.
 ///
 /// We no longer carry the envelope bytes — the proxy already wrote them
-/// onto channel A; the sequencer only republishes the ref.
+/// onto tx_data; the sequencer only republishes the ref.
 #[derive(Debug, Clone)]
 struct RefMetadata {
     correlation_id: u64,
     /// Carries through to `TxRef.tx_hash`.
     tx_hash: alloy_primitives::B256,
     /// The Aeron-offer position the proxy got back when it published this
-    /// envelope onto channel A. Used by downstream consumers to look up
+    /// envelope onto tx_data. Used by downstream consumers to look up
     /// the envelope on the A archive.
     tx_data_position: BPosition,
 }
@@ -160,8 +160,8 @@ impl<DB: StateDatabase> Sequencer<DB> {
         self.state.seed_next_nonce(sender, n);
     }
 
-    /// Publish a `TxRef` for `meta` to channel B. The `tx_data_position` was
-    /// observed off the channel-A subscription — the proxy did the actual
+    /// Publish a `TxRef` for `meta` to tx_ordering. The `tx_data_position` was
+    /// observed off the tx_data subscription — the proxy did the actual
     /// envelope write — so this is a single B write, not a dual write.
     /// On B-backpressure the caller reinserts the metadata so the retry
     /// republishes the same `(tx_hash, shard, tx_data_position)` triple.
@@ -196,14 +196,14 @@ impl<DB: StateDatabase> Sequencer<DB> {
 
     /// Drive one ingress message through the state machine. Returns
     /// `Ok(true)` if work was done, `Ok(false)` if both the retry-drain and
-    /// the channel-A poll were empty.
+    /// the tx_data poll were empty.
     ///
     /// Order of operations:
     ///  1. First flush any metadata sitting at `pending[next_nonce]` (these
     ///     are the rebuffered-after-backpressure entries). If the B publish
     ///     blocks again, re-rewind and return `Backpressure` without
-    ///     touching channel A.
-    ///  2. Then poll channel A for the next observed envelope and process it.
+    ///     touching tx_data.
+    ///  2. Then poll tx_data for the next observed envelope and process it.
     pub fn run_once<I, B, R>(
         &mut self,
         channel_a: &mut I,
@@ -246,7 +246,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
             warn!(
                 expected = self.cfg.partition_index,
                 got = part,
-                "channel-A envelope for wrong shard; skipping"
+                "tx_data envelope for wrong shard; skipping"
             );
             return Ok(true);
         }

@@ -50,9 +50,9 @@ pub struct ChannelsConfig {
     /// `TxEnvelope` bytes (D-Sh12). One stream per sequencer. URI template
     /// substitutes `{sid}` with the sequencer id (e.g.
     /// `"aeron:ipc?alias=a-{sid}"`); stream id is
-    /// `tx_dattx_dattx_data_stream_id_base + sequencer_id`.
-    pub tx_dattx_dattx_data_channel_template: String,
-    pub tx_dattx_dattx_data_stream_id_base: i32,
+    /// `tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id`.
+    pub tx_dattx_dattx_dattx_data_channel_template: String,
+    pub tx_dattx_dattx_dattx_data_stream_id_base: i32,
 
     /// TxOrdering: canonical orderer carrying tiny `TxOrderingMessage`
     /// records (TxRef + sealer-emitted boundary markers). Recorded.
@@ -77,9 +77,9 @@ pub struct ChannelsConfig {
     /// tx_data has its own fsync sidecar publishing
     /// `fsynced_tx_data_position[i]` to its own watermark stream. URI template
     /// substitutes `{sid}` with the sequencer id. Stream id is
-    /// `fsync_watermark_tx_dattx_dattx_data_stream_id_base + sequencer_id`.
-    pub fsync_watermark_tx_dattx_dattx_data_channel_template: String,
-    pub fsync_watermark_tx_dattx_dattx_data_stream_id_base: i32,
+    /// `fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id`.
+    pub fsync_watermark_tx_dattx_dattx_dattx_data_channel_template: String,
+    pub fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base: i32,
 
     /// Aggregated quorum watermark (tx_ordering).
     pub quorum_watermark_channel: String,
@@ -89,13 +89,13 @@ pub struct ChannelsConfig {
 impl ChannelsConfig {
     /// TxData[i] URI for a given sequencer (`{sid}` substituted).
     pub fn a_channel(&self, sequencer_id: u8) -> String {
-        self.tx_dattx_dattx_data_channel_template
+        self.tx_dattx_dattx_dattx_data_channel_template
             .replace("{sid}", &sequencer_id.to_string())
     }
 
-    /// TxData[i] stream id (`tx_dattx_dattx_data_stream_id_base + sequencer_id`).
+    /// TxData[i] stream id (`tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id`).
     pub fn a_stream_id(&self, sequencer_id: u8) -> i32 {
-        self.tx_dattx_dattx_data_stream_id_base + sequencer_id as i32
+        self.tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id as i32
     }
 
     /// Per-recorder tx_ordering fsync watermark URI (`{rid}` substituted).
@@ -106,13 +106,13 @@ impl ChannelsConfig {
 
     /// Per-sequencer tx_data fsync watermark URI (`{sid}` substituted).
     pub fn fsync_watermark_a_channel(&self, sequencer_id: u8) -> String {
-        self.fsync_watermark_tx_dattx_dattx_data_channel_template
+        self.fsync_watermark_tx_dattx_dattx_dattx_data_channel_template
             .replace("{sid}", &sequencer_id.to_string())
     }
 
     /// Per-sequencer tx_data fsync watermark stream id.
     pub fn fsync_watermark_a_stream_id(&self, sequencer_id: u8) -> i32 {
-        self.fsync_watermark_tx_dattx_dattx_data_stream_id_base + sequencer_id as i32
+        self.fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base + sequencer_id as i32
     }
 }
 
@@ -137,8 +137,8 @@ impl Default for LogConfig {
                 catalog_file_sync_level: 1,
             },
             channels: ChannelsConfig {
-                tx_dattx_dattx_data_channel_template: "aeron:ipc?alias=a-{sid}".into(),
-                tx_dattx_dattx_data_stream_id_base: 2000,
+                tx_dattx_dattx_dattx_data_channel_template: "aeron:ipc?alias=a-{sid}".into(),
+                tx_dattx_dattx_dattx_data_stream_id_base: 2000,
                 tx_ordering_channel: "aeron:udp?endpoint=224.0.1.1:40001".into(),
                 tx_ordering_stream_id: 1001,
                 tx_receipts_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
@@ -147,9 +147,9 @@ impl Default for LogConfig {
                 receipt_cache_stream_id: 1003,
                 fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),
                 fsync_watermark_stream_id: 1010,
-                fsync_watermark_tx_dattx_dattx_data_channel_template:
+                fsync_watermark_tx_dattx_dattx_dattx_data_channel_template:
                     "aeron:ipc?alias=fsync-wm-a-{sid}".into(),
-                fsync_watermark_tx_dattx_dattx_data_stream_id_base: 1030,
+                fsync_watermark_tx_dattx_dattx_dattx_data_stream_id_base: 1030,
                 quorum_watermark_channel: "aeron:udp?endpoint=224.0.1.1:40020".into(),
                 quorum_watermark_stream_id: 1020,
             },

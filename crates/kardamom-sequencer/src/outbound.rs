@@ -1,11 +1,11 @@
 //! Outbound channel abstractions.
 //!
 //! Under the MDS topology (D-Sh12 v2) the sequencer **does not** publish
-//! to channel A — that's the proxy's job. The sequencer is purely a
+//! to tx_data — that's the proxy's job. The sequencer is purely a
 //! reader-of-A + publisher-of-B-refs: for each envelope observed on its
-//! shard's channel A (via [`crate::inbound::TxDataSubscriber`]), if the
+//! shard's tx_data (via [`crate::inbound::TxDataSubscriber`]), if the
 //! nonce gate matches, it publishes a tiny [`kardamom_types::TxRef`] onto
-//! the canonical orderer channel B
+//! the canonical orderer tx_ordering
 //! ([`TxOrderingRefPublisher`]) — Aeron *concurrent* multi-publisher, ordered
 //! with refs from the other P-1 sequencers in this shard's group and
 //! sealer-emitted `BlockBoundaryStart` markers.
@@ -57,7 +57,7 @@ pub mod fakes {
 
     use super::*;
 
-    /// In-memory channel-B `TxRef` publisher. Records every published ref
+    /// In-memory tx_ordering `TxRef` publisher. Records every published ref
     /// in arrival order so tests can assert the canonical sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
