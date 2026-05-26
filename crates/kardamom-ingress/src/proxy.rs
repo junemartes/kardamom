@@ -68,7 +68,7 @@ where
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
     /// Per S0 D-Sh5: highest `BlockBoundary.block_number` observed on
-    /// channel C. Read by `eth_blockNumber`. `AtomicU64` is plenty —
+    /// tx_receipts. Read by `eth_blockNumber`. `AtomicU64` is plenty —
     /// monotonic, single-writer (the BlockBoundary watcher), many readers.
     pub(crate) latest_block_number: Arc<AtomicU64>,
     /// Per S0 D-Sh4: state-DB handle for `eth_getTransactionReceipt(hash)`
@@ -141,7 +141,7 @@ where
         me
     }
 
-    /// Highest `BlockBoundary.block_number` observed on channel C. Backs
+    /// Highest `BlockBoundary.block_number` observed on tx_receipts. Backs
     /// `eth_blockNumber` per S0 D-Sh5.
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
@@ -169,7 +169,7 @@ where
 
     fn spawn_receipt_cache_watcher(&self) {
         // CachedReceipt is the join of `(sender, nonce)` with `(tx_hash, tx_idx)`
-        // — channel C alone doesn't carry `sender`, so the receipt-cache stream
+        // — tx_receipts alone doesn't carry `sender`, so the receipt-cache stream
         // is the authoritative binding for client release.
         let rx = self.subscription.subscribe_receipt_cache();
         let pending = self.pending.clone();
@@ -232,7 +232,7 @@ where
         // channel before we'd otherwise have registered, especially under load.
         let wait = self.pending.register(sender, nonce);
 
-        // Publish onto channel A[shard]. The shard is selected by sender-
+        // Publish onto tx_data[shard]. The shard is selected by sender-
         // address hash (`partition_for(sender, K)`) so every tx from a given
         // sender lands on the same shard's A stream, which lets the P
         // sequencers per shard nonce-order them consistently. The envelope

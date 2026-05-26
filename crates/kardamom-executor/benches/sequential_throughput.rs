@@ -198,7 +198,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
             let snapshots = MutatingSnapshotSource(snap);
 
             // Post-S4-arch-update wiring: pre-load all envelopes onto a
-            // single channel A and all TxRefs onto channel B before the
+            // single tx_data and all TxRefs onto tx_ordering before the
             // executor starts. The bench measures end-to-end actor
             // throughput; the demux split itself adds one extra crossbeam
             // hop per tx, which should be negligible vs. revm time.

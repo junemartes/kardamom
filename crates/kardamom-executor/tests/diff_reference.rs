@@ -4,7 +4,7 @@
 //! v0 corpus: transfers, a contract `SSTORE`, a revert. Mainnet-vector
 //! corpus is a v1 follow-up.
 //!
-//! Post-S4-arch-update wiring: M=1 channel-A + 1 channel-B; the demux
+//! Post-S4-arch-update wiring: M=1 tx_data + 1 tx_ordering; the demux
 //! doesn't affect determinism but the public Executor::run signature
 //! changed.
 

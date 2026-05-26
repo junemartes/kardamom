@@ -1,9 +1,9 @@
-//! M=4 sequencers each subscribed to their own channel A and racing to
-//! publish refs onto a shared canonical channel B (MDS topology —
+//! M=4 sequencers each subscribed to their own tx_data and racing to
+//! publish refs onto a shared canonical tx_ordering (MDS topology —
 //! D-Sh12 v2 / spec §2.3).
 //!
 //! Asserts the system-level invariants of the split:
-//!  * Each ref on channel B has `shard_id` matching the producing
+//!  * Each ref on tx_ordering has `shard_id` matching the producing
 //!    sequencer's shard (no cross-shard leakage).
 //!  * The per-sender nonce sequence reconstructed from the canonical B
 //!    arrival order is strictly ascending and dense.
@@ -82,7 +82,7 @@ fn find_signers_for_partition(target: u32, n: usize, seed_start: u64) -> Vec<Pri
 
 #[test]
 fn m_eq_4_sequencers_publish_canonical_refs() {
-    // Build M sequencers, each subscribed to its own channel A. They all
+    // Build M sequencers, each subscribed to its own tx_data. They all
     // share one `InMemoryTxOrderingRefPublisher` (cloning shares the
     // underlying Vec — same canonical B stream).
     let b = InMemoryTxOrderingRefPublisher::default();
@@ -187,7 +187,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     }
 
     // Walk the canonical B order, resolve every ref against the scripted
-    // channel-A input by (shard, tx_data_position), and assert per-sender nonce
+    // tx_data input by (shard, tx_data_position), and assert per-sender nonce
     // sequences are strictly ascending and dense from 0.
     let mut per_sender_nonces: HashMap<Address, Vec<u64>> = HashMap::new();
     for r in &refs {
@@ -240,7 +240,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
         );
     }
 
-    // No duplicates were reported (in-order channel-A reads, no past nonces).
+    // No duplicates were reported (in-order tx_data reads, no past nonces).
     for (i, rc) in rcs.iter().enumerate() {
         assert!(
             rc.duplicates.lock().unwrap().is_empty(),

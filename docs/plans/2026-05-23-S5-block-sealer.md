@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ship a singleton-with-hot-standby block sealer for the kardamom rollup that emits `BlockBoundaryStart` markers into the canonical log (channel B) every 250ms wall-clock, electing its leader deterministically from the set of recorder hosts whose per-recorder watermark is caught up to the current B tail — with zero durable state outside B.
+**Goal:** Ship a singleton-with-hot-standby block sealer for the kardamom rollup that emits `BlockBoundaryStart` markers into the canonical log (tx_ordering) every 250ms wall-clock, electing its leader deterministically from the set of recorder hosts whose per-recorder watermark is caught up to the current B tail — with zero durable state outside B.
 
-**Architecture:** A new crate `crates/kardamom-sealer` that runs as a long-lived process (typically co-located with each recorder host). All instances subscribe to channel B and to all per-recorder watermark streams from S3. Each instance independently computes the same leader function — `lowest host-id among caught-up recorders` — and only the instance whose `host_id` matches the elected leader publishes `BlockBoundaryStart` to B via an Aeron concurrent publication. The leader's tick loop wakes on a wall-clock timer aligned to 250ms boundaries, reads the current Aeron `Publication::position()` for B, increments a local `block_number` (bootstrapped by replaying B's tail at startup), and publishes. All state is reconstructable from B; recovery is mechanical.
+**Architecture:** A new crate `crates/kardamom-sealer` that runs as a long-lived process (typically co-located with each recorder host). All instances subscribe to tx_ordering and to all per-recorder watermark streams from S3. Each instance independently computes the same leader function — `lowest host-id among caught-up recorders` — and only the instance whose `host_id` matches the elected leader publishes `BlockBoundaryStart` to B via an Aeron concurrent publication. The leader's tick loop wakes on a wall-clock timer aligned to 250ms boundaries, reads the current Aeron `Publication::position()` for B, increments a local `block_number` (bootstrapped by replaying B's tail at startup), and publishes. All state is reconstructable from B; recovery is mechanical.
 
 **Tech Stack:** Rust 2024 edition, tokio (async runtime + timers), `kardamom-log` (S3 types: `BPosition`, `BlockBoundaryStart`, channel handles, watermark streams), Aeron via S3's wrappers, `tracing` for observability, `criterion` for benches, `turmoil` or a deterministic harness for chaos tests.
 
@@ -115,7 +115,7 @@ Notes:
 //! S5 block sealer.
 //!
 //! Emits `BlockBoundaryStart` markers every 250ms wall-clock into the canonical
-//! log (channel B). Singleton with hot standbys; leader is the lowest-host-id
+//! log (tx_ordering). Singleton with hot standbys; leader is the lowest-host-id
 //! sealer whose recorder peer is caught up to the current B tail.
 //!
 //! All state is reconstructable from B. The sealer keeps no durable state.
@@ -140,7 +140,7 @@ pub use sealer::Sealer;
 
 S5 of the kardamom sequencer. One sealer process per recorder host;
 deterministic leader election (lowest caught-up host id) chooses which one
-emits `BlockBoundaryStart` to channel B every 250ms. All state is
+emits `BlockBoundaryStart` to tx_ordering every 250ms. All state is
 reconstructable from B's tail; failover is mechanical.
 
 Spec: `docs/specs/2026-05-23-high-throughput-sequencer-design.md` §2.6, §4.5.
@@ -258,7 +258,7 @@ use thiserror::Error;
 pub struct SealerConfig {
     /// This process's host identifier. Must appear in `recorder_host_ids`.
     pub host_id: u16,
-    /// Aeron channel URI for channel B (publish + subscribe on the same channel).
+    /// Aeron channel URI for tx_ordering (publish + subscribe on the same channel).
     pub channel_b_uri: String,
     pub channel_tx_ordering_stream_id: i32,
     /// Aeron channel URI carrying all per-recorder watermark streams (one stream per recorder).
@@ -1063,10 +1063,10 @@ pub async fn bootstrap_block_number(
 Create `crates/kardamom-sealer/tests/bootstrap_tail_scan.rs`:
 
 ```rust
-//! Integration test: bootstrap block_number from a mock channel-B stream.
+//! Integration test: bootstrap block_number from a mock tx_ordering stream.
 //!
 //! Uses kardamom-log's in-memory mock subscriber (which S3 must provide as part
-//! of the channel-B handle's test interface).
+//! of the tx_ordering handle's test interface).
 
 use kardamom_log::test_helpers::MockChannelB;
 use kardamom_log::{BlockBoundaryStart, BPosition};
@@ -1239,7 +1239,7 @@ impl<C: WallClock> BoundaryEmitter<C> {
                 }
                 Err(kardamom_log::PublishError::BackPressured) => {
                     if std::time::Instant::now() >= deadline {
-                        anyhow::bail!("backpressure on channel B persisted >50 ms; skipping tick");
+                        anyhow::bail!("backpressure on tx_ordering persisted >50 ms; skipping tick");
                     }
                     tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(8);
@@ -1851,7 +1851,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(host_id = cfg.host_id, "starting sealer");
 
-    // S3 builds the channel-B handle and watermark handle from the URIs + stream ids.
+    // S3 builds the tx_ordering handle and watermark handle from the URIs + stream ids.
     let b_handle = kardamom_log::channel_b::connect(
         &cfg.channel_b_uri,
         cfg.channel_tx_ordering_stream_id,
@@ -1979,8 +1979,8 @@ git push -u origin claude/s5-block-sealer
 gh pr create --title "S5: block sealer (kardamom-sealer crate)" --body "$(cat <<'EOF'
 ## Summary
 - New `kardamom-sealer` crate implementing the S5 subsystem from the high-throughput sequencer spec.
-- Deterministic leader election (lowest host id among caught-up recorders); zero durable state outside channel B.
-- 250ms-aligned tick loop emits `BlockBoundaryStart` markers via the channel-B concurrent publisher.
+- Deterministic leader election (lowest host id among caught-up recorders); zero durable state outside tx_ordering.
+- 250ms-aligned tick loop emits `BlockBoundaryStart` markers via the tx_ordering concurrent publisher.
 
 ## Test plan
 - [ ] `cargo test -p kardamom-sealer` (unit, property, integration, chaos)

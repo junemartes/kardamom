@@ -167,7 +167,7 @@ pub fn apply_write_set(delta: &mut PendingDelta, ws: WriteSet) {
 
 // NOTE: No `block_delta_root` / state-root function here. Per S0 D-Sh11 the
 // executor does not compute or publish any state-root commitment. The sealed
-// BlockBoundary on channel C is slim; the state writer flushes the delta to
+// BlockBoundary on tx_receipts is slim; the state writer flushes the delta to
 // libmdbx, and that's the end of the executor's role in block closure.
 
 #[cfg(test)]

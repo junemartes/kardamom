@@ -2,14 +2,14 @@
 //!
 //! Parses a TOML `SequencerConfig`, validates the partition index, and
 //! either:
-//!   - if `aeron-live` is enabled: opens the real Aeron channels (channel B
+//!   - if `aeron-live` is enabled: opens the real Aeron channels (tx_ordering
 //!     publisher, receipt-cache publisher, ingress subscriber) via
 //!     `kardamom-log` and runs the sequencer loop, or
 //!   - if `aeron-live` is NOT enabled: emits a clear error and exits with
 //!     status 2 so operators don't ship a no-op binary by accident.
 //!
 //! The aeron-live wiring uses the existing `kardamom_log::publisher` /
-//! `subscriber` builders for channel B and the receipt-cache channel. The
+//! `subscriber` builders for tx_ordering and the receipt-cache channel. The
 //! proxy -> sequencer ingress channel surface is still under design in S3 /
 //! S1 (currently an in-process `MockChannels` mpsc); when that surface lands
 //! as a real Aeron stream this binary will gain a concrete IngressSource
@@ -33,7 +33,7 @@ struct Args {
     /// Override the partition count (M).
     #[arg(long)]
     partition_count: Option<u32>,
-    /// Override the sequencer id embedded in every channel-B `TxRef`
+    /// Override the sequencer id embedded in every tx_ordering `TxRef`
     /// (D-Sh12). If omitted and the TOML did not set it, falls back to
     /// `partition_index as u8` so the default M=8 deployment "just
     /// works".

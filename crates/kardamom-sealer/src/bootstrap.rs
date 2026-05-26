@@ -1,6 +1,6 @@
 //! Bootstrap the local `block_number` counter from B's tail.
 //!
-//! On startup the sealer subscribes to the boundary stream on channel B and
+//! On startup the sealer subscribes to the boundary stream on tx_ordering and
 //! drains every `BlockBoundaryStart` already in the recording. The largest
 //! `block_number` it sees + 1 becomes the local counter's initial value. If
 //! the tail is empty (genesis), `block_number` starts at 1.

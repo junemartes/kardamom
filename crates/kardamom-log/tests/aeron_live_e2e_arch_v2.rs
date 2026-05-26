@@ -8,8 +8,8 @@
 //! - M=2 executors-side `TxDataSubscriber`s drain those envelopes into a
 //!   per-A buffer indexed by `(sequencer_id, BPosition)`.
 //! - One `TxOrderingPublisher` (concurrent) publishes `TxRef` records into
-//!   channel B in an interleaved canonical order.
-//! - One `ChannelBSubscriber` walks channel B in canonical order, joining
+//!   tx_ordering in an interleaved canonical order.
+//! - One `ChannelBSubscriber` walks tx_ordering in canonical order, joining
 //!   each ref against the A-buffer and asserting the recovered sequence
 //!   matches the canonical order Aeron produced.
 //!
@@ -80,7 +80,7 @@ async fn split_architecture_m_plus_one_e2e() {
     let endpoint = cluster.archive_control_endpoint(0).await;
     eprintln!("aeron archive control: {endpoint}");
 
-    // Per-A streams are IPC-aliased per sequencer; channel B is the UDP
+    // Per-A streams are IPC-aliased per sequencer; tx_ordering is the UDP
     // endpoint the container exposes. Stream-id arithmetic matches the
     // ChannelsConfig defaults.
     let mut cfg = LogConfig::default();
@@ -99,7 +99,7 @@ async fn split_architecture_m_plus_one_e2e() {
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
     aeron.start().expect("aeron start");
 
-    // Per-sequencer channel-A publishers + per-A subscribers.
+    // Per-sequencer tx_data publishers + per-A subscribers.
     let mut a_pubs: Vec<TxDataPublisher> = Vec::with_capacity(M as usize);
     let subs = Subscribers {
         aeron: aeron.clone(),
@@ -125,7 +125,7 @@ async fn split_architecture_m_plus_one_e2e() {
         }
     }
 
-    // Interleave TxRefs onto channel B in a non-trivial order so we exercise
+    // Interleave TxRefs onto tx_ordering in a non-trivial order so we exercise
     // the per-A-buffer / B-canonical-order join.
     for (sid, pos_a, _corr) in &publish_plan {
         b_pub
@@ -137,7 +137,7 @@ async fn split_architecture_m_plus_one_e2e() {
             .unwrap();
     }
 
-    // Drain channel-A subscriptions into per-A buffers (executor model:
+    // Drain tx_data subscriptions into per-A buffers (executor model:
     // M+1 reader threads — here, polled sequentially for test determinism).
     let mut a_buffer: HashMap<(u8, BPosition), TxEnvelope> = HashMap::new();
     let total_a = (TXS_PER_SEQ as usize) * (M as usize);
@@ -157,11 +157,11 @@ async fn split_architecture_m_plus_one_e2e() {
     assert_eq!(
         a_buffer.len(),
         total_a,
-        "expected {total_a} channel-A envelopes, got {}",
+        "expected {total_a} tx_data envelopes, got {}",
         a_buffer.len()
     );
 
-    // Walk channel B in canonical order. For each TxRef, join against the
+    // Walk tx_ordering in canonical order. For each TxRef, join against the
     // A-buffer; recover the canonical sequence of correlation_ids and
     // compare to publish_plan.
     let mut canonical: Vec<u64> = Vec::new();

@@ -10,9 +10,9 @@ pub struct SequencerConfig {
     /// This process's partition index (`0..partition_count`).
     pub partition_index: u32,
     /// Stable identifier for this sequencer process. Embedded in every
-    /// [`kardamom_types::TxRef`] this sequencer writes onto channel B so
+    /// [`kardamom_types::TxRef`] this sequencer writes onto tx_ordering so
     /// downstream consumers can route the ref back to the correct
-    /// per-sequencer channel A archive (D-Sh12 / spec §2.3).
+    /// per-sequencer tx_data archive (D-Sh12 / spec §2.3).
     ///
     /// **Invariant:** `sequencer_id` matches `partition_index` for the
     /// default M=8 deployment (one sequencer per partition). The field is
@@ -25,7 +25,7 @@ pub struct SequencerConfig {
     pub max_pending_per_sender: usize,
     /// Optional CPU core to pin this process to. `None` = no pin.
     pub core_id: Option<usize>,
-    /// Backpressure behaviour when channel B blocks.
+    /// Backpressure behaviour when tx_ordering blocks.
     pub backpressure_policy: BackpressurePolicy,
 }
 
