@@ -83,10 +83,7 @@ fn main() -> anyhow::Result<()> {
     }
     cfg.validate()?;
 
-    tracing::info!(
-        ?cfg,
-        "kardamom-sequencer config parsed; Aeron wiring TBD"
-    );
+    tracing::info!(?cfg, "kardamom-sequencer config parsed; Aeron wiring TBD");
     eprintln!(
         "kardamom-sequencer: config validated. The ingress channel surface \
          (proxy -> sequencer) still uses in-process mpsc as of this build; \

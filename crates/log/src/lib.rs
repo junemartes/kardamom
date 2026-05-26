@@ -24,17 +24,17 @@
 //! - `docker-e2e` — gates the testcontainers-driven Aeron e2e harness; implies
 //!   `testing`.
 
+pub mod aeron_live;
 pub mod codec;
 pub mod config;
 pub mod error;
-pub mod receipt_cache;
-pub mod supervisor;
-pub mod watermark;
-pub mod aeron_live;
 pub mod publisher;
+pub mod receipt_cache;
 pub mod recorder;
 pub mod subscriber;
+pub mod supervisor;
 pub mod tx_ordering_archive;
+pub mod watermark;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

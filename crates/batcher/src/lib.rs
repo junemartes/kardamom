@@ -23,6 +23,7 @@
 //! `` / / for
 //! the cross-cutting decisions that shape this crate.
 
+pub mod archive_live;
 pub mod archive_reader;
 pub mod batch;
 pub mod batcher;
@@ -33,7 +34,6 @@ pub mod frame;
 pub mod multi_archive_reader;
 pub mod recon;
 pub mod settlement;
-pub mod archive_live;
 
 pub use batch::{BatchAccumulator, ClosedBlock, RecordedTx};
 pub use batcher::{Batcher, MockSender, PostedBatch, Sender};
