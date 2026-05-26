@@ -228,10 +228,11 @@ fn actor_receipts_match_naive_reference() {
     let (c_tx, c_rx) = bounded::<CMessage>(8);
     for (i, (env, _sg)) in pairs.iter().enumerate() {
         let position_a = bpos((i as i32) * 200);
+        let tx_hash = env.tx_hash;
         a_tx.send((position_a, env.clone())).unwrap();
         b_tx.send((
             bpos(i as i32),
-            ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+            ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
         ))
         .unwrap();
     }

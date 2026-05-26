@@ -102,14 +102,16 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
     let mut sub = FakeChannelBSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     let r1 = TxRef {
-        sequencer_id: 0,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 0,
         position_a: BPosition {
             term_id: 0,
             term_offset: 0,
         },
     };
     let r2 = TxRef {
-        sequencer_id: 1,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 1,
         position_a: BPosition {
             term_id: 0,
             term_offset: 64,
@@ -159,25 +161,29 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
     // canonical — the B-stream is).
     let _ = b_pub
         .publish_ref(&TxRef {
-            sequencer_id: 0,
+            tx_hash: alloy_primitives::B256::ZERO,
+            shard_id: 0,
             position_a: p_0a,
         })
         .unwrap();
     let _ = b_pub
         .publish_ref(&TxRef {
-            sequencer_id: 1,
+            tx_hash: alloy_primitives::B256::ZERO,
+            shard_id: 1,
             position_a: p_1a,
         })
         .unwrap();
     let _ = b_pub
         .publish_ref(&TxRef {
-            sequencer_id: 1,
+            tx_hash: alloy_primitives::B256::ZERO,
+            shard_id: 1,
             position_a: p_1b,
         })
         .unwrap();
     let _ = b_pub
         .publish_ref(&TxRef {
-            sequencer_id: 0,
+            tx_hash: alloy_primitives::B256::ZERO,
+            shard_id: 0,
             position_a: p_0b,
         })
         .unwrap();
@@ -207,7 +213,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
         |_b_pos, msg| {
             if let ChannelBMessage::TxRef(r) = msg {
                 let env = a_buffer
-                    .remove(&(r.sequencer_id, r.position_a))
+                    .remove(&(r.shard_id, r.position_a))
                     .expect("ref must hit A-buffer");
                 canonical.push(env.correlation_id);
             }

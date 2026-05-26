@@ -56,6 +56,9 @@ use crate::state::{NonceOutcome, PartitionState, ProcessAction};
 #[derive(Debug, Clone)]
 struct EncodedFrame {
     correlation_id: u64,
+    /// Carries through to `TxRef.tx_hash` so the downstream B publish
+    /// includes the canonical hash without re-decoding the envelope.
+    tx_hash: alloy_primitives::B256,
     bytes: Vec<u8>,
 }
 
@@ -186,9 +189,13 @@ impl<DB: StateDatabase> Sequencer<DB> {
             Err(e) => return Err(e),
         };
 
-        // 2. Channel B — tiny TxRef. If this back-pressures the A entry is
-        //    an orphan (documented).
-        let txref = TxRef::new(self.cfg.sequencer_id, position_a);
+        // 2. Channel B — tiny TxRef carrying tx_hash + shard + A-position.
+        //    `tx_hash` lets downstream consumers (executor/batcher) dedup
+        //    the P duplicate refs racing sequencers will produce under the
+        //    MDS topology. `sequencer_id` doubles as the shard index in the
+        //    one-sequencer-per-shard default deployment. If this
+        //    back-pressures the A entry is an orphan (documented).
+        let txref = TxRef::new(payload.tx_hash, self.cfg.sequencer_id, position_a);
         match b.try_publish_ref(&txref) {
             Ok(()) => {
                 metrics::record_publish(self.cfg.partition_index);
@@ -278,9 +285,11 @@ impl<DB: StateDatabase> Sequencer<DB> {
         // Cheap on cold senders; no-op (one HashMap::contains_key) on warm.
         self.hydrate_if_unknown(sender);
 
+        let tx_hash = envelope.tx_hash;
         let bytes = encode_envelope_for_a(&envelope)?;
         let frame = EncodedFrame {
             correlation_id: envelope.correlation_id,
+            tx_hash,
             bytes,
         };
 

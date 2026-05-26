@@ -126,7 +126,8 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     for (n_txs, blk) in plan {
         for _ in 0..n_txs {
             let env = transfer(&signer, nonce, to, 1);
-            expected_hashes.push(env.tx_hash);
+            let tx_hash = env.tx_hash;
+            expected_hashes.push(tx_hash);
             // Publish to channel A[0] at `a_pos`.
             let position_a = bpos(a_pos);
             a_tx.send((position_a, env)).unwrap();
@@ -135,7 +136,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             // canonical id (Receipt.tx_idx).
             b_tx.send((
                 bpos(bpos_off),
-                ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+                ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
             ))
             .unwrap();
             nonce += 1;

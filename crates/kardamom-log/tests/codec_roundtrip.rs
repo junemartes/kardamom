@@ -28,7 +28,8 @@ fn log_codec_tx_ref_roundtrip() {
     // tiny TxRef-based messages (D-Sh12). Verify both wire shapes encode
     // through the shared codec helpers.
     let r = TxRef {
-        sequencer_id: 2,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 2,
         position_a: BPosition {
             term_id: 4,
             term_offset: 8192,
@@ -48,7 +49,7 @@ fn log_codec_tx_ref_roundtrip() {
     assert_eq!(back, r);
 
     let view = access::<TxRef>(&bytes).unwrap();
-    assert_eq!(view.sequencer_id, 2);
+    assert_eq!(view.shard_id, 2);
     assert_eq!(view.position_a.term_id, 4);
     assert_eq!(view.position_a.term_offset, 8192);
 }
@@ -56,7 +57,8 @@ fn log_codec_tx_ref_roundtrip() {
 #[test]
 fn log_codec_channel_b_message_roundtrip() {
     let m = ChannelBMessage::TxRef(TxRef {
-        sequencer_id: 3,
+        tx_hash: alloy_primitives::B256::ZERO,
+        shard_id: 3,
         position_a: BPosition {
             term_id: 1,
             term_offset: 4096,

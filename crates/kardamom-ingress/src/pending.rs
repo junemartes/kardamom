@@ -132,12 +132,6 @@ impl PendingReceipts {
         self.release_satisfied().await;
     }
 
-    /// Backwards-compatible alias for [`update_quorum_watermark`].
-    #[deprecated(note = "use update_quorum_watermark")]
-    pub async fn update_watermark(&self, wm: QuorumWatermark) {
-        self.update_quorum_watermark(wm).await;
-    }
-
     /// Walk every parked entry and release the ones whose stored receipt's
     /// B-position is now covered by the configured durability gate.
     async fn release_satisfied(&self) {
