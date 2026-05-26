@@ -231,9 +231,9 @@ fn m4_canonical_b_order_drives_receipts() {
         let pick = live[rng.random_range(0..live.len())];
         shuffled.push(per_sid[pick].pop_front().unwrap());
     }
-    for (sid, pos_a, _h) in &shuffled {
+    for (sid, pos_a, h) in &shuffled {
         b_pub
-            .publish_ref(&TxRef::new(*sid, *pos_a))
+            .publish_ref(&TxRef::new(*h, *sid, *pos_a))
             .expect("publish ref");
     }
     // Sealer-emitted boundary: closes block 1 at the last B position.
@@ -413,7 +413,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         term_offset: 0,
     };
     b_pub
-        .publish_ref(&TxRef::new(0, position_a))
+        .publish_ref(&TxRef::new(alloy_primitives::B256::ZERO, 0, position_a))
         .expect("publish ref");
     b_pub
         .publish_boundary(&BlockBoundaryStart {

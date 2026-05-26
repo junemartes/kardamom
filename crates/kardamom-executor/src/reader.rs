@@ -222,6 +222,19 @@ where
         .spawn(move || {
             let mut next_tx_idx = TxIndex::ZERO;
             let mut last_warn_len: usize = 0;
+            // tx_hash dedup. Under the MDS topology the P sequencers per
+            // shard each republish the same `(tx_hash, shard, position_a)`
+            // TxRef onto channel B, so this reader sees P duplicates per
+            // logical tx. Only the first occurrence drives a join-buffer
+            // take + exec dispatch; the rest are silently dropped.
+            //
+            // TODO: this set grows unboundedly. Switch to an LRU keyed by
+            // tx_hash with a window large enough to outlive the longest
+            // possible in-flight reorder, then evict by age (the canonical
+            // order on B means once we're past nonce N we'll never see
+            // nonce <N again from the same sender).
+            let mut seen_tx_hashes: std::collections::HashSet<alloy_primitives::B256> =
+                std::collections::HashSet::new();
             loop {
                 let (position, msg) = match b_sub.next() {
                     Ok(p) => p,
@@ -230,9 +243,19 @@ where
                 };
                 match msg {
                     ChannelBMessage::TxRef(tx_ref) => {
+                        if !seen_tx_hashes.insert(tx_ref.tx_hash) {
+                            // Duplicate from racing sequencers — drop.
+                            debug!(
+                                target: "executor::reader",
+                                tx_hash = ?tx_ref.tx_hash,
+                                shard_id = tx_ref.shard_id,
+                                "skipping duplicate TxRef (MDS racing sequencers)"
+                            );
+                            continue;
+                        }
                         let env = match wait_for_envelope(
                             &buffer,
-                            tx_ref.sequencer_id,
+                            tx_ref.shard_id,
                             tx_ref.position_a,
                             cfg.join_timeout,
                             cfg.join_poll_interval,
@@ -241,13 +264,13 @@ where
                             None => {
                                 warn!(
                                     target: "executor::reader",
-                                    sequencer_id = tx_ref.sequencer_id,
+                                    sequencer_id = tx_ref.shard_id,
                                     position_a = ?tx_ref.position_a,
                                     timeout_ms = cfg.join_timeout.as_millis() as u64,
                                     "join timeout: TxRef has no envelope on channel A; aborting"
                                 );
                                 return Err(ExecutorError::JoinTimeout {
-                                    sequencer_id: tx_ref.sequencer_id,
+                                    sequencer_id: tx_ref.shard_id,
                                     position_a: tx_ref.position_a,
                                     timeout_ms: cfg.join_timeout.as_millis() as u64,
                                 });
@@ -422,8 +445,22 @@ mod tests {
 
         let b = VecChannelBSub {
             queue: VecDeque::from(vec![
-                Ok((pos(0), ChannelBMessage::TxRef(TxRef::new(0, pos(0))))),
-                Ok((pos(16), ChannelBMessage::TxRef(TxRef::new(1, pos(50))))),
+                Ok((
+                    pos(0),
+                    ChannelBMessage::TxRef(TxRef::new(
+                        alloy_primitives::B256::repeat_byte(0xA1),
+                        0,
+                        pos(0),
+                    )),
+                )),
+                Ok((
+                    pos(16),
+                    ChannelBMessage::TxRef(TxRef::new(
+                        alloy_primitives::B256::repeat_byte(0xA2),
+                        1,
+                        pos(50),
+                    )),
+                )),
                 Ok((
                     pos(32),
                     ChannelBMessage::BoundaryStart(BlockBoundaryStart {
@@ -497,7 +534,7 @@ mod tests {
         let b = VecChannelBSub {
             queue: VecDeque::from(vec![Ok((
                 pos(0),
-                ChannelBMessage::TxRef(TxRef::new(2, pos(0))),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 2, pos(0))),
             ))]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(2);
@@ -529,7 +566,7 @@ mod tests {
         let b = VecChannelBSub {
             queue: VecDeque::from(vec![Ok((
                 pos(0),
-                ChannelBMessage::TxRef(TxRef::new(7, pos(0))),
+                ChannelBMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 7, pos(0))),
             ))]),
         };
         let (tx, _rx) = bounded::<ReaderToExec>(2);

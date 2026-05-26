@@ -74,7 +74,7 @@ fn match_dual_writes_once() {
     assert_eq!(a.published.lock().unwrap().len(), 1);
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].sequencer_id, 0);
+    assert_eq!(refs[0].shard_id, 0);
     assert!(rc.duplicates.lock().unwrap().is_empty());
 }
 
