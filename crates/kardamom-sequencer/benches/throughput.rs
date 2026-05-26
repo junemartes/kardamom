@@ -21,7 +21,7 @@ use kardamom_sequencer::inbound::IngressSource;
 use kardamom_sequencer::outbound::fakes::{
     InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
-use kardamom_sequencer::primary::PrimarySequencer;
+use kardamom_sequencer::sequencer::Sequencer;
 
 struct DequeIngress(VecDeque<TxEnvelope>);
 impl IngressSource for DequeIngress {
@@ -70,13 +70,16 @@ fn bench_in_order(c: &mut Criterion) {
         b.iter_batched(
             || {
                 (
-                    PrimarySequencer::new(SequencerConfig {
-                        partition_count: 1,
-                        partition_index: 0,
-                        sequencer_id: 0,
-                        max_pending_per_sender: 16,
-                        ..Default::default()
-                    }),
+                    Sequencer::new(
+                        SequencerConfig {
+                            partition_count: 1,
+                            partition_index: 0,
+                            sequencer_id: 0,
+                            max_pending_per_sender: 16,
+                            ..Default::default()
+                        },
+                        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+                    ),
                     DequeIngress(batch.clone().into_iter().collect()),
                     InMemoryChannelAPublisher::new(0),
                     InMemoryChannelBRefPublisher::default(),

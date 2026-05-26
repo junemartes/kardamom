@@ -1,11 +1,18 @@
 //! S2 sequencer subsystem for the kardamom rollup.
 //!
-//! One process per ingress partition (default M=8). Each process exclusively
-//! owns a sender slice (`keccak(sender)[..8] % M`), maintains per-sender
-//! next-nonce state, and publishes canonical-ordered raw `TxEnvelope` messages
-//! into Aeron channel B. A hot-standby sibling tails B and takes over on lease
-//! expiry, inheriting the in-lockstep `next_nonce` map so no sender's nonce
-//! check resets to zero.
+//! Stateless sequencer: in-memory `next_nonce` map is treated as a cache,
+//! reconstructable from canonical sources (state DB for cold senders, plus
+//! channel-A tail for warm steady-state visibility — the latter is a
+//! follow-up; today the sequencer falls back to state DB on cache miss).
+//!
+//! Topology:
+//!   - Proxy shards senders by address (`keccak(sender) % M`).
+//!   - Each shard has an ordered group of K sequencers: one **preferred**,
+//!     the rest **followers**. Proxy forwards txs to the preferred; if no
+//!     ack within ~1ms, retries to the next follower and promotes it.
+//!   - Sequencers themselves are symmetric. No primary/standby distinction,
+//!     no lease — the "preferred" pointer lives in the proxy's routing
+//!     table, not in any sequencer's state.
 //!
 //! ## D-Sh3 (sender trust)
 //!
@@ -19,18 +26,18 @@ pub mod config;
 pub mod duplicate;
 pub mod error;
 pub mod inbound;
-pub mod lease;
 pub mod metrics;
 pub mod outbound;
 pub mod partition;
 pub mod pending;
-pub mod primary;
 pub mod sender;
-pub mod standby;
+pub mod sequencer;
 pub mod state;
 
-pub use config::{BackpressurePolicy, SequencerConfig, SequencerRole};
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
+pub use config::{BackpressurePolicy, SequencerConfig};
 pub use duplicate::DuplicateNotification;
 pub use error::SequencerError;
-pub use primary::{PrimarySequencer, Shutdown};
-pub use standby::HotStandbyTailer;
+pub use sequencer::{Sequencer, Shutdown};
