@@ -64,13 +64,26 @@ jobs:
             --features 'kardamom-log/docker-e2e,e2e/full-pipeline-e2e' \
             --tests
 
-      # Run the headline test: the cross-component proof-of-pipeline.
+      # Run the headline test: the cross-component proof-of-pipeline
+      # (the in-process variant that wires all services as tokio tasks
+      # against one shared Aeron container).
       - name: full-pipeline-e2e proof-of-pipeline test
         run: |
           cargo test \
             -p e2e \
             --features 'full-pipeline-e2e' \
             --test full_pipeline_e2e -- --ignored --nocapture proof_of_pipeline
+
+      # Multi-process variant: spawn each kardamom-* binary as its own
+      # OS process pointed at the bind-mounted Aeron container, drive
+      # transfers through the proxy's JSON-RPC server. The most realistic
+      # deployment shape — matches what ansible / nomad would launch.
+      - name: full-pipeline-e2e multi-process test
+        run: |
+          cargo test \
+            -p e2e \
+            --features 'full-pipeline-e2e' \
+            --test multiprocess_e2e -- --ignored --nocapture multiprocess_e2e_signed_transfer_round_trip
 
       # Per-component docker_e2e smoke tests (gate-only today; they bring up
       # AeronTestCluster and assert the harness comes up). Run after the
