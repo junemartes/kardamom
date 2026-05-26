@@ -1,11 +1,14 @@
 [package]
-name = "sequencer"
+name = "kardamom-sequencer"
 version.workspace = true
 edition.workspace = true
 
 [[bin]]
 name = "kardamom-sequencer"
 path = "src/bin/kardamom-sequencer.rs"
+
+[lib]
+name = "sequencer"
 
 [features]
 # In-memory fakes for downstream-crate unit tests. Enables the `fakes` modules
@@ -42,7 +45,7 @@ criterion.workspace = true
 # Pull in our own `testing` feature so integration tests under `tests/`
 # always have access to the `fakes` modules without needing
 # `cargo test --features testing` (matches the convention CI uses).
-sequencer = { path = ".", features = ["testing"] }
+sequencer = { path = ".", package = "kardamom-sequencer", features = ["testing"] }
 log = { workspace = true, features = ["testing"] }
 proptest = "1"
 rand = "0.9"

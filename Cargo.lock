@@ -1205,39 +1205,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
-name = "batcher"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-contract",
- "alloy-eips 2.0.5",
- "alloy-network",
- "alloy-node-bindings",
- "alloy-primitives",
- "alloy-provider",
- "alloy-rpc-types-eth",
- "alloy-sol-types",
- "anyhow",
- "bytes",
- "clap",
- "criterion 0.7.0",
- "kardamom-deployer",
- "log 0.1.0",
- "metrics",
- "proptest",
- "rkyv",
- "rusteron-archive",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber 0.3.23",
- "types",
- "zstd",
-]
-
-[[package]]
 name = "bech32"
 version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1253,7 +1220,7 @@ dependencies = [
  "cexpr",
  "clang-sys",
  "itertools 0.13.0",
- "log 0.4.30",
+ "log",
  "prettyplease",
  "proc-macro2",
  "quote",
@@ -1381,7 +1348,7 @@ dependencies = [
  "hyper-rustls 0.26.0",
  "hyper-util",
  "hyperlocal-next",
- "log 0.4.30",
+ "log",
  "pin-project-lite",
  "rustls 0.22.4",
  "rustls-native-certs 0.7.3",
@@ -2255,16 +2222,16 @@ dependencies = [
  "alloy-primitives",
  "bytes",
  "criterion 0.5.1",
- "executor",
  "hdrhistogram",
- "log 0.1.0",
+ "kardamom-executor",
+ "kardamom-log",
+ "kardamom-state",
+ "kardamom-types",
  "rkyv",
- "state",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber 0.3.23",
- "types",
 ]
 
 [[package]]
@@ -2409,31 +2376,6 @@ dependencies = [
  "hashbag",
  "left-right",
  "smallvec",
-]
-
-[[package]]
-name = "executor"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-eips 2.0.5",
- "alloy-network",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-signer-local",
- "bytes",
- "criterion 0.5.1",
- "crossbeam-channel",
- "dashmap",
- "log 0.1.0",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
- "revm",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "types",
 ]
 
 [[package]]
@@ -2666,7 +2608,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "log 0.4.30",
+ "log",
  "rustversion",
  "windows-link",
  "windows-result",
@@ -3107,7 +3049,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "log 0.4.30",
+ "log",
  "rustls 0.22.4",
  "rustls-native-certs 0.7.3",
  "rustls-pki-types",
@@ -3125,7 +3067,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "log 0.4.30",
+ "log",
  "rustls 0.23.40",
  "rustls-native-certs 0.8.3",
  "tokio",
@@ -3182,7 +3124,7 @@ dependencies = [
  "core-foundation-sys",
  "iana-time-zone-haiku",
  "js-sys",
- "log 0.4.30",
+ "log",
  "wasm-bindgen",
  "windows-core",
 ]
@@ -3364,45 +3306,12 @@ dependencies = [
  "indexmap 2.14.0",
  "is-terminal",
  "itoa",
- "log 0.4.30",
+ "log",
  "num-format",
  "once_cell",
  "quick-xml",
  "rgb",
  "str_stack",
-]
-
-[[package]]
-name = "ingress"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-rpc-types-eth",
- "alloy-signer-local",
- "async-trait",
- "bytes",
- "criterion 0.7.0",
- "dashmap",
- "futures",
- "governor",
- "hyper",
- "jsonrpsee",
- "k256",
- "log 0.1.0",
- "metrics",
- "nonzero_ext",
- "rand 0.9.4",
- "secp256k1 0.31.1",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber 0.3.23",
- "types",
 ]
 
 [[package]]
@@ -3484,7 +3393,7 @@ dependencies = [
  "cfg-if",
  "combine",
  "jni-sys 0.3.1",
- "log 0.4.30",
+ "log",
  "thiserror 1.0.69",
  "walkdir",
  "windows-sys 0.45.0",
@@ -3500,7 +3409,7 @@ dependencies = [
  "combine",
  "jni-macros",
  "jni-sys 0.4.1",
- "log 0.4.30",
+ "log",
  "simd_cesu8",
  "thiserror 2.0.18",
  "walkdir",
@@ -3775,6 +3684,39 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-batcher"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-contract",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-node-bindings",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
+ "anyhow",
+ "bytes",
+ "clap",
+ "criterion 0.7.0",
+ "kardamom-deployer",
+ "kardamom-log",
+ "kardamom-types",
+ "metrics",
+ "proptest",
+ "rkyv",
+ "rusteron-archive",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+ "zstd",
+]
+
+[[package]]
 name = "kardamom-bench"
 version = "0.1.0"
 dependencies = [
@@ -3828,6 +3770,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-executor"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer-local",
+ "bytes",
+ "criterion 0.5.1",
+ "crossbeam-channel",
+ "dashmap",
+ "kardamom-log",
+ "kardamom-types",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "revm",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kardamom-ingress"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-signer-local",
+ "async-trait",
+ "bytes",
+ "criterion 0.7.0",
+ "dashmap",
+ "futures",
+ "governor",
+ "hyper",
+ "jsonrpsee",
+ "k256",
+ "kardamom-log",
+ "kardamom-types",
+ "metrics",
+ "nonzero_ext",
+ "rand 0.9.4",
+ "secp256k1 0.31.1",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "kardamom-log"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bytes",
+ "crossbeam-channel",
+ "futures",
+ "kardamom-types",
+ "rkyv",
+ "rusteron-archive",
+ "rusteron-client",
+ "serde",
+ "tempfile",
+ "testcontainers",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-node"
 version = "0.1.0"
 dependencies = [
@@ -3855,6 +3875,88 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kardamom-sealer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "criterion 0.7.0",
+ "kardamom-log",
+ "kardamom-sealer",
+ "kardamom-types",
+ "metrics",
+ "proptest",
+ "rkyv",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "kardamom-sequencer"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer-local",
+ "anyhow",
+ "bytes",
+ "clap",
+ "core_affinity",
+ "criterion 0.5.1",
+ "ctrlc",
+ "kardamom-log",
+ "kardamom-sequencer",
+ "kardamom-types",
+ "metrics",
+ "proptest",
+ "rand 0.9.4",
+ "rkyv",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "kardamom-state"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-rlp",
+ "anyhow",
+ "bytes",
+ "criterion 0.7.0",
+ "crossbeam-channel",
+ "kardamom-log",
+ "kardamom-types",
+ "metrics",
+ "rkyv",
+ "signet-libmdbx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kardamom-types"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "bytes",
+ "rkyv",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -3974,26 +4076,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 dependencies = [
  "scopeguard",
-]
-
-[[package]]
-name = "log"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "bytes",
- "crossbeam-channel",
- "futures",
- "rkyv",
- "rusteron-archive",
- "rusteron-client",
- "serde",
- "tempfile",
- "testcontainers",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "types",
 ]
 
 [[package]]
@@ -4746,7 +4828,7 @@ dependencies = [
  "findshlibs",
  "inferno",
  "libc",
- "log 0.4.30",
+ "log",
  "nix 0.26.4",
  "once_cell",
  "smallvec",
@@ -5211,7 +5293,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "js-sys",
- "log 0.4.30",
+ "log",
  "mime",
  "once_cell",
  "percent-encoding",
@@ -5252,7 +5334,7 @@ dependencies = [
  "hyper-rustls 0.27.9",
  "hyper-util",
  "js-sys",
- "log 0.4.30",
+ "log",
  "percent-encoding",
  "pin-project-lite",
  "quinn",
@@ -5677,7 +5759,7 @@ dependencies = [
  "bindgen",
  "cmake",
  "dunce",
- "log 0.4.30",
+ "log",
  "pkg-config",
  "proc-macro2",
  "regex",
@@ -5694,7 +5776,7 @@ dependencies = [
  "bindgen",
  "cmake",
  "dunce",
- "log 0.4.30",
+ "log",
  "pkg-config",
  "proc-macro2",
  "rusteron-code-gen",
@@ -5708,7 +5790,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "714ab561238d6bba63607589cdf2bb732f6957f9ef0f85caade7d499a868d31e"
 dependencies = [
  "itertools 0.14.0",
- "log 0.4.30",
+ "log",
  "proc-macro2",
  "quote",
  "regex",
@@ -5734,7 +5816,7 @@ version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf4ef73721ac7bcd79b2b315da7779d8fc09718c6b3d2d1b2d94850eb8c18432"
 dependencies = [
- "log 0.4.30",
+ "log",
  "ring",
  "rustls-pki-types",
  "rustls-webpki 0.102.8",
@@ -5749,7 +5831,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
- "log 0.4.30",
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -5811,7 +5893,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "jni 0.21.1",
- "log 0.4.30",
+ "log",
  "once_cell",
  "rustls 0.23.40",
  "rustls-native-certs 0.8.3",
@@ -5832,7 +5914,7 @@ dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
  "jni 0.22.4",
- "log 0.4.30",
+ "log",
  "once_cell",
  "rustls 0.23.40",
  "rustls-native-certs 0.8.3",
@@ -5950,27 +6032,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "sealer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "criterion 0.7.0",
- "log 0.1.0",
- "metrics",
- "proptest",
- "rkyv",
- "sealer",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber 0.3.23",
- "types",
-]
 
 [[package]]
 name = "sec1"
@@ -6093,36 +6154,6 @@ name = "send_wrapper"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
-
-[[package]]
-name = "sequencer"
-version = "0.1.0"
-dependencies = [
- "alloy-consensus",
- "alloy-network",
- "alloy-primitives",
- "alloy-rlp",
- "alloy-signer-local",
- "anyhow",
- "bytes",
- "clap",
- "core_affinity",
- "criterion 0.5.1",
- "ctrlc",
- "log 0.1.0",
- "metrics",
- "proptest",
- "rand 0.9.4",
- "rkyv",
- "sequencer",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber 0.3.23",
- "types",
-]
 
 [[package]]
 name = "serde"
@@ -6423,7 +6454,7 @@ dependencies = [
  "futures",
  "http",
  "httparse",
- "log 0.4.30",
+ "log",
  "rand 0.8.6",
  "sha1",
 ]
@@ -6461,27 +6492,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "state"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "alloy-rlp",
- "anyhow",
- "bytes",
- "criterion 0.7.0",
- "crossbeam-channel",
- "log 0.1.0",
- "metrics",
- "rkyv",
- "signet-libmdbx",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "types",
-]
 
 [[package]]
 name = "static_assertions"
@@ -6667,7 +6677,7 @@ dependencies = [
  "docker_credential",
  "either",
  "futures",
- "log 0.4.30",
+ "log",
  "memchr",
  "parse-display",
  "pin-project-lite",
@@ -7026,7 +7036,7 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
 dependencies = [
- "log 0.4.30",
+ "log",
  "once_cell",
  "tracing-core",
 ]
@@ -7069,16 +7079,6 @@ name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
-
-[[package]]
-name = "types"
-version = "0.1.0"
-dependencies = [
- "alloy-primitives",
- "bytes",
- "rkyv",
- "thiserror 2.0.18",
-]
 
 [[package]]
 name = "ucd-trie"
@@ -7857,7 +7857,7 @@ dependencies = [
  "anyhow",
  "bitflags 2.11.1",
  "indexmap 2.14.0",
- "log 0.4.30",
+ "log",
  "serde",
  "serde_derive",
  "serde_json",
@@ -7876,7 +7876,7 @@ dependencies = [
  "anyhow",
  "id-arena",
  "indexmap 2.14.0",
- "log 0.4.30",
+ "log",
  "semver 1.0.28",
  "serde",
  "serde_derive",

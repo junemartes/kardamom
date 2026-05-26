@@ -1,7 +1,10 @@
 [package]
-name = "ingress"
+name = "kardamom-ingress"
 version.workspace = true
 edition.workspace = true
+
+[lib]
+name = "ingress"
 
 [features]
 default = ["binary-protocol"]

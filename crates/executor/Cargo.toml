@@ -1,7 +1,10 @@
 [package]
-name = "executor"
+name = "kardamom-executor"
 version.workspace = true
 edition.workspace = true
+
+[lib]
+name = "executor"
 
 [dependencies]
 # : shared types live in kardamom-types.

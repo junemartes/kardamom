@@ -1,7 +1,10 @@
 [package]
-name = "state"
+name = "kardamom-state"
 version.workspace = true
 edition.workspace = true
+
+[lib]
+name = "state"
 
 [features]
 default = []

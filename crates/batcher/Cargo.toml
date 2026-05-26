@@ -1,8 +1,11 @@
 [package]
-name = "batcher"
+name = "kardamom-batcher"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
+
+[lib]
+name = "batcher"
 
 [features]
 default = []

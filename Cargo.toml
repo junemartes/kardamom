@@ -39,10 +39,8 @@ alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
-types = { path = "crates/types" }
-log = { path = "crates/log" }
-
-
+types = { path = "crates/types", package = "kardamom-types" }
+log = { path = "crates/log", package = "kardamom-log" }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
 io-uring = "0.7"
 rusteron-client = "0.1"

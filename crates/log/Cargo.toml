@@ -1,7 +1,10 @@
 [package]
-name = "log"
+name = "kardamom-log"
 version.workspace = true
 edition.workspace = true
+
+[lib]
+name = "log"
 
 [features]
 default = []
