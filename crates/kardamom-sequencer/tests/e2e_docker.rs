@@ -49,7 +49,7 @@ async fn aeron_cluster_serves_m_plus_one_topology_smoke() {
         .expect("aeron container should start");
     // The harness exposes one shared Archive endpoint; all M channel-A
     // streams + the single channel-B stream live on it (per
-    // `ChannelsConfig::tx_dattx_data_channel_template`'s `aeron:ipc?alias=a-{sid}`
+    // `ChannelsConfig::tx_dattx_dattx_data_channel_template`'s `aeron:ipc?alias=a-{sid}`
     // default + the shared `tx_ordering_channel`).
     let archive = cluster.archive_control_endpoint(0).await;
     let response = cluster.archive_response_endpoint(0).await;

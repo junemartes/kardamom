@@ -186,7 +186,7 @@ mod tests {
         let toml = r#"
             host_id = 7
             channel_b_uri = "aeron:udp?endpoint=224.0.0.1:40123"
-            channel_b_stream_id = 1001
+            channel_tx_ordering_stream_id = 1001
             watermark_channel_uri = "aeron:udp?endpoint=224.0.0.1:40124"
             watermark_stream_id_base = 2000
             recorder_host_ids = [1, 2, 7]
@@ -206,7 +206,7 @@ mod tests {
         let toml = r#"
             host_id = 1
             channel_b_uri = "x"
-            channel_b_stream_id = 1
+            channel_tx_ordering_stream_id = 1
             watermark_channel_uri = "x"
             watermark_stream_id_base = 1
             recorder_host_ids = [1]
@@ -222,7 +222,7 @@ mod tests {
         let cfg = SealerConfig {
             host_id: 99,
             channel_b_uri: "x".into(),
-            channel_b_stream_id: 1,
+            channel_tx_ordering_stream_id: 1,
             watermark_channel_uri: "x".into(),
             watermark_stream_id_base: 1,
             recorder_host_ids: vec![1, 2, 3],
@@ -260,7 +260,7 @@ pub struct SealerConfig {
     pub host_id: u16,
     /// Aeron channel URI for channel B (publish + subscribe on the same channel).
     pub channel_b_uri: String,
-    pub channel_b_stream_id: i32,
+    pub channel_tx_ordering_stream_id: i32,
     /// Aeron channel URI carrying all per-recorder watermark streams (one stream per recorder).
     pub watermark_channel_uri: String,
     /// Stream id of recorder `host_id` is `watermark_stream_id_base + host_id as i32`.
@@ -1045,7 +1045,7 @@ pub async fn bootstrap_block_number(
     sub: &mut kardamom_log::channel_b::Subscriber,
     lookback_ms: u64,
 ) -> anyhow::Result<u64> {
-    let from = sub.position_at_wall_offset(lookback_ms).await?;
+    let from = sub.tx_data_positiont_wall_offset(lookback_ms).await?;
     let mut stream = sub.tail_scan(from).await?;
     let mut max_seen: Option<u64> = None;
     use futures::StreamExt;
@@ -1297,7 +1297,7 @@ fn cfg(host_id: u16) -> SealerConfig {
     SealerConfig {
         host_id,
         channel_b_uri: "mock".into(),
-        channel_b_stream_id: 1,
+        channel_tx_ordering_stream_id: 1,
         watermark_channel_uri: "mock".into(),
         watermark_stream_id_base: 2000,
         recorder_host_ids: vec![1, 2, 3],
@@ -1557,7 +1557,7 @@ fn cfg(host_id: u16) -> SealerConfig { /* identical to single_emitter::cfg */
     SealerConfig {
         host_id,
         channel_b_uri: "mock".into(),
-        channel_b_stream_id: 1,
+        channel_tx_ordering_stream_id: 1,
         watermark_channel_uri: "mock".into(),
         watermark_stream_id_base: 2000,
         recorder_host_ids: vec![1, 2, 3],
@@ -1668,7 +1668,7 @@ fn cfg(host_id: u16) -> SealerConfig {
     SealerConfig {
         host_id,
         channel_b_uri: "mock".into(),
-        channel_b_stream_id: 1,
+        channel_tx_ordering_stream_id: 1,
         watermark_channel_uri: "mock".into(),
         watermark_stream_id_base: 2000,
         recorder_host_ids: vec![1, 2, 3],
@@ -1854,7 +1854,7 @@ async fn main() -> Result<()> {
     // S3 builds the channel-B handle and watermark handle from the URIs + stream ids.
     let b_handle = kardamom_log::channel_b::connect(
         &cfg.channel_b_uri,
-        cfg.channel_b_stream_id,
+        cfg.channel_tx_ordering_stream_id,
     ).await?;
     let w_handle = kardamom_log::watermark::connect_all(
         &cfg.watermark_channel_uri,
