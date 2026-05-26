@@ -8,8 +8,8 @@
 //!
 //! - **M channel-A reader threads** (one per sequencer partition) each
 //!   subscribe to their channel A and stream full `TxEnvelope`s into a shared
-//!   **join buffer** keyed by `(sequencer_id, position_a)`.
-//! - **One channel-B reader thread** pulls tiny `ChannelBMessage` records
+//!   **join buffer** keyed by `(sequencer_id, tx_data_position)`.
+//! - **One channel-B reader thread** pulls tiny `TxOrderingMessage` records
 //!   (`TxRef | BoundaryStart`) in canonical order. For each `TxRef`, it joins
 //!   against the buffer and hands `(b_position, TxEnvelope)` to the exec
 //!   thread. For each `BoundaryStart`, it forwards verbatim.
@@ -51,8 +51,8 @@ use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::executor::execute_tx;
 use crate::reader::{
-    ChannelASubscription, ChannelBSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
-    spawn_channel_a_reader, spawn_channel_b_reader,
+    JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
+    spawn_tx_data_reader, spawn_tx_ordering_reader,
 };
 use crate::types::{CMessage, TxIndex};
 
@@ -122,8 +122,8 @@ impl Executor {
     // reducing it.
     pub fn run<C, S, Q, P>(
         cfg: ExecutorConfig,
-        a_subs: Vec<Box<dyn ChannelASubscription>>,
-        b_sub: Box<dyn ChannelBSubscription>,
+        a_subs: Vec<Box<dyn TxDataSubscription>>,
+        b_sub: Box<dyn TxOrderingSubscription>,
         c_pub: C,
         snapshots: S,
         sw_signal: Q,
@@ -147,11 +147,11 @@ impl Executor {
             Vec::with_capacity(a_subs.len());
         for a in a_subs {
             // The trait object's `next` already advertises sequencer_id.
-            a_handles.push(spawn_channel_a_reader(BoxedASub(a), buffer.clone()));
+            a_handles.push(spawn_tx_data_reader(BoxedASub(a), buffer.clone()));
         }
 
         let b_handle =
-            spawn_channel_b_reader(BoxedBSub(b_sub), buffer.clone(), cfg.reader.clone(), tx_r2e);
+            spawn_tx_ordering_reader(BoxedBSub(b_sub), buffer.clone(), cfg.reader.clone(), tx_r2e);
 
         let exec = spawn_exec(
             cfg.clone(),
@@ -185,10 +185,10 @@ impl Executor {
 }
 
 // Trait-object adapters so the reader fns (generic on a concrete type) can
-// own a `Box<dyn ChannelASubscription>` / `Box<dyn ChannelBSubscription>`
+// own a `Box<dyn TxDataSubscription>` / `Box<dyn TxOrderingSubscription>`
 // without requiring the caller to monomorphise per-M.
-struct BoxedASub(Box<dyn ChannelASubscription>);
-impl ChannelASubscription for BoxedASub {
+struct BoxedASub(Box<dyn TxDataSubscription>);
+impl TxDataSubscription for BoxedASub {
     fn sequencer_id(&self) -> u8 {
         self.0.sequencer_id()
     }
@@ -197,9 +197,9 @@ impl ChannelASubscription for BoxedASub {
     }
 }
 
-struct BoxedBSub(Box<dyn ChannelBSubscription>);
-impl ChannelBSubscription for BoxedBSub {
-    fn next(&mut self) -> Result<(BPosition, kardamom_types::ChannelBMessage), ExecutorError> {
+struct BoxedBSub(Box<dyn TxOrderingSubscription>);
+impl TxOrderingSubscription for BoxedBSub {
+    fn next(&mut self) -> Result<(BPosition, kardamom_types::TxOrderingMessage), ExecutorError> {
         self.0.next()
     }
 }

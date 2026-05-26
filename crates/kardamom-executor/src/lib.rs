@@ -5,14 +5,14 @@
 //! reference. Publishes receipts + sealed BlockBoundaries to channel C.
 //! Block-STM is explicitly out of scope for v0; S4 v1 will replace the
 //! single execution thread with parallel workers behind the same
-//! `ChannelASubscription` / `ChannelBSubscription` / `ChannelCPublication`
+//! `TxDataSubscription` / `TxOrderingSubscription` / `ChannelCPublication`
 //! interface.
 //!
 //! ## Wire topology (post-D-Sh12)
 //!
-//! - **Channel A[i]** (per-sequencer, M of them) carries full `TxEnvelope`
+//! - **TxData[i]** (per-sequencer, M of them) carries full `TxEnvelope`
 //!   bytes. Executors run M subscriptions, one per sequencer partition.
-//! - **Channel B** carries tiny `ChannelBMessage` records (`TxRef |
+//! - **TxOrdering** carries tiny `TxOrderingMessage` records (`TxRef |
 //!   BoundaryStart`) — ~16-32 B each. This is the canonical orderer.
 //! - **Channel C** carries `Receipt` and slim `BlockBoundary` records (the
 //!   executor's output).
@@ -51,7 +51,7 @@ pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet, apply_write_set};
 pub use error::ExecutorError;
 pub use reader::{
-    ChannelASubscription, ChannelBSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
+    JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
 };
 pub use state::{
     MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
@@ -60,7 +60,7 @@ pub use state::{
 // Shared types re-exported from kardamom-types so external callers can pull
 // them via `kardamom_executor::*` without a separate dependency line.
 pub use kardamom_types::{
-    AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, ChannelBMessage,
-    Receipt, SnapshotSource, StateDatabase, StorageChange, TxEnvelope, TxRef, WireLog,
+    AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt,
+    SnapshotSource, StateDatabase, StorageChange, TxEnvelope, TxOrderingMessage, TxRef, WireLog,
 };
 pub use types::{CMessage, ReceiptStatus, TxIndex};

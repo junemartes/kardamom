@@ -2,7 +2,7 @@
 //! channel-A/channel-B reader topology + join-by-ref semantics.
 //!
 //! Uses the `kardamom-log::testing::Fake*` in-memory pub/sub fakes so we
-//! exercise the exact wire types (`TxEnvelope`, `ChannelBMessage`,
+//! exercise the exact wire types (`TxEnvelope`, `TxOrderingMessage`,
 //! `TxRef`) and rkyv codec the production Aeron path uses, without the
 //! testcontainers dependency. Real-Aeron coverage of the same topology
 //! lives in `tests/docker_aeron_e2e.rs`.
@@ -37,29 +37,29 @@ use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
-    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, ReaderConfig, StateWriterSignal,
-    TxEnvelope as KtTxEnvelope, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ChannelCPublication, Executor, ExecutorConfig,
+    ExecutorError, MockStateDatabase, MutatingSnapshotSource, ReaderConfig, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
+    TxRef, WriterApplyingQueue,
 };
 use kardamom_log::testing::{
-    FakeBus, FakeChannelAPublication, FakeChannelASubscription, FakeChannelBPublication,
-    FakeChannelBSubscription,
+    FakeBus, FakeChannelAPublication, FakeChannelBPublication, FakeTxDataSubscription,
+    FakeTxOrderingSubscription,
 };
 
-/// Bridge a `FakeChannelASubscription` into a `ChannelASubscription`. The
-/// real-Aeron equivalent is `kardamom_log::ChannelASubscriber` driven by
-/// `AeronRuntime::channel_a_subscriber(i)` on a dedicated OS thread.
+/// Bridge a `FakeTxDataSubscription` into a `TxDataSubscription`. The
+/// real-Aeron equivalent is `kardamom_log::TxDataSubscriber` driven by
+/// `AeronRuntime::tx_data_subscriber(i)` on a dedicated OS thread.
 struct FakeASubAdapter {
     sequencer_id: u8,
-    sub: FakeChannelASubscription,
+    sub: FakeTxDataSubscription,
     /// Set by the test driver once it has finished publishing; the
     /// subscription becomes "closed" when both the bus is drained AND this
     /// flag is set, mimicking Aeron's notion of an EOS.
     closed: Arc<AtomicBool>,
 }
 
-impl ChannelASubscription for FakeASubAdapter {
+impl TxDataSubscription for FakeASubAdapter {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -89,13 +89,13 @@ impl ChannelASubscription for FakeASubAdapter {
 }
 
 struct FakeBSubAdapter {
-    sub: FakeChannelBSubscription,
+    sub: FakeTxOrderingSubscription,
     closed: Arc<AtomicBool>,
 }
-impl ChannelBSubscription for FakeBSubAdapter {
-    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
+impl TxOrderingSubscription for FakeBSubAdapter {
+    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         loop {
-            let mut out: Option<(BPosition, ChannelBMessage)> = None;
+            let mut out: Option<(BPosition, TxOrderingMessage)> = None;
             self.sub.poll(
                 |pos, msg| {
                     if out.is_none() {
@@ -178,20 +178,20 @@ fn m4_canonical_b_order_drives_receipts() {
 
     let bus = FakeBus::new();
     // Per-sequencer channel-A pub/sub pairs. Channel URI / stream-id match
-    // the `ChannelsConfig::a_channel_template` convention.
+    // the `ChannelsConfig::tx_data_channel_template` convention.
     let mut a_pubs: Vec<FakeChannelAPublication> = Vec::with_capacity(M as usize);
-    let mut a_sub_handles: Vec<FakeChannelASubscription> = Vec::with_capacity(M as usize);
+    let mut a_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
     for sid in 0..M {
         let chan = format!("aeron:ipc?alias=a-{sid}");
         let stream_id = 2000 + (sid as i32);
         a_pubs.push(FakeChannelAPublication::open(&bus, sid, &chan, stream_id));
-        a_sub_handles.push(FakeChannelASubscription::open(&bus, &chan, stream_id));
+        a_sub_handles.push(FakeTxDataSubscription::open(&bus, &chan, stream_id));
     }
     let b_pub = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
-    let b_sub_handle = FakeChannelBSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
+    let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     // Phase 1: every sequencer publishes its envelopes onto channel A.
-    // Record (sid, position_a, tx_hash) so we can assert canonical order.
+    // Record (sid, tx_data_position, tx_hash) so we can assert canonical order.
     let mut plan: Vec<(u8, BPosition, alloy_primitives::B256)> = Vec::new();
     let mut by_sid_nonce: Vec<u64> = vec![0; M as usize];
     // We want 50 txs per sequencer. Publish them sequencer-by-sequencer
@@ -247,7 +247,7 @@ fn m4_canonical_b_order_drives_receipts() {
     //
     // Workaround: drain a temporary subscription to find the last
     // position the bus assigned to a TxRef.
-    let mut peek = FakeChannelBSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
+    let mut peek = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
     let mut last_pos: Option<BPosition> = None;
     peek.poll(
         |pos, _msg| {
@@ -272,7 +272,7 @@ fn m4_canonical_b_order_drives_receipts() {
     let a_closed: Vec<Arc<AtomicBool>> = (0..M).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let b_closed = Arc::new(AtomicBool::new(false));
 
-    let mut a_subs: Vec<Box<dyn ChannelASubscription>> = Vec::with_capacity(M as usize);
+    let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(M as usize);
     for (sid, (sub, closed)) in a_sub_handles
         .into_iter()
         .zip(a_closed.iter().cloned())
@@ -284,7 +284,7 @@ fn m4_canonical_b_order_drives_receipts() {
             closed,
         }));
     }
-    let b_sub: Box<dyn ChannelBSubscription> = Box::new(FakeBSubAdapter {
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(FakeBSubAdapter {
         sub: b_sub_handle,
         closed: b_closed.clone(),
     });
@@ -377,9 +377,9 @@ fn tx_ref_arriving_before_envelope_still_joins() {
 
     let bus = FakeBus::new();
     let a_pub = FakeChannelAPublication::open(&bus, 0, "aeron:ipc?alias=a-0", 2000);
-    let a_sub_handle = FakeChannelASubscription::open(&bus, "aeron:ipc?alias=a-0", 2000);
+    let a_sub_handle = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-0", 2000);
     let b_pub = FakeChannelBPublication::open(&bus, "aeron:ipc?alias=b", 1001);
-    let b_sub_handle = FakeChannelBSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
+    let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     let env = transfer(&signer, 0, to);
     let expected_hash = env.tx_hash;
@@ -396,7 +396,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         let _ = _a_pub_late.publish(&env_clone).expect("publish A late");
     });
 
-    // Meanwhile, immediately stake out the position_a we'll claim in
+    // Meanwhile, immediately stake out the tx_data_position we'll claim in
     // the ref. The fake's `publish` advances `next_offset` by the
     // payload length, so we need to know what BPosition the A publish
     // will land at. The fake bus is fresh, so the first envelope's
@@ -408,12 +408,16 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     // rely on the fake's well-defined zero-init.)
     drop(a_pub); // we won't use this handle; the inserter has its own.
 
-    let position_a = BPosition {
+    let tx_data_position = BPosition {
         term_id: 0,
         term_offset: 0,
     };
     b_pub
-        .publish_ref(&TxRef::new(alloy_primitives::B256::ZERO, 0, position_a))
+        .publish_ref(&TxRef::new(
+            alloy_primitives::B256::ZERO,
+            0,
+            tx_data_position,
+        ))
         .expect("publish ref");
     b_pub
         .publish_boundary(&BlockBoundaryStart {
@@ -431,12 +435,12 @@ fn tx_ref_arriving_before_envelope_still_joins() {
 
     let a_closed = Arc::new(AtomicBool::new(false));
     let b_closed = Arc::new(AtomicBool::new(false));
-    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(FakeASubAdapter {
+    let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(FakeASubAdapter {
         sequencer_id: 0,
         sub: a_sub_handle,
         closed: a_closed.clone(),
     })];
-    let b_sub: Box<dyn ChannelBSubscription> = Box::new(FakeBSubAdapter {
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(FakeBSubAdapter {
         sub: b_sub_handle,
         closed: b_closed.clone(),
     });
