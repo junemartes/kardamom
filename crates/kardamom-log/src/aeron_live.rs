@@ -14,7 +14,7 @@
 //! dedicated OS thread; cross-thread coordination uses crossbeam/mpsc
 //! channels at the role boundary, never the Aeron client itself. This
 //! follows the pattern established by the S3-fix-agent learnings —
-//! splitting per-channel-A and channel-B publishers into separate threads
+//! splitting per-tx_data and tx_ordering publishers into separate threads
 //! is *allowed* if the role wants the parallelism, because each thread
 //! owns its own `AeronRuntime`/`Aeron` pair.
 //!
@@ -74,7 +74,7 @@ impl AeronRuntime {
     // TxData (per-sequencer, exclusive publication)
     // -----------------------------------------------------------------------
 
-    /// Open the channel-A publisher for sequencer `sequencer_id`. Calling
+    /// Open the tx_data publisher for sequencer `sequencer_id`. Calling
     /// this on a non-sequencer host is a programmer error — the per-A
     /// stream is exclusive-publisher and the only writer must be the
     /// sequencer that owns the partition.
@@ -82,7 +82,7 @@ impl AeronRuntime {
         TxDataPublisher::open(&self.aeron, &self.channels, sequencer_id)
     }
 
-    /// Open a channel-A subscription. Executors / batchers open M of these
+    /// Open a tx_data subscription. Executors / batchers open M of these
     /// (one per sequencer).
     pub fn tx_data_subscriber(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         self.subscribers().a(sequencer_id)
@@ -118,7 +118,7 @@ impl AeronRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Channel C (receipts, RAM only)
+    // TxReceipts (receipts, RAM only)
     // -----------------------------------------------------------------------
 
     pub fn channel_c_publisher(&self) -> Result<ChannelCPublisher, LogError> {

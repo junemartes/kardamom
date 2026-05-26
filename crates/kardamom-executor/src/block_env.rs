@@ -1,7 +1,7 @@
 //! Build a deterministic revm `BlockEnv` / `CfgEnv` for a single executed tx.
 //!
 //! Spec invariant I3: every field is a pure function of the canonical
-//! channel-B input. No wall clocks, no entropy.
+//! tx_ordering input. No wall clocks, no entropy.
 
 use alloy_primitives::U256;
 use kardamom_types::BlockBoundaryStart;

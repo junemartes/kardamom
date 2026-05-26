@@ -1,5 +1,5 @@
 //! Kardamom canonical log: Aeron-backed channels B and C, the receipt-cache
-//! channel, and the quorum watermark aggregator that give channel B its
+//! channel, and the quorum watermark aggregator that give tx_ordering its
 //! durability guarantee.
 //!
 //! Durability model: the Aeron Archive daemon is configured with

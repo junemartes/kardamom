@@ -5,7 +5,7 @@ S3 canonical-log subsystem. See `docs/specs/2026-05-23-high-throughput-sequencer
 ## Owned components
 
 - **TxOrdering** (canonical tx log, recorded, fsync-quorum durable)
-- **Channel C** (receipts + block boundaries, RAM only)
+- **TxReceipts** (receipts + block boundaries, RAM only)
 - **Receipt-cache channel** (`CachedReceipt` stream, RAM only)
 - **Per-recorder fsync-watermark stream** (published from the Aeron Archive's recording position, which is byte-durable when the archive runs with `fileSyncLevel=1`)
 - **Quorum fsync-watermark aggregator** (Q-of-N largest position)
@@ -41,7 +41,7 @@ Wire types live in `kardamom-types`; this crate re-exports them via `kardamom_lo
 
 ## Replay
 
-We do **not** ship a custom channel-B replay API. Aeron Archive already exposes the standard replay protocol; offline consumers (S7 L1 batcher) read segment files directly or use Aeron Archive's built-in replay (D-Sh10).
+We do **not** ship a custom tx_ordering replay API. Aeron Archive already exposes the standard replay protocol; offline consumers (S7 L1 batcher) read segment files directly or use Aeron Archive's built-in replay (D-Sh10).
 
 ## Runtime dependencies
 

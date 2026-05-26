@@ -199,7 +199,7 @@ where
 }
 
 // ============================================================================
-// Channel-A and Channel-B typed fakes (D-Sh12 split architecture).
+// TxData and TxOrdering typed fakes (D-Sh12 split architecture).
 //
 // Per spec §2.3:
 //   - TxData[i] is an Aeron *exclusive* publication carrying full
@@ -209,9 +209,9 @@ where
 //
 // At the in-memory-fake level, "exclusive vs concurrent" collapses (we only
 // model one publisher at a time, so there is no CAS-cursor contention to
-// simulate). The distinction is *type-level*: the channel-A pub/sub pair is
+// simulate). The distinction is *type-level*: the tx_data pub/sub pair is
 // parameterised by `TxEnvelope` and constructs single-producer streams keyed
-// by `sequencer_id`; the channel-B pub/sub pair is parameterised by
+// by `sequencer_id`; the tx_ordering pub/sub pair is parameterised by
 // `TxOrderingMessage` and shares one stream. Tests that need to verify real
 // concurrent-pub interleaving must use the docker e2e harness.
 // ============================================================================
@@ -232,7 +232,7 @@ pub struct FakeChannelAPublication {
 }
 
 impl FakeChannelAPublication {
-    /// Open the channel-A[i] pub on `bus`, using the channel URI/stream-id
+    /// Open the tx_data[i] pub on `bus`, using the channel URI/stream-id
     /// convention "<channel>"/"<stream_id>". A real wiring uses
     /// `kardamom_log::config::ChannelsConfig::tx_dattx_dattx_dattx_dattx_dattx_dattx_data_channel_template` to derive
     /// per-sequencer URIs.
@@ -250,8 +250,8 @@ impl FakeChannelAPublication {
     }
 
     /// Publish a `TxEnvelope` and return its fragment-start `BPosition` on
-    /// channel A[i]. Sequencers pass this `BPosition` into [`TxRef::new`]
-    /// before writing to channel B.
+    /// tx_data[i]. Sequencers pass this `BPosition` into [`TxRef::new`]
+    /// before writing to tx_ordering.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
         self.pub_handle.publish(env)
     }
@@ -259,9 +259,9 @@ impl FakeChannelAPublication {
 
 /// TxData[i]: per-sequencer subscription returning `(BPosition, TxEnvelope)`.
 ///
-/// Executors run M+1 of these (one per channel A) plus one channel-B
+/// Executors run M+1 of these (one per tx_data) plus one tx_ordering
 /// subscription. Per spec §2.4 they buffer A messages keyed by `BPosition`
-/// until the corresponding `TxRef` arrives on channel B.
+/// until the corresponding `TxRef` arrives on tx_ordering.
 pub struct FakeTxDataSubscription {
     sub: FakeSubscription,
 }
@@ -317,13 +317,13 @@ impl FakeChannelBPublication {
         }
     }
 
-    /// Publish a [`TxRef`] onto channel B. Returns the fragment's start
+    /// Publish a [`TxRef`] onto tx_ordering. Returns the fragment's start
     /// position (the canonical B-position).
     pub fn publish_ref(&self, r: &TxRef) -> Result<BPosition, LogError> {
         self.publish_message(&TxOrderingMessage::TxRef(*r))
     }
 
-    /// Publish a [`kardamom_types::BlockBoundaryStart`] onto channel B
+    /// Publish a [`kardamom_types::BlockBoundaryStart`] onto tx_ordering
     /// (sealer-emitted). Returns the boundary's canonical position.
     pub fn publish_boundary(
         &self,

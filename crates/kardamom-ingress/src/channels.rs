@@ -24,7 +24,7 @@ use kardamom_types::{
 use crate::error::IngressError;
 
 /// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
-/// sender-sharded channel A streams (`partition_for(envelope.sender, K)`
+/// sender-sharded tx_data streams (`partition_for(envelope.sender, K)`
 /// gives the shard index), and republishes `CachedReceipt` entries to the
 /// receipt-cache channel.
 #[async_trait]
@@ -40,11 +40,11 @@ pub trait IngressPublication: Send + Sync + 'static {
 }
 
 /// Subscriber surface. The proxy subscribes to the receipt-cache channel (for
-/// release), the quorum-watermark stream (for I2 ack gating), the channel-C
-/// `Receipt` stream (for metrics + cache replay), and the channel-C
+/// release), the quorum-watermark stream (for I2 ack gating), the tx_receipts
+/// `Receipt` stream (for metrics + cache replay), and the tx_receipts
 /// `BlockBoundary` stream (per S0 D-Sh5, for `eth_blockNumber`).
 pub trait IngressSubscription: Send + Sync + 'static {
-    /// Stream of `Receipt`s observed on channel C. Surface used for metrics
+    /// Stream of `Receipt`s observed on tx_receipts. Surface used for metrics
     /// and bookkeeping; the receipt-cache stream is the source of truth for
     /// client release.
     fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
@@ -56,7 +56,7 @@ pub trait IngressSubscription: Send + Sync + 'static {
     fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark>;
     /// Stream of `CachedReceipt` messages (executor → proxy nonce cache).
     fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt>;
-    /// Stream of `BlockBoundary` markers on channel C; backs `eth_blockNumber`.
+    /// Stream of `BlockBoundary` markers on tx_receipts; backs `eth_blockNumber`.
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary>;
 }
 
@@ -68,7 +68,7 @@ pub trait IngressSubscription: Send + Sync + 'static {
 /// integration test and in the criterion benches.
 #[derive(Clone)]
 pub struct MockChannels {
-    /// One sender per channel A shard.
+    /// One sender per tx_data shard.
     pub tx_data_tx: Vec<mpsc::UnboundedSender<TxEnvelope>>,
     pub receipt_bus: broadcast::Sender<Receipt>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
@@ -79,7 +79,7 @@ pub struct MockChannels {
 }
 
 impl MockChannels {
-    /// Build a fresh bus with `shards` channel A lanes. Returns the bus
+    /// Build a fresh bus with `shards` tx_data lanes. Returns the bus
     /// and a `Vec` of receivers, one per shard (the test's "fake
     /// sequencer" drains these).
     pub fn new(shards: usize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {

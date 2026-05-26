@@ -1,7 +1,7 @@
 //! S5 block sealer.
 //!
 //! Emits [`kardamom_types::BlockBoundaryStart`] markers every 250 ms wall-clock
-//! onto channel B. Singleton with hot standbys; leader is the lowest-recorder-id
+//! onto tx_ordering. Singleton with hot standbys; leader is the lowest-recorder-id
 //! sealer whose recorder peer is caught up to the current B tail. Election is
 //! driven by [`kardamom_leases::Lease`] — the same primitive the S2 sequencer
 //! uses — so all three subsystems share one deterministic election rule.

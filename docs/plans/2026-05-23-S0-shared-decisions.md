@@ -67,7 +67,7 @@ This keeps the §3 sequencer nonce-check budget tight (no secp256k1 in the hot p
 
 ## D-Sh5: `eth_blockNumber` for the proxy
 
-S1 v0 currently returns `U256::ZERO`. Replace with: proxy subscribes to channel C; tracks the highest `BlockBoundary.block_number` it has seen; serves that from `eth_blockNumber`. Simple addition to S1.
+S1 v0 currently returns `U256::ZERO`. Replace with: proxy subscribes to tx_receipts; tracks the highest `BlockBoundary.block_number` it has seen; serves that from `eth_blockNumber`. Simple addition to S1.
 
 ## D-Sh6: Branch and PR strategy
 
@@ -108,13 +108,13 @@ The L1 batcher (S7) **does not query the live sequencer** for tx data. It reads 
 Consequences:
 - The batcher is **temporally decoupled** from the live pipeline. It can be down for hours; tx flow continues; when it comes back, it catches up by reading the archive.
 - The batcher needs no Aeron *publication* infrastructure — it's a pure consumer of fsynced disk data plus an L1 RPC client. It can run on a separate host (or even outside the cluster, given archive file access).
-- The batcher does **not** subscribe to channel C. All inputs it needs — raw `TxEnvelope` bytes and `BlockBoundaryStart` markers — live on channel B's archive (the sealer publishes boundaries onto B, not C, per spec §2.6).
+- The batcher does **not** subscribe to tx_receipts. All inputs it needs — raw `TxEnvelope` bytes and `BlockBoundaryStart` markers — live on tx_ordering's archive (the sealer publishes boundaries onto B, not C, per spec §2.6).
 
 **Overrides** the earlier plan that had the batcher subscribing to C and assuming a live `ChannelBArchive::replay_range` API in `kardamom-log`.
 
 **Updates required:**
 - S7 plan: source is **B archive only** (segment-file read or Aeron Archive replay protocol). No C subscription. No live coordination with the running sequencer.
-- S3 plan: remove the proposed live "channel-B replay" API from `kardamom-log`. The Aeron Archive itself already exposes the replay protocol; S3 owns the recorder and segment files, not a custom replay API on top.
+- S3 plan: remove the proposed live "tx_ordering replay" API from `kardamom-log`. The Aeron Archive itself already exposes the replay protocol; S3 owns the recorder and segment files, not a custom replay API on top.
 
 ## D-Sh11: State root is **not** computed by the kardamom node
 
@@ -131,7 +131,7 @@ Consequences:
 
 **Updates required:**
 - Spec §2.4 (executor): remove state-root computation step.
-- Spec §2.5 (channel C `BlockBoundary` message): remove `state_root_commitment` field.
+- Spec §2.5 (tx_receipts `BlockBoundary` message): remove `state_root_commitment` field.
 - Spec §2.8 (L1 batcher): replace "L1 settlement contract holds state-root commitments" with "L1 settlement contract is a data-availability sink; state-root attestation is a separate validator subsystem (deferred)."
 - S4 plan: remove `state_root_commitment` from the `BlockBoundary` it emits; remove the delta-hash / state-root computation task.
 - S7 plan: remove state-root field from the L1 payload format; update the `KardamomL2Settlement.sol` design accordingly.

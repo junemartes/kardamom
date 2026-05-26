@@ -1,10 +1,10 @@
-//! End-to-end sequencer behaviour against a scripted channel-A
-//! subscription and in-memory channel-B / receipt-cache publishers
+//! End-to-end sequencer behaviour against a scripted tx_data
+//! subscription and in-memory tx_ordering / receipt-cache publishers
 //! (MDS topology — D-Sh12 v2). Asserts:
-//!  * Canonical order on channel B (the `TxRef` sequence) matches a
+//!  * Canonical order on tx_ordering (the `TxRef` sequence) matches a
 //!    per-sender nonce-ascending sequence.
 //!  * Each ref's `tx_data_position` matches the position the proxy supplied
-//!    on the scripted channel-A subscription.
+//!    on the scripted tx_data subscription.
 //!  * Duplicates are dropped and reported on the receipt-cache channel.
 //!  * Future-nonce txs are buffered and drained when the prior arrives.
 
@@ -56,7 +56,7 @@ fn signed_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -
 }
 
 /// Synthesize an A-position for each scripted envelope so refs carry a
-/// unique pointer back to the simulated channel A.
+/// unique pointer back to the simulated tx_data.
 fn pos_n(n: u64) -> BPosition {
     BPosition {
         term_id: 0,
@@ -122,7 +122,7 @@ fn integration_1000_txs_100_senders_with_chaos() {
         "every in-order input should produce a TxRef on B"
     );
 
-    // For each ref, look up the (sender, nonce) the proxy fed into channel A
+    // For each ref, look up the (sender, nonce) the proxy fed into tx_data
     // at that position. Then verify per-sender the nonces emerge in
     // ascending order 0..10.
     let mut per_sender: HashMap<Address, Vec<u64>> = HashMap::new();

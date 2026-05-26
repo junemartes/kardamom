@@ -1,12 +1,12 @@
 //! Integration test: feed a synthetic stream of (txs + boundaries) into an
-//! `Executor` and assert the channel-C output matches expectation.
+//! `Executor` and assert the tx_receipts output matches expectation.
 //!
 //! Post-S4-arch-update wiring (D-Sh12 / spec §2.4): single-sequencer
-//! (M=1) topology. Envelopes are pushed onto a fake channel A; tiny
+//! (M=1) topology. Envelopes are pushed onto a fake tx_data; tiny
 //! `TxRef` records + a `BlockBoundaryStart` are pushed onto fake channel
 //! B in the same canonical order. The executor's M+1 readers join the
 //! two streams via the in-process `JoinBuffer`. The expected receipts
-//! and slim boundaries on channel C are unchanged from pre-split.
+//! and slim boundaries on tx_receipts are unchanged from pre-split.
 
 use std::thread;
 use std::time::Duration;
@@ -30,7 +30,7 @@ use kardamom_executor::{
 };
 
 /// Bridge a crossbeam receiver of `(BPosition, TxEnvelope)` into a
-/// `TxDataSubscription`. The `BPosition` we emit is the channel-A
+/// `TxDataSubscription`. The `BPosition` we emit is the tx_data
 /// position (the value sequencers publish in `TxRef`); we make it equal
 /// to a synthetic offset for the test.
 struct ChanASub {
@@ -112,7 +112,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
 
-    // Single-sequencer topology: one channel A, one channel B.
+    // Single-sequencer topology: one tx_data, one tx_ordering.
     let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(64);
     let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(64);
     let (c_tx, c_rx) = bounded::<CMessage>(64);
@@ -128,10 +128,10 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             let env = transfer(&signer, nonce, to, 1);
             let tx_hash = env.tx_hash;
             expected_hashes.push(tx_hash);
-            // Publish to channel A[0] at `a_pos`.
+            // Publish to tx_data[0] at `a_pos`.
             let tx_data_position = bpos(a_pos);
             a_tx.send((tx_data_position, env)).unwrap();
-            // Then publish a TxRef onto channel B at canonical position
+            // Then publish a TxRef onto tx_ordering at canonical position
             // `bpos_off`. The executor uses the B position as the tx's
             // canonical id (Receipt.tx_idx).
             b_tx.send((
