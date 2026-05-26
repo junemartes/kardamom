@@ -1,15 +1,29 @@
 //! Primary sequencer event step + loop.
 //!
 //! [`PrimarySequencer::run_once`] polls the ingress source for at most one
-//! message, drives the state machine, and publishes the resulting actions to
-//! channel B and the receipt cache. [`PrimarySequencer::run`] wraps it in a
-//! shutdown-aware loop with optional core-pin.
+//! message, drives the state machine, and performs the **dual-write**
+//! defined by the D-Sh12 split architecture (spec §2.3):
 //!
-//! Backpressure on B is **never** silent: if `try_publish` returns
-//! `Backpressure`, the state machine is rewound via
-//! `PartitionState::reinsert_for_retry` and the error bubbles up so the loop
-//! can apply its retry policy. The reinserted payload is replayed on the next
-//! successful publish (exactly-once at the canonical layer).
+//!  1. Full `TxEnvelope` bytes → the sequencer's own per-A
+//!     [`ChannelAPublisher`] (exclusive, ~memcpy speed). Returns the
+//!     fragment's `BPosition` on the A-stream.
+//!  2. Tiny [`kardamom_types::TxRef`]`{ sequencer_id, position_a }` →
+//!     the canonical orderer [`ChannelBRefPublisher`] (concurrent
+//!     multi-publisher).
+//!
+//! State (pending-nonce map, drain buffer) is advanced **only after both
+//! publications succeed**. If *either* fails — e.g. an A or B back-pressure
+//! signal — the state machine is rewound via
+//! [`PartitionState::reinsert_for_retry`] and the error bubbles up so the
+//! loop can apply its retry policy. On a B-backpressure retry, the
+//! previously-A-published envelope becomes an orphan on the A-stream (no
+//! ref on B points at it). Downstream consumers must tolerate
+//! unreferenced A entries; this is the agreed cost of dual writes in the
+//! split architecture (the canonical layer's exactly-once guarantee is on
+//! channel B, by `TxRef` arrival).
+//!
+//! See also [`crate::outbound`] for the trait surface and in-memory fakes
+//! used by tests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,7 +33,7 @@ use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
 use kardamom_log::codec;
-use kardamom_types::TxEnvelope;
+use kardamom_types::{TxEnvelope, TxRef};
 use tracing::{trace, warn};
 
 use crate::config::SequencerConfig;
@@ -27,26 +41,28 @@ use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
 use crate::inbound::IngressSource;
 use crate::metrics;
-use crate::outbound::{BPublisher, ReceiptCachePublisher};
+use crate::outbound::{ChannelAPublisher, ChannelBRefPublisher, ReceiptCachePublisher};
 use crate::partition::partition_for;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction};
 
-/// A canonical-ordered payload ready to publish on channel B.
+/// A canonical-ordered payload ready to dual-write (A + B) for a sender.
 ///
 /// Stored inside `PartitionState<EncodedFrame>` so that
 /// `reinsert_for_retry` puts a complete, ready-to-resend record back in the
 /// pending buffer (instead of forcing a re-decode + re-encode on the retry
-/// path).
+/// path). The B-side ref is constructed *after* the A publish succeeds
+/// because the ref's `position_a` is the A publisher's return value.
 #[derive(Debug, Clone)]
 struct EncodedFrame {
     correlation_id: u64,
     bytes: Vec<u8>,
 }
 
-/// Encode a `TxEnvelope` for channel B using `kardamom_log::codec::encode`
-/// (rkyv archival).
-fn encode_envelope_for_b(env: &TxEnvelope) -> Result<Vec<u8>, SequencerError> {
+/// Encode a `TxEnvelope` for channel A using `kardamom_log::codec::encode`
+/// (rkyv archival). The same encoding is consumed by downstream
+/// `channel_a_subscriber()` calls via `codec::access` / `codec::materialize`.
+fn encode_envelope_for_a(env: &TxEnvelope) -> Result<Vec<u8>, SequencerError> {
     codec::encode(env)
         .map(|av| av.into_vec())
         .map_err(SequencerError::from)
@@ -117,41 +133,94 @@ impl PrimarySequencer {
         &self.cfg
     }
 
+    /// Dual-write helper: publish `payload.bytes` to channel A, then
+    /// build a `TxRef` from the returned `BPosition` and publish to
+    /// channel B. Returns `Ok(())` only if **both** writes succeeded.
+    ///
+    /// On A backpressure: nothing landed; the caller reinserts the payload
+    /// at this nonce.
+    ///
+    /// On B backpressure: the envelope is already on the A archive but no
+    /// `TxRef` ever points to it; this is an acceptable orphan per the
+    /// split-architecture contract. The caller still reinserts so the
+    /// retry produces a *fresh* A entry and a (this time matching) B ref.
+    fn dual_publish<A, B>(
+        &self,
+        a: &mut A,
+        b: &mut B,
+        payload: &EncodedFrame,
+    ) -> Result<(), SequencerError>
+    where
+        A: ChannelAPublisher,
+        B: ChannelBRefPublisher,
+    {
+        // 1. Channel A — full envelope bytes. Bubble back on backpressure.
+        let position_a = match a.try_publish(&payload.bytes) {
+            Ok(pos) => pos,
+            Err(SequencerError::Backpressure) => {
+                metrics::record_backpressure(self.cfg.partition_index);
+                return Err(SequencerError::Backpressure);
+            }
+            Err(e) => return Err(e),
+        };
+
+        // 2. Channel B — tiny TxRef. If this back-pressures the A entry is
+        //    an orphan (documented).
+        let txref = TxRef::new(self.cfg.sequencer_id, position_a);
+        match b.try_publish_ref(&txref) {
+            Ok(()) => {
+                metrics::record_publish(self.cfg.partition_index);
+                Ok(())
+            }
+            Err(SequencerError::Backpressure) => {
+                metrics::record_backpressure(self.cfg.partition_index);
+                warn!(
+                    sequencer_id = self.cfg.sequencer_id,
+                    correlation_id = payload.correlation_id,
+                    ?position_a,
+                    "B back-pressure after A publish; A entry will be orphaned on retry"
+                );
+                Err(SequencerError::Backpressure)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Drive one ingress message through the state machine. Returns
     /// `Ok(true)` if work was done, `Ok(false)` if both the retry-drain and
     /// the ingress poll were empty.
     ///
     /// Order of operations:
     ///  1. First flush any payloads sitting at `pending[next_nonce]` (these
-    ///     are the rebuffered-after-backpressure entries). If `try_publish`
-    ///     blocks again, we re-rewind and return `Backpressure` without
-    ///     touching ingress.
+    ///     are the rebuffered-after-backpressure entries). If either
+    ///     dual-write side blocks again, we re-rewind and return
+    ///     `Backpressure` without touching ingress.
     ///  2. Then poll ingress for the next inbound envelope and process it.
-    pub fn run_once<I, B, R>(
+    pub fn run_once<I, A, B, R>(
         &mut self,
         ingress: &mut I,
+        a: &mut A,
         b: &mut B,
         rc: &mut R,
     ) -> Result<bool, SequencerError>
     where
         I: IngressSource,
-        B: BPublisher,
+        A: ChannelAPublisher,
+        B: ChannelBRefPublisher,
         R: ReceiptCachePublisher,
     {
         // Step 1: flush retry-rebuffered entries first.
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
             for (sender, n, payload) in pending {
-                if let Err(SequencerError::Backpressure) = b.try_publish(&payload.bytes) {
-                    metrics::record_backpressure(self.cfg.partition_index);
+                if let Err(SequencerError::Backpressure) = self.dual_publish(a, b, &payload) {
                     self.state.reinsert_for_retry(sender, n, payload);
                     return Err(SequencerError::Backpressure);
                 }
-                metrics::record_publish(self.cfg.partition_index);
                 trace!(
                     nonce = n,
                     correlation_id = payload.correlation_id,
-                    "published (drain-pending)"
+                    "dual-published (drain-pending)"
                 );
             }
             return Ok(true);
@@ -184,7 +253,7 @@ impl PrimarySequencer {
         // is read. We never call `recover_signer()` on it (D-Sh3).
         let nonce = decode_nonce(&envelope.raw_tx)?;
 
-        let bytes = encode_envelope_for_b(&envelope)?;
+        let bytes = encode_envelope_for_a(&envelope)?;
         let frame = EncodedFrame {
             correlation_id: envelope.correlation_id,
             bytes,
@@ -212,27 +281,26 @@ impl PrimarySequencer {
 
         for action in result.actions {
             match action {
-                ProcessAction::Publish { nonce: n, payload } => match b.try_publish(&payload.bytes)
-                {
-                    Ok(()) => {
-                        metrics::record_publish(self.cfg.partition_index);
-                        trace!(
-                            nonce = n,
-                            correlation_id = payload.correlation_id,
-                            "published"
-                        );
+                ProcessAction::Publish { nonce: n, payload } => {
+                    match self.dual_publish(a, b, &payload) {
+                        Ok(()) => {
+                            trace!(
+                                nonce = n,
+                                correlation_id = payload.correlation_id,
+                                "dual-published"
+                            );
+                        }
+                        Err(SequencerError::Backpressure) => {
+                            // Roll back: the state machine had advanced for
+                            // this tx but the canonical ref never landed on
+                            // B. The reinsert also re-buffers the payload
+                            // so the retry replays it verbatim.
+                            self.state.reinsert_for_retry(sender, n, payload);
+                            return Err(SequencerError::Backpressure);
+                        }
+                        Err(e) => return Err(e),
                     }
-                    Err(SequencerError::Backpressure) => {
-                        metrics::record_backpressure(self.cfg.partition_index);
-                        // Roll back: the state machine had advanced for this
-                        // tx but the byte never landed on B. The reinsert
-                        // also re-buffers the payload so the retry replays
-                        // it verbatim.
-                        self.state.reinsert_for_retry(sender, n, payload);
-                        return Err(SequencerError::Backpressure);
-                    }
-                    Err(e) => return Err(e),
-                },
+                }
                 ProcessAction::ReportDuplicate { nonce: n } => {
                     rc.publish_duplicate(DuplicateNotification {
                         correlation_id: envelope.correlation_id,
@@ -247,16 +315,18 @@ impl PrimarySequencer {
 
     /// Pin this thread to the configured core (if any) and loop until
     /// shutdown.
-    pub fn run<I, B, R>(
+    pub fn run<I, A, B, R>(
         &mut self,
         ingress: &mut I,
+        a: &mut A,
         b: &mut B,
         rc: &mut R,
         shutdown: Shutdown,
     ) -> Result<(), SequencerError>
     where
         I: IngressSource,
-        B: BPublisher,
+        A: ChannelAPublisher,
+        B: ChannelBRefPublisher,
         R: ReceiptCachePublisher,
     {
         if let Some(core) = self.cfg.core_id {
@@ -270,7 +340,7 @@ impl PrimarySequencer {
             if shutdown.is_signaled() {
                 return Ok(());
             }
-            match self.run_once(ingress, b, rc) {
+            match self.run_once(ingress, a, b, rc) {
                 Ok(true) => backoff_us = 1,
                 Ok(false) => {
                     std::thread::sleep(Duration::from_micros(backoff_us));

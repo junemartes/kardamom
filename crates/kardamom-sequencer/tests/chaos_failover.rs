@@ -1,6 +1,13 @@
 //! Chaos test: primary fails mid-stream, standby is promoted. Asserts:
 //!   - No nonce gap on B for the affected sender.
 //!   - No duplicate (sender, nonce) on B.
+//!
+//! In the D-Sh12 split architecture (spec §2.3) the sequencer dual-writes:
+//! full `TxEnvelope`s to channel A and tiny `TxRef`s to channel B. The
+//! standby tails B and replays each ref into its nonce map by looking up
+//! the underlying envelope on the appropriate channel A. This test wires
+//! the in-memory A+B fakes to a small adapter that does exactly that
+//! lookup before handing a `BMessage` to the standby.
 
 use std::sync::{Arc, Mutex};
 
@@ -18,50 +25,59 @@ use kardamom_sequencer::DuplicateNotification;
 use kardamom_sequencer::config::{SequencerConfig, SequencerRole};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::{BMessage, BReplaySource, IngressSource};
-use kardamom_sequencer::outbound::{BPublisher, ReceiptCachePublisher};
+use kardamom_sequencer::outbound::ReceiptCachePublisher;
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryChannelAPublisher, InMemoryChannelBRefPublisher,
+};
 use kardamom_sequencer::primary::PrimarySequencer;
 use kardamom_sequencer::standby::HotStandbyTailer;
 
-#[derive(Default, Clone)]
-struct SharedB {
-    frames: Arc<Mutex<Vec<Vec<u8>>>>,
-    decoded_for_replay: Arc<Mutex<Vec<BMessage>>>,
-}
-
-impl BPublisher for SharedB {
-    fn try_publish(&mut self, frame_bytes: &[u8]) -> Result<(), SequencerError> {
-        self.frames.lock().unwrap().push(frame_bytes.to_vec());
-        // Decode the rkyv-archived TxEnvelope to project a BMessage::Tx so the
-        // standby (which only sees BMessage) can replay it.
-        let env: TxEnvelope = codec::materialize::<TxEnvelope>(frame_bytes)
-            .map_err(|e| SequencerError::MalformedFrame(e.to_string()))?;
-        let nonce = ConsensusEnvelope::decode(&mut env.raw_tx.as_ref())
-            .map_err(|e| SequencerError::MalformedFrame(e.to_string()))?
-            .nonce();
-        self.decoded_for_replay.lock().unwrap().push(BMessage::Tx {
-            sender: env.sender,
-            nonce,
-        });
-        Ok(())
-    }
-}
-
+/// Adapter: tail the in-memory channel-B ref log and, for each ref, fetch
+/// the envelope from the matching channel A in-memory fake, decode the
+/// nonce, and yield a `BMessage::Tx`. Mirrors what a real standby will do
+/// once it owns a real `ChannelBSubscriber` + per-A `ChannelASubscriber`
+/// handles.
 #[derive(Clone)]
-struct SharedBSubscription {
-    inner: Arc<Mutex<Vec<BMessage>>>,
+struct ChannelBRefReplay {
+    refs: Arc<Mutex<Vec<kardamom_types::TxRef>>>,
+    a_publishers: Vec<InMemoryChannelAPublisher>,
     cursor: Arc<Mutex<usize>>,
 }
 
-impl BReplaySource for SharedBSubscription {
+impl BReplaySource for ChannelBRefReplay {
     fn poll(&mut self) -> Result<Option<BMessage>, SequencerError> {
-        let v = self.inner.lock().unwrap();
+        let v = self.refs.lock().unwrap();
         let mut c = self.cursor.lock().unwrap();
         if *c >= v.len() {
             return Ok(None);
         }
-        let m = v[*c].clone();
+        let r = v[*c];
         *c += 1;
-        Ok(Some(m))
+        let a = self
+            .a_publishers
+            .iter()
+            .find(|p| p.sequencer_id == r.sequencer_id)
+            .ok_or_else(|| {
+                SequencerError::MalformedFrame(format!(
+                    "TxRef sequencer_id {} not in known A set",
+                    r.sequencer_id
+                ))
+            })?;
+        let bytes = a.fetch(r.position_a).ok_or_else(|| {
+            SequencerError::MalformedFrame(format!(
+                "channel A[{}] missing entry at {:?}",
+                r.sequencer_id, r.position_a
+            ))
+        })?;
+        let env: TxEnvelope = codec::materialize::<TxEnvelope>(&bytes)
+            .map_err(|e| SequencerError::MalformedFrame(e.to_string()))?;
+        let nonce = ConsensusEnvelope::decode(&mut env.raw_tx.as_ref())
+            .map_err(|e| SequencerError::MalformedFrame(e.to_string()))?
+            .nonce();
+        Ok(Some(BMessage::Tx {
+            sender: env.sender,
+            nonce,
+        }))
     }
 }
 
@@ -120,6 +136,7 @@ fn standby_takeover_no_gap_no_duplicate() {
     let cfg = SequencerConfig {
         partition_count: 1,
         partition_index: 0,
+        sequencer_id: 0,
         max_pending_per_sender: 8,
         role: SequencerRole::Primary,
         ..Default::default()
@@ -137,46 +154,52 @@ fn standby_takeover_no_gap_no_duplicate() {
         ingress_p.q.push(signed_envelope(&signer1, n));
     }
 
-    let shared_b = SharedB::default();
-    let standby_sub = SharedBSubscription {
-        inner: shared_b.decoded_for_replay.clone(),
+    let mut a_pub = InMemoryChannelAPublisher::new(cfg.sequencer_id);
+    let mut b_pub = InMemoryChannelBRefPublisher::default();
+    let standby_src = ChannelBRefReplay {
+        refs: b_pub.refs.clone(),
+        a_publishers: vec![a_pub.clone()],
         cursor: Arc::new(Mutex::new(0)),
     };
-    let mut b_pub = shared_b.clone();
     let mut rc = NullReceiptCache;
 
     // Drive primary for 10 messages, then simulate a crash.
     for _ in 0..10 {
         primary
-            .run_once(&mut ingress_p, &mut b_pub, &mut rc)
+            .run_once(&mut ingress_p, &mut a_pub, &mut b_pub, &mut rc)
             .unwrap();
     }
 
     // Replay everything primary has published into the standby.
-    let mut standby_src = standby_sub.clone();
-    while standby.run_once(&mut standby_src).unwrap() {}
+    let mut standby_src_replay = standby_src.clone();
+    while standby.run_once(&mut standby_src_replay).unwrap() {}
     assert_eq!(standby.next_nonce(signer1.address()), 10);
 
     // Promote standby: hand its state to a brand-new primary.
     let inherited = standby.into_state();
-    let mut promoted = PrimarySequencer::with_state(cfg, inherited);
+    let mut promoted = PrimarySequencer::with_state(cfg.clone(), inherited);
 
-    // Remaining 10 ingress messages flow into the promoted primary.
+    // Remaining 10 ingress messages flow into the promoted primary. The
+    // promoted primary keeps publishing onto the same channel A + B
+    // (single-sequencer cluster in this test).
     let mut ingress_promoted = VecIngress::default();
     for n in 10u64..20 {
         ingress_promoted.q.push(signed_envelope(&signer1, n));
     }
     while promoted
-        .run_once(&mut ingress_promoted, &mut b_pub, &mut rc)
+        .run_once(&mut ingress_promoted, &mut a_pub, &mut b_pub, &mut rc)
         .unwrap()
     {}
 
-    // Decode every B frame and assert canonical order.
-    let frames = shared_b.frames.lock().unwrap();
-    let mut nonces: Vec<u64> = frames
+    // Walk the canonical B order, resolve each ref against channel A, and
+    // assert exactly-once + dense ordering for sender 1.
+    let refs = b_pub.refs.lock().unwrap().clone();
+    let mut nonces: Vec<u64> = refs
         .iter()
-        .map(|bytes| {
-            let env: TxEnvelope = codec::materialize::<TxEnvelope>(bytes).unwrap();
+        .map(|r| {
+            assert_eq!(r.sequencer_id, cfg.sequencer_id);
+            let bytes = a_pub.fetch(r.position_a).expect("A lookup must succeed");
+            let env: TxEnvelope = codec::materialize::<TxEnvelope>(&bytes).unwrap();
             assert_eq!(env.sender, signer1.address());
             ConsensusEnvelope::decode(&mut env.raw_tx.as_ref())
                 .unwrap()
