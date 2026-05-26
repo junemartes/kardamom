@@ -10,7 +10,7 @@ use alloy_eips::eip4844::Blob;
 use crate::blob::unpack_from_blobs;
 use crate::compress::decode_zstd;
 use crate::error::BatcherError;
-use crate::frame::{BlockFrame, Kar1Payload, MAGIC, decode as frame_decode};
+use crate::frame::{BlockFrame, Kar1Payload, decode as frame_decode};
 
 /// Reconstruct the per-block tx stream from a sequence of blobs.
 ///
@@ -33,9 +33,15 @@ fn is_zstd(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[0] == 0x28 && bytes[1] == 0xB5 && bytes[2] == 0x2F && bytes[3] == 0xFD
 }
 
-/// Returns false for KAR1 magic (which begins with 'K' / 0x4B), confirming our
-/// disambiguation is safe.
-#[allow(dead_code)]
-fn _magic_disambiguates() {
-    debug_assert!(!is_zstd(&MAGIC));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::frame::MAGIC;
+
+    /// KAR1 magic must not be mistaken for a zstd stream — its first byte
+    /// is 'K' (0x4B), whereas zstd streams start with 0x28.
+    #[test]
+    fn kar1_magic_is_not_zstd() {
+        assert!(!is_zstd(&MAGIC));
+    }
 }

@@ -20,12 +20,10 @@
 //! [`crate::multi_archive_reader::MultiArchiveReader`].
 
 use std::cell::RefCell;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use kardamom_types::{ChannelBMessage, TxEnvelope};
-use rkyv::api::high::{HighDeserializer, HighValidator};
-use rkyv::rancor;
 
 use rusteron_archive::{
     AeronArchive, AeronArchiveRecordingDescriptor,
@@ -90,56 +88,6 @@ impl LiveSegmentDescriptor {
     pub fn open_a(&self) -> Result<ChannelASegmentReader, BatcherError> {
         TypedSegmentReader::<TxEnvelope>::open(&self.segment_path)
     }
-}
-
-/// Back-compat alias / minimal struct used elsewhere — a B-only live reader.
-pub struct LiveArchiveReader {
-    pub segment: ChannelBSegmentReader,
-    pub recording_id: i64,
-    pub start_position: i64,
-    pub term_buffer_length: i32,
-    pub segment_file_length: i32,
-}
-
-impl LiveArchiveReader {
-    /// Look up the descriptor, compute the active segment's base position,
-    /// and open the corresponding `.rec` file as a channel-B segment reader.
-    /// (Pre-D-Sh12 callers used this for a single B-archive of TxEnvelopes;
-    /// the channel now carries `ChannelBMessage`s — same on-disk layout,
-    /// different payload type.)
-    pub fn open(
-        archive: &AeronArchive,
-        recording_id: i64,
-        archive_dir: PathBuf,
-    ) -> Result<Self, BatcherError> {
-        let d = LiveSegmentDescriptor::resolve(archive, recording_id, archive_dir)?;
-        let segment = d.open_b()?;
-        Ok(Self {
-            segment,
-            recording_id: d.recording_id,
-            start_position: d.start_position,
-            term_buffer_length: d.term_buffer_length,
-            segment_file_length: d.segment_file_length,
-        })
-    }
-}
-
-/// Resolve `(recording_id, archive_dir) -> segment_path` without holding
-/// the typed reader open. Used by callers that want to plug the resolved
-/// path into a [`crate::multi_archive_reader::MultiArchiveConfig`] together
-/// with the rest of the M-archive topology.
-pub fn resolve_segment_path<T>(
-    archive: &AeronArchive,
-    recording_id: i64,
-    archive_dir: &Path,
-) -> Result<PathBuf, BatcherError>
-where
-    T: rkyv::Archive,
-    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
-        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
-{
-    let d = LiveSegmentDescriptor::resolve(archive, recording_id, archive_dir.to_path_buf())?;
-    Ok(d.segment_path)
 }
 
 fn fetch_descriptor(
