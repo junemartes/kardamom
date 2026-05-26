@@ -2,14 +2,14 @@
 //!
 //! - **TxData[i]** — per-sequencer **exclusive** publication of full
 //!   `TxEnvelope` bytes. One per sequencer; the sequencer is the only
-//!   publisher to its own channel-A stream, so there is no CAS-cursor
+//!   publisher to its own tx_data stream, so there is no CAS-cursor
 //!   contention and writes run at near-`memcpy` speed.
 //! - **TxOrdering** — canonical orderer. Shared (concurrent) multi-publisher
 //!   carrying the small [`TxOrderingMessage`] enum (`TxRef | BoundaryStart`).
 //!   Many publisher handles (M sequencers + the sealer) may offer to the
 //!   same Aeron stream; Aeron serialises them into a single byte order, and
 //!   that order *is* the canonical L2 ordering (system invariant I1).
-//! - **Channel C** — receipts + boundaries. RAM only.
+//! - **TxReceipts** — receipts + boundaries. RAM only.
 //! - **Watermark / quorum-watermark / receipt-cache** — auxiliary streams.
 //!
 //! Channel URIs in [`crate::config::ChannelsConfig`] are stored as `String`
@@ -40,7 +40,7 @@ use kardamom_types::{
 // rusteron re-exports we depend on. `AeronPublication` is the shared
 // (concurrent) variant; `AeronExclusivePublication` is the single-publisher
 // variant. TxOrdering uses shared (concurrent multi-publisher serialised into
-// the canonical order); channel A uses exclusive (one writer per stream,
+// the canonical order); tx_data uses exclusive (one writer per stream,
 // near-memcpy speed).
 type AeronClient = rusteron_client::Aeron;
 type Pub = rusteron_client::AeronPublication;
@@ -81,12 +81,12 @@ fn add_exclusive_pub(
 /// TxData[i]: per-sequencer exclusive publisher of full `TxEnvelope`
 /// bytes. The sequencer is the only writer to its own A-stream — no
 /// CAS-cursor contention — and the recorded archive is the source of truth
-/// for the bulk transaction data referenced from channel B.
+/// for the bulk transaction data referenced from tx_ordering.
 ///
 /// Per-A URIs are derived from
 /// [`ChannelsConfig::tx_dattx_dattx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
 /// with `{sid}` substituted for the sequencer id. Stream ids are derived as
-/// `tx_dattx_dattx_data_stream_id_base + sequencer_id` so M parallel channel-A streams can
+/// `tx_dattx_dattx_data_stream_id_base + sequencer_id` so M parallel tx_data streams can
 /// coexist on a shared Media Driver.
 pub struct TxDataPublisher {
     sequencer_id: u8,
@@ -115,10 +115,10 @@ impl TxDataPublisher {
         self.sequencer_id
     }
 
-    /// Publish a full `TxEnvelope` to channel A[i]. Returns the fragment's
-    /// position on the channel-A stream — the value the sequencer will hand
+    /// Publish a full `TxEnvelope` to tx_data[i]. Returns the fragment's
+    /// position on the tx_data stream — the value the sequencer will hand
     /// to [`kardamom_types::TxRef::new`] when writing the canonical record
-    /// to channel B.
+    /// to tx_ordering.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, env)
     }
@@ -130,8 +130,8 @@ impl TxDataPublisher {
 
 /// TxOrdering: canonical orderer. Concurrent (shared) publisher carrying
 /// [`TxOrderingMessage`] records — `TxRef` (~16 B) and `BlockBoundaryStart`.
-/// Bulk transaction bytes flow on the per-sequencer channel-A archives;
-/// channel B only ever sees small records, so the canonical-orderer CAS
+/// Bulk transaction bytes flow on the per-sequencer tx_data archives;
+/// tx_ordering only ever sees small records, so the canonical-orderer CAS
 /// cursor stays cheap.
 pub struct TxOrderingPublisher {
     pub_handle: Pub,
@@ -148,13 +148,13 @@ impl TxOrderingPublisher {
         Ok(Self { pub_handle })
     }
 
-    /// Publish a [`TxRef`] onto channel B. Returns the canonical B-position
+    /// Publish a [`TxRef`] onto tx_ordering. Returns the canonical B-position
     /// of the record (system invariant I1).
     pub fn publish_ref(&self, r: &TxRef) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, &TxOrderingMessage::TxRef(*r))
     }
 
-    /// Publish a sealer-emitted boundary onto channel B.
+    /// Publish a sealer-emitted boundary onto tx_ordering.
     pub fn publish_boundary(&self, b: &BlockBoundaryStart) -> Result<BPosition, LogError> {
         offer(
             &self.pub_handle,
@@ -170,14 +170,19 @@ impl TxOrderingPublisher {
     }
 }
 
-/// Channel C: receipts + boundaries. RAM only.
+/// TxReceipts: receipts + boundaries. RAM only.
 pub struct ChannelCPublisher {
     pub_handle: Pub,
 }
 
 impl ChannelCPublisher {
     pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(aeron, &ch.c_channel, ch.c_stream_id, "C")?;
+        let pub_handle = add_pub(
+            aeron,
+            &ch.tx_receipts_channel,
+            ch.tx_receipts_stream_id,
+            "C",
+        )?;
         Ok(Self { pub_handle })
     }
 
@@ -212,7 +217,7 @@ impl ReceiptCachePublisher {
     }
 }
 
-/// Per-channel-B-recorder fsync-watermark publisher. Each B-recorder host
+/// Per-tx_ordering-recorder fsync-watermark publisher. Each B-recorder host
 /// opens one of these; the quorum aggregator subscribes to all N.
 pub struct WatermarkPublisher {
     pub_handle: Pub,
@@ -238,7 +243,7 @@ impl WatermarkPublisher {
     }
 }
 
-/// Per-channel-A fsync-watermark publisher (D-Sh12). One per sequencer
+/// Per-tx_data fsync-watermark publisher (D-Sh12). One per sequencer
 /// host; downstream consumers (ack-path coordinator, executor) subscribe
 /// to whichever A-watermarks they care about. TxData is single-host
 /// durability by default — there is no quorum aggregator for A.
@@ -289,7 +294,7 @@ impl QuorumPublisher {
 
 /// Unifies the two Aeron publication variants behind a single `offer_bytes`.
 /// `Pub` (concurrent) is used by channels B/C/watermark/quorum/receipt-cache;
-/// `ExclusivePub` (single-writer) by channel A[i]. Both expose the same
+/// `ExclusivePub` (single-writer) by tx_data[i]. Both expose the same
 /// `i64`-returning `offer` over `&[u8]` — the trait just lets us write one
 /// retry loop instead of two.
 trait OfferBytes {
@@ -359,7 +364,7 @@ fn decode_position(p: i64) -> BPosition {
 /// because `AeronClient` is thread-confined (`!Send + !Sync`) and the whole
 /// publisher set lives on one Aeron-client thread by design.
 ///
-/// `a` is the per-sequencer channel-A publisher — only the sequencer hosts
+/// `a` is the per-sequencer tx_data publisher — only the sequencer hosts
 /// populate it; executor / batcher / sealer hosts leave it `None`.
 #[derive(Clone)]
 pub struct Publishers {
