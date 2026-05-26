@@ -10,12 +10,12 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::TxEnvelope;
+use kardamom_types::{BPosition, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedIngress;
+use kardamom_sequencer::inbound::fakes::ScriptedChannelA;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testing::FakeStateDatabase;
@@ -51,28 +51,33 @@ fn one_partition_cfg() -> SequencerConfig {
     }
 }
 
+fn pos(offset: i32) -> BPosition {
+    BPosition {
+        term_id: 0,
+        term_offset: offset,
+    }
+}
+
 #[test]
 fn hydrates_committed_nonce_for_established_sender() {
     // Sender already has on-chain activity: state DB reports their next
     // nonce is 5. The sequencer must hydrate at 5, not 0, so the first
-    // ingress tx (nonce 5) lands on the matched path instead of being
+    // channel-A tx (nonce 5) lands on the matched path instead of being
     // buffered as a future nonce.
     let signer = PrivateKeySigner::random();
     let db = Arc::new(FakeStateDatabase::new());
     db.set_nonce(signer.address(), 5);
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
-    let mut ing = ScriptedIngress {
-        queue: [signed_envelope(&signer, 5, 100)].into(),
+    let mut channel_a = ScriptedChannelA {
+        queue: [(pos(0), signed_envelope(&signer, 5, 100))].into(),
         disconnected: false,
     };
-    let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
 
-    while seq.run_once(&mut ing, &mut a, &mut b, &mut rc).unwrap() {}
+    while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
 
-    // Nonce 5 should have been published (matched path).
     assert_eq!(
         b.refs.lock().unwrap().len(),
         1,
@@ -82,22 +87,19 @@ fn hydrates_committed_nonce_for_established_sender() {
 
 #[test]
 fn hydrates_zero_for_brand_new_sender() {
-    // State DB has no entry for the sender (Ok(None)). Hydration falls
-    // back to nonce 0; tx with nonce 0 is accepted.
     let signer = PrivateKeySigner::random();
     let db = Arc::new(FakeStateDatabase::new());
-    // Note: db.set_nonce not called → basic() returns Ok(None) for this sender.
+    // db.set_nonce not called → basic() returns Ok(None) for this sender.
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
-    let mut ing = ScriptedIngress {
-        queue: [signed_envelope(&signer, 0, 100)].into(),
+    let mut channel_a = ScriptedChannelA {
+        queue: [(pos(0), signed_envelope(&signer, 0, 100))].into(),
         disconnected: false,
     };
-    let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
 
-    while seq.run_once(&mut ing, &mut a, &mut b, &mut rc).unwrap() {}
+    while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
 
     assert_eq!(b.refs.lock().unwrap().len(), 1);
 }
@@ -106,27 +108,22 @@ fn hydrates_zero_for_brand_new_sender() {
 fn hydration_runs_once_per_sender() {
     // Second tx from the same sender must NOT re-query the state DB —
     // the in-memory map is the authority after the first hydration.
-    // We assert this indirectly: the second tx (nonce 1) must succeed
-    // after the first (nonce 0) advanced the cached state, even though
-    // the state DB still reports None (which would re-hydrate at 0 if
-    // hydration ran again, breaking the test).
     let signer = PrivateKeySigner::random();
     let db = Arc::new(FakeStateDatabase::new());
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
-    let mut ing = ScriptedIngress {
+    let mut channel_a = ScriptedChannelA {
         queue: [
-            signed_envelope(&signer, 0, 100),
-            signed_envelope(&signer, 1, 101),
+            (pos(0), signed_envelope(&signer, 0, 100)),
+            (pos(64), signed_envelope(&signer, 1, 101)),
         ]
         .into(),
         disconnected: false,
     };
-    let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
 
-    while seq.run_once(&mut ing, &mut a, &mut b, &mut rc).unwrap() {}
+    while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
 
     assert_eq!(
         b.refs.lock().unwrap().len(),
