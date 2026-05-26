@@ -25,7 +25,7 @@
 
 use std::collections::BTreeMap;
 
-use kardamom_types::{BPosition, FsyncWatermark};
+use kardamom_types::BPosition;
 
 /// Per-recorder state observed by the local sealer process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,14 +86,6 @@ pub const TERM_LEN_BYTES: i64 = 16 * 1024 * 1024;
 #[inline]
 pub fn bpos_to_abs(p: BPosition) -> i64 {
     (p.term_id as i64) * TERM_LEN_BYTES + p.term_offset as i64
-}
-
-/// Convenience: build a `FsyncWatermark` from a `RecorderState`.
-pub fn watermark_for(s: RecorderState) -> FsyncWatermark {
-    FsyncWatermark {
-        recorder_id: s.recorder_id,
-        position: s.fsynced,
-    }
 }
 
 /// Decide which sealer should emit. Returns `None` if no recorder is caught up

@@ -38,7 +38,7 @@ use kardamom_sequencer::outbound::fakes::{
     InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
 use kardamom_sequencer::partition::partition_for;
-use kardamom_sequencer::primary::PrimarySequencer;
+use kardamom_sequencer::sequencer::Sequencer;
 
 const M: u32 = 4;
 // Per the task spec: each of the M=4 sequencers dual-writes 100 txs. We
@@ -97,7 +97,8 @@ fn m_eq_4_sequencers_dual_write_round_trip() {
     // channel-B ref publisher (clones share state by design — that's how
     // we model the single canonical stream).
     let b = InMemoryChannelBRefPublisher::default();
-    let mut sequencers: Vec<PrimarySequencer> = Vec::with_capacity(M as usize);
+    let mut sequencers: Vec<Sequencer<kardamom_sequencer::testing::FakeStateDatabase>> =
+        Vec::with_capacity(M as usize);
     let mut a_pubs: Vec<InMemoryChannelAPublisher> = Vec::with_capacity(M as usize);
     let mut b_pubs: Vec<InMemoryChannelBRefPublisher> = Vec::with_capacity(M as usize);
     let mut rcs: Vec<InMemoryReceiptCachePublisher> = Vec::with_capacity(M as usize);
@@ -114,7 +115,10 @@ fn m_eq_4_sequencers_dual_write_round_trip() {
             max_pending_per_sender: TX_PER_SENDER as usize * 2,
             ..Default::default()
         };
-        sequencers.push(PrimarySequencer::new(cfg));
+        sequencers.push(Sequencer::new(
+            cfg,
+            std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        ));
         a_pubs.push(InMemoryChannelAPublisher::new(i as u8));
         b_pubs.push(b.clone());
         rcs.push(InMemoryReceiptCachePublisher::default());

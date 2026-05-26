@@ -26,7 +26,7 @@ use kardamom_sequencer::inbound::fakes::ScriptedIngress;
 use kardamom_sequencer::outbound::fakes::{
     InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
-use kardamom_sequencer::primary::PrimarySequencer;
+use kardamom_sequencer::sequencer::Sequencer;
 
 fn signer(seed: u64) -> PrivateKeySigner {
     let mut k = [0u8; 32];
@@ -66,7 +66,10 @@ fn integration_1000_txs_100_senders_with_chaos() {
         max_pending_per_sender: 16,
         ..Default::default()
     };
-    let mut seq = PrimarySequencer::new(cfg.clone());
+    let mut seq = Sequencer::new(
+        cfg.clone(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xDEAD_BEEF);
     let signers: Vec<_> = (1..=100u64).map(signer).collect();
@@ -158,7 +161,10 @@ fn integration_duplicates_are_reported() {
         max_pending_per_sender: 4,
         ..Default::default()
     };
-    let mut seq = PrimarySequencer::new(cfg);
+    let mut seq = Sequencer::new(
+        cfg,
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     let s = signer(7);
     let mut ingress = ScriptedIngress::default();
     ingress.queue.push_back(signed_envelope(&s, 0, 100));
@@ -192,7 +198,10 @@ fn integration_bounded_buffer_evicts_oldest() {
         max_pending_per_sender: 4,
         ..Default::default()
     };
-    let mut seq = PrimarySequencer::new(cfg);
+    let mut seq = Sequencer::new(
+        cfg,
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     let s = signer(42);
     let mut ingress = ScriptedIngress::default();
     for n in 100..110u64 {

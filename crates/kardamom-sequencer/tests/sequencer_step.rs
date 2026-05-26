@@ -1,4 +1,4 @@
-//! Driver-level tests for `PrimarySequencer::run_once` + `run`.
+//! Driver-level tests for `Sequencer::run_once` + `run`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -16,7 +16,7 @@ use kardamom_sequencer::inbound::fakes::ScriptedIngress;
 use kardamom_sequencer::outbound::fakes::{
     InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
-use kardamom_sequencer::primary::{PrimarySequencer, Shutdown};
+use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 
 fn signer(seed: u64) -> PrivateKeySigner {
     let mut k = [0u8; 32];
@@ -65,7 +65,10 @@ fn match_dual_writes_once() {
     let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = PrimarySequencer::new(one_partition_cfg());
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     assert!(seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
     assert_eq!(a.published.lock().unwrap().len(), 1);
@@ -86,7 +89,10 @@ fn past_nonce_emits_duplicate_notification() {
     let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = PrimarySequencer::new(one_partition_cfg());
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
     seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
@@ -112,7 +118,10 @@ fn future_nonce_buffered_then_drained() {
     let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = PrimarySequencer::new(one_partition_cfg());
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
     assert_eq!(a.published.lock().unwrap().len(), 0);
@@ -133,7 +142,10 @@ fn a_backpressure_rewinds_state_and_retry_succeeds() {
     *a.fail_with_backpressure.lock().unwrap() = true;
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = PrimarySequencer::new(one_partition_cfg());
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     let r = seq.run_once(&mut ingress, &mut a, &mut b, &mut rc);
     assert!(matches!(
@@ -178,7 +190,10 @@ fn b_backpressure_after_a_publish_orphans_a_and_rewinds() {
     let mut b = InMemoryChannelBRefPublisher::default();
     *b.fail_with_backpressure.lock().unwrap() = true;
     let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = PrimarySequencer::new(one_partition_cfg());
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     let r = seq.run_once(&mut ingress, &mut a, &mut b, &mut rc);
     assert!(matches!(
@@ -227,7 +242,10 @@ fn run_once_returns_false_when_empty() {
     let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = PrimarySequencer::new(one_partition_cfg());
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     assert!(!seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
 }
 
@@ -239,7 +257,10 @@ fn wrong_partition_message_skipped() {
         sequencer_id: 0,
         ..Default::default()
     };
-    let mut seq = PrimarySequencer::new(cfg.clone());
+    let mut seq = Sequencer::new(
+        cfg.clone(),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
 
     // Find a signer whose address routes to a partition != 0.
     let mut seed = 1u64;
@@ -265,7 +286,10 @@ fn wrong_partition_message_skipped() {
 #[test]
 fn run_loops_until_shutdown_signaled() {
     let cfg = one_partition_cfg();
-    let mut seq = PrimarySequencer::new(cfg);
+    let mut seq = Sequencer::new(
+        cfg,
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     let mut ingress = ScriptedIngress::default();
     let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
@@ -278,7 +302,10 @@ fn run_loops_until_shutdown_signaled() {
 #[test]
 fn run_returns_when_ingress_disconnected() {
     let cfg = one_partition_cfg();
-    let mut seq = PrimarySequencer::new(cfg);
+    let mut seq = Sequencer::new(
+        cfg,
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     let mut ingress = ScriptedIngress {
         disconnected: true,
         ..Default::default()

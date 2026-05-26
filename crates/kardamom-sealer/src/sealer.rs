@@ -32,6 +32,9 @@ use crate::watermark_tracker::WatermarkTracker;
 
 pub struct Sealer<C: WallClock + Clone, P: BoundaryPublisher> {
     cfg: SealerConfig,
+    /// Cached `cfg.host_id.to_string()` so the per-tick metric label allocation
+    /// doesn't fire every 250 ms.
+    host_id_str: String,
     clock: C,
     tracker: Arc<WatermarkTracker>,
     emitter: BoundaryEmitter<C, P>,
@@ -48,11 +51,13 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
         cfg.validate()?;
         let tracker = Arc::new(WatermarkTracker::new(cfg.recorder_ids.clone()));
         let host_id = cfg.host_id;
+        let host_id_str = host_id.to_string();
         let tick_ms = cfg.tick_interval_ms;
         let emitter =
             BoundaryEmitter::new(publisher, clock.clone(), initial_block, tick_ms, host_id);
         Ok(Self {
             cfg,
+            host_id_str,
             clock,
             tracker,
             emitter,
@@ -97,7 +102,7 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
         );
         metrics::gauge!(
             "sealer_election_winner",
-            "host_id" => self.cfg.host_id.to_string(),
+            "host_id" => self.host_id_str.clone(),
         )
         .set(if leader == Some(self.cfg.host_id) {
             1.0
@@ -112,14 +117,11 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
         // Sync block_number to whatever's been observed on B so flapping
         // leadership can't produce duplicates. `sync_block_number` is a
         // no-op when our local counter is already ahead.
-        let observed_next = self
-            .observed_block
-            .load(Ordering::Relaxed)
-            .saturating_add(1);
-        self.emitter.sync_block_number(observed_next);
+        let observed = self.observed_block.load(Ordering::Relaxed);
+        self.emitter.sync_block_number(observed.saturating_add(1));
         let emitted = self.emitter.run_one_tick().await?;
         // Record our own emission so the next snapshot reflects it.
-        if emitted > self.observed_block.load(Ordering::Relaxed) {
+        if emitted > observed {
             self.observed_block.store(emitted, Ordering::Relaxed);
         }
         Ok(Some(emitted))
