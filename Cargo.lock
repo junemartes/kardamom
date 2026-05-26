@@ -3743,6 +3743,7 @@ dependencies = [
  "bytes",
  "criterion 0.5.1",
  "crossbeam-channel",
+ "dashmap",
  "kardamom-log",
  "kardamom-types",
  "rand 0.9.4",
@@ -3785,6 +3786,17 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "kardamom-leases"
+version = "0.1.0"
+dependencies = [
+ "kardamom-log",
+ "kardamom-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
