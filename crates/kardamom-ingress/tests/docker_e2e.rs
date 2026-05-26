@@ -12,7 +12,7 @@
 //! **v0 scope:** brings up the Aeron container and asserts the harness
 //! resolves its host ports. The full proxy↔real-Aeron round-trip
 //! requires an adapter that wraps `kardamom-log`'s `aeron-live`
-//! `ChannelBPublisher` / `ReceiptCacheSubscriber` / etc. as an
+//! `TxOrderingPublisher` / `ReceiptCacheSubscriber` / etc. as an
 //! `IngressPublication` / `IngressSubscription` implementor — those
 //! types are `!Send + !Sync` (per S3's `rusteron` quirks doc) so the
 //! adapter has to live on a dedicated OS thread and forward messages

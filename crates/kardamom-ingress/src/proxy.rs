@@ -241,7 +241,7 @@ where
         let shard = partition_for(sender, self.cfg.partition_count_m) as usize;
         let correlation_id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         self.publication
-            .publish_channel_a(
+            .publish_tx_data(
                 shard,
                 TxEnvelope {
                     correlation_id,

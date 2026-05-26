@@ -17,14 +17,14 @@ use kardamom_types::{BPosition, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
-use kardamom_sequencer::inbound::ChannelASubscriber;
+use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
 struct DequeChannelA(VecDeque<(BPosition, TxEnvelope)>);
-impl ChannelASubscriber for DequeChannelA {
+impl TxDataSubscriber for DequeChannelA {
     fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
         Ok(self.0.pop_front())
     }
@@ -86,7 +86,7 @@ fn bench_in_order(c: &mut Criterion) {
                         std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
                     ),
                     DequeChannelA(batch.clone().into_iter().collect()),
-                    InMemoryChannelBRefPublisher::default(),
+                    InMemoryTxOrderingRefPublisher::default(),
                     InMemoryReceiptCachePublisher::default(),
                 )
             },
