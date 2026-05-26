@@ -18,14 +18,14 @@ pub struct SealerConfig {
     /// Typed `u8` to match `kardamom_types::FsyncWatermark::recorder_id`; the
     /// `kardamom-leases::Lease` primitive also keys recorders by `u8`.
     pub host_id: u8,
-    /// Aeron channel URI for channel B (publish + subscribe on the same channel).
+    /// Aeron channel URI for tx_ordering (publish + subscribe on the same channel).
     pub channel_b_uri: String,
-    /// Aeron stream id carrying `TxEnvelope`s on channel B.
+    /// Aeron stream id carrying `TxEnvelope`s on tx_ordering.
     pub channel_b_tx_stream_id: i32,
-    /// Aeron stream id carrying `BlockBoundaryStart`s on channel B. Must differ
+    /// Aeron stream id carrying `BlockBoundaryStart`s on tx_ordering. Must differ
     /// from `channel_b_tx_stream_id` so subscribers can demultiplex by type
     /// without an in-band tag. The two streams share the same underlying
-    /// channel — the sealer is "just another publisher on channel B" per spec
+    /// channel — the sealer is "just another publisher on tx_ordering" per spec
     /// §2.6, but with its own stream id so consumers can subscribe selectively.
     pub channel_b_boundary_stream_id: i32,
     /// Aeron channel URI carrying the per-recorder watermark streams.

@@ -12,7 +12,7 @@
 //! **v0 scope:** brings up the Aeron container and asserts the harness
 //! resolves its host ports. The full sealer ↔ real-Aeron round-trip
 //! requires a `BoundaryPublisher` adapter wrapping `kardamom-log`'s
-//! `aeron-live` channel-B concurrent publisher. The current
+//! `aeron-live` tx_ordering concurrent publisher. The current
 //! `kardamom-log` exposes the low-level rusteron primitives but not yet
 //! a high-level `TxOrderingPublisher` async wrapper (see
 //! crates/kardamom-log/src/publisher.rs); building that wrapper is a

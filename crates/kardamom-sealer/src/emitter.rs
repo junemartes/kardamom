@@ -135,7 +135,9 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
                             "reason" => "backpressure",
                         )
                         .increment(1);
-                        anyhow::bail!("backpressure on channel B persisted >50 ms; skipping tick");
+                        anyhow::bail!(
+                            "backpressure on tx_ordering persisted >50 ms; skipping tick"
+                        );
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
                     backoff_ms = (backoff_ms * 2).min(8);

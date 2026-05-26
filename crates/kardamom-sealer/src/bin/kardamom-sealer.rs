@@ -2,7 +2,7 @@
 //!
 //! Loads a TOML `SealerConfig`, validates it, and either:
 //!
-//!   - With `aeron-live` enabled: opens the channel-B publisher + per-recorder
+//!   - With `aeron-live` enabled: opens the tx_ordering publisher + per-recorder
 //!     watermark subscribers via `kardamom-log` and runs the sealer's
 //!     `run_forever` loop. (Wiring lands alongside the cross-component
 //!     real-Aeron e2e work; see the spec §"Implementation order".)
@@ -53,7 +53,7 @@ fn main() -> Result<()> {
     {
         eprintln!(
             "kardamom-sealer: built without the aeron-live feature; the live \
-             channel-B publisher and per-recorder watermark subscribers \
+             tx_ordering publisher and per-recorder watermark subscribers \
              require it. Re-build with `--features aeron-live` to run \
              against real Aeron. Exiting 0 (config validated)."
         );
@@ -64,7 +64,7 @@ fn main() -> Result<()> {
     {
         eprintln!(
             "kardamom-sealer: aeron-live feature is enabled but the real \
-             channel-B wrapper is still landing as part of the cross-component \
+             tx_ordering wrapper is still landing as part of the cross-component \
              real-Aeron e2e (see docs/plans/2026-05-23-S5-block-sealer.md \
              Task 15). Config validated; exiting 0."
         );
