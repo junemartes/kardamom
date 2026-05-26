@@ -33,6 +33,12 @@ struct Args {
     /// Override the partition count (M).
     #[arg(long)]
     partition_count: Option<u32>,
+    /// Override the sequencer id embedded in every channel-B `TxRef`
+    /// (D-Sh12). If omitted and the TOML did not set it, falls back to
+    /// `partition_index as u8` so the default M=8 deployment "just
+    /// works".
+    #[arg(long)]
+    sequencer_id: Option<u8>,
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
@@ -58,6 +64,22 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(m) = args.partition_count {
         cfg.partition_count = m;
+    }
+    if let Some(id) = args.sequencer_id {
+        cfg.sequencer_id = id;
+    } else if cfg.sequencer_id == 0 && cfg.partition_index != 0 {
+        // Convenience: if the operator only specified --partition-index N
+        // (without an explicit --sequencer-id or a TOML override) and the
+        // TOML left the field at its default of 0, derive the conventional
+        // "one sequencer per partition" id automatically. This avoids the
+        // failure mode where every process writes ChannelB refs with
+        // sequencer_id=0 and downstream consumers can't tell them apart.
+        cfg.sequencer_id = cfg.partition_index as u8;
+        tracing::info!(
+            partition_index = cfg.partition_index,
+            sequencer_id = cfg.sequencer_id,
+            "sequencer_id defaulted from partition_index"
+        );
     }
     if let Some(c) = args.core_id {
         cfg.core_id = Some(c);
