@@ -99,11 +99,12 @@ impl ChannelAPublisher {
         ch: &ChannelsConfig,
         sequencer_id: u8,
     ) -> Result<Self, LogError> {
-        let uri = ch
-            .a_channel_template
-            .replace("{sid}", &sequencer_id.to_string());
-        let stream_id = ch.a_stream_id_base + sequencer_id as i32;
-        let pub_handle = add_exclusive_pub(aeron, &uri, stream_id, "A")?;
+        let pub_handle = add_exclusive_pub(
+            aeron,
+            &ch.a_channel(sequencer_id),
+            ch.a_stream_id(sequencer_id),
+            "A",
+        )?;
         Ok(Self {
             sequencer_id,
             pub_handle,
@@ -119,7 +120,7 @@ impl ChannelAPublisher {
     /// to [`kardamom_types::TxRef::new`] when writing the canonical record
     /// to channel B.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
-        offer_exclusive(&self.pub_handle, env)
+        offer(&self.pub_handle, env)
     }
 }
 
@@ -215,10 +216,12 @@ impl WatermarkPublisher {
         ch: &ChannelsConfig,
         recorder_id: u8,
     ) -> Result<Self, LogError> {
-        let channel = ch
-            .fsync_watermark_channel_template
-            .replace("{rid}", &recorder_id.to_string());
-        let pub_handle = add_pub(aeron, &channel, ch.fsync_watermark_stream_id, "wm")?;
+        let pub_handle = add_pub(
+            aeron,
+            &ch.fsync_watermark_channel(recorder_id),
+            ch.fsync_watermark_stream_id,
+            "wm",
+        )?;
         Ok(Self { pub_handle })
     }
 
@@ -241,11 +244,12 @@ impl WatermarkAPublisher {
         ch: &ChannelsConfig,
         sequencer_id: u8,
     ) -> Result<Self, LogError> {
-        let channel = ch
-            .fsync_watermark_a_channel_template
-            .replace("{sid}", &sequencer_id.to_string());
-        let stream_id = ch.fsync_watermark_a_stream_id_base + sequencer_id as i32;
-        let pub_handle = add_pub(aeron, &channel, stream_id, "wm-a")?;
+        let pub_handle = add_pub(
+            aeron,
+            &ch.fsync_watermark_a_channel(sequencer_id),
+            ch.fsync_watermark_a_stream_id(sequencer_id),
+            "wm-a",
+        )?;
         Ok(Self { pub_handle })
     }
 
@@ -275,25 +279,49 @@ impl QuorumPublisher {
     }
 }
 
-fn offer<T>(p: &Pub, msg: &T) -> Result<BPosition, LogError>
+/// Unifies the two Aeron publication variants behind a single `offer_bytes`.
+/// `Pub` (concurrent) is used by channels B/C/watermark/quorum/receipt-cache;
+/// `ExclusivePub` (single-writer) by channel A[i]. Both expose the same
+/// `i64`-returning `offer` over `&[u8]` — the trait just lets us write one
+/// retry loop instead of two.
+trait OfferBytes {
+    fn offer_bytes(&self, bytes: &[u8]) -> i64;
+}
+
+impl OfferBytes for Pub {
+    #[inline]
+    fn offer_bytes(&self, bytes: &[u8]) -> i64 {
+        self.offer(
+            bytes,
+            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
+        )
+    }
+}
+
+impl OfferBytes for ExclusivePub {
+    #[inline]
+    fn offer_bytes(&self, bytes: &[u8]) -> i64 {
+        self.offer(
+            bytes,
+            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
+        )
+    }
+}
+
+fn offer<P, T>(p: &P, msg: &T) -> Result<BPosition, LogError>
 where
+    P: OfferBytes,
     T: for<'a> rkyv::Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
 {
     let bytes: AlignedVec = codec::encode(msg)?;
     let len = bytes.len();
-    // AeronPublication::offer returns the new stream position (>=0) or
+    // `AeronPublication::offer` returns the new stream position (>=0) or
     // a negative back-pressure code. Retry up to 1024 times on back-pressure.
-    // We pass no reserved-value supplier — the type-erased "None" lives on
-    // the `Handlers` utility struct since `None::<&Handler<_>>` cannot
-    // infer the closure-callback generic parameter.
     for attempt in 0..1024 {
-        let r = p.offer(
-            bytes.as_slice(),
-            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-        );
+        let r = p.offer_bytes(bytes.as_slice());
         if r >= 0 {
-            // Aeron returns the position *after* the message; the caller
-            // wants the fragment's *start* (so the value it embeds in a
+            // Aeron returns the position *after* the message; callers
+            // want the fragment's *start* (so the value embedded in a
             // TxRef matches what the subscriber later sees as the
             // fragment's term_offset).
             return Ok(decode_position(r - len as i64));
@@ -305,33 +333,6 @@ where
     }
     Err(LogError::Aeron(
         "back-pressure timeout after 1024 retries".into(),
-    ))
-}
-
-/// Same as `offer` but for the exclusive-publisher variant. Channel A
-/// publishers go through this path so the data-bulk write avoids the
-/// concurrent-pub CAS cursor entirely (spec §2.3).
-fn offer_exclusive<T>(p: &ExclusivePub, msg: &T) -> Result<BPosition, LogError>
-where
-    T: for<'a> rkyv::Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
-{
-    let bytes: AlignedVec = codec::encode(msg)?;
-    let len = bytes.len();
-    for attempt in 0..1024 {
-        let r = p.offer(
-            bytes.as_slice(),
-            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-        );
-        if r >= 0 {
-            return Ok(decode_position(r - len as i64));
-        }
-        if attempt % 64 == 63 {
-            warn!(attempt, "aeron back-pressure (channel A), retrying");
-        }
-        std::hint::spin_loop();
-    }
-    Err(LogError::Aeron(
-        "back-pressure timeout after 1024 retries (channel A)".into(),
     ))
 }
 

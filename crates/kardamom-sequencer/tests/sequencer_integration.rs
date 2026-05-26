@@ -122,7 +122,7 @@ fn integration_1000_txs_100_senders_with_chaos() {
     // archived TxEnvelope; we never recover from signature.
     let mut per_sender: HashMap<Address, Vec<u64>> = HashMap::new();
     for r in &refs {
-        assert_eq!(r.sequencer_id, cfg.sequencer_id);
+        assert_eq!(r.shard_id, cfg.sequencer_id);
         let bytes = a
             .fetch(r.position_a)
             .expect("every TxRef must resolve to an envelope on channel A");

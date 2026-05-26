@@ -70,6 +70,24 @@ impl FakeConcurrentPublication {
         g.next_offset += bytes.len() as i64;
         g.next_offset
     }
+
+    /// Encode `msg` with rkyv, append it to the stream, and return the
+    /// fragment's *start* `BPosition` (matches the real publisher's
+    /// convention used by [`crate::publisher::offer`]).
+    fn publish<T>(&self, msg: &T) -> Result<BPosition, LogError>
+    where
+        T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+    {
+        let bytes =
+            rkyv::to_bytes::<rancor::Error>(msg).map_err(|e| LogError::Codec(e.to_string()))?;
+        let off = self.offer(bytes.as_slice());
+        let frag_start = off - bytes.len() as i64;
+        let header = FakeHeader::from_offset(frag_start);
+        Ok(BPosition {
+            term_id: header.term_id(),
+            term_offset: header.term_offset(),
+        })
+    }
 }
 
 /// Mimics `rusteron_client::Header` enough for our consumers.
@@ -136,14 +154,7 @@ impl FakePublication {
     where
         T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
     {
-        let bytes =
-            rkyv::to_bytes::<rancor::Error>(msg).map_err(|e| LogError::Codec(e.to_string()))?;
-        let off = self.pub_handle.offer(bytes.as_slice());
-        let header = FakeHeader::from_offset(off);
-        Ok(BPosition {
-            term_id: header.term_id(),
-            term_offset: header.term_offset(),
-        })
+        self.pub_handle.publish(msg)
     }
 }
 
@@ -238,23 +249,11 @@ impl FakeChannelAPublication {
         self.sequencer_id
     }
 
-    /// Publish a `TxEnvelope` and return its `BPosition` on channel A[i].
-    /// Sequencers pass this `BPosition` into [`TxRef::new`] before writing
-    /// to channel B.
+    /// Publish a `TxEnvelope` and return its fragment-start `BPosition` on
+    /// channel A[i]. Sequencers pass this `BPosition` into [`TxRef::new`]
+    /// before writing to channel B.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
-        let bytes =
-            rkyv::to_bytes::<rancor::Error>(env).map_err(|e| LogError::Codec(e.to_string()))?;
-        let off = self.pub_handle.offer(bytes.as_slice());
-        // Match the real publisher's "post-offer position" convention: the
-        // position points just past the encoded fragment. The fragment's
-        // *start* position is what executors / batchers reference; we
-        // expose that one (off - len) as the returned `BPosition`.
-        let frag_start = off - bytes.len() as i64;
-        let header = FakeHeader::from_offset(frag_start);
-        Ok(BPosition {
-            term_id: header.term_id(),
-            term_offset: header.term_offset(),
-        })
+        self.pub_handle.publish(env)
     }
 }
 
@@ -334,15 +333,7 @@ impl FakeChannelBPublication {
     }
 
     fn publish_message(&self, m: &ChannelBMessage) -> Result<BPosition, LogError> {
-        let bytes =
-            rkyv::to_bytes::<rancor::Error>(m).map_err(|e| LogError::Codec(e.to_string()))?;
-        let off = self.pub_handle.offer(bytes.as_slice());
-        let frag_start = off - bytes.len() as i64;
-        let header = FakeHeader::from_offset(frag_start);
-        Ok(BPosition {
-            term_id: header.term_id(),
-            term_offset: header.term_offset(),
-        })
+        self.pub_handle.publish(m)
     }
 }
 
