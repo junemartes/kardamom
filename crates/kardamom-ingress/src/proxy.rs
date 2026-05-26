@@ -13,9 +13,7 @@ use alloy_rlp::Decodable;
 use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use kardamom_types::{
-    BPosition, BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope,
-};
+use kardamom_types::{BPosition, BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
