@@ -13,17 +13,16 @@ use std::sync::Arc;
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use kardamom_types::{BPosition, Receipt, StateDatabase};
-use signet_libmdbx::Environment;
+use signet_libmdbx::{Database, Environment};
 use signet_libmdbx::tx::aliases::RoTxSync;
 
 use crate::env::StateEnv;
 use crate::error::StateError;
-use crate::meta::{KEY_LAST_COMMITTED_BLOCK, decode_u64};
+use crate::meta::{KEY_LAST_COMMITTED_BLOCK, decode_u64, encode_b_position};
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
     decode_account_value, decode_receipt_value, decode_storage_value, decode_tx_hash_value,
-    encode_account_key, encode_b_position_key, encode_code_key, encode_storage_key,
-    encode_tx_hash_key,
+    encode_account_key, encode_code_key, encode_storage_key, encode_tx_hash_key,
 };
 
 /// MVCC snapshot of the state DB at exactly one block boundary.
@@ -39,6 +38,13 @@ pub struct StateSnapshot {
 struct SnapshotInner {
     txn: RoTxSync,
     block_number: u64,
+    // DBI handles cached at open time. `Database` is `Copy` (u32 + flags), so
+    // the per-call `txn.open_db(...)` round-trip is replaced by a struct read.
+    accounts_db: Database,
+    storage_db: Database,
+    code_db: Database,
+    receipts_db: Database,
+    tx_hash_db: Database,
     // Keep the env Arc alive so the env doesn't outlive the snapshot's RO txn.
     _env: Arc<Environment>,
 }
@@ -53,10 +59,20 @@ impl StateSnapshot {
             Some(bytes) => decode_u64(&bytes)?,
             None => 0,
         };
+        let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
+        let storage_db = txn.open_db(Some(TABLE_STORAGE))?;
+        let code_db = txn.open_db(Some(TABLE_CODE))?;
+        let receipts_db = txn.open_db(Some(TABLE_RECEIPTS))?;
+        let tx_hash_db = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
         Ok(Self {
             inner: Arc::new(SnapshotInner {
                 txn,
                 block_number,
+                accounts_db,
+                storage_db,
+                code_db,
+                receipts_db,
+                tx_hash_db,
                 _env: env.env.clone(),
             }),
         })
@@ -73,8 +89,11 @@ impl StateDatabase for StateSnapshot {
 
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
         let key = encode_account_key(address);
-        let db = self.inner.txn.open_db(Some(TABLE_ACCOUNTS))?;
-        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+        match self
+            .inner
+            .txn
+            .get::<Vec<u8>>(self.inner.accounts_db.dbi(), &key)?
+        {
             None => Ok(None),
             Some(bytes) => {
                 let v = decode_account_value(&bytes)?;
@@ -85,8 +104,11 @@ impl StateDatabase for StateSnapshot {
 
     fn storage(&self, address: Address, key: B256) -> Result<U256, Self::Error> {
         let composite = encode_storage_key(address, key);
-        let db = self.inner.txn.open_db(Some(TABLE_STORAGE))?;
-        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &composite)? {
+        match self
+            .inner
+            .txn
+            .get::<Vec<u8>>(self.inner.storage_db.dbi(), &composite)?
+        {
             None => Ok(U256::ZERO),
             Some(bytes) => decode_storage_value(&bytes),
         }
@@ -94,8 +116,11 @@ impl StateDatabase for StateSnapshot {
 
     fn code_by_hash(&self, code_hash: B256) -> Result<Bytes, Self::Error> {
         let key = encode_code_key(code_hash);
-        let db = self.inner.txn.open_db(Some(TABLE_CODE))?;
-        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+        match self
+            .inner
+            .txn
+            .get::<Vec<u8>>(self.inner.code_db.dbi(), &key)?
+        {
             None => Ok(Bytes::new()),
             Some(b) => Ok(Bytes::from(b)),
         }
@@ -104,9 +129,12 @@ impl StateDatabase for StateSnapshot {
     /// D-Sh4: load a Receipt by its canonical BPosition. Returns None if no
     /// receipt was committed at that position.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
-        let key = encode_b_position_key(pos);
-        let db = self.inner.txn.open_db(Some(TABLE_RECEIPTS))?;
-        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+        let key = encode_b_position(pos);
+        match self
+            .inner
+            .txn
+            .get::<Vec<u8>>(self.inner.receipts_db.dbi(), &key)?
+        {
             None => Ok(None),
             Some(bytes) => decode_receipt_value(&bytes).map(Some),
         }
@@ -115,8 +143,11 @@ impl StateDatabase for StateSnapshot {
     /// D-Sh4: tx_hash → BPosition lookup. Feeds S1 `eth_getTransactionReceipt`.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
         let key = encode_tx_hash_key(tx_hash);
-        let db = self.inner.txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
-        match self.inner.txn.get::<Vec<u8>>(db.dbi(), &key)? {
+        match self
+            .inner
+            .txn
+            .get::<Vec<u8>>(self.inner.tx_hash_db.dbi(), &key)?
+        {
             None => Ok(None),
             Some(bytes) => decode_tx_hash_value(&bytes).map(Some),
         }

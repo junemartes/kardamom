@@ -162,33 +162,10 @@ pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
 
 // ---------- receipts ----------
 //
-// Key: BPosition (8 bytes — i32 BE term_id ++ i32 BE term_offset).
+// Key: BPosition (8 bytes — i32 BE term_id ++ i32 BE term_offset). The codec
+// itself lives in [`crate::meta`] (`encode_b_position` / `decode_b_position`)
+// since it's used for both receipt keys and several meta-cursor values.
 // Value: rkyv-archived `Receipt` (kardamom-types).
-
-pub fn encode_b_position_key(p: BPosition) -> [u8; 8] {
-    let mut out = [0u8; 8];
-    out[..4].copy_from_slice(&p.term_id.to_be_bytes());
-    out[4..].copy_from_slice(&p.term_offset.to_be_bytes());
-    out
-}
-
-pub fn decode_b_position_key(bytes: &[u8]) -> Result<BPosition, StateError> {
-    if bytes.len() != 8 {
-        return Err(StateError::BadEncoding {
-            table: TABLE_RECEIPTS,
-            expected: 8,
-            got: bytes.len(),
-        });
-    }
-    let mut t_id = [0u8; 4];
-    t_id.copy_from_slice(&bytes[..4]);
-    let mut t_off = [0u8; 4];
-    t_off.copy_from_slice(&bytes[4..]);
-    Ok(BPosition {
-        term_id: i32::from_be_bytes(t_id),
-        term_offset: i32::from_be_bytes(t_off),
-    })
-}
 
 pub fn encode_receipt_value(r: &Receipt) -> Vec<u8> {
     // `Receipt` upstream derives `rkyv::Archive/Serialize/Deserialize`.
@@ -207,27 +184,28 @@ pub fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
 // ---------- tx_hash_index (D-Sh4) ----------
 //
 // Key: `B256 tx_hash` (32 B). Value: `BPosition` (8 B, same layout as
-// `encode_b_position_key`). Populated during block commit (one entry per
-// receipt). Read path: S1 proxy's `eth_getTransactionReceipt(hash)` calls
-// `StateDatabase::get_tx_position(hash)` → `StateDatabase::get_receipt(pos)`.
+// the receipts-table key — see [`crate::meta::encode_b_position`]). Populated
+// during block commit (one entry per receipt). Read path: S1 proxy's
+// `eth_getTransactionReceipt(hash)` calls `StateDatabase::get_tx_position(hash)`
+// → `StateDatabase::get_receipt(pos)`.
 
 pub fn encode_tx_hash_key(hash: B256) -> [u8; 32] {
     hash.into()
 }
 
 pub fn encode_tx_hash_value(pos: BPosition) -> [u8; 8] {
-    encode_b_position_key(pos)
+    crate::meta::encode_b_position(pos)
 }
 
 pub fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
-    if bytes.len() != 8 {
-        return Err(StateError::BadEncoding {
+    crate::meta::decode_b_position(bytes).map_err(|e| match e {
+        StateError::BadEncoding { expected, got, .. } => StateError::BadEncoding {
             table: TABLE_TX_HASH_INDEX,
-            expected: 8,
-            got: bytes.len(),
-        });
-    }
-    decode_b_position_key(bytes)
+            expected,
+            got,
+        },
+        other => other,
+    })
 }
 
 #[cfg(test)]
@@ -322,15 +300,16 @@ mod tests {
 
     #[test]
     fn b_position_key_lexicographically_ordered() {
-        let a = encode_b_position_key(BPosition {
+        use crate::meta::encode_b_position;
+        let a = encode_b_position(BPosition {
             term_id: 0,
             term_offset: 1,
         });
-        let b = encode_b_position_key(BPosition {
+        let b = encode_b_position(BPosition {
             term_id: 0,
             term_offset: 2,
         });
-        let c = encode_b_position_key(BPosition {
+        let c = encode_b_position(BPosition {
             term_id: 1,
             term_offset: 0,
         });

@@ -30,9 +30,8 @@ use crate::meta::{
 use crate::schema::{
     AccountValue, HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META,
     TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX, encode_account_key, encode_account_value,
-    encode_b_position_key, encode_block_key, encode_code_key, encode_header_value,
-    encode_receipt_value, encode_storage_key, encode_storage_value, encode_tx_hash_key,
-    encode_tx_hash_value,
+    encode_block_key, encode_code_key, encode_header_value, encode_receipt_value,
+    encode_storage_key, encode_storage_value, encode_tx_hash_key, encode_tx_hash_value,
 };
 use crate::snapshot::StateSnapshot;
 use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
@@ -241,7 +240,7 @@ impl StateWriter {
         // proxy can serve eth_getTransactionReceipt(hash) via two reads:
         //   StateDatabase::get_tx_position(hash) → StateDatabase::get_receipt(pos)
         for r in &batch.delta.receipts {
-            let pos_key = encode_b_position_key(r.tx_idx);
+            let pos_key = encode_b_position(r.tx_idx);
             txn.put(
                 receipts,
                 pos_key,
