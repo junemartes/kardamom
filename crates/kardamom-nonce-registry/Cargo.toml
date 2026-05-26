@@ -1,0 +1,16 @@
+[package]
+name = "kardamom-nonce-registry"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+kardamom-types.workspace = true
+redis = { workspace = true, features = ["tokio-comp", "script"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+testcontainers.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

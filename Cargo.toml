@@ -42,6 +42,7 @@ alloy-node-bindings = "2.0"
 # S3 foundation crates
 kardamom-types = { path = "crates/kardamom-types" }
 kardamom-log = { path = "crates/kardamom-log" }
+kardamom-nonce-registry = { path = "crates/kardamom-nonce-registry" }
 
 # S3 external deps
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
@@ -54,6 +55,7 @@ tempfile = "3"
 bytes = "1"
 libc = "0.2"
 futures = "0.3"
+redis = { version = "0.27", default-features = false }
 
 [profile.release]
 debug = true

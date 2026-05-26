@@ -1,8 +1,21 @@
 //! Lease orchestration: bridges [`crate::standby::HotStandbyTailer`] and
-//! [`crate::primary::PrimarySequencer`] across a takeover. The deterministic
-//! lowest-host-id-among-caught-up-recorders implementation lives in
-//! `kardamom_leases::Lease`; this module wraps it with the per-role shutdown
-//! signals + takeover-arm flag needed by the sequencer process.
+//! [`crate::primary::PrimarySequencer`] across a takeover.
+//!
+//! ## Migration note
+//!
+//! The original v1 design wrapped `kardamom_leases::Lease` here to drive
+//! single-leader sequencer failover. Per the leaderless-hot-path direction,
+//! the sequencer no longer needs leader election — multiple sequencers can
+//! race on channel B (Aeron serializes), and per-sender nonce gating is
+//! owned by the new `kardamom-nonce-registry` (Redis-backed CAS).
+//!
+//! This module is retained transitionally: the `LeaseHandle` trait,
+//! `LeaseOrchestrator`, and `fakes::SharedManualLease` keep the existing
+//! chaos/failover tests compiling while `primary.rs` is progressively
+//! rewired onto the registry. The `KardamomLeaseHandle` wrapper has been
+//! deleted and the `kardamom-leases` crate dependency has been dropped.
+//! Once the registry wiring lands, this entire module + `standby.rs`
+//! become deletable.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,47 +24,18 @@ use std::time::Duration;
 use crate::error::SequencerError;
 use crate::primary::Shutdown;
 
-/// Lease primitive abstracted for testability. `kardamom_leases::Lease`
-/// implements its own state machine (driven by `observe_fsync` +
-/// `observe_quorum`); we wrap it via [`KardamomLeaseHandle`] below.
+/// Lease primitive abstracted for testability. Implementations drive the
+/// per-process primary/standby state machine; production wiring is being
+/// replaced by `kardamom-nonce-registry` (see module-level note).
 pub trait LeaseHandle: Send {
     /// True if this process currently holds the slice lease.
     fn is_held(&self) -> bool;
-    /// Attempt to acquire the lease. Returns true on success. For the
-    /// deterministic v0 lease this is a no-op observer — the lease
-    /// "acquires" itself the moment the host becomes the lowest-id
-    /// caught-up recorder.
+    /// Attempt to acquire the lease. Returns true on success.
     fn try_acquire(&mut self) -> bool;
-    /// Send a heartbeat. For the deterministic v0 lease there's no explicit
-    /// heartbeat (freshness is implicit in the most recent fsync watermark
-    /// observation); this returns `Ok(())` for the wrapper.
+    /// Send a heartbeat (no-op for the deterministic v0 lease).
     fn renew(&mut self) -> Result<(), SequencerError>;
     /// The lease TTL — the renewer ticks at `ttl / 3`.
     fn ttl(&self) -> Duration;
-}
-
-/// Thin wrapper over `kardamom_leases::Lease` adapting it to
-/// [`LeaseHandle`]. Callers feed `observe_fsync` / `observe_quorum` from the
-/// supervisor's watermark stream; this wrapper only exposes the read surface
-/// the orchestrator uses.
-pub struct KardamomLeaseHandle {
-    pub lease: kardamom_leases::Lease,
-    pub ttl: Duration,
-}
-
-impl LeaseHandle for KardamomLeaseHandle {
-    fn is_held(&self) -> bool {
-        self.lease.held_by_us()
-    }
-    fn try_acquire(&mut self) -> bool {
-        self.lease.held_by_us()
-    }
-    fn renew(&mut self) -> Result<(), SequencerError> {
-        Ok(())
-    }
-    fn ttl(&self) -> Duration {
-        self.ttl
-    }
 }
 
 /// Per-process orchestrator shared between the renewer thread and the
