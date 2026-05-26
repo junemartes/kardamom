@@ -62,7 +62,7 @@ fn fake_fsync_watermark_stream_per_recorder() {
 }
 
 // ---------------------------------------------------------------------------
-// Channel-A / Channel-B fakes (D-Sh12 split architecture).
+// TxData / TxOrdering fakes (D-Sh12 split architecture).
 // ---------------------------------------------------------------------------
 
 fn env(corr: u64, byte: u8) -> TxEnvelope {

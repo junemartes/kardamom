@@ -1,14 +1,14 @@
-//! Channel-B wire message: the canonical-orderer payload in the split
+//! TxOrdering wire message: the canonical-orderer payload in the split
 //! architecture (D-Sh12).
 //!
 //! TxOrdering carries only two things, both small:
-//!   1. [`TxRef`] — a pointer into the per-sequencer channel A archive,
+//!   1. [`TxRef`] — a pointer into the per-sequencer tx_data archive,
 //!      written by sequencers via Aeron *concurrent* multi-publisher.
 //!   2. [`BlockBoundaryStart`] — block-boundary marker written by the sealer
 //!      (also concurrent multi-publisher on the same stream so the boundary
 //!      is canonically ordered with the surrounding refs).
 //!
-//! Both variants are tiny (~16-32 B), so the channel-B CAS cursor sees only
+//! Both variants are tiny (~16-32 B), so the tx_ordering CAS cursor sees only
 //! reference traffic; the bulk-data path runs on M parallel exclusive channel
 //! A archives. See spec §2.3.
 //!
@@ -21,13 +21,13 @@ use rkyv::{Archive, Deserialize, Serialize};
 use crate::boundary::BlockBoundaryStart;
 use crate::txref::TxRef;
 
-/// One channel-B wire record. Variants are kept narrow to preserve the
-/// "tiny payload" property that makes channel-B's concurrent publication
+/// One tx_ordering wire record. Variants are kept narrow to preserve the
+/// "tiny payload" property that makes tx_ordering's concurrent publication
 /// affordable (D-Sh12: ~16-32 B per record).
 #[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub enum TxOrderingMessage {
-    /// A reference to a transaction on a channel-A archive.
+    /// A reference to a transaction on a tx_data archive.
     TxRef(TxRef),
     /// A block-boundary marker emitted by the sealer.
     BoundaryStart(BlockBoundaryStart),

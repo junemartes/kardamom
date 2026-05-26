@@ -1,9 +1,9 @@
-//! Drives an Aeron Archive instance to record a single stream (channel B
-//! *or* a channel A[i] per D-Sh12) and exposes the current durable
+//! Drives an Aeron Archive instance to record a single stream (tx_ordering
+//! *or* a tx_data[i] per D-Sh12) and exposes the current durable
 //! recording position.
 //!
 //! Topology after D-Sh12:
-//!   - One `Recorder` with `RecorderKind::TxOrdering` per channel-B recorder host
+//!   - One `Recorder` with `RecorderKind::TxOrdering` per tx_ordering recorder host
 //!     (N total; quorum-fsynced via the `QuorumAggregator`).
 //!   - One `Recorder` with `RecorderKind::TxData { sequencer_id }` per sequencer
 //!     host (M total; single-host fsync each).
@@ -60,9 +60,9 @@ type Archive = rusteron_archive::AeronArchive;
 /// rationale).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
-    /// Per-sequencer channel-A recorder (carries full TxEnvelopes).
+    /// Per-sequencer tx_data recorder (carries full TxEnvelopes).
     A { sequencer_id: u8 },
-    /// Channel-B canonical-orderer recorder (carries tiny TxRefs).
+    /// TxOrdering canonical-orderer recorder (carries tiny TxRefs).
     B,
 }
 
@@ -84,7 +84,7 @@ pub struct Recorder {
 }
 
 impl Recorder {
-    /// Start recording channel B on this host. Used by the N channel-B
+    /// Start recording tx_ordering on this host. Used by the N tx_ordering
     /// recorder hosts that participate in the quorum.
     pub fn start_b(
         archive: Archive,
@@ -103,7 +103,7 @@ impl Recorder {
         )
     }
 
-    /// Start recording channel A[sequencer_id]. Per D-Sh12, each sequencer
+    /// Start recording tx_data[sequencer_id]. Per D-Sh12, each sequencer
     /// host runs one of these recording its own exclusive-publisher stream.
     pub fn start_a(
         archive: Archive,
