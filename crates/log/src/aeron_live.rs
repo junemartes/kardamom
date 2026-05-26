@@ -20,8 +20,10 @@
 //!
 //! ## Roles
 //!
-//! - **Sequencer i:** `tx_data_publisher(i)` (its own A) +
-//!   `tx_ordering_publisher()` (the canonical orderer).
+//! - **Proxy (ingress) i:** `tx_data_publisher(i)` (its shard's A); the
+//!   proxy fans out validated envelopes to the per-shard tx_data stream.
+//! - **Sequencer:** `tx_data_subscriber(i)` (warm cache from its shard's A)
+//!   + `tx_ordering_publisher()` (races peers to publish refs).
 //! - **Executor / batcher:** `tx_data_subscriber(i)` for i in 0..M +
 //!   `tx_ordering_subscriber()`.
 //! - **Sealer:** `tx_ordering_publisher()` only (emits boundaries).
@@ -74,22 +76,23 @@ impl AeronRuntime {
     // TxData (per-sequencer, exclusive publication)
     // -----------------------------------------------------------------------
 
-    /// Open the tx_data publisher for sequencer `sequencer_id`. Calling
-    /// this on a non-sequencer host is a programmer error — the per-A
-    /// stream is exclusive-publisher and the only writer must be the
-    /// sequencer that owns the partition.
+    /// Open the tx_data publisher for shard `sequencer_id`. Wired by the
+    /// proxy (ingress) for its shard, which fans validated envelopes onto
+    /// the per-shard tx_data stream for sequencers / executors / batchers
+    /// to consume.
     pub fn tx_data_publisher(&self, sequencer_id: u8) -> Result<TxDataPublisher, LogError> {
         TxDataPublisher::open(&self.aeron, &self.channels, sequencer_id)
     }
 
-    /// Open a tx_data subscription. Executors / batchers open M of these
-    /// (one per sequencer).
+    /// Open a tx_data subscription. Sequencers open the one matching their
+    /// shard (warm cache); executors / batchers open M of these (one per
+    /// shard).
     pub fn tx_data_subscriber(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         self.subscribers().a(sequencer_id)
     }
 
-    /// Open the per-A fsync watermark publisher. Each sequencer's fsync
-    /// sidecar opens one of these.
+    /// Open the per-A fsync watermark publisher. Opened by the proxy host
+    /// that owns the tx_data shard.
     pub fn channel_a_watermark_publisher(
         &self,
         sequencer_id: u8,
