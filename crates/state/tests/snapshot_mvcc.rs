@@ -4,7 +4,7 @@
 mod common;
 
 use alloy_primitives::{U256, address};
-use types::StateDatabase;
+use kardamom_types::StateDatabase;
 
 #[test]
 fn pre_n_snapshot_keeps_pre_n_view() {

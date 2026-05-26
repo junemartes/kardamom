@@ -1,7 +1,7 @@
 //! 31-byte-per-field-element blob packing round-trip tests.
 
 use alloy_eips::eip4844::BYTES_PER_BLOB;
-use batcher::blob::{USABLE_BYTES_PER_BLOB, pack_to_blobs, unpack_from_blobs};
+use kardamom_batcher::blob::{USABLE_BYTES_PER_BLOB, pack_to_blobs, unpack_from_blobs};
 
 #[test]
 fn empty_payload_packs_to_one_blob() {

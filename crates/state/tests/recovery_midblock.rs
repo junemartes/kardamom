@@ -10,9 +10,9 @@
 mod common;
 
 use alloy_primitives::{U256, address};
-use state::env::{Durability, StateEnvBuilder};
-use state::{StateSnapshot, StateWriter, read_recovery_point};
-use types::StateDatabase;
+use kardamom_state::env::{Durability, StateEnvBuilder};
+use kardamom_state::{StateSnapshot, StateWriter, read_recovery_point};
+use kardamom_types::StateDatabase;
 
 #[test]
 fn recovery_point_matches_last_committed_block() {

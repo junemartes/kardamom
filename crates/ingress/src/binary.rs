@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinHandle;
 
-use types::StateDatabase;
+use kardamom_types::StateDatabase;
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;

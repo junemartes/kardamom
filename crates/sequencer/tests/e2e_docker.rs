@@ -1,7 +1,7 @@
 //! e2e: real Aeron Media Driver + Archive in Docker via the
-//! `log::testing::AeronTestCluster` harness from S3.
+//! `kardamom_log::testing::AeronTestCluster` harness from S3.
 //!
-//! Per the same convention used by `kardamom-ingress::tests::docker_e2e.rs`,
+//! Per the same convention used by `kardamom-kardamom_ingress::tests::docker_e2e.rs`,
 //! this is a topology smoke test that proves a single Aeron node can serve
 //! both the per-sequencer tx_data streams and the shared tx_ordering
 //! orderer — the full round-trip (Aeron-backed `IngressSource` adapter
@@ -15,7 +15,7 @@
 
 #![cfg(feature = "docker-e2e")]
 
-use log::testing::AeronTestCluster;
+use kardamom_log::testing::AeronTestCluster;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]

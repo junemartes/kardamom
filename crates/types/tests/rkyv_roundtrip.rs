@@ -1,6 +1,6 @@
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
-use types::*;
+use kardamom_types::*;
 
 fn roundtrip<T>(value: &T) -> T
 where
@@ -207,7 +207,7 @@ fn channel_b_message_helpers() {
 #[test]
 fn block_delta_roundtrip() {
     use alloy_primitives::U256;
-    use types::delta::CodeEntry;
+    use kardamom_types::delta::CodeEntry;
     let d = BlockDelta {
         block_number: 99,
         accounts: vec![AccountChange {

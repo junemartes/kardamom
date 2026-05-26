@@ -62,7 +62,7 @@ use tracing::{error, warn};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use types::{
+use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, FsyncWatermark, QuorumWatermark,
     Receipt, TxEnvelope, TxOrderingMessage,
 };

@@ -23,15 +23,17 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
+use kardamom_types::{BPosition, TxEnvelope};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
-use types::{BPosition, TxEnvelope};
 
-use sequencer::config::SequencerConfig;
-use sequencer::inbound::fakes::ScriptedTxData;
-use sequencer::outbound::fakes::{InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher};
-use sequencer::partition::partition_for;
-use sequencer::sequencer::Sequencer;
+use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+};
+use kardamom_sequencer::partition::partition_for;
+use kardamom_sequencer::sequencer::Sequencer;
 
 const M: u32 = 4;
 const SENDERS_PER_PARTITION: usize = 4;
@@ -84,7 +86,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     // share one `InMemoryTxOrderingRefPublisher` (cloning shares the
     // underlying Vec — same canonical B stream).
     let b = InMemoryTxOrderingRefPublisher::default();
-    let mut sequencers: Vec<Sequencer<sequencer::testing::FakeStateDatabase>> =
+    let mut sequencers: Vec<Sequencer<kardamom_sequencer::testing::FakeStateDatabase>> =
         Vec::with_capacity(M as usize);
     let mut b_pubs: Vec<InMemoryTxOrderingRefPublisher> = Vec::with_capacity(M as usize);
     let mut rcs: Vec<InMemoryReceiptCachePublisher> = Vec::with_capacity(M as usize);
@@ -103,7 +105,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
         };
         sequencers.push(Sequencer::new(
             cfg,
-            std::sync::Arc::new(sequencer::testing::FakeStateDatabase::new()),
+            std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
         ));
         b_pubs.push(b.clone());
         rcs.push(InMemoryReceiptCachePublisher::default());

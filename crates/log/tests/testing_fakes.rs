@@ -4,12 +4,14 @@ use std::collections::HashMap;
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
-use log::testing::{
+use kardamom_log::testing::{
     FakeBus, FakeFsyncWatermarkStream, FakePublication, FakeTxDataPublication,
     FakeTxDataSubscription, FakeTxOrderingPublication, FakeTxOrderingSubscription,
     FakeTypedSubscription,
 };
-use types::{BPosition, BlockBoundaryStart, FsyncWatermark, TxEnvelope, TxOrderingMessage, TxRef};
+use kardamom_types::{
+    BPosition, BlockBoundaryStart, FsyncWatermark, TxEnvelope, TxOrderingMessage, TxRef,
+};
 
 #[test]
 fn fake_pub_sub_roundtrip() {

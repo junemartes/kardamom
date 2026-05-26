@@ -3,8 +3,6 @@ name = "kardamom-types"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-name = "types"
 
 [dependencies]
 alloy-primitives.workspace = true

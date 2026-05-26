@@ -17,9 +17,11 @@
 
 use std::path::PathBuf;
 
-use batcher::batcher::{Batcher, BatcherConfig, MockSender};
-use batcher::multi_archive_reader::{MultiArchiveConfig, MultiArchiveReader, ResolvedRecord};
 use clap::Parser;
+use kardamom_batcher::batcher::{Batcher, BatcherConfig, MockSender};
+use kardamom_batcher::multi_archive_reader::{
+    MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
+};
 use tracing::{info, warn};
 
 #[derive(Parser, Debug)]

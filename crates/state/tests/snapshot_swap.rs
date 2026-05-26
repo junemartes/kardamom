@@ -4,7 +4,7 @@
 mod common;
 
 use alloy_primitives::address;
-use types::StateDatabase;
+use kardamom_types::StateDatabase;
 
 #[test]
 fn each_commit_publishes_a_post_commit_snapshot() {

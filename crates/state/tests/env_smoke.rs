@@ -1,8 +1,8 @@
 //! Smoke test: open an env, verify each table is openable inside a read txn,
 //! then close it cleanly.
 
-use state::env::{Durability, StateEnvBuilder};
-use state::schema::ALL_TABLES;
+use kardamom_state::env::{Durability, StateEnvBuilder};
+use kardamom_state::schema::ALL_TABLES;
 
 #[test]
 fn env_opens_and_closes() {

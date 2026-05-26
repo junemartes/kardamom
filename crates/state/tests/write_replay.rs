@@ -4,8 +4,8 @@
 mod common;
 
 use alloy_primitives::{U256, address};
-use state::StateSnapshot;
-use types::StateDatabase;
+use kardamom_state::StateSnapshot;
+use kardamom_types::StateDatabase;
 
 #[test]
 fn writer_applies_deltas_and_state_reflects_them() {

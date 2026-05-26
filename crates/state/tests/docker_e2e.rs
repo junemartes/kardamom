@@ -1,5 +1,5 @@
 //! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker via
-//! the [`log::testing::AeronTestCluster`] harness from S3.
+//! the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
 //!
 //!— mock-based unit and integration tests in this crate stay
 //! (write_replay, snapshot_mvcc, snapshot_swap, concurrent_readers,
@@ -27,10 +27,10 @@
 #![cfg(feature = "docker-e2e")]
 
 use alloy_primitives::address;
-use log::testing::AeronTestCluster;
-use state::StateWriter;
-use state::env::{Durability, StateEnvBuilder};
-use types::StateDatabase;
+use kardamom_log::testing::AeronTestCluster;
+use kardamom_state::StateWriter;
+use kardamom_state::env::{Durability, StateEnvBuilder};
+use kardamom_types::StateDatabase;
 
 mod common;
 

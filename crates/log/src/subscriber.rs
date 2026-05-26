@@ -16,7 +16,7 @@ use rkyv::rancor;
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use types::{
+use kardamom_types::{
     BPosition, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
     TxOrderingMessage,
 };

@@ -3,8 +3,6 @@ name = "kardamom-log"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-name = "log"
 
 [features]
 default = []
@@ -23,7 +21,7 @@ alloy-primitives.workspace = true
 bytes.workspace = true
 crossbeam-channel.workspace = true
 futures.workspace = true
-types.workspace = true
+kardamom-types.workspace = true
 rkyv.workspace = true
 rusteron-archive.workspace = true
 rusteron-client.workspace = true

@@ -9,7 +9,7 @@
 //! [`ClosedBlock`] per boundary. Txs received before the first boundary are
 //! attributed to the first block.
 
-use types::{BPosition, BlockBoundaryStart, TxEnvelope};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RecordedTx {

@@ -6,9 +6,9 @@
 #![allow(dead_code)]
 
 use alloy_primitives::{Address, B256, U256};
-use state::env::Durability;
-use state::{StateEnvBuilder, StateWriter, WriteBatch, WriterHandle};
-use types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt, StorageChange};
+use kardamom_state::env::Durability;
+use kardamom_state::{StateEnvBuilder, StateWriter, WriteBatch, WriterHandle};
+use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt, StorageChange};
 
 /// Spawn a fresh writer over a tempdir-backed env. Returns the tempdir guard
 /// so the caller controls its lifetime (drop it after the writer).

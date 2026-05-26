@@ -17,8 +17,8 @@ pub enum SequencerError {
     Log(String),
 }
 
-impl From<log::LogError> for SequencerError {
-    fn from(value: log::LogError) -> Self {
+impl From<kardamom_log::LogError> for SequencerError {
+    fn from(value: kardamom_log::LogError) -> Self {
         SequencerError::Log(value.to_string())
     }
 }

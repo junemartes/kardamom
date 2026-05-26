@@ -1,6 +1,6 @@
 //! Sender-to-partition routing.
 //!
-//! Algorithm must match `ingress::routing::partition_for` exactly:
+//! Algorithm must match `kardamom_ingress::routing::partition_for` exactly:
 //! take the first 8 bytes of `keccak256(sender.as_slice())` as a big-endian
 //! `u64`, then `% m`. The proxy routes by this rule; the sequencer must agree
 //! byte-for-byte or messages land on the wrong partition.

@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
+use kardamom_types::{BPosition, Receipt, StateDatabase};
 use signet_libmdbx::tx::aliases::RoTxSync;
 use signet_libmdbx::{Database, Environment};
-use types::{BPosition, Receipt, StateDatabase};
 
 use crate::env::StateEnv;
 use crate::error::StateError;

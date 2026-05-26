@@ -5,11 +5,11 @@ use std::hint::black_box;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
-use batcher::batch::{ClosedBlock, RecordedTx};
-use batcher::batcher::{BatcherConfig, pack_blocks};
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
-use types::{BPosition, TxEnvelope};
+use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
+use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
+use kardamom_types::{BPosition, TxEnvelope};
 
 fn make_block(n_txs: usize, raw_len: usize) -> ClosedBlock {
     let txs = (0..n_txs as u64)

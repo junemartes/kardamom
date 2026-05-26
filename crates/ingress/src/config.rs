@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use types::AckPolicy;
+use kardamom_types::AckPolicy;
 
 /// Static configuration for an `IngressProxy` instance.
 ///
@@ -36,7 +36,7 @@ pub struct IngressConfig {
     /// Receipt-cache capacity (FIFO-evicted).
     pub receipt_cache_capacity: usize,
     /// Which durability gate the proxy waits on before acking a tx. See
-    /// [`types::AckPolicy`] for the four modes.
+    /// [`kardamom_types::AckPolicy`] for the four modes.
     pub ack_policy: AckPolicy,
 }
 

@@ -10,13 +10,15 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxEnvelope};
 
-use sequencer::config::SequencerConfig;
-use sequencer::inbound::fakes::ScriptedTxData;
-use sequencer::outbound::fakes::{InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher};
-use sequencer::sequencer::Sequencer;
-use sequencer::testing::FakeStateDatabase;
+use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+};
+use kardamom_sequencer::sequencer::Sequencer;
+use kardamom_sequencer::testing::FakeStateDatabase;
 
 fn signed_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
     let mut tx = TxLegacy {

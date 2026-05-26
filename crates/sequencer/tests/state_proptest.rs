@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use alloy_primitives::Address;
 use proptest::prelude::*;
 
-use sequencer::state::{PartitionState, ProcessAction};
+use kardamom_sequencer::state::{PartitionState, ProcessAction};
 
 fn addr(i: u8) -> Address {
     Address::repeat_byte(i)

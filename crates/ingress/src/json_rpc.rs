@@ -18,7 +18,7 @@ use jsonrpsee::proc_macros::rpc;
 use jsonrpsee::server::{Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 
-use types::StateDatabase;
+use kardamom_types::StateDatabase;
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
@@ -121,14 +121,14 @@ where
     }
 }
 
-/// Adapter from our internal `types::Receipt` to alloy's
+/// Adapter from our internal `kardamom_types::Receipt` to alloy's
 /// `TransactionReceipt`. The internal type carries the canonical B-position
 /// and `write_set_hash` that the public Eth API does not need; this drops
 /// them. Block-number / block-hash / from / to / transaction-index are left
 /// at default — populating those requires a state-DB join that v0 of the
 /// proxy doesn't perform. The calling test asserts presence, not field-by-
 /// field equality.
-fn receipt_to_rpc(r: types::Receipt) -> TransactionReceipt {
+fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
     TransactionReceipt {
         inner: alloy_rpc_types_eth::ReceiptEnvelope::Legacy(alloy_consensus::ReceiptWithBloom {
             receipt: alloy_consensus::Receipt {

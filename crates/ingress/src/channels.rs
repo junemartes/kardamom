@@ -17,7 +17,7 @@ use alloy_primitives::B256;
 use async_trait::async_trait;
 use tokio::sync::{Mutex, broadcast, mpsc};
 
-use types::{
+use kardamom_types::{
     BPosition, BlockBoundary, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
 };
 
@@ -153,7 +153,7 @@ impl IngressSubscription for MockChannels {
 }
 
 // ============================================================================
-// InMemoryStateDb — implements `types::StateDatabase` for tests.
+// InMemoryStateDb — implements `kardamom_types::StateDatabase` for tests.
 //
 // Real production proxy gets the libmdbx-backed impl shipped by S6 once that
 // crate lands. The proxy only uses the receipt + tx_hash_index read paths
@@ -192,9 +192,9 @@ impl InMemoryStateDb {
 #[error("in-memory state db error")]
 pub struct InMemoryStateError;
 
-impl types::StateError for InMemoryStateError {}
+impl kardamom_types::StateError for InMemoryStateError {}
 
-impl types::StateDatabase for InMemoryStateDb {
+impl kardamom_types::StateDatabase for InMemoryStateDb {
     type Error = InMemoryStateError;
 
     fn basic(
@@ -236,7 +236,7 @@ mod tests {
     use super::*;
     use alloy_primitives::Address;
     use bytes::Bytes;
-    use types::StateDatabase;
+    use kardamom_types::StateDatabase;
 
     #[tokio::test]
     async fn mock_routes_to_shard() {

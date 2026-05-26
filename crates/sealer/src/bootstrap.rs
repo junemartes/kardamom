@@ -19,7 +19,7 @@
 //! exercise; the supervisor's bootstrap path uses the same helper after
 //! draining the live subscription.
 
-use types::BlockBoundaryStart;
+use kardamom_types::BlockBoundaryStart;
 
 /// Iterator-based helper. Returns the next `block_number` the local emitter
 /// should use:
@@ -43,7 +43,7 @@ pub fn next_after(max_seen: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::BPosition;
+    use kardamom_types::BPosition;
 
     fn bs(n: u64) -> BlockBoundaryStart {
         BlockBoundaryStart {

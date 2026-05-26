@@ -4,18 +4,16 @@ version.workspace = true
 edition.workspace = true
 build = "build.rs"
 
-[lib]
-name = "batcher"
 
 [features]
 default = []
 # Real Aeron container e2e. Implies the in-memory testing helpers from
 # `log` because the harness re-uses some of them.
-docker-e2e = ["log/docker-e2e", "log/testing"]
+docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 
 [dependencies]
-types.workspace = true
-log.workspace = true
+kardamom-types.workspace = true
+kardamom-log.workspace = true
 # Pulled in as a regular dependency (not just dev-dep) primarily to force
 # build-order: kardamom-deployer's build.rs runs forge install + forge build,
 # populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
@@ -49,7 +47,7 @@ tokio.workspace = true
 clap.workspace = true
 
 [dev-dependencies]
-log = { workspace = true, features = ["testing"] }
+kardamom-log = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

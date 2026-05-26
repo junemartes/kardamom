@@ -1,7 +1,7 @@
 //! **Proof-of-pipeline** end-to-end test.
 //!
 //! Brings up real Aeron in Docker, wires the kardamom log layer against it
-//! via the new Send-friendly [`log::aeron_live`] adapters, and drives N
+//! via the new Send-friendly [`kardamom_log::aeron_live`] adapters, and drives N
 //! synthetic txs through:
 //!
 //!   1. publish onto tx_data (real Aeron, recorded — per-shard envelope
@@ -32,13 +32,13 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use e2e::pipeline::channel_uri_for;
-use log::aeron_live::{
+use kardamom_log::aeron_live::{
     AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle, TxReceiptsPublisherHandle,
     TxReceiptsSubscriberHandle,
 };
-use log::config::LogConfig;
-use log::testing::AeronTestCluster;
-use types::{BPosition, BlockBoundary, Receipt, TxEnvelope, WireLog};
+use kardamom_log::config::LogConfig;
+use kardamom_log::testing::AeronTestCluster;
+use kardamom_types::{BPosition, BlockBoundary, Receipt, TxEnvelope, WireLog};
 
 async fn docker_available() -> bool {
     use tokio::process::Command;
@@ -239,9 +239,9 @@ async fn proof_of_pipeline_round_trip() {
 /// Open a libmdbx state writer in a tempdir, push one BlockDelta, and assert
 /// the post-commit snapshot reflects the committed account.
 fn state_writer_round_trip() {
-    use state::env::{Durability, StateEnvBuilder};
-    use state::writer::{StateWriter, WriteBatch};
-    use types::{AccountChange, BlockDelta, StateDatabase};
+    use kardamom_state::env::{Durability, StateEnvBuilder};
+    use kardamom_state::writer::{StateWriter, WriteBatch};
+    use kardamom_types::{AccountChange, BlockDelta, StateDatabase};
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let env = StateEnvBuilder::new(tmp.path())

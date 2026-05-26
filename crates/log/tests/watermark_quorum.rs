@@ -1,5 +1,5 @@
-use log::watermark::QuorumState;
-use types::{BPosition, FsyncWatermark};
+use kardamom_log::watermark::QuorumState;
+use kardamom_types::{BPosition, FsyncWatermark};
 
 fn pos(t: i32, o: i32) -> BPosition {
     BPosition {

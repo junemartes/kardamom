@@ -11,9 +11,9 @@ use alloy_signer_local::PrivateKeySigner;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use k256::ecdsa::{RecoveryId, signature::hazmat::PrehashSigner};
 
-use ingress::config::IngressConfig;
-use ingress::{InMemoryStateDb, IngressProxy, MockChannels};
-use types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
+use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
 
 fn sign(s: &PrivateKeySigner, nonce: u64) -> Bytes {
     let tx = TxLegacy {

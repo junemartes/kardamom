@@ -22,7 +22,7 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 
-use executor::{
+use kardamom_executor::{
     BPosition, BlockBoundary, BlockBoundaryStart, CMessage, Executor, ExecutorConfig,
     ExecutorError, MockStateDatabase, MutatingSnapshotSource, StateWriterSignal,
     TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,

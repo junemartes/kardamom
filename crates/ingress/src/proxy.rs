@@ -12,7 +12,7 @@ use alloy_primitives::{B256, Bytes as AlloyBytes};
 use alloy_rlp::Decodable;
 use tokio::sync::broadcast;
 
-use types::{BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
+use kardamom_types::{BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;

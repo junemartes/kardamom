@@ -16,14 +16,16 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
+use kardamom_types::{BPosition, TxEnvelope};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
-use types::{BPosition, TxEnvelope};
 
-use sequencer::config::SequencerConfig;
-use sequencer::inbound::fakes::ScriptedTxData;
-use sequencer::outbound::fakes::{InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher};
-use sequencer::sequencer::Sequencer;
+use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+};
+use kardamom_sequencer::sequencer::Sequencer;
 
 fn signer(seed: u64) -> PrivateKeySigner {
     let mut k = [0u8; 32];
@@ -74,7 +76,7 @@ fn integration_1000_txs_100_senders_with_chaos() {
     };
     let mut seq = Sequencer::new(
         cfg.clone(),
-        std::sync::Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xDEAD_BEEF);
@@ -162,7 +164,7 @@ fn integration_duplicates_are_reported() {
     };
     let mut seq = Sequencer::new(
         cfg,
-        std::sync::Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
     let s = signer(7);
     let mut channel_a = ScriptedTxData::default();
@@ -210,7 +212,7 @@ fn integration_bounded_buffer_evicts_oldest() {
     };
     let mut seq = Sequencer::new(
         cfg,
-        std::sync::Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
     let s = signer(42);
     let mut channel_a = ScriptedTxData::default();

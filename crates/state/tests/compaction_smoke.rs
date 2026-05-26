@@ -2,8 +2,8 @@
 //! file. Does not verify byte-for-byte equivalence (that's the responsibility
 //! of libmdbx itself).
 
-use state::compact_to;
-use state::env::{Durability, StateEnvBuilder};
+use kardamom_state::compact_to;
+use kardamom_state::env::{Durability, StateEnvBuilder};
 
 #[test]
 fn compact_emits_a_directory() {

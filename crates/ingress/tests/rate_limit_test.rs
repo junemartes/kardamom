@@ -8,9 +8,9 @@ use std::time::Duration;
 use alloy_primitives::Bytes;
 use nonzero_ext::nonzero;
 
-use ingress::config::IngressConfig;
-use ingress::error::IngressError;
-use ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::error::IngressError;
+use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
 
 #[tokio::test]
 async fn third_call_from_same_ip_is_rate_limited() {

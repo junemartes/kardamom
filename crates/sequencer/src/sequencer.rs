@@ -42,8 +42,8 @@ use std::time::Duration;
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
+use kardamom_types::{BPosition, StateDatabase, TxRef};
 use tracing::{trace, warn};
-use types::{BPosition, StateDatabase, TxRef};
 
 use crate::config::SequencerConfig;
 use crate::duplicate::DuplicateNotification;

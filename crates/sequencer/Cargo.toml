@@ -7,8 +7,6 @@ edition.workspace = true
 name = "kardamom-sequencer"
 path = "src/bin/kardamom-sequencer.rs"
 
-[lib]
-name = "sequencer"
 
 [features]
 # In-memory fakes for downstream-crate unit tests. Enables the `fakes` modules
@@ -16,7 +14,7 @@ name = "sequencer"
 # pull-back; off in production.
 testing = []
 # Real-Aeron Docker e2e test gate. Implies `testing` for the harness import.
-docker-e2e = ["testing", "log/docker-e2e"]
+docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -27,8 +25,8 @@ bytes.workspace = true
 clap.workspace = true
 core_affinity = "0.8"
 ctrlc = { version = "3", features = ["termination"] }
-log = { workspace = true, features = ["testing"] }
-types.workspace = true
+kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-types.workspace = true
 metrics.workspace = true
 rkyv.workspace = true
 serde.workspace = true
@@ -45,8 +43,8 @@ criterion.workspace = true
 # Pull in our own `testing` feature so integration tests under `tests/`
 # always have access to the `fakes` modules without needing
 # `cargo test --features testing` (matches the convention CI uses).
-sequencer = { path = ".", package = "kardamom-sequencer", features = ["testing"] }
-log = { workspace = true, features = ["testing"] }
+kardamom-sequencer = { path = ".", features = ["testing"] }
+kardamom-log = { workspace = true, features = ["testing"] }
 proptest = "1"
 rand = "0.9"
 

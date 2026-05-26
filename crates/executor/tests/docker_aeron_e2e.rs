@@ -4,9 +4,9 @@
 //! tx_ordering/C wrappers under the `aeron-live` + `testing` features of
 //! `kardamom-log`. Today S3 only ships:
 //!
-//! - `log::testing::AeronTestCluster` (testcontainers harness),
-//! - `log::testing::Fake*` in-memory pub/sub stand-ins,
-//! - `log::codec::{encode, access, materialize}` for rkyv ↔ bytes.
+//! - `kardamom_log::testing::AeronTestCluster` (testcontainers harness),
+//! - `kardamom_log::testing::Fake*` in-memory pub/sub stand-ins,
+//! - `kardamom_log::codec::{encode, access, materialize}` for rkyv ↔ bytes.
 //!
 //! The tx_ordering/C publishers and subscribers that wrap the real rusteron
 //! handles into `TxOrderingSubscription` / `TxReceiptsPublication` adapters are
@@ -25,7 +25,7 @@
 //! `RealTxReceiptsSubscription` (gated by `aeron-live`).
 //!
 //! Until then, the in-memory `FakePublication` / `FakeTypedSubscription`
-//! fakes shipped by `log::testing` already give us the wire-format
+//! fakes shipped by `kardamom_log::testing` already give us the wire-format
 //! check via the unit tests in this crate; the real-Aeron coverage is
 //! about back-pressure / fsync / image-availability behaviour that only
 //! emerges against the real Java Media Driver + Archive.

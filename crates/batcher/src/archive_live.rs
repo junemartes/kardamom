@@ -1,7 +1,7 @@
 //! Live Aeron Archive reader. (unconditional dep on rusteron.)
 //!
 //! Same `!Send + !Sync` thread-confinement discipline as
-//! `log::recorder` — owns its `AeronArchive` on a single thread,
+//! `kardamom_log::recorder` — owns its `AeronArchive` on a single thread,
 //! never crosses it.
 //!
 //! v0 implements the **filesystem read path**: the batcher process has direct
@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use types::{TxEnvelope, TxOrderingMessage};
+use kardamom_types::{TxEnvelope, TxOrderingMessage};
 
 use rusteron_archive::{
     AeronArchive, AeronArchiveRecordingDescriptor,

@@ -8,7 +8,7 @@ use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
-use types::{BPosition, Receipt, StateDatabase, StateError};
+use kardamom_types::{BPosition, Receipt, StateDatabase, StateError};
 
 /// In-memory `StateDatabase` used by sequencer tests. By default every
 /// `basic` lookup returns `Ok(None)` (sender hydrates as a new account at

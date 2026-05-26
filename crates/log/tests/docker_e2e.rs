@@ -1,6 +1,6 @@
 //! Real-Aeron e2e: publish + record + watermark + subscribe end-to-end via
 //! Docker containers. Other crates' e2e tests (S1, S2, S4, S5, S6, S7) reuse
-//! [`log::testing::AeronTestCluster`] (gated behind the `docker-e2e`
+//! [`kardamom_log::testing::AeronTestCluster`] (gated behind the `docker-e2e`
 //! feature).
 //!
 //! Gated on the `docker-e2e` + `aeron-live` features AND on Docker
@@ -20,11 +20,11 @@
 use std::rc::Rc;
 use std::time::Duration;
 
-use log::config::LogConfig;
-use log::publisher::TxOrderingPublisher;
-use log::subscriber::Subscribers;
-use log::testing::AeronTestCluster;
-use types::{BPosition, TxOrderingMessage, TxRef};
+use kardamom_log::config::LogConfig;
+use kardamom_log::publisher::TxOrderingPublisher;
+use kardamom_log::subscriber::Subscribers;
+use kardamom_log::testing::AeronTestCluster;
+use kardamom_types::{BPosition, TxOrderingMessage, TxRef};
 
 async fn docker_available() -> bool {
     use tokio::process::Command;

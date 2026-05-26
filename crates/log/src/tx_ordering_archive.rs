@@ -24,7 +24,7 @@ use tracing::error;
 use crate::aeron_live::{AeronRuntime, DeliverFn};
 use crate::codec;
 use crate::error::LogError;
-use types::{BPosition, TxOrderingMessage};
+use kardamom_types::{BPosition, TxOrderingMessage};
 
 type Archive = rusteron_archive::AeronArchive;
 

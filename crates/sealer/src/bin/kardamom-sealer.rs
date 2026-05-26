@@ -10,7 +10,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Parser;
-use sealer::SealerConfig;
+use kardamom_sealer::SealerConfig;
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-sealer", version, about = "S5 block sealer")]

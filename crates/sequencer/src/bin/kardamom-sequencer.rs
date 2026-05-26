@@ -8,7 +8,7 @@
 //!   - if `aeron-live` is NOT enabled: emits a clear error and exits with
 //!     status 2 so operators don't ship a no-op binary by accident.
 //!
-//! The aeron-live wiring uses the existing `log::publisher` /
+//! The aeron-live wiring uses the existing `kardamom_log::publisher` /
 //! `subscriber` builders for tx_ordering and the receipt-cache channel. The
 //! proxy -> sequencer ingress channel surface is still under design in S3 /
 //! S1 (currently an in-process `MockChannels` mpsc); when that surface lands
@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use sequencer::config::SequencerConfig;
+use kardamom_sequencer::config::SequencerConfig;
 
 #[derive(Debug, Parser)]
 #[command(name = "kardamom-sequencer", version, about = "S2 sequencer process")]

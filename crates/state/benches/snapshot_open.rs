@@ -5,8 +5,8 @@ use std::time::Duration;
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use state::StateSnapshot;
-use state::env::{Durability, StateEnvBuilder};
+use kardamom_state::StateSnapshot;
+use kardamom_state::env::{Durability, StateEnvBuilder};
 
 fn bench_snapshot_open(c: &mut Criterion) {
     let dir = tempfile::tempdir().unwrap();

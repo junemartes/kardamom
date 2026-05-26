@@ -3,8 +3,6 @@ name = "kardamom-ingress"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-name = "ingress"
 
 [features]
 default = ["binary-protocol"]
@@ -13,7 +11,7 @@ binary-protocol = []
 # Gates a Docker-backed e2e test (real Aeron via kardamom-log testcontainers
 # harness). Off by default so `cargo test` works without Docker. Implies
 # `kardamom-log/docker-e2e` for the AeronTestCluster harness.
-docker-e2e = ["log/docker-e2e"]
+docker-e2e = ["kardamom-log/docker-e2e"]
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -26,8 +24,8 @@ dashmap = "6"
 governor = "0.10"
 hyper = { version = "1", features = ["http1", "server"] }
 jsonrpsee.workspace = true
-log = { workspace = true, features = ["testing"] }
-types.workspace = true
+kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-types.workspace = true
 metrics.workspace = true
 nonzero_ext = "0.3"
 secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
@@ -44,7 +42,7 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 futures.workspace = true
 jsonrpsee = { version = "0.26", features = ["server", "macros", "client", "http-client"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
-log = { workspace = true, features = ["testing"] }
+kardamom-log = { workspace = true, features = ["testing"] }
 rand = "0.9"
 tracing-subscriber.workspace = true
 

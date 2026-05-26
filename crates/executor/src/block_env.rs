@@ -4,8 +4,8 @@
 //! tx_ordering input. No wall clocks, no entropy.
 
 use alloy_primitives::U256;
+use kardamom_types::BlockBoundaryStart;
 use revm::context::{BlockEnv, CfgEnv};
-use types::BlockBoundaryStart;
 
 /// Per-block execution context derived from the sealer's BlockBoundaryStart.
 /// Stable for every tx in the block; rebuilt at each boundary.
@@ -50,7 +50,7 @@ impl ExecEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::BPosition;
+    use kardamom_types::BPosition;
 
     fn pos(off: i32) -> BPosition {
         BPosition {

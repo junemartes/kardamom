@@ -20,7 +20,7 @@ use std::sync::{Arc, RwLock};
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
-use types::{
+use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt, SnapshotSource, StateDatabase,
     StateError, StorageChange,
 };

@@ -1,14 +1,14 @@
 //! Per-tick overhead microbench for the boundary emitter.
 //!
-//! Drives [`sealer::emitter::BoundaryEmitter::run_one_tick`] against
+//! Drives [`kardamom_sealer::emitter::BoundaryEmitter::run_one_tick`] against
 //! the in-memory FakeBus adapter. Measures the sealer's CPU work only — not
 //! Aeron transit. Target: sub-microsecond per tick on commodity hardware.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use log::testing::FakeBus;
-use sealer::clock::MockClock;
-use sealer::emitter::BoundaryEmitter;
-use sealer::emitter::fakes::FakeBoundaryPublisher;
+use kardamom_log::testing::FakeBus;
+use kardamom_sealer::clock::MockClock;
+use kardamom_sealer::emitter::BoundaryEmitter;
+use kardamom_sealer::emitter::fakes::FakeBoundaryPublisher;
 
 fn bench_emit(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()

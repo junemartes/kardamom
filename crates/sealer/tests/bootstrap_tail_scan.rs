@@ -1,11 +1,11 @@
-//! Bootstrap integration test against `log::testing::FakeBus`.
+//! Bootstrap integration test against `kardamom_log::testing::FakeBus`.
 //!
 //! Publishes `BlockBoundaryStart`s on the boundary stream; the bootstrap
 //! drain helper should return `max + 1`.
 
-use log::testing::{FakeBus, FakePublication, FakeTypedSubscription};
-use sealer::bootstrap::next_block_number_from_iter;
-use types::{BPosition, BlockBoundaryStart};
+use kardamom_log::testing::{FakeBus, FakePublication, FakeTypedSubscription};
+use kardamom_sealer::bootstrap::next_block_number_from_iter;
+use kardamom_types::{BPosition, BlockBoundaryStart};
 
 const CHANNEL: &str = "aeron:udp?endpoint=fake:0";
 const BOUNDARY_STREAM: i32 = 9001;

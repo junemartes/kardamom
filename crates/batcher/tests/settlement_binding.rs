@@ -2,7 +2,7 @@
 
 use alloy_primitives::{Address, B256, keccak256};
 use alloy_sol_types::SolCall;
-use batcher::settlement::{
+use kardamom_batcher::settlement::{
     IKardamomL2Settlement, PostBatchParams, versioned_hashes_from_commitments,
 };
 

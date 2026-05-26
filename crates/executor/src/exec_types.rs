@@ -7,17 +7,17 @@
 //!
 //! Pre-S4-arch-update this module also held a `BMessage` enum that was the
 //! executor's internal inbound demux (`Tx | BoundaryStart` with full
-//! envelopes). Post- the inbound type is `types::
+//! envelopes). Post- the inbound type is `kardamom_types::
 //! TxOrderingMessage` (tiny refs + boundaries) plus the per-A `TxEnvelope`
 //! streams; the executor reads them through the `reader.rs` module rather
 //! than a single demux enum.
 //!
 //! The executor's `ReceiptStatus` enum is a local presentation of revm's
-//! execution outcome — `types::Receipt.status` is a single `bool`
+//! execution outcome — `kardamom_types::Receipt.status` is a single `bool`
 //! (success/failure); the executor converts before publishing.
 
+use kardamom_types::{BlockBoundary, Receipt};
 use revm::context::result::HaltReason;
-use types::{BlockBoundary, Receipt};
 
 /// Monotonically increasing global index of a tx within the canonical
 /// tx_ordering stream. Derived by the executor's tx_ordering reader from the
@@ -42,7 +42,7 @@ pub enum CMessage {
 }
 
 /// Executor-local presentation of revm's execution outcome. Folded into a
-/// `bool` when materializing `types::Receipt.status` (success vs.
+/// `bool` when materializing `kardamom_types::Receipt.status` (success vs.
 /// failure); the richer Halt reason stays internal for diagnostics/logs only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptStatus {
@@ -60,7 +60,7 @@ impl ReceiptStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::BPosition;
+    use kardamom_types::BPosition;
 
     #[test]
     fn tx_index_next_increments() {

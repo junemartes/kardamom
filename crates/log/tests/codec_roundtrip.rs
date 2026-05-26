@@ -1,7 +1,7 @@
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
-use log::codec::{access, encode, materialize};
-use types::*;
+use kardamom_log::codec::{access, encode, materialize};
+use kardamom_types::*;
 
 #[test]
 fn log_codec_access_and_materialize() {

@@ -11,7 +11,7 @@
 //! | `last_fsynced_b_position`            | `BPosition` (8 B)              |
 //! | `schema_version`                     | `u32 BE` (currently 1)         |
 
-use types::BPosition;
+use kardamom_types::BPosition;
 
 use crate::error::StateError;
 

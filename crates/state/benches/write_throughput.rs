@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use state::env::{Durability, StateEnvBuilder};
-use state::{StateWriter, WriteBatch};
-use types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt};
+use kardamom_state::env::{Durability, StateEnvBuilder};
+use kardamom_state::{StateWriter, WriteBatch};
+use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt};
 
 fn big_batch(block: u64) -> WriteBatch {
     // ~25 MB target: 100 B per account × 250k accounts. Real workload mixes

@@ -2,7 +2,7 @@
 //! pipeline.
 //!
 //! Brings up real Aeron in Docker, opens the new Send-friendly
-//! [`log::aeron_live`] adapters, and measures:
+//! [`kardamom_log::aeron_live`] adapters, and measures:
 //!
 //!   - **throughput** — sustained tx/s over the publish→subscribe round
 //!     trip on tx_data,
@@ -29,10 +29,10 @@ fn run_e2e_throughput(c: &mut Criterion) {
 
     use alloy_primitives::{Address, B256};
     use bytes::Bytes;
-    use log::aeron_live::{AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle};
-    use log::config::LogConfig;
-    use log::testing::AeronTestCluster;
-    use types::TxEnvelope;
+    use kardamom_log::aeron_live::{AeronRuntime, TxDataPublisherHandle, TxDataSubscriberHandle};
+    use kardamom_log::config::LogConfig;
+    use kardamom_log::testing::AeronTestCluster;
+    use kardamom_types::TxEnvelope;
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

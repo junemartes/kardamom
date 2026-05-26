@@ -13,13 +13,15 @@ use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxEnvelope};
 
-use sequencer::config::SequencerConfig;
-use sequencer::error::SequencerError;
-use sequencer::inbound::TxDataSubscriber;
-use sequencer::outbound::fakes::{InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher};
-use sequencer::sequencer::Sequencer;
+use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::error::SequencerError;
+use kardamom_sequencer::inbound::TxDataSubscriber;
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+};
+use kardamom_sequencer::sequencer::Sequencer;
 
 struct DequeTxData(VecDeque<(BPosition, TxEnvelope)>);
 impl TxDataSubscriber for DequeTxData {
@@ -81,7 +83,7 @@ fn bench_in_order(c: &mut Criterion) {
                             max_pending_per_sender: 16,
                             ..Default::default()
                         },
-                        std::sync::Arc::new(sequencer::testing::FakeStateDatabase::new()),
+                        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
                     ),
                     DequeTxData(batch.clone().into_iter().collect()),
                     InMemoryTxOrderingRefPublisher::default(),

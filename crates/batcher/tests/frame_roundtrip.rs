@@ -1,8 +1,8 @@
 //! KAR1 framing round-trip tests.
 
 use alloy_primitives::{Address, B256};
-use batcher::frame::{BlockFrame, Kar1Payload, MAGIC, TxFrame, decode, encode};
 use bytes::Bytes;
+use kardamom_batcher::frame::{BlockFrame, Kar1Payload, MAGIC, TxFrame, decode, encode};
 
 fn sample_payload() -> Kar1Payload {
     Kar1Payload {

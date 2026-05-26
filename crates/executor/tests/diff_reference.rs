@@ -28,8 +28,8 @@ use revm::primitives::{KECCAK_EMPTY, TxKind};
 use revm::state::Bytecode;
 use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
-use executor::executor::SnapshotRef;
-use executor::{
+use kardamom_executor::executor::SnapshotRef;
+use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxDataSubscription,
     TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
@@ -81,7 +81,7 @@ fn bpos(off: i32) -> BPosition {
     }
 }
 
-/// Build a proxy-style `types::TxEnvelope` (raw_tx, sender, tx_hash
+/// Build a proxy-style `kardamom_types::TxEnvelope` (raw_tx, sender, tx_hash
 /// populated). The naïve reference decodes back to alloy for revm.
 fn legacy(
     signer: &PrivateKeySigner,

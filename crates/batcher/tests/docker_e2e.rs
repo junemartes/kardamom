@@ -1,5 +1,5 @@
 //! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker via
-//! the [`log::testing::AeronTestCluster`] harness from S3.
+//! the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
 //!
 //!— mock-based unit and integration tests in this crate stay;
 //! this is *additional* coverage that brings up the real Aeron container so we
@@ -35,14 +35,16 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use alloy_primitives::{Address, B256};
-use batcher::archive_reader::append_frame;
-use batcher::batcher::{Batcher, BatcherConfig, MockSender, pack_blocks};
-use batcher::multi_archive_reader::{MultiArchiveConfig, MultiArchiveReader, ResolvedRecord};
-use batcher::recon::reconstruct;
 use bytes::Bytes;
-use log::testing::AeronTestCluster;
+use kardamom_batcher::archive_reader::append_frame;
+use kardamom_batcher::batcher::{Batcher, BatcherConfig, MockSender, pack_blocks};
+use kardamom_batcher::multi_archive_reader::{
+    MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
+};
+use kardamom_batcher::recon::reconstruct;
+use kardamom_log::testing::AeronTestCluster;
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 use tempfile::TempDir;
-use types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 
 fn pos(o: i32) -> BPosition {
     BPosition {

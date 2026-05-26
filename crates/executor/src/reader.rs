@@ -52,7 +52,7 @@ use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
-use types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage};
 
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
@@ -60,9 +60,9 @@ use crate::exec_types::TxIndex;
 /// Subscription to one **tx_data[i]**.
 ///
 /// One impl per sequencer partition. Implementations:
-/// - in production: `log::TxDataSubscriber` on a dedicated OS thread.
+/// - in production: `kardamom_log::TxDataSubscriber` on a dedicated OS thread.
 /// - in tests: [`crate::testing::VecTxDataSub`] /
-///   `FakeTxDataSubscription` from `log::testing`.
+///   `FakeTxDataSubscription` from `kardamom_log::testing`.
 ///
 /// The contract: `next` blocks until the next `(tx_data_position, envelope)` is
 /// available; returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
@@ -81,9 +81,9 @@ pub trait TxDataSubscription: Send {
 /// tagged with its canonical `BPosition`. The `BPosition` is the system's
 /// canonical L2 tx ordering (invariant I1).
 ///
-/// In production: `log::TxOrderingSubscriber` on a dedicated OS thread.
+/// In production: `kardamom_log::TxOrderingSubscriber` on a dedicated OS thread.
 /// In tests: see [`crate::testing::VecTxOrderingSub`] or
-/// `log::testing::FakeTxOrderingSubscription`.
+/// `kardamom_log::testing::FakeTxOrderingSubscription`.
 pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
 }
@@ -244,7 +244,7 @@ where
                         if !seen_tx_hashes.insert(tx_ref.tx_hash) {
                             // Duplicate from racing sequencers — drop.
                             debug!(
-                                target: "executor::reader",
+                                target: "kardamom_executor::reader",
                                 tx_hash = ?tx_ref.tx_hash,
                                 shard_id = tx_ref.shard_id,
                                 "skipping duplicate TxRef (MDS racing sequencers)"
@@ -261,7 +261,7 @@ where
                             Some(e) => e,
                             None => {
                                 warn!(
-                                    target: "executor::reader",
+                                    target: "kardamom_executor::reader",
                                     sequencer_id = tx_ref.shard_id,
                                     tx_data_position = ?tx_ref.tx_data_position,
                                     timeout_ms = cfg.join_timeout.as_millis() as u64,
@@ -281,7 +281,7 @@ where
                         let cur = buffer.len();
                         if cur >= cfg.buffer_warn_threshold && cur > last_warn_len * 2 {
                             warn!(
-                                target: "executor::reader",
+                                target: "kardamom_executor::reader",
                                 join_buffer_len = cur,
                                 threshold = cfg.buffer_warn_threshold,
                                 "join buffer growth: A-publisher likely outrunning B"
@@ -304,7 +304,7 @@ where
                     }
                     TxOrderingMessage::BoundaryStart(b) => {
                         debug!(
-                            target: "executor::reader",
+                            target: "kardamom_executor::reader",
                             block_number = b.block_number,
                             end_tx_idx = ?b.end_tx_idx,
                             "forwarding BlockBoundaryStart"
@@ -353,8 +353,8 @@ mod tests {
     use alloy_signer_local::PrivateKeySigner;
     use bytes::Bytes;
     use crossbeam_channel::bounded;
+    use kardamom_types::TxRef;
     use std::collections::VecDeque;
-    use types::TxRef;
 
     fn envelope(signer: &PrivateKeySigner, nonce: u64) -> TxEnvelope {
         let mut tx = TxLegacy {

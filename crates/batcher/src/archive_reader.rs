@@ -36,9 +36,9 @@ use std::io::Read;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
+use kardamom_types::{BPosition, TxEnvelope, TxOrderingMessage};
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
-use types::{BPosition, TxEnvelope, TxOrderingMessage};
 
 use crate::error::BatcherError;
 

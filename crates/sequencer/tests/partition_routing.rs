@@ -1,7 +1,7 @@
 //! Integration test pinning partition_for distribution + cross-crate parity.
 
 use alloy_primitives::Address;
-use sequencer::partition::{partition_for, validate_partition_count};
+use kardamom_sequencer::partition::{partition_for, validate_partition_count};
 
 #[test]
 fn partition_distributes_roughly_uniformly() {

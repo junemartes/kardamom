@@ -20,7 +20,7 @@
 //! position that is byte-durable on local storage — no separate fsync
 //! sidecar is required. The per-recorder watermark loop
 //! ([`run_watermark_loop`]) periodically polls this position and republishes
-//! it as a [`types::FsyncWatermark`] for the quorum aggregator
+//! it as a [`kardamom_types::FsyncWatermark`] for the quorum aggregator
 //! ([`crate::watermark::QuorumAggregator`]) to combine.
 //!
 //! ## Design note: thread confinement
@@ -50,7 +50,7 @@ use tracing::{info, warn};
 use crate::config::{ChannelsConfig, RecorderId};
 use crate::error::LogError;
 use crate::publisher::WatermarkPublisher;
-use types::FsyncWatermark;
+use kardamom_types::FsyncWatermark;
 
 type Archive = rusteron_archive::AeronArchive;
 
@@ -220,9 +220,9 @@ impl Recorder {
     /// Decompose an absolute Aeron stream position into the
     /// `(term_id, term_offset)` pair `BPosition` carries, using this
     /// recording's term buffer length.
-    fn to_bposition(&self, pos: i64) -> types::BPosition {
+    fn to_bposition(&self, pos: i64) -> kardamom_types::BPosition {
         let term_len = self.term_buffer_length as i64;
-        types::BPosition {
+        kardamom_types::BPosition {
             term_id: (pos / term_len) as i32,
             term_offset: (pos % term_len) as i32,
         }

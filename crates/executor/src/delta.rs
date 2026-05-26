@@ -1,6 +1,6 @@
 //! Per-tx write-set accumulation and deterministic hashing.
 //!
-//! `WriteSet` is the per-tx unit. `types::BlockDelta` is the
+//! `WriteSet` is the per-tx unit. `kardamom_types::BlockDelta` is the
 //! per-block accumulator the state writer eventually consumes. The crucial
 //! invariant is that `WriteSet::hash()` is identical across all executor
 //! replicas for any given tx — see (divergence panic).
@@ -18,8 +18,8 @@ use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use bytes::Bytes;
-use types::delta::CodeEntry;
-use types::{AccountChange, BlockDelta, StorageChange};
+use kardamom_types::delta::CodeEntry;
+use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 
 /// One transaction's write effects. `BTreeMap` so iteration is canonical.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -93,7 +93,7 @@ impl WriteSet {
 
 /// Mutable per-block accumulator the exec thread carries between txs. Holds
 /// the same canonical maps as `WriteSet` so we can both layer running writes
-/// over the snapshot for the next tx and serialize to `types::
+/// over the snapshot for the next tx and serialize to `kardamom_types::
 /// BlockDelta` at block close.
 #[derive(Debug, Default, Clone)]
 pub struct PendingDelta {

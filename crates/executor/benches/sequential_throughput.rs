@@ -25,9 +25,9 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 use revm::primitives::KECCAK_EMPTY;
 use revm::state::Bytecode;
 
-use executor::block_env::ExecEnv;
-use executor::executor::execute_tx;
-use executor::{
+use kardamom_executor::block_env::ExecEnv;
+use kardamom_executor::executor::execute_tx;
+use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, MutatingSnapshotSource, PendingDelta, StateWriterSignal, TxDataSubscription,
     TxEnvelope as KtTxEnvelope, TxIndex, TxOrderingMessage, TxOrderingSubscription,

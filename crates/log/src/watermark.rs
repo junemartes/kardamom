@@ -9,7 +9,7 @@
 //! advancing, and the quorum stalls past it once Q-1 survivors have moved
 //! beyond it. The supervisor is responsible for restarting dead recorders.
 
-use types::{BPosition, FsyncWatermark};
+use kardamom_types::{BPosition, FsyncWatermark};
 
 #[derive(Clone, Debug)]
 pub struct QuorumState {
@@ -77,7 +77,7 @@ mod aggregator {
     use crate::error::LogError;
     use crate::publisher::QuorumPublisher;
     use crate::subscriber::Subscribers;
-    use types::QuorumWatermark;
+    use kardamom_types::QuorumWatermark;
 
     use super::QuorumState;
 

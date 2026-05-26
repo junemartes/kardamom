@@ -1,7 +1,7 @@
 //! Property: `pack_to_blobs` ↔ `unpack_from_blobs` round-trips any byte input
 //! ≤ 6 blobs of payload.
 
-use batcher::blob::{USABLE_BYTES_PER_BLOB, pack_to_blobs, unpack_from_blobs};
+use kardamom_batcher::blob::{USABLE_BYTES_PER_BLOB, pack_to_blobs, unpack_from_blobs};
 use proptest::prelude::*;
 
 proptest! {

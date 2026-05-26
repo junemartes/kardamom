@@ -10,7 +10,7 @@ use alloy_primitives::Address;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
-use types::{CachedReceipt, Receipt};
+use kardamom_types::{CachedReceipt, Receipt};
 
 use crate::channels::IngressSubscription;
 
@@ -83,7 +83,7 @@ mod tests {
     use alloy_primitives::B256;
 
     use crate::channels::MockChannels;
-    use types::BPosition;
+    use kardamom_types::BPosition;
 
     fn dummy(idx: i32) -> Receipt {
         Receipt {

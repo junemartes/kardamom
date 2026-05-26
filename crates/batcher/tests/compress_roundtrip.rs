@@ -1,6 +1,6 @@
 //! zstd round-trip + a ratio sanity test.
 
-use batcher::compress::{DEFAULT_LEVEL, decode_zstd, encode_zstd};
+use kardamom_batcher::compress::{DEFAULT_LEVEL, decode_zstd, encode_zstd};
 
 #[test]
 fn roundtrip_arbitrary_bytes() {

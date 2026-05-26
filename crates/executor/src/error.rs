@@ -1,7 +1,7 @@
 //! Errors raised by the executor actor and its helpers.
 
 use crate::exec_types::TxIndex;
-use types::BPosition;
+use kardamom_types::BPosition;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutorError {
@@ -34,7 +34,7 @@ pub enum ExecutorError {
     #[error("state-writer signal channel closed")]
     StateWriterClosed,
 
-    /// The tx_ordering reader pulled a [`types::TxRef`] but the
+    /// The tx_ordering reader pulled a [`kardamom_types::TxRef`] but the
     /// referenced envelope never appeared on its tx_data within the
     /// configured join timeout. Either the tx_data publisher fell over,
     /// or the sequencer published a ref pointing at a position it never

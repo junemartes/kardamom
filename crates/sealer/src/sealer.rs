@@ -12,7 +12,7 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use types::BlockBoundaryStart;
+use kardamom_types::BlockBoundaryStart;
 
 use crate::clock::WallClock;
 use crate::config::SealerConfig;
@@ -74,8 +74,8 @@ mod tests {
     use super::*;
     use crate::clock::MockClock;
     use crate::emitter::fakes::FakeBoundaryPublisher;
-    use log::testing::FakeBus;
-    use types::BPosition;
+    use kardamom_log::testing::FakeBus;
+    use kardamom_types::BPosition;
 
     fn cfg() -> SealerConfig {
         SealerConfig {

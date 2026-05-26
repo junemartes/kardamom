@@ -10,7 +10,7 @@ use alloy_primitives::{Address, B256, U256, address};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::SolEvent;
 
-use batcher::settlement::IKardamomL2Settlement;
+use kardamom_batcher::settlement::IKardamomL2Settlement;
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 

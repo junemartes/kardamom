@@ -11,7 +11,7 @@
 //! executor consumes B from `recovery_point.last_fsynced_b_position` and
 //! re-derives any blocks the writer never got to commit.
 
-use types::BPosition;
+use kardamom_types::BPosition;
 
 use crate::env::StateEnv;
 use crate::error::StateError;

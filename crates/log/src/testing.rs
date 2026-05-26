@@ -22,7 +22,7 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::LogError;
-use types::{BPosition, FsyncWatermark};
+use kardamom_types::{BPosition, FsyncWatermark};
 
 /// Map from `(channel, stream_id)` to shared per-stream state.
 type StreamMap = HashMap<(String, i32), Arc<Mutex<StreamState>>>;
@@ -216,7 +216,7 @@ where
 // concurrent-pub interleaving must use the docker e2e harness.
 // ============================================================================
 
-use types::{TxEnvelope, TxOrderingMessage, TxRef};
+use kardamom_types::{TxEnvelope, TxOrderingMessage, TxRef};
 
 /// TxData[i]: per-sequencer **exclusive** publication of full
 /// `TxEnvelope` bytes. In production this maps to
@@ -234,7 +234,7 @@ pub struct FakeTxDataPublication {
 impl FakeTxDataPublication {
     /// Open the tx_data[i] pub on `bus`, using the channel URI/stream-id
     /// convention "<channel>"/"<stream_id>". A real wiring uses
-    /// `log::config::ChannelsConfig::tx_data_channel_template` to derive
+    /// `kardamom_log::config::ChannelsConfig::tx_data_channel_template` to derive
     /// per-sequencer URIs.
     pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
         Self {
@@ -323,9 +323,12 @@ impl FakeTxOrderingPublication {
         self.publish_message(&TxOrderingMessage::TxRef(*r))
     }
 
-    /// Publish a [`types::BlockBoundaryStart`] onto tx_ordering
+    /// Publish a [`kardamom_types::BlockBoundaryStart`] onto tx_ordering
     /// (sealer-emitted). Returns the boundary's canonical position.
-    pub fn publish_boundary(&self, b: &types::BlockBoundaryStart) -> Result<BPosition, LogError> {
+    pub fn publish_boundary(
+        &self,
+        b: &kardamom_types::BlockBoundaryStart,
+    ) -> Result<BPosition, LogError> {
         self.publish_message(&TxOrderingMessage::BoundaryStart(b.clone()))
     }
 

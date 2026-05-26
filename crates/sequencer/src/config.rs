@@ -10,7 +10,7 @@ pub struct SequencerConfig {
     /// This process's partition index (`0..partition_count`).
     pub partition_index: u32,
     /// Stable identifier for this sequencer process. Embedded in every
-    /// [`types::TxRef`] this sequencer writes onto tx_ordering so
+    /// [`kardamom_types::TxRef`] this sequencer writes onto tx_ordering so
     /// downstream consumers can route the ref back to the correct
     /// per-sequencer tx_data archive.
     ///

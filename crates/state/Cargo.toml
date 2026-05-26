@@ -3,8 +3,6 @@ name = "kardamom-state"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-name = "state"
 
 [features]
 default = []
@@ -14,7 +12,7 @@ bench-internals = []
 # Gates the real-Aeron Docker e2e test (). Off by default so
 # `cargo test` works in environments without a Docker daemon. CI runs the
 # Docker harness via `--features docker-e2e -- --ignored`.
-docker-e2e = ["log/docker-e2e", "log/testing"]
+docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 
 [dependencies]
 # `rlp` feature enables RlpEncodable/RlpDecodable on Address, B256, U256.
@@ -23,8 +21,8 @@ alloy-rlp = { workspace = true, features = ["derive"] }
 anyhow.workspace = true
 bytes.workspace = true
 crossbeam-channel = "0.5"
-log.workspace = true
-types.workspace = true
+kardamom-log.workspace = true
+kardamom-types.workspace = true
 # libmdbx binding. We use the signet-libmdbx fork (MIT/Apache, idiomatic 0.8
 # API) rather than vorot93/libmdbx (MPL-2.0) : the MIT/Apache fork
 # is preferred when the licensing matters. The on-disk format is identical

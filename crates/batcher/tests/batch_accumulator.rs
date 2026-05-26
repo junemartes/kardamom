@@ -1,9 +1,9 @@
 //! `BatchAccumulator` grouping tests.
 
 use alloy_primitives::{Address, B256};
-use batcher::batch::BatchAccumulator;
 use bytes::Bytes;
-use types::{BPosition, BlockBoundaryStart, TxEnvelope};
+use kardamom_batcher::batch::BatchAccumulator;
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
 fn pos(offset: i32) -> BPosition {
     BPosition {

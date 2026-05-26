@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use alloy_primitives::{U256, address};
-use types::StateDatabase;
+use kardamom_types::StateDatabase;
 
 #[test]
 fn four_readers_with_distinct_snapshots() {

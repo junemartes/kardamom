@@ -10,7 +10,7 @@
 //! `tx_hash` populated by the proxy — no recovery or hashing happens here.
 
 use crate::error::SequencerError;
-use types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxEnvelope};
 
 /// Subscription to one tx_data stream. Yields `(tx_data_position, envelope)`
 /// per Aeron fragment. Production implementations wrap a

@@ -9,12 +9,14 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxEnvelope};
 
-use sequencer::config::SequencerConfig;
-use sequencer::inbound::fakes::ScriptedTxData;
-use sequencer::outbound::fakes::{InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher};
-use sequencer::sequencer::{Sequencer, Shutdown};
+use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
+};
+use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 
 fn signer(seed: u64) -> PrivateKeySigner {
     let mut k = [0u8; 32];
@@ -74,7 +76,7 @@ fn match_publishes_ref() {
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
@@ -97,7 +99,7 @@ fn past_nonce_emits_duplicate_notification() {
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
@@ -128,7 +130,7 @@ fn future_nonce_buffered_then_drained() {
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
@@ -153,11 +155,14 @@ fn b_backpressure_rewinds_state_and_retry_succeeds() {
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
     let r = seq.run_once(&mut channel_a, &mut b, &mut rc);
-    assert!(matches!(r, Err(sequencer::SequencerError::Backpressure)));
+    assert!(matches!(
+        r,
+        Err(kardamom_sequencer::SequencerError::Backpressure)
+    ));
     assert_eq!(b.refs.lock().unwrap().len(), 0, "B never accepted the ref");
 
     // Recover B; the next run_once drains the rebuffered nonce 0 onto B.
@@ -175,7 +180,7 @@ fn run_once_returns_false_when_empty() {
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
     assert!(!seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
 }
@@ -190,14 +195,14 @@ fn wrong_shard_message_skipped() {
     };
     let mut seq = Sequencer::new(
         cfg.clone(),
-        Arc::new(sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
     // Find a signer whose address routes to a shard != 0.
     let mut seed = 1u64;
     let env = loop {
         let s = signer(seed);
-        let p = sequencer::partition::partition_for(s.address(), cfg.partition_count);
+        let p = kardamom_sequencer::partition::partition_for(s.address(), cfg.partition_count);
         if p != cfg.partition_index {
             break signed_tx_envelope(&s, 0, 1);
         }
@@ -219,7 +224,10 @@ fn wrong_shard_message_skipped() {
 #[test]
 fn run_loops_until_shutdown_signaled() {
     let cfg = one_partition_cfg();
-    let mut seq = Sequencer::new(cfg, Arc::new(sequencer::testing::FakeStateDatabase::new()));
+    let mut seq = Sequencer::new(
+        cfg,
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     let mut channel_a = ScriptedTxData::default();
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
@@ -231,7 +239,10 @@ fn run_loops_until_shutdown_signaled() {
 #[test]
 fn run_returns_when_channel_a_disconnected() {
     let cfg = one_partition_cfg();
-    let mut seq = Sequencer::new(cfg, Arc::new(sequencer::testing::FakeStateDatabase::new()));
+    let mut seq = Sequencer::new(
+        cfg,
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
     let mut channel_a = ScriptedTxData {
         disconnected: true,
         ..Default::default()

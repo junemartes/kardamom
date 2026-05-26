@@ -58,8 +58,8 @@ pub use state::{
     WriterApplyingQueue,
 };
 // Shared types re-exported from the `types` crate so external callers can
-// pull them via `executor::*` without a separate dependency line.
-pub use ::types::{
+// pull them via `kardamom_executor::*` without a separate dependency line.
+pub use ::kardamom_types::{
     AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt,
     SnapshotSource, StateDatabase, StorageChange, TxEnvelope, TxOrderingMessage, TxRef, WireLog,
 };

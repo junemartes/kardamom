@@ -32,7 +32,7 @@ use tracing::warn;
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use types::{
+use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, FsyncWatermark, QuorumWatermark,
     Receipt, TxEnvelope, TxOrderingMessage, TxRef,
 };
@@ -117,7 +117,7 @@ impl TxDataPublisher {
 
     /// Publish a full `TxEnvelope` to tx_data[i]. Returns the fragment's
     /// position on the tx_data stream — the value the sequencer will hand
-    /// to [`types::TxRef::new`] when writing the canonical record
+    /// to [`kardamom_types::TxRef::new`] when writing the canonical record
     /// to tx_ordering.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, env)

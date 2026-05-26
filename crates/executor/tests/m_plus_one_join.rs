@@ -1,7 +1,7 @@
 //! integration tests for the M+1
 //! tx_data/tx_ordering reader topology + join-by-ref semantics.
 //!
-//! Uses the `kardamom-log::testing::Fake*` in-memory pub/sub fakes so we
+//! Uses the `kardamom-kardamom_log::testing::Fake*` in-memory pub/sub fakes so we
 //! exercise the exact wire types (`TxEnvelope`, `TxOrderingMessage`,
 //! `TxRef`) and rkyv codec the production Aeron path uses, without the
 //! testcontainers dependency. Real-Aeron coverage of the same topology
@@ -36,19 +36,19 @@ use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
-use executor::{
+use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, MutatingSnapshotSource, ReaderConfig, StateWriterSignal, TxDataSubscription,
     TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
     TxRef, WriterApplyingQueue,
 };
-use log::testing::{
+use kardamom_log::testing::{
     FakeBus, FakeTxDataPublication, FakeTxDataSubscription, FakeTxOrderingPublication,
     FakeTxOrderingSubscription,
 };
 
 /// Bridge a `FakeTxDataSubscription` into a `TxDataSubscription`. The
-/// real-Aeron equivalent is `log::TxDataSubscriber` opened directly on a
+/// real-Aeron equivalent is `kardamom_log::TxDataSubscriber` opened directly on a
 /// dedicated OS thread (one Aeron client per thread, since the client is
 /// `!Send + !Sync`).
 struct FakeASubAdapter {

@@ -44,7 +44,7 @@ use std::thread::{self, JoinHandle};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::debug;
 
-use types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource};
+use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource};
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
@@ -98,7 +98,7 @@ impl Default for ExecutorConfig {
 
 /// Internal envelope routed from exec → commit thread.
 enum ExecToCommit {
-    Receipt(types::Receipt),
+    Receipt(kardamom_types::Receipt),
     Boundary(BlockBoundary),
 }
 
@@ -192,14 +192,14 @@ impl TxDataSubscription for BoxedASub {
     fn sequencer_id(&self) -> u8 {
         self.0.sequencer_id()
     }
-    fn next(&mut self) -> Result<(BPosition, types::TxEnvelope), ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, kardamom_types::TxEnvelope), ExecutorError> {
         self.0.next()
     }
 }
 
 struct BoxedBSub(Box<dyn TxOrderingSubscription>);
 impl TxOrderingSubscription for BoxedBSub {
-    fn next(&mut self) -> Result<(BPosition, types::TxOrderingMessage), ExecutorError> {
+    fn next(&mut self) -> Result<(BPosition, kardamom_types::TxOrderingMessage), ExecutorError> {
         self.0.next()
     }
 }
@@ -377,9 +377,9 @@ mod exec_tests {
     };
     use alloy_signer_local::PrivateKeySigner;
     use bytes::Bytes;
+    use kardamom_types::{BPosition, TxEnvelope as KtTxEnvelope};
     use revm::primitives::KECCAK_EMPTY;
     use std::sync::{Arc, Mutex};
-    use types::{BPosition, TxEnvelope as KtTxEnvelope};
 
     fn pos(off: i32) -> BPosition {
         BPosition {
@@ -551,8 +551,8 @@ mod exec_tests {
 mod commit_tests {
     use super::*;
     use alloy_primitives::B256;
+    use kardamom_types::{BPosition, BlockBoundary, Receipt};
     use std::sync::{Arc, Mutex};
-    use types::{BPosition, BlockBoundary, Receipt};
 
     struct RecordPub(Arc<Mutex<Vec<CMessage>>>);
     impl TxReceiptsPublication for RecordPub {

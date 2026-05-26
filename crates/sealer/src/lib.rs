@@ -1,6 +1,6 @@
 //! Block sealer.
 //!
-//! Emits [`types::BlockBoundaryStart`] markers every 250 ms wall-clock
+//! Emits [`kardamom_types::BlockBoundaryStart`] markers every 250 ms wall-clock
 //! onto tx_ordering. Single-instance for v1: there is no election, no
 //! standby, no failover. If the sealer process dies the L2 stops producing
 //! blocks until an operator restarts it — acceptable for v1 because the

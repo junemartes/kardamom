@@ -4,7 +4,7 @@ use thiserror::Error;
 
 /// Errors a state-database operation may surface.
 ///
-/// `types::StateError` is the marker trait the trait surface returns;
+/// `kardamom_types::StateError` is the marker trait the trait surface returns;
 /// we implement it for this type so a `StateDatabase` impl over `StateSnapshot`
 /// can advertise this as its associated `Error`.
 #[derive(Debug, Error)]
@@ -42,5 +42,5 @@ impl From<signet_libmdbx::ReadError> for StateError {
     }
 }
 
-// Implement the marker trait required by `types::StateDatabase`.
-impl types::StateError for StateError {}
+// Implement the marker trait required by `kardamom_types::StateDatabase`.
+impl kardamom_types::StateError for StateError {}

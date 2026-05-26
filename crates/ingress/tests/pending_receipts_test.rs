@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use alloy_signer_local::PrivateKeySigner;
 
-use ingress::config::IngressConfig;
-use ingress::error::IngressError;
-use ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::error::IngressError;
+use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
 
 #[tokio::test]
 async fn submit_times_out_when_no_executor_responds() {

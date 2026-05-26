@@ -9,7 +9,7 @@
 //!   actor.
 //!
 //!this module does **not** compute `tx_hash`. It copies
-//! `tx_hash` (and `sender`) directly from the inbound `types::
+//! `tx_hash` (and `sender`) directly from the inbound `kardamom_types::
 //! TxEnvelope`, which the proxy (S1) populated at the system boundary.
 
 use alloy_consensus::Transaction;
@@ -17,13 +17,13 @@ use alloy_eips::eip2718::Decodable2718;
 use alloy_primitives::Bytes as AlloyBytes;
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
+use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope, WireLog};
 use revm::context::TxEnv;
 use revm::context::result::ExecutionResult;
 use revm::database::{CacheDB, DatabaseRef};
 use revm::primitives::{KECCAK_EMPTY, Log, TxKind};
 use revm::state::{AccountInfo, Bytecode};
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
-use types::{BPosition, Receipt, StateDatabase, TxEnvelope, WireLog};
 
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
@@ -96,7 +96,7 @@ pub struct StateRefError(pub String);
 impl revm::database_interface::DBErrorMarker for StateRefError {}
 
 /// Decode an `alloy_consensus::TxEnvelope` from the `raw_tx` bytes carried
-/// in a `types::TxEnvelope`. The signature is already verified by
+/// in a `kardamom_types::TxEnvelope`. The signature is already verified by
 /// the proxy (S1, S0); we just need the typed accessors to build a
 /// revm `TxEnv`.
 pub fn decode_alloy_envelope(
@@ -135,7 +135,7 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
 /// receipt plus a fresh per-tx WriteSet. The caller folds the WriteSet into
 /// the PendingDelta before invoking the next tx so later txs see the writes.
 ///
-/// `inbound_envelope: &TxEnvelope` is `types::TxEnvelope`. Its
+/// `inbound_envelope: &TxEnvelope` is `kardamom_types::TxEnvelope`. Its
 /// `sender` and `tx_hash` are trusted unconditionally — the proxy (S1)
 /// populated them at the system boundary. The executor **never recomputes
 /// `tx_hash`** (S0) and **never recovers a sender** (S0); it
@@ -285,7 +285,7 @@ mod tests {
     use alloy_network::TxSignerSync;
     use alloy_primitives::{TxKind as APTxKind, U256, address, keccak256};
     use alloy_signer_local::PrivateKeySigner;
-    use types::{BPosition, BlockBoundaryStart, TxEnvelope as KtTxEnvelope};
+    use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope as KtTxEnvelope};
 
     fn boundary(block_number: u64) -> BlockBoundaryStart {
         BlockBoundaryStart {
@@ -351,7 +351,7 @@ mod tests {
         //the receipt's tx_hash MUST equal the inbound envelope's
         // tx_hash byte-for-byte. No recomputation in the executor.
         assert_eq!(receipt.tx_hash, env_tx.tx_hash);
-        assert!(receipt.status); // success = bool true (types::Receipt)
+        assert!(receipt.status); // success = bool true (kardamom_types::Receipt)
         assert!(receipt.gas_used >= 21_000);
         // Both accounts touched: sender (balance + nonce) and recipient (balance).
         assert!(ws.accounts.contains_key(&from));

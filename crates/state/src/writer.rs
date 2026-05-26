@@ -17,9 +17,9 @@
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
+use kardamom_types::{BlockBoundary, BlockDelta};
 use signet_libmdbx::{WriteFlags, sys::EnvironmentKind};
 use tracing::{debug, error, info, warn};
-use types::{BlockBoundary, BlockDelta};
 
 use crate::env::StateEnv;
 use crate::error::StateError;

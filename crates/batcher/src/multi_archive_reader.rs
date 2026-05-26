@@ -29,7 +29,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
+use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope, TxOrderingMessage, TxRef};
 
 use crate::archive_reader::{TxDataSegmentReader, TxOrderingSegmentReader};
 use crate::error::BatcherError;

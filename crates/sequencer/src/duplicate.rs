@@ -10,7 +10,7 @@
 use alloy_primitives::Address;
 use rkyv::{Archive, Deserialize, Serialize};
 
-use types::wire;
+use kardamom_types::wire;
 
 /// Emitted by the sequencer to the receipt-cache channel when an inbound
 /// `TxEnvelope` has a nonce strictly less than the sender's expected next

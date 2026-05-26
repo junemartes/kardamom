@@ -17,7 +17,7 @@
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::{Decodable, Encodable, RlpDecodable, RlpEncodable};
-use types::{BPosition, Receipt};
+use kardamom_types::{BPosition, Receipt};
 
 use crate::error::StateError;
 
@@ -320,7 +320,7 @@ mod tests {
     #[test]
     fn receipt_value_roundtrip() {
         // Sanity-check that the rkyv codec round-trips a non-trivial Receipt.
-        use types::WireLog;
+        use kardamom_types::WireLog;
         let r = Receipt {
             tx_idx: BPosition {
                 term_id: 1,

@@ -6,7 +6,7 @@
 //! the hash.
 
 use alloy_primitives::{Address, B256, U256};
-use executor::delta::WriteSet;
+use kardamom_executor::delta::WriteSet;
 use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;

@@ -1,5 +1,5 @@
 //! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker
-//! via the [`log::testing::AeronTestCluster`] harness from S3.
+//! via the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
 //!
 //!— mock-based unit and integration tests in this crate
 //! stay; this is *additional* coverage that brings up the real Aeron
@@ -22,7 +22,7 @@
 
 #![cfg(feature = "docker-e2e")]
 
-use log::testing::AeronTestCluster;
+use kardamom_log::testing::AeronTestCluster;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires Docker; run with `cargo test --features docker-e2e -- --ignored`"]

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use alloy_signer_local::PrivateKeySigner;
-use ingress::sig_verify::{BatchVerifier, recover_single};
+use kardamom_ingress::sig_verify::{BatchVerifier, recover_single};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn batched_matches_single_on_1000_txs() {

@@ -41,8 +41,8 @@ pub mod testing;
 
 pub use error::LogError;
 
-// Re-export the shared types so existing call sites can `use log::types::*`
+// Re-export the shared types so existing call sites can `use kardamom_log::types::*`
 // transparently (they import from kardamom-types under the hood).
 pub mod types {
-    pub use types::*;
+    pub use kardamom_types::*;
 }

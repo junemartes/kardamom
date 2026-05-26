@@ -9,14 +9,14 @@ default = []
 # Run the full-pipeline cross-component test under real Aeron in Docker.
 # Implies the `docker-e2e` testcontainers harness. Off by default so the
 # standard CI stays fast; the dedicated docker-e2e CI job opts in.
-full-pipeline-e2e = ["log/docker-e2e", "log/testing"]
+full-pipeline-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 
 [lib]
 path = "src/lib.rs"
 
 [dependencies]
-log.workspace = true
-types.workspace = true
+kardamom-log.workspace = true
+kardamom-types.workspace = true
 
 alloy-primitives.workspace = true
 bytes.workspace = true
@@ -29,8 +29,8 @@ tracing.workspace = true
 # feature is enabled (see [features] above).
 criterion.workspace = true
 hdrhistogram.workspace = true
-executor = { path = "../executor", package = "kardamom-executor" }
-state = { path = "../state", package = "kardamom-state" }
+kardamom-executor = { path = "../executor" }
+kardamom-state = { path = "../state" }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

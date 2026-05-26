@@ -3,12 +3,10 @@ name = "kardamom-executor"
 version.workspace = true
 edition.workspace = true
 
-[lib]
-name = "executor"
 
 [dependencies]
 # : shared types live in kardamom-types.
-types = { workspace = true }
+kardamom-types = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
@@ -23,7 +21,7 @@ dashmap = { workspace = true }
 [dev-dependencies]
 # : hermetic unit tests use kardamom-log's in-memory fakes.
 # Real-Aeron e2e tests pull `docker-e2e` to bring in the testcontainers harness.
-log = { workspace = true, features = ["testing"] }
+kardamom-log = { workspace = true, features = ["testing"] }
 alloy-signer-local.workspace = true
 alloy-network.workspace = true
 alloy-eips.workspace = true

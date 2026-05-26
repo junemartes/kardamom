@@ -20,7 +20,7 @@ use alloy_primitives::Address;
 use dashmap::DashMap;
 use tokio::sync::{Mutex, oneshot};
 
-use types::{AckPolicy, BPosition, FsyncWatermark, QuorumWatermark, Receipt};
+use kardamom_types::{AckPolicy, BPosition, FsyncWatermark, QuorumWatermark, Receipt};
 
 use crate::error::IngressError;
 

@@ -34,11 +34,11 @@ use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
-use log::config::LogConfig;
-use log::publisher::{TxDataPublisher, TxOrderingPublisher};
-use log::subscriber::Subscribers;
-use log::testing::AeronTestCluster;
-use types::{BPosition, TxEnvelope, TxOrderingMessage, TxRef};
+use kardamom_log::config::LogConfig;
+use kardamom_log::publisher::{TxDataPublisher, TxOrderingPublisher};
+use kardamom_log::subscriber::Subscribers;
+use kardamom_log::testing::AeronTestCluster;
+use kardamom_types::{BPosition, TxEnvelope, TxOrderingMessage, TxRef};
 
 const M: u8 = 2;
 const TXS_PER_SEQ: u64 = 25;

@@ -1,7 +1,7 @@
 //! Sender accessor for ingress tx frames.
 //!
 //!: the proxy (S1) recovers the sender during batched secp256k1
-//! verification and writes it into [`types::TxEnvelope::sender`]
+//! verification and writes it into [`kardamom_types::TxEnvelope::sender`]
 //! (typed `Address`, never `Option`). The sequencer trusts this value
 //! unconditionally — no fallback, no `recover_signer()`, no paranoid-check
 //! mode. The sequencer performs zero secp256k1 work on the hot path, which
@@ -15,7 +15,7 @@
 //!     the proxy regressed.
 
 use alloy_primitives::Address;
-use types::TxEnvelope;
+use kardamom_types::TxEnvelope;
 
 /// Return the proxy-populated sender for a [`TxEnvelope`].
 ///
@@ -34,7 +34,7 @@ pub fn sender_of(envelope: &TxEnvelope) -> Address {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use types::TxEnvelope;
+    use kardamom_types::TxEnvelope;
 
     fn env_with_sender(sender: Address) -> TxEnvelope {
         TxEnvelope {

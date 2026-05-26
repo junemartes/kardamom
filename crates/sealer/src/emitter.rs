@@ -8,13 +8,13 @@
 //!   4. Increment `block_number`.
 //!
 //! The `BoundaryPublisher` trait abstracts the underlying transport so unit
-//! tests run against `log::testing::FakePublication` and production
+//! tests run against `kardamom_log::testing::FakePublication` and production
 //! drives an Aeron concurrent publication (added in Task 13's CLI plumbing).
 
 use std::sync::Arc;
 
 use anyhow::Result;
-use types::{BPosition, BlockBoundaryStart};
+use kardamom_types::{BPosition, BlockBoundaryStart};
 
 use crate::clock::WallClock;
 use crate::tick::floor_to_tick;
@@ -144,7 +144,7 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
 
 #[cfg(any(test, feature = "testing"))]
 pub mod fakes {
-    //! In-memory `BoundaryPublisher` over [`log::testing::FakeBus`].
+    //! In-memory `BoundaryPublisher` over [`kardamom_log::testing::FakeBus`].
     //!
     //! Exposed under `testing` so integration tests (single_emitter,
     //! failover, chaos_isolation) can re-use the same adapter the unit
@@ -152,8 +152,8 @@ pub mod fakes {
 
     use std::sync::{Arc, Mutex};
 
-    use log::testing::{FakeBus, FakePublication, FakeTypedSubscription};
-    use types::{BPosition, BlockBoundaryStart};
+    use kardamom_log::testing::{FakeBus, FakePublication, FakeTypedSubscription};
+    use kardamom_types::{BPosition, BlockBoundaryStart};
 
     use super::{BoundaryPublisher, PublishError};
 
@@ -224,7 +224,7 @@ pub mod fakes {
 mod tests {
     use super::*;
     use crate::clock::MockClock;
-    use log::testing::FakeBus;
+    use kardamom_log::testing::FakeBus;
 
     fn emitter_with_fake(
         clock: MockClock,

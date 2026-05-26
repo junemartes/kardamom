@@ -11,10 +11,10 @@ use std::time::Duration;
 use alloy_primitives::B256;
 use alloy_signer_local::PrivateKeySigner;
 
-use ingress::config::IngressConfig;
-use ingress::routing::partition_for;
-use ingress::{InMemoryStateDb, IngressProxy, MockChannels};
-use types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
+use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::routing::partition_for;
+use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn each_tx_lands_on_keccak_partition() {

@@ -4,7 +4,7 @@
 //! to tx_data — that's the proxy's job. The sequencer is purely a
 //! reader-of-A + publisher-of-B-refs: for each envelope observed on its
 //! shard's tx_data (via [`crate::inbound::TxDataSubscriber`]), if the
-//! nonce gate matches, it publishes a tiny [`types::TxRef`] onto
+//! nonce gate matches, it publishes a tiny [`kardamom_types::TxRef`] onto
 //! the canonical orderer tx_ordering
 //! ([`TxOrderingRefPublisher`]) — Aeron *concurrent* multi-publisher, ordered
 //! with refs from the other P-1 sequencers in this shard's group and
@@ -21,9 +21,9 @@
 //!
 //! All surfaces are traits so unit tests can use the in-memory fakes
 //! (no Aeron media driver required); production wiring binds them to the
-//! real `log::publisher` types.
+//! real `kardamom_log::publisher` types.
 
-use types::TxRef;
+use kardamom_types::TxRef;
 
 use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
@@ -53,7 +53,7 @@ pub trait ReceiptCachePublisher: Send {
 pub mod fakes {
     use std::sync::{Arc, Mutex};
 
-    use types::TxRef;
+    use kardamom_types::TxRef;
 
     use super::*;
 
@@ -92,7 +92,7 @@ mod tests {
     use super::fakes::*;
     use super::*;
     use alloy_primitives::{Address, B256};
-    use types::{BPosition, TxRef};
+    use kardamom_types::{BPosition, TxRef};
 
     #[test]
     fn fake_b_records_refs() {
