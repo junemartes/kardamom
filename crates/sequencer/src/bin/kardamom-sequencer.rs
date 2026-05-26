@@ -22,7 +22,8 @@ use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_types::{
-    BPosition, Receipt, StateDatabase, StateError, TxEnvelope, TxError, TxOrderingMessage, TxRef,
+    BPosition, DepositRef, Receipt, StateDatabase, StateError, TxEnvelope, TxError,
+    TxOrderingMessage, TxRef,
 };
 
 #[derive(Debug, Parser)]
@@ -165,20 +166,31 @@ impl LiveTxOrderingRefPub {
 
 impl TxOrderingRefPublisher for LiveTxOrderingRefPub {
     fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError> {
-        match self.handle.publish(&TxOrderingMessage::TxRef(*r)) {
-            Ok(_pos) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
-                // The AeronRuntime publish loop retries on back-pressure
-                // internally (up to 1024 attempts); a returned error means
-                // we hit the cap. Surface as Backpressure so the sequencer
-                // state machine rewinds and retries on the next pass.
-                if msg.contains("back-pressure") {
-                    Err(SequencerError::Backpressure)
-                } else {
-                    tracing::error!(error = %msg, "tx_ordering publish failed");
-                    Err(SequencerError::Backpressure)
-                }
+        publish_ordering(&self.handle, TxOrderingMessage::TxRef(*r))
+    }
+
+    fn try_publish_deposit_ref(&mut self, r: &DepositRef) -> Result<(), SequencerError> {
+        publish_ordering(&self.handle, TxOrderingMessage::DepositRef(*r))
+    }
+}
+
+fn publish_ordering(
+    handle: &TxOrderingPublisherHandle,
+    msg: TxOrderingMessage,
+) -> Result<(), SequencerError> {
+    match handle.publish(&msg) {
+        Ok(_pos) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            // The AeronRuntime publish loop retries on back-pressure
+            // internally (up to 1024 attempts); a returned error means
+            // we hit the cap. Surface as Backpressure so the sequencer
+            // state machine rewinds and retries on the next pass.
+            if msg.contains("back-pressure") {
+                Err(SequencerError::Backpressure)
+            } else {
+                tracing::error!(error = %msg, "tx_ordering publish failed");
+                Err(SequencerError::Backpressure)
             }
         }
     }

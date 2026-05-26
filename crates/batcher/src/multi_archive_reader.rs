@@ -174,26 +174,40 @@ impl Iterator for MultiArchiveReader {
     type Item = Result<ResolvedRecord, BatcherError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let next_b = self.b_reader.next()?;
-        let rec = match next_b {
-            Err(e) => return Some(Err(e)),
-            Ok(r) => r,
-        };
-        let position = rec.position;
-        match rec.value {
-            TxOrderingMessage::TxRef(r) => match self.resolve(&r) {
-                Ok(env) => Some(Ok(ResolvedRecord::Tx {
-                    position,
-                    sequencer_id: r.shard_id,
-                    tx_data_position: r.tx_data_position,
-                    env,
-                })),
-                Err(e) => Some(Err(e)),
-            },
-            TxOrderingMessage::BoundaryStart(b) => Some(Ok(ResolvedRecord::Boundary {
-                position,
-                marker: b,
-            })),
+        // The batcher only emits user-tx data + block boundaries to L1.
+        // DepositRefs are L1-originated; we skip them by recursing until we
+        // hit a record the batcher cares about.
+        loop {
+            let next_b = self.b_reader.next()?;
+            let rec = match next_b {
+                Err(e) => return Some(Err(e)),
+                Ok(r) => r,
+            };
+            let position = rec.position;
+            match rec.value {
+                TxOrderingMessage::TxRef(r) => {
+                    return match self.resolve(&r) {
+                        Ok(env) => Some(Ok(ResolvedRecord::Tx {
+                            position,
+                            sequencer_id: r.shard_id,
+                            tx_data_position: r.tx_data_position,
+                            env,
+                        })),
+                        Err(e) => Some(Err(e)),
+                    };
+                }
+                TxOrderingMessage::DepositRef(_) => {
+                    // L1 deposits originated on L1; they don't need to be
+                    // re-batched back. Skip.
+                    continue;
+                }
+                TxOrderingMessage::BoundaryStart(b) => {
+                    return Some(Ok(ResolvedRecord::Boundary {
+                        position,
+                        marker: b,
+                    }));
+                }
+            }
         }
     }
 }

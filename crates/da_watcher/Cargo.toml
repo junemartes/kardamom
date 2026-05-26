@@ -1,0 +1,26 @@
+[package]
+name = "kardamom-da-watcher"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+testing = []
+
+[dependencies]
+kardamom-types = { workspace = true }
+
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-rlp.workspace = true
+alloy-sol-types.workspace = true
+
+bytes.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+alloy-primitives.workspace = true

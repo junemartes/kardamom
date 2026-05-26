@@ -3757,6 +3757,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-da-watcher"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-rlp",
+ "alloy-rpc-types-eth",
+ "alloy-sol-types",
+ "async-trait",
+ "bytes",
+ "kardamom-types",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-deployer"
 version = "0.1.0"
 dependencies = [

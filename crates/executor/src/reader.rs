@@ -302,6 +302,23 @@ where
                             return Ok(()); // exec thread shutting down
                         }
                     }
+                    TxOrderingMessage::DepositRef(dep_ref) => {
+                        // The DA-watcher / deposits join is a separate
+                        // follow-up; v0 of the deposit channel wires
+                        // sequencer → tx_ordering only. The executor's
+                        // deposit-execution path lives in the DA watcher
+                        // PR and isn't enabled here yet, so deposits are
+                        // observed and dropped. Logged at debug so the
+                        // canonical ordering is visible in traces without
+                        // affecting tx_idx accounting.
+                        debug!(
+                            target: "executor::reader",
+                            source_hash = ?dep_ref.source_hash,
+                            deposit_position = ?dep_ref.deposit_position,
+                            ?position,
+                            "skipping DepositRef (deposit execution path not yet wired)"
+                        );
+                    }
                     TxOrderingMessage::BoundaryStart(b) => {
                         debug!(
                             target: "kardamom_executor::reader",
