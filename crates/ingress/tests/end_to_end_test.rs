@@ -13,7 +13,7 @@ use alloy_signer_local::PrivateKeySigner;
 use ingress::config::IngressConfig;
 use ingress::routing::partition_for;
 use ingress::{InMemoryStateDb, IngressProxy, MockChannels};
-use types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
+use types::{BPosition, QuorumWatermark, Receipt};
 
 fn nonce_of(raw: &bytes::Bytes) -> u64 {
     use alloy_consensus::TxEnvelope;
@@ -43,7 +43,7 @@ async fn one_hundred_txs_route_and_receive_receipts() {
     // receipt + watermark.
     let mut handles = Vec::new();
     for (i, mut rx) in partition_rx.drain(..).enumerate() {
-        let receipt_cache_bus = mock.receipt_cache_bus.clone();
+        let receipt_bus = mock.receipt_bus.clone();
         let watermark_bus = mock.watermark_bus.clone();
         handles.push(tokio::spawn(async move {
             let mut local_idx: i32 = 0;
@@ -61,13 +61,11 @@ async fn one_hundred_txs_route_and_receive_receipts() {
                     gas_used: 21_000,
                     logs: Vec::new(),
                     write_set_hash: B256::ZERO,
-                };
-                let _ = receipt_cache_bus.send(CachedReceipt {
-                    sender: envelope.sender,
+                    from: envelope.sender,
                     nonce,
-                    tx_hash: envelope.tx_hash,
-                    receipt: receipt.clone(),
-                });
+                    ..Default::default()
+                };
+                let _ = receipt_bus.send(receipt);
                 let _ = watermark_bus.send(QuorumWatermark { position: pos });
             }
         }));
@@ -127,7 +125,7 @@ async fn proxy_parks_until_watermark_advances() {
 
     // Fake executor for partition 0 that publishes the receipt-cache
     // immediately but holds off advancing the watermark for ~200ms.
-    let receipt_cache_bus = mock.receipt_cache_bus.clone();
+    let receipt_bus = mock.receipt_bus.clone();
     let watermark_bus = mock.watermark_bus.clone();
     let rx0 = partition_rx.remove(0);
     let _rx1 = partition_rx.remove(0);
@@ -146,13 +144,11 @@ async fn proxy_parks_until_watermark_advances() {
                 gas_used: 21_000,
                 logs: Vec::new(),
                 write_set_hash: B256::ZERO,
-            };
-            let _ = receipt_cache_bus.send(CachedReceipt {
-                sender: envelope.sender,
+                from: envelope.sender,
                 nonce,
-                tx_hash: envelope.tx_hash,
-                receipt,
-            });
+                ..Default::default()
+            };
+            let _ = receipt_bus.send(receipt);
             tokio::time::sleep(Duration::from_millis(200)).await;
             let _ = watermark_bus.send(QuorumWatermark { position: pos });
         }

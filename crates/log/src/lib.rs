@@ -1,6 +1,5 @@
-//! Kardamom canonical log: Aeron-backed channels B and C, the receipt-cache
-//! channel, and the quorum watermark aggregator that give tx_ordering its
-//! durability guarantee.
+//! Kardamom canonical log: Aeron-backed channels B and C and the quorum
+//! watermark aggregator that give tx_ordering its durability guarantee.
 //!
 //! Durability model: the Aeron Archive daemon is configured with
 //! `fileSyncLevel=1` so it fdatasyncs each recorded frame inline. The
@@ -27,7 +26,6 @@
 pub mod codec;
 pub mod config;
 pub mod error;
-pub mod receipt_cache;
 pub mod supervisor;
 pub mod watermark;
 

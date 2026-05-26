@@ -14,7 +14,7 @@ use alloy_signer_local::PrivateKeySigner;
 use ingress::config::IngressConfig;
 use ingress::routing::partition_for;
 use ingress::{InMemoryStateDb, IngressProxy, MockChannels};
-use types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
+use types::{BPosition, QuorumWatermark, Receipt};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn each_tx_lands_on_keccak_partition() {
@@ -32,7 +32,7 @@ async fn each_tx_lands_on_keccak_partition() {
         // watermark immediately.
         let mut spawns = Vec::new();
         for (i, mut rx) in rx_vec.drain(..).enumerate() {
-            let receipt_cache_bus = mock.receipt_cache_bus.clone();
+            let receipt_bus = mock.receipt_bus.clone();
             let watermark_bus = mock.watermark_bus.clone();
             spawns.push(tokio::spawn(async move {
                 let mut local_idx: i32 = 0;
@@ -42,6 +42,7 @@ async fn each_tx_lands_on_keccak_partition() {
                         term_id: i as i32,
                         term_offset: local_idx,
                     };
+                    let nonce = extract_nonce(&envelope.raw_tx);
                     let receipt = Receipt {
                         tx_idx: pos,
                         tx_hash: envelope.tx_hash,
@@ -49,13 +50,11 @@ async fn each_tx_lands_on_keccak_partition() {
                         gas_used: 21_000,
                         logs: Vec::new(),
                         write_set_hash: B256::ZERO,
+                        from: envelope.sender,
+                        nonce,
+                        ..Default::default()
                     };
-                    let _ = receipt_cache_bus.send(CachedReceipt {
-                        sender: envelope.sender,
-                        nonce: extract_nonce(&envelope.raw_tx),
-                        tx_hash: envelope.tx_hash,
-                        receipt: receipt.clone(),
-                    });
+                    let _ = receipt_bus.send(receipt);
                     let _ = watermark_bus.send(QuorumWatermark { position: pos });
                 }
             }));
@@ -90,8 +89,8 @@ async fn each_tx_lands_on_keccak_partition() {
 }
 
 /// Decode just the `nonce` field out of an RLP-encoded legacy tx so the
-/// fake executor can fill in the `CachedReceipt.nonce` field that the
-/// proxy uses to look up its pending entry.
+/// fake executor can fill in the `Receipt.nonce` field that the proxy uses
+/// to look up its pending entry.
 fn extract_nonce(raw: &bytes::Bytes) -> u64 {
     use alloy_consensus::TxEnvelope;
     use alloy_consensus::transaction::Transaction;

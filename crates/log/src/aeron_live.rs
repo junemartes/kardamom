@@ -63,8 +63,8 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, FsyncWatermark, QuorumWatermark,
-    Receipt, TxEnvelope, TxOrderingMessage,
+    BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
+    TxEnvelope, TxOrderingMessage,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -695,54 +695,6 @@ impl TxReceiptsBoundarySubscriberHandle {
 }
 
 // ---------------------------------------------------------------------------
-// Receipt cache (proxy ↔ executor).
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-pub struct ReceiptCachePublisherHandle {
-    inner: PubHandle,
-}
-
-impl ReceiptCachePublisherHandle {
-    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        Ok(Self {
-            inner: rt.open_publication(&ch.receipt_cache_channel, ch.receipt_cache_stream_id)?,
-        })
-    }
-
-    pub fn publish(&self, r: &CachedReceipt) -> Result<BPosition, LogError> {
-        self.inner.publish(r)
-    }
-
-    pub fn raw(&self) -> &PubHandle {
-        &self.inner
-    }
-}
-
-pub struct ReceiptCacheSubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, CachedReceipt)>,
-}
-
-impl ReceiptCacheSubscriberHandle {
-    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        Ok(Self {
-            rx: rt.open_subscription::<CachedReceipt>(
-                &ch.receipt_cache_channel,
-                ch.receipt_cache_stream_id,
-            )?,
-        })
-    }
-
-    pub async fn recv(&mut self) -> Option<(BPosition, CachedReceipt)> {
-        self.rx.recv().await
-    }
-
-    pub fn try_recv(&mut self) -> Option<(BPosition, CachedReceipt)> {
-        self.rx.try_recv().ok()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Per-recorder fsync watermark.
 // ---------------------------------------------------------------------------
 
@@ -850,8 +802,6 @@ const _: fn() = || {
     assert_send_sync::<TxReceiptsPublisherHandle>();
     assert_send::<TxReceiptsSubscriberHandle>();
     assert_send::<TxReceiptsBoundarySubscriberHandle>();
-    assert_send_sync::<ReceiptCachePublisherHandle>();
-    assert_send::<ReceiptCacheSubscriberHandle>();
     assert_send_sync::<FsyncWatermarkPublisherHandle>();
     assert_send::<FsyncWatermarkSubscriberHandle>();
     assert_send_sync::<QuorumPublisherHandle>();

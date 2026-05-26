@@ -136,7 +136,7 @@ impl FakeSubscription {
 }
 
 /// High-level fake publication that consumers can use in place of
-/// `TxOrderingPublisher` / `TxReceiptsPublisher` / `ReceiptCachePublisher`.
+/// `TxOrderingPublisher` / `TxReceiptsPublisher`.
 pub struct FakePublication {
     pub_handle: FakeConcurrentPublication,
 }

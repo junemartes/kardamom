@@ -12,7 +12,7 @@ use alloy_primitives::{B256, Bytes as AlloyBytes};
 use alloy_rlp::Decodable;
 use tokio::sync::broadcast;
 
-use types::{BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
+use types::{BlockBoundary, Receipt, StateDatabase, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -71,10 +71,9 @@ where
     /// tx_receipts. Read by `eth_blockNumber`. `AtomicU64` is plenty —
     /// monotonic, single-writer (the BlockBoundary watcher), many readers.
     pub(crate) latest_block_number: Arc<AtomicU64>,
-    ///state-DB handle for `eth_getTransactionReceipt(hash)`
-    /// via `get_tx_position(tx_hash)` → `get_receipt(position)`. S6 owns the
-    /// `tx_hash_index` libmdbx table. v0 + tests use the in-memory impl in
-    /// [`crate::channels::InMemoryStateDb`].
+    /// State-DB handle reserved for `eth_getBalance` / `eth_getTransactionCount`
+    /// (still stubbed pending the S6 reader interface). The receipt path is
+    /// now served entirely from the in-memory [`ReceiptCache`].
     pub(crate) state_db: Arc<DB>,
 }
 
@@ -129,7 +128,7 @@ where
             latest_block_number: Arc::new(AtomicU64::new(0)),
             state_db,
         };
-        me.spawn_receipt_cache_watcher();
+        me.spawn_tx_receipts_watcher();
         // Only subscribe to watermark streams the configured policy needs.
         if me.cfg.ack_policy.requires_quorum() {
             me.spawn_quorum_watermark_watcher();
@@ -148,11 +147,13 @@ where
         self.latest_block_number.load(Ordering::Acquire)
     }
 
-    /// Lookup a receipt by `tx_hash` via the state-DB `tx_hash_index` table
-    ///. Returns `None` if the tx has not yet been committed.
+    /// Lookup a receipt by `tx_hash` in the in-memory tx_receipts index.
+    /// The executor publishes the enriched `Receipt` onto tx_receipts; ingress
+    /// subscribes and answers `eth_getTransactionReceipt` straight from RAM
+    /// with no state-DB join. Returns `None` for txs that have not yet been
+    /// observed (including those evicted from the bounded cache).
     pub fn lookup_receipt_by_hash(&self, tx_hash: B256) -> Option<Receipt> {
-        let pos = self.state_db.get_tx_position(tx_hash).ok().flatten()?;
-        self.state_db.get_receipt(pos).ok().flatten()
+        self.cache.lookup_by_tx_hash(tx_hash)
     }
 
     fn spawn_block_boundary_watcher(&self) {
@@ -167,19 +168,23 @@ where
         });
     }
 
-    fn spawn_receipt_cache_watcher(&self) {
-        // CachedReceipt is the join of `(sender, nonce)` with `(tx_hash, tx_idx)`
-        // — tx_receipts alone doesn't carry `sender`, so the receipt-cache stream
-        // is the authoritative binding for client release.
-        let rx = self.subscription.subscribe_receipt_cache();
+    fn spawn_tx_receipts_watcher(&self) {
+        // The enriched `Receipt` carries `from` + `nonce` + `tx_hash` directly,
+        // so a single tx_receipts subscription is enough to populate both the
+        // (sender, nonce) retry-dedup index and the tx_hash → Receipt index
+        // used by `eth_getTransactionReceipt`. It also drives client release
+        // through `pending.on_receipt`.
+        let rx = self.subscription.subscribe_receipts();
         let pending = self.pending.clone();
         let cache = self.cache.clone();
-        spawn_broadcast_watcher(rx, move |c: CachedReceipt| {
+        spawn_broadcast_watcher(rx, move |receipt: Receipt| {
             let pending = pending.clone();
             let cache = cache.clone();
             async move {
-                cache.insert(c.sender, c.nonce, c.receipt.clone());
-                pending.on_receipt(c.sender, c.nonce, c.receipt).await;
+                let sender = receipt.from;
+                let nonce = receipt.nonce;
+                cache.insert(receipt.clone());
+                pending.on_receipt(sender, nonce, receipt).await;
             }
         });
     }

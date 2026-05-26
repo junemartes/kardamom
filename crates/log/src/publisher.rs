@@ -33,8 +33,8 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, FsyncWatermark, QuorumWatermark,
-    Receipt, TxEnvelope, TxOrderingMessage, TxRef,
+    BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
+    TxEnvelope, TxOrderingMessage, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
@@ -192,28 +192,6 @@ impl TxReceiptsPublisher {
 
     pub fn publish_boundary(&self, b: &BlockBoundary) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, b)
-    }
-}
-
-/// Receipt-cache channel: per-tx `CachedReceipt` messages. RAM only,
-/// consumed by short-lived clients (proxy nonce cache, RPC frontends).
-pub struct ReceiptCachePublisher {
-    pub_handle: Pub,
-}
-
-impl ReceiptCachePublisher {
-    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(
-            aeron,
-            &ch.receipt_cache_channel,
-            ch.receipt_cache_stream_id,
-            "rc",
-        )?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish(&self, r: &CachedReceipt) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, r)
     }
 }
 
