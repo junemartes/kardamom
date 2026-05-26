@@ -18,7 +18,9 @@ use kardamom_types::TxEnvelope;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::IngressSource;
-use kardamom_sequencer::outbound::fakes::{InMemoryBPublisher, InMemoryReceiptCachePublisher};
+use kardamom_sequencer::outbound::fakes::{
+    InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+};
 use kardamom_sequencer::primary::PrimarySequencer;
 
 struct DequeIngress(VecDeque<TxEnvelope>);
@@ -71,16 +73,18 @@ fn bench_in_order(c: &mut Criterion) {
                     PrimarySequencer::new(SequencerConfig {
                         partition_count: 1,
                         partition_index: 0,
+                        sequencer_id: 0,
                         max_pending_per_sender: 16,
                         ..Default::default()
                     }),
                     DequeIngress(batch.clone().into_iter().collect()),
-                    InMemoryBPublisher::default(),
+                    InMemoryChannelAPublisher::new(0),
+                    InMemoryChannelBRefPublisher::default(),
                     InMemoryReceiptCachePublisher::default(),
                 )
             },
-            |(mut seq, mut ing, mut bp, mut rc)| {
-                while seq.run_once(&mut ing, &mut bp, &mut rc).unwrap() {}
+            |(mut seq, mut ing, mut ap, mut bp, mut rc)| {
+                while seq.run_once(&mut ing, &mut ap, &mut bp, &mut rc).unwrap() {}
             },
             BatchSize::SmallInput,
         );
