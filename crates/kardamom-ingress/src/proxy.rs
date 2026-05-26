@@ -232,11 +232,17 @@ where
         // channel before we'd otherwise have registered, especially under load.
         let wait = self.pending.register(sender, nonce);
 
-        let partition = partition_for(sender, self.cfg.partition_count_m) as usize;
+        // Publish onto channel A[shard]. The shard is selected by sender-
+        // address hash (`partition_for(sender, K)`) so every tx from a given
+        // sender lands on the same shard's A stream, which lets the P
+        // sequencers per shard nonce-order them consistently. The envelope
+        // carries the canonical `tx_hash` so downstream consumers can dedup
+        // and re-emit it without recomputing (S0 D-Sh4).
+        let shard = partition_for(sender, self.cfg.partition_count_m) as usize;
         let correlation_id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         self.publication
-            .publish_ingress(
-                partition,
+            .publish_channel_a(
+                shard,
                 TxEnvelope {
                     correlation_id,
                     raw_tx: raw_tx.0.clone(),
