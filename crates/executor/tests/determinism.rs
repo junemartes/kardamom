@@ -150,6 +150,7 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             cfg,
             a_subs,
             b_sub,
+            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,

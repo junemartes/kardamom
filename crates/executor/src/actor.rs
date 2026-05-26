@@ -50,10 +50,12 @@ use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::{CMessage, TxIndex};
+use crate::executor::execute_deposit_tx;
 use crate::executor::execute_tx;
 use crate::reader::{
-    JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
-    spawn_tx_data_reader, spawn_tx_ordering_reader,
+    DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
+    TxDataSubscription, TxOrderingSubscription, spawn_tx_data_reader, spawn_tx_deposits_reader,
+    spawn_tx_ordering_reader,
 };
 
 /// Publication handle for tx_receipts.
@@ -102,9 +104,9 @@ enum ExecToCommit {
     Boundary(BlockBoundary),
 }
 
-/// Owns the M+3 threads (M tx_data readers, 1 tx_ordering reader, 1 exec, 1
-/// commit). `run` blocks until the tx_ordering subscription closes or an
-/// error occurs.
+/// Owns the M+4 threads (M tx_data readers, 1 tx_deposits reader, 1
+/// tx_ordering reader, 1 exec, 1 commit). `run` blocks until the
+/// tx_ordering subscription closes or an error occurs.
 pub struct Executor;
 
 impl Executor {
@@ -115,15 +117,20 @@ impl Executor {
     /// `a_subs` holds one subscription per sequencer partition (M total).
     /// They may be supplied in any order — each subscription declares its
     /// own `sequencer_id`.
-    #[allow(clippy::too_many_arguments)] // 8 args is the natural shape of the
-    // executor's run-once API (config, M A-subs, B-sub, C-pub, snapshots,
-    // state-writer signal, state-writer queue, initial block); packaging
-    // them into a builder struct would shuffle the noise around without
-    // reducing it.
+    ///
+    /// `dep_sub` is the tx_deposits subscription. Pass `None` to disable
+    /// the deposit path (legacy + most unit tests); when `None`, any
+    /// `DepositRef` observed on tx_ordering will trigger a join timeout
+    /// since no deposit can land in the buffer. Production wiring always
+    /// passes `Some`.
+    #[allow(clippy::too_many_arguments)] // 9 args is the natural shape of the
+    // executor's run-once API; see the long-form note in [`execute_tx`]
+    // for the same rationale applied to per-tx execution.
     pub fn run<C, S, Q, P>(
         cfg: ExecutorConfig,
         a_subs: Vec<Box<dyn TxDataSubscription>>,
         b_sub: Box<dyn TxOrderingSubscription>,
+        dep_sub: Option<Box<dyn DepositSubscription>>,
         c_pub: C,
         snapshots: S,
         sw_signal: Q,
@@ -137,6 +144,7 @@ impl Executor {
         P: StateWriterQueue + 'static,
     {
         let buffer = JoinBuffer::new();
+        let deposit_buffer = DepositJoinBuffer::new();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth);
 
@@ -150,8 +158,16 @@ impl Executor {
             a_handles.push(spawn_tx_data_reader(BoxedASub(a), buffer.clone()));
         }
 
-        let b_handle =
-            spawn_tx_ordering_reader(BoxedBSub(b_sub), buffer.clone(), cfg.reader.clone(), tx_r2e);
+        let dep_handle =
+            dep_sub.map(|d| spawn_tx_deposits_reader(BoxedDepSub(d), deposit_buffer.clone()));
+
+        let b_handle = spawn_tx_ordering_reader(
+            BoxedBSub(b_sub),
+            buffer.clone(),
+            deposit_buffer.clone(),
+            cfg.reader.clone(),
+            tx_r2e,
+        );
 
         let exec = spawn_exec(
             cfg.clone(),
@@ -165,11 +181,11 @@ impl Executor {
         let commit = spawn_commit(c_pub, rx_e2c);
 
         // Join in this order: B reader (closes first when tx_ordering is
-        // exhausted), then exec, then commit, then A readers. TxData
-        // subscriptions may keep producing after tx_ordering closes; we let
-        // them drain to clean shutdown. Errors from any thread propagate;
-        // the first error wins but every join still runs so threads tear
-        // down cleanly.
+        // exhausted), then exec, then commit, then A + deposits readers.
+        // The tx_data + tx_deposits subscriptions may keep producing after
+        // tx_ordering closes; we let them drain to clean shutdown. Errors
+        // from any thread propagate; the first error wins but every join
+        // still runs so threads tear down cleanly.
         let r_b = b_handle.join().expect("tx_ordering reader panic");
         let r_exec = exec.join().expect("exec panic");
         let r_commit = commit.join().expect("commit panic");
@@ -180,7 +196,10 @@ impl Executor {
                 r_a = res;
             }
         }
-        r_b.and(r_exec).and(r_commit).and(r_a)
+        let r_dep = dep_handle
+            .map(|h| h.join().expect("tx_deposits reader panic"))
+            .unwrap_or(Ok(()));
+        r_b.and(r_exec).and(r_commit).and(r_a).and(r_dep)
     }
 }
 
@@ -200,6 +219,13 @@ impl TxDataSubscription for BoxedASub {
 struct BoxedBSub(Box<dyn TxOrderingSubscription>);
 impl TxOrderingSubscription for BoxedBSub {
     fn next(&mut self) -> Result<(BPosition, kardamom_types::TxOrderingMessage), ExecutorError> {
+        self.0.next()
+    }
+}
+
+struct BoxedDepSub(Box<dyn DepositSubscription>);
+impl DepositSubscription for BoxedDepSub {
+    fn next(&mut self) -> Result<(BPosition, kardamom_types::Deposit), ExecutorError> {
         self.0.next()
     }
 }
@@ -273,6 +299,41 @@ where
                             tx_idx,
                             position,
                             &envelope,
+                            tx_index_in_block,
+                            cumulative_gas_used,
+                        )?;
+                        cumulative_gas_used = receipt.cumulative_gas_used;
+                        tx_index_in_block += 1;
+                        delta.apply(ws);
+                        last_processed_position = Some(position);
+                        if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    ReaderToExec::Deposit {
+                        tx_idx,
+                        deposit,
+                        position,
+                    } => {
+                        if tx_idx != expected_tx_idx {
+                            return Err(ExecutorError::OutOfOrderTx {
+                                got: tx_idx,
+                                expected: expected_tx_idx,
+                            });
+                        }
+                        expected_tx_idx = expected_tx_idx.next();
+                        let env = ExecEnv {
+                            chain_id: cfg.chain_id,
+                            block_number: current_block,
+                            l2_timestamp: current_l2_ts,
+                        };
+                        let (receipt, ws) = execute_deposit_tx(
+                            &snapshot,
+                            &delta,
+                            env,
+                            tx_idx,
+                            position,
+                            &deposit,
                             tx_index_in_block,
                             cumulative_gas_used,
                         )?;

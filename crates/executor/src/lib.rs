@@ -51,7 +51,8 @@ pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet, apply_write_set};
 pub use error::ExecutorError;
 pub use reader::{
-    JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
+    DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
+    TxDataSubscription, TxOrderingSubscription,
 };
 pub use state::{
     MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,

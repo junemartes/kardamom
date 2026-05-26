@@ -244,6 +244,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
                     },
                     a_subs,
                     b_sub,
+                    None,
                     ChanCPub(c_tx),
                     snapshots,
                     Imm,

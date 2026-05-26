@@ -264,6 +264,7 @@ fn actor_receipts_match_naive_reference() {
             },
             a_subs,
             b_sub,
+            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,
