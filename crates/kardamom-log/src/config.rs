@@ -86,6 +86,36 @@ pub struct ChannelsConfig {
     pub quorum_watermark_stream_id: i32,
 }
 
+impl ChannelsConfig {
+    /// Channel A[i] URI for a given sequencer (`{sid}` substituted).
+    pub fn a_channel(&self, sequencer_id: u8) -> String {
+        self.a_channel_template
+            .replace("{sid}", &sequencer_id.to_string())
+    }
+
+    /// Channel A[i] stream id (`a_stream_id_base + sequencer_id`).
+    pub fn a_stream_id(&self, sequencer_id: u8) -> i32 {
+        self.a_stream_id_base + sequencer_id as i32
+    }
+
+    /// Per-recorder channel-B fsync watermark URI (`{rid}` substituted).
+    pub fn fsync_watermark_channel(&self, recorder_id: u8) -> String {
+        self.fsync_watermark_channel_template
+            .replace("{rid}", &recorder_id.to_string())
+    }
+
+    /// Per-sequencer channel-A fsync watermark URI (`{sid}` substituted).
+    pub fn fsync_watermark_a_channel(&self, sequencer_id: u8) -> String {
+        self.fsync_watermark_a_channel_template
+            .replace("{sid}", &sequencer_id.to_string())
+    }
+
+    /// Per-sequencer channel-A fsync watermark stream id.
+    pub fn fsync_watermark_a_stream_id(&self, sequencer_id: u8) -> i32 {
+        self.fsync_watermark_a_stream_id_base + sequencer_id as i32
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QuorumConfig {
     /// Total recorders.
