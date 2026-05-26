@@ -12,9 +12,9 @@
 //! **D-Sh12 v0 scope:** brings up the Aeron container, writes synthetic
 //! segment files in the canonical KAR1-internal frame format that the
 //! batcher's offline `TypedSegmentReader` consumes:
-//!   - one **channel-B** archive carrying `TxOrderingMessage` records
+//!   - one **tx_ordering** archive carrying `TxOrderingMessage` records
 //!     (`TxRef + BoundaryStart`); and
-//!   - one or more **per-sequencer channel-A** archives carrying the full
+//!   - one or more **per-sequencer tx_data** archives carrying the full
 //!     `TxEnvelope` records the refs point at.
 //!
 //! Then it runs the full batcher pipeline through the
@@ -22,7 +22,7 @@
 //! → assert blobs), and asserts a `BatchPosted`-shaped `PostBatchParams`
 //! could be assembled.
 //!
-//! The full path "publish to channel B / channel A[i] with rusteron →
+//! The full path "publish to tx_ordering / tx_data[i] with rusteron →
 //! recorder writes Aeron-native segment frames → batcher decodes via
 //! rusteron-archive replay protocol" lands when the high-level
 //! `ChannelBArchive` / `ChannelAArchive` wrappers ship from `kardamom-log`

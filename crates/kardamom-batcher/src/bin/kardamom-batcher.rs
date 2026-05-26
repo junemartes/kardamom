@@ -1,13 +1,13 @@
 //! `kardamom-batcher` CLI.
 //!
 //! Pure orchestration:
-//!   - Open the offline channel-B segment reader at `--channel-b-segment`.
-//!   - Open per-sequencer channel-A segment readers via
-//!     `--channel-a-archive sid=path,sid=path,...`.
+//!   - Open the offline tx_ordering segment reader at `--tx_ordering-segment`.
+//!   - Open per-sequencer tx_data segment readers via
+//!     `--tx_data-archive sid=path,sid=path,...`.
 //!   - Build a [`Batcher`] with a `Sender` that talks to the settlement
 //!     contract over `--rpc-url`.
 //!   - Run until SIGTERM, advancing per-block batches as `BlockBoundaryStart`
-//!     markers arrive in the canonical (channel-B) archive.
+//!     markers arrive in the canonical (tx_ordering) archive.
 //!
 //! v0 wires the parsing + smoke print path; the real `Sender` impl is a
 //! follow-up task that wraps an `alloy_provider::Provider` + the
@@ -29,13 +29,13 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-batcher", version)]
 struct Cli {
-    /// Path to the channel-B Aeron Archive segment file (.rec) — the
+    /// Path to the tx_ordering Aeron Archive segment file (.rec) — the
     /// canonical orderer carrying `TxOrderingMessage` records (TxRef + boundary).
     #[arg(long, alias = "segment")]
     channel_b_segment: PathBuf,
 
-    /// Per-sequencer channel-A archive paths, in the form
-    /// `sid=path,sid=path,...`. Each sequencer that appears on channel B
+    /// Per-sequencer tx_data archive paths, in the form
+    /// `sid=path,sid=path,...`. Each sequencer that appears on tx_ordering
     /// via a `TxRef` must have its A-archive listed here so the batcher can
     /// resolve the envelope bytes.
     #[arg(long, default_value = "")]

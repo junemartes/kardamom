@@ -2,7 +2,7 @@
 //! `BlockBoundaryStart` markers.
 //!
 //! Spec: §2.6 (sealer emits boundaries onto B) plus S0 D-Sh10 (batcher
-//! consumes channel B only; never queries the live sequencer).
+//! consumes tx_ordering only; never queries the live sequencer).
 //!
 //! The accumulator is **stream-oriented**: it sees a single ordered sequence of
 //! records — interleaved txs and boundary markers — and emits one

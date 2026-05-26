@@ -1,9 +1,9 @@
 //! M-archive offline reader (D-Sh12 / spec D11 / §2.8).
 //!
-//! After D-Sh12 the canonical-ordering archive (channel B) carries only
-//! [`TxOrderingMessage`] records — `TxRef` (pointer into channel A[i]) and
+//! After D-Sh12 the canonical-ordering archive (tx_ordering) carries only
+//! [`TxOrderingMessage`] records — `TxRef` (pointer into tx_data[i]) and
 //! `BlockBoundaryStart` (sealer). Full [`TxEnvelope`] bytes live on the
-//! per-sequencer channel A archives.
+//! per-sequencer tx_data archives.
 //!
 //! This module ties the two together for the offline batcher pipeline:
 //!
@@ -12,7 +12,7 @@
 //!    each into a `(BPosition -> TxEnvelope)` map. (For v0 the offline path
 //!    materialises the per-A index in RAM — fine for batch sizes that fit a
 //!    few segment files. Streaming/page-cache modes are a future scale-up.)
-//! 3. Walk channel B in order; for each [`TxOrderingMessage::TxRef`] resolve
+//! 3. Walk tx_ordering in order; for each [`TxOrderingMessage::TxRef`] resolve
 //!    `(sequencer_id, tx_data_position)` against the right per-A index; for each
 //!    [`TxOrderingMessage::BoundaryStart`] yield the boundary marker.
 //!
@@ -37,15 +37,15 @@ use crate::error::BatcherError;
 /// A record resolved from the M+1 archive topology back into the legacy
 /// "stream of tx + boundary" shape that the [`crate::batch::BatchAccumulator`]
 /// already understands. The `position` field is the canonical B-position of
-/// the originating channel-B record (system invariant I1), not the channel-A
+/// the originating tx_ordering record (system invariant I1), not the tx_data
 /// position the envelope was fetched from. Canonical L2 ordering is by B.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedRecord {
     Tx {
-        /// Canonical position of the `TxRef` on channel B. This is the value
+        /// Canonical position of the `TxRef` on tx_ordering. This is the value
         /// the batch accumulator stores in `RecordedTx::position`.
         position: BPosition,
-        /// The originating channel-A position. Useful for diagnostics and
+        /// The originating tx_data position. Useful for diagnostics and
         /// for the per-A reader's own bookkeeping. Carried through so test
         /// asserts can verify resolution went to the right A-archive.
         sequencer_id: u8,
@@ -58,9 +58,9 @@ pub enum ResolvedRecord {
     },
 }
 
-/// Configuration for the M-archive reader. `b_segment` is the channel-B
+/// Configuration for the M-archive reader. `b_segment` is the tx_ordering
 /// segment file path; `a_segments` maps `sequencer_id` to the corresponding
-/// channel-A segment file path.
+/// tx_data segment file path.
 ///
 /// For v0 each archive is one segment file; multi-segment iteration is the
 /// same algorithm applied to consecutive files and is left for a follow-up
@@ -73,7 +73,7 @@ pub struct MultiArchiveConfig {
 }
 
 impl MultiArchiveConfig {
-    /// Parse the `--channel-a-archive sid=path,sid=path,...` CLI form. Used
+    /// Parse the `--tx_data-archive sid=path,sid=path,...` CLI form. Used
     /// by the CLI driver; centralised here so tests can exercise the same
     /// parser without depending on `clap`.
     pub fn parse_a_spec(spec: &str) -> Result<HashMap<u8, PathBuf>, BatcherError> {
@@ -81,18 +81,18 @@ impl MultiArchiveConfig {
         for entry in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             let (sid_str, path_str) = entry.split_once('=').ok_or_else(|| {
                 BatcherError::Config(format!(
-                    "channel-a-archive entry '{entry}' missing '=' separator"
+                    "tx_data-archive entry '{entry}' missing '=' separator"
                 ))
             })?;
             let sid: u8 = sid_str.trim().parse().map_err(|e| {
                 BatcherError::Config(format!(
-                    "channel-a-archive sequencer id '{sid_str}' is not a u8: {e}"
+                    "tx_data-archive sequencer id '{sid_str}' is not a u8: {e}"
                 ))
             })?;
             let path = PathBuf::from(path_str.trim());
             if out.insert(sid, path).is_some() {
                 return Err(BatcherError::Config(format!(
-                    "channel-a-archive sequencer id {sid} listed twice"
+                    "tx_data-archive sequencer id {sid} listed twice"
                 )));
             }
         }
@@ -100,13 +100,13 @@ impl MultiArchiveConfig {
     }
 }
 
-/// Per-sequencer channel-A position index: maps `BPosition` to the decoded
+/// Per-sequencer tx_data position index: maps `BPosition` to the decoded
 /// `TxEnvelope` so the B-walker can resolve refs in `O(1)`.
 ///
 /// Built once per A-archive during [`MultiArchiveReader::open`].
 type PerASegmentIndex = HashMap<BPosition, TxEnvelope>;
 
-/// M-archive offline reader. Walks channel B in canonical order, resolving
+/// M-archive offline reader. Walks tx_ordering in canonical order, resolving
 /// each `TxRef` against the per-sequencer A indexes.
 pub struct MultiArchiveReader {
     b_reader: ChannelBSegmentReader,
@@ -130,7 +130,7 @@ impl MultiArchiveReader {
         })
     }
 
-    /// Open the channel-B reader only, with **explicitly-supplied**
+    /// Open the tx_ordering reader only, with **explicitly-supplied**
     /// per-A indexes. Useful for tests that synthesise an in-memory index
     /// rather than write a segment file to disk.
     pub fn with_indexes(
@@ -144,7 +144,7 @@ impl MultiArchiveReader {
         })
     }
 
-    /// Number of channel-A archives this reader is resolving against.
+    /// Number of tx_data archives this reader is resolving against.
     pub fn a_archive_count(&self) -> usize {
         self.a_indexes.len()
     }
@@ -157,13 +157,13 @@ impl MultiArchiveReader {
     fn resolve(&self, r: &TxRef) -> Result<TxEnvelope, BatcherError> {
         let idx = self.a_indexes.get(&r.shard_id).ok_or_else(|| {
             BatcherError::Config(format!(
-                "channel-A archive for sequencer_id={} not configured",
+                "tx_data archive for sequencer_id={} not configured",
                 r.shard_id
             ))
         })?;
         idx.get(&r.tx_data_position).cloned().ok_or_else(|| {
             BatcherError::Frame(format!(
-                "TxRef sequencer_id={} tx_data_position={:?} not found in channel-A index",
+                "TxRef sequencer_id={} tx_data_position={:?} not found in tx_data index",
                 r.shard_id, r.tx_data_position
             ))
         })
@@ -198,7 +198,7 @@ impl Iterator for MultiArchiveReader {
     }
 }
 
-/// Read a channel-A segment file fully and build the `BPosition ->
+/// Read a tx_data segment file fully and build the `BPosition ->
 /// TxEnvelope` lookup.
 pub fn load_a_index(path: &Path) -> Result<PerASegmentIndex, BatcherError> {
     let reader = ChannelASegmentReader::open(path)?;
@@ -207,7 +207,7 @@ pub fn load_a_index(path: &Path) -> Result<PerASegmentIndex, BatcherError> {
         let rec = rec?;
         if idx.insert(rec.position, rec.value).is_some() {
             return Err(BatcherError::Frame(format!(
-                "duplicate channel-A position {:?} in {}",
+                "duplicate tx_data position {:?} in {}",
                 rec.position,
                 path.display()
             )));

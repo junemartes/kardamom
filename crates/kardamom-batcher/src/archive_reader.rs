@@ -1,7 +1,7 @@
 //! Offline Aeron Archive segment reader.
 //!
 //! S0 D-Sh10: the batcher reads from on-disk Aeron Archive segment files. It
-//! does not subscribe to channel C, does not talk to the live sequencer.
+//! does not subscribe to tx_receipts, does not talk to the live sequencer.
 //!
 //! ## D-Sh12 architecture: split data and ordering
 //!
@@ -25,7 +25,7 @@
 //! ```
 //!
 //! The header is type-agnostic; the payload type is determined by *which
-//! archive* the segment file came from (channel B vs channel A[i]). The
+//! archive* the segment file came from (tx_ordering vs tx_data[i]). The
 //! reader is generic over the payload type so it can deserialise either.
 //!
 //! The active segment may end mid-frame; the reader truncates at the last
@@ -46,7 +46,7 @@ const FRAME_HEADER_LEN: usize = 4 + 4 + 4 + 4; // 16 bytes (length, reserved, te
 const FRAME_ALIGN: usize = 8;
 
 /// One decoded record from a typed segment file. The position is the
-/// fragment's start position on the originating Aeron stream — for channel A
+/// fragment's start position on the originating Aeron stream — for tx_data
 /// segments this is the position a sequencer recorded in [`TxRef::tx_data_position`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TypedRecord<T> {
@@ -56,7 +56,7 @@ pub struct TypedRecord<T> {
 
 /// Generic offline reader over an archive segment file. The type parameter
 /// `T` is the rkyv-archived payload carried by every frame in this segment.
-/// For channel B archives use `T = TxOrderingMessage`; for channel A archives
+/// For tx_ordering archives use `T = TxOrderingMessage`; for tx_data archives
 /// use `T = TxEnvelope`.
 pub struct TypedSegmentReader<T> {
     bytes: Vec<u8>,
@@ -90,7 +90,7 @@ where
     }
 
     /// Drain the reader into a `Vec<TypedRecord<T>>`. Convenience for
-    /// pre-loading an entire (channel A) segment into the per-A position
+    /// pre-loading an entire (tx_data) segment into the per-A position
     /// index used by [`crate::multi_archive_reader::MultiArchiveReader`].
     pub fn collect_all(self) -> Result<Vec<TypedRecord<T>>, BatcherError> {
         self.collect::<Result<Vec<_>, _>>()
@@ -159,8 +159,8 @@ where
 /// Append one frame to `out`. Helper used by tests and the future writer-side
 /// adapter; encodes one record in the simplified KAR1-internal segment format.
 ///
-/// The frame is type-agnostic: caller writes the same way for channel A
-/// (T = TxEnvelope) and channel B (T = TxOrderingMessage).
+/// The frame is type-agnostic: caller writes the same way for tx_data
+/// (T = TxEnvelope) and tx_ordering (T = TxOrderingMessage).
 pub fn append_frame<T>(out: &mut Vec<u8>, position: BPosition, value: &T)
 where
     T: for<'a> rkyv::Serialize<

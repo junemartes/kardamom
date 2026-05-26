@@ -2,8 +2,8 @@
 //!
 //! End-to-end exercise of the **new D-Sh12 M+1 archive topology**:
 //!
-//! 1. Build per-sequencer channel-A archives with full `TxEnvelope` bytes.
-//! 2. Build the channel-B archive with the canonical `TxOrderingMessage`
+//! 1. Build per-sequencer tx_data archives with full `TxEnvelope` bytes.
+//! 2. Build the tx_ordering archive with the canonical `TxOrderingMessage`
 //!    record stream (`TxRef + BoundaryStart`).
 //! 3. Drive the offline `MultiArchiveReader` → `BatchAccumulator` →
 //!    `pack_blocks` pipeline to produce the same `PostedBatch` the

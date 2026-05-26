@@ -12,11 +12,11 @@
 //!
 //! - **TxOrdering archive** carries the canonical orderer payload — only
 //!   `TxOrderingMessage` records (`TxRef + BoundaryStart`). Tiny per-record.
-//! - **Per-sequencer channel A archives** carry the bulk `TxEnvelope` bytes.
+//! - **Per-sequencer tx_data archives** carry the bulk `TxEnvelope` bytes.
 //!   One per sequencer; opened on demand by [`multi_archive_reader`].
 //!
 //! [`multi_archive_reader::MultiArchiveReader`] is the glue: it walks B in
-//! canonical order, resolving each `TxRef` against the appropriate channel-A
+//! canonical order, resolving each `TxRef` against the appropriate tx_data
 //! position index, and yields [`multi_archive_reader::ResolvedRecord`]s the
 //! existing [`batch::BatchAccumulator`] can consume as-is.
 //!

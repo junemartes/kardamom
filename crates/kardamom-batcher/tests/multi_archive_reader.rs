@@ -1,4 +1,4 @@
-//! M-archive (channel B + per-sequencer channel A) offline reader tests.
+//! M-archive (tx_ordering + per-sequencer tx_data) offline reader tests.
 //!
 //! Covers:
 //!   * happy-path in-order resolution (refs come on B after the env was
@@ -8,7 +8,7 @@
 //!     pins this invariant down);
 //!   * missing-A-archive surfaced as a `BatcherError::Config`;
 //!   * canonical-ordering invariant: the output `position` field is the
-//!     channel-B canonical position, not the A-archive position the envelope
+//!     tx_ordering canonical position, not the A-archive position the envelope
 //!     was fetched from.
 //!
 //! Also exercises the CLI spec parser.
@@ -122,7 +122,7 @@ fn happy_path_in_order_resolution() {
     let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 5);
 
-    // Canonical order matches the channel-B walk; payload bytes resolved
+    // Canonical order matches the tx_ordering walk; payload bytes resolved
     // from the correct A-archive.
     let expected_correlation = [10u64, 20, 11, 21];
     for (i, exp) in expected_correlation.iter().enumerate() {

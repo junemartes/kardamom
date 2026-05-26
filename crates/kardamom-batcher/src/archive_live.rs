@@ -13,9 +13,9 @@
 //! The replay-protocol path (no filesystem access) is deferred; the
 //! filesystem path covers the spec and matches the layout the recorder writes.
 //!
-//! After D-Sh12 the batcher resolves a B-archive recording (channel B,
+//! After D-Sh12 the batcher resolves a B-archive recording (tx_ordering,
 //! `T = TxOrderingMessage`) plus M per-sequencer A-archive recordings
-//! (channel A[i], `T = TxEnvelope`). This module produces one
+//! (tx_data[i], `T = TxEnvelope`). This module produces one
 //! `LiveSegmentDescriptor` per recording id — callers compose them into the
 //! [`crate::multi_archive_reader::MultiArchiveReader`].
 
@@ -77,14 +77,14 @@ impl LiveSegmentDescriptor {
         })
     }
 
-    /// Open a channel-B typed reader over this descriptor's segment file.
+    /// Open a tx_ordering typed reader over this descriptor's segment file.
     pub fn open_b(&self) -> Result<ChannelBSegmentReader, BatcherError> {
         TypedSegmentReader::<TxOrderingMessage>::open(&self.segment_path)
     }
 
-    /// Open a channel-A typed reader over this descriptor's segment file.
+    /// Open a tx_data typed reader over this descriptor's segment file.
     /// The caller is responsible for ensuring the underlying recording is
-    /// in fact a channel-A recording for some sequencer.
+    /// in fact a tx_data recording for some sequencer.
     pub fn open_a(&self) -> Result<ChannelASegmentReader, BatcherError> {
         TypedSegmentReader::<TxEnvelope>::open(&self.segment_path)
     }
