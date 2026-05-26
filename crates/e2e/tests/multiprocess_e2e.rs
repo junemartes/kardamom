@@ -91,8 +91,7 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
     let alice = signer_from_seed(0x11);
     let alice_addr = alice.address();
     let bob_addr = Address::repeat_byte(0x22);
-    let alice_balance_wei: U256 = U256::from(1_000_000_000_000_000_000_000u128); // 1000 ETH
-    let alice_genesis = format!("{alice_addr:#x}:{alice_balance_wei}");
+    let genesis_path = write_genesis_toml(cfg_dir.path(), CHAIN_ID, alice_addr);
 
     // ----- Spawn the four services. SIGTERM order on teardown is reverse:
     // ----- ingress (stops new submissions) → executor → sequencer → sealer.
@@ -127,8 +126,8 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg("1")
             .arg("--chain-id")
             .arg(CHAIN_ID.to_string())
-            .arg("--genesis-account")
-            .arg(&alice_genesis)
+            .arg("--chain")
+            .arg(&genesis_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit()),
     );
@@ -296,6 +295,22 @@ fn write_ingress_config(dir: &Path) -> PathBuf {
     // runtime tuning today. Write an empty TOML so the presence check passes.
     let p = dir.join("ingress.toml");
     std::fs::write(&p, "").unwrap();
+    p
+}
+
+/// Write a kardamom `Genesis` TOML that funds `alice` with 1000 ETH. The
+/// executor bin loads this via `--chain` and seeds the in-memory state DB.
+fn write_genesis_toml(dir: &Path, chain_id: u64, alice: Address) -> PathBuf {
+    let p = dir.join("genesis.toml");
+    let body = format!(
+        r#"chain_id = {chain_id}
+
+[[alloc]]
+address = "{alice:#x}"
+balance = "1000000000000000000000"
+"#
+    );
+    std::fs::write(&p, body).unwrap();
     p
 }
 

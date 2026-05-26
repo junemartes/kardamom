@@ -47,12 +47,13 @@ struct Args {
     /// by bumping this.
     #[arg(long, default_value_t = 1)]
     initial_block: u64,
-    /// Genesis allocation: `address:balance_wei`. Repeatable. Seeds the
-    /// in-memory state DB with funded accounts so revm has balance to
-    /// debit. Production deployments load this from a chain spec; for
-    /// the v0 deployable scaffold + e2e tests it's a CLI flag.
-    #[arg(long = "genesis-account", value_name = "ADDRESS:BALANCE_WEI")]
-    genesis_accounts: Vec<String>,
+    /// Path to a genesis TOML (schema: `kardamom_node::Genesis`). The
+    /// chain id is taken from this file (must match `--chain-id` if both
+    /// are set), and every `[[alloc]]` entry seeds the in-memory state
+    /// DB with the listed balance / nonce / code so revm has account
+    /// state to debit on the first transaction from each sender.
+    #[arg(long)]
+    chain: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -118,17 +119,38 @@ async fn main() -> Result<()> {
         .context("open TxReceiptsPublisherHandle")?;
     let c_pub = LiveTxReceiptsPub { handle: c_handle };
 
+    // Load genesis if provided; seed the in-memory state DB and adopt
+    // its chain_id when present.
+    let genesis = match args.chain.as_ref() {
+        Some(path) => Some(load_genesis(path)?),
+        None => None,
+    };
+    let chain_id = genesis
+        .as_ref()
+        .map(|g| g.chain_id)
+        .unwrap_or(args.chain_id);
+    if let Some(g) = &genesis
+        && args.chain_id != 1
+        && args.chain_id != g.chain_id
+    {
+        anyhow::bail!(
+            "--chain-id {} conflicts with genesis chain_id {}",
+            args.chain_id,
+            g.chain_id
+        );
+    }
+
     // In-memory state backend (v0). Sharing one MockStateDatabase between
     // the snapshot source (read) and the state-writer queue (write) gives
     // the executor a self-consistent view; future revisions plug in
     // `state::StateWriter` here.
-    let db = build_genesis_db(&args.genesis_accounts).context("genesis allocation")?;
+    let db = build_genesis_db(genesis.as_ref());
     let snapshots = MutatingSnapshotSource(db.clone());
     let sw_queue = WriterApplyingQueue::new(db);
     let sw_signal = ImmediateSignal;
 
     let cfg = ExecutorConfig {
-        chain_id: args.chain_id,
+        chain_id,
         ..ExecutorConfig::default()
     };
     let initial_block = args.initial_block;
@@ -164,26 +186,49 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parse `--genesis-account ADDRESS:BALANCE_WEI` entries and seed a fresh
-/// `MockStateDatabase`. Every account is created at nonce 0 with empty
-/// code (`code_hash = ZERO`).
-fn build_genesis_db(entries: &[String]) -> Result<MockStateDatabase> {
-    use alloy_primitives::{Address, B256, U256};
+/// Load a kardamom genesis TOML and run its semantic validation
+/// (chain_id != 0, no duplicate alloc addresses).
+fn load_genesis(path: &std::path::Path) -> Result<kardamom_node::Genesis> {
+    let raw = std::fs::read_to_string(path).context("read genesis TOML")?;
+    let genesis: kardamom_node::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
+    genesis.validate().context("validate genesis")?;
+    Ok(genesis)
+}
+
+/// Seed a fresh `MockStateDatabase` from a `Genesis` (or build an empty one
+/// if none was supplied). Every `AllocEntry` becomes one account with the
+/// declared balance, nonce, and code (if any). The code's keccak256 hash is
+/// stored as the account's `code_hash` and the code bytes are made
+/// retrievable via `code_by_hash`.
+fn build_genesis_db(genesis: Option<&kardamom_node::Genesis>) -> MockStateDatabase {
+    use alloy_primitives::{B256, keccak256};
     let mut builder = MockStateDatabase::builder();
-    for entry in entries {
-        let (addr_s, bal_s) = entry.split_once(':').ok_or_else(|| {
-            anyhow::anyhow!("genesis-account `{entry}` missing `address:balance`")
-        })?;
-        let addr: Address = addr_s
-            .parse()
-            .with_context(|| format!("parse address from `{entry}`"))?;
-        let balance: U256 = bal_s
-            .parse()
-            .with_context(|| format!("parse balance (decimal wei) from `{entry}`"))?;
-        tracing::info!(?addr, %balance, "seeding genesis account");
-        builder = builder.account(addr, balance, 0, B256::ZERO);
+    let Some(g) = genesis else {
+        return builder.build();
+    };
+    for entry in &g.alloc {
+        let nonce = entry.nonce.unwrap_or(0);
+        let code_hash = entry
+            .code
+            .as_ref()
+            .map(|c| keccak256(c.as_ref()))
+            .unwrap_or(B256::ZERO);
+        tracing::info!(
+            address = ?entry.address,
+            balance = %entry.balance,
+            nonce,
+            has_code = entry.code.is_some(),
+            "seeding genesis account"
+        );
+        builder = builder.account(entry.address, entry.balance, nonce, code_hash);
+        if let Some(code) = entry.code.as_ref() {
+            // `Genesis::AllocEntry.code` is `alloy_primitives::Bytes`;
+            // MockStateDatabase wants `bytes::Bytes`. They're separate
+            // newtypes that share the same underlying buffer.
+            builder = builder.code(code_hash, code.0.clone());
+        }
     }
-    Ok(builder.build())
+    builder.build()
 }
 
 // ---------------------------------------------------------------------------
