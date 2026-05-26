@@ -18,11 +18,12 @@ docker-e2e = ["testing", "dep:testcontainers"]
 # Off by default so the crate compiles cleanly on hosts without the Aeron C
 # library installed. Real Aeron deployments and the docker-e2e harness enable
 # this feature.
-aeron-live = ["dep:rusteron-client", "dep:rusteron-archive"]
+aeron-live = ["dep:rusteron-client", "dep:rusteron-archive", "dep:crossbeam-channel"]
 
 [dependencies]
 alloy-primitives.workspace = true
 bytes.workspace = true
+crossbeam-channel = { workspace = true, optional = true }
 futures.workspace = true
 types.workspace = true
 rkyv.workspace = true

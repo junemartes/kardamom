@@ -20,8 +20,13 @@ RUN mkdir -p /opt/aeron && \
     curl -L "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_VERSION}/aeron-all-${AERON_VERSION}.jar" \
         -o /opt/aeron/aeron-all.jar
 
-ENV AERON_DIR=/dev/shm/aeron
-ENV AERON_ARCHIVE_DIR=/var/lib/aeron/archive
+# `aeron.dir` lives in a subdir of a bind-mount root so Aeron can freely
+# rmdir + recreate `aeron.dir` on every start without touching the
+# mountpoint itself (which can't be `rmdir`'d). The host bind-mounts
+# `/aeron-mount` and reads/writes `/aeron-mount/dir` from outside.
+ENV AERON_DIR=/aeron-mount/dir
+ENV AERON_ARCHIVE_MOUNT=/aeron-mount/archive
+ENV AERON_ARCHIVE_DIR=/aeron-mount/archive/dir
 ENV AERON_ARCHIVE_CLASS=io.aeron.archive.ArchivingMediaDriver
 
 # Sensible defaults for testing — small term length to keep RSS low.
@@ -31,8 +36,8 @@ ENV AERON_IPC_TERM_BUFFER_LENGTH=4194304
 # Expose Archive control + response + replication ports.
 EXPOSE 8010/udp 8011/udp 8020/udp 8021/udp
 
-RUN mkdir -p ${AERON_ARCHIVE_DIR} && \
-    chmod -R 777 ${AERON_ARCHIVE_DIR}
+RUN mkdir -p /aeron-mount && chmod 0777 /aeron-mount && \
+    mkdir -p /aeron-mount/archive && chmod 0777 /aeron-mount/archive
 
 COPY entrypoint.sh /opt/aeron/entrypoint.sh
 RUN chmod +x /opt/aeron/entrypoint.sh

@@ -32,11 +32,15 @@ pub mod supervisor;
 pub mod watermark;
 
 #[cfg(feature = "aeron-live")]
+pub mod aeron_live;
+#[cfg(feature = "aeron-live")]
 pub mod publisher;
 #[cfg(feature = "aeron-live")]
 pub mod recorder;
 #[cfg(feature = "aeron-live")]
 pub mod subscriber;
+#[cfg(feature = "aeron-live")]
+pub mod tx_ordering_archive;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;

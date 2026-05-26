@@ -415,9 +415,10 @@ impl FakeFsyncWatermarkStream {
 
 #[cfg(feature = "docker-e2e")]
 mod docker {
+    use std::path::PathBuf;
     use std::time::Duration;
 
-    use testcontainers::core::{IntoContainerPort, WaitFor};
+    use testcontainers::core::{IntoContainerPort, Mount, WaitFor};
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
@@ -425,25 +426,28 @@ mod docker {
     const AERON_IMAGE_NAME: &str = "kardamom-aeron";
     const AERON_IMAGE_TAG: &str = "test";
 
+    /// One Aeron node: the running container plus the host directories that
+    /// shadow its `AERON_DIR` (Media Driver shared-memory) and
+    /// `AERON_ARCHIVE_DIR` (Archive segment files). Sharing these dirs with
+    /// the host lets a host-side Aeron client join the container's Media
+    /// Driver directly (no embedded MD on the host needed).
+    struct Node {
+        container: ContainerAsync<GenericImage>,
+        aeron_dir_host: PathBuf,
+        archive_dir_host: PathBuf,
+    }
+
     /// Reusable Aeron e2e harness. Each instance owns one or more real Aeron
     /// containers and exposes the host ports the Rust code should connect to.
     pub struct AeronTestCluster {
-        nodes: Vec<ContainerAsync<GenericImage>>,
+        nodes: Vec<Node>,
     }
 
     impl AeronTestCluster {
         /// Bring up a single Aeron node (Media Driver + Archive in one JVM).
         pub async fn single_node() -> Result<Self, Box<dyn std::error::Error>> {
             ensure_image_built().await?;
-            let image = GenericImage::new(AERON_IMAGE_NAME, AERON_IMAGE_TAG)
-                .with_exposed_port(8010_u16.udp())
-                .with_exposed_port(8011_u16.udp())
-                .with_exposed_port(8020_u16.udp())
-                .with_exposed_port(8021_u16.udp())
-                .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"));
-
-            let node = image.with_shm_size(256 * 1024 * 1024).start().await?;
-
+            let node = spawn_node().await?;
             Ok(Self { nodes: vec![node] })
         }
 
@@ -452,14 +456,7 @@ mod docker {
             ensure_image_built().await?;
             let mut nodes = Vec::with_capacity(n);
             for _ in 0..n {
-                let image = GenericImage::new(AERON_IMAGE_NAME, AERON_IMAGE_TAG)
-                    .with_exposed_port(8010_u16.udp())
-                    .with_exposed_port(8011_u16.udp())
-                    .with_exposed_port(8020_u16.udp())
-                    .with_exposed_port(8021_u16.udp())
-                    .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"));
-                let node = image.with_shm_size(256 * 1024 * 1024).start().await?;
-                nodes.push(node);
+                nodes.push(spawn_node().await?);
             }
             Ok(Self { nodes })
         }
@@ -468,6 +465,7 @@ mod docker {
         /// channel endpoint for node `i`.
         pub async fn archive_control_endpoint(&self, i: usize) -> String {
             let port = self.nodes[i]
+                .container
                 .get_host_port_ipv4(8010_u16.udp())
                 .await
                 .unwrap();
@@ -476,10 +474,23 @@ mod docker {
 
         pub async fn archive_response_endpoint(&self, i: usize) -> String {
             let port = self.nodes[i]
+                .container
                 .get_host_port_ipv4(8011_u16.udp())
                 .await
                 .unwrap();
             format!("127.0.0.1:{port}")
+        }
+
+        /// Host filesystem path of `aeron.dir` for node `i`. Pass this to
+        /// `AeronRuntime::spawn_with_dir(...)` so a host Aeron client joins
+        /// the container's Media Driver.
+        pub fn aeron_dir_host(&self, i: usize) -> &std::path::Path {
+            &self.nodes[i].aeron_dir_host
+        }
+
+        /// Host filesystem path of `aeron.archive.dir` for node `i`.
+        pub fn archive_dir_host(&self, i: usize) -> &std::path::Path {
+            &self.nodes[i].archive_dir_host
         }
 
         pub fn len(&self) -> usize {
@@ -492,9 +503,68 @@ mod docker {
 
         /// Stop node `i` (simulates recorder failure for quorum tests).
         pub async fn stop(&mut self, i: usize) -> Result<(), Box<dyn std::error::Error>> {
-            self.nodes[i].stop().await?;
+            self.nodes[i].container.stop().await?;
             Ok(())
         }
+    }
+
+    /// Build the host tempdir + bind-mounted container.
+    ///
+    /// Aeron stores absolute paths inside `cnc.dat` (the command-and-control
+    /// shared-memory file) — when the host client opens the buffer the MD
+    /// has prepared, it follows those paths verbatim. So the bind-mount
+    /// source and destination must share the same absolute path on both
+    /// host and container.
+    ///
+    /// Layout (identical on host and inside container):
+    /// ```text
+    ///   /tmp/kardamom-aeron-<suffix>/
+    ///     dir/              <-- Aeron's `aeron.dir` (cnc.dat, etc.)
+    ///     archive/dir/      <-- Aeron Archive's segment files
+    /// ```
+    /// Aeron's `MediaDriver.ensureDirectoryIsRecreated` rmdir+mkdir the
+    /// inner `dir/` subdir on every start, so the bind-mounted parent stays
+    /// intact.
+    async fn spawn_node() -> Result<Node, Box<dyn std::error::Error>> {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::path::PathBuf::from(format!("/tmp/kardamom-aeron-{suffix:x}"));
+        let aeron_dir = root.join("dir");
+        let archive_dir = root.join("archive").join("dir");
+        std::fs::create_dir_all(root.join("archive"))?;
+        for d in [&root, &root.join("archive")] {
+            let mut p = std::fs::metadata(d)?.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                p.set_mode(0o777);
+            }
+            std::fs::set_permissions(d, p)?;
+        }
+
+        let root_str = root.to_str().ok_or("mount path not utf-8")?.to_string();
+        let aeron_dir_in_container = format!("{root_str}/dir");
+        let archive_dir_in_container = format!("{root_str}/archive/dir");
+
+        let image = GenericImage::new(AERON_IMAGE_NAME, AERON_IMAGE_TAG)
+            .with_exposed_port(8010_u16.udp())
+            .with_exposed_port(8011_u16.udp())
+            .with_exposed_port(8020_u16.udp())
+            .with_exposed_port(8021_u16.udp())
+            .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"))
+            .with_mount(Mount::bind_mount(root_str.clone(), root_str.clone()))
+            .with_env_var("AERON_DIR", aeron_dir_in_container)
+            .with_env_var("AERON_ARCHIVE_DIR", archive_dir_in_container);
+
+        let container = image.with_shm_size(256 * 1024 * 1024).start().await?;
+
+        Ok(Node {
+            container,
+            aeron_dir_host: aeron_dir,
+            archive_dir_host: archive_dir,
+        })
     }
 
     /// `docker build`s the Aeron image once per test run, idempotent.

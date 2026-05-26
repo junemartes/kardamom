@@ -58,6 +58,7 @@ futures = "0.3"
 # `(sequencer_id, BPosition) → TxEnvelope` entries; the tx_ordering reader thread
 # pops them as each `TxRef` arrives. Many writers + one reader → DashMap.
 dashmap = "6"
+crossbeam-channel = "0.5"
 
 [profile.release]
 debug = true
