@@ -3862,6 +3862,7 @@ dependencies = [
 ]
 
 [[package]]
+<<<<<<< HEAD
 name = "kardamom-sealer"
 version = "0.1.0"
 dependencies = [
@@ -3884,6 +3885,8 @@ dependencies = [
 ]
 
 [[package]]
+=======
+>>>>>>> origin/claude/s4-v0-sequential-executor
 name = "kardamom-sequencer"
 version = "0.1.0"
 dependencies = [
