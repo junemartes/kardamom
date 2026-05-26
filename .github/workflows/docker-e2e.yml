@@ -61,7 +61,7 @@ jobs:
           cargo build \
             -p kardamom-log \
             -p e2e \
-            --features 'log/docker-e2e,e2e/full-pipeline-e2e' \
+            --features 'kardamom-log/docker-e2e,e2e/full-pipeline-e2e' \
             --tests
 
       # Run the headline test: the cross-component proof-of-pipeline.
