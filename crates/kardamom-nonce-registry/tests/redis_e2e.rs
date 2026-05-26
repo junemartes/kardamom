@@ -3,7 +3,7 @@
 use alloy_primitives::Address;
 use kardamom_nonce_registry::{CheckOutcome, NonceRegistry, RegistryConfig};
 use testcontainers::{
-    GenericImage, ImageExt,
+    GenericImage,
     core::{IntoContainerPort, WaitFor},
     runners::AsyncRunner,
 };
