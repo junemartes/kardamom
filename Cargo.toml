@@ -44,6 +44,12 @@ kardamom-types = { path = "crates/kardamom-types" }
 kardamom-log = { path = "crates/kardamom-log" }
 kardamom-nonce-registry = { path = "crates/kardamom-nonce-registry" }
 
+# Re-introduced in S5 (block sealer election + S7 batcher election).
+# Originally lived in s3-canonical-log; moved here so it sits at the layer
+# of its first remaining consumer after the sequencer was rewired onto
+# kardamom-nonce-registry.
+kardamom-leases = { path = "crates/kardamom-leases" }
+
 # S3 external deps
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
 io-uring = "0.7"
