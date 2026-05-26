@@ -9,12 +9,12 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::TxEnvelope;
+use kardamom_types::{BPosition, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedIngress;
+use kardamom_sequencer::inbound::fakes::ScriptedChannelA;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelAPublisher, InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
 };
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 
@@ -56,25 +56,34 @@ fn one_partition_cfg() -> SequencerConfig {
     }
 }
 
+/// Monotonically synthesize a `BPosition` for the in-memory subscription so
+/// every observed envelope has a distinct A-position (the way Aeron-archive
+/// fragment offsets do in production).
+fn pos(offset: i32) -> BPosition {
+    BPosition {
+        term_id: 0,
+        term_offset: offset,
+    }
+}
+
 #[test]
-fn match_dual_writes_once() {
+fn match_publishes_ref() {
     let s = signer(1);
     let env = signed_tx_envelope(&s, 0, 7);
-    let mut ingress = ScriptedIngress::default();
-    ingress.queue.push_back(env);
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
+    channel_a.queue.push_back((pos(0), env));
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
-    assert!(seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
-    assert_eq!(a.published.lock().unwrap().len(), 1);
+    assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(refs[0].shard_id, 0);
+    assert_eq!(refs[0].position_a, pos(0));
     assert!(rc.duplicates.lock().unwrap().is_empty());
 }
 
@@ -83,22 +92,24 @@ fn past_nonce_emits_duplicate_notification() {
     let s = signer(2);
     let env0 = signed_tx_envelope(&s, 0, 100);
     let env0_dup = signed_tx_envelope(&s, 0, 200);
-    let mut ingress = ScriptedIngress::default();
-    ingress.queue.push_back(env0);
-    ingress.queue.push_back(env0_dup);
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
+    channel_a.queue.push_back((pos(0), env0));
+    channel_a.queue.push_back((pos(64), env0_dup));
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
-    seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
-    seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
 
-    assert_eq!(a.published.lock().unwrap().len(), 1);
-    assert_eq!(b.refs.lock().unwrap().len(), 1);
+    assert_eq!(
+        b.refs.lock().unwrap().len(),
+        1,
+        "only first nonce-0 published"
+    );
     let dups = rc.duplicates.lock().unwrap();
     assert_eq!(dups.len(), 1);
     assert_eq!(dups[0].correlation_id, 200);
@@ -111,146 +122,71 @@ fn future_nonce_buffered_then_drained() {
     let s = signer(3);
     let env0 = signed_tx_envelope(&s, 0, 100);
     let env1 = signed_tx_envelope(&s, 1, 101);
-    let mut ingress = ScriptedIngress::default();
-    // Out of order: 1 first.
-    ingress.queue.push_back(env1);
-    ingress.queue.push_back(env0);
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
+    // Out of order: nonce 1 first.
+    channel_a.queue.push_back((pos(0), env1));
+    channel_a.queue.push_back((pos(64), env0));
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
-    seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
-    assert_eq!(a.published.lock().unwrap().len(), 0);
-    assert_eq!(b.refs.lock().unwrap().len(), 0);
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert_eq!(b.refs.lock().unwrap().len(), 0, "nonce 1 buffered");
 
-    seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap();
-    assert_eq!(a.published.lock().unwrap().len(), 2);
-    assert_eq!(b.refs.lock().unwrap().len(), 2);
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    let refs = b.refs.lock().unwrap();
+    assert_eq!(refs.len(), 2, "nonce 0 publishes + drains buffered nonce 1");
+    // Both refs land in nonce order: nonce 0 at pos(64), nonce 1 at pos(0).
+    assert_eq!(refs[0].position_a, pos(64));
+    assert_eq!(refs[1].position_a, pos(0));
 }
 
 #[test]
-fn a_backpressure_rewinds_state_and_retry_succeeds() {
+fn b_backpressure_rewinds_state_and_retry_succeeds() {
     let s = signer(4);
     let env = signed_tx_envelope(&s, 0, 100);
-    let mut ingress = ScriptedIngress::default();
-    ingress.queue.push_back(env);
-    let mut a = InMemoryChannelAPublisher::new(0);
-    *a.fail_with_backpressure.lock().unwrap() = true;
-    let mut b = InMemoryChannelBRefPublisher::default();
-    let mut rc = InMemoryReceiptCachePublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
-
-    let r = seq.run_once(&mut ingress, &mut a, &mut b, &mut rc);
-    assert!(matches!(
-        r,
-        Err(kardamom_sequencer::SequencerError::Backpressure)
-    ));
-    assert_eq!(a.published.lock().unwrap().len(), 0);
-    assert_eq!(b.refs.lock().unwrap().len(), 0);
-
-    // Recover A; the next run_once drains the rebuffered nonce 0 onto both
-    // channels, then the call after processes the fresh ingress nonce 1.
-    *a.fail_with_backpressure.lock().unwrap() = false;
-    let env1 = signed_tx_envelope(&s, 1, 101);
-    ingress.queue.push_back(env1);
-    assert!(seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
-    assert_eq!(
-        a.published.lock().unwrap().len(),
-        1,
-        "drain-pending publishes 0 to A"
-    );
-    assert_eq!(
-        b.refs.lock().unwrap().len(),
-        1,
-        "drain-pending publishes 0's ref to B"
-    );
-    assert!(seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
-    assert_eq!(a.published.lock().unwrap().len(), 2);
-    assert_eq!(b.refs.lock().unwrap().len(), 2);
-}
-
-#[test]
-fn b_backpressure_after_a_publish_orphans_a_and_rewinds() {
-    // Documented behaviour: when channel B back-pressures after channel A
-    // has already accepted the envelope, the A entry is an orphan (no ref
-    // will ever point at it). The state machine still rewinds and the
-    // retry publishes a *fresh* A entry + matching B ref.
-    let s = signer(5);
-    let env = signed_tx_envelope(&s, 0, 100);
-    let mut ingress = ScriptedIngress::default();
-    ingress.queue.push_back(env);
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
+    channel_a.queue.push_back((pos(0), env));
     let mut b = InMemoryChannelBRefPublisher::default();
     *b.fail_with_backpressure.lock().unwrap() = true;
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
-    let r = seq.run_once(&mut ingress, &mut a, &mut b, &mut rc);
+    let r = seq.run_once(&mut channel_a, &mut b, &mut rc);
     assert!(matches!(
         r,
         Err(kardamom_sequencer::SequencerError::Backpressure)
     ));
-    assert_eq!(
-        a.published.lock().unwrap().len(),
-        1,
-        "first attempt left an orphan envelope on A"
-    );
-    assert_eq!(b.refs.lock().unwrap().len(), 0, "B never got the ref");
+    assert_eq!(b.refs.lock().unwrap().len(), 0, "B never accepted the ref");
 
-    // Recover B; the retry publishes a *new* A entry plus a matching B ref.
+    // Recover B; the next run_once drains the rebuffered nonce 0 onto B.
     *b.fail_with_backpressure.lock().unwrap() = false;
-    assert!(seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
-    assert_eq!(
-        a.published.lock().unwrap().len(),
-        2,
-        "retry adds a fresh A entry (the first one is the orphan)"
-    );
+    assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     let refs = b.refs.lock().unwrap();
-    assert_eq!(refs.len(), 1, "B ref now points at the retry's A entry");
-    // The orphan and the live entry are byte-identical (it's the same
-    // envelope, retried). What distinguishes them is the *position* on A:
-    // the orphan sits at offset 0, the retry at offset orphan.len(). The
-    // ref must point at the retry's position (non-zero offset).
-    let orphan_len = a.published.lock().unwrap()[0].len() as i32;
-    assert_ne!(
-        refs[0].position_a.term_offset, 0,
-        "ref must point past the orphan, not at it"
-    );
-    assert_eq!(
-        refs[0].position_a.term_offset, orphan_len,
-        "ref position must be exactly after the orphan entry"
-    );
-    // And the resolved bytes must materialize to the same envelope the
-    // sequencer accepted.
-    let fetched = a.fetch(refs[0].position_a).expect("ref resolves");
-    assert_eq!(fetched.len(), orphan_len as usize);
+    assert_eq!(refs.len(), 1, "drain-pending republishes the rewound ref");
+    assert_eq!(refs[0].position_a, pos(0));
 }
 
 #[test]
 fn run_once_returns_false_when_empty() {
-    let mut ingress = ScriptedIngress::default();
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let mut seq = Sequencer::new(
         one_partition_cfg(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
-    assert!(!seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
+    assert!(!seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
 }
 
 #[test]
-fn wrong_partition_message_skipped() {
+fn wrong_shard_message_skipped() {
     let cfg = SequencerConfig {
         partition_count: 8,
         partition_index: 0,
@@ -259,10 +195,10 @@ fn wrong_partition_message_skipped() {
     };
     let mut seq = Sequencer::new(
         cfg.clone(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
 
-    // Find a signer whose address routes to a partition != 0.
+    // Find a signer whose address routes to a shard != 0.
     let mut seed = 1u64;
     let env = loop {
         let s = signer(seed);
@@ -273,14 +209,16 @@ fn wrong_partition_message_skipped() {
         seed += 1;
     };
 
-    let mut ingress = ScriptedIngress::default();
-    ingress.queue.push_back(env);
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
+    channel_a.queue.push_back((pos(0), env));
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
-    assert!(seq.run_once(&mut ingress, &mut a, &mut b, &mut rc).unwrap());
-    assert_eq!(a.published.lock().unwrap().len(), 0);
-    assert_eq!(b.refs.lock().unwrap().len(), 0);
+    assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
+    assert_eq!(
+        b.refs.lock().unwrap().len(),
+        0,
+        "wrong-shard envelope ignored"
+    );
 }
 
 #[test]
@@ -288,32 +226,30 @@ fn run_loops_until_shutdown_signaled() {
     let cfg = one_partition_cfg();
     let mut seq = Sequencer::new(
         cfg,
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
-    let mut ingress = ScriptedIngress::default();
-    let mut a = InMemoryChannelAPublisher::new(0);
+    let mut channel_a = ScriptedChannelA::default();
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let shutdown = Shutdown::from_atomic(Arc::new(AtomicBool::new(true)));
-    let result = seq.run(&mut ingress, &mut a, &mut b, &mut rc, shutdown);
+    let result = seq.run(&mut channel_a, &mut b, &mut rc, shutdown);
     assert!(result.is_ok(), "{result:?}");
 }
 
 #[test]
-fn run_returns_when_ingress_disconnected() {
+fn run_returns_when_channel_a_disconnected() {
     let cfg = one_partition_cfg();
     let mut seq = Sequencer::new(
         cfg,
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
     );
-    let mut ingress = ScriptedIngress {
+    let mut channel_a = ScriptedChannelA {
         disconnected: true,
         ..Default::default()
     };
-    let mut a = InMemoryChannelAPublisher::new(0);
     let mut b = InMemoryChannelBRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
     let shutdown = Shutdown::new();
-    let result = seq.run(&mut ingress, &mut a, &mut b, &mut rc, shutdown);
+    let result = seq.run(&mut channel_a, &mut b, &mut rc, shutdown);
     assert!(result.is_ok(), "{result:?}");
 }
