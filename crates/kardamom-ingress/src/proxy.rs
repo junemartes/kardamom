@@ -10,10 +10,9 @@ use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_primitives::{B256, Bytes as AlloyBytes};
 use alloy_rlp::Decodable;
-use bytes::Bytes;
 use tokio::sync::broadcast;
 
-use kardamom_types::{BPosition, BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
+use kardamom_types::{BlockBoundary, CachedReceipt, Receipt, StateDatabase, TxEnvelope};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -23,6 +22,25 @@ use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
 use crate::routing::partition_for;
 use crate::sig_verify::BatchVerifier;
+
+/// Drains a `broadcast::Receiver<T>` and forwards each item to `f`, swallowing
+/// `Lagged` and exiting on `Closed`. Used by the four proxy watcher tasks.
+fn spawn_broadcast_watcher<T, F, Fut>(mut rx: broadcast::Receiver<T>, mut f: F)
+where
+    T: Clone + Send + 'static,
+    F: FnMut(T) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(item) => f(item).await,
+                Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            }
+        }
+    });
+}
 
 /// Handle returned by `IngressProxy::start`. Drop it to shut down listeners
 /// gracefully.
@@ -138,73 +156,49 @@ where
     }
 
     fn spawn_block_boundary_watcher(&self) {
-        let mut rx: broadcast::Receiver<BlockBoundary> =
-            self.subscription.subscribe_block_boundaries();
+        let rx = self.subscription.subscribe_block_boundaries();
         let latest = self.latest_block_number.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(b) => {
-                        // Monotonic: never go backwards. `fetch_max` is
-                        // portable and lock-free.
-                        latest.fetch_max(b.block_number, Ordering::AcqRel);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
+        spawn_broadcast_watcher(rx, move |b: BlockBoundary| {
+            let latest = latest.clone();
+            // `fetch_max` keeps the counter monotonic without a lock.
+            async move {
+                latest.fetch_max(b.block_number, Ordering::AcqRel);
             }
         });
     }
 
     fn spawn_receipt_cache_watcher(&self) {
-        // The executor publishes `CachedReceipt { sender, nonce, tx_hash,
-        // receipt }` on the receipt-cache channel. This is the proxy's
-        // authoritative `(sender, nonce, receipt)` binding for client
-        // release (channel C alone carries `tx_hash` + `tx_idx` but not
-        // sender; receipt-cache is the join).
-        let mut rx: broadcast::Receiver<CachedReceipt> =
-            self.subscription.subscribe_receipt_cache();
+        // CachedReceipt is the join of `(sender, nonce)` with `(tx_hash, tx_idx)`
+        // — channel C alone doesn't carry `sender`, so the receipt-cache stream
+        // is the authoritative binding for client release.
+        let rx = self.subscription.subscribe_receipt_cache();
         let pending = self.pending.clone();
         let cache = self.cache.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(c) => {
-                        cache.insert(c.sender, c.nonce, c.receipt.clone());
-                        pending.on_receipt(c.sender, c.nonce, c.receipt).await;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
+        spawn_broadcast_watcher(rx, move |c: CachedReceipt| {
+            let pending = pending.clone();
+            let cache = cache.clone();
+            async move {
+                cache.insert(c.sender, c.nonce, c.receipt.clone());
+                pending.on_receipt(c.sender, c.nonce, c.receipt).await;
             }
         });
     }
 
     fn spawn_quorum_watermark_watcher(&self) {
-        let mut rx = self.subscription.subscribe_watermark();
+        let rx = self.subscription.subscribe_watermark();
         let pending = self.pending.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(w) => pending.update_quorum_watermark(w).await,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
+        spawn_broadcast_watcher(rx, move |w| {
+            let pending = pending.clone();
+            async move { pending.update_quorum_watermark(w).await }
         });
     }
 
     fn spawn_local_fsync_watermark_watcher(&self) {
-        let mut rx = self.subscription.subscribe_local_fsync_watermark();
+        let rx = self.subscription.subscribe_local_fsync_watermark();
         let pending = self.pending.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(w) => pending.update_local_watermark(w).await,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                }
-            }
+        spawn_broadcast_watcher(rx, move |w| {
+            let pending = pending.clone();
+            async move { pending.update_local_watermark(w).await }
         });
     }
 
@@ -216,54 +210,42 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<ReceiptResponse, IngressError> {
-        // 1. Rate limit (cheap reject).
         self.rate_limiter
             .check(client_ip)
             .map_err(|_| IngressError::RateLimited(client_ip.to_string()))?;
 
-        // 2. Decode envelope (NOT yet sig-verified).
         let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref())
             .map_err(|e| IngressError::Decode(e.to_string()))?;
         let nonce = env.nonce();
 
-        // 3. Batched sig verify — produces (sender, tx_hash) together.
-        //    Per S0 D-Sh3 + D-Sh4 the proxy is the *only* place either field
-        //    is computed. Failure here returns
-        //    IngressError::SignatureInvalid → JSON-RPC -32602 BEFORE we
-        //    publish to Aeron.
+        // Per S0 D-Sh3 + D-Sh4: the proxy is the *only* place `sender` and
+        // `tx_hash` are computed. Both fields are stamped into the envelope
+        // before any downstream consumer observes the tx, and the sig-verify
+        // failure path returns *before* we publish to Aeron.
         let (sender, tx_hash) = self.verifier.recover(env, raw_tx.clone()).await?;
 
-        // 4. Cache lookup — idempotent retry?
         if let Some(prev) = self.cache.lookup(sender, nonce) {
             return Ok(ReceiptResponse { receipt: prev });
         }
 
-        // 5. Park *before* publishing — the receipt could arrive on the
-        //    cache channel before we'd otherwise have registered, especially
-        //    under high load.
+        // Park *before* publishing — the receipt can arrive on the cache
+        // channel before we'd otherwise have registered, especially under load.
         let wait = self.pending.register(sender, nonce);
 
-        // 6. Publish to partition. The envelope carries the canonical
-        //    `tx_hash` so the executor copies it straight into
-        //    `Receipt.tx_hash` (S0 D-Sh4 — no recomputation downstream).
         let partition = partition_for(sender, self.cfg.partition_count_m) as usize;
         let correlation_id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
-        // Convert from alloy_primitives::Bytes (newtype around bytes::Bytes)
-        // to the bare bytes::Bytes that `TxEnvelope` carries.
-        let raw_tx_bytes: Bytes = raw_tx.0.clone();
         self.publication
             .publish_ingress(
                 partition,
                 TxEnvelope {
                     correlation_id,
-                    raw_tx: raw_tx_bytes,
+                    raw_tx: raw_tx.0.clone(),
                     sender,
                     tx_hash,
                 },
             )
             .await?;
 
-        // 7. Wait on the parked oneshot with timeout.
         wait.await_with_timeout(self.cfg.pending_receipt_timeout)
             .await
     }
@@ -279,16 +261,6 @@ where
     #[inline]
     pub fn config(&self) -> &IngressConfig {
         &self.cfg
-    }
-
-    /// Latest quorum watermark observed (returned via the pending map's
-    /// internal cache). Returns `None` until the first snapshot arrives.
-    pub async fn latest_watermark(&self) -> Option<BPosition> {
-        // Re-implemented here rather than exposing PendingReceipts internals;
-        // we use the proxy's own watch by spawning a one-shot consumer for
-        // tests / debugging. For v0 we just return None until needed —
-        // proxies don't otherwise surface the watermark.
-        None
     }
 
     /// Start all configured listeners (jsonrpsee HTTP+WS, optional TCP,
