@@ -208,11 +208,12 @@ fn bench_actor_throughput(c: &mut Criterion) {
 
             for i in 0..BATCH {
                 let position_a = pos((i as i32) * 200);
-                a_tx.send((position_a, signed_transfer(&signer, to, i)))
-                    .unwrap();
+                let env = signed_transfer(&signer, to, i);
+                let tx_hash = env.tx_hash;
+                a_tx.send((position_a, env)).unwrap();
                 b_tx.send((
                     pos(i as i32),
-                    ChannelBMessage::TxRef(TxRef::new(0, position_a)),
+                    ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
                 ))
                 .unwrap();
             }
