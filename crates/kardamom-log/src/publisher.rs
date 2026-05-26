@@ -1,11 +1,11 @@
 //! Aeron publishers for the split-architecture log tier (D-Sh12):
 //!
-//! - **Channel A[i]** — per-sequencer **exclusive** publication of full
+//! - **TxData[i]** — per-sequencer **exclusive** publication of full
 //!   `TxEnvelope` bytes. One per sequencer; the sequencer is the only
 //!   publisher to its own channel-A stream, so there is no CAS-cursor
 //!   contention and writes run at near-`memcpy` speed.
-//! - **Channel B** — canonical orderer. Shared (concurrent) multi-publisher
-//!   carrying the small [`ChannelBMessage`] enum (`TxRef | BoundaryStart`).
+//! - **TxOrdering** — canonical orderer. Shared (concurrent) multi-publisher
+//!   carrying the small [`TxOrderingMessage`] enum (`TxRef | BoundaryStart`).
 //!   Many publisher handles (M sequencers + the sealer) may offer to the
 //!   same Aeron stream; Aeron serialises them into a single byte order, and
 //!   that order *is* the canonical L2 ordering (system invariant I1).
@@ -33,13 +33,13 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, ChannelBMessage, FsyncWatermark,
-    QuorumWatermark, Receipt, TxEnvelope, TxRef,
+    BPosition, BlockBoundary, BlockBoundaryStart, CachedReceipt, FsyncWatermark, QuorumWatermark,
+    Receipt, TxEnvelope, TxOrderingMessage, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
 // (concurrent) variant; `AeronExclusivePublication` is the single-publisher
-// variant. Channel B uses shared (concurrent multi-publisher serialised into
+// variant. TxOrdering uses shared (concurrent multi-publisher serialised into
 // the canonical order); channel A uses exclusive (one writer per stream,
 // near-memcpy speed).
 type AeronClient = rusteron_client::Aeron;
@@ -75,25 +75,25 @@ fn add_exclusive_pub(
 }
 
 // ===========================================================================
-// Channel A[i] — per-sequencer exclusive publisher of full TxEnvelopes.
+// TxData[i] — per-sequencer exclusive publisher of full TxEnvelopes.
 // ===========================================================================
 
-/// Channel A[i]: per-sequencer exclusive publisher of full `TxEnvelope`
+/// TxData[i]: per-sequencer exclusive publisher of full `TxEnvelope`
 /// bytes. The sequencer is the only writer to its own A-stream — no
 /// CAS-cursor contention — and the recorded archive is the source of truth
 /// for the bulk transaction data referenced from channel B.
 ///
 /// Per-A URIs are derived from
-/// [`ChannelsConfig::a_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
+/// [`ChannelsConfig::tx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
 /// with `{sid}` substituted for the sequencer id. Stream ids are derived as
-/// `a_stream_id_base + sequencer_id` so M parallel channel-A streams can
+/// `tx_data_stream_id_base + sequencer_id` so M parallel channel-A streams can
 /// coexist on a shared Media Driver.
-pub struct ChannelAPublisher {
+pub struct TxDataPublisher {
     sequencer_id: u8,
     pub_handle: ExclusivePub,
 }
 
-impl ChannelAPublisher {
+impl TxDataPublisher {
     pub fn open(
         aeron: &AeronClient,
         ch: &ChannelsConfig,
@@ -125,39 +125,47 @@ impl ChannelAPublisher {
 }
 
 // ===========================================================================
-// Channel B — canonical orderer, tiny refs (+ sealer boundaries).
+// TxOrdering — canonical orderer, tiny refs (+ sealer boundaries).
 // ===========================================================================
 
-/// Channel B: canonical orderer. Concurrent (shared) publisher carrying
-/// [`ChannelBMessage`] records — `TxRef` (~16 B) and `BlockBoundaryStart`.
+/// TxOrdering: canonical orderer. Concurrent (shared) publisher carrying
+/// [`TxOrderingMessage`] records — `TxRef` (~16 B) and `BlockBoundaryStart`.
 /// Bulk transaction bytes flow on the per-sequencer channel-A archives;
 /// channel B only ever sees small records, so the canonical-orderer CAS
 /// cursor stays cheap.
-pub struct ChannelBPublisher {
+pub struct TxOrderingPublisher {
     pub_handle: Pub,
 }
 
-impl ChannelBPublisher {
+impl TxOrderingPublisher {
     pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(aeron, &ch.b_channel, ch.b_stream_id, "B")?;
+        let pub_handle = add_pub(
+            aeron,
+            &ch.tx_ordering_channel,
+            ch.tx_ordering_stream_id,
+            "B",
+        )?;
         Ok(Self { pub_handle })
     }
 
     /// Publish a [`TxRef`] onto channel B. Returns the canonical B-position
     /// of the record (system invariant I1).
     pub fn publish_ref(&self, r: &TxRef) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, &ChannelBMessage::TxRef(*r))
+        offer(&self.pub_handle, &TxOrderingMessage::TxRef(*r))
     }
 
     /// Publish a sealer-emitted boundary onto channel B.
     pub fn publish_boundary(&self, b: &BlockBoundaryStart) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, &ChannelBMessage::BoundaryStart(b.clone()))
+        offer(
+            &self.pub_handle,
+            &TxOrderingMessage::BoundaryStart(b.clone()),
+        )
     }
 
-    /// Lower-level publish: hand an already-built [`ChannelBMessage`] to
+    /// Lower-level publish: hand an already-built [`TxOrderingMessage`] to
     /// the publisher. Useful when downstream batches refs and boundaries
     /// before emitting.
-    pub fn publish_message(&self, m: &ChannelBMessage) -> Result<BPosition, LogError> {
+    pub fn publish_message(&self, m: &TxOrderingMessage) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, m)
     }
 }
@@ -232,7 +240,7 @@ impl WatermarkPublisher {
 
 /// Per-channel-A fsync-watermark publisher (D-Sh12). One per sequencer
 /// host; downstream consumers (ack-path coordinator, executor) subscribe
-/// to whichever A-watermarks they care about. Channel A is single-host
+/// to whichever A-watermarks they care about. TxData is single-host
 /// durability by default — there is no quorum aggregator for A.
 pub struct WatermarkAPublisher {
     pub_handle: Pub,
@@ -356,7 +364,7 @@ fn decode_position(p: i64) -> BPosition {
 #[derive(Clone)]
 pub struct Publishers {
     pub aeron: Rc<AeronClient>,
-    pub a: Option<Rc<ChannelAPublisher>>,
-    pub b: Rc<ChannelBPublisher>,
+    pub a: Option<Rc<TxDataPublisher>>,
+    pub b: Rc<TxOrderingPublisher>,
     pub c: Rc<ChannelCPublisher>,
 }
