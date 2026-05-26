@@ -26,9 +26,8 @@
 //! ```
 //!
 //! Each tx_data reader thread is dedicated to one Aeron subscription
-//! (tx_data[i]); see `aeron_live.rs` in `kardamom-log` for the
-//! Send-safety pattern (`rusteron_client::Aeron` is `!Send + !Sync`, so each
-//! subscription must own its own Aeron client on its own OS thread). The
+//! (tx_data[i]). `rusteron_client::Aeron` is `!Send + !Sync`, so each
+//! subscription must own its own Aeron client on its own OS thread. The
 //! reader simply inserts every fragment into the shared [`JoinBuffer`].
 //!
 //! The single tx_ordering reader pulls [`TxOrderingMessage`] records in canonical
@@ -61,10 +60,9 @@ use crate::exec_types::TxIndex;
 /// Subscription to one **tx_data[i]**.
 ///
 /// One impl per sequencer partition. Implementations:
-/// - in production: `log::TxDataSubscriber` wrapped in a
-///   per-thread `AeronRuntime` (see `aeron_live.rs`).
+/// - in production: `log::TxDataSubscriber` on a dedicated OS thread.
 /// - in tests: [`crate::testing::VecTxDataSub`] /
-///   `FakeTxDataSubscription` from `kardamom-log::testing`.
+///   `FakeTxDataSubscription` from `log::testing`.
 ///
 /// The contract: `next` blocks until the next `(tx_data_position, envelope)` is
 /// available; returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
@@ -83,9 +81,9 @@ pub trait TxDataSubscription: Send {
 /// tagged with its canonical `BPosition`. The `BPosition` is the system's
 /// canonical L2 tx ordering (invariant I1).
 ///
-/// In production: `log::TxOrderingSubscriber` wrapped in a per-thread
-/// `AeronRuntime`. In tests: see [`crate::testing::VecTxOrderingSub`] or
-/// `kardamom-log::testing::FakeTxOrderingSubscription`.
+/// In production: `log::TxOrderingSubscriber` on a dedicated OS thread.
+/// In tests: see [`crate::testing::VecTxOrderingSub`] or
+/// `log::testing::FakeTxOrderingSubscription`.
 pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
 }

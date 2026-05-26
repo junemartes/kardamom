@@ -48,8 +48,9 @@ use log::testing::{
 };
 
 /// Bridge a `FakeTxDataSubscription` into a `TxDataSubscription`. The
-/// real-Aeron equivalent is `log::TxDataSubscriber` driven by
-/// `AeronRuntime::tx_data_subscriber(i)` on a dedicated OS thread.
+/// real-Aeron equivalent is `log::TxDataSubscriber` opened directly on a
+/// dedicated OS thread (one Aeron client per thread, since the client is
+/// `!Send + !Sync`).
 struct FakeASubAdapter {
     sequencer_id: u8,
     sub: FakeTxDataSubscription,

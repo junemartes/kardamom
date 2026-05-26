@@ -32,8 +32,6 @@ pub mod supervisor;
 pub mod watermark;
 
 #[cfg(feature = "aeron-live")]
-pub mod aeron_live;
-#[cfg(feature = "aeron-live")]
 pub mod publisher;
 #[cfg(feature = "aeron-live")]
 pub mod recorder;
