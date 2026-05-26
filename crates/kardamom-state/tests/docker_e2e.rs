@@ -12,9 +12,9 @@
 //!
 //! **v0 scope:** brings up the Aeron container, opens a real libmdbx
 //! `StateWriter`, and asserts the harness resolves its host ports + the
-//! writer can apply at least one local batch. The full channel-C subscribe
+//! writer can apply at least one local batch. The full tx_receipts subscribe
 //! → BlockDelta-build → writer round-trip requires a `ChannelCSubscriber`
-//! adapter wrapping `kardamom-log`'s `aeron-live` channel-C async wrapper.
+//! adapter wrapping `kardamom-log`'s `aeron-live` tx_receipts async wrapper.
 //! Mirrors S4/S5: the high-level `ChannelC` async wrapper is not yet
 //! shipped by `kardamom-log` (only the low-level rusteron primitives plus
 //! the `testing::AeronTestCluster` harness are exposed). When that wrapper

@@ -14,7 +14,7 @@
 
 **Assumed interfaces (coordination required):**
 - **S0 / `kardamom-types`:** owns `BPosition`, `Receipt`, `BlockBoundary`, and the `StateDatabase` trait (per D-Sh1). **This plan does not redefine any of those types** — every module imports them via `use kardamom_types::{...}`. The `Receipt` shape is `{ tx_idx: BPosition, tx_hash: B256, status: bool, gas_used: u64, logs: Vec<Log>, write_set_hash: B256 }` (D-Sh1). `BlockBoundary` is `{ block_number, end_tx_idx: BPosition, l2_timestamp }` — **no `state_root_commitment` field** (D-Sh11). `BPosition` is `{ term_id: i32, term_offset: i32 }` (D-Sh1).
-- **S3 (`kardamom-log`):** provides the Aeron channel implementations that ferry `Receipt` and `BlockBoundary` over channel C. This crate's e2e test (Task 25) drives the real Aeron testcontainer harness exported by `kardamom-log`.
+- **S3 (`kardamom-log`):** provides the Aeron channel implementations that ferry `Receipt` and `BlockBoundary` over tx_receipts. This crate's e2e test (Task 25) drives the real Aeron testcontainer harness exported by `kardamom-log`.
 - **S4 (`kardamom-executor`):** emits a `BlockDelta` value (defined in this plan, Task 8) on a `crossbeam::channel::Sender<BlockDelta>` provided by `kardamom-state` at startup. Coordination: S4 imports `kardamom_state::BlockDelta` and uses the channel the state writer creates.
 - **`StateDatabase` trait:** **defined in `kardamom-types`** (per D-Sh1, not in this crate). S6 only provides the concrete `impl StateDatabase for StateSnapshot` for the libmdbx backend. S6 also extends the trait surface with `get_tx_position(tx_hash: B256) -> Option<BPosition>` and `get_receipt(position: BPosition) -> Option<Receipt>` (declared in `kardamom-types`, implemented here) so the S1 proxy can serve `eth_getTransactionReceipt(hash)` (D-Sh4).
 
@@ -2772,7 +2772,7 @@ Defer to the user — do not auto-open. The plan ends with all changes committed
 
 Per S0 D-Sh8, every component plan **must** include an e2e test that drives the real Aeron Media Driver + Archive containers (via the `testcontainers`-based harness exported by `kardamom-log` under the `testing` feature). Unit tests with the in-memory fake are fine for logic; e2e MUST be real Aeron — no mocks at this layer.
 
-This test brings up a real Aeron stack, feeds real `Receipt` and `BlockBoundary` messages through channel C, runs a real state-writer process consuming them, and asserts:
+This test brings up a real Aeron stack, feeds real `Receipt` and `BlockBoundary` messages through tx_receipts, runs a real state-writer process consuming them, and asserts:
 
 1. After all blocks are committed, the libmdbx state matches the expected account / storage / receipt values.
 2. The `tx_hash_index` table correctly resolves every tx hash back to its `BPosition` and a follow-up `get_receipt(position)` returns the same receipt that was sent.
@@ -2788,7 +2788,7 @@ use std::time::Duration;
 
 use alloy_primitives::{address, B256, U256};
 use kardamom_log::testing::aeron_docker::AeronStack;       // harness from S3 (D-Sh8)
-use kardamom_log::{ChannelC, ChannelCMessage};            // channel C pub/sub on real Aeron
+use kardamom_log::{ChannelC, ChannelCMessage};            // tx_receipts pub/sub on real Aeron
 use kardamom_state::{
     env::{Durability, StateEnvBuilder},
     AccountChange, AccountChanges, BlockDelta, CodeChanges, NewAccountState, StateWriter,
@@ -2816,7 +2816,7 @@ async fn real_aeron_to_state_writer_e2e() {
     let aeron = AeronStack::start().await.expect("aeron docker stack");
     let channel_c = ChannelC::connect(aeron.client_config())
         .await
-        .expect("channel C pub/sub");
+        .expect("tx_receipts pub/sub");
 
     // ---- 2. spin up the real state writer against a fresh libmdbx env ----
     let dir = tempfile::tempdir().unwrap();
@@ -2826,7 +2826,7 @@ async fn real_aeron_to_state_writer_e2e() {
         .unwrap();
     let writer = StateWriter::spawn(env.clone()).unwrap();
 
-    // The "state writer process": a single task that subscribes to channel C,
+    // The "state writer process": a single task that subscribes to tx_receipts,
     // accumulates receipts per virtual block, and forwards a `BlockDelta` to
     // the writer whenever it sees a `BlockBoundary`. Real Aeron in the middle,
     // real BlockDelta channel out to libmdbx.
