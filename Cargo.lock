@@ -2219,12 +2219,22 @@ checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 name = "e2e"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-network",
  "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer-local",
+ "anyhow",
+ "async-trait",
  "bytes",
  "criterion 0.5.1",
+ "crossbeam-channel",
  "hdrhistogram",
  "kardamom-executor",
+ "kardamom-ingress",
  "kardamom-log",
+ "kardamom-sealer",
+ "kardamom-sequencer",
  "kardamom-state",
  "kardamom-types",
  "rkyv",

@@ -27,9 +27,19 @@ tracing.workspace = true
 [dev-dependencies]
 # Note: docker-e2e is activated only when the `full-pipeline-e2e`
 # feature is enabled (see [features] above).
+alloy-consensus.workspace = true
+alloy-network.workspace = true
+alloy-rlp.workspace = true
+alloy-signer-local.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"
 criterion.workspace = true
+crossbeam-channel.workspace = true
 hdrhistogram.workspace = true
 kardamom-executor = { path = "../executor" }
+kardamom-ingress = { path = "../ingress" }
+kardamom-sealer = { path = "../sealer" }
+kardamom-sequencer = { path = "../sequencer", features = ["testing"] }
 kardamom-state = { path = "../state" }
 tempfile.workspace = true
 tracing-subscriber.workspace = true
