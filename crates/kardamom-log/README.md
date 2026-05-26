@@ -4,7 +4,7 @@ S3 canonical-log subsystem. See `docs/specs/2026-05-23-high-throughput-sequencer
 
 ## Owned components
 
-- **Channel B** (canonical tx log, recorded, fsync-quorum durable)
+- **TxOrdering** (canonical tx log, recorded, fsync-quorum durable)
 - **Channel C** (receipts + block boundaries, RAM only)
 - **Receipt-cache channel** (`CachedReceipt` stream, RAM only)
 - **Per-recorder fsync-watermark stream** (published from the Aeron Archive's recording position, which is byte-durable when the archive runs with `fileSyncLevel=1`)
@@ -15,7 +15,7 @@ S3 canonical-log subsystem. See `docs/specs/2026-05-23-high-throughput-sequencer
 
 ## Durability model
 
-Channel B durability comes from two things working together:
+TxOrdering durability comes from two things working together:
 
 1. The Aeron Archive daemon is launched with `aeron.archive.file.sync.level=1` (and the same for the catalog file). Every recorded frame is `fdatasync`'d to local storage before the recording position advances past it. The defaults live in [`config::AeronConfig`]; the supervisor exports the value via both the `AERON_ARCHIVE_FILE_SYNC_LEVEL` env var (C archive) and the `-Daeron.archive.file.sync.level` system property (Java archive).
 2. The per-recorder watermark loop polls the archive's recording position and republishes it. N recorders feed the quorum aggregator, which publishes the Q-th largest position as the durability watermark proxies use for the I2 ack guarantee.

@@ -16,7 +16,7 @@
 
 **Key dependencies / assumptions:**
 - **`crates/kardamom-types`** (per S0 D-Sh1) owns all shared wire/data types: `BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundaryStart`, `BlockBoundary`, `BlockDelta`, the `StateDatabase` trait, and the `SnapshotSource` trait. The executor **imports** these — it does not define them. (S0 explicitly overrides this plan's earlier choice to host `StateDatabase` in `crates/kardamom-executor/src/state.rs`.)
-- **S3 (`crates/kardamom-log`)** publishes/consumes Aeron channels B and C. The wire-type definitions live in `kardamom-types`; `kardamom-log` exposes only the channel implementations (`ChannelBSubscription`, `ChannelCPublication`) and reads `Archived<T>` zero-copy from Aeron buffers using `rkyv` 0.8 (S0 D-Sh2).
+- **S3 (`crates/kardamom-log`)** publishes/consumes Aeron channels B and C. The wire-type definitions live in `kardamom-types`; `kardamom-log` exposes only the channel implementations (`TxOrderingSubscription`, `ChannelCPublication`) and reads `Archived<T>` zero-copy from Aeron buffers using `rkyv` 0.8 (S0 D-Sh2).
 - **S6 (`crates/kardamom-state`)** provides a `libmdbx`-backed implementation of the `StateDatabase` trait (the trait itself lives in `kardamom-types`, so S6 depends on `kardamom-types`, not on `kardamom-executor`).
 - **S5 (`crates/kardamom-sealer`)** emits `BlockBoundaryStart` *inline* on channel B. The executor never reads a wall clock; `block.timestamp` comes from `BlockBoundaryStart.l2_timestamp` and `block.number` from `BlockBoundaryStart.block_number`.
 
@@ -226,7 +226,7 @@ git commit -m "executor: add crate skeleton"
 - [ ] **Step 1: Write the type definitions**
 
 ```rust
-//! Channel B / Channel C executor-side demux wrappers.
+//! TxOrdering / Channel C executor-side demux wrappers.
 //!
 //! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
 //! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`) are imported from
@@ -1435,7 +1435,7 @@ use crate::types::{BMessage, CMessage, TxIndex};
 
 /// Subscription to channel B. Implementations: real (Aeron) in `kardamom-log`;
 /// test mock in `actor.rs::tests`.
-pub trait ChannelBSubscription: Send {
+pub trait TxOrderingSubscription: Send {
     /// Block until the next record is available or return Err when the
     /// subscription closes.
     fn next(&mut self) -> Result<BMessage, ExecutorError>;
@@ -1495,7 +1495,7 @@ impl Executor {
         initial_block: u64,
     ) -> Result<(), ExecutorError>
     where
-        B: ChannelBSubscription + 'static,
+        B: TxOrderingSubscription + 'static,
         C: ChannelCPublication + 'static,
         S: SnapshotSource + 'static,
         Q: StateWriterSignal + 'static,
@@ -1564,7 +1564,7 @@ impl Executor {
         initial_block: u64,
     ) -> Result<(), ExecutorError>
     where
-        B: ChannelBSubscription + 'static,
+        B: TxOrderingSubscription + 'static,
         C: ChannelCPublication + 'static,
         S: SnapshotSource + 'static,
         Q: StateWriterSignal + 'static,
@@ -1588,7 +1588,7 @@ impl Executor {
 
 fn spawn_reader<B>(mut b_sub: B, out: Sender<ReaderToExec>) -> JoinHandle<Result<(), ExecutorError>>
 where
-    B: ChannelBSubscription + 'static,
+    B: TxOrderingSubscription + 'static,
 {
     thread::Builder::new()
         .name("executor-reader".into())
@@ -1697,7 +1697,7 @@ mod reader_tests {
     struct VecBSub {
         queue: VecDeque<Result<BMessage, ExecutorError>>,
     }
-    impl ChannelBSubscription for VecBSub {
+    impl TxOrderingSubscription for VecBSub {
         fn next(&mut self) -> Result<BMessage, ExecutorError> {
             self.queue
                 .pop_front()
@@ -2168,7 +2168,7 @@ git commit -m "executor: commit thread publishes receipts + boundaries on C"
 //! BlockBoundaryStart) and publishing receipts + sealed BlockBoundaries to
 //! channel C. Block-STM is explicitly out of scope for v0; S4 v1 will replace
 //! the single execution thread with parallel workers behind the same channel
-//! interface (`ChannelBSubscription` / `ChannelCPublication`).
+//! interface (`TxOrderingSubscription` / `ChannelCPublication`).
 //!
 //! See `docs/specs/2026-05-23-high-throughput-sequencer-design.md`
 //! §2.4 + V0 scope. Shared types come from `kardamom-types` (S0 D-Sh1).
@@ -2182,7 +2182,7 @@ pub mod state;
 pub mod types;
 
 pub use actor::{
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, StateWriterQueue,
+    TxOrderingSubscription, ChannelCPublication, Executor, ExecutorConfig, StateWriterQueue,
     StateWriterSignal,
 };
 pub use block_env::ExecEnv;
@@ -2245,13 +2245,13 @@ use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    TxOrderingSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
     TxEnvelope as KtTxEnvelope, TxIndex,
 };
 
 struct ChanBSub(Receiver<BMessage>);
-impl ChannelBSubscription for ChanBSub {
+impl TxOrderingSubscription for ChanBSub {
     fn next(&mut self) -> Result<BMessage, ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
@@ -2418,13 +2418,13 @@ use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    TxOrderingSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
     TxEnvelope as KtTxEnvelope, TxIndex,
 };
 
 struct ChanBSub(Receiver<BMessage>);
-impl ChannelBSubscription for ChanBSub {
+impl TxOrderingSubscription for ChanBSub {
     fn next(&mut self) -> Result<BMessage, ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
@@ -2585,7 +2585,7 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 use kardamom_executor::executor::SnapshotRef;
 use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    TxOrderingSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
     TxEnvelope as KtTxEnvelope, TxIndex,
 };
@@ -2595,9 +2595,9 @@ const SSTORE_42_AT_0: [u8; 6] = [0x60, 0x42, 0x60, 0x00, 0x55, 0x00];
 // PUSH1 0x00; PUSH1 0x00; REVERT
 const REVERT_CODE: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
 
-// ChannelBSubscription / ChannelCPublication mocks (same as Task 14/15).
+// TxOrderingSubscription / ChannelCPublication mocks (same as Task 14/15).
 struct ChanBSub(Receiver<BMessage>);
-impl ChannelBSubscription for ChanBSub {
+impl TxOrderingSubscription for ChanBSub {
     fn next(&mut self) -> Result<BMessage, ExecutorError> { self.0.recv().map_err(|_| ExecutorError::ChannelBClosed) }
 }
 struct ChanCPub(Sender<CMessage>);
@@ -2853,7 +2853,7 @@ use kardamom_executor::block_env::ExecEnv;
 use kardamom_executor::executor::execute_tx;
 use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    TxOrderingSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
     TxEnvelope as KtTxEnvelope, TxIndex,
 };
@@ -2956,7 +2956,7 @@ fn bench_sstore_step(c: &mut Criterion) {
 
 // Actor end-to-end: 256 txs per iter; reports throughput in tx/s.
 struct ChanBSub(Receiver<BMessage>);
-impl ChannelBSubscription for ChanBSub {
+impl TxOrderingSubscription for ChanBSub {
     fn next(&mut self) -> Result<BMessage, ExecutorError> { self.0.recv().map_err(|_| ExecutorError::ChannelBClosed) }
 }
 struct ChanCPub(Sender<CMessage>);
@@ -3087,7 +3087,7 @@ use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
     BMessage, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, CMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
+    TxOrderingSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
     MockStateDatabase, SnapshotSource, StateDatabase, StateWriterQueue, StateWriterSignal,
     TxEnvelope as KtTxEnvelope, TxIndex,
 };
@@ -3096,7 +3096,7 @@ use kardamom_executor::{
 // subscription/publication traits.
 use kardamom_log::testing::{
     docker_available, AeronTestHarness, RealChannelBPublication,
-    RealChannelBSubscription, RealChannelCPublication, RealChannelCSubscription,
+    RealTxOrderingSubscription, RealChannelCPublication, RealChannelCSubscription,
 };
 
 /// Build a proxy-style envelope: sign, 2718-encode, populate sender + tx_hash.
@@ -3118,10 +3118,10 @@ fn build_envelope(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnv
 }
 
 // Adapter from the real Aeron-backed channel-B subscription to the executor's
-// trait. `RealChannelBSubscription::poll_next` returns archived rkyv views; we
+// trait. `RealTxOrderingSubscription::poll_next` returns archived rkyv views; we
 // materialize once here for the executor's BMessage demux.
-struct B(RealChannelBSubscription);
-impl ChannelBSubscription for B {
+struct B(RealTxOrderingSubscription);
+impl TxOrderingSubscription for B {
     fn next(&mut self) -> Result<BMessage, ExecutorError> {
         loop {
             match self.0.poll_next_blocking(Duration::from_secs(5)) {
@@ -3180,7 +3180,7 @@ fn executor_consumes_real_aeron_b_publishes_real_aeron_c() {
         .expect("open c sub");
 
     // The executor's adapters open *its* subscription on B and publication on C.
-    let b_sub_for_exec: RealChannelBSubscription = harness
+    let b_sub_for_exec: RealTxOrderingSubscription = harness
         .open_channel_b_subscription(&channel_b_uri)
         .expect("open b sub for executor");
     let c_pub_for_exec: RealChannelCPublication = harness
@@ -3341,4 +3341,4 @@ If `git status` is clean, skip this step.
 - **Tasks:** 20 (skeleton → types → state → error → hashing → invariance property → block env → per-tx step → actor skeleton → reader → exec → commit → re-exports → integration replay → determinism → diff vs naive revm → divergence-doc → criterion bench → Docker real-Aeron e2e → workspace sweep).
 - **Files created/modified:** 1 new crate, 8 src files, 4 tests/ (including the real-Aeron Docker e2e), 1 bench, 1 Cargo.toml.
 - **No code outside `crates/kardamom-executor/` is touched.** `crates/node/src/executor.rs` stays as the in-process RPC node's executor until a later integration spec wires the new executor in.
-- **Block-STM remains out of scope for v0.** S4 v1 (separate spec + plan) will replace `spawn_exec`'s single-threaded body with parallel Block-STM workers behind the same `ChannelBSubscription` / `ChannelCPublication` / `SnapshotSource` traits — no other component should require changes.
+- **Block-STM remains out of scope for v0.** S4 v1 (separate spec + plan) will replace `spawn_exec`'s single-threaded body with parallel Block-STM workers behind the same `TxOrderingSubscription` / `ChannelCPublication` / `SnapshotSource` traits — no other component should require changes.

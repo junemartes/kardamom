@@ -13,9 +13,9 @@ use bytes::Bytes;
 use kardamom_types::{BPosition, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::inbound::fakes::ScriptedChannelA;
+use kardamom_sequencer::inbound::fakes::ScriptedTxData;
 use kardamom_sequencer::outbound::fakes::{
-    InMemoryChannelBRefPublisher, InMemoryReceiptCachePublisher,
+    InMemoryReceiptCachePublisher, InMemoryTxOrderingRefPublisher,
 };
 use kardamom_sequencer::sequencer::Sequencer;
 use kardamom_sequencer::testing::FakeStateDatabase;
@@ -69,11 +69,11 @@ fn hydrates_committed_nonce_for_established_sender() {
     db.set_nonce(signer.address(), 5);
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
-    let mut channel_a = ScriptedChannelA {
+    let mut channel_a = ScriptedTxData {
         queue: [(pos(0), signed_envelope(&signer, 5, 100))].into(),
         disconnected: false,
     };
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
 
     while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
@@ -92,11 +92,11 @@ fn hydrates_zero_for_brand_new_sender() {
     // db.set_nonce not called → basic() returns Ok(None) for this sender.
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
-    let mut channel_a = ScriptedChannelA {
+    let mut channel_a = ScriptedTxData {
         queue: [(pos(0), signed_envelope(&signer, 0, 100))].into(),
         disconnected: false,
     };
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
 
     while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}
@@ -112,7 +112,7 @@ fn hydration_runs_once_per_sender() {
     let db = Arc::new(FakeStateDatabase::new());
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
-    let mut channel_a = ScriptedChannelA {
+    let mut channel_a = ScriptedTxData {
         queue: [
             (pos(0), signed_envelope(&signer, 0, 100)),
             (pos(64), signed_envelope(&signer, 1, 101)),
@@ -120,7 +120,7 @@ fn hydration_runs_once_per_sender() {
         .into(),
         disconnected: false,
     };
-    let mut b = InMemoryChannelBRefPublisher::default();
+    let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryReceiptCachePublisher::default();
 
     while seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap() {}

@@ -3,11 +3,11 @@
 //!
 //! Topology validated:
 //!
-//! - M=2 sequencers each open a `ChannelAPublisher` (exclusive) and publish
+//! - M=2 sequencers each open a `TxDataPublisher` (exclusive) and publish
 //!   N tx envelopes apiece.
-//! - M=2 executors-side `ChannelASubscriber`s drain those envelopes into a
+//! - M=2 executors-side `TxDataSubscriber`s drain those envelopes into a
 //!   per-A buffer indexed by `(sequencer_id, BPosition)`.
-//! - One `ChannelBPublisher` (concurrent) publishes `TxRef` records into
+//! - One `TxOrderingPublisher` (concurrent) publishes `TxRef` records into
 //!   channel B in an interleaved canonical order.
 //! - One `ChannelBSubscriber` walks channel B in canonical order, joining
 //!   each ref against the A-buffer and asserting the recovered sequence
@@ -35,10 +35,10 @@ use std::time::Duration;
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use kardamom_log::config::LogConfig;
-use kardamom_log::publisher::{ChannelAPublisher, ChannelBPublisher};
+use kardamom_log::publisher::{TxDataPublisher, TxOrderingPublisher};
 use kardamom_log::subscriber::Subscribers;
 use kardamom_log::testing::AeronTestCluster;
-use kardamom_types::{BPosition, ChannelBMessage, TxEnvelope, TxRef};
+use kardamom_types::{BPosition, TxEnvelope, TxOrderingMessage, TxRef};
 
 const M: u8 = 2;
 const TXS_PER_SEQ: u64 = 25;
@@ -84,35 +84,36 @@ async fn split_architecture_m_plus_one_e2e() {
     // endpoint the container exposes. Stream-id arithmetic matches the
     // ChannelsConfig defaults.
     let mut cfg = LogConfig::default();
-    cfg.channels.b_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
-    cfg.channels.b_stream_id = 1001;
-    // Channel A stays on IPC inside the container's media driver (this test
+    cfg.channels.tx_ordering_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
+    cfg.channels.tx_ordering_stream_id = 1001;
+    // TxData stays on IPC inside the container's media driver (this test
     // runs the client *against* the container, so the per-A streams need to
     // be reachable from outside too — use UDP with distinct endpoints).
-    cfg.channels.a_channel_template = format!("aeron:udp?endpoint={endpoint}|alias=a-{{sid}}");
-    cfg.channels.a_stream_id_base = 2000;
+    cfg.channels.tx_dattx_dattx_dattx_data_channel_template =
+        format!("aeron:udp?endpoint={endpoint}|alias=a-{{sid}}");
+    cfg.channels.tx_dattx_dattx_dattx_data_stream_id_base = 2000;
 
     let ctx = rusteron_client::AeronContext::new().expect("aeron context");
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
     aeron.start().expect("aeron start");
 
     // Per-sequencer channel-A publishers + per-A subscribers.
-    let mut a_pubs: Vec<ChannelAPublisher> = Vec::with_capacity(M as usize);
+    let mut a_pubs: Vec<TxDataPublisher> = Vec::with_capacity(M as usize);
     let subs = Subscribers {
         aeron: aeron.clone(),
         ch: cfg.channels.clone(),
     };
     let mut a_subs = Vec::with_capacity(M as usize);
     for sid in 0..M {
-        a_pubs.push(ChannelAPublisher::open(&aeron, &cfg.channels, sid).unwrap());
+        a_pubs.push(TxDataPublisher::open(&aeron, &cfg.channels, sid).unwrap());
         a_subs.push(subs.a(sid).unwrap());
     }
 
-    let b_pub = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
+    let b_pub = TxOrderingPublisher::open(&aeron, &cfg.channels).unwrap();
     let mut b_sub = subs.b().unwrap();
 
     // Publish TXS_PER_SEQ envelopes per sequencer; remember each
-    // (sequencer_id, position_a, expected correlation_id).
+    // (sequencer_id, tx_data_position, expected correlation_id).
     let mut publish_plan: Vec<(u8, BPosition, u64)> = Vec::new();
     for n in 0..TXS_PER_SEQ {
         for sid in 0..M {
@@ -129,7 +130,7 @@ async fn split_architecture_m_plus_one_e2e() {
             .publish_ref(&TxRef {
                 tx_hash: alloy_primitives::B256::ZERO,
                 shard_id: *sid,
-                position_a: *pos_a,
+                tx_data_position: *pos_a,
             })
             .unwrap();
     }
@@ -166,9 +167,9 @@ async fn split_architecture_m_plus_one_e2e() {
     while canonical.len() < publish_plan.len() && std::time::Instant::now() < deadline {
         b_sub.poll(
             |m, _b_pos| {
-                if let ChannelBMessage::TxRef(r) = m {
+                if let TxOrderingMessage::TxRef(r) = m {
                     let env = a_buffer
-                        .remove(&(r.shard_id, r.position_a))
+                        .remove(&(r.shard_id, r.tx_data_position))
                         .expect("TxRef must hit A-buffer");
                     canonical.push(env.correlation_id);
                 }

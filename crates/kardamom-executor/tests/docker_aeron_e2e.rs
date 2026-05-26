@@ -9,19 +9,19 @@
 //! - `kardamom_log::codec::{encode, access, materialize}` for rkyv ↔ bytes.
 //!
 //! The channel-B/C publishers and subscribers that wrap the real rusteron
-//! handles into `ChannelBSubscription` / `ChannelCPublication` adapters are
+//! handles into `TxOrderingSubscription` / `ChannelCPublication` adapters are
 //! still TBD in `kardamom-log`. Once those land, the e2e test follows the
 //! Task 19 outline in `docs/plans/2026-05-23-S4-v0-sequential-executor.md`:
 //!
 //! 1. `AeronTestCluster::single_node().await?`
 //! 2. Open a publisher on channel B, a subscriber on channel C.
 //! 3. Publish N rkyv-encoded `TxEnvelope`s + a `BlockBoundaryStart`.
-//! 4. Wire the executor's `ChannelBSubscription` / `ChannelCPublication`
+//! 4. Wire the executor's `TxOrderingSubscription` / `ChannelCPublication`
 //!    adapters and run.
 //! 5. Drain channel C, assert receipts and the slim boundary.
 //!
 //! Tracking: S3 follow-up PR to expose `RealChannelBPublication`,
-//! `RealChannelBSubscription`, `RealChannelCPublication`,
+//! `RealTxOrderingSubscription`, `RealChannelCPublication`,
 //! `RealChannelCSubscription` (gated by `aeron-live`).
 //!
 //! Until then, the in-memory `FakePublication` / `FakeTypedSubscription`

@@ -3,10 +3,10 @@
 //! Under the MDS topology (D-Sh12 v2) the sequencer **does not** publish
 //! to channel A — that's the proxy's job. The sequencer is purely a
 //! reader-of-A + publisher-of-B-refs: for each envelope observed on its
-//! shard's channel A (via [`crate::inbound::ChannelASubscriber`]), if the
+//! shard's channel A (via [`crate::inbound::TxDataSubscriber`]), if the
 //! nonce gate matches, it publishes a tiny [`kardamom_types::TxRef`] onto
 //! the canonical orderer channel B
-//! ([`ChannelBRefPublisher`]) — Aeron *concurrent* multi-publisher, ordered
+//! ([`TxOrderingRefPublisher`]) — Aeron *concurrent* multi-publisher, ordered
 //! with refs from the other P-1 sequencers in this shard's group and
 //! sealer-emitted `BlockBoundaryStart` markers.
 //!
@@ -28,13 +28,13 @@ use kardamom_types::TxRef;
 use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
 
-/// Channel B publisher contract — the canonical orderer. Publishes tiny
+/// TxOrdering publisher contract — the canonical orderer. Publishes tiny
 /// [`TxRef`] records (~41 B) into Aeron's concurrent multi-publisher
 /// stream.
 ///
 /// A blocked transport must surface as `Err(SequencerError::Backpressure)`
 /// so the state machine can rewind.
-pub trait ChannelBRefPublisher: Send {
+pub trait TxOrderingRefPublisher: Send {
     fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError>;
 }
 
@@ -60,12 +60,12 @@ pub mod fakes {
     /// In-memory channel-B `TxRef` publisher. Records every published ref
     /// in arrival order so tests can assert the canonical sequence.
     #[derive(Default, Clone)]
-    pub struct InMemoryChannelBRefPublisher {
+    pub struct InMemoryTxOrderingRefPublisher {
         pub refs: Arc<Mutex<Vec<TxRef>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
     }
 
-    impl ChannelBRefPublisher for InMemoryChannelBRefPublisher {
+    impl TxOrderingRefPublisher for InMemoryTxOrderingRefPublisher {
         fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn fake_b_records_refs() {
-        let mut p = InMemoryChannelBRefPublisher::default();
+        let mut p = InMemoryTxOrderingRefPublisher::default();
         p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default()))
             .unwrap();
         p.try_publish_ref(&TxRef::new(B256::ZERO, 1, BPosition::default()))
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn fake_b_can_simulate_backpressure() {
-        let mut p = InMemoryChannelBRefPublisher::default();
+        let mut p = InMemoryTxOrderingRefPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
             p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default())),
