@@ -17,7 +17,8 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, CachedReceipt, ChannelBMessage, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+    BPosition, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+    TxOrderingMessage,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -111,16 +112,16 @@ fn header_pos(h: &Header) -> Option<BPosition> {
     })
 }
 
-/// Channel A[i]: per-sequencer subscription of full `TxEnvelope` bytes.
+/// TxData[i]: per-sequencer subscription of full `TxEnvelope` bytes.
 /// Executors run M of these (one per sequencer); the per-A reader buffers
 /// envelopes keyed by `BPosition` until the corresponding `TxRef` arrives
 /// on channel B (spec §2.4).
-pub type ChannelASubscriber = TypedSubscriber<TxEnvelope>;
+pub type TxDataSubscriber = TypedSubscriber<TxEnvelope>;
 
-/// Channel B: canonical orderer. Yields [`ChannelBMessage`] records
+/// TxOrdering: canonical orderer. Yields [`TxOrderingMessage`] records
 /// (`TxRef | BoundaryStart`). The `BPosition` handed to the callback is the
 /// fragment's canonical L2 position (system invariant I1).
-pub type ChannelBSubscriber = TypedSubscriber<ChannelBMessage>;
+pub type ChannelBSubscriber = TypedSubscriber<TxOrderingMessage>;
 pub type ChannelCReceiptSubscriber = TypedSubscriber<Receipt>;
 pub type ReceiptCacheSubscriber = TypedSubscriber<CachedReceipt>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
@@ -137,7 +138,7 @@ pub struct Subscribers {
 impl Subscribers {
     /// Open the channel-A subscription for sequencer `sequencer_id`. Run
     /// M of these on each executor host to feed the per-A buffer.
-    pub fn a(&self, sequencer_id: u8) -> Result<ChannelASubscriber, LogError> {
+    pub fn a(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
             &self.ch.a_channel(sequencer_id),
@@ -146,7 +147,11 @@ impl Subscribers {
     }
 
     pub fn b(&self) -> Result<ChannelBSubscriber, LogError> {
-        TypedSubscriber::open(&self.aeron, &self.ch.b_channel, self.ch.b_stream_id)
+        TypedSubscriber::open(
+            &self.aeron,
+            &self.ch.tx_ordering_channel,
+            self.ch.tx_ordering_stream_id,
+        )
     }
 
     pub fn c_receipts(&self) -> Result<ChannelCReceiptSubscriber, LogError> {
@@ -170,7 +175,7 @@ impl Subscribers {
     }
 
     /// Subscribe to a sequencer-local channel-A fsync watermark stream
-    /// (one publisher per sequencer; see `fsync_watermark_a_channel_template`).
+    /// (one publisher per sequencer; see `fsync_watermark_tx_dattx_data_channel_template`).
     pub fn watermark_a(&self, sequencer_id: u8) -> Result<WatermarkSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,

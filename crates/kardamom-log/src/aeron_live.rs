@@ -20,11 +20,11 @@
 //!
 //! ## Roles
 //!
-//! - **Sequencer i:** `channel_a_publisher(i)` (its own A) +
-//!   `channel_b_publisher()` (the canonical orderer).
-//! - **Executor / batcher:** `channel_a_subscriber(i)` for i in 0..M +
-//!   `channel_b_subscriber()`.
-//! - **Sealer:** `channel_b_publisher()` only (emits boundaries).
+//! - **Sequencer i:** `tx_data_publisher(i)` (its own A) +
+//!   `tx_ordering_publisher()` (the canonical orderer).
+//! - **Executor / batcher:** `tx_data_subscriber(i)` for i in 0..M +
+//!   `tx_ordering_subscriber()`.
+//! - **Sealer:** `tx_ordering_publisher()` only (emits boundaries).
 //!
 //! Gated behind the `aeron-live` cargo feature.
 
@@ -33,12 +33,12 @@ use std::rc::Rc;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::publisher::{
-    ChannelAPublisher, ChannelBPublisher, ChannelCPublisher, QuorumPublisher,
-    ReceiptCachePublisher, WatermarkAPublisher, WatermarkPublisher,
+    ChannelCPublisher, QuorumPublisher, ReceiptCachePublisher, TxDataPublisher,
+    TxOrderingPublisher, WatermarkAPublisher, WatermarkPublisher,
 };
 use crate::subscriber::{
-    ChannelASubscriber, ChannelBSubscriber, ChannelCReceiptSubscriber, QuorumSubscriber,
-    ReceiptCacheSubscriber, Subscribers, WatermarkSubscriber,
+    ChannelBSubscriber, ChannelCReceiptSubscriber, QuorumSubscriber, ReceiptCacheSubscriber,
+    Subscribers, TxDataSubscriber, WatermarkSubscriber,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -71,20 +71,20 @@ impl AeronRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Channel A (per-sequencer, exclusive publication)
+    // TxData (per-sequencer, exclusive publication)
     // -----------------------------------------------------------------------
 
     /// Open the channel-A publisher for sequencer `sequencer_id`. Calling
     /// this on a non-sequencer host is a programmer error — the per-A
     /// stream is exclusive-publisher and the only writer must be the
     /// sequencer that owns the partition.
-    pub fn channel_a_publisher(&self, sequencer_id: u8) -> Result<ChannelAPublisher, LogError> {
-        ChannelAPublisher::open(&self.aeron, &self.channels, sequencer_id)
+    pub fn tx_data_publisher(&self, sequencer_id: u8) -> Result<TxDataPublisher, LogError> {
+        TxDataPublisher::open(&self.aeron, &self.channels, sequencer_id)
     }
 
     /// Open a channel-A subscription. Executors / batchers open M of these
     /// (one per sequencer).
-    pub fn channel_a_subscriber(&self, sequencer_id: u8) -> Result<ChannelASubscriber, LogError> {
+    pub fn tx_data_subscriber(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         self.subscribers().a(sequencer_id)
     }
 
@@ -106,14 +106,14 @@ impl AeronRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Channel B (canonical orderer, concurrent publication, tiny payload)
+    // TxOrdering (canonical orderer, concurrent publication, tiny payload)
     // -----------------------------------------------------------------------
 
-    pub fn channel_b_publisher(&self) -> Result<ChannelBPublisher, LogError> {
-        ChannelBPublisher::open(&self.aeron, &self.channels)
+    pub fn tx_ordering_publisher(&self) -> Result<TxOrderingPublisher, LogError> {
+        TxOrderingPublisher::open(&self.aeron, &self.channels)
     }
 
-    pub fn channel_b_subscriber(&self) -> Result<ChannelBSubscriber, LogError> {
+    pub fn tx_ordering_subscriber(&self) -> Result<ChannelBSubscriber, LogError> {
         self.subscribers().b()
     }
 
@@ -142,7 +142,7 @@ impl AeronRuntime {
     }
 
     // -----------------------------------------------------------------------
-    // Channel B fsync watermarks + quorum
+    // TxOrdering fsync watermarks + quorum
     // -----------------------------------------------------------------------
 
     pub fn channel_b_watermark_publisher(
