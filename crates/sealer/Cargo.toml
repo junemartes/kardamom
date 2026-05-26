@@ -10,14 +10,10 @@ path = "src/bin/kardamom-sealer.rs"
 [features]
 default = []
 # In-memory testing fakes for downstream-crate unit tests. Mirrors the
-# convention used by kardamom-sequencer / kardamom-log: a `testing` feature
-# gates the in-process mocks so that crate consumers can re-use the
-# sealer's election + emission code without a real Aeron environment.
+# convention used by `sequencer` / `log`: a `testing` feature gates the
+# in-process mocks so that crate consumers can re-use the sealer's
+# emission code without a real Aeron environment.
 testing = ["log/testing"]
-# Real Aeron wiring. Off by default so the crate builds on hosts without the
-# Aeron C library installed. CI runs `--all-features --locked` on a host with
-# Aeron available.
-aeron-live = ["log/aeron-live"]
 # Docker-driven real-Aeron e2e gate. Implies `testing` for the harness import.
 docker-e2e = ["testing", "log/docker-e2e"]
 

@@ -36,6 +36,6 @@ fn docker_aeron_e2e_pending_real_channel_wrappers() {
     // populate this with the end-to-end scenario.
     eprintln!(
         "docker_aeron_e2e: pending Real* tx_ordering / tx_receipts wrappers \
-         in `log` under the `aeron-live` feature. See module docs."
+         in `log`. See module docs."
     );
 }

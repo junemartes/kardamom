@@ -15,7 +15,7 @@
 //! cargo test -p kardamom-log --features 'docker-e2e aeron-live' --test docker_e2e -- --nocapture
 //! ```
 
-#![cfg(all(feature = "docker-e2e", feature = "aeron-live"))]
+#![cfg(feature = "docker-e2e")]
 
 use std::rc::Rc;
 use std::time::Duration;

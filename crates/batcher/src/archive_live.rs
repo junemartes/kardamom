@@ -1,4 +1,4 @@
-//! Live Aeron Archive reader. Gated behind `feature = "aeron-live"`.
+//! Live Aeron Archive reader. (unconditional dep on rusteron.)
 //!
 //! Same `!Send + !Sync` thread-confinement discipline as
 //! `log::recorder` — owns its `AeronArchive` on a single thread,

@@ -7,9 +7,9 @@ publish = false
 [features]
 default = []
 # Run the full-pipeline cross-component test under real Aeron in Docker.
-# Implies `aeron-live` + `docker-e2e` everywhere it touches. Off by default
-# so the standard CI stays fast; the dedicated docker-e2e CI job opts in.
-full-pipeline-e2e = ["log/aeron-live", "log/docker-e2e", "log/testing"]
+# Implies the `docker-e2e` testcontainers harness. Off by default so the
+# standard CI stays fast; the dedicated docker-e2e CI job opts in.
+full-pipeline-e2e = ["log/docker-e2e", "log/testing"]
 
 [lib]
 path = "src/lib.rs"
@@ -25,9 +25,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# Note: aeron-live and docker-e2e are activated only when the
-# `full-pipeline-e2e` feature is enabled (see [features] above). Plain
-# `cargo test -p e2e` does not pull rusteron / cmake / docker.
+# Note: docker-e2e is activated only when the `full-pipeline-e2e`
+# feature is enabled (see [features] above).
 criterion.workspace = true
 hdrhistogram.workspace = true
 executor = { path = "../executor" }

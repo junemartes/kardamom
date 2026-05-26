@@ -59,16 +59,16 @@ jobs:
       - name: cargo build (docker-e2e feature)
         run: |
           cargo build \
-            -p kardamom-log \
-            -p kardamom-e2e \
-            --features 'kardamom-log/docker-e2e,kardamom-log/aeron-live,kardamom-e2e/full-pipeline-e2e' \
+            -p log \
+            -p e2e \
+            --features 'log/docker-e2e,e2e/full-pipeline-e2e' \
             --tests
 
       # Run the headline test: the cross-component proof-of-pipeline.
       - name: full-pipeline-e2e proof-of-pipeline test
         run: |
           cargo test \
-            -p kardamom-e2e \
+            -p e2e \
             --features 'full-pipeline-e2e' \
             --test full_pipeline_e2e -- --ignored --nocapture proof_of_pipeline
 
@@ -78,10 +78,10 @@ jobs:
       - name: per-component docker_e2e smoke
         run: |
           cargo test \
-            -p kardamom-log \
-            --features 'docker-e2e,aeron-live' \
+            -p log \
+            --features 'docker-e2e' \
             --test docker_e2e -- --ignored --nocapture
           cargo test \
-            -p kardamom-log \
-            --features 'docker-e2e,aeron-live' \
+            -p log \
+            --features 'docker-e2e' \
             --test aeron_live_e2e -- --ignored --nocapture

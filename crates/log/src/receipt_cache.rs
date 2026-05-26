@@ -6,8 +6,5 @@
 //!
 //! Real publishers/subscribers live behind the `aeron-live` feature. In-memory
 //! fakes (used by other crates' unit tests) live in [`crate::testing`].
-
-#[cfg(feature = "aeron-live")]
 pub use crate::publisher::ReceiptCachePublisher;
-#[cfg(feature = "aeron-live")]
 pub use crate::subscriber::ReceiptCacheSubscriber;

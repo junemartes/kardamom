@@ -67,8 +67,6 @@ impl QuorumState {
 // ---------------------------------------------------------------------------
 // QuorumAggregator runner task (gated behind `aeron-live`)
 // ---------------------------------------------------------------------------
-
-#[cfg(feature = "aeron-live")]
 mod aggregator {
     use std::sync::Arc;
     use std::time::Duration;
@@ -126,6 +124,4 @@ mod aggregator {
         }
     }
 }
-
-#[cfg(feature = "aeron-live")]
 pub use aggregator::QuorumAggregator;

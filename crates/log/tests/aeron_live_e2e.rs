@@ -11,9 +11,9 @@
 //!   3. published `TxEnvelope`s round-trip through real Aeron and emerge on
 //!      the subscriber in publish order, with non-zero `BPosition` cursors.
 //!
-//! Gated on `docker-e2e` + `aeron-live` features AND on Docker availability.
+//! Gated on the `docker-e2e` feature AND on Docker availability.
 
-#![cfg(all(feature = "docker-e2e", feature = "aeron-live"))]
+#![cfg(feature = "docker-e2e")]
 
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ async fn docker_available() -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker; run with `cargo test -p log --features docker-e2e,aeron-live --test aeron_live_e2e -- --ignored`"]
+#[ignore = "requires Docker; run with `cargo test -p log --features docker-e2e --test aeron_live_e2e -- --ignored`"]
 async fn aeron_live_send_friendly_round_trip() {
     if !docker_available().await {
         eprintln!("skipping: docker not available");

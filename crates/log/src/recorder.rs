@@ -8,7 +8,7 @@
 //!   - One `Recorder` with `RecorderKind::TxData { sequencer_id }` per sequencer
 //!     host (M total; single-host fsync each).
 //!
-//! Gated behind the `aeron-live` cargo feature.
+//! (unconditional dep on rusteron.)
 //!
 //! ## Durability model
 //!

@@ -47,7 +47,7 @@
 //!   watermark streams feeding the quorum aggregator.
 //! - `Quorum{Publisher,Subscriber}Handle` — aggregated quorum watermark.
 //!
-//! Gated behind `feature = "aeron-live"`.
+//! (unconditional dep on rusteron.)
 
 use std::ffi::CString;
 use std::rc::Rc;

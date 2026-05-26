@@ -85,19 +85,13 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         ?cfg,
-        "kardamom-sequencer config parsed; Aeron wiring is staged in a follow-up \
-         (S3 ingress-channel surface is in-process mpsc as of this build)"
+        "kardamom-sequencer config parsed; Aeron wiring TBD"
     );
-
-    #[cfg(feature = "aeron-live")]
-    {
-        eprintln!(
-            "kardamom-sequencer: aeron-live build received; the ingress channel \
-             surface (proxy -> sequencer) still uses in-process mpsc on the \
-             landed S1/S3 surfaces. A real Aeron ingress publisher will land \
-             alongside the S5/S6 e2e work; this binary is currently a CLI \
-             smoke runner."
-        );
-    }
+    eprintln!(
+        "kardamom-sequencer: config validated. The ingress channel surface \
+         (proxy -> sequencer) still uses in-process mpsc as of this build; \
+         a real Aeron ingress publisher lands alongside the cross-component \
+         e2e. This binary is currently a CLI smoke runner."
+    );
     Ok(())
 }

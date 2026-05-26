@@ -11,7 +11,7 @@
 //! handles (which are thread-confined; see [`crate::aeron_live`] for the
 //! threading discipline).
 //!
-//! Gated behind `feature = "aeron-live"`.
+//! (unconditional dep on rusteron.)
 
 use std::cell::RefCell;
 use std::path::PathBuf;

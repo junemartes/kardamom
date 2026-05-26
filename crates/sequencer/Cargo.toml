@@ -12,9 +12,6 @@ path = "src/bin/kardamom-sequencer.rs"
 # under `inbound` / `outbound`. On by default in this crate's `[dev-dependencies]`
 # pull-back; off in production.
 testing = []
-# Real Aeron wiring. Off by default so the crate builds without the Aeron C
-# library installed (CI runs the all-features matrix on a host that has it).
-aeron-live = ["log/aeron-live"]
 # Real-Aeron Docker e2e test gate. Implies `testing` for the harness import.
 docker-e2e = ["testing", "log/docker-e2e"]
 

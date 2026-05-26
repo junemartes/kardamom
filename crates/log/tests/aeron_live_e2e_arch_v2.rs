@@ -26,7 +26,7 @@
 //!     --test aeron_live_e2e_arch_v2 -- --nocapture
 //! ```
 
-#![cfg(all(feature = "docker-e2e", feature = "aeron-live"))]
+#![cfg(feature = "docker-e2e")]
 
 use std::collections::HashMap;
 use std::rc::Rc;

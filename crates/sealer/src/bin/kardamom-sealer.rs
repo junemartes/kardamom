@@ -1,13 +1,10 @@
 //! kardamom-sealer: block sealer CLI.
 //!
-//! Loads a TOML `SealerConfig`, validates it, and either:
-//!
-//!   - With `aeron-live` enabled: opens the tx_ordering publisher via
-//!     `kardamom-log` and runs the sealer's `run_forever` loop.
-//!
-//!   - Without `aeron-live`: parses + validates the config, prints a clear
-//!     "aeron-live build required" message, and exits with status 0 so smoke
-//!     tests can exercise the CLI surface without an Aeron environment.
+//! Loads a TOML `SealerConfig`, validates it, and (eventually) opens the
+//! tx_ordering publisher via `log` to run the sealer's `run_forever` loop.
+//! For now this binary is a CLI smoke runner — it parses + validates the
+//! config and exits 0; the live wrapper lands with the cross-component
+//! real-Aeron e2e.
 
 use std::path::PathBuf;
 
@@ -42,24 +39,10 @@ fn main() -> Result<()> {
         "kardamom-sealer config parsed"
     );
 
-    #[cfg(not(feature = "aeron-live"))]
-    {
-        eprintln!(
-            "kardamom-sealer: built without the aeron-live feature; the live \
-             tx_ordering publisher requires it. Re-build with \
-             `--features aeron-live` to run against real Aeron. \
-             Exiting 0 (config validated)."
-        );
-        Ok(())
-    }
-
-    #[cfg(feature = "aeron-live")]
-    {
-        eprintln!(
-            "kardamom-sealer: aeron-live feature is enabled but the real \
-             tx_ordering wrapper is still landing as part of the cross-component \
-             real-Aeron e2e. Config validated; exiting 0."
-        );
-        Ok(())
-    }
+    eprintln!(
+        "kardamom-sealer: config validated. The real tx_ordering wrapper is \
+         still landing as part of the cross-component real-Aeron e2e; this \
+         binary is currently a CLI smoke runner. Exiting 0."
+    );
+    Ok(())
 }

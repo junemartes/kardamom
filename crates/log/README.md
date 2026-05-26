@@ -1,6 +1,6 @@
-# kardamom-log
+# log
 
-S3 canonical-log subsystem. See `` §2.3 and §2.5, and `` / / /.
+Canonical-log subsystem.
 
 ## Owned components
 
@@ -11,7 +11,10 @@ S3 canonical-log subsystem. See `` §2.3 and §2.5, and `` / / /.
 - **Quorum fsync-watermark aggregator** (Q-of-N largest position)
 - **`testing` feature** — in-memory pub/sub fakes for other crates' unit tests
 - **`docker-e2e` feature + `docker/aeron/`** — testcontainers-driven Aeron Docker harness; reusable by other crates' e2e tests
-- **`aeron-live` feature** — gates the real rusteron-backed publishers / subscribers / recorder
+
+The real rusteron-backed publishers / subscribers / recorder / archive replay
+adapters are unconditional dependencies of this crate; cmake + JDK 17 are
+required at compile time.
 
 ## Durability model
 
@@ -26,14 +29,13 @@ For correlated power-loss survival, point `archive_dir` at enterprise NVMe with 
 
 | feature       | what it enables                                                   | requires at compile time            |
 |---------------|-------------------------------------------------------------------|-------------------------------------|
-| (default)     | codec, config, supervisor, watermark, types                       | rust                                |
-| `testing`     | adds `kardamom_log::testing::Fake*`                               | (none extra)                        |
-| `aeron-live`  | adds `publisher`, `subscriber`, `recorder`                        | cmake + JDK + Aeron C build         |
+| (default)     | everything — publishers, subscribers, recorder, archive replay    | cmake + JDK 17 + Aeron C build      |
+| `testing`     | adds `log::testing::Fake*`                                        | (none extra)                        |
 | `docker-e2e`  | implies `testing`, adds `AeronTestCluster`                        | docker at *runtime*                 |
 
 ## Shared types
 
-Wire types live in `kardamom-types`; this crate re-exports them via `kardamom_log::types::*` for convenience. Do not add new wire types here.
+Wire types live in `types`; this crate re-exports them via `log::types::*` for convenience. Do not add new wire types here.
 
 ## Wire codec
 

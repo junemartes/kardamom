@@ -16,7 +16,7 @@
 //! for ergonomics; we convert to `CString`/`&CStr` at the FFI boundary since
 //! the rusteron 0.1.16x bindings exclusively take `&CStr`.
 //!
-//! Gated behind the `aeron-live` cargo feature; not built in default
+//! (unconditional dep on rusteron.) Not used in default
 //! `cargo test` runs.
 
 use std::ffi::CString;
