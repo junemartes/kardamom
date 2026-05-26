@@ -3,74 +3,84 @@
 //! S0 D-Sh10: the batcher reads from on-disk Aeron Archive segment files. It
 //! does not subscribe to channel C, does not talk to the live sequencer.
 //!
-//! Aeron's real on-disk frame format is documented in `aeron-driver`; for v0
-//! the offline reader operates over a **simplified KAR1-internal frame format**
-//! that the batcher itself can write (used by tests + the in-process reader
-//! path). The real-Aeron live path (Task 11) uses `rusteron-archive`'s replay
-//! protocol; the filesystem path documented here covers the spec when the
-//! batcher has direct read access to the archive directory.
+//! ## D-Sh12 architecture: split data and ordering
 //!
-//! The simplified format used by [`SegmentReader`] is one frame per record:
+//! After D-Sh12 the on-disk archives carry **two different payload types**:
+//!
+//! - **Channel B** segments carry [`ChannelBMessage`] records (`TxRef +
+//!   BoundaryStart`) — the canonical orderer.
+//! - **Per-sequencer Channel A** segments carry full [`TxEnvelope`] records —
+//!   the bulk transaction data.
+//!
+//! The simplified on-disk frame format the batcher uses for v0 is one
+//! length-prefixed rkyv archive per record:
 //!
 //! ```text
 //!   length      u32 LE      total frame length including this header
-//!   stream_kind u8          0 = tx (TxEnvelope), 1 = boundary (BlockBoundaryStart)
-//!   reserved    u24 zero
+//!   reserved    u32 zero
 //!   term_id     i32 LE
 //!   term_offset i32 LE
-//!   payload     length - 16 bytes
+//!   payload     length - 16 bytes (rkyv archive of T)
 //!   pad         zero, to next 8-byte boundary
 //! ```
 //!
-//! Each payload is a rkyv-archived value of the corresponding `kardamom-types`
-//! struct. The active segment may end mid-frame; the reader truncates at the
-//! last full frame.
+//! The header is type-agnostic; the payload type is determined by *which
+//! archive* the segment file came from (channel B vs channel A[i]). The
+//! reader is generic over the payload type so it can deserialise either.
+//!
+//! The active segment may end mid-frame; the reader truncates at the last
+//! full frame.
 
 use std::fs::File;
 use std::io::Read;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 
-use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
+use kardamom_types::{BPosition, ChannelBMessage, TxEnvelope};
 use rkyv::api::high::{HighDeserializer, HighValidator};
 use rkyv::rancor;
 
 use crate::error::BatcherError;
 
-pub const STREAM_KIND_TX: u8 = 0;
-pub const STREAM_KIND_BOUNDARY: u8 = 1;
-
-const FRAME_HEADER_LEN: usize = 4 + 1 + 3 + 4 + 4; // 16 bytes
+const FRAME_HEADER_LEN: usize = 4 + 4 + 4 + 4; // 16 bytes (length, reserved, term_id, term_offset)
 const FRAME_ALIGN: usize = 8;
 
-/// A single record decoded from a segment file.
+/// One decoded record from a typed segment file. The position is the
+/// fragment's start position on the originating Aeron stream — for channel A
+/// segments this is the position a sequencer recorded in [`TxRef::position_a`].
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum SegmentRecord {
-    Tx {
-        position: BPosition,
-        env: TxEnvelope,
-    },
-    Boundary {
-        position: BPosition,
-        marker: BlockBoundaryStart,
-    },
+pub struct TypedRecord<T> {
+    pub position: BPosition,
+    pub value: T,
 }
 
-/// Iterator-style reader over one or more archive segment files. For the v0
-/// filesystem path we accept a single segment file plus the descriptor fields;
-/// multi-segment iteration is the same algorithm applied to consecutive files.
-pub struct SegmentReader {
+/// Generic offline reader over an archive segment file. The type parameter
+/// `T` is the rkyv-archived payload carried by every frame in this segment.
+/// For channel B archives use `T = ChannelBMessage`; for channel A archives
+/// use `T = TxEnvelope`.
+pub struct TypedSegmentReader<T> {
     bytes: Vec<u8>,
     pos: usize,
+    _marker: PhantomData<T>,
 }
 
-impl SegmentReader {
+impl<T> TypedSegmentReader<T>
+where
+    T: rkyv::Archive,
+    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+{
     /// Open a segment file. `segment_path` is the full path to the `.rec`
     /// file (typically `<archive_dir>/<recording_id>-<segmentBase>.rec`).
     pub fn open(segment_path: &Path) -> Result<Self, BatcherError> {
         let mut f = File::open(segment_path)?;
         let mut bytes = Vec::new();
         f.read_to_end(&mut bytes)?;
-        Ok(Self { bytes, pos: 0 })
+        Ok(Self {
+            bytes,
+            pos: 0,
+            _marker: PhantomData,
+        })
     }
 
     /// Compose the canonical segment file path:
@@ -78,10 +88,22 @@ impl SegmentReader {
     pub fn segment_path(archive_dir: &Path, recording_id: i64, segment_base: i64) -> PathBuf {
         archive_dir.join(format!("{recording_id}-{segment_base}.rec"))
     }
+
+    /// Drain the reader into a `Vec<TypedRecord<T>>`. Convenience for
+    /// pre-loading an entire (channel A) segment into the per-A position
+    /// index used by [`crate::multi_archive_reader::MultiArchiveReader`].
+    pub fn collect_all(self) -> Result<Vec<TypedRecord<T>>, BatcherError> {
+        self.collect::<Result<Vec<_>, _>>()
+    }
 }
 
-impl Iterator for SegmentReader {
-    type Item = Result<SegmentRecord, BatcherError>;
+impl<T> Iterator for TypedSegmentReader<T>
+where
+    T: rkyv::Archive,
+    T::Archived: rkyv::Deserialize<T, HighDeserializer<rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+{
+    type Item = Result<TypedRecord<T>, BatcherError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         // Need at least a header.
@@ -94,8 +116,7 @@ impl Iterator for SegmentReader {
             // Truncated active segment — stop.
             return None;
         }
-        let stream_kind = buf[4];
-        // bytes 5..8 reserved
+        // bytes 4..8 reserved
         let term_id = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let term_offset = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
         let payload = &buf[FRAME_HEADER_LEN..len];
@@ -105,16 +126,9 @@ impl Iterator for SegmentReader {
             term_offset,
         };
 
-        let rec = match stream_kind {
-            STREAM_KIND_TX => match access_owned::<TxEnvelope>(payload) {
-                Ok(env) => Ok(SegmentRecord::Tx { position, env }),
-                Err(e) => Err(e),
-            },
-            STREAM_KIND_BOUNDARY => match access_owned::<BlockBoundaryStart>(payload) {
-                Ok(marker) => Ok(SegmentRecord::Boundary { position, marker }),
-                Err(e) => Err(e),
-            },
-            other => Err(BatcherError::Frame(format!("unknown stream_kind {other}"))),
+        let rec = match access_owned::<T>(payload) {
+            Ok(value) => Ok(TypedRecord { position, value }),
+            Err(e) => Err(e),
         };
 
         // Advance by the aligned frame length.
@@ -124,6 +138,14 @@ impl Iterator for SegmentReader {
         Some(rec)
     }
 }
+
+/// Channel B segment reader: yields [`ChannelBMessage`] records (TxRef +
+/// BoundaryStart) in canonical order.
+pub type ChannelBSegmentReader = TypedSegmentReader<ChannelBMessage>;
+
+/// Channel A[i] segment reader: yields full [`TxEnvelope`] records in the
+/// order sequencer `i` wrote them.
+pub type ChannelASegmentReader = TypedSegmentReader<TxEnvelope>;
 
 fn access_owned<T>(bytes: &[u8]) -> Result<T, BatcherError>
 where
@@ -136,7 +158,10 @@ where
 
 /// Append one frame to `out`. Helper used by tests and the future writer-side
 /// adapter; encodes one record in the simplified KAR1-internal segment format.
-pub fn append_frame<T>(out: &mut Vec<u8>, stream_kind: u8, position: BPosition, value: &T)
+///
+/// The frame is type-agnostic: caller writes the same way for channel A
+/// (T = TxEnvelope) and channel B (T = ChannelBMessage).
+pub fn append_frame<T>(out: &mut Vec<u8>, position: BPosition, value: &T)
 where
     T: for<'a> rkyv::Serialize<
             rkyv::api::high::HighSerializer<
@@ -149,8 +174,7 @@ where
     let payload = rkyv::to_bytes::<rancor::Error>(value).expect("rkyv encode");
     let total: u32 = (FRAME_HEADER_LEN + payload.len()) as u32;
     out.extend_from_slice(&total.to_le_bytes());
-    out.push(stream_kind);
-    out.extend_from_slice(&[0, 0, 0]); // reserved
+    out.extend_from_slice(&[0u8; 4]); // reserved (was: stream_kind + 3 reserved bytes; collapsed in D-Sh12)
     out.extend_from_slice(&position.term_id.to_le_bytes());
     out.extend_from_slice(&position.term_offset.to_le_bytes());
     out.extend_from_slice(payload.as_slice());

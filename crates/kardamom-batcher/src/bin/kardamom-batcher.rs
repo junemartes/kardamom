@@ -1,11 +1,13 @@
 //! `kardamom-batcher` CLI.
 //!
 //! Pure orchestration:
-//!   - Open the offline segment reader at `--archive-dir / --recording-id`.
+//!   - Open the offline channel-B segment reader at `--channel-b-segment`.
+//!   - Open per-sequencer channel-A segment readers via
+//!     `--channel-a-archive sid=path,sid=path,...`.
 //!   - Build a [`Batcher`] with a `Sender` that talks to the settlement
 //!     contract over `--rpc-url`.
 //!   - Run until SIGTERM, advancing per-block batches as `BlockBoundaryStart`
-//!     markers arrive in the archive.
+//!     markers arrive in the canonical (channel-B) archive.
 //!
 //! v0 wires the parsing + smoke print path; the real `Sender` impl is a
 //! follow-up task that wraps an `alloy_provider::Provider` + the
@@ -16,8 +18,10 @@
 use std::path::PathBuf;
 
 use clap::Parser;
-use kardamom_batcher::archive_reader::{SegmentReader, SegmentRecord};
 use kardamom_batcher::batcher::{Batcher, BatcherConfig, MockSender};
+use kardamom_batcher::multi_archive_reader::{
+    MultiArchiveConfig, MultiArchiveReader, ResolvedRecord,
+};
 use kardamom_leases::{Lease, LeaseConfig};
 use kardamom_types::{BPosition, FsyncWatermark, QuorumWatermark};
 use tracing::{info, warn};
@@ -25,9 +29,17 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-batcher", version)]
 struct Cli {
-    /// Path to one Aeron Archive segment file (.rec).
-    #[arg(long)]
-    segment: PathBuf,
+    /// Path to the channel-B Aeron Archive segment file (.rec) — the
+    /// canonical orderer carrying `ChannelBMessage` records (TxRef + boundary).
+    #[arg(long, alias = "segment")]
+    channel_b_segment: PathBuf,
+
+    /// Per-sequencer channel-A archive paths, in the form
+    /// `sid=path,sid=path,...`. Each sequencer that appears on channel B
+    /// via a `TxRef` must have its A-archive listed here so the batcher can
+    /// resolve the envelope bytes.
+    #[arg(long, default_value = "")]
+    channel_a_archive: String,
 
     /// Optional explicit blocks-per-batch group size.
     #[arg(long, default_value_t = 1)]
@@ -62,7 +74,16 @@ fn main() -> anyhow::Result<()> {
         warn!("live L1 broadcast path not yet wired; falling back to dry-run");
     }
 
-    let mut reader = SegmentReader::open(&cli.segment)?;
+    let a_segments = MultiArchiveConfig::parse_a_spec(&cli.channel_a_archive)?;
+    let multi_cfg = MultiArchiveConfig {
+        b_segment: cli.channel_b_segment.clone(),
+        a_segments,
+    };
+    let reader = MultiArchiveReader::open(&multi_cfg)?;
+    info!(
+        a_archive_count = reader.a_archive_count(),
+        "opened M-archive reader",
+    );
     let mut batcher = Batcher::new(
         BatcherConfig {
             blocks_per_batch: cli.blocks_per_batch,
@@ -88,13 +109,13 @@ fn main() -> anyhow::Result<()> {
 
     let mut tx_count: u64 = 0;
     let mut block_count: u64 = 0;
-    for rec in &mut reader {
+    for rec in reader {
         match rec? {
-            SegmentRecord::Tx { position, env } => {
+            ResolvedRecord::Tx { position, env, .. } => {
                 tx_count += 1;
                 batcher.accumulator().observe_tx(env, position);
             }
-            SegmentRecord::Boundary { marker, .. } => {
+            ResolvedRecord::Boundary { marker, .. } => {
                 block_count += 1;
                 let closed = batcher.accumulator().observe_boundary(marker);
                 batcher.on_closed_block(closed, &lease)?;
