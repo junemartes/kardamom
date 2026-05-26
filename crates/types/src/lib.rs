@@ -3,7 +3,7 @@
 //! No I/O. No Aeron. No libmdbx. Everything in this crate is `#[no_std]`-
 //! friendly in spirit (we still use `alloc` for `Vec`/`Bytes`).
 //!
-//! Wire types (`TxEnvelope`, `Receipt`, `BlockBoundary*`, `CachedReceipt`,
+//! Wire types (`TxEnvelope`, `Receipt`, `BlockBoundary*`,
 //! `FsyncWatermark`, `QuorumWatermark`, `BlockDelta`) derive
 //! `#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]`. Consumers
 //! that need zero-copy access use `rkyv::access::<Archived<T>>(bytes)`;
@@ -33,7 +33,7 @@ pub use boundary::{BlockBoundary, BlockBoundaryStart};
 pub use delta::{AccountChange, BlockDelta, StorageChange};
 pub use envelope::TxEnvelope;
 pub use position::BPosition;
-pub use receipt::{CachedReceipt, Receipt, WireLog};
+pub use receipt::{Receipt, WireLog};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_ordering::TxOrderingMessage;
 pub use txref::TxRef;

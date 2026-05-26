@@ -140,6 +140,14 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
 /// populated them at the system boundary. The executor **never recomputes
 /// `tx_hash`** (S0) and **never recovers a sender** (S0); it
 /// copies both fields straight through into the outbound `Receipt`.
+///
+/// `tx_index_in_block` is the zero-based index within the in-flight block
+/// (resets at every `BlockBoundaryStart`). `cumulative_gas_used_before` is the
+/// running gas sum for txs already executed in the same block; the returned
+/// receipt's `cumulative_gas_used` equals this plus the new tx's `gas_used`.
+#[allow(clippy::too_many_arguments)] // 8 args is the natural shape of an
+// "execute one tx" entry point — packaging them into a struct would shuffle
+// the noise around without reducing it.
 pub fn execute_tx<S: StateDatabase>(
     snapshot: &S,
     delta: &PendingDelta,
@@ -147,9 +155,19 @@ pub fn execute_tx<S: StateDatabase>(
     tx_idx: TxIndex,
     tx_position: BPosition,
     inbound_envelope: &TxEnvelope,
+    tx_index_in_block: u64,
+    cumulative_gas_used_before: u64,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
     let alloy_env = decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx)?;
     let signer = inbound_envelope.sender; // trusted from proxy; no recovery
+    let nonce = alloy_env.nonce();
+    let to = alloy_env.to();
+    // Effective gas price mirrors the value `tx_env_from_alloy` feeds revm:
+    // legacy/2930 `gas_price` when present, otherwise the 1559/4844
+    // `max_fee_per_gas` cap. v0 has basefee = 0 so the cap is what's paid.
+    let effective_gas_price = alloy_env
+        .gas_price()
+        .unwrap_or_else(|| alloy_env.max_fee_per_gas());
 
     // Layer the running delta on top of the snapshot via CacheDB so revm
     // sees writes from earlier txs in the same block.
@@ -211,6 +229,14 @@ pub fn execute_tx<S: StateDatabase>(
 
     let write_set_hash = ws.hash();
     let wire_logs = logs.iter().map(wire_log).collect();
+    let cumulative_gas_used = cumulative_gas_used_before + gas_used;
+    // Contract address is meaningful only for successful CREATE txs.
+    // Failed CREATEs and any CALL tx have `contract_address = None`.
+    let contract_address = if to.is_none() && status.is_success() {
+        Some(signer.create(nonce))
+    } else {
+        None
+    };
 
     // CRITICAL (S0): copy `tx_hash` straight from the inbound envelope —
     // DO NOT recompute via keccak256(raw_tx). The proxy (S1) is the canonical
@@ -222,6 +248,14 @@ pub fn execute_tx<S: StateDatabase>(
         gas_used,
         logs: wire_logs,
         write_set_hash,
+        nonce,
+        from: signer,
+        to,
+        contract_address,
+        effective_gas_price,
+        block_number: env.block_number,
+        transaction_index: tx_index_in_block,
+        cumulative_gas_used,
     };
     Ok((receipt, ws))
 }
@@ -346,7 +380,7 @@ mod tests {
 
         let env_tx = signed_transfer(&signer, to, 1_000, 0);
         let (receipt, ws) =
-            execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx).expect("execute");
+            execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0).expect("execute");
 
         //the receipt's tx_hash MUST equal the inbound envelope's
         // tx_hash byte-for-byte. No recomputation in the executor.
@@ -360,6 +394,16 @@ mod tests {
         // No storage or code writes for a plain transfer.
         assert!(ws.storage.is_empty());
         assert!(ws.code.is_empty());
+
+        // RPC enrichment populated by execute_tx.
+        assert_eq!(receipt.from, from);
+        assert_eq!(receipt.to, Some(to));
+        assert_eq!(receipt.contract_address, None);
+        assert_eq!(receipt.nonce, 0);
+        assert_eq!(receipt.effective_gas_price, 0); // tx built with gas_price = 0
+        assert_eq!(receipt.block_number, 1);
+        assert_eq!(receipt.transaction_index, 0);
+        assert_eq!(receipt.cumulative_gas_used, receipt.gas_used);
     }
 
     #[test]
@@ -377,19 +421,36 @@ mod tests {
         // First transfer.
         let tx1 = signed_transfer(&signer, to, 100, 0);
         let (r1, ws1) =
-            execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &tx1).expect("execute 1");
+            execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &tx1, 0, 0).expect("execute 1");
         assert!(r1.status);
         assert_eq!(r1.tx_hash, tx1.tx_hash); // copied, not recomputed
+        assert_eq!(r1.nonce, 0);
+        assert_eq!(r1.transaction_index, 0);
+        let gas_after_tx1 = r1.cumulative_gas_used;
         delta.apply(ws1);
 
         // Second transfer from the same sender; nonce must be 1, sender
         // balance must already be debited 100.
         let tx2 = signed_transfer(&signer, to, 50, 1);
-        let (r2, ws2) =
-            execute_tx(&snap, &delta, env, TxIndex(1), pos(1), &tx2).expect("execute 2");
+        let (r2, ws2) = execute_tx(
+            &snap,
+            &delta,
+            env,
+            TxIndex(1),
+            pos(1),
+            &tx2,
+            1,
+            gas_after_tx1,
+        )
+        .expect("execute 2");
         assert!(r2.status);
         assert_eq!(r2.tx_hash, tx2.tx_hash);
         assert_eq!(ws2.accounts[&to].1, U256::from(150u64));
         assert_eq!(ws2.accounts[&from].0, 2); // nonce
+        // RPC enrichment: tx2 sees a higher nonce + transaction_index;
+        // cumulative_gas_used accumulates across both txs in the block.
+        assert_eq!(r2.nonce, 1);
+        assert_eq!(r2.transaction_index, 1);
+        assert_eq!(r2.cumulative_gas_used, gas_after_tx1 + r2.gas_used);
     }
 }

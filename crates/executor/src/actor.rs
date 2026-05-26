@@ -233,6 +233,9 @@ where
             // re-derive block numbers without sealer help.
             let mut current_block = initial_block + 1;
             let mut current_l2_ts: u64 = 0;
+            // Per-block RPC enrichment counters; reset at each BoundaryStart.
+            let mut tx_index_in_block: u64 = 0;
+            let mut cumulative_gas_used: u64 = 0;
             // Last tx_ordering position the exec thread folded into a
             // receipt. Used to validate alignment with
             // `BlockBoundaryStart.end_tx_idx`.
@@ -263,8 +266,18 @@ where
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
-                        let (receipt, ws) =
-                            execute_tx(&snapshot, &delta, env, tx_idx, position, &envelope)?;
+                        let (receipt, ws) = execute_tx(
+                            &snapshot,
+                            &delta,
+                            env,
+                            tx_idx,
+                            position,
+                            &envelope,
+                            tx_index_in_block,
+                            cumulative_gas_used,
+                        )?;
+                        cumulative_gas_used = receipt.cumulative_gas_used;
+                        tx_index_in_block += 1;
                         delta.apply(ws);
                         last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
@@ -324,6 +337,9 @@ where
                         // old. The trait returns an owned value.
                         snapshot = snapshots.snapshot_after(block_number);
                         current_block = block_number + 1;
+                        // New block opens with empty per-block counters.
+                        tx_index_in_block = 0;
+                        cumulative_gas_used = 0;
                         // The next block's wall-clock timestamp arrives in
                         // its own BlockBoundaryStart; until then we keep
                         // the previous value as a deterministic
@@ -578,6 +594,7 @@ mod commit_tests {
             gas_used: 21_000,
             logs: Vec::new(),
             write_set_hash: B256::ZERO,
+            ..Default::default()
         }))
         .unwrap();
         tx.send(ExecToCommit::Boundary(BlockBoundary {

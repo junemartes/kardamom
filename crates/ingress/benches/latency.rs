@@ -12,7 +12,7 @@ use k256::ecdsa::{RecoveryId, signature::hazmat::PrehashSigner};
 
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
-use kardamom_types::{BPosition, CachedReceipt, QuorumWatermark, Receipt};
+use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 
 fn sign(s: &PrivateKeySigner, nonce: u64) -> Bytes {
     let tx = TxLegacy {
@@ -58,7 +58,7 @@ fn bench_e2e_latency(c: &mut Criterion) {
         let state_db = Arc::new(InMemoryStateDb::new());
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
         for (i, mut rx) in rx_vec.drain(..).enumerate() {
-            let receipt_cache_bus = mock.receipt_cache_bus.clone();
+            let receipt_bus = mock.receipt_bus.clone();
             let watermark_bus = mock.watermark_bus.clone();
             tokio::spawn(async move {
                 let mut local: i32 = 0;
@@ -76,13 +76,11 @@ fn bench_e2e_latency(c: &mut Criterion) {
                         gas_used: 21_000,
                         logs: Vec::new(),
                         write_set_hash: B256::ZERO,
-                    };
-                    let _ = receipt_cache_bus.send(CachedReceipt {
-                        sender: envelope.sender,
+                        from: envelope.sender,
                         nonce,
-                        tx_hash: envelope.tx_hash,
-                        receipt,
-                    });
+                        ..Default::default()
+                    };
+                    let _ = receipt_bus.send(receipt);
                     let _ = watermark_bus.send(QuorumWatermark { position: pos });
                 }
             });

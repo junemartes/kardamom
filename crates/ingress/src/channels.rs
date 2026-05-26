@@ -5,7 +5,7 @@
 //! integration tests we provide [`MockChannels`], a fully in-process
 //! implementation that uses `tokio::sync::mpsc` (for partition publish, which
 //! has a single consumer per partition) and `tokio::sync::broadcast` (for the
-//! receipt-cache / quorum-watermark / block-boundary fan-out streams).
+//! tx_receipts / quorum-watermark / block-boundary fan-out streams).
 //!
 //! Wire types come exclusively from [`types`]; this
 //! module defines **no new wire types**.
@@ -15,18 +15,17 @@ use std::sync::Arc;
 
 use alloy_primitives::B256;
 use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc};
 
 use kardamom_types::{
-    BPosition, BlockBoundary, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
+    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
 };
 
 use crate::error::IngressError;
 
 /// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
 /// sender-sharded tx_data streams (`partition_for(envelope.sender, K)`
-/// gives the shard index), and republishes `CachedReceipt` entries to the
-/// receipt-cache channel.
+/// gives the shard index).
 #[async_trait]
 pub trait IngressPublication: Send + Sync + 'static {
     /// Publish `envelope` onto `channel_A[shard]`. Multiple proxies can
@@ -34,19 +33,16 @@ pub trait IngressPublication: Send + Sync + 'static {
     /// publication semantics serialize them into one canonical byte order.
     async fn publish_tx_data(&self, shard: usize, envelope: TxEnvelope)
     -> Result<(), IngressError>;
-
-    /// Publish a `CachedReceipt` onto the receipt-cache channel.
-    async fn publish_receipt_cache(&self, cached: CachedReceipt) -> Result<(), IngressError>;
 }
 
-/// Subscriber surface. The proxy subscribes to the receipt-cache channel (for
-/// release), the quorum-watermark stream (for I2 ack gating), the tx_receipts
-/// `Receipt` stream (for metrics + cache replay), and the tx_receipts
-///`BlockBoundary` stream (, for `eth_blockNumber`).
+/// Subscriber surface. The proxy subscribes to the tx_receipts `Receipt`
+/// stream (drives the in-memory tx_hash / (sender, nonce) indexes and client
+/// release), the quorum-watermark stream (for ack gating), and the
+/// tx_receipts `BlockBoundary` stream (for `eth_blockNumber`).
 pub trait IngressSubscription: Send + Sync + 'static {
-    /// Stream of `Receipt`s observed on tx_receipts. Surface used for metrics
-    /// and bookkeeping; the receipt-cache stream is the source of truth for
-    /// client release.
+    /// Stream of enriched `Receipt`s observed on tx_receipts. Drives the
+    /// in-memory `tx_hash → Receipt` and `(sender, nonce) → Receipt` indexes
+    /// and releases parked client submissions in `PendingReceipts`.
     fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
     /// Stream of `QuorumWatermark` snapshots.
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
@@ -54,8 +50,6 @@ pub trait IngressSubscription: Send + Sync + 'static {
     /// (the per-recorder watermark stream for the host this proxy runs on).
     /// Used by ack policies that gate on local fsync.
     fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark>;
-    /// Stream of `CachedReceipt` messages (executor → proxy nonce cache).
-    fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt>;
     /// Stream of `BlockBoundary` markers on tx_receipts; backs `eth_blockNumber`.
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary>;
 }
@@ -73,9 +67,7 @@ pub struct MockChannels {
     pub receipt_bus: broadcast::Sender<Receipt>,
     pub watermark_bus: broadcast::Sender<QuorumWatermark>,
     pub local_fsync_bus: broadcast::Sender<FsyncWatermark>,
-    pub receipt_cache_bus: broadcast::Sender<CachedReceipt>,
     pub block_boundary_bus: broadcast::Sender<BlockBoundary>,
-    pub published_cache: Arc<Mutex<Vec<CachedReceipt>>>,
 }
 
 impl MockChannels {
@@ -93,7 +85,6 @@ impl MockChannels {
         let (receipt_bus, _) = broadcast::channel(1024);
         let (watermark_bus, _) = broadcast::channel(1024);
         let (local_fsync_bus, _) = broadcast::channel(1024);
-        let (receipt_cache_bus, _) = broadcast::channel(1024);
         let (block_boundary_bus, _) = broadcast::channel(1024);
         (
             Self {
@@ -101,9 +92,7 @@ impl MockChannels {
                 receipt_bus,
                 watermark_bus,
                 local_fsync_bus,
-                receipt_cache_bus,
                 block_boundary_bus,
-                published_cache: Arc::new(Mutex::new(Vec::new())),
             },
             rx_vec,
         )
@@ -125,13 +114,6 @@ impl IngressPublication for MockChannels {
             .send(envelope)
             .map_err(|e| IngressError::PartitionUnavailable(e.to_string()))
     }
-
-    async fn publish_receipt_cache(&self, cached: CachedReceipt) -> Result<(), IngressError> {
-        self.published_cache.lock().await.push(cached.clone());
-        // Receiver count of 0 is fine — receipt-cache is best-effort.
-        let _ = self.receipt_cache_bus.send(cached);
-        Ok(())
-    }
 }
 
 impl IngressSubscription for MockChannels {
@@ -143,9 +125,6 @@ impl IngressSubscription for MockChannels {
     }
     fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark> {
         self.local_fsync_bus.subscribe()
-    }
-    fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt> {
-        self.receipt_cache_bus.subscribe()
     }
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary> {
         self.block_boundary_bus.subscribe()
@@ -269,6 +248,7 @@ mod tests {
             gas_used: 21_000,
             logs: Vec::new(),
             write_set_hash: B256::ZERO,
+            ..Default::default()
         };
         db.record(tx_hash, pos, receipt.clone());
         assert_eq!(db.get_tx_position(tx_hash).unwrap(), Some(pos));

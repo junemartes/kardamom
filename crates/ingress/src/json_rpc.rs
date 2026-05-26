@@ -11,7 +11,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt};
 use jsonrpsee::core::RpcResult;
 use jsonrpsee::proc_macros::rpc;
@@ -123,32 +123,57 @@ where
 
 /// Adapter from our internal `kardamom_types::Receipt` to alloy's
 /// `TransactionReceipt`. The internal type carries the canonical B-position
-/// and `write_set_hash` that the public Eth API does not need; this drops
-/// them. Block-number / block-hash / from / to / transaction-index are left
-/// at default — populating those requires a state-DB join that v0 of the
-/// proxy doesn't perform. The calling test asserts presence, not field-by-
-/// field equality.
+/// and `write_set_hash` that the public Eth API does not need; everything
+/// else is now populated by the executor at execution time and ingress just
+/// reshapes the fields.
+///
+/// `block_hash` stays `None` in v0: the slim `BlockBoundary` has no state
+/// commitment, so there is no meaningful hash to return. JSON-RPC permits
+/// `null` here.
 fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
+    let block_number = r.block_number;
+    let logs: Vec<alloy_rpc_types_eth::Log> = r
+        .logs
+        .into_iter()
+        .enumerate()
+        .map(|(log_index, wl)| alloy_rpc_types_eth::Log {
+            inner: Log {
+                address: wl.address,
+                data: LogData::new_unchecked(
+                    wl.topics,
+                    alloy_primitives::Bytes::copy_from_slice(wl.data.as_ref()),
+                ),
+            },
+            block_hash: None,
+            block_number: Some(block_number),
+            block_timestamp: None,
+            transaction_hash: Some(r.tx_hash),
+            transaction_index: Some(r.transaction_index),
+            log_index: Some(log_index as u64),
+            removed: false,
+        })
+        .collect();
+    let logs_bloom = alloy_primitives::logs_bloom(logs.iter().map(|l| &l.inner));
     TransactionReceipt {
         inner: alloy_rpc_types_eth::ReceiptEnvelope::Legacy(alloy_consensus::ReceiptWithBloom {
             receipt: alloy_consensus::Receipt {
                 status: alloy_consensus::Eip658Value::Eip658(r.status),
-                cumulative_gas_used: r.gas_used,
-                logs: Vec::new(),
+                cumulative_gas_used: r.cumulative_gas_used,
+                logs,
             },
-            logs_bloom: alloy_primitives::Bloom::ZERO,
+            logs_bloom,
         }),
         transaction_hash: r.tx_hash,
-        transaction_index: None,
+        transaction_index: Some(r.transaction_index),
         block_hash: None,
-        block_number: None,
+        block_number: Some(r.block_number),
         gas_used: r.gas_used,
-        effective_gas_price: 0,
+        effective_gas_price: r.effective_gas_price,
         blob_gas_used: None,
         blob_gas_price: None,
-        from: Address::ZERO,
-        to: None,
-        contract_address: None,
+        from: r.from,
+        to: r.to,
+        contract_address: r.contract_address,
     }
 }
 

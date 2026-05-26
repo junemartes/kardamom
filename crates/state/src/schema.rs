@@ -337,6 +337,7 @@ mod tests {
             write_set_hash: b256!(
                 "0x0000000000000000000000000000000000000000000000000000000000000099"
             ),
+            ..Default::default()
         };
         let bytes = encode_receipt_value(&r);
         let got = decode_receipt_value(&bytes).unwrap();

@@ -63,11 +63,6 @@ pub struct ChannelsConfig {
     pub tx_receipts_channel: String,
     pub tx_receipts_stream_id: i32,
 
-    /// Receipt-cache channel: `CachedReceipt` messages for proxy/RPC consumers.
-    /// Not recorded.
-    pub receipt_cache_channel: String,
-    pub receipt_cache_stream_id: i32,
-
     /// TxOrdering per-recorder fsync watermark publication, parameterized by
     /// recorder_id. e.g. "aeron:ipc?alias=fsync-wm-b-{rid}".
     pub fsync_watermark_channel_template: String,
@@ -143,8 +138,6 @@ impl Default for LogConfig {
                 tx_ordering_stream_id: 1001,
                 tx_receipts_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
                 tx_receipts_stream_id: 1002,
-                receipt_cache_channel: "aeron:udp?endpoint=224.0.1.1:40003".into(),
-                receipt_cache_stream_id: 1003,
                 fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),
                 fsync_watermark_stream_id: 1010,
                 fsync_watermark_tx_data_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),

@@ -12,9 +12,7 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use kardamom_log::aeron_live::{
-    AeronRuntime, PubHandle, TxDataSubscriberHandle, TxOrderingPublisherHandle,
-};
+use kardamom_log::aeron_live::{AeronRuntime, TxDataSubscriberHandle, TxOrderingPublisherHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::duplicate::DuplicateNotification;
@@ -95,12 +93,6 @@ async fn main() -> anyhow::Result<()> {
         .context("open TxDataSubscriberHandle")?;
     let tx_ordering_pub = TxOrderingPublisherHandle::open(&rt, &channels)
         .context("open TxOrderingPublisherHandle")?;
-    let receipt_cache_pub = rt
-        .open_publication(
-            &channels.receipt_cache_channel,
-            channels.receipt_cache_stream_id,
-        )
-        .context("open receipt-cache publication")?;
 
     let shutdown = Shutdown::new();
     let shutdown_for_task = shutdown.clone();
@@ -115,7 +107,12 @@ async fn main() -> anyhow::Result<()> {
         let mut sequencer = Sequencer::new(cfg_clone, state_db);
         let mut tx_data = LiveTxDataSub::new(tx_data_sub);
         let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub);
-        let mut rc = LiveReceiptCachePub::new(receipt_cache_pub);
+        // DuplicateNotification publishing is a no-op for now: PR #29
+        // removed the receipt-cache Aeron channel, and the
+        // proxy no longer subscribes for these. A follow-up wires a
+        // dedicated duplicate-notifications channel; until then we drop
+        // the notifications on the floor.
+        let mut rc = NoopReceiptCachePub;
         sequencer.run(&mut tx_data, &mut tx_ordering, &mut rc, shutdown_for_task)
     });
 
@@ -184,22 +181,15 @@ impl TxOrderingRefPublisher for LiveTxOrderingRefPub {
     }
 }
 
-struct LiveReceiptCachePub {
-    handle: PubHandle,
-}
+/// No-op `ReceiptCachePublisher`. The sequencer's duplicate-notification
+/// transport is being reworked as a follow-up to PR #29 (which removed the
+/// shared receipt-cache Aeron channel); until that lands we drop duplicate
+/// notifications on the floor — the executor still produces the canonical
+/// receipt and the proxy serves it from the tx_receipts index instead.
+struct NoopReceiptCachePub;
 
-impl LiveReceiptCachePub {
-    fn new(handle: PubHandle) -> Self {
-        Self { handle }
-    }
-}
-
-impl ReceiptCachePublisher for LiveReceiptCachePub {
-    fn publish_duplicate(&mut self, notification: DuplicateNotification) {
-        if let Err(e) = self.handle.publish(&notification) {
-            tracing::warn!(error = %e, "receipt-cache publish_duplicate failed (non-fatal)");
-        }
-    }
+impl ReceiptCachePublisher for NoopReceiptCachePub {
+    fn publish_duplicate(&mut self, _notification: DuplicateNotification) {}
 }
 
 // ---------------------------------------------------------------------------

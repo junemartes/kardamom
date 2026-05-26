@@ -52,6 +52,7 @@ fn big_batch(block: u64) -> WriteBatch {
                 gas_used: 21_000,
                 logs: vec![],
                 write_set_hash: B256::ZERO,
+                ..Default::default()
             }],
         },
     )

@@ -18,14 +18,11 @@ use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::IngressError;
 use kardamom_ingress::proxy::IngressProxy;
 use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, QuorumSubscriberHandle,
-    ReceiptCachePublisherHandle, ReceiptCacheSubscriberHandle, TxDataPublisherHandle,
+    AeronRuntime, FsyncWatermarkSubscriberHandle, QuorumSubscriberHandle, TxDataPublisherHandle,
     TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::LogConfig;
-use kardamom_types::{
-    BlockBoundary, CachedReceipt, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope,
-};
+use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Parser)]
@@ -107,14 +104,12 @@ async fn main() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// IngressPublication adapter over M TxDataPublisherHandle + 1
-// ReceiptCachePublisherHandle.
+// IngressPublication adapter over M TxDataPublisherHandle.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct LiveIngressPublication {
     tx_data: Vec<TxDataPublisherHandle>,
-    receipt_cache: ReceiptCachePublisherHandle,
 }
 
 impl LiveIngressPublication {
@@ -129,12 +124,7 @@ impl LiveIngressPublication {
                 .map_err(|e| IngressError::Internal(format!("open tx_data[{sid}]: {e}")))?;
             tx_data.push(h);
         }
-        let receipt_cache = ReceiptCachePublisherHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open receipt_cache: {e}")))?;
-        Ok(Self {
-            tx_data,
-            receipt_cache,
-        })
+        Ok(Self { tx_data })
     }
 }
 
@@ -158,15 +148,6 @@ impl IngressPublication for LiveIngressPublication {
             .map(|_| ())
             .map_err(|e| IngressError::Internal(format!("publish_tx_data: {e}")))
     }
-
-    async fn publish_receipt_cache(&self, cached: CachedReceipt) -> Result<(), IngressError> {
-        let h = self.receipt_cache.clone();
-        tokio::task::spawn_blocking(move || h.publish(&cached))
-            .await
-            .map_err(|e| IngressError::Internal(format!("publish_receipt_cache join: {e}")))?
-            .map(|_| ())
-            .map_err(|e| IngressError::Internal(format!("publish_receipt_cache: {e}")))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -180,7 +161,6 @@ struct LiveIngressSubscription {
     receipts: broadcast::Sender<Receipt>,
     watermarks: broadcast::Sender<QuorumWatermark>,
     local_fsync: broadcast::Sender<FsyncWatermark>,
-    receipt_cache: broadcast::Sender<CachedReceipt>,
     block_boundaries: broadcast::Sender<BlockBoundary>,
 }
 
@@ -193,7 +173,6 @@ impl LiveIngressSubscription {
         let (receipts_tx, _) = broadcast::channel::<Receipt>(1024);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(1024);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(1024);
-        let (receipt_cache_tx, _) = broadcast::channel::<CachedReceipt>(1024);
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(1024);
 
         // tx_receipts → Receipt fan-out
@@ -226,16 +205,6 @@ impl LiveIngressSubscription {
             }
         });
 
-        // Receipt-cache CachedReceipt fan-out
-        let mut cache_sub = ReceiptCacheSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open receipt cache: {e}")))?;
-        let tx = receipt_cache_tx.clone();
-        tokio::spawn(async move {
-            while let Some((_pos, c)) = cache_sub.recv().await {
-                let _ = tx.send(c);
-            }
-        });
-
         // tx_receipts → BlockBoundary fan-out
         let mut boundary_sub = TxReceiptsBoundarySubscriberHandle::open(rt, channels)
             .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
@@ -250,7 +219,6 @@ impl LiveIngressSubscription {
             receipts: receipts_tx,
             watermarks: watermarks_tx,
             local_fsync: local_fsync_tx,
-            receipt_cache: receipt_cache_tx,
             block_boundaries: block_boundaries_tx,
         })
     }
@@ -265,9 +233,6 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark> {
         self.local_fsync.subscribe()
-    }
-    fn subscribe_receipt_cache(&self) -> broadcast::Receiver<CachedReceipt> {
-        self.receipt_cache.subscribe()
     }
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary> {
         self.block_boundaries.subscribe()

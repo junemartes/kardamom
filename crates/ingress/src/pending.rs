@@ -1,7 +1,7 @@
 //! Pending-receipts map: parks a client `oneshot` until both
-//! (a) a `CachedReceipt` for `(sender, nonce)` arrives on the receipt-cache
-//!     channel (the executor's authoritative `(sender, nonce, receipt)`
-//!     binding), AND
+//! (a) a `Receipt` for the matching `(sender, nonce)` arrives on the
+//!     tx_receipts stream (the executor's enriched receipt carries
+//!     `from`+`nonce`+`tx_hash` directly), AND
 //! (b) the durability gate selected by [`AckPolicy`] has reached
 //!     `receipt.tx_idx`.
 //!
@@ -95,10 +95,11 @@ impl PendingReceipts {
         }
     }
 
-    /// Called by the receipt watcher when a `CachedReceipt` arrives. If the
-    /// configured durability gate has already advanced past the receipt's
-    /// B-position, releases the client immediately; otherwise stores the
-    /// receipt and waits for the next watermark update.
+    /// Called by the tx_receipts watcher when a `Receipt` arrives for a
+    /// parked (sender, nonce). If the configured durability gate has already
+    /// advanced past the receipt's B-position, releases the client
+    /// immediately; otherwise stores the receipt and waits for the next
+    /// watermark update.
     pub async fn on_receipt(&self, sender: Address, nonce: u64, receipt: Receipt) {
         let key = (sender, nonce);
         let entry = {
@@ -218,6 +219,7 @@ mod tests {
             gas_used: 21_000,
             logs: Vec::new(),
             write_set_hash: B256::ZERO,
+            ..Default::default()
         }
     }
 

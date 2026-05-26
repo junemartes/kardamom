@@ -75,6 +75,39 @@ fn receipt_roundtrip() {
             data: Bytes::from_static(b"log-data"),
         }],
         write_set_hash: B256::repeat_byte(0xAB),
+        nonce: 7,
+        from: Address::repeat_byte(0x77),
+        to: Some(Address::repeat_byte(0x88)),
+        contract_address: None,
+        effective_gas_price: 1_000_000_000_000,
+        block_number: 42,
+        transaction_index: 3,
+        cumulative_gas_used: 84_000,
+    };
+    assert_eq!(roundtrip(&v), v);
+}
+
+#[test]
+fn receipt_roundtrip_contract_creation() {
+    // CREATE tx variant: `to` is None, `contract_address` is Some.
+    let v = Receipt {
+        tx_idx: BPosition {
+            term_id: 0,
+            term_offset: 0,
+        },
+        tx_hash: B256::repeat_byte(0x11),
+        status: true,
+        gas_used: 100_000,
+        logs: vec![],
+        write_set_hash: B256::ZERO,
+        nonce: 0,
+        from: Address::repeat_byte(0x22),
+        to: None,
+        contract_address: Some(Address::repeat_byte(0x33)),
+        effective_gas_price: 0,
+        block_number: 1,
+        transaction_index: 0,
+        cumulative_gas_used: 100_000,
     };
     assert_eq!(roundtrip(&v), v);
 }
@@ -121,27 +154,6 @@ fn watermark_roundtrip() {
         },
     };
     assert_eq!(roundtrip(&q), q);
-}
-
-#[test]
-fn cached_receipt_roundtrip() {
-    let cr = CachedReceipt {
-        sender: Address::repeat_byte(0x33),
-        nonce: 42,
-        tx_hash: B256::repeat_byte(0x44),
-        receipt: Receipt {
-            tx_idx: BPosition {
-                term_id: 1,
-                term_offset: 0,
-            },
-            tx_hash: B256::repeat_byte(0x44),
-            status: true,
-            gas_used: 21_000,
-            logs: vec![],
-            write_set_hash: B256::ZERO,
-        },
-    };
-    assert_eq!(roundtrip(&cr), cr);
 }
 
 #[test]

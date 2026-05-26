@@ -75,6 +75,7 @@ fn synthetic_receipt(env: &TxEnvelope, tx_idx: BPosition) -> Receipt {
         gas_used: 21_000,
         logs: Vec::<WireLog>::new(),
         write_set_hash: B256::repeat_byte(0xEE),
+        ..Default::default()
     }
 }
 
