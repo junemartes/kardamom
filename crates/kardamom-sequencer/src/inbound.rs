@@ -6,7 +6,7 @@
 //! fragment. The sequencer's job is to reorder by per-sender nonce and
 //! republish a `TxRef { tx_hash, shard_id, tx_data_position }` onto tx_ordering.
 //!
-//! Per D-Sh3 / D-Sh4 the inbound `TxEnvelope` already has `sender` and
+//! Per / the inbound `TxEnvelope` already has `sender` and
 //! `tx_hash` populated by the proxy — no recovery or hashing happens here.
 
 use crate::error::SequencerError;

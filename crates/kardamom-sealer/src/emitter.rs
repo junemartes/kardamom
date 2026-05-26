@@ -30,7 +30,7 @@ pub trait BoundaryPublisher: Send {
     fn publish(&mut self, msg: &BlockBoundaryStart) -> Result<BPosition, PublishError>;
 
     /// Current tail position of the channel the boundary references as
-    /// `end_tx_idx`. For v0 this is the tx-stream tail (matching spec §2.6:
+    /// `end_tx_idx`. For v0 this is the tx-stream tail (matching:
     /// "every tx ≤ end_tx_idx is in this block"). The testing adapter exposes
     /// the in-memory next_offset; the real implementation will read the
     /// Aeron Publication's `position()` for the tx stream.

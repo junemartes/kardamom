@@ -6,7 +6,7 @@ use alloy_primitives::{Address, keccak256};
 ///
 /// Implementation: take the first 8 bytes of `keccak256(sender)` as a
 /// big-endian `u64`, then `% m`. This matches the algorithm described in
-/// spec §2.1.
+///
 #[inline]
 pub fn partition_for(sender: Address, m: u32) -> u32 {
     debug_assert!(m > 0, "partition count must be positive");

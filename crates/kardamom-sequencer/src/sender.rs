@@ -1,6 +1,6 @@
 //! Sender accessor for ingress tx frames.
 //!
-//! D-Sh3: the proxy (S1) recovers the sender during batched secp256k1
+//!: the proxy (S1) recovers the sender during batched secp256k1
 //! verification and writes it into [`kardamom_types::TxEnvelope::sender`]
 //! (typed `Address`, never `Option`). The sequencer trusts this value
 //! unconditionally — no fallback, no `recover_signer()`, no paranoid-check
@@ -25,7 +25,7 @@ use kardamom_types::TxEnvelope;
 pub fn sender_of(envelope: &TxEnvelope) -> Address {
     debug_assert!(
         envelope.sender != Address::ZERO,
-        "TxEnvelope.sender must be populated by the proxy (D-Sh3); got Address::ZERO"
+        "TxEnvelope.sender must be populated by the proxy; got Address::ZERO"
     );
     envelope.sender
 }

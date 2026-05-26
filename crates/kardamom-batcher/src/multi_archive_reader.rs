@@ -1,6 +1,6 @@
-//! M-archive offline reader (D-Sh12 / spec D11 / §2.8).
+//! M-archive offline reader.
 //!
-//! After D-Sh12 the canonical-ordering archive (tx_ordering) carries only
+//! After the canonical-ordering archive (tx_ordering) carries only
 //! [`TxOrderingMessage`] records — `TxRef` (pointer into tx_data[i]) and
 //! `BlockBoundaryStart` (sealer). Full [`TxEnvelope`] bytes live on the
 //! per-sequencer tx_data archives.
@@ -17,7 +17,7 @@
 //!    [`TxOrderingMessage::BoundaryStart`] yield the boundary marker.
 //!
 //! The output is a stream of [`ResolvedRecord`]s — exactly the shape the
-//! existing [`crate::batch::BatchAccumulator`] consumed before D-Sh12. The
+//! existing [`crate::batch::BatchAccumulator`] consumed before. The
 //! BatchAccumulator therefore needs no behavioural change.
 //!
 //! Out-of-order opens — refs on B for A-positions that haven't been read

@@ -7,7 +7,7 @@
 //! has a single consumer per partition) and `tokio::sync::broadcast` (for the
 //! receipt-cache / quorum-watermark / block-boundary fan-out streams).
 //!
-//! Wire types come exclusively from [`kardamom_types`] per S0 D-Sh1; this
+//! Wire types come exclusively from [`kardamom_types`]; this
 //! module defines **no new wire types**.
 
 use std::collections::HashMap;
@@ -42,7 +42,7 @@ pub trait IngressPublication: Send + Sync + 'static {
 /// Subscriber surface. The proxy subscribes to the receipt-cache channel (for
 /// release), the quorum-watermark stream (for I2 ack gating), the tx_receipts
 /// `Receipt` stream (for metrics + cache replay), and the tx_receipts
-/// `BlockBoundary` stream (per S0 D-Sh5, for `eth_blockNumber`).
+///`BlockBoundary` stream (, for `eth_blockNumber`).
 pub trait IngressSubscription: Send + Sync + 'static {
     /// Stream of `Receipt`s observed on tx_receipts. Surface used for metrics
     /// and bookkeeping; the receipt-cache stream is the source of truth for
@@ -157,7 +157,7 @@ impl IngressSubscription for MockChannels {
 //
 // Real production proxy gets the libmdbx-backed impl shipped by S6 once that
 // crate lands. The proxy only uses the receipt + tx_hash_index read paths
-// (per S0 D-Sh4), but the trait demands the full `basic`/`storage`/`code_by_hash`
+//, but the trait demands the full `basic`/`storage`/`code_by_hash`
 // surface — we stub those out with a sane default.
 // ============================================================================
 

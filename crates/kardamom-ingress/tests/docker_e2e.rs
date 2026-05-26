@@ -1,7 +1,7 @@
 //! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker
 //! via the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
 //!
-//! Per S0 D-Sh8 — mock-based unit and integration tests in this crate
+//!— mock-based unit and integration tests in this crate
 //! stay; this is *additional* coverage that brings up the real Aeron
 //! containers so we catch wire-format / IPC / back-pressure bugs the
 //! mocks cannot surface.

@@ -1,4 +1,4 @@
-//! Block boundary markers. State root is **not** carried (D-Sh11).
+//! Block boundary markers. State root is **not** carried.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -15,7 +15,7 @@ pub struct BlockBoundaryStart {
 
 /// Block-boundary closeout emitted by executors onto tx_receipts once they have
 /// finished executing through `end_tx_idx`. No `state_root_commitment` field
-/// (D-Sh11 — state-root attestation is a deferred validator concern).
+///.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct BlockBoundary {

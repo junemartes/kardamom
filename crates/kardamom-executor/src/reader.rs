@@ -1,9 +1,9 @@
 //! TxData / tx_ordering reader threads + join buffer (S4-arch-update,
-//! D-Sh12, spec §2.4).
+//!,).
 //!
-//! Before S4-arch-update the executor had **one** tx_ordering reader thread that
+//! Before the executor had **one** tx_ordering reader thread that
 //! pulled full [`TxEnvelope`]s off tx_ordering and handed them downstream. After
-//! the split-architecture refactor (D-Sh12 / spec D11) tx_ordering carries only
+//! the split-architecture refactor tx_ordering carries only
 //! ~16-32 B [`TxOrderingMessage`] records (`TxRef | BoundaryStart`); the full
 //! envelope bytes live on M per-sequencer **tx_data** archives.
 //!
@@ -139,7 +139,7 @@ pub struct ReaderConfig {
     /// Upper bound on how long the tx_ordering reader will wait for a
     /// `TxRef`'s envelope to land on its tx_data. 100 ms matches the
     /// "few µs of A-publisher lag is fine, anything more is upstream
-    /// failure" comment in the S4-arch-update plan.
+    /// failure" comment in the plan.
     pub join_timeout: Duration,
     /// Polling interval used during the join wait. Trade-off: smaller =
     /// faster recovery from lag, more CPU; larger = vice versa. 50 µs is

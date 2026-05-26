@@ -13,7 +13,7 @@
 //! The replay-protocol path (no filesystem access) is deferred; the
 //! filesystem path covers the spec and matches the layout the recorder writes.
 //!
-//! After D-Sh12 the batcher resolves a B-archive recording (tx_ordering,
+//! After the batcher resolves a B-archive recording (tx_ordering,
 //! `T = TxOrderingMessage`) plus M per-sequencer A-archive recordings
 //! (tx_data[i], `T = TxEnvelope`). This module produces one
 //! `LiveSegmentDescriptor` per recording id — callers compose them into the

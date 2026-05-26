@@ -38,7 +38,7 @@ fn each_commit_publishes_a_post_commit_snapshot() {
 
 #[test]
 fn tx_hash_lookup_round_trips_through_writer() {
-    // D-Sh4: writer populates tx_hash_index on every commit; snapshots can
+    //: writer populates tx_hash_index on every commit; snapshots can
     // resolve tx_hash → BPosition → Receipt.
     let (_dir, writer) = common::open_tmp_writer();
     let addr = address!("0x00000000000000000000000000000000000000bb");

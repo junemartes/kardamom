@@ -25,7 +25,7 @@ fn log_codec_access_and_materialize() {
 #[test]
 fn log_codec_tx_ref_roundtrip() {
     // TxData still carries full TxEnvelopes (above). TxOrdering carries
-    // tiny TxRef-based messages (D-Sh12). Verify both wire shapes encode
+    // tiny TxRef-based messages. Verify both wire shapes encode
     // through the shared codec helpers.
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,

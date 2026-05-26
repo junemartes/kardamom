@@ -5,9 +5,9 @@
 //! | `accounts`      | `Address` (20 B)                 | RLP `(u64 nonce, U256 balance, B256 code_hash, B256 storage_root)` |
 //! | `storage`       | `Address ++ B256 key` (52 B)     | `U256 value` (32 B, big-endian)                  |
 //! | `code`          | `B256 code_hash` (32 B)          | raw bytecode                                     |
-//! | `headers`       | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp)` — **no state root** (D-Sh11) |
+//! | `headers`       | `u64 block_number` (8 B BE)      | encoded `(BPosition end_tx_idx, u64 l2_timestamp)` — **no state root** |
 //! | `receipts`      | `BPosition tx_idx` (8 B)         | encoded `Receipt` (rkyv archive, owned at rest)  |
-//! | `tx_hash_index` | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE term_id ++ i32 BE term_offset) — feeds S1 `eth_getTransactionReceipt(hash)` (D-Sh4) |
+//! | `tx_hash_index` | `B256 tx_hash` (32 B)            | `BPosition` (8 B, i32 BE term_id ++ i32 BE term_offset) — feeds S1 `eth_getTransactionReceipt(hash)` |
 //! | `meta`          | `&[u8]` (well-known keys, below) | varies — see `meta.rs`                           |
 //!
 //! BE encoding on the `headers` key keeps `block_number` ordered under mdbx's
@@ -100,7 +100,7 @@ pub fn encode_code_key(hash: B256) -> [u8; 32] {
 
 // ---------- headers ----------
 //
-// Per D-Sh11, headers do NOT carry a state-root commitment. The encoded value
+// Per, headers do NOT carry a state-root commitment. The encoded value
 // is `(end_tx_idx: BPosition, l2_timestamp: u64)`. We use a hand-rolled fixed-
 // width encoding (8 + 8 + 4 reserved = 20 bytes) instead of RLP — the row is
 // fixed-size and BPosition is not an RLP-native type.
@@ -181,7 +181,7 @@ pub fn decode_receipt_value(bytes: &[u8]) -> Result<Receipt, StateError> {
     })
 }
 
-// ---------- tx_hash_index (D-Sh4) ----------
+// ---------- tx_hash_index ----------
 //
 // Key: `B256 tx_hash` (32 B). Value: `BPosition` (8 B, same layout as
 // the receipts-table key — see [`crate::meta::encode_b_position`]). Populated
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn header_value_roundtrip_no_state_root() {
-        // D-Sh11: headers carry NO state_root_commitment.
+        //: headers carry NO state_root_commitment.
         let v = HeaderValue {
             end_tx_idx: BPosition {
                 term_id: 3,
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn tx_hash_index_roundtrip() {
-        // D-Sh4: tx_hash → BPosition lookup table.
+        //: tx_hash → BPosition lookup table.
         let hash = b256!("0x000000000000000000000000000000000000000000000000000000000000dead");
         let pos = BPosition {
             term_id: 7,

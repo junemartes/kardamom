@@ -1,7 +1,7 @@
 //! Per-sender future-nonce buffer.
 //!
 //! Bounded `BTreeMap<u64, T>` keyed by nonce. On overflow the smallest nonce
-//! is evicted (LRU-by-nonce — spec §2.2 says "evict the oldest to make room").
+//! is evicted (LRU-by-nonce — says "evict the oldest to make room").
 //! `drain_consecutive_from(start)` walks ascending keys and yields the
 //! contiguous run starting at `start`; the first gap stops the drain.
 

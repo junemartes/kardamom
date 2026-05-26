@@ -6,7 +6,7 @@
 //! `SystemTime::now()`; the mock implementation lets tests advance time
 //! deterministically.
 //!
-//! Wall-clock source policy (S0 D-Sh9-3): v0 uses the host's
+//! Wall-clock source policy (S0-3): v0 uses the host's
 //! `SystemTime`. Operators are responsible for chrony/ntpd. PTP is a
 //! follow-up if cross-host skew becomes the dominant non-determinism
 //! source for `l2_timestamp`.

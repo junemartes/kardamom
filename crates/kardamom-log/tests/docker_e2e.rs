@@ -80,7 +80,7 @@ async fn aeron_publish_record_subscribe_e2e() {
     };
     let mut sub = subs.b().unwrap();
 
-    // TxOrdering now carries TxRefs, not TxEnvelopes (D-Sh12). Publish 100
+    // TxOrdering now carries TxRefs, not TxEnvelopes. Publish 100
     // refs (alternating which sequencer they belong to) and assert the
     // subscriber sees them all in the canonical order Aeron produced.
     let mut last_pos = BPosition::ZERO;

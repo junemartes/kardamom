@@ -47,7 +47,7 @@ pub struct AeronConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ChannelsConfig {
     /// TxData[i]: per-sequencer **exclusive** publisher of full
-    /// `TxEnvelope` bytes (D-Sh12). One stream per sequencer. URI template
+    /// `TxEnvelope` bytes. One stream per sequencer. URI template
     /// substitutes `{sid}` with the sequencer id (e.g.
     /// `"aeron:ipc?alias=a-{sid}"`); stream id is
     /// `tx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_dattx_data_stream_id_base + sequencer_id`.
@@ -73,7 +73,7 @@ pub struct ChannelsConfig {
     pub fsync_watermark_channel_template: String,
     pub fsync_watermark_stream_id: i32,
 
-    /// TxData per-sequencer fsync watermark publication. D-Sh12: each
+    /// TxData per-sequencer fsync watermark publication.: each
     /// tx_data has its own fsync sidecar publishing
     /// `fsynced_tx_data_position[i]` to its own watermark stream. URI template
     /// substitutes `{sid}` with the sequencer id. Stream id is

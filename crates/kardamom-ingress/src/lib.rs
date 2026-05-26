@@ -8,7 +8,7 @@
 //! channel, and answers retries from an in-memory receipt cache.
 //!
 //! The proxy is **the only place** that computes either `TxEnvelope.sender`
-//! or `TxEnvelope.tx_hash` (per S0 D-Sh3 + D-Sh4). Both are produced together
+//! or `TxEnvelope.tx_hash`. Both are produced together
 //! at the sig-verify boundary (ECDSA recovery + a single `keccak256(raw_tx)`
 //! pass) and published into the envelope before any downstream consumer
 //! observes the tx. Downstream code may trust both fields unconditionally.

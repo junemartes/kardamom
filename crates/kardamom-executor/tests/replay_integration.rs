@@ -1,7 +1,7 @@
 //! Integration test: feed a synthetic stream of (txs + boundaries) into an
 //! `Executor` and assert the tx_receipts output matches expectation.
 //!
-//! Post-S4-arch-update wiring (D-Sh12 / spec §2.4): single-sequencer
+//! Post-S4-arch-update wiring: single-sequencer
 //! (M=1) topology. Envelopes are pushed onto a fake tx_data; tiny
 //! `TxRef` records + a `BlockBoundaryStart` are pushed onto fake channel
 //! B in the same canonical order. The executor's M+1 readers join the
@@ -193,7 +193,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
                 receipts += 1;
             }
             CMessage::BlockBoundary(b) => {
-                // S0 D-Sh11: BlockBoundary has no state_root_commitment field.
+                // S0: BlockBoundary has no state_root_commitment field.
                 // We assert only the slim three-field shape via destructure.
                 let BlockBoundary {
                     block_number,
@@ -207,7 +207,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     }
     assert_eq!(receipts, 10);
     assert_eq!(boundaries, 3);
-    // CRITICAL (S0 D-Sh4): every receipt's tx_hash must equal the inbound
+    // CRITICAL (S0): every receipt's tx_hash must equal the inbound
     // envelope's tx_hash, byte-for-byte, in the same order. The executor
     // never recomputes — it propagates.
     assert_eq!(got_hashes, expected_hashes);

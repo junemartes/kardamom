@@ -1,4 +1,4 @@
-//! End-to-end test of the **split-architecture** log tier (D-Sh12) against a
+//! End-to-end test of the **split-architecture** log tier against a
 //! real Aeron Media Driver running in Docker.
 //!
 //! Topology validated:

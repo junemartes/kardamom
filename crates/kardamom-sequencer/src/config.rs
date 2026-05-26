@@ -12,7 +12,7 @@ pub struct SequencerConfig {
     /// Stable identifier for this sequencer process. Embedded in every
     /// [`kardamom_types::TxRef`] this sequencer writes onto tx_ordering so
     /// downstream consumers can route the ref back to the correct
-    /// per-sequencer tx_data archive (D-Sh12 / spec §2.3).
+    /// per-sequencer tx_data archive.
     ///
     /// **Invariant:** `sequencer_id` matches `partition_index` for the
     /// default M=8 deployment (one sequencer per partition). The field is

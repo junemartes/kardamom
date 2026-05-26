@@ -1,4 +1,4 @@
-//! S4-arch-update (D-Sh12 / spec §2.4) integration tests for the M+1
+//! integration tests for the M+1
 //! tx_data/tx_ordering reader topology + join-by-ref semantics.
 //!
 //! Uses the `kardamom-log::testing::Fake*` in-memory pub/sub fakes so we
@@ -211,7 +211,7 @@ fn m4_canonical_b_order_drives_receipts() {
     // Phase 2: interleave the per-A plan into an arbitrary canonical
     // order and publish refs onto tx_ordering. Per-sequencer FIFO must be
     // preserved (tx_data is exclusive per publisher, refs land on B
-    // in A-publish order — see spec §2.3), so the interleaving is a
+    // in A-publish order — see), so the interleaving is a
     // **merge** of M ordered queues, not a global shuffle. Inter-stream
     // interleaving is chosen at random.
     let mut per_sid: Vec<std::collections::VecDeque<(u8, BPosition, alloy_primitives::B256)>> =

@@ -126,7 +126,7 @@ impl StateDatabase for StateSnapshot {
         }
     }
 
-    /// D-Sh4: load a Receipt by its canonical BPosition. Returns None if no
+    ///: load a Receipt by its canonical BPosition. Returns None if no
     /// receipt was committed at that position.
     fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
         let key = encode_b_position(pos);
@@ -140,7 +140,7 @@ impl StateDatabase for StateSnapshot {
         }
     }
 
-    /// D-Sh4: tx_hash → BPosition lookup. Feeds S1 `eth_getTransactionReceipt`.
+    ///: tx_hash → BPosition lookup. Feeds S1 `eth_getTransactionReceipt`.
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
         let key = encode_tx_hash_key(tx_hash);
         match self

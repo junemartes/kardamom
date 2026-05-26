@@ -1,11 +1,11 @@
 //! Offline Aeron Archive segment reader.
 //!
-//! S0 D-Sh10: the batcher reads from on-disk Aeron Archive segment files. It
+//! S0: the batcher reads from on-disk Aeron Archive segment files. It
 //! does not subscribe to tx_receipts, does not talk to the live sequencer.
 //!
-//! ## D-Sh12 architecture: split data and ordering
+//! ## architecture: split data and ordering
 //!
-//! After D-Sh12 the on-disk archives carry **two different payload types**:
+//! After the on-disk archives carry **two different payload types**:
 //!
 //! - **TxOrdering** segments carry [`TxOrderingMessage`] records (`TxRef +
 //!   BoundaryStart`) — the canonical orderer.
@@ -174,7 +174,7 @@ where
     let payload = rkyv::to_bytes::<rancor::Error>(value).expect("rkyv encode");
     let total: u32 = (FRAME_HEADER_LEN + payload.len()) as u32;
     out.extend_from_slice(&total.to_le_bytes());
-    out.extend_from_slice(&[0u8; 4]); // reserved (was: stream_kind + 3 reserved bytes; collapsed in D-Sh12)
+    out.extend_from_slice(&[0u8; 4]); // reserved (was: stream_kind + 3 reserved bytes; collapsed in)
     out.extend_from_slice(&position.term_id.to_le_bytes());
     out.extend_from_slice(&position.term_offset.to_le_bytes());
     out.extend_from_slice(payload.as_slice());

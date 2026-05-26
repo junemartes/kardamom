@@ -67,11 +67,11 @@ where
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
-    /// Per S0 D-Sh5: highest `BlockBoundary.block_number` observed on
+    ///highest `BlockBoundary.block_number` observed on
     /// tx_receipts. Read by `eth_blockNumber`. `AtomicU64` is plenty —
     /// monotonic, single-writer (the BlockBoundary watcher), many readers.
     pub(crate) latest_block_number: Arc<AtomicU64>,
-    /// Per S0 D-Sh4: state-DB handle for `eth_getTransactionReceipt(hash)`
+    ///state-DB handle for `eth_getTransactionReceipt(hash)`
     /// via `get_tx_position(tx_hash)` → `get_receipt(position)`. S6 owns the
     /// `tx_hash_index` libmdbx table. v0 + tests use the in-memory impl in
     /// [`crate::channels::InMemoryStateDb`].
@@ -142,14 +142,14 @@ where
     }
 
     /// Highest `BlockBoundary.block_number` observed on tx_receipts. Backs
-    /// `eth_blockNumber` per S0 D-Sh5.
+    /// `eth_blockNumber`.
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
         self.latest_block_number.load(Ordering::Acquire)
     }
 
     /// Lookup a receipt by `tx_hash` via the state-DB `tx_hash_index` table
-    /// per S0 D-Sh4. Returns `None` if the tx has not yet been committed.
+    ///. Returns `None` if the tx has not yet been committed.
     pub fn lookup_receipt_by_hash(&self, tx_hash: B256) -> Option<Receipt> {
         let pos = self.state_db.get_tx_position(tx_hash).ok().flatten()?;
         self.state_db.get_receipt(pos).ok().flatten()
@@ -218,7 +218,7 @@ where
             .map_err(|e| IngressError::Decode(e.to_string()))?;
         let nonce = env.nonce();
 
-        // Per S0 D-Sh3 + D-Sh4: the proxy is the *only* place `sender` and
+        //: the proxy is the *only* place `sender` and
         // `tx_hash` are computed. Both fields are stamped into the envelope
         // before any downstream consumer observes the tx, and the sig-verify
         // failure path returns *before* we publish to Aeron.
@@ -237,7 +237,7 @@ where
         // sender lands on the same shard's A stream, which lets the P
         // sequencers per shard nonce-order them consistently. The envelope
         // carries the canonical `tx_hash` so downstream consumers can dedup
-        // and re-emit it without recomputing (S0 D-Sh4).
+        // and re-emit it without recomputing (S0).
         let shard = partition_for(sender, self.cfg.partition_count_m) as usize;
         let correlation_id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
         self.publication

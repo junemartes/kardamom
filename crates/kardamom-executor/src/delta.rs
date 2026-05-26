@@ -3,9 +3,9 @@
 //! `WriteSet` is the per-tx unit. `kardamom_types::BlockDelta` is the
 //! per-block accumulator the state writer eventually consumes. The crucial
 //! invariant is that `WriteSet::hash()` is identical across all executor
-//! replicas for any given tx — see spec §4.4 (divergence panic).
+//! replicas for any given tx — see (divergence panic).
 //!
-//! **No state-root computation here** (S0 D-Sh11). The executor never emits
+//! **No state-root computation here** (S0). The executor never emits
 //! a state-root commitment. Per-tx `write_set_hash` is the sole determinism
 //! witness; block-level attestation is a future validator concern.
 //!
@@ -165,7 +165,7 @@ pub fn apply_write_set(delta: &mut PendingDelta, ws: WriteSet) {
     delta.apply(ws);
 }
 
-// NOTE: No `block_delta_root` / state-root function here. Per S0 D-Sh11 the
+//NOTE: No `block_delta_root` / state-root function here. the
 // executor does not compute or publish any state-root commitment. The sealed
 // BlockBoundary on tx_receipts is slim; the state writer flushes the delta to
 // libmdbx, and that's the end of the executor's role in block closure.

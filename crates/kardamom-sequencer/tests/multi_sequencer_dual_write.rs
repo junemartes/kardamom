@@ -1,6 +1,6 @@
 //! M=4 sequencers each subscribed to their own tx_data and racing to
 //! publish refs onto a shared canonical tx_ordering (MDS topology —
-//! D-Sh12 v2 / spec §2.3).
+//! /).
 //!
 //! Asserts the system-level invariants of the split:
 //!  * Each ref on tx_ordering has `shard_id` matching the producing

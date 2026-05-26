@@ -1,6 +1,5 @@
-//! D-Sh8 e2e: real Aeron Media Driver + Archive in Docker via the
-//! `kardamom_log::testing::AeronTestCluster` harness from S3 (D-Sh12
-//! split-architecture: M tx_data streams + 1 canonical tx_ordering).
+//! e2e: real Aeron Media Driver + Archive in Docker via the
+//! `kardamom_log::testing::AeronTestCluster` harness from S3.
 //!
 //! Per the same convention used by `kardamom-ingress::tests::docker_e2e.rs`,
 //! this is a topology smoke test that proves a single Aeron node can serve

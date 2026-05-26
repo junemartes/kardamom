@@ -1,7 +1,7 @@
 //! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker via
 //! the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
 //!
-//! Per S0 D-Sh8 — mock-based unit and integration tests in this crate stay;
+//!— mock-based unit and integration tests in this crate stay;
 //! this is *additional* coverage that brings up the real Aeron container so we
 //! catch wire-format / IPC / back-pressure bugs the in-process reader cannot
 //! surface.
@@ -9,7 +9,7 @@
 //! Gated behind `feature = "docker-e2e"` because it requires a Docker daemon
 //! and ~30s startup; default `cargo test` skips it.
 //!
-//! **D-Sh12 v0 scope:** brings up the Aeron container, writes synthetic
+//! ** scope:** brings up the Aeron container, writes synthetic
 //! segment files in the canonical KAR1-internal frame format that the
 //! batcher's offline `TypedSegmentReader` consumes:
 //!   - one **tx_ordering** archive carrying `TxOrderingMessage` records

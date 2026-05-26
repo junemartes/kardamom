@@ -1,4 +1,4 @@
-//! Offline segment-file reader tests (D-Sh12 typed-segment form).
+//! Offline segment-file reader tests.
 
 use std::io::Write;
 

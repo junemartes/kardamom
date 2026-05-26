@@ -1,9 +1,9 @@
 # kardamom-types
 
 Pure data types and traits shared across the kardamom subsystems. Per
-**D-Sh1** in `docs/plans/2026-05-23-S0-shared-decisions.md`, every wire type
+ in ``, every wire type
 that crosses an Aeron channel or a libmdbx boundary lives here, derives
-`rkyv::{Archive, Serialize, Deserialize}` (D-Sh2), and is consumed by S1, S2,
+`rkyv::{Archive, Serialize, Deserialize}`, and is consumed by S1, S2,
 S3, S4, S5, S6, S7.
 
 This crate has **no I/O dependencies** — no Aeron, no libmdbx, no
@@ -13,10 +13,10 @@ you have the wrong crate.
 ## Owned types
 
 - `BPosition` — canonical L2 tx identifier (Aeron position)
-- `TxEnvelope` — raw tx + correlation id + sender + tx_hash (sender and tx_hash always populated; D-Sh3, D-Sh4)
+- `TxEnvelope` — raw tx + correlation id + sender + tx_hash (sender and tx_hash always populated;,)
 - `Receipt`, `WireLog` — per-tx execution receipt + log entry
 - `CachedReceipt` — receipt-cache channel message
-- `BlockBoundaryStart`, `BlockBoundary` — block markers (no state root; D-Sh11)
+- `BlockBoundaryStart`, `BlockBoundary` — block markers (no state root;)
 - `FsyncWatermark`, `QuorumWatermark` — durability accounting
 - `BlockDelta`, `AccountChange`, `StorageChange`, `CodeEntry` — block-write payload (executor → state writer)
 - `StateDatabase`, `SnapshotSource` — state-access traits

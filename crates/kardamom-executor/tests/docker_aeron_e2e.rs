@@ -11,7 +11,7 @@
 //! The tx_ordering/C publishers and subscribers that wrap the real rusteron
 //! handles into `TxOrderingSubscription` / `ChannelCPublication` adapters are
 //! still TBD in `kardamom-log`. Once those land, the e2e test follows the
-//! Task 19 outline in `docs/plans/2026-05-23-S4-v0-sequential-executor.md`:
+//! Task 19 outline in ``:
 //!
 //! 1. `AeronTestCluster::single_node().await?`
 //! 2. Open a publisher on tx_ordering, a subscriber on tx_receipts.

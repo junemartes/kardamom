@@ -199,9 +199,9 @@ where
 }
 
 // ============================================================================
-// TxData and TxOrdering typed fakes (D-Sh12 split architecture).
+// TxData and TxOrdering typed fakes.
 //
-// Per spec §2.3:
+// Per:
 //   - TxData[i] is an Aeron *exclusive* publication carrying full
 //     TxEnvelopes. M of them (one per sequencer), each its own stream.
 //   - TxOrdering is the canonical orderer: Aeron *concurrent* multi-publisher
@@ -260,7 +260,7 @@ impl FakeChannelAPublication {
 /// TxData[i]: per-sequencer subscription returning `(BPosition, TxEnvelope)`.
 ///
 /// Executors run M+1 of these (one per tx_data) plus one tx_ordering
-/// subscription. Per spec §2.4 they buffer A messages keyed by `BPosition`
+/// subscription. Per they buffer A messages keyed by `BPosition`
 /// until the corresponding `TxRef` arrives on tx_ordering.
 pub struct FakeTxDataSubscription {
     sub: FakeSubscription,

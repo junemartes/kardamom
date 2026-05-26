@@ -8,7 +8,7 @@ default = []
 # Bench-only feature that exposes a few internal helpers. The workspace builds
 # fine without it.
 bench-internals = []
-# Gates the real-Aeron Docker e2e test (per S0 D-Sh8). Off by default so
+# Gates the real-Aeron Docker e2e test (). Off by default so
 # `cargo test` works in environments without a Docker daemon. CI runs the
 # Docker harness via `--features docker-e2e -- --ignored`.
 docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
@@ -23,7 +23,7 @@ crossbeam-channel = "0.5"
 kardamom-log.workspace = true
 kardamom-types.workspace = true
 # libmdbx binding. We use the signet-libmdbx fork (MIT/Apache, idiomatic 0.8
-# API) rather than vorot93/libmdbx (MPL-2.0) per S0 D-Sh9: the MIT/Apache fork
+# API) rather than vorot93/libmdbx (MPL-2.0) : the MIT/Apache fork
 # is preferred when the licensing matters. The on-disk format is identical
 # (both wrap upstream libmdbx).
 signet-libmdbx = "0.8"

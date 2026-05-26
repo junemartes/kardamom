@@ -2,10 +2,10 @@
 //!
 //! Method set is the minimal v0 Ethereum subset:
 //! - `eth_chainId`
-//! - `eth_blockNumber` (per S0 D-Sh5: served from the tx_receipts
+//!- `eth_blockNumber` (served from the tx_receipts
 //!   `BlockBoundary` watcher in the proxy)
 //! - `eth_sendRawTransaction`
-//! - `eth_getTransactionReceipt` (per S0 D-Sh4: state-DB `tx_hash_index`
+//!- `eth_getTransactionReceipt` (state-DB `tx_hash_index`
 //!   lookup)
 //! - `eth_getBalance` / `eth_getTransactionCount` — return a clear error
 //!   ("deferred to S6 state writer") rather than "method not found".
@@ -83,7 +83,7 @@ where
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        // Per S0 D-Sh5: the proxy's tx_receipts watcher (spawned in
+        //the proxy's tx_receipts watcher (spawned in
         // `IngressProxy::new`) maintains `latest_block_number: AtomicU64`.
         Ok(U256::from(self.proxy.latest_block_number()))
     }
@@ -115,7 +115,7 @@ where
     }
 
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
-        // Per S0 D-Sh4: state-DB `tx_hash_index` lookup. S6 will own the
+        //state-DB `tx_hash_index` lookup. S6 will own the
         // libmdbx-backed impl; v0 + tests use `InMemoryStateDb`. Returns
         // `null` per JSON-RPC convention if not yet committed.
         Ok(self.proxy.lookup_receipt_by_hash(hash).map(receipt_to_rpc))

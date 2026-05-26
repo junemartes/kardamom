@@ -1,5 +1,5 @@
 //! Tx envelope. `sender` and `tx_hash` are *always* populated by the proxy
-//! (D-Sh3, D-Sh4). Downstream code trusts both fields unconditionally.
+//!. Downstream code trusts both fields unconditionally.
 
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;

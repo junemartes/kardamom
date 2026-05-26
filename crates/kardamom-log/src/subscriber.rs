@@ -115,7 +115,7 @@ fn header_pos(h: &Header) -> Option<BPosition> {
 /// TxData[i]: per-sequencer subscription of full `TxEnvelope` bytes.
 /// Executors run M of these (one per sequencer); the per-A reader buffers
 /// envelopes keyed by `BPosition` until the corresponding `TxRef` arrives
-/// on tx_ordering (spec §2.4).
+/// on tx_ordering.
 pub type TxDataSubscriber = TypedSubscriber<TxEnvelope>;
 
 /// TxOrdering: canonical orderer. Yields [`TxOrderingMessage`] records

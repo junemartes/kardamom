@@ -9,7 +9,7 @@ default = []
 # Pulls the live `rusteron-archive` reader path. Off by default so the crate
 # compiles cleanly on hosts without the Aeron C library installed.
 aeron-live = ["kardamom-log/aeron-live", "dep:rusteron-archive"]
-# Real Aeron container e2e (per S0 D-Sh8). Implies the in-memory testing
+# Real Aeron container e2e (). Implies the in-memory testing
 # helpers from kardamom-log because the harness re-uses some of them.
 docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 

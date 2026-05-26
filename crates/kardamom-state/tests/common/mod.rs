@@ -33,7 +33,7 @@ pub fn bpos(block: u64) -> BPosition {
 /// one receipt with a deterministic tx_hash. Used by Tasks 17-21.
 ///
 /// Per upstream `AccountChange` shape: `{ address, nonce, balance, code_hash }` —
-/// no storage_root field (v0 executor does not maintain MPT roots per D-Sh11).
+/// no storage_root field (v0 executor does not maintain MPT roots per).
 pub fn simple_delta(
     block: u64,
     addr: Address,

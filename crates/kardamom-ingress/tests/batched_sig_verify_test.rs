@@ -1,6 +1,6 @@
 //! Equivalence: for any signed legacy tx, `BatchVerifier::recover` and
 //! `recover_single` agree on `(sender, tx_hash)` — the canonical pair the
-//! proxy produces at the system boundary per S0 D-Sh3/D-Sh4.
+//! proxy produces at the system boundary.
 
 mod common;
 

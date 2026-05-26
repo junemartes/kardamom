@@ -11,7 +11,7 @@
 //!
 //! This crate owns the **transport implementation** only. Wire data types live
 //! in [`kardamom_types`] (re-exported from there). Do not add new wire types
-//! here — extend `kardamom-types` instead, per D-Sh1.
+//! here — extend `kardamom-types` instead, per.
 //!
 //! ## Feature gates
 //!

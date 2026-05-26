@@ -1,8 +1,8 @@
 //! Drives an Aeron Archive instance to record a single stream (tx_ordering
-//! *or* a tx_data[i] per D-Sh12) and exposes the current durable
+//! *or* a tx_data[i] per) and exposes the current durable
 //! recording position.
 //!
-//! Topology after D-Sh12:
+//! Topology after:
 //!   - One `Recorder` with `RecorderKind::TxOrdering` per tx_ordering recorder host
 //!     (N total; quorum-fsynced via the `QuorumAggregator`).
 //!   - One `Recorder` with `RecorderKind::TxData { sequencer_id }` per sequencer
@@ -56,7 +56,7 @@ type Archive = rusteron_archive::AeronArchive;
 
 /// Which logical tx_data recorder is tailing. TxOrdering feeds the
 /// quorum aggregator (N recorders, Q-of-N watermark). TxData[i] feeds
-/// the per-sequencer single-host fsync (no quorum by default — see D-Sh12
+/// the per-sequencer single-host fsync (no quorum by default — see
 /// rationale).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
@@ -103,7 +103,7 @@ impl Recorder {
         )
     }
 
-    /// Start recording tx_data[sequencer_id]. Per D-Sh12, each sequencer
+    /// Start recording tx_data[sequencer_id]. Per, each sequencer
     /// host runs one of these recording its own exclusive-publisher stream.
     pub fn start_a(
         archive: Archive,

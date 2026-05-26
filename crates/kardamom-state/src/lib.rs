@@ -1,6 +1,6 @@
 //! libmdbx-backed L2 state DB.
 //!
-//! See `docs/plans/2026-05-23-S6-state-writer.md` and the system spec §5 for
+//! See `` and the system for
 //! the protocol and crate-level invariants.
 
 pub mod compaction;

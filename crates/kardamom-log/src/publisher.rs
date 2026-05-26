@@ -1,4 +1,4 @@
-//! Aeron publishers for the split-architecture log tier (D-Sh12):
+//! Aeron publishers for the split-architecture log tier:
 //!
 //! - **TxData[i]** — per-sequencer **exclusive** publication of full
 //!   `TxEnvelope` bytes. One per sequencer; the sequencer is the only
@@ -243,7 +243,7 @@ impl WatermarkPublisher {
     }
 }
 
-/// Per-tx_data fsync-watermark publisher (D-Sh12). One per sequencer
+/// Per-tx_data fsync-watermark publisher. One per sequencer
 /// host; downstream consumers (ack-path coordinator, executor) subscribe
 /// to whichever A-watermarks they care about. TxData is single-host
 /// durability by default — there is no quorum aggregator for A.

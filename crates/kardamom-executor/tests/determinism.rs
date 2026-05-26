@@ -1,7 +1,7 @@
 //! Determinism conformance: two executor instances driven by the same input
 //! must produce byte-identical tx_receipts output (every `tx_hash` and every
 //! `write_set_hash` matches). No state-root assertion: the executor does not
-//! emit a state-root commitment (S0 D-Sh11).
+//! emit a state-root commitment (S0).
 //!
 //! Post-S4-arch-update wiring: M=1 tx_data + 1 tx_ordering, refs join via
 //! the executor's `JoinBuffer`. Determinism doesn't depend on the demux

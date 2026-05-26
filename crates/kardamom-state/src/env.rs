@@ -3,7 +3,7 @@
 //! Every other module in this crate goes through `StateEnv` for the env
 //! handle. Geometry is set once at open time per `geometry.rs`.
 //!
-//! We use the `signet-libmdbx` 0.8 binding (MIT/Apache, per S0 D-Sh9). The
+//! We use the `signet-libmdbx` 0.8 binding (MIT/Apache). The
 //! environment runs in the synchronized transaction mode (`begin_ro_sync` /
 //! `begin_rw_sync`) so the writer thread + executor's RO snapshot thread can
 //! share handles safely.

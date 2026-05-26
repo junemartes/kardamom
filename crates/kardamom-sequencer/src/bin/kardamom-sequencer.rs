@@ -34,7 +34,7 @@ struct Args {
     #[arg(long)]
     partition_count: Option<u32>,
     /// Override the sequencer id embedded in every tx_ordering `TxRef`
-    /// (D-Sh12). If omitted and the TOML did not set it, falls back to
+    ///. If omitted and the TOML did not set it, falls back to
     /// `partition_index as u8` so the default M=8 deployment "just
     /// works".
     #[arg(long)]

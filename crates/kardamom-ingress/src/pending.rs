@@ -5,7 +5,7 @@
 //! (b) the durability gate selected by [`AckPolicy`] has reached
 //!     `receipt.tx_idx`.
 //!
-//! Both conditions are required by invariant I2 (spec §1).
+//! Both conditions are required by invariant I2.
 //!
 //! The durability gate is configurable: see [`AckPolicy`] for the four modes.
 //! `OnQuorum` (the default) preserves the original behavior — wait for the

@@ -1,6 +1,6 @@
 //! §6 conformance test (post to Anvil → reconstruct from L1).
 //!
-//! End-to-end exercise of the **new D-Sh12 M+1 archive topology**:
+//! End-to-end exercise of the **new M+1 archive topology**:
 //!
 //! 1. Build per-sequencer tx_data archives with full `TxEnvelope` bytes.
 //! 2. Build the tx_ordering archive with the canonical `TxOrderingMessage`
@@ -20,7 +20,7 @@
 //!
 //! Skips gracefully if anvil is not installed (same convention the deployer
 //! and `anvil_e2e.rs` use). The test exists to pin down the §6 conformance
-//! invariant under the post-D-Sh12 input topology: split data and ordering
+//! invariant under the  input topology: split data and ordering
 //! must round-trip through the batcher exactly the same as the pre-split
 //! single-archive layout did.
 
@@ -59,7 +59,7 @@ fn pos(o: i32) -> BPosition {
     }
 }
 
-/// Write the M+1 synthetic archives that emulate a post-D-Sh12 sequencer:
+/// Write the M+1 synthetic archives that emulate a  sequencer:
 /// 2 sequencers, 3 txs each, 1 boundary on B.
 fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::PathBuf>) {
     // Per-sequencer envelopes.

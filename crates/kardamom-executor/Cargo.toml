@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-# Per S0 D-Sh1: shared types live in kardamom-types.
+# : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true
@@ -18,7 +18,7 @@ crossbeam-channel = "0.5"
 dashmap = { workspace = true }
 
 [dev-dependencies]
-# Per S0 D-Sh8: hermetic unit tests use kardamom-log's in-memory fakes.
+# : hermetic unit tests use kardamom-log's in-memory fakes.
 # Real-Aeron e2e tests pull `docker-e2e` to bring in the testcontainers harness.
 kardamom-log = { workspace = true, features = ["testing"] }
 alloy-signer-local.workspace = true

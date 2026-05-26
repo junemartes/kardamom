@@ -1,5 +1,5 @@
 //! TxOrdering wire message: the canonical-orderer payload in the split
-//! architecture (D-Sh12).
+//! architecture.
 //!
 //! TxOrdering carries only two things, both small:
 //!   1. [`TxRef`] — a pointer into the per-sequencer tx_data archive,
@@ -10,7 +10,7 @@
 //!
 //! Both variants are tiny (~16-32 B), so the tx_ordering CAS cursor sees only
 //! reference traffic; the bulk-data path runs on M parallel exclusive channel
-//! A archives. See spec §2.3.
+//! A archives. See
 //!
 //! Encoded as a 1-byte tag prefix followed by the rkyv archive of the variant.
 //! We keep the tag *outside* the rkyv archive so that a reader can branch
@@ -23,7 +23,7 @@ use crate::txref::TxRef;
 
 /// One tx_ordering wire record. Variants are kept narrow to preserve the
 /// "tiny payload" property that makes tx_ordering's concurrent publication
-/// affordable (D-Sh12: ~16-32 B per record).
+/// affordable.
 #[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub enum TxOrderingMessage {

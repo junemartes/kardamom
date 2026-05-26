@@ -12,7 +12,7 @@
 //! - `last_fsynced_b_position` = `boundary.end_tx_idx` (same; the boundary
 //!   `end_tx_idx` IS the last B position the executor committed through).
 //!
-//! `BlockDelta` lives in `kardamom-types` per S0 D-Sh1 — we never redefine it.
+//! `BlockDelta` lives in `kardamom-types` — we never redefine it.
 
 use std::thread::{self, JoinHandle};
 
@@ -183,7 +183,7 @@ impl StateWriter {
         // --- accounts ---
         // Upstream AccountChange = { address, nonce, balance, code_hash } — no
         // storage_root (v0 executor does not maintain per-account MPT roots,
-        // see D-Sh11). We persist storage_root = B256::ZERO at v0; future
+        // see). We persist storage_root = B256::ZERO at v0; future
         // validator subsystems can recompute roots offline.
         for change in &batch.delta.accounts {
             let key = encode_account_key(change.address);
@@ -222,7 +222,7 @@ impl StateWriter {
             }
         }
 
-        // --- headers (D-Sh11: no state_root_commitment) ---
+        // --- headers ---
         let header = HeaderValue {
             end_tx_idx: batch.boundary.end_tx_idx,
             l2_timestamp: batch.boundary.l2_timestamp,
@@ -234,7 +234,7 @@ impl StateWriter {
             WriteFlags::UPSERT,
         )?;
 
-        // --- receipts + tx_hash_index (D-Sh4) ---
+        // --- receipts + tx_hash_index ---
         // For each receipt: write the receipt at its BPosition key, AND
         // populate tx_hash_index[receipt.tx_hash] = receipt.tx_idx so the S1
         // proxy can serve eth_getTransactionReceipt(hash) via two reads:

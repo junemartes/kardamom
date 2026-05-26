@@ -1,14 +1,13 @@
 //! Kardamom L1 batcher.
 //!
-//! Offline, archive-driven (S0 D-Sh10): reads the canonical L2 stream from
+//! Offline, archive-driven (S0): reads the canonical L2 stream from
 //! the on-disk Aeron archives, groups it into per-block batches, packs them
-//! into EIP-4844 blobs (KAR1 + zstd framing, no state-root field per S0
-//! D-Sh11), and posts them to the `KardamomL2Settlement` data-availability
+//! into EIP-4844 blobs (KAR1 + zstd framing, no state-root field /!), and posts them to the `KardamomL2Settlement` data-availability
 //! sink contract on L1.
 //!
-//! ## D-Sh12 split data/ordering topology
+//! ## split data/ordering topology
 //!
-//! After D-Sh12 the batcher reads from `M + 1` archives, not one:
+//! After the batcher reads from `M + 1` archives, not one:
 //!
 //! - **TxOrdering archive** carries the canonical orderer payload — only
 //!   `TxOrderingMessage` records (`TxRef + BoundaryStart`). Tiny per-record.
@@ -20,8 +19,8 @@
 //! position index, and yields [`multi_archive_reader::ResolvedRecord`]s the
 //! existing [`batch::BatchAccumulator`] can consume as-is.
 //!
-//! See `docs/plans/2026-05-23-S7-l1-batcher.md` for the full task plan and
-//! `docs/plans/2026-05-23-S0-shared-decisions.md` D-Sh10 / D-Sh11 / D-Sh12 for
+//! See `` for the full task plan and
+//! `` / / for
 //! the cross-cutting decisions that shape this crate.
 
 pub mod archive_reader;

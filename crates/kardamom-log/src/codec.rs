@@ -5,7 +5,7 @@
 //! the caller explicitly asks (`materialize`), e.g. when they need to outlive
 //! the fragment buffer.
 //!
-//! Per D-Sh2: rkyv v0.8 replaces the earlier bincode choice. Wire types live
+//! Per: rkyv v0.8 replaces the earlier bincode choice. Wire types live
 //! in `kardamom-types`; this crate is transport only.
 
 use rkyv::api::high::{HighDeserializer, HighSerializer, HighValidator};

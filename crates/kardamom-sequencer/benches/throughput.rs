@@ -1,6 +1,6 @@
 //! Per-sequencer throughput on one core.
 //!
-//! Sender supplied by the proxy (no secp256k1 on this hot path per D-Sh3).
+//! Sender supplied by the proxy (no secp256k1 on this hot path per).
 //! Target per the spec is >100k tx/s per core for simple sigs; this bench
 //! measures `run_once` loop throughput on a single thread.
 

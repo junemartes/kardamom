@@ -10,6 +10,6 @@ stops advancing.
 
 All state is reconstructable from B's tail; failover is mechanical.
 
-Spec: `docs/specs/2026-05-23-high-throughput-sequencer-design.md` §2.6, §4.5.
-Plan: `docs/plans/2026-05-23-S5-block-sealer.md` (live decisions tracked
+Spec: `` §2.6, §4.5.
+Plan: `` (live decisions tracked
 inline in the crate's module docs; the plan is the historical reference).

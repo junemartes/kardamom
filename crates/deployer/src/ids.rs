@@ -14,7 +14,7 @@ pub enum ContractId {
     EthLockbox,
     /// L2 data-availability sink for the S7 L1 batcher. Records
     /// `(prevBatchIndex, blobHashes, l2BlockStart, l2BlockEnd)` and emits
-    /// `BatchPosted` — no state-root storage (S0 D-Sh11).
+    /// `BatchPosted` — no state-root storage (S0).
     KardamomL2Settlement,
 }
 

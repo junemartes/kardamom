@@ -14,7 +14,7 @@
 //!     no lease — the "preferred" pointer lives in the proxy's routing
 //!     table, not in any sequencer's state.
 //!
-//! ## D-Sh3 (sender trust)
+//! ## Sender trust
 //!
 //! The proxy (S1) recovers the sender during batched secp256k1 verification and
 //! writes it into `TxEnvelope.sender` (typed `Address`, never `Option`). This

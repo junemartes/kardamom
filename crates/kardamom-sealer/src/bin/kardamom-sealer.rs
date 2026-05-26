@@ -65,8 +65,7 @@ fn main() -> Result<()> {
         eprintln!(
             "kardamom-sealer: aeron-live feature is enabled but the real \
              tx_ordering wrapper is still landing as part of the cross-component \
-             real-Aeron e2e (see docs/plans/2026-05-23-S5-block-sealer.md \
-             Task 15). Config validated; exiting 0."
+             real-Aeron e2e. Config validated; exiting 0."
         );
         Ok(())
     }

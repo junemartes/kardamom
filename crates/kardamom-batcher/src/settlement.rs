@@ -1,6 +1,6 @@
 //! `KardamomL2Settlement` sol! bindings + Rust post helper.
 //!
-//! The contract is the pure DA sink (S0 D-Sh11). Calldata is the abi-encoded
+//! The contract is the pure DA sink (S0). Calldata is the abi-encoded
 //! `(prevBatchIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd)` payload;
 //! blob bytes ride along in the 4844 sidecar.
 

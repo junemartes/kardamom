@@ -1,7 +1,7 @@
 //! `BatchAccumulator` — groups txs into per-block batches at
 //! `BlockBoundaryStart` markers.
 //!
-//! Spec: §2.6 (sealer emits boundaries onto B) plus S0 D-Sh10 (batcher
+//! Spec: §2.6 (sealer emits boundaries onto B) plus S0 (batcher
 //! consumes tx_ordering only; never queries the live sequencer).
 //!
 //! The accumulator is **stream-oriented**: it sees a single ordered sequence of

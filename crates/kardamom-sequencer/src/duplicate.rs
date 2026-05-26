@@ -1,6 +1,6 @@
 //! Receipt-cache duplicate notification (Past-nonce signal).
 //!
-//! The spec §2.2 calls for the sequencer to publish a "duplicate notification"
+//! The calls for the sequencer to publish a "duplicate notification"
 //! onto the receipt-cache channel when an incoming tx has `nonce < expected`.
 //! No existing wire type in `kardamom-types` covers this; we ship a small
 //! local rkyv-archived type here so the proxy / receipt-cache consumers can

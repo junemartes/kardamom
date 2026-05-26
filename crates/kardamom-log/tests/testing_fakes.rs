@@ -62,7 +62,7 @@ fn fake_fsync_watermark_stream_per_recorder() {
 }
 
 // ---------------------------------------------------------------------------
-// TxData / TxOrdering fakes (D-Sh12 split architecture).
+// TxData / TxOrdering fakes.
 // ---------------------------------------------------------------------------
 
 fn env(corr: u64, byte: u8) -> TxEnvelope {
@@ -140,7 +140,7 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
     assert_eq!(got[2], TxOrderingMessage::BoundaryStart(b));
 }
 
-/// Mini end-to-end of the executor's B-to-A join (spec §2.4): A-readers
+/// Mini end-to-end of the executor's B-to-A join: A-readers
 /// buffer envelopes keyed by `(sequencer_id, tx_data_position)`; the B-reader
 /// walks the canonical order, looking up the envelope on each `TxRef`.
 #[test]

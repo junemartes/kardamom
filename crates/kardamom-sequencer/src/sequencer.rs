@@ -4,7 +4,7 @@
 //! most one fragment and republishes a canonical-order `TxRef` onto
 //! tx_ordering.
 //!
-//! Per the MDS topology (D-Sh12 v2 / spec §2.3): the proxy has already
+//! Per the MDS topology: the proxy has already
 //! published the envelope onto tx_data, so the sequencer's input is
 //! `(tx_data_position, envelope)` — the proxy's Aeron-offer position is the
 //! lookup key downstream consumers (executor, batcher) use to resolve the
@@ -254,7 +254,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
         // Decode the alloy `TxEnvelope` out of `raw_tx` to extract `nonce`.
         // The decode is the only per-tx work the sequencer does beyond the
         // state-machine arithmetic; the result is discarded after the nonce
-        // is read. We never call `recover_signer()` on it (D-Sh3).
+        // is read. We never call `recover_signer()` on it.
         let nonce = decode_nonce(&envelope.raw_tx)?;
 
         // Cache-miss hydration: first time we see this sender, fetch the

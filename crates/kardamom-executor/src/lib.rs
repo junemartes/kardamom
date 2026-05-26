@@ -8,7 +8,7 @@
 //! `TxDataSubscription` / `TxOrderingSubscription` / `ChannelCPublication`
 //! interface.
 //!
-//! ## Wire topology (post-D-Sh12)
+//! ## Wire topology ()
 //!
 //! - **TxData[i]** (per-sequencer, M of them) carries full `TxEnvelope`
 //!   bytes. Executors run M subscriptions, one per sequencer partition.
@@ -17,9 +17,9 @@
 //! - **TxReceipts** carries `Receipt` and slim `BlockBoundary` records (the
 //!   executor's output).
 //!
-//! See `docs/specs/2026-05-23-high-throughput-sequencer-design.md` §2.3
+//! See `` §2.3
 //! (transport split) and §2.4 (executor). Shared types come from
-//! `kardamom-types` (S0 D-Sh1).
+//! `kardamom-types` (S0).
 //!
 //! ## Divergence detection
 //!

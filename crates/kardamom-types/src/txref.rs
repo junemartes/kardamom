@@ -1,5 +1,5 @@
 //! `TxRef` — the tiny canonical-orderer record carried on tx_ordering in the
-//! split (tx_data + tx_ordering) architecture (D-Sh12, spec D11 / §2.3).
+//! split (tx_data + tx_ordering) architecture.
 //!
 //! TxOrdering carries `{ tx_hash, shard_id, tx_data_position }` records (~41 B
 //! per record) plus the occasional [`BlockBoundaryStart`] from the sealer.

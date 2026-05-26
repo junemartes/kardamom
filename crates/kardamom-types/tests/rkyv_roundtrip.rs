@@ -91,7 +91,7 @@ fn boundary_roundtrip() {
     };
     assert_eq!(roundtrip(&start), start);
 
-    // BlockBoundary has NO state_root_commitment field (D-Sh1 / D-Sh11).
+    // BlockBoundary has NO state_root_commitment field.
     let end = BlockBoundary {
         block_number: 7,
         end_tx_idx: BPosition {

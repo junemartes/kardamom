@@ -25,7 +25,7 @@ pub struct WireLog {
 #[rkyv(derive(Debug))]
 pub struct Receipt {
     pub tx_idx: BPosition,
-    /// Copied from `TxEnvelope.tx_hash` — never recomputed by the executor (D-Sh4).
+    /// Copied from `TxEnvelope.tx_hash` — never recomputed by the executor.
     #[rkyv(with = wire::B256Bytes)]
     pub tx_hash: B256,
     pub status: bool,

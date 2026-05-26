@@ -1,6 +1,6 @@
 //! KAR1 framing — the on-blob payload format.
 //!
-//! Explicitly **no `state_root` field** (S0 D-Sh11). After framing, the entire
+//! Explicitly **no `state_root` field** (S0). After framing, the entire
 //! payload may be zstd-compressed (flag bit 0 set) and then sliced into 31-byte
 //! field-element chunks for blob packing.
 //!

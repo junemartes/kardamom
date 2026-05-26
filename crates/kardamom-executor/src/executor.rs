@@ -8,7 +8,7 @@
 //!   `EvmState` output) and merged into the running `PendingDelta` by the
 //!   actor.
 //!
-//! Per S0 D-Sh4: this module does **not** compute `tx_hash`. It copies
+//!this module does **not** compute `tx_hash`. It copies
 //! `tx_hash` (and `sender`) directly from the inbound `kardamom_types::
 //! TxEnvelope`, which the proxy (S1) populated at the system boundary.
 
@@ -97,7 +97,7 @@ impl revm::database_interface::DBErrorMarker for StateRefError {}
 
 /// Decode an `alloy_consensus::TxEnvelope` from the `raw_tx` bytes carried
 /// in a `kardamom_types::TxEnvelope`. The signature is already verified by
-/// the proxy (S1, S0 D-Sh3); we just need the typed accessors to build a
+/// the proxy (S1, S0); we just need the typed accessors to build a
 /// revm `TxEnv`.
 pub fn decode_alloy_envelope(
     raw_tx: &Bytes,
@@ -111,7 +111,7 @@ pub fn decode_alloy_envelope(
 }
 
 /// Convert a recovered tx envelope into a `TxEnv`. `signer` is the proxy-
-/// populated sender — never recomputed here (S0 D-Sh3).
+/// populated sender — never recomputed here (S0).
 pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -> TxEnv {
     TxEnv {
         caller: signer,
@@ -138,7 +138,7 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
 /// `inbound_envelope: &TxEnvelope` is `kardamom_types::TxEnvelope`. Its
 /// `sender` and `tx_hash` are trusted unconditionally — the proxy (S1)
 /// populated them at the system boundary. The executor **never recomputes
-/// `tx_hash`** (S0 D-Sh4) and **never recovers a sender** (S0 D-Sh3); it
+/// `tx_hash`** (S0) and **never recovers a sender** (S0); it
 /// copies both fields straight through into the outbound `Receipt`.
 pub fn execute_tx<S: StateDatabase>(
     snapshot: &S,
@@ -212,7 +212,7 @@ pub fn execute_tx<S: StateDatabase>(
     let write_set_hash = ws.hash();
     let wire_logs = logs.iter().map(wire_log).collect();
 
-    // CRITICAL (S0 D-Sh4): copy `tx_hash` straight from the inbound envelope —
+    // CRITICAL (S0): copy `tx_hash` straight from the inbound envelope —
     // DO NOT recompute via keccak256(raw_tx). The proxy (S1) is the canonical
     // hash producer.
     let receipt = Receipt {
@@ -348,7 +348,7 @@ mod tests {
         let (receipt, ws) =
             execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx).expect("execute");
 
-        // Per S0 D-Sh4: the receipt's tx_hash MUST equal the inbound envelope's
+        //the receipt's tx_hash MUST equal the inbound envelope's
         // tx_hash byte-for-byte. No recomputation in the executor.
         assert_eq!(receipt.tx_hash, env_tx.tx_hash);
         assert!(receipt.status); // success = bool true (kardamom_types::Receipt)

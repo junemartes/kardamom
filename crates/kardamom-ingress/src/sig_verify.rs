@@ -1,7 +1,7 @@
 //! secp256k1 ECDSA recovery for transaction sender addresses + canonical
 //! `tx_hash`.
 //!
-//! Per S0 D-Sh3 / D-Sh4: the proxy is the **only** component that computes
+//!: the proxy is the **only** component that computes
 //! either field. Both are produced together (`recover_signer()` + a single
 //! `keccak256(raw_tx)` pass) so downstream consumers may trust
 //! `TxEnvelope.{sender, tx_hash}` unconditionally. Failure ⇒ caller MUST
@@ -54,7 +54,7 @@ struct VerifyRequest {
 /// Submitted requests park on a `oneshot` until the ring is flushed: either
 /// because depth was reached, or because the flush timer fires.
 ///
-/// Per S0 D-Sh3 + D-Sh4: each `recover` call returns `(sender, tx_hash)`. The
+///: each `recover` call returns `(sender, tx_hash)`. The
 /// keccak256 over `raw_tx` is computed alongside ECDSA recovery in the same
 /// batch slot (essentially free vs. the ECDSA cost). Failure ⇒ caller rejects
 /// at the RPC boundary.
@@ -186,7 +186,7 @@ mod tests {
         let (recovered, tx_hash) = recover_single(&env, &raw).unwrap();
         assert_eq!(recovered, expected);
         // tx_hash MUST equal keccak256(raw_tx) — the canonical hash defined
-        // by S0 D-Sh4.
+        // by S0.
         assert_eq!(tx_hash, keccak256(raw.as_ref()));
     }
 }

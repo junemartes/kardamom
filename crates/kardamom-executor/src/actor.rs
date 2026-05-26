@@ -1,10 +1,10 @@
 //! Executor actor: M tx_data reader threads + 1 tx_ordering reader thread +
 //! sequential execution thread + commit thread.
 //!
-//! ## Topology change (S4-arch-update, D-Sh12 / spec §2.4)
+//! ## Topology change (S4-arch-update, /)
 //!
 //! Pre-S4-arch-update there was **one** tx_ordering reader thread that pulled
-//! full `TxEnvelope`s off tx_ordering. Post-D-Sh12 the inbound demux is split:
+//! full `TxEnvelope`s off tx_ordering. Post- the inbound demux is split:
 //!
 //! - **M tx_data reader threads** (one per sequencer partition) each
 //!   subscribe to their tx_data and stream full `TxEnvelope`s into a shared
@@ -289,7 +289,7 @@ where
                             });
                         }
 
-                        // S0 D-Sh11: NO state-root computation. The sealed
+                        // S0: NO state-root computation. The sealed
                         // BlockBoundary on tx_receipts is slim — three
                         // fields, no commitment.
                         let boundary = BlockBoundary {
@@ -488,7 +488,7 @@ mod exec_tests {
             .find(|a| a.address == to)
             .expect("recipient");
         assert_eq!(to_acc.balance, U256::from(150u64));
-        // S0 D-Sh11 regression guard: destructure to enforce the 3-field
+        // S0 regression guard: destructure to enforce the 3-field
         // shape of BlockBoundary at compile time.
         let BlockBoundary {
             block_number: _,

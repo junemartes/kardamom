@@ -1,5 +1,5 @@
 //! `MockStateDatabase`: in-memory fixture implementing the `StateDatabase`
-//! trait defined in `kardamom-types` (per S0 D-Sh1).
+//! trait defined in `kardamom-types`.
 //!
 //! The trait and `StateError` marker live in `kardamom-types`. No trait
 //! definition lives in this crate.

@@ -1,6 +1,6 @@
 //! End-to-end sequencer behaviour against a scripted tx_data
 //! subscription and in-memory tx_ordering / receipt-cache publishers
-//! (MDS topology — D-Sh12 v2). Asserts:
+//! (MDS topology). Asserts:
 //!  * Canonical order on tx_ordering (the `TxRef` sequence) matches a
 //!    per-sender nonce-ascending sequence.
 //!  * Each ref's `tx_data_position` matches the position the proxy supplied

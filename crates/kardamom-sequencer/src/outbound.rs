@@ -1,6 +1,6 @@
 //! Outbound channel abstractions.
 //!
-//! Under the MDS topology (D-Sh12 v2) the sequencer **does not** publish
+//! Under the MDS topology the sequencer **does not** publish
 //! to tx_data — that's the proxy's job. The sequencer is purely a
 //! reader-of-A + publisher-of-B-refs: for each envelope observed on its
 //! shard's tx_data (via [`crate::inbound::TxDataSubscriber`]), if the
