@@ -52,7 +52,9 @@ pub struct BoundaryEmitter<C: WallClock, P: BoundaryPublisher> {
     clock: Arc<C>,
     block_number: u64,
     tick_interval_ms: u64,
-    host_id: u8,
+    /// Pre-formatted `host_id` for the per-emit metric labels, so we don't
+    /// allocate a fresh `String` every tick.
+    host_id_str: String,
 }
 
 impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
@@ -62,7 +64,7 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
             clock: Arc::new(clock),
             block_number: initial_block,
             tick_interval_ms: tick_ms,
-            host_id,
+            host_id_str: host_id.to_string(),
         }
     }
 
@@ -115,12 +117,12 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
                     self.block_number += 1;
                     metrics::counter!(
                         "sealer_boundaries_emitted_total",
-                        "host_id" => self.host_id.to_string(),
+                        "host_id" => self.host_id_str.clone(),
                     )
                     .increment(1);
                     metrics::gauge!(
                         "sealer_block_number",
-                        "host_id" => self.host_id.to_string(),
+                        "host_id" => self.host_id_str.clone(),
                     )
                     .set(emitted as f64);
                     return Ok(emitted);
@@ -129,7 +131,7 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
                     if std::time::Instant::now() >= deadline {
                         metrics::counter!(
                             "sealer_tick_skipped_total",
-                            "host_id" => self.host_id.to_string(),
+                            "host_id" => self.host_id_str.clone(),
                             "reason" => "backpressure",
                         )
                         .increment(1);
