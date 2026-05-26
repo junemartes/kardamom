@@ -30,9 +30,9 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 
 use kardamom_executor::executor::SnapshotRef;
 use kardamom_executor::{
-    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, StateWriterSignal, TxEnvelope as KtTxEnvelope,
+    BPosition, BlockBoundaryStart, CMessage, ChannelCPublication, Executor, ExecutorConfig,
+    ExecutorError, MockStateDatabase, MutatingSnapshotSource, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
     TxRef, WriterApplyingQueue,
 };
 
@@ -45,7 +45,7 @@ struct ChanASub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
 }
-impl ChannelASubscription for ChanASub {
+impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -55,9 +55,9 @@ impl ChannelASubscription for ChanASub {
         })
     }
 }
-struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
-impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
+struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
+impl TxOrderingSubscription for ChanBSub {
+    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -224,21 +224,21 @@ fn actor_receipts_match_naive_reference() {
 
     // Now drive the actor.
     let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(8);
-    let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>(8);
+    let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(8);
     let (c_tx, c_rx) = bounded::<CMessage>(8);
     for (i, (env, _sg)) in pairs.iter().enumerate() {
-        let position_a = bpos((i as i32) * 200);
+        let tx_data_position = bpos((i as i32) * 200);
         let tx_hash = env.tx_hash;
-        a_tx.send((position_a, env.clone())).unwrap();
+        a_tx.send((tx_data_position, env.clone())).unwrap();
         b_tx.send((
             bpos(i as i32),
-            ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
+            TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position)),
         ))
         .unwrap();
     }
     b_tx.send((
         bpos(pairs.len() as i32),
-        ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+        TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 1,
             end_tx_idx: bpos((pairs.len() - 1) as i32),
             l2_timestamp: 1_700_000_000,
@@ -250,11 +250,11 @@ fn actor_receipts_match_naive_reference() {
 
     let writer_q = WriterApplyingQueue::new(snap_actor.clone());
     let snapshots = MutatingSnapshotSource(snap_actor);
-    let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+    let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(ChanASub {
         sequencer_id: 0,
         rx: a_rx,
     })];
-    let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(ChanBSub(b_rx));
     let h = thread::spawn(move || {
         Executor::run(
             ExecutorConfig {

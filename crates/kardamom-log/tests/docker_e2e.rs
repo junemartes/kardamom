@@ -21,10 +21,10 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use kardamom_log::config::LogConfig;
-use kardamom_log::publisher::ChannelBPublisher;
+use kardamom_log::publisher::TxOrderingPublisher;
 use kardamom_log::subscriber::Subscribers;
 use kardamom_log::testing::AeronTestCluster;
-use kardamom_types::{BPosition, ChannelBMessage, TxRef};
+use kardamom_types::{BPosition, TxOrderingMessage, TxRef};
 
 async fn docker_available() -> bool {
     use tokio::process::Command;
@@ -55,8 +55,8 @@ async fn aeron_publish_record_subscribe_e2e() {
     eprintln!("aeron archive control: {endpoint}");
 
     let mut cfg = LogConfig::default();
-    cfg.channels.b_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
-    cfg.channels.b_stream_id = 1001;
+    cfg.channels.tx_ordering_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
+    cfg.channels.tx_ordering_stream_id = 1001;
 
     // Connect a host-side Aeron client to the container's Media Driver.
     // The rusteron 0.1.16x API is: build an AeronContext, set the aeron
@@ -73,14 +73,14 @@ async fn aeron_publish_record_subscribe_e2e() {
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
     aeron.start().expect("aeron start");
 
-    let pubr = ChannelBPublisher::open(&aeron, &cfg.channels).unwrap();
+    let pubr = TxOrderingPublisher::open(&aeron, &cfg.channels).unwrap();
     let subs = Subscribers {
         aeron: aeron.clone(),
         ch: cfg.channels.clone(),
     };
     let mut sub = subs.b().unwrap();
 
-    // Channel B now carries TxRefs, not TxEnvelopes (D-Sh12). Publish 100
+    // TxOrdering now carries TxRefs, not TxEnvelopes (D-Sh12). Publish 100
     // refs (alternating which sequencer they belong to) and assert the
     // subscriber sees them all in the canonical order Aeron produced.
     let mut last_pos = BPosition::ZERO;
@@ -89,7 +89,7 @@ async fn aeron_publish_record_subscribe_e2e() {
             .publish_ref(&TxRef {
                 tx_hash: alloy_primitives::B256::ZERO,
                 shard_id: (i % 4) as u8,
-                position_a: BPosition {
+                tx_data_position: BPosition {
                     term_id: 0,
                     term_offset: (i as i32) * 64,
                 },
@@ -103,7 +103,7 @@ async fn aeron_publish_record_subscribe_e2e() {
     while received < 100 && std::time::Instant::now() < deadline {
         received += sub.poll(
             |m, _pos| {
-                assert!(matches!(m, ChannelBMessage::TxRef(_)));
+                assert!(matches!(m, TxOrderingMessage::TxRef(_)));
             },
             256,
         );

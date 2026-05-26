@@ -136,7 +136,7 @@ impl FakeSubscription {
 }
 
 /// High-level fake publication that consumers can use in place of
-/// `ChannelBPublisher` / `ChannelCPublisher` / `ReceiptCachePublisher`.
+/// `TxOrderingPublisher` / `ChannelCPublisher` / `ReceiptCachePublisher`.
 pub struct FakePublication {
     pub_handle: FakeConcurrentPublication,
 }
@@ -202,23 +202,23 @@ where
 // Channel-A and Channel-B typed fakes (D-Sh12 split architecture).
 //
 // Per spec §2.3:
-//   - Channel A[i] is an Aeron *exclusive* publication carrying full
+//   - TxData[i] is an Aeron *exclusive* publication carrying full
 //     TxEnvelopes. M of them (one per sequencer), each its own stream.
-//   - Channel B is the canonical orderer: Aeron *concurrent* multi-publisher
-//     carrying ChannelBMessage records (TxRef | BoundaryStart), ~16-32 B.
+//   - TxOrdering is the canonical orderer: Aeron *concurrent* multi-publisher
+//     carrying TxOrderingMessage records (TxRef | BoundaryStart), ~16-32 B.
 //
 // At the in-memory-fake level, "exclusive vs concurrent" collapses (we only
 // model one publisher at a time, so there is no CAS-cursor contention to
 // simulate). The distinction is *type-level*: the channel-A pub/sub pair is
 // parameterised by `TxEnvelope` and constructs single-producer streams keyed
 // by `sequencer_id`; the channel-B pub/sub pair is parameterised by
-// `ChannelBMessage` and shares one stream. Tests that need to verify real
+// `TxOrderingMessage` and shares one stream. Tests that need to verify real
 // concurrent-pub interleaving must use the docker e2e harness.
 // ============================================================================
 
-use kardamom_types::{ChannelBMessage, TxEnvelope, TxRef};
+use kardamom_types::{TxEnvelope, TxOrderingMessage, TxRef};
 
-/// Channel A[i]: per-sequencer **exclusive** publication of full
+/// TxData[i]: per-sequencer **exclusive** publication of full
 /// `TxEnvelope` bytes. In production this maps to
 /// `Aeron::add_exclusive_publication`; the fake just preserves FIFO.
 ///
@@ -234,7 +234,7 @@ pub struct FakeChannelAPublication {
 impl FakeChannelAPublication {
     /// Open the channel-A[i] pub on `bus`, using the channel URI/stream-id
     /// convention "<channel>"/"<stream_id>". A real wiring uses
-    /// `kardamom_log::config::ChannelsConfig::a_channel_template` to derive
+    /// `kardamom_log::config::ChannelsConfig::tx_dattx_dattx_dattx_dattx_dattx_data_channel_template` to derive
     /// per-sequencer URIs.
     pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
         Self {
@@ -257,16 +257,16 @@ impl FakeChannelAPublication {
     }
 }
 
-/// Channel A[i]: per-sequencer subscription returning `(BPosition, TxEnvelope)`.
+/// TxData[i]: per-sequencer subscription returning `(BPosition, TxEnvelope)`.
 ///
 /// Executors run M+1 of these (one per channel A) plus one channel-B
 /// subscription. Per spec §2.4 they buffer A messages keyed by `BPosition`
 /// until the corresponding `TxRef` arrives on channel B.
-pub struct FakeChannelASubscription {
+pub struct FakeTxDataSubscription {
     sub: FakeSubscription,
 }
 
-impl FakeChannelASubscription {
+impl FakeTxDataSubscription {
     pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
         Self {
             sub: FakeSubscription {
@@ -278,7 +278,7 @@ impl FakeChannelASubscription {
 
     /// Poll and invoke `f` with `(BPosition, TxEnvelope)` per fragment.
     /// `BPosition` is the fragment *start* — the same value a sequencer
-    /// emitted as `TxRef.position_a`.
+    /// emitted as `TxRef.tx_data_position`.
     pub fn poll<F: FnMut(BPosition, TxEnvelope)>(
         &mut self,
         mut f: F,
@@ -301,8 +301,8 @@ impl FakeChannelASubscription {
     }
 }
 
-/// Channel B: canonical orderer, **concurrent** multi-publisher carrying
-/// [`ChannelBMessage`] records (TxRef | BoundaryStart). In production this
+/// TxOrdering: canonical orderer, **concurrent** multi-publisher carrying
+/// [`TxOrderingMessage`] records (TxRef | BoundaryStart). In production this
 /// maps to `Aeron::add_publication` (the shared / concurrent variant).
 pub struct FakeChannelBPublication {
     pub_handle: FakeConcurrentPublication,
@@ -320,7 +320,7 @@ impl FakeChannelBPublication {
     /// Publish a [`TxRef`] onto channel B. Returns the fragment's start
     /// position (the canonical B-position).
     pub fn publish_ref(&self, r: &TxRef) -> Result<BPosition, LogError> {
-        self.publish_message(&ChannelBMessage::TxRef(*r))
+        self.publish_message(&TxOrderingMessage::TxRef(*r))
     }
 
     /// Publish a [`kardamom_types::BlockBoundaryStart`] onto channel B
@@ -329,22 +329,22 @@ impl FakeChannelBPublication {
         &self,
         b: &kardamom_types::BlockBoundaryStart,
     ) -> Result<BPosition, LogError> {
-        self.publish_message(&ChannelBMessage::BoundaryStart(b.clone()))
+        self.publish_message(&TxOrderingMessage::BoundaryStart(b.clone()))
     }
 
-    fn publish_message(&self, m: &ChannelBMessage) -> Result<BPosition, LogError> {
+    fn publish_message(&self, m: &TxOrderingMessage) -> Result<BPosition, LogError> {
         self.pub_handle.publish(m)
     }
 }
 
-/// Channel B subscription returning `(BPosition, ChannelBMessage)` per
+/// TxOrdering subscription returning `(BPosition, TxOrderingMessage)` per
 /// fragment. The B-position is the canonical L2 tx ordering identifier
 /// (system invariant I1).
-pub struct FakeChannelBSubscription {
+pub struct FakeTxOrderingSubscription {
     sub: FakeSubscription,
 }
 
-impl FakeChannelBSubscription {
+impl FakeTxOrderingSubscription {
     pub fn open(bus: &FakeBus, channel: &str, stream_id: i32) -> Self {
         Self {
             sub: FakeSubscription {
@@ -354,14 +354,14 @@ impl FakeChannelBSubscription {
         }
     }
 
-    pub fn poll<F: FnMut(BPosition, ChannelBMessage)>(
+    pub fn poll<F: FnMut(BPosition, TxOrderingMessage)>(
         &mut self,
         mut f: F,
         fragment_limit: usize,
     ) -> usize {
         self.sub.poll(
             |bytes: &[u8], header: FakeHeader| {
-                if let Ok(m) = rkyv::from_bytes::<ChannelBMessage, rancor::Error>(bytes) {
+                if let Ok(m) = rkyv::from_bytes::<TxOrderingMessage, rancor::Error>(bytes) {
                     f(
                         BPosition {
                             term_id: header.term_id(),

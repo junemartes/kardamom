@@ -28,10 +28,10 @@ use revm::state::Bytecode;
 use kardamom_executor::block_env::ExecEnv;
 use kardamom_executor::executor::execute_tx;
 use kardamom_executor::{
-    BPosition, BlockBoundaryStart, CMessage, ChannelASubscription, ChannelBMessage,
-    ChannelBSubscription, ChannelCPublication, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, PendingDelta, StateWriterSignal,
-    TxEnvelope as KtTxEnvelope, TxIndex, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, ChannelCPublication, Executor, ExecutorConfig,
+    ExecutorError, MockStateDatabase, MutatingSnapshotSource, PendingDelta, StateWriterSignal,
+    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxIndex, TxOrderingMessage,
+    TxOrderingSubscription, TxRef, WriterApplyingQueue,
 };
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
@@ -152,7 +152,7 @@ struct ChanASub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
 }
-impl ChannelASubscription for ChanASub {
+impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -162,9 +162,9 @@ impl ChannelASubscription for ChanASub {
         })
     }
 }
-struct ChanBSub(Receiver<(BPosition, ChannelBMessage)>);
-impl ChannelBSubscription for ChanBSub {
-    fn next(&mut self) -> Result<(BPosition, ChannelBMessage), ExecutorError> {
+struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
+impl TxOrderingSubscription for ChanBSub {
+    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::ChannelBClosed)
     }
 }
@@ -203,23 +203,23 @@ fn bench_actor_throughput(c: &mut Criterion) {
             // throughput; the demux split itself adds one extra crossbeam
             // hop per tx, which should be negligible vs. revm time.
             let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>((BATCH as usize) + 8);
-            let (b_tx, b_rx) = bounded::<(BPosition, ChannelBMessage)>((BATCH as usize) + 8);
+            let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((BATCH as usize) + 8);
             let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
 
             for i in 0..BATCH {
-                let position_a = pos((i as i32) * 200);
+                let tx_data_position = pos((i as i32) * 200);
                 let env = signed_transfer(&signer, to, i);
                 let tx_hash = env.tx_hash;
-                a_tx.send((position_a, env)).unwrap();
+                a_tx.send((tx_data_position, env)).unwrap();
                 b_tx.send((
                     pos(i as i32),
-                    ChannelBMessage::TxRef(TxRef::new(tx_hash, 0, position_a)),
+                    TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position)),
                 ))
                 .unwrap();
             }
             b_tx.send((
                 pos(BATCH as i32),
-                ChannelBMessage::BoundaryStart(BlockBoundaryStart {
+                TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                     block_number: 1,
                     end_tx_idx: pos((BATCH as i32) - 1),
                     l2_timestamp: 0,
@@ -229,11 +229,11 @@ fn bench_actor_throughput(c: &mut Criterion) {
             drop(a_tx);
             drop(b_tx);
 
-            let a_subs: Vec<Box<dyn ChannelASubscription>> = vec![Box::new(ChanASub {
+            let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(ChanASub {
                 sequencer_id: 0,
                 rx: a_rx,
             })];
-            let b_sub: Box<dyn ChannelBSubscription> = Box::new(ChanBSub(b_rx));
+            let b_sub: Box<dyn TxOrderingSubscription> = Box::new(ChanBSub(b_rx));
             let h = thread::spawn(move || {
                 Executor::run(
                     ExecutorConfig {
