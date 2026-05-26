@@ -1,8 +1,8 @@
 //! Kardamom S4 v0 sequential executor.
 //!
 //! Single-threaded revm executor that subscribes to M per-sequencer
-//! **channel A**'s + the canonical **channel B** orderer and joins them by
-//! reference. Publishes receipts + sealed BlockBoundaries to channel C.
+//! **tx_data**'s + the canonical **tx_ordering** orderer and joins them by
+//! reference. Publishes receipts + sealed BlockBoundaries to tx_receipts.
 //! Block-STM is explicitly out of scope for v0; S4 v1 will replace the
 //! single execution thread with parallel workers behind the same
 //! `TxDataSubscription` / `TxOrderingSubscription` / `ChannelCPublication`
@@ -14,7 +14,7 @@
 //!   bytes. Executors run M subscriptions, one per sequencer partition.
 //! - **TxOrdering** carries tiny `TxOrderingMessage` records (`TxRef |
 //!   BoundaryStart`) — ~16-32 B each. This is the canonical orderer.
-//! - **Channel C** carries `Receipt` and slim `BlockBoundary` records (the
+//! - **TxReceipts** carries `Receipt` and slim `BlockBoundary` records (the
 //!   executor's output).
 //!
 //! See `docs/specs/2026-05-23-high-throughput-sequencer-design.md` §2.3
@@ -26,7 +26,7 @@
 //! Spec §4.4 mandates that two replicas publishing a `Receipt` with the same
 //! `tx_idx` but different `write_set_hash` halt the chain. The executor
 //! cannot detect this from its own output — it has no visibility into peer
-//! replicas. The detection point is the **channel-C consumer** that dedupes
+//! replicas. The detection point is the **tx_receipts consumer** that dedupes
 //! by `tx_idx`; that consumer panics on hash mismatch.
 //!
 //! That consumer lives in the `kardamom-log` crate (S3). The chaos test

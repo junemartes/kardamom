@@ -234,7 +234,7 @@ pub struct FakeChannelAPublication {
 impl FakeChannelAPublication {
     /// Open the tx_data[i] pub on `bus`, using the channel URI/stream-id
     /// convention "<channel>"/"<stream_id>". A real wiring uses
-    /// `kardamom_log::config::ChannelsConfig::tx_dattx_dattx_dattx_data_channel_template` to derive
+    /// `kardamom_log::config::ChannelsConfig::tx_dattx_dattx_dattx_dattx_data_channel_template` to derive
     /// per-sequencer URIs.
     pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
         Self {

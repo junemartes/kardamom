@@ -1,4 +1,4 @@
-//! Channel-C executor-side demux wrapper + `TxIndex` newtype.
+//! TxReceipts executor-side demux wrapper + `TxIndex` newtype.
 //!
 //! Shared wire types (`BPosition`, `TxEnvelope`, `Receipt`, `BlockBoundary`,
 //! `BlockBoundaryStart`, `BlockDelta`, `AccountChange`, `TxOrderingMessage`,
@@ -20,7 +20,7 @@ use kardamom_types::{BlockBoundary, Receipt};
 use revm::context::result::HaltReason;
 
 /// Monotonically increasing global index of a tx within the canonical
-/// channel-B stream. Derived by the executor's channel-B reader from the
+/// tx_ordering stream. Derived by the executor's tx_ordering reader from the
 /// input order, starting at 0 for the first tx after genesis. The
 /// downstream `Receipt.tx_idx` is the `BPosition` (the canonical wire id);
 /// this `TxIndex` is an executor-local sanity counter only.
@@ -34,7 +34,7 @@ impl TxIndex {
     }
 }
 
-/// One published record on channel C — receipts and sealed boundaries.
+/// One published record on tx_receipts — receipts and sealed boundaries.
 #[derive(Debug, Clone)]
 pub enum CMessage {
     Receipt(Receipt),

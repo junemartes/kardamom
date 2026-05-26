@@ -89,9 +89,10 @@ async fn split_architecture_m_plus_one_e2e() {
     // TxData stays on IPC inside the container's media driver (this test
     // runs the client *against* the container, so the per-A streams need to
     // be reachable from outside too — use UDP with distinct endpoints).
-    cfg.channels.tx_dattx_dattx_dattx_data_channel_template =
+    cfg.channels
+        .tx_dattx_dattx_dattx_dattx_data_channel_template =
         format!("aeron:udp?endpoint={endpoint}|alias=a-{{sid}}");
-    cfg.channels.tx_dattx_dattx_dattx_data_stream_id_base = 2000;
+    cfg.channels.tx_dattx_dattx_dattx_dattx_data_stream_id_base = 2000;
 
     let ctx = rusteron_client::AeronContext::new().expect("aeron context");
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));

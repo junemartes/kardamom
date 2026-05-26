@@ -1,34 +1,34 @@
-//! Executor actor: M channel-A reader threads + 1 channel-B reader thread +
+//! Executor actor: M tx_data reader threads + 1 tx_ordering reader thread +
 //! sequential execution thread + commit thread.
 //!
 //! ## Topology change (S4-arch-update, D-Sh12 / spec §2.4)
 //!
-//! Pre-S4-arch-update there was **one** channel-B reader thread that pulled
-//! full `TxEnvelope`s off channel B. Post-D-Sh12 the inbound demux is split:
+//! Pre-S4-arch-update there was **one** tx_ordering reader thread that pulled
+//! full `TxEnvelope`s off tx_ordering. Post-D-Sh12 the inbound demux is split:
 //!
-//! - **M channel-A reader threads** (one per sequencer partition) each
-//!   subscribe to their channel A and stream full `TxEnvelope`s into a shared
+//! - **M tx_data reader threads** (one per sequencer partition) each
+//!   subscribe to their tx_data and stream full `TxEnvelope`s into a shared
 //!   **join buffer** keyed by `(sequencer_id, tx_data_position)`.
-//! - **One channel-B reader thread** pulls tiny `TxOrderingMessage` records
+//! - **One tx_ordering reader thread** pulls tiny `TxOrderingMessage` records
 //!   (`TxRef | BoundaryStart`) in canonical order. For each `TxRef`, it joins
 //!   against the buffer and hands `(b_position, TxEnvelope)` to the exec
 //!   thread. For each `BoundaryStart`, it forwards verbatim.
 //!
 //! The exec thread, commit thread, state-snapshot swap protocol, write-set
-//! hashing, and channel-C emission are **unchanged** — the executor's
+//! hashing, and tx_receipts emission are **unchanged** — the executor's
 //! external contract (consume canonical-ordered txs + boundaries, produce
-//! ordered receipts + slim boundaries on channel C) is identical. Only the
+//! ordered receipts + slim boundaries on tx_receipts) is identical. Only the
 //! inbound demux moves.
 //!
 //! See `reader.rs` for the join-buffer + reader-thread implementation.
 //!
 //! Wiring:
 //! ```text
-//!   channel A[0..M]    channel B
+//!   tx_data[0..M]    tx_ordering
 //!        │                │
 //!        ▼                ▼
 //!   ┌─────────┐     ┌──────────┐
-//!   │M readers│──►  │B reader  │──► exec ──► commit ──► channel C
+//!   │M readers│──►  │B reader  │──► exec ──► commit ──► tx_receipts
 //!   │ (insert │join │(lookup+  │
 //!   │ buffer) │buf  │ forward) │
 //!   └─────────┘     └──────────┘
@@ -56,7 +56,7 @@ use crate::reader::{
 };
 use crate::types::{CMessage, TxIndex};
 
-/// Publication handle for channel C.
+/// Publication handle for tx_receipts.
 pub trait ChannelCPublication: Send {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError>;
 }
@@ -102,14 +102,14 @@ enum ExecToCommit {
     Boundary(BlockBoundary),
 }
 
-/// Owns the M+3 threads (M channel-A readers, 1 channel-B reader, 1 exec, 1
-/// commit). `run` blocks until the channel-B subscription closes or an
+/// Owns the M+3 threads (M tx_data readers, 1 tx_ordering reader, 1 exec, 1
+/// commit). `run` blocks until the tx_ordering subscription closes or an
 /// error occurs.
 pub struct Executor;
 
 impl Executor {
     /// Spawn the readers, exec, commit threads and join them. Returns when
-    /// channel B closes cleanly or when any thread propagates a fatal
+    /// tx_ordering closes cleanly or when any thread propagates a fatal
     /// error.
     ///
     /// `a_subs` holds one subscription per sequencer partition (M total).
@@ -140,7 +140,7 @@ impl Executor {
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth);
 
-        // M channel-A reader threads, one per sequencer partition. Each
+        // M tx_data reader threads, one per sequencer partition. Each
         // owns its subscription for the duration; we collect the join
         // handles to surface any error.
         let mut a_handles: Vec<JoinHandle<Result<(), ExecutorError>>> =
@@ -164,18 +164,18 @@ impl Executor {
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
-        // Join in this order: B reader (closes first when channel B is
-        // exhausted), then exec, then commit, then A readers. Channel-A
-        // subscriptions may keep producing after channel B closes; we let
+        // Join in this order: B reader (closes first when tx_ordering is
+        // exhausted), then exec, then commit, then A readers. TxData
+        // subscriptions may keep producing after tx_ordering closes; we let
         // them drain to clean shutdown. Errors from any thread propagate;
         // the first error wins but every join still runs so threads tear
         // down cleanly.
-        let r_b = b_handle.join().expect("channel-b reader panic");
+        let r_b = b_handle.join().expect("tx_ordering reader panic");
         let r_exec = exec.join().expect("exec panic");
         let r_commit = commit.join().expect("commit panic");
         let mut r_a: Result<(), ExecutorError> = Ok(());
         for h in a_handles {
-            let res = h.join().expect("channel-a reader panic");
+            let res = h.join().expect("tx_data reader panic");
             if r_a.is_ok() {
                 r_a = res;
             }
@@ -233,11 +233,11 @@ where
             // re-derive block numbers without sealer help.
             let mut current_block = initial_block + 1;
             let mut current_l2_ts: u64 = 0;
-            // Last channel-B position the exec thread folded into a
+            // Last tx_ordering position the exec thread folded into a
             // receipt. Used to validate alignment with
             // `BlockBoundaryStart.end_tx_idx`.
             let mut last_processed_position: Option<BPosition> = None;
-            // Sanity: tx_idx assigned by the channel-B reader is monotone.
+            // Sanity: tx_idx assigned by the tx_ordering reader is monotone.
             let mut expected_tx_idx = TxIndex::ZERO;
 
             loop {
@@ -277,7 +277,7 @@ where
                         l2_timestamp,
                     }) => {
                         // Alignment: BlockBoundaryStart.end_tx_idx is a
-                        // BPosition identifying the LAST channel-B record
+                        // BPosition identifying the LAST tx_ordering record
                         // that belongs to the closing block. It must match
                         // the executor's most recent processed position.
                         if let Some(lp) = last_processed_position
@@ -290,7 +290,7 @@ where
                         }
 
                         // S0 D-Sh11: NO state-root computation. The sealed
-                        // BlockBoundary on channel C is slim — three
+                        // BlockBoundary on tx_receipts is slim — three
                         // fields, no commitment.
                         let boundary = BlockBoundary {
                             block_number,
@@ -301,7 +301,7 @@ where
                         // Drain the delta. We swap it out so the writer
                         // owns it. The PendingDelta becomes a BlockDelta
                         // here; receipts are carried separately on
-                        // channel C, so the BlockDelta the writer
+                        // tx_receipts, so the BlockDelta the writer
                         // receives has an empty receipts vec.
                         let pending = std::mem::take(&mut delta);
                         let bd: BlockDelta = pending.finalize(block_number);
