@@ -202,19 +202,23 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
 // ============================================================================
 
 /// Compile every service bin once at the start of the test so the spawn
-/// loop below doesn't have to race a partial cargo build.
+/// loop below doesn't have to race a partial cargo build. `--bin <name>`
+/// on its own resolves only against the current package's bin targets
+/// (the `e2e` test crate has none); pass `-p <pkg>` for each so cargo
+/// looks up the right workspace member.
 fn build_service_bins() {
     let st = Command::new(env!("CARGO"))
         .args([
             "build",
-            "--bin",
+            "-p",
             "kardamom-sealer",
-            "--bin",
+            "-p",
             "kardamom-sequencer",
-            "--bin",
+            "-p",
             "kardamom-executor",
-            "--bin",
+            "-p",
             "kardamom-ingress",
+            "--bins",
         ])
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
