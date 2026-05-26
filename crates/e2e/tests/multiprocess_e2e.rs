@@ -173,30 +173,34 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
     for nonce in 0..N {
         let raw = signed_transfer(&alice, bob_addr, U256::from(1u64), nonce);
         let raw_hex = format!("0x{}", hex::encode(&raw));
-        let resp: Value = client
+        // `eth_sendRawTransaction` returns just the tx_hash. The proxy
+        // waits for the receipt internally and only resolves the request
+        // once the receipt has arrived on tx_receipts.
+        let returned_hash: B256 = client
             .request("eth_sendRawTransaction", rpc_params![raw_hex])
             .await
             .expect("eth_sendRawTransaction");
-        // The proxy returns a serialized TransactionReceipt; assert the
-        // tx_hash matches what we signed.
+
+        // Verify it's the hash we signed.
         let env = ConsensusEnvelope::decode(&mut raw.as_slice()).expect("decode my tx");
         let expected_hash = *env.tx_hash();
-        let received_hash = resp
-            .get("transactionHash")
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<B256>().ok())
-            .unwrap_or_else(|| panic!("missing transactionHash in response: {resp}"));
-        assert_eq!(received_hash, expected_hash, "tx {nonce}: tx_hash mismatch");
-        let status = resp
+        assert_eq!(returned_hash, expected_hash, "tx {nonce}: tx_hash mismatch");
+
+        // Fetch the receipt body via eth_getTransactionReceipt and assert
+        // status=success.
+        let receipt: Value = client
+            .request("eth_getTransactionReceipt", rpc_params![returned_hash])
+            .await
+            .expect("eth_getTransactionReceipt");
+        let status = receipt
             .get("status")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        // alloy serialises status as "0x1" / "0x0".
         assert_eq!(
             status, "0x1",
-            "tx {nonce}: receipt status not success ({resp})"
+            "tx {nonce}: receipt status not success ({receipt})"
         );
-        tracing::info!(nonce, tx_hash = ?expected_hash, "received receipt");
+        tracing::info!(nonce, tx_hash = ?expected_hash, "receipt verified");
     }
 
     tracing::info!("all {N} receipts validated; tearing down");
