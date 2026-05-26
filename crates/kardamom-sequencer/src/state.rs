@@ -134,11 +134,13 @@ impl<T> PartitionState<T> {
     /// `process(sender, nonce, _)` will pick it up and publish it. Also
     /// rewinds `next_nonce` so the retry sees `nonce == expected`.
     ///
-    /// Used by `PrimarySequencer::run_once` when `BPublisher::try_publish`
-    /// returns `Backpressure` — we must NOT advance state for a message that
-    /// did not actually land on B. Also marks the sender as "drain-pending"
-    /// so a subsequent call to [`Self::drain_pending`] can resume the
-    /// publish without needing fresh ingress.
+    /// Used by `PrimarySequencer::run_once` when the dual-write
+    /// (`ChannelAPublisher::try_publish` + `ChannelBRefPublisher::try_publish_ref`)
+    /// returns `Backpressure` from either side — we must NOT advance state
+    /// for a message whose canonical `TxRef` did not actually land on B.
+    /// Also marks the sender as "drain-pending" so a subsequent call to
+    /// [`Self::drain_pending`] can resume the publish without needing
+    /// fresh ingress.
     pub fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
         // Rewind expected nonce so the retry treats it as a Match.
         self.next.insert(sender, nonce);
