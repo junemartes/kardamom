@@ -26,7 +26,7 @@ use std::time::Duration;
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, B256, U256};
-use alloy_rlp::Encodable;
+use alloy_rlp::{Decodable, Encodable};
 use alloy_signer_local::PrivateKeySigner;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
