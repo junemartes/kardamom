@@ -53,6 +53,14 @@ impl<T> PartitionState<T> {
         self.next.get(&sender).copied().unwrap_or(0)
     }
 
+    /// Returns the cached next-nonce for `sender`, or `None` if the sender
+    /// has never been seen by this partition. Used by the cache-miss
+    /// hydration path: a `None` triggers a one-time canonical lookup
+    /// against the state DB before falling through to [`Self::process`].
+    pub fn next_nonce_known(&self, sender: Address) -> Option<u64> {
+        self.next.get(&sender).copied()
+    }
+
     pub fn iter_next_nonces(&self) -> impl Iterator<Item = (Address, u64)> + '_ {
         self.next.iter().map(|(a, n)| (*a, *n))
     }

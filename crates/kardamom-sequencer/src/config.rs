@@ -27,9 +27,6 @@ pub struct SequencerConfig {
     pub core_id: Option<usize>,
     /// Backpressure behaviour when channel B blocks.
     pub backpressure_policy: BackpressurePolicy,
-    /// Role: primary owns the slice; standby tails B and waits for lease
-    /// takeover.
-    pub role: SequencerRole,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -41,13 +38,6 @@ pub enum BackpressurePolicy {
     SpinRetry { max_retries: u32 },
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SequencerRole {
-    Primary,
-    Standby,
-}
-
 impl Default for SequencerConfig {
     fn default() -> Self {
         Self {
@@ -57,7 +47,6 @@ impl Default for SequencerConfig {
             max_pending_per_sender: 16,
             core_id: None,
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
-            role: SequencerRole::Primary,
         }
     }
 }
