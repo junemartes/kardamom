@@ -20,7 +20,7 @@
 //!     - match → emit a publish action for this nonce + drain any
 //!       buffered higher nonces that newly become contiguous;
 //!     - future → buffer (bounded per-sender);
-//!     - past → emit a `DuplicateNotification`.
+//!     - past → emit a `TxError { reason: DuplicatedTx { expected_nonce } }`.
 //!  4. For each `Publish` action, build
 //!     `TxRef { tx_hash, shard_id, tx_data_position }` and publish to tx_ordering.
 //!     If B back-pressures, [`PartitionState::reinsert_for_retry`] rewinds
@@ -42,15 +42,14 @@ use std::time::Duration;
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
-use kardamom_types::{BPosition, StateDatabase, TxRef};
+use kardamom_types::{BPosition, StateDatabase, TxError, TxErrorReason, TxRef};
 use tracing::{trace, warn};
 
 use crate::config::SequencerConfig;
-use crate::duplicate::DuplicateNotification;
 use crate::error::SequencerError;
 use crate::inbound::TxDataSubscriber;
 use crate::metrics;
-use crate::outbound::{ReceiptCachePublisher, TxOrderingRefPublisher};
+use crate::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use crate::partition::partition_for;
 use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction};
@@ -213,7 +212,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
     where
         I: TxDataSubscriber,
         B: TxOrderingRefPublisher,
-        R: ReceiptCachePublisher,
+        R: TxErrorPublisher,
     {
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
@@ -312,11 +311,14 @@ impl<DB: StateDatabase> Sequencer<DB> {
                         Err(e) => return Err(e),
                     }
                 }
-                ProcessAction::ReportDuplicate { nonce: n } => {
-                    rc.publish_duplicate(DuplicateNotification {
-                        correlation_id: envelope.correlation_id,
+                ProcessAction::ReportDuplicate {
+                    nonce: n,
+                    expected_nonce,
+                } => {
+                    rc.publish_error(TxError {
                         sender,
                         nonce: n,
+                        reason: TxErrorReason::DuplicatedTx { expected_nonce },
                     });
                 }
             }
@@ -336,7 +338,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
     where
         I: TxDataSubscriber,
         B: TxOrderingRefPublisher,
-        R: ReceiptCachePublisher,
+        R: TxErrorPublisher,
     {
         if let Some(core) = self.cfg.core_id {
             let id = core_affinity::CoreId { id: core };

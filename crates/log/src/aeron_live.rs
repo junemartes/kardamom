@@ -64,7 +64,7 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope, TxOrderingMessage,
+    TxEnvelope, TxError, TxOrderingMessage,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -695,6 +695,51 @@ impl TxReceiptsBoundarySubscriberHandle {
 }
 
 // ---------------------------------------------------------------------------
+// TxErrors (sequencer → ingress).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct TxErrorsPublisherHandle {
+    inner: PubHandle,
+}
+
+impl TxErrorsPublisherHandle {
+    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        Ok(Self {
+            inner: rt.open_publication(&ch.tx_errors_channel, ch.tx_errors_stream_id)?,
+        })
+    }
+
+    pub fn publish(&self, e: &TxError) -> Result<BPosition, LogError> {
+        self.inner.publish(e)
+    }
+
+    pub fn raw(&self) -> &PubHandle {
+        &self.inner
+    }
+}
+
+pub struct TxErrorsSubscriberHandle {
+    rx: UnboundedReceiver<(BPosition, TxError)>,
+}
+
+impl TxErrorsSubscriberHandle {
+    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        Ok(Self {
+            rx: rt.open_subscription::<TxError>(&ch.tx_errors_channel, ch.tx_errors_stream_id)?,
+        })
+    }
+
+    pub async fn recv(&mut self) -> Option<(BPosition, TxError)> {
+        self.rx.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Option<(BPosition, TxError)> {
+        self.rx.try_recv().ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-recorder fsync watermark.
 // ---------------------------------------------------------------------------
 
@@ -802,6 +847,8 @@ const _: fn() = || {
     assert_send_sync::<TxReceiptsPublisherHandle>();
     assert_send::<TxReceiptsSubscriberHandle>();
     assert_send::<TxReceiptsBoundarySubscriberHandle>();
+    assert_send_sync::<TxErrorsPublisherHandle>();
+    assert_send::<TxErrorsSubscriberHandle>();
     assert_send_sync::<FsyncWatermarkPublisherHandle>();
     assert_send::<FsyncWatermarkSubscriberHandle>();
     assert_send_sync::<QuorumPublisherHandle>();

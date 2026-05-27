@@ -19,10 +19,12 @@ use kardamom_ingress::error::IngressError;
 use kardamom_ingress::proxy::IngressProxy;
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, QuorumSubscriberHandle, TxDataPublisherHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
+    TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::LogConfig;
-use kardamom_types::{BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope};
+use kardamom_types::{
+    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
+};
 use tokio::sync::broadcast;
 
 #[derive(Debug, Parser)]
@@ -192,6 +194,7 @@ struct LiveIngressSubscription {
     watermarks: broadcast::Sender<QuorumWatermark>,
     local_fsync: broadcast::Sender<FsyncWatermark>,
     block_boundaries: broadcast::Sender<BlockBoundary>,
+    tx_errors: broadcast::Sender<TxError>,
 }
 
 impl LiveIngressSubscription {
@@ -204,6 +207,7 @@ impl LiveIngressSubscription {
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(1024);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(1024);
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(1024);
+        let (tx_errors_tx, _) = broadcast::channel::<TxError>(1024);
 
         // tx_receipts → Receipt fan-out
         let mut receipts_sub = TxReceiptsSubscriberHandle::open(rt, channels)
@@ -245,11 +249,22 @@ impl LiveIngressSubscription {
             }
         });
 
+        // tx_errors → TxError fan-out
+        let mut errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
+            .map_err(|e| IngressError::Internal(format!("open tx_errors: {e}")))?;
+        let tx = tx_errors_tx.clone();
+        tokio::spawn(async move {
+            while let Some((_pos, e)) = errors_sub.recv().await {
+                let _ = tx.send(e);
+            }
+        });
+
         Ok(Self {
             receipts: receipts_tx,
             watermarks: watermarks_tx,
             local_fsync: local_fsync_tx,
             block_boundaries: block_boundaries_tx,
+            tx_errors: tx_errors_tx,
         })
     }
 }
@@ -266,6 +281,9 @@ impl IngressSubscription for LiveIngressSubscription {
     }
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary> {
         self.block_boundaries.subscribe()
+    }
+    fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
+        self.tx_errors.subscribe()
     }
 }
 

@@ -34,7 +34,7 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope, TxOrderingMessage, TxRef,
+    TxEnvelope, TxError, TxOrderingMessage, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
@@ -192,6 +192,23 @@ impl TxReceiptsPublisher {
 
     pub fn publish_boundary(&self, b: &BlockBoundary) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, b)
+    }
+}
+
+/// TxErrors: sequencer-emitted rejection signals (e.g. duplicate / past-nonce).
+/// RAM only, consumed by ingress to release parked client submissions early.
+pub struct TxErrorsPublisher {
+    pub_handle: Pub,
+}
+
+impl TxErrorsPublisher {
+    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let pub_handle = add_pub(aeron, &ch.tx_errors_channel, ch.tx_errors_stream_id, "err")?;
+        Ok(Self { pub_handle })
+    }
+
+    pub fn publish(&self, e: &TxError) -> Result<BPosition, LogError> {
+        offer(&self.pub_handle, e)
     }
 }
 

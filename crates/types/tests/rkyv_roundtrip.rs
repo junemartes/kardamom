@@ -157,6 +157,16 @@ fn watermark_roundtrip() {
 }
 
 #[test]
+fn tx_error_roundtrip() {
+    let e = TxError {
+        sender: Address::repeat_byte(0x55),
+        nonce: 7,
+        reason: TxErrorReason::DuplicatedTx { expected_nonce: 12 },
+    };
+    assert_eq!(roundtrip(&e), e);
+}
+
+#[test]
 fn tx_ref_roundtrip() {
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,

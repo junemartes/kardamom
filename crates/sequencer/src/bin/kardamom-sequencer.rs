@@ -1,8 +1,8 @@
 //! `kardamom-sequencer`: per-partition sequencer process.
 //!
 //! Parses a TOML [`SequencerConfig`], opens its shard's tx_data subscriber +
-//! the canonical tx_ordering publisher + a receipt-cache publisher for
-//! duplicate notifications, and runs the sequencer main loop on a dedicated
+//! the canonical tx_ordering publisher + a tx_errors publisher for
+//! rejection signals, and runs the sequencer main loop on a dedicated
 //! blocking thread until SIGTERM / Ctrl-C.
 
 use std::path::PathBuf;
@@ -12,16 +12,17 @@ use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
-use kardamom_log::aeron_live::{AeronRuntime, TxDataSubscriberHandle, TxOrderingPublisherHandle};
+use kardamom_log::aeron_live::{
+    AeronRuntime, TxDataSubscriberHandle, TxErrorsPublisherHandle, TxOrderingPublisherHandle,
+};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::duplicate::DuplicateNotification;
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
-use kardamom_sequencer::outbound::{ReceiptCachePublisher, TxOrderingRefPublisher};
+use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_types::{
-    BPosition, Receipt, StateDatabase, StateError, TxEnvelope, TxOrderingMessage, TxRef,
+    BPosition, Receipt, StateDatabase, StateError, TxEnvelope, TxError, TxOrderingMessage, TxRef,
 };
 
 #[derive(Debug, Parser)]
@@ -93,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
         .context("open TxDataSubscriberHandle")?;
     let tx_ordering_pub = TxOrderingPublisherHandle::open(&rt, &channels)
         .context("open TxOrderingPublisherHandle")?;
+    let tx_errors_pub =
+        TxErrorsPublisherHandle::open(&rt, &channels).context("open TxErrorsPublisherHandle")?;
 
     let shutdown = Shutdown::new();
     let shutdown_for_task = shutdown.clone();
@@ -107,13 +110,13 @@ async fn main() -> anyhow::Result<()> {
         let mut sequencer = Sequencer::new(cfg_clone, state_db);
         let mut tx_data = LiveTxDataSub::new(tx_data_sub);
         let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub);
-        // DuplicateNotification publishing is a no-op for now: PR #29
-        // removed the receipt-cache Aeron channel, and the
-        // proxy no longer subscribes for these. A follow-up wires a
-        // dedicated duplicate-notifications channel; until then we drop
-        // the notifications on the floor.
-        let mut rc = NoopReceiptCachePub;
-        sequencer.run(&mut tx_data, &mut tx_ordering, &mut rc, shutdown_for_task)
+        let mut tx_errors = LiveTxErrorPub::new(tx_errors_pub);
+        sequencer.run(
+            &mut tx_data,
+            &mut tx_ordering,
+            &mut tx_errors,
+            shutdown_for_task,
+        )
     });
 
     wait_for_shutdown().await;
@@ -181,15 +184,28 @@ impl TxOrderingRefPublisher for LiveTxOrderingRefPub {
     }
 }
 
-/// No-op `ReceiptCachePublisher`. The sequencer's duplicate-notification
-/// transport is being reworked as a follow-up to PR #29 (which removed the
-/// shared receipt-cache Aeron channel); until that lands we drop duplicate
-/// notifications on the floor — the executor still produces the canonical
-/// receipt and the proxy serves it from the tx_receipts index instead.
-struct NoopReceiptCachePub;
+/// Live `TxErrorPublisher` wrapping a `TxErrorsPublisherHandle`. Sequencer-
+/// emitted rejections (duplicate / past-nonce today) are published on the
+/// `tx_errors` Aeron channel; ingress consumes them to release parked
+/// clients early. Publish failures are logged and dropped — the canonical
+/// state has already advanced (or the tx was rejected), so there is nothing
+/// to roll back.
+struct LiveTxErrorPub {
+    handle: TxErrorsPublisherHandle,
+}
 
-impl ReceiptCachePublisher for NoopReceiptCachePub {
-    fn publish_duplicate(&mut self, _notification: DuplicateNotification) {}
+impl LiveTxErrorPub {
+    fn new(handle: TxErrorsPublisherHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl TxErrorPublisher for LiveTxErrorPub {
+    fn publish_error(&mut self, e: TxError) {
+        if let Err(err) = self.handle.publish(&e) {
+            tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
