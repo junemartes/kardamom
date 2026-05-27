@@ -429,15 +429,43 @@ mod docker {
     const AERON_IMAGE_NAME: &str = "kardamom-aeron";
     const AERON_IMAGE_TAG: &str = "test";
 
-    /// One Aeron node: the running container plus the host directories that
-    /// shadow its `AERON_DIR` (Media Driver shared-memory) and
-    /// `AERON_ARCHIVE_DIR` (Archive segment files). Sharing these dirs with
-    /// the host lets a host-side Aeron client join the container's Media
-    /// Driver directly (no embedded MD on the host needed).
-    struct Node {
+    /// One Aeron node. Either backed by a Docker container we spawn (the
+    /// default — works on Linux, fails on macOS-Docker due to virtiofs
+    /// breaking `cnc.dat` shared-memory semantics), or an "external" mode
+    /// where the test points us at an already-running Media Driver via the
+    /// `KARDAMOM_AERON_DIR` env var. The external mode lets macOS devs run
+    /// the MD natively (`just aeron-driver-up`).
+    ///
+    /// The `Container` variant is boxed so the enum stays small — its
+    /// inner `ContainerAsync` is ~200 B vs the `External` variant's two
+    /// `PathBuf`s; clippy's `large_enum_variant` flags the discrepancy.
+    enum Node {
+        Container(Box<ContainerNode>),
+        External {
+            aeron_dir: PathBuf,
+            archive_dir: PathBuf,
+        },
+    }
+
+    struct ContainerNode {
         container: ContainerAsync<GenericImage>,
         aeron_dir_host: PathBuf,
         archive_dir_host: PathBuf,
+    }
+
+    impl Node {
+        fn aeron_dir(&self) -> &std::path::Path {
+            match self {
+                Node::Container(c) => &c.aeron_dir_host,
+                Node::External { aeron_dir, .. } => aeron_dir,
+            }
+        }
+        fn archive_dir(&self) -> &std::path::Path {
+            match self {
+                Node::Container(c) => &c.archive_dir_host,
+                Node::External { archive_dir, .. } => archive_dir,
+            }
+        }
     }
 
     /// Reusable Aeron e2e harness. Each instance owns one or more real Aeron
@@ -447,8 +475,28 @@ mod docker {
     }
 
     impl AeronTestCluster {
-        /// Bring up a single Aeron node (Media Driver + Archive in one JVM).
+        /// Bring up a single Aeron node, or — if the env var
+        /// `KARDAMOM_AERON_DIR` is set — adopt the already-running Media
+        /// Driver that owns that directory. The env path lets a macOS dev
+        /// run `just aeron-driver-up` and then run the e2e tests against a
+        /// host-native MD, dodging the Docker-on-macOS shared-memory
+        /// limitation.
         pub async fn single_node() -> Result<Self, Box<dyn std::error::Error>> {
+            if let Ok(dir) = std::env::var("KARDAMOM_AERON_DIR") {
+                let aeron_dir = PathBuf::from(dir);
+                // Convention: archive dir lives next to aeron.dir, matching
+                // the layout `aeron-driver-up` writes.
+                let archive_dir = aeron_dir
+                    .parent()
+                    .map(|p| p.join("archive"))
+                    .unwrap_or_else(|| aeron_dir.clone());
+                return Ok(Self {
+                    nodes: vec![Node::External {
+                        aeron_dir,
+                        archive_dir,
+                    }],
+                });
+            }
             ensure_image_built().await?;
             let node = spawn_node().await?;
             Ok(Self { nodes: vec![node] })
@@ -465,35 +513,47 @@ mod docker {
         }
 
         /// "host:port" the test should pass as the Aeron Archive control
-        /// channel endpoint for node `i`.
+        /// channel endpoint for node `i`. Container mode resolves the
+        /// dynamically-allocated host port; external mode returns the
+        /// fixed port `just aeron-driver-up` configures (8010).
         pub async fn archive_control_endpoint(&self, i: usize) -> String {
-            let port = self.nodes[i]
-                .container
-                .get_host_port_ipv4(8010_u16.udp())
-                .await
-                .unwrap();
-            format!("127.0.0.1:{port}")
+            match &self.nodes[i] {
+                Node::Container(c) => {
+                    let port = c
+                        .container
+                        .get_host_port_ipv4(8010_u16.udp())
+                        .await
+                        .unwrap();
+                    format!("127.0.0.1:{port}")
+                }
+                Node::External { .. } => "127.0.0.1:8010".to_string(),
+            }
         }
 
         pub async fn archive_response_endpoint(&self, i: usize) -> String {
-            let port = self.nodes[i]
-                .container
-                .get_host_port_ipv4(8011_u16.udp())
-                .await
-                .unwrap();
-            format!("127.0.0.1:{port}")
+            match &self.nodes[i] {
+                Node::Container(c) => {
+                    let port = c
+                        .container
+                        .get_host_port_ipv4(8011_u16.udp())
+                        .await
+                        .unwrap();
+                    format!("127.0.0.1:{port}")
+                }
+                Node::External { .. } => "127.0.0.1:8011".to_string(),
+            }
         }
 
         /// Host filesystem path of `aeron.dir` for node `i`. Pass this to
         /// `AeronRuntime::spawn_with_dir(...)` so a host Aeron client joins
-        /// the container's Media Driver.
+        /// the Media Driver.
         pub fn aeron_dir_host(&self, i: usize) -> &std::path::Path {
-            &self.nodes[i].aeron_dir_host
+            self.nodes[i].aeron_dir()
         }
 
         /// Host filesystem path of `aeron.archive.dir` for node `i`.
         pub fn archive_dir_host(&self, i: usize) -> &std::path::Path {
-            &self.nodes[i].archive_dir_host
+            self.nodes[i].archive_dir()
         }
 
         pub fn len(&self) -> usize {
@@ -505,8 +565,11 @@ mod docker {
         }
 
         /// Stop node `i` (simulates recorder failure for quorum tests).
+        /// In external mode this is a no-op — the operator manages the MD.
         pub async fn stop(&mut self, i: usize) -> Result<(), Box<dyn std::error::Error>> {
-            self.nodes[i].container.stop().await?;
+            if let Node::Container(c) = &mut self.nodes[i] {
+                c.container.stop().await?;
+            }
             Ok(())
         }
     }
@@ -563,11 +626,11 @@ mod docker {
 
         let container = image.with_shm_size(256 * 1024 * 1024).start().await?;
 
-        Ok(Node {
+        Ok(Node::Container(Box::new(ContainerNode {
             container,
             aeron_dir_host: aeron_dir,
             archive_dir_host: archive_dir,
-        })
+        })))
     }
 
     /// `docker build`s the Aeron image once per test run, idempotent.

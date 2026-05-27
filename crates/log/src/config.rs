@@ -144,22 +144,37 @@ impl Default for LogConfig {
                 file_sync_level: 1,
                 catalog_file_sync_level: 1,
             },
+            // Defaults are all IPC so single-host deployments (the
+            // in-container test runs on Linux, the `just aeron-driver-up`
+            // path runs on macOS) work out of the box. Multi-host
+            // production deployments override the {tx_ordering,
+            // tx_receipts, fsync_watermark, quorum_watermark} channels
+            // to UDP unicast or UDP multicast at the operator's discretion.
+            // macOS in particular cannot route UDP multicast over
+            // loopback, so the IPC defaults are required for local e2e.
             channels: ChannelsConfig {
                 tx_data_channel_template: "aeron:ipc?alias=a-{sid}".into(),
                 tx_data_stream_id_base: 2000,
-                tx_ordering_channel: "aeron:udp?endpoint=224.0.1.1:40001".into(),
+                tx_ordering_channel: "aeron:ipc?alias=tx-ordering".into(),
                 tx_ordering_stream_id: 1001,
-                tx_receipts_channel: "aeron:udp?endpoint=224.0.1.1:40002".into(),
+                tx_receipts_channel: "aeron:ipc?alias=tx-receipts".into(),
                 tx_receipts_stream_id: 1002,
-                tx_errors_channel: "aeron:udp?endpoint=224.0.1.1:40003".into(),
-                tx_errors_stream_id: 1003,
-                tx_deposits_channel: "aeron:udp?endpoint=224.0.1.1:40004".into(),
-                tx_deposits_stream_id: 1004,
-                fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),
+                tx_errors_channel: "aeron:ipc?alias=tx-errors".into(),
+                // 1003 collides with `tx_receipts_stream_id + 1` (the
+                // BlockBoundary side-stream); Aeron IPC routes by
+                // stream_id (alias is purely a debug label), so a
+                // subscriber on tx-errors/1003 receives the executor's
+                // BlockBoundary frames and rkyv-decodes them as TxError.
+                // 1015 sits comfortably between the receipt block (1002,
+                // 1003) and the fsync-watermark block (1010).
+                tx_errors_stream_id: 1015,
+                tx_deposits_channel: "aeron:ipc?alias=tx-deposits".into(),
+                tx_deposits_stream_id: 1016,
+                fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
                 fsync_watermark_stream_id: 1010,
                 fsync_watermark_tx_data_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),
                 fsync_watermark_tx_data_stream_id_base: 1030,
-                quorum_watermark_channel: "aeron:udp?endpoint=224.0.1.1:40020".into(),
+                quorum_watermark_channel: "aeron:ipc?alias=quorum-watermark".into(),
                 quorum_watermark_stream_id: 1020,
             },
             quorum: QuorumConfig { n: 3, q: 2 },

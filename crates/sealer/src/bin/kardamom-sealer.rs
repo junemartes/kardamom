@@ -72,6 +72,20 @@ async fn main() -> Result<()> {
         .context("open TxOrderingPublisherHandle")?;
     let adapter = TxOrderingBoundaryAdapter::new(publisher);
 
+    // Spawn a tail-tracker: subscribe to tx_ordering, forward every
+    // observed fragment's position into the adapter's `last_pos`. The
+    // executor checks `BoundaryStart.end_tx_idx == last_processed_pos`
+    // for alignment, so the sealer must stamp the boundary with the
+    // actual stream tail — not just positions it has itself published.
+    let mut tail_sub = TxOrderingSubscriberHandle::open(&rt, &channels)
+        .context("open TxOrderingSubscriberHandle for tail tracker")?;
+    let last_pos = adapter.last_pos_handle();
+    tokio::spawn(async move {
+        while let Some((pos, _msg)) = tail_sub.recv().await {
+            *last_pos.lock().unwrap() = pos;
+        }
+    });
+
     let sealer = Sealer::new(cfg.clone(), SystemClock, adapter, initial_block)
         .context("construct Sealer")?;
 
@@ -126,6 +140,13 @@ struct TxOrderingBoundaryAdapter {
 }
 
 impl TxOrderingBoundaryAdapter {
+    /// Hand out a clone of the shared `last_pos` cell so an external
+    /// tail-tracker task can keep it up-to-date as TxRefs land on
+    /// tx_ordering from the racing sequencers.
+    fn last_pos_handle(&self) -> Arc<Mutex<BPosition>> {
+        self.last_pos.clone()
+    }
+
     fn new(pub_handle: TxOrderingPublisherHandle) -> Self {
         Self {
             pub_handle,

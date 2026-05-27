@@ -258,9 +258,13 @@ fn workspace_target_bin() -> PathBuf {
 
 fn write_sealer_config(dir: &Path) -> PathBuf {
     let p = dir.join("sealer.toml");
+    // Match `LogConfig::default().channels.tx_ordering_*` so the sealer
+    // publishes on the same Aeron stream the executor + sequencer
+    // subscribe to. UDP multicast doesn't round-trip through macOS
+    // loopback, so we use the IPC defaults for local + CI alike.
     let body = r#"
 host_id = 0
-channel_b_uri = "aeron:udp?endpoint=224.0.1.1:40001"
+channel_b_uri = "aeron:ipc?alias=tx-ordering"
 channel_b_tx_stream_id = 1
 channel_b_boundary_stream_id = 1001
 tick_interval_ms = 250
