@@ -1,0 +1,39 @@
+[package]
+name = "kardamom-da-watcher"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+testing = []
+
+[dependencies]
+kardamom-types = { workspace = true }
+
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+alloy-rpc-types-eth.workspace = true
+alloy-rlp.workspace = true
+alloy-sol-types.workspace = true
+
+bytes.workspace = true
+async-trait = "0.1"
+thiserror.workspace = true
+tokio = { workspace = true }
+tracing.workspace = true
+
+# Binary-only deps. These are unused by the library itself; they support the
+# `kardamom-da-watcher` CLI binary defined under `src/bin/`.
+anyhow.workspace = true
+clap.workspace = true
+humantime-serde.workspace = true
+serde.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+alloy-primitives.workspace = true
+
+[[bin]]
+name = "kardamom-da-watcher"
+path = "src/bin/kardamom-da-watcher.rs"

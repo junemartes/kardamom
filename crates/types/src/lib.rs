@@ -19,6 +19,7 @@
 pub mod ack_policy;
 pub mod boundary;
 pub mod delta;
+pub mod deposit;
 pub mod envelope;
 pub mod genesis;
 pub mod position;
@@ -33,6 +34,7 @@ pub mod wire;
 pub use ack_policy::AckPolicy;
 pub use boundary::{BlockBoundary, BlockBoundaryStart};
 pub use delta::{AccountChange, BlockDelta, StorageChange};
+pub use deposit::{Deposit, DepositRef};
 pub use envelope::TxEnvelope;
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::BPosition;

@@ -167,6 +167,63 @@ fn tx_error_roundtrip() {
 }
 
 #[test]
+fn deposit_roundtrip_call() {
+    let d = Deposit {
+        source_hash: B256::repeat_byte(0xAA),
+        from: Address::repeat_byte(0x11),
+        to: Some(Address::repeat_byte(0x22)),
+        mint: 1_000_000_000_000u128,
+        value: alloy_primitives::U256::from(500_000_000_000u128),
+        gas_limit: 200_000,
+        is_system_transaction: false,
+        input: Bytes::from_static(b"\xde\xad\xbe\xef"),
+    };
+    assert_eq!(roundtrip(&d), d);
+}
+
+#[test]
+fn deposit_roundtrip_create() {
+    let d = Deposit {
+        source_hash: B256::repeat_byte(0xBB),
+        from: Address::repeat_byte(0x33),
+        to: None,
+        mint: 0,
+        value: alloy_primitives::U256::ZERO,
+        gas_limit: 100_000,
+        is_system_transaction: false,
+        input: Bytes::new(),
+    };
+    assert_eq!(roundtrip(&d), d);
+}
+
+#[test]
+fn deposit_ref_roundtrip() {
+    let r = DepositRef {
+        source_hash: B256::repeat_byte(0xCD),
+        deposit_position: BPosition {
+            term_id: 2,
+            term_offset: 4096,
+        },
+    };
+    assert_eq!(roundtrip(&r), r);
+}
+
+#[test]
+fn tx_ordering_message_deposit_ref_variant_roundtrips() {
+    let r = DepositRef {
+        source_hash: B256::repeat_byte(0x99),
+        deposit_position: BPosition {
+            term_id: 0,
+            term_offset: 64,
+        },
+    };
+    let msg = TxOrderingMessage::DepositRef(r);
+    assert_eq!(roundtrip(&msg), msg);
+    assert!(msg.is_deposit_ref());
+    assert_eq!(msg.as_deposit_ref(), Some(&r));
+}
+
+#[test]
 fn tx_ref_roundtrip() {
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,

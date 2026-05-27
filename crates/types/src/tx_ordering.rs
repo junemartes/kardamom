@@ -1,16 +1,20 @@
 //! TxOrdering wire message: the canonical-orderer payload in the split
 //! architecture.
 //!
-//! TxOrdering carries only two things, both small:
+//! TxOrdering carries only three things, all small:
 //!   1. [`TxRef`] — a pointer into the per-sequencer tx_data archive,
 //!      written by sequencers via Aeron *concurrent* multi-publisher.
-//!   2. [`BlockBoundaryStart`] — block-boundary marker written by the sealer
+//!   2. [`DepositRef`] — a pointer into the `tx_deposits` archive, also
+//!      written by sequencers in response to deposit messages observed on
+//!      `tx_deposits`. Carries the canonical ordering of L1 deposits
+//!      interleaved with regular L2 txs.
+//!   3. [`BlockBoundaryStart`] — block-boundary marker written by the sealer
 //!      (also concurrent multi-publisher on the same stream so the boundary
 //!      is canonically ordered with the surrounding refs).
 //!
-//! Both variants are tiny (~16-32 B), so the tx_ordering CAS cursor sees only
-//! reference traffic; the bulk-data path runs on M parallel exclusive channel
-//! A archives. See
+//! All three variants are tiny (~16-36 B), so the tx_ordering CAS cursor sees
+//! only reference traffic; the bulk-data path runs on M parallel exclusive
+//! channel A archives plus the deposits archive.
 //!
 //! Encoded as a 1-byte tag prefix followed by the rkyv archive of the variant.
 //! We keep the tag *outside* the rkyv archive so that a reader can branch
@@ -19,6 +23,7 @@
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::boundary::BlockBoundaryStart;
+use crate::deposit::DepositRef;
 use crate::txref::TxRef;
 
 /// One tx_ordering wire record. Variants are kept narrow to preserve the
@@ -29,14 +34,22 @@ use crate::txref::TxRef;
 pub enum TxOrderingMessage {
     /// A reference to a transaction on a tx_data archive.
     TxRef(TxRef),
+    /// A reference to a deposit on the `tx_deposits` archive.
+    DepositRef(DepositRef),
     /// A block-boundary marker emitted by the sealer.
     BoundaryStart(BlockBoundaryStart),
 }
 
 impl TxOrderingMessage {
-    /// Whether this record is a tx ref (vs. a sealer-emitted boundary).
+    /// Whether this record is a tx ref (vs. a sealer-emitted boundary or a
+    /// deposit ref).
     pub const fn is_tx_ref(&self) -> bool {
         matches!(self, Self::TxRef(_))
+    }
+
+    /// Whether this record is a deposit ref.
+    pub const fn is_deposit_ref(&self) -> bool {
+        matches!(self, Self::DepositRef(_))
     }
 
     /// Whether this record is a block-boundary marker.
@@ -48,7 +61,15 @@ impl TxOrderingMessage {
     pub const fn as_tx_ref(&self) -> Option<&TxRef> {
         match self {
             Self::TxRef(r) => Some(r),
-            Self::BoundaryStart(_) => None,
+            Self::DepositRef(_) | Self::BoundaryStart(_) => None,
+        }
+    }
+
+    /// If this record is a deposit ref, return the contained `DepositRef`.
+    pub const fn as_deposit_ref(&self) -> Option<&DepositRef> {
+        match self {
+            Self::DepositRef(d) => Some(d),
+            Self::TxRef(_) | Self::BoundaryStart(_) => None,
         }
     }
 
@@ -56,7 +77,7 @@ impl TxOrderingMessage {
     pub const fn as_boundary(&self) -> Option<&BlockBoundaryStart> {
         match self {
             Self::BoundaryStart(b) => Some(b),
-            Self::TxRef(_) => None,
+            Self::TxRef(_) | Self::DepositRef(_) => None,
         }
     }
 }
@@ -64,6 +85,12 @@ impl TxOrderingMessage {
 impl From<TxRef> for TxOrderingMessage {
     fn from(r: TxRef) -> Self {
         Self::TxRef(r)
+    }
+}
+
+impl From<DepositRef> for TxOrderingMessage {
+    fn from(d: DepositRef) -> Self {
+        Self::DepositRef(d)
     }
 }
 

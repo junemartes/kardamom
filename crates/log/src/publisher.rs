@@ -33,8 +33,8 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope, TxError, TxOrderingMessage, TxRef,
+    BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
+    Receipt, TxEnvelope, TxError, TxOrderingMessage, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
@@ -209,6 +209,28 @@ impl TxErrorsPublisher {
 
     pub fn publish(&self, e: &TxError) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, e)
+    }
+}
+
+/// TxDeposits: DA-watcher → sequencer channel for L1 deposit envelopes.
+/// RAM only.
+pub struct TxDepositsPublisher {
+    pub_handle: Pub,
+}
+
+impl TxDepositsPublisher {
+    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let pub_handle = add_pub(
+            aeron,
+            &ch.tx_deposits_channel,
+            ch.tx_deposits_stream_id,
+            "dep",
+        )?;
+        Ok(Self { pub_handle })
+    }
+
+    pub fn publish(&self, d: &Deposit) -> Result<BPosition, LogError> {
+        offer(&self.pub_handle, d)
     }
 }
 

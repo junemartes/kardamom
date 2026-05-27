@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
             cfg,
             a_subs,
             b_sub,
+            None, // dep_sub: deposits wired via DA watcher in a follow-up
             c_pub,
             snapshots,
             sw_signal,

@@ -69,6 +69,13 @@ pub struct ChannelsConfig {
     pub tx_errors_channel: String,
     pub tx_errors_stream_id: i32,
 
+    /// TxDeposits: DA watcher publishes full `Deposit` envelopes here; the M
+    /// sequencers subscribe and republish a `DepositRef` onto `tx_ordering`
+    /// so the canonical order interleaves L1 deposits with regular L2 txs.
+    /// RAM only.
+    pub tx_deposits_channel: String,
+    pub tx_deposits_stream_id: i32,
+
     /// TxOrdering per-recorder fsync watermark publication, parameterized by
     /// recorder_id. e.g. "aeron:ipc?alias=fsync-wm-b-{rid}".
     pub fsync_watermark_channel_template: String,
@@ -146,6 +153,8 @@ impl Default for LogConfig {
                 tx_receipts_stream_id: 1002,
                 tx_errors_channel: "aeron:udp?endpoint=224.0.1.1:40003".into(),
                 tx_errors_stream_id: 1003,
+                tx_deposits_channel: "aeron:udp?endpoint=224.0.1.1:40004".into(),
+                tx_deposits_stream_id: 1004,
                 fsync_watermark_channel_template: "aeron:udp?endpoint=224.0.1.1:4010{rid}".into(),
                 fsync_watermark_stream_id: 1010,
                 fsync_watermark_tx_data_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),

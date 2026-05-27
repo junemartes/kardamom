@@ -63,8 +63,8 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, FsyncWatermark, QuorumWatermark, Receipt,
-    TxEnvelope, TxError, TxOrderingMessage,
+    BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
+    Receipt, TxEnvelope, TxError, TxOrderingMessage,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -740,6 +740,52 @@ impl TxErrorsSubscriberHandle {
 }
 
 // ---------------------------------------------------------------------------
+// TxDeposits (DA watcher → sequencer).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct TxDepositsPublisherHandle {
+    inner: PubHandle,
+}
+
+impl TxDepositsPublisherHandle {
+    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        Ok(Self {
+            inner: rt.open_publication(&ch.tx_deposits_channel, ch.tx_deposits_stream_id)?,
+        })
+    }
+
+    pub fn publish(&self, d: &Deposit) -> Result<BPosition, LogError> {
+        self.inner.publish(d)
+    }
+
+    pub fn raw(&self) -> &PubHandle {
+        &self.inner
+    }
+}
+
+pub struct TxDepositsSubscriberHandle {
+    rx: UnboundedReceiver<(BPosition, Deposit)>,
+}
+
+impl TxDepositsSubscriberHandle {
+    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        Ok(Self {
+            rx: rt
+                .open_subscription::<Deposit>(&ch.tx_deposits_channel, ch.tx_deposits_stream_id)?,
+        })
+    }
+
+    pub async fn recv(&mut self) -> Option<(BPosition, Deposit)> {
+        self.rx.recv().await
+    }
+
+    pub fn try_recv(&mut self) -> Option<(BPosition, Deposit)> {
+        self.rx.try_recv().ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Per-recorder fsync watermark.
 // ---------------------------------------------------------------------------
 
@@ -849,6 +895,8 @@ const _: fn() = || {
     assert_send::<TxReceiptsBoundarySubscriberHandle>();
     assert_send_sync::<TxErrorsPublisherHandle>();
     assert_send::<TxErrorsSubscriberHandle>();
+    assert_send_sync::<TxDepositsPublisherHandle>();
+    assert_send::<TxDepositsSubscriberHandle>();
     assert_send_sync::<FsyncWatermarkPublisherHandle>();
     assert_send::<FsyncWatermarkSubscriberHandle>();
     assert_send_sync::<QuorumPublisherHandle>();

@@ -175,6 +175,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             cfg,
             a_subs,
             b_sub,
+            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,
