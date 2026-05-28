@@ -28,9 +28,13 @@ tracing.workspace = true
 # Note: docker-e2e is activated only when the `full-pipeline-e2e`
 # feature is enabled (see [features] above).
 alloy-consensus.workspace = true
+alloy-contract.workspace = true
 alloy-network.workspace = true
+alloy-node-bindings.workspace = true
+alloy-provider.workspace = true
 alloy-rlp.workspace = true
 alloy-signer-local.workspace = true
+alloy-sol-types.workspace = true
 anyhow.workspace = true
 async-trait = "0.1"
 criterion.workspace = true
@@ -39,6 +43,8 @@ hex = "0.4"
 libc.workspace = true
 hdrhistogram.workspace = true
 jsonrpsee = { workspace = true, features = ["http-client"] }
+kardamom-da-watcher = { path = "../da_watcher" }
+kardamom-deployer = { path = "../deployer" }
 kardamom-executor = { path = "../executor" }
 kardamom-ingress = { path = "../ingress" }
 kardamom-sealer = { path = "../sealer" }

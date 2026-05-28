@@ -98,21 +98,59 @@ java-home:
     echo "ERROR: no JDK 17+ found. Run 'just bootstrap'." >&2
     exit 1
 
+# Install a cmake wrapper shim under ${TMPDIR:-/tmp}/kardamom-cmake-shim/ that
+# forwards to the real cmake but injects -DJava_{JAVA,JAVAC,JAR,JAVADOC}_EXECUTABLE
+# pointing at $JAVA_HOME's bin on configure calls (those with -B). Without this,
+# the rusteron-archive build invokes cmake which on macOS hard-codes
+# /usr/libexec/java_home (returns the system JDK 11) for FindJava — even with
+# JAVA_HOME set in the env. The shim also ensures $JAVA_HOME/bin is at the
+# front of PATH so the SBE-codegen Gradle step picks up JDK 17 too.
+[private]
+java-shim:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    JH="$(just java-home)"
+    SHIM_DIR="${TMPDIR:-/tmp}/kardamom-cmake-shim"
+    mkdir -p "$SHIM_DIR"
+    REAL_CMAKE="$(command -v cmake)"
+    [[ -x "$REAL_CMAKE" ]] || { echo "ERROR: cmake not found" >&2; exit 1; }
+    cat > "$SHIM_DIR/cmake" <<EOF
+    #!/usr/bin/env bash
+    inject=0
+    for a in "\$@"; do
+      case "\$a" in
+        --build|--install|--version) inject=0; break ;;
+        -B) inject=1 ;;
+      esac
+    done
+    if [[ "\$inject" == "1" && -n "\${JAVA_HOME:-}" && -x "\$JAVA_HOME/bin/java" ]]; then
+      exec "$REAL_CMAKE" \\
+        "-DJava_JAVA_EXECUTABLE=\$JAVA_HOME/bin/java" \\
+        "-DJava_JAVAC_EXECUTABLE=\$JAVA_HOME/bin/javac" \\
+        "-DJava_JAR_EXECUTABLE=\$JAVA_HOME/bin/jar" \\
+        "-DJava_JAVADOC_EXECUTABLE=\$JAVA_HOME/bin/javadoc" \\
+        "\$@"
+    fi
+    exec "$REAL_CMAKE" "\$@"
+    EOF
+    chmod +x "$SHIM_DIR/cmake"
+    echo "$SHIM_DIR:$JH/bin"
+
 # Type-check the whole workspace with every feature (incl. aeron-live).
 check:
-    JAVA_HOME="$(just java-home)" cargo check --workspace --all-features --locked
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo check --workspace --all-features --locked
 
 # Lint with clippy across all features, mirroring CI (-D warnings).
 clippy:
-    JAVA_HOME="$(just java-home)" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
 # Run the test suite across all features.
 test:
-    JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked
 
 # Targeted check that just the Aeron bindings compile.
 check-aeron:
-    JAVA_HOME="$(just java-home)" cargo check -p kardamom-log --features aeron-live --locked
+    PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo check -p kardamom-log --features aeron-live --locked
 
 # Path where the host-native Aeron Media Driver writes cnc.dat + archive.
 # Used by `aeron-driver-up` / `aeron-driver-down` / `test-e2e-local`. Lives
@@ -206,10 +244,13 @@ test-e2e-local: aeron-driver-up
     set -euo pipefail
     DIR={{AERON_LOCAL_ROOT}}/dir
     trap 'just aeron-driver-down' EXIT
-    JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
+    SHIM="$(just java-shim)"
+    PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
         cargo test -p e2e --features full-pipeline-e2e \
             --test full_pipeline_e2e --locked -- --ignored --nocapture proof_of_pipeline
-    JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
+    PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
         cargo test -p e2e --features full-pipeline-e2e \
             --test multiprocess_e2e --locked -- --ignored --nocapture --test-threads=1 \
-            multiprocess_e2e_signed_transfer_round_trip multiprocess_e2e_deposit_round_trip
+            multiprocess_e2e_signed_transfer_round_trip \
+            multiprocess_e2e_deposit_round_trip \
+            anvil_pipeline_e2e_l1_deposit_and_l2_round_trip

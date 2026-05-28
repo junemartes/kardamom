@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::{Address, B256, TxKind, U256, address};
 use alloy_rlp::{Decodable, Encodable};
 use alloy_signer_local::PrivateKeySigner;
 use jsonrpsee::core::client::ClientT;
@@ -415,6 +415,399 @@ async fn multiprocess_e2e_deposit_round_trip() {
 }
 
 // ============================================================================
+// Phase 2: anvil L1 → da-watcher → L2 round-trip
+// ============================================================================
+
+use alloy_node_bindings::Anvil;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_sol_types::sol;
+use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
+use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
+
+sol! {
+    #[sol(rpc)]
+    contract ETHLockbox {
+        function depositETH(address to, uint64 gasLimit, bytes calldata data) external payable;
+    }
+}
+
+/// Factory owner used by the kardamom-deployer ERC-7955 factory bootstrap.
+/// Pinned by `kardamom_deployer::tests` so dev/test deployments are
+/// deterministic.
+const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
+/// Arbitrary L1 EOA that calls `depositETH` — distinct from the factory
+/// owner to demonstrate the lockbox is permissionless.
+const DEPOSITOR: Address = address!("000000000000000000000000000000000000C0FE");
+
+/// Full L1 → L2 round-trip:
+///
+/// 1. Spin up anvil as the L1.
+/// 2. Inject the ERC-7955 factory bytecode at the canonical address.
+/// 3. Deploy `ETHLockbox` via `kardamom_deployer` (proxy + impl, all on L1).
+/// 4. Spin up the five kardamom services (sealer, sequencer, executor,
+///    ingress, da-watcher) — da-watcher pointed at anvil's RPC + the
+///    deployed lockbox.
+/// 5. Call `depositETH(target, …)` on L1 as DEPOSITOR.
+/// 6. Wait for the L2 deposit `Receipt` on tx_receipts (matched by
+///    `source_hash = Receipt.tx_hash`). The full path exercised:
+///    L1 event → da-watcher derives `Deposit` → publishes on tx_deposits
+///    → sequencer republishes `DepositRef` on tx_ordering → executor
+///    joins, mints, publishes Receipt.
+/// 7. Execute three L2 transfers from Alice (funded via genesis alloc).
+/// 8. Deploy a tiny contract on L2 from Alice; assert
+///    `contractAddress != 0x0` and `status = 0x1`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires anvil (forge) + Docker / host-native MD + cargo-built kardamom-* bins; run with `cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e -- --ignored --nocapture anvil_pipeline_e2e_l1_deposit_and_l2_round_trip`"]
+async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    if !docker_available().await {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+
+    // -------- L1: anvil + ERC-7955 factory + ETHLockbox -----------------
+    // `--slots-in-an-epoch 1` makes anvil's `finalized` tag advance after
+    // each new block (default value lags `latest` by ~64 blocks, mirroring
+    // mainnet finality). The da-watcher reads only finalized blocks, so
+    // without this the watcher would never see the deposit.
+    let anvil = match Anvil::new()
+        .arg("--slots-in-an-epoch")
+        .arg("1")
+        .try_spawn()
+    {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("skipping: anvil unavailable: {e}");
+            return;
+        }
+    };
+    let l1_url = anvil.endpoint();
+    tracing::info!(l1_url = %l1_url, "anvil L1 up");
+
+    let l1_provider = ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .connect_http(l1_url.parse().expect("parse anvil endpoint"));
+
+    // Inject the ERC-7955 factory runtime at its canonical address so the
+    // deployer can drive it without us having to deploy the factory's
+    // CREATE2 deployer ourselves.
+    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
+    let _: serde_json::Value = l1_provider
+        .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
+        .await
+        .expect("anvil_setCode");
+
+    // Fund + impersonate the deployer owner and the depositor. The owner
+    // pays for factory bootstrap + the EthLockbox deploy; the depositor
+    // pays for `depositETH` later.
+    for who in [DEV_OWNER, DEPOSITOR] {
+        let _: serde_json::Value = l1_provider
+            .raw_request(
+                "anvil_setBalance".into(),
+                (who, U256::from(1_000_000_000_000_000_000_000u128)),
+            )
+            .await
+            .expect("anvil_setBalance");
+        let _: serde_json::Value = l1_provider
+            .raw_request("anvil_impersonateAccount".into(), (who,))
+            .await
+            .expect("anvil_impersonateAccount");
+    }
+
+    // Deploy ETHLockbox via the deployer. `l2_minter` is an opaque param
+    // baked into the lockbox at init — we don't exercise the L2-side mint
+    // authority here (the executor mints unconditionally from a Deposit).
+    let l2_minter = Address::from([0xBE; 20]);
+    let deployer = Deployer::new(l1_provider.clone(), DEV_OWNER);
+    deployer
+        .ensure_factory(DEV_OWNER)
+        .await
+        .expect("ensure_factory");
+    deployer
+        .apply(
+            &[Op::Deploy {
+                l2_chain_id: CHAIN_ID,
+                id: ContractId::EthLockbox,
+                init_args: encode_address_arg(l2_minter),
+            }],
+            DEV_OWNER,
+        )
+        .await
+        .expect("deploy ETHLockbox");
+
+    let entries = deployer
+        .addresses(Some(CHAIN_ID))
+        .await
+        .expect("addresses");
+    let lockbox_addr = entries
+        .iter()
+        .find(|e| e.id == ContractId::EthLockbox.id())
+        .expect("ETHLockbox registered")
+        .proxy;
+    tracing::info!(?lockbox_addr, "ETHLockbox deployed on L1");
+
+    // -------- Kardamom: 5 services, including da-watcher ----------------
+    build_service_bins_with_da_watcher();
+
+    let cluster = AeronTestCluster::single_node()
+        .await
+        .expect("aeron container up");
+    let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
+    tracing::info!(aeron_dir = %aeron_dir.display(), "aeron container running");
+
+    let cfg_dir = TempDir::new().expect("cfg tempdir");
+    let sealer_cfg = write_sealer_config(cfg_dir.path());
+    let sequencer_cfg = write_sequencer_config(cfg_dir.path());
+    let executor_cfg = write_executor_config(cfg_dir.path());
+    let ingress_cfg = write_ingress_config(cfg_dir.path());
+
+    // Alice is funded via genesis (for the L2 transfer + contract deploy
+    // steps); Bob receives transfers; `l2_target` is the deposit's L2
+    // recipient (the inner-call target).
+    let alice = signer_from_seed(0x11);
+    let alice_addr = alice.address();
+    let bob_addr = Address::repeat_byte(0x22);
+    let l2_target = Address::repeat_byte(0x44);
+    let genesis_path = write_genesis_toml(cfg_dir.path(), CHAIN_ID, alice_addr);
+
+    let target_bin = workspace_target_bin();
+
+    let sealer = ChildGuard::spawn(
+        "kardamom-sealer",
+        Command::new(target_bin.join("kardamom-sealer"))
+            .arg("--config")
+            .arg(&sealer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let sequencer = ChildGuard::spawn(
+        "kardamom-sequencer",
+        Command::new(target_bin.join("kardamom-sequencer"))
+            .arg("--config")
+            .arg(&sequencer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let executor = ChildGuard::spawn(
+        "kardamom-executor",
+        Command::new(target_bin.join("kardamom-executor"))
+            .arg("--config")
+            .arg(&executor_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--chain-id")
+            .arg(CHAIN_ID.to_string())
+            .arg("--chain")
+            .arg(&genesis_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let ingress = ChildGuard::spawn(
+        "kardamom-ingress",
+        Command::new(target_bin.join("kardamom-ingress"))
+            .arg("--config")
+            .arg(&ingress_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--jsonrpc-bind")
+            .arg(format!("127.0.0.1:{JSONRPC_PORT}"))
+            .arg("--ack-policy")
+            .arg("on-offer")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let da_watcher = ChildGuard::spawn(
+        "kardamom-da-watcher",
+        Command::new(target_bin.join("kardamom-da-watcher"))
+            .arg("--l1-rpc")
+            .arg(&l1_url)
+            .arg("--lockbox")
+            .arg(format!("{lockbox_addr:#x}"))
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            // Short poll: anvil produces blocks on demand, so 1 s is plenty.
+            .arg("--poll-interval-secs")
+            .arg("1")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+
+    let rpc_url = format!("http://127.0.0.1:{JSONRPC_PORT}");
+    wait_for_jsonrpc(&rpc_url, Duration::from_secs(30))
+        .await
+        .expect("ingress JSON-RPC ready");
+    // Pipeline settle: same Aeron-handshake race as the L2-only test —
+    // see issue #31 for the upstream fix.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Test-side: subscribe to tx_receipts so we can wait for the deposit's
+    // executor receipt by source_hash.
+    let aeron_rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
+    let channels = LogConfig::default().channels;
+    let mut receipts_sub =
+        TxReceiptsSubscriberHandle::open(&aeron_rt, &channels).expect("receipts sub");
+    tokio::time::sleep(Duration::from_secs(2)).await; // sub handshake
+
+    // -------- Step 1: deposit on L1 -------------------------------------
+    let lockbox = ETHLockbox::new(lockbox_addr, l1_provider.clone());
+    const MINT_WEI: u128 = 50_000_000_000_000_000_000; // 50 ETH
+    let l1_receipt = lockbox
+        .depositETH(l2_target, 200_000, alloy_primitives::Bytes::new())
+        .value(U256::from(MINT_WEI))
+        .from(DEPOSITOR)
+        .send()
+        .await
+        .expect("send depositETH")
+        .get_receipt()
+        .await
+        .expect("L1 depositETH receipt");
+
+    let log = l1_receipt
+        .inner
+        .logs()
+        .iter()
+        .find(|l| l.address() == lockbox_addr)
+        .expect("DepositInitiated log on lockbox");
+    let l1_block_hash = log.block_hash.expect("block_hash");
+    let l1_log_index: u64 = log.log_index.expect("log_index");
+    let expected_source_hash = kardamom_da_watcher::source_hash(l1_block_hash, l1_log_index);
+    tracing::info!(
+        ?expected_source_hash,
+        ?l1_block_hash,
+        l1_log_index,
+        "L1 deposit submitted; waiting for da-watcher → L2"
+    );
+
+    // Force-advance the L1 chain a few blocks so the `finalized` tag moves
+    // past the deposit's block. With `--slots-in-an-epoch 1`, finalised
+    // lags `latest` by ~2 blocks; mining 5 more comfortably covers that
+    // even after further L1 activity.
+    for _ in 0..5 {
+        let _: serde_json::Value = l1_provider
+            .raw_request("evm_mine".into(), ())
+            .await
+            .expect("evm_mine");
+    }
+
+    // -------- Step 2: wait for the executor's deposit Receipt ------------
+    // The executor stamps `Receipt.tx_hash = deposit.source_hash` for
+    // deposits, so we match on source_hash directly. Generous 60 s window
+    // covers anvil's finalisation lag + the watcher's 1 s poll + the
+    // sequencer/executor processing time.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let mut deposit_receipt: Option<kardamom_types::Receipt> = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), receipts_sub.recv()).await {
+            Ok(Some((_pos, r))) if r.tx_hash == expected_source_hash => {
+                deposit_receipt = Some(r);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("tx_receipts subscription closed unexpectedly"),
+            Err(_) => continue,
+        }
+    }
+    let dr = deposit_receipt.expect("no L2 deposit receipt arrived within 60 s");
+    assert!(dr.status, "deposit receipt status=false: {dr:?}");
+    assert_eq!(dr.to, Some(l2_target), "deposit receipt.to mismatch");
+    assert_eq!(
+        dr.effective_gas_price, 0,
+        "deposits pay no fee — effective_gas_price should be 0"
+    );
+    tracing::info!(
+        block_number = dr.block_number,
+        gas_used = dr.gas_used,
+        "L1 → L2 deposit confirmed"
+    );
+
+    // -------- Step 3: three L2 transfers from Alice ---------------------
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_secs(60))
+        .build(&rpc_url)
+        .expect("http client");
+
+    for nonce in 0..3 {
+        let raw = signed_transfer(&alice, bob_addr, U256::from(1u64), nonce);
+        let raw_hex = format!("0x{}", hex::encode(&raw));
+        let tx_hash: B256 = client
+            .request("eth_sendRawTransaction", rpc_params![&raw_hex])
+            .await
+            .expect("eth_sendRawTransaction (transfer)");
+        let env = ConsensusEnvelope::decode(&mut raw.as_slice()).expect("decode my tx");
+        assert_eq!(tx_hash, *env.tx_hash(), "transfer nonce={nonce} hash mismatch");
+        let receipt: Value = client
+            .request("eth_getTransactionReceipt", rpc_params![tx_hash])
+            .await
+            .expect("eth_getTransactionReceipt (transfer)");
+        let status = receipt
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(
+            status, "0x1",
+            "transfer nonce={nonce} status not success ({receipt})"
+        );
+    }
+    tracing::info!("3 L2 transfers confirmed");
+
+    // -------- Step 4: contract-creation on L2 from Alice ----------------
+    // Tiny valid creation bytecode that returns a 1-byte runtime (0x01):
+    //   60 01 60 0c 60 00 39 60 01 60 00 f3 01
+    //   PUSH1 1 PUSH1 12 PUSH1 0 CODECOPY PUSH1 1 PUSH1 0 RETURN <runtime>
+    let creation = hex::decode("6001600c60003960016000f301").expect("decode bytecode");
+    let raw = signed_create_contract(&alice, &creation, 3);
+    let raw_hex = format!("0x{}", hex::encode(&raw));
+    let tx_hash: B256 = client
+        .request("eth_sendRawTransaction", rpc_params![&raw_hex])
+        .await
+        .expect("eth_sendRawTransaction (deploy)");
+    let receipt: Value = client
+        .request("eth_getTransactionReceipt", rpc_params![tx_hash])
+        .await
+        .expect("eth_getTransactionReceipt (deploy)");
+    let status = receipt
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(status, "0x1", "deploy status not success ({receipt})");
+    let contract_address = receipt
+        .get("contractAddress")
+        .and_then(|v| v.as_str())
+        .expect("contractAddress");
+    assert!(
+        contract_address.starts_with("0x")
+            && contract_address != "0x0000000000000000000000000000000000000000",
+        "contractAddress not set ({contract_address})"
+    );
+    tracing::info!(contract_address, "L2 contract deployed");
+
+    // -------- Teardown --------------------------------------------------
+    drop(receipts_sub);
+    drop(aeron_rt);
+    drop(da_watcher);
+    drop(ingress);
+    drop(executor);
+    drop(sequencer);
+    drop(sealer);
+    drop(cluster);
+    drop(anvil);
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
@@ -442,6 +835,32 @@ fn build_service_bins() {
         .status()
         .expect("cargo build status");
     assert!(st.success(), "failed to build kardamom service bins");
+}
+
+/// Same as [`build_service_bins`] but also builds `kardamom-da-watcher`.
+/// Used by the anvil-rooted Phase 2 test that needs the DA watcher
+/// subprocess to read deposits from the L1.
+fn build_service_bins_with_da_watcher() {
+    let st = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "-p",
+            "kardamom-sealer",
+            "-p",
+            "kardamom-sequencer",
+            "-p",
+            "kardamom-executor",
+            "-p",
+            "kardamom-ingress",
+            "-p",
+            "kardamom-da-watcher",
+            "--bins",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("cargo build status");
+    assert!(st.success(), "failed to build kardamom service bins (+ da-watcher)");
 }
 
 /// Resolve `<workspace>/target/<profile>` where the service bins live.
@@ -538,6 +957,24 @@ fn signed_transfer(signer: &PrivateKeySigner, to: Address, value: U256, nonce: u
     let sig = signer.sign_transaction_sync(&mut tx).expect("sign");
     let env: ConsensusEnvelope = tx.into_signed(sig).into();
     let mut out = Vec::with_capacity(256);
+    env.encode(&mut out);
+    out
+}
+
+/// Sign a contract-creation tx (legacy, no `to` set, `input` = creation code).
+fn signed_create_contract(signer: &PrivateKeySigner, code: &[u8], nonce: u64) -> Vec<u8> {
+    let mut tx = TxLegacy {
+        chain_id: Some(CHAIN_ID),
+        nonce,
+        gas_price: 1,
+        gas_limit: 500_000,
+        to: TxKind::Create,
+        value: U256::ZERO,
+        input: code.to_vec().into(),
+    };
+    let sig = signer.sign_transaction_sync(&mut tx).expect("sign");
+    let env: ConsensusEnvelope = tx.into_signed(sig).into();
+    let mut out = Vec::with_capacity(256 + code.len());
     env.encode(&mut out);
     out
 }
