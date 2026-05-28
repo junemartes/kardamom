@@ -3780,6 +3780,7 @@ dependencies = [
  "bytes",
  "clap",
  "humantime-serde",
+ "kardamom-log",
  "kardamom-types",
  "serde",
  "thiserror 2.0.18",

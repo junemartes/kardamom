@@ -31,7 +31,12 @@ use alloy_signer_local::PrivateKeySigner;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClientBuilder;
 use jsonrpsee::rpc_params;
+use kardamom_log::aeron_live::{
+    AeronRuntime, TxDepositsPublisherHandle, TxReceiptsSubscriberHandle,
+};
+use kardamom_log::config::LogConfig;
 use kardamom_log::testing::AeronTestCluster;
+use kardamom_types::Deposit;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -158,6 +163,14 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
         .await
         .expect("ingress JSON-RPC ready");
 
+    // Pipeline settle: the ingress's JSON-RPC is up as soon as its tokio
+    // task binds, but the sequencer's tx_data subscription opens 1–2 s
+    // later (Aeron client + MD handshake). Aeron IPC late-joiners do not
+    // replay pre-subscription history, so a tx published before the
+    // sequencer subscribes is silently dropped. Sleep so every downstream
+    // sub is connected before we offer anything.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
     // ----- Submit N signed transfers via eth_sendRawTransaction. The
     // ----- proxy waits for the receipt via its in-memory tx_receipts cache
     // ----- (post-PR-#29) and returns the receipt body in the RPC response.
@@ -176,7 +189,7 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
         // waits for the receipt internally and only resolves the request
         // once the receipt has arrived on tx_receipts.
         let returned_hash: B256 = client
-            .request("eth_sendRawTransaction", rpc_params![raw_hex])
+            .request("eth_sendRawTransaction", rpc_params![&raw_hex])
             .await
             .expect("eth_sendRawTransaction");
 
@@ -206,6 +219,194 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
 
     // ----- Teardown. Drop in reverse order so the channels everyone
     // ----- subscribes to remain alive while consumers tear down.
+    drop(ingress);
+    drop(executor);
+    drop(sequencer);
+    drop(sealer);
+    drop(cluster);
+}
+
+/// L1 deposit → L2 mint round-trip.
+///
+/// Bypasses the L1 + DA watcher: opens a `TxDepositsPublisherHandle` in the
+/// test process and offers a synthetic `Deposit` directly onto `tx_deposits`,
+/// then asserts the executor produces a matching success `Receipt` (joined
+/// via `source_hash`) on `tx_receipts`. Exercises the new bin wiring:
+/// sequencer subscribes tx_deposits + emits `DepositRef`, executor joins +
+/// executes via the deposit code path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker / host-native MD + cargo-built kardamom-* bins; run with `cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e -- --ignored --nocapture multiprocess_e2e_deposit_round_trip`"]
+async fn multiprocess_e2e_deposit_round_trip() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    if !docker_available().await {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+
+    build_service_bins();
+
+    let cluster = AeronTestCluster::single_node()
+        .await
+        .expect("aeron container up");
+    let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
+    tracing::info!(aeron_dir = %aeron_dir.display(), "aeron container running");
+
+    let cfg_dir = TempDir::new().expect("cfg tempdir");
+    let sealer_cfg = write_sealer_config(cfg_dir.path());
+    let sequencer_cfg = write_sequencer_config(cfg_dir.path());
+    let executor_cfg = write_executor_config(cfg_dir.path());
+    let ingress_cfg = write_ingress_config(cfg_dir.path());
+
+    // Genesis: no funded EOAs needed — the deposit mints from L1.
+    let genesis_path = write_genesis_toml(cfg_dir.path(), CHAIN_ID, Address::ZERO);
+
+    let target_bin = workspace_target_bin();
+
+    let sealer = ChildGuard::spawn(
+        "kardamom-sealer",
+        Command::new(target_bin.join("kardamom-sealer"))
+            .arg("--config")
+            .arg(&sealer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let sequencer = ChildGuard::spawn(
+        "kardamom-sequencer",
+        Command::new(target_bin.join("kardamom-sequencer"))
+            .arg("--config")
+            .arg(&sequencer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let executor = ChildGuard::spawn(
+        "kardamom-executor",
+        Command::new(target_bin.join("kardamom-executor"))
+            .arg("--config")
+            .arg(&executor_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--chain-id")
+            .arg(CHAIN_ID.to_string())
+            .arg("--chain")
+            .arg(&genesis_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let ingress = ChildGuard::spawn(
+        "kardamom-ingress",
+        Command::new(target_bin.join("kardamom-ingress"))
+            .arg("--config")
+            .arg(&ingress_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--jsonrpc-bind")
+            .arg(format!("127.0.0.1:{JSONRPC_PORT}"))
+            .arg("--ack-policy")
+            .arg("on-offer")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+
+    // Use the ingress's JSON-RPC bind as a readiness proxy: when it's
+    // listening, every bin is at least partway through Aeron setup.
+    let rpc_url = format!("http://127.0.0.1:{JSONRPC_PORT}");
+    wait_for_jsonrpc(&rpc_url, Duration::from_secs(30))
+        .await
+        .expect("ingress JSON-RPC ready");
+
+    // Open the test-side Aeron handles against the same MD: a publisher
+    // on tx_deposits (impersonates the DA watcher) and a subscriber on
+    // tx_receipts (so we can match the executor's deposit Receipt).
+    let aeron_rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
+    let channels = LogConfig::default().channels;
+    let deposits_pub =
+        TxDepositsPublisherHandle::open(&aeron_rt, &channels).expect("deposits pub");
+    let mut receipts_sub =
+        TxReceiptsSubscriberHandle::open(&aeron_rt, &channels).expect("receipts sub");
+
+    // Pipeline + Aeron handshake settle: the bin processes' subscriptions
+    // open ~1–2 s after their starting log line; our own publisher /
+    // subscriber must also handshake against the MD. 5 s covers both
+    // (matches the L2-transfer test).
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Synthesise a Deposit. `from` is the aliased L1 sender (any address
+    // works for this test — there's no signature on the deposit envelope);
+    // mint credits `from`, then the inner call (here a zero-value no-op
+    // call from `from` to `to`) runs against the credited balance. A
+    // unique `source_hash` makes the executor's dedup happy.
+    let aliased_from = Address::repeat_byte(0x11);
+    let target = Address::repeat_byte(0xCC);
+    const MINT_WEI: u128 = 100_000_000_000_000_000_000; // 100 ETH
+    let source_hash = B256::repeat_byte(0xDA);
+    let deposit = Deposit {
+        source_hash,
+        from: aliased_from,
+        to: Some(target),
+        mint: MINT_WEI,
+        value: U256::ZERO,
+        gas_limit: 100_000,
+        is_system_transaction: false,
+        input: bytes::Bytes::new(),
+    };
+
+    deposits_pub.publish(&deposit).expect("publish deposit");
+    tracing::info!(?source_hash, "synthetic deposit published onto tx_deposits");
+
+    // Wait for the matching Receipt on tx_receipts. The deposit reader
+    // joins on source_hash inside the executor, then runs the deposit
+    // pre-credit + inner call, then publishes the Receipt. The executor
+    // sets `Receipt.tx_hash = deposit.source_hash` (deposits don't have
+    // a 2718 keccak), so we match on that.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut matched: Option<kardamom_types::Receipt> = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(250), receipts_sub.recv()).await {
+            Ok(Some((_pos, r))) if r.tx_hash == source_hash => {
+                matched = Some(r);
+                break;
+            }
+            Ok(Some(_)) => continue, // unrelated receipt (sealer's empty blocks)
+            Ok(None) => panic!("tx_receipts subscription closed unexpectedly"),
+            Err(_) => continue, // 250 ms tick — keep polling until deadline
+        }
+    }
+
+    let r = matched.expect("no matching deposit receipt arrived within 30 s");
+    assert!(r.status, "deposit receipt status was false: {r:?}");
+    assert_eq!(r.from, aliased_from, "receipt.from mismatch");
+    assert_eq!(r.to, Some(target), "receipt.to mismatch");
+    assert_eq!(r.tx_hash, source_hash, "receipt.tx_hash != source_hash");
+    assert_eq!(
+        r.effective_gas_price, 0,
+        "deposits pay no fee — effective_gas_price should be 0"
+    );
+    tracing::info!(
+        block_number = r.block_number,
+        gas_used = r.gas_used,
+        "deposit receipt verified; tearing down"
+    );
+
+    // Tear down in reverse: drop the test-side Aeron handles first so the
+    // bin processes don't see spurious subscription-closed errors on the
+    // tx_receipts stream while they're still publishing.
+    drop(receipts_sub);
+    drop(deposits_pub);
+    drop(aeron_rt);
     drop(ingress);
     drop(executor);
     drop(sequencer);

@@ -7,22 +7,25 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use clap::Parser;
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxErrorsPublisherHandle, TxOrderingPublisherHandle,
+    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    TxOrderingPublisherHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_sequencer::config::SequencerConfig;
+use kardamom_sequencer::deposit::{DepositSubscriber, process_deposit};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_types::{
-    BPosition, DepositRef, Receipt, StateDatabase, StateError, TxEnvelope, TxError,
+    BPosition, Deposit, DepositRef, Receipt, StateDatabase, StateError, TxEnvelope, TxError,
     TxOrderingMessage, TxRef,
 };
 
@@ -95,19 +98,28 @@ async fn main() -> anyhow::Result<()> {
         .context("open TxDataSubscriberHandle")?;
     let tx_ordering_pub = TxOrderingPublisherHandle::open(&rt, &channels)
         .context("open TxOrderingPublisherHandle")?;
+    let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
+        .context("open TxDepositsSubscriberHandle")?;
     let tx_errors_pub =
         TxErrorsPublisherHandle::open(&rt, &channels).context("open TxErrorsPublisherHandle")?;
 
     let shutdown = Shutdown::new();
-    let shutdown_for_task = shutdown.clone();
+    let shutdown_for_main = shutdown.clone();
+    let shutdown_for_deposits = shutdown.clone();
 
     let state_db = Arc::new(EmptyStateDatabase);
     let cfg_clone = cfg.clone();
 
+    // The tx_ordering publisher carries both `TxRef` (this loop) and
+    // `DepositRef` (the deposit pump below). Cloning the handle is sound
+    // — the underlying Aeron publication is a single multi-publisher
+    // stream and the SDK serialises offers internally.
+    let tx_ordering_pub_for_deposits = tx_ordering_pub.clone();
+
     // The sequencer main loop is sync (std::thread + std::thread::sleep
     // backoff). Hand it to spawn_blocking so the async runtime stays
     // responsive for shutdown handling.
-    let join = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+    let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
         let mut sequencer = Sequencer::new(cfg_clone, state_db);
         let mut tx_data = LiveTxDataSub::new(tx_data_sub);
         let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub);
@@ -116,17 +128,48 @@ async fn main() -> anyhow::Result<()> {
             &mut tx_data,
             &mut tx_ordering,
             &mut tx_errors,
-            shutdown_for_task,
+            shutdown_for_main,
         )
+    });
+
+    // Independent pump for tx_deposits → DepositRef on tx_ordering. The
+    // deposit path is not nonce-gated; it's a simple poll → publish loop
+    // that runs alongside the canonical TxData → TxRef path.
+    let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut deposit_sub = LiveDepositSub::new(tx_deposits_sub);
+        let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub_for_deposits);
+        let mut backoff_us = 1u64;
+        loop {
+            if shutdown_for_deposits.is_signaled() {
+                return Ok(());
+            }
+            match process_deposit(&mut deposit_sub, &mut tx_ordering) {
+                Ok(true) => backoff_us = 1,
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_micros(backoff_us));
+                    backoff_us = backoff_us.saturating_mul(2).min(100);
+                }
+                Err(SequencerError::Backpressure) => {
+                    std::thread::sleep(Duration::from_micros(10));
+                }
+                Err(SequencerError::IngressDisconnected) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
     });
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
     shutdown.signal();
-    match join.await {
+    match join_main.await {
         Ok(Ok(())) => tracing::info!("sequencer main loop returned cleanly"),
         Ok(Err(e)) => tracing::error!(error = %e, "sequencer main loop returned an error"),
         Err(e) => tracing::error!(error = %e, "sequencer task panicked"),
+    }
+    match join_deposits.await {
+        Ok(Ok(())) => tracing::info!("sequencer deposit pump returned cleanly"),
+        Ok(Err(e)) => tracing::error!(error = %e, "sequencer deposit pump returned an error"),
+        Err(e) => tracing::error!(error = %e, "sequencer deposit task panicked"),
     }
     drop(rt);
     Ok(())
@@ -150,6 +193,22 @@ impl TxDataSubscriber for LiveTxDataSub {
     fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
         // try_recv is non-blocking. The Sequencer's run loop handles
         // backoff when poll returns None.
+        Ok(self.handle.try_recv())
+    }
+}
+
+struct LiveDepositSub {
+    handle: TxDepositsSubscriberHandle,
+}
+
+impl LiveDepositSub {
+    fn new(handle: TxDepositsSubscriberHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl DepositSubscriber for LiveDepositSub {
+    fn poll(&mut self) -> Result<Option<(BPosition, Deposit)>, SequencerError> {
         Ok(self.handle.try_recv())
     }
 }

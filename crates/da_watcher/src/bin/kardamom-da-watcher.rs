@@ -3,32 +3,25 @@
 //! Parses an `--l1-rpc <URL>` + `--lockbox <ADDRESS>` (plus an optional
 //! `--poll-interval <DURATION>`, default 12s), constructs an
 //! [`da_watcher::RpcL1Source`] over an alloy HTTP provider, spawns the
-//! watcher loop, and waits for ctrl-c. Deposits the watcher emits are
-//! forwarded to a `DepositPublisher`.
-//!
-//! The Aeron-backed `DepositPublisher` adapter (wraps
-//! `kardamom_log::TxDepositsPublisher`) lives behind a future production wiring
-//! commit — `rusteron_client::Aeron` is `!Send + !Sync` so it needs a
-//! dedicated thread + Send-able channel, the same pattern the sequencer
-//! and executor binaries are following. Until that adapter lands, this
-//! binary uses the [`TracingDepositPublisher`] below: every deposit gets
-//! logged at `info` so smoke tests + dry runs work end-to-end.
-//!
-//! This mirrors the staging pattern in `kardamom-sequencer`: the CLI
-//! scaffold + RPC reads are correct and exercisable today; the publish
-//! sink lands in a follow-up alongside the per-binary Aeron client wiring.
+//! watcher loop, and waits for ctrl-c. Each observed deposit is republished
+//! onto the `tx_deposits` Aeron channel via the live
+//! [`LiveTxDepositsPublisher`] adapter (wraps `kardamom_log::TxDepositsPublisherHandle`).
 
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
 use alloy_primitives::Address;
 use alloy_provider::ProviderBuilder;
+use anyhow::Context;
 use clap::Parser;
 use tokio::signal;
 
 use kardamom_da_watcher::{
     DaWatcherConfig, DepositPublisher, PublishError, RpcL1Source, spawn as spawn_watcher,
 };
+use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
+use kardamom_log::config::LogConfig;
 use kardamom_types::{BPosition, Deposit};
 
 #[derive(Debug, Parser)]
@@ -47,6 +40,11 @@ struct Args {
     /// Polling cadence in seconds (default 12).
     #[arg(long, default_value_t = 12)]
     poll_interval_secs: u64,
+    /// Aeron Media Driver directory (`aeron.dir`). When omitted, falls
+    /// back to the Aeron client's default lookup (`AERON_DIR` env / OS
+    /// default). The local-e2e `just` recipe always passes this explicitly.
+    #[arg(long)]
+    aeron_dir: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -69,21 +67,27 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
+    let channels = LogConfig::default().channels;
+    let aeron_rt = match args.aeron_dir.as_ref() {
+        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
+        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
+    };
+    let tx_deposits_pub = TxDepositsPublisherHandle::open(&aeron_rt, &channels)
+        .context("open TxDepositsPublisherHandle")?;
+
     rt.block_on(async move {
         let provider = ProviderBuilder::new()
             .connect(&args.l1_rpc)
             .await
             .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", args.l1_rpc))?;
         let source = RpcL1Source::new(provider);
-        let publisher = TracingDepositPublisher;
+        let publisher = LiveTxDepositsPublisher::new(tx_deposits_pub);
 
         tracing::info!(
             l1_rpc = %args.l1_rpc,
             ?lockbox,
             poll_interval = ?cfg.poll_interval,
-            "kardamom-da-watcher starting; the Aeron-backed publisher adapter \
-             is staged in a follow-up — this binary currently logs each \
-             observed deposit at info level"
+            "kardamom-da-watcher starting; publishing deposits onto tx_deposits"
         );
 
         let handle = spawn_watcher(publisher, source, cfg);
@@ -100,25 +104,36 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })?;
+    drop(aeron_rt);
     Ok(())
 }
 
-/// Placeholder [`DepositPublisher`] that logs each deposit at `info`. The
-/// production Aeron-backed adapter (wraps `kardamom_log::TxDepositsPublisher`)
-/// replaces this in a follow-up; see the module doc.
-struct TracingDepositPublisher;
+/// Live [`DepositPublisher`] backed by an Aeron `tx_deposits` publication.
+/// Each observed deposit is republished onto the canonical `tx_deposits`
+/// stream so the downstream sequencer can derive `DepositRef`s onto
+/// `tx_ordering`.
+struct LiveTxDepositsPublisher {
+    handle: TxDepositsPublisherHandle,
+}
 
-impl DepositPublisher for TracingDepositPublisher {
+impl LiveTxDepositsPublisher {
+    fn new(handle: TxDepositsPublisherHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl DepositPublisher for LiveTxDepositsPublisher {
     fn publish(&self, deposit: &Deposit) -> Result<BPosition, PublishError> {
-        tracing::info!(
-            target: "kardamom_da_watcher",
-            source_hash = ?deposit.source_hash,
-            from = ?deposit.from,
-            to = ?deposit.to,
-            mint = deposit.mint,
-            gas_limit = deposit.gas_limit,
-            "deposit observed (tracing publisher — not yet on tx_deposits)"
-        );
-        Ok(BPosition::default())
+        match self.handle.publish(deposit) {
+            Ok(pos) => Ok(pos),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("back-pressure") {
+                    Err(PublishError::Backpressure)
+                } else {
+                    Err(PublishError::Transport(msg))
+                }
+            }
+        }
     }
 }

@@ -13,14 +13,16 @@ use std::sync::mpsc as sync_mpsc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_executor::{
-    CMessage, Executor, ExecutorConfig, ExecutorError, MockStateDatabase, MutatingSnapshotSource,
-    TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication, WriterApplyingQueue,
+    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, MockStateDatabase,
+    MutatingSnapshotSource, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
+    WriterApplyingQueue,
 };
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxOrderingSubscriberHandle, TxReceiptsPublisherHandle,
+    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxOrderingSubscriberHandle,
+    TxReceiptsPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
-use kardamom_types::{BPosition, TxEnvelope, TxOrderingMessage};
+use kardamom_types::{BPosition, Deposit, TxEnvelope, TxOrderingMessage};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -114,6 +116,22 @@ async fn main() -> Result<()> {
     });
     let b_sub: Box<dyn TxOrderingSubscription> = Box::new(LiveTxOrderingSub { rx: b_rx });
 
+    // 1 tx_deposits subscription. The executor's deposit reader thread
+    // joins `(deposit_position, Deposit)` envelopes against the
+    // `DepositRef`s observed on tx_ordering; `source_hash` is the dedup
+    // key. Same async→sync bridge as tx_ordering above.
+    let mut tx_deposits_handle = TxDepositsSubscriberHandle::open(&rt, &channels)
+        .context("open TxDepositsSubscriberHandle")?;
+    let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
+    tokio::spawn(async move {
+        while let Some(item) = tx_deposits_handle.recv().await {
+            if d_tx.send(item).is_err() {
+                break;
+            }
+        }
+    });
+    let dep_sub: Box<dyn DepositSubscription> = Box::new(LiveTxDepositsSub { rx: d_rx });
+
     // tx_receipts publication.
     let c_handle = TxReceiptsPublisherHandle::open(&rt, &channels)
         .context("open TxReceiptsPublisherHandle")?;
@@ -163,7 +181,7 @@ async fn main() -> Result<()> {
             cfg,
             a_subs,
             b_sub,
-            None, // dep_sub: deposits wired via DA watcher in a follow-up
+            Some(dep_sub),
             c_pub,
             snapshots,
             sw_signal,
@@ -260,6 +278,16 @@ struct LiveTxOrderingSub {
 impl TxOrderingSubscription for LiveTxOrderingSub {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.rx.recv().map_err(|_| ExecutorError::TxOrderingClosed)
+    }
+}
+
+struct LiveTxDepositsSub {
+    rx: sync_mpsc::Receiver<(BPosition, Deposit)>,
+}
+
+impl DepositSubscription for LiveTxDepositsSub {
+    fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError> {
+        self.rx.recv().map_err(|_| ExecutorError::DepositsClosed)
     }
 }
 

@@ -24,6 +24,7 @@ tracing.workspace = true
 
 # Binary-only deps. These are unused by the library itself; they support the
 # `kardamom-da-watcher` CLI binary defined under `src/bin/`.
+kardamom-log = { workspace = true }
 anyhow.workspace = true
 clap.workspace = true
 humantime-serde.workspace = true

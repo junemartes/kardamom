@@ -211,4 +211,5 @@ test-e2e-local: aeron-driver-up
             --test full_pipeline_e2e --locked -- --ignored --nocapture proof_of_pipeline
     JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
         cargo test -p e2e --features full-pipeline-e2e \
-            --test multiprocess_e2e --locked -- --ignored --nocapture multiprocess_e2e_signed_transfer_round_trip
+            --test multiprocess_e2e --locked -- --ignored --nocapture --test-threads=1 \
+            multiprocess_e2e_signed_transfer_round_trip multiprocess_e2e_deposit_round_trip
