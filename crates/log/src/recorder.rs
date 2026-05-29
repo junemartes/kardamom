@@ -157,7 +157,9 @@ impl Recorder {
 
         // start_recording: (channel, stream_id, source_location, auto_stop)
         // SOURCE_LOCATION_LOCAL -> we are co-located with the publisher.
-        let recording_id = archive
+        // The return value is a subscription_id (not a recording_id) — the
+        // actual recording_id is assigned when data first flows.
+        archive
             .start_recording(
                 channel_c.as_c_str(),
                 stream_id,
@@ -165,12 +167,14 @@ impl Recorder {
                 false,
             )
             .map_err(|e| LogError::Aeron(format!("start_recording {ctx}: {e}")))?;
-        info!(recording_id, ?kind, "started recording");
 
         // Pull the descriptor once at startup so we can compute segment file
         // paths without a control-channel round-trip on every fsync tick.
-        let (start_position, term_buffer_length, segment_file_length) =
-            fetch_descriptor(&archive, recording_id)?;
+        // We look up the recording by channel fragment + stream_id (not by
+        // the subscription_id returned above, which is NOT the recording_id).
+        let (recording_id, start_position, term_buffer_length, segment_file_length) =
+            fetch_descriptor_for_uri(&archive, &channel_c, stream_id)?;
+        info!(recording_id, ?kind, "started recording");
 
         Ok(Self {
             archive,
@@ -283,11 +287,22 @@ pub fn run_watermark_loop(
     Ok(())
 }
 
-/// One-shot descriptor fetch via `list_recording`. We implement the
-/// `AeronArchiveRecordingDescriptorConsumerFuncCallback` trait on a small
-/// `Rc<RefCell<Captured>>` shim. Single-thread access is enforced by the
-/// fact that `AeronArchive` itself is `!Send + !Sync`.
-fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i32), LogError> {
+/// Find the recording descriptor for the given channel + stream_id.
+///
+/// `start_recording` returns a `subscription_id` (not a `recording_id`).
+/// The actual `recording_id` is assigned by the archive daemon when data
+/// first flows through the subscription.  We must look up the recording by
+/// channel fragment + stream_id rather than by the subscription_id.
+///
+/// We poll `list_recordings_for_uri` (scanning from recording_id=0) with a
+/// short sleep until the first matching descriptor appears or we time out.
+/// In practice, the recording appears within milliseconds of the publication
+/// connecting to the subscription.
+fn fetch_descriptor_for_uri(
+    archive: &Archive,
+    channel: &CString,
+    stream_id: i32,
+) -> Result<(i64, i64, i32, i32), LogError> {
     use rusteron_archive::{
         AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
         Handler,
@@ -295,6 +310,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
 
     #[derive(Default)]
     struct Captured {
+        recording_id: i64,
         start_position: i64,
         term_buffer_length: i32,
         segment_file_length: i32,
@@ -311,6 +327,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
             desc: AeronArchiveRecordingDescriptor,
         ) {
             let mut g = self.captured.borrow_mut();
+            g.recording_id = desc.recording_id();
             g.start_position = desc.start_position();
             g.term_buffer_length = desc.term_buffer_length();
             g.segment_file_length = desc.segment_file_length();
@@ -318,24 +335,40 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
         }
     }
 
-    let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
-    let handler = Handler::leak(Consumer {
-        captured: captured.clone(),
-    });
+    // Poll up to ~3 s in 50 ms increments. `start_recording` is
+    // asynchronous — the archive daemon may not have written the catalog
+    // entry yet by the time the control-channel reply arrives, and data
+    // must actually start flowing before the recording_id is assigned.
+    const MAX_ATTEMPTS: u32 = 60;
+    const POLL_SLEEP: Duration = Duration::from_millis(50);
 
-    archive
-        .list_recording(recording_id, Some(&handler))
-        .map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
+    for attempt in 0..MAX_ATTEMPTS {
+        let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
+        let handler = Handler::leak(Consumer {
+            captured: captured.clone(),
+        });
 
-    let g = captured.borrow();
-    if !g.seen {
-        return Err(LogError::Aeron(format!(
-            "list_recording({recording_id}) returned no descriptor"
-        )));
+        archive
+            .list_recordings_for_uri(0, 1, channel.as_c_str(), stream_id, Some(&handler))
+            .map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+
+        let g = captured.borrow();
+        if g.seen {
+            return Ok((
+                g.recording_id,
+                g.start_position,
+                g.term_buffer_length,
+                g.segment_file_length,
+            ));
+        }
+        drop(g);
+
+        if attempt + 1 < MAX_ATTEMPTS {
+            std::thread::sleep(POLL_SLEEP);
+        }
     }
-    Ok((
-        g.start_position,
-        g.term_buffer_length,
-        g.segment_file_length,
-    ))
+
+    Err(LogError::Aeron(format!(
+        "list_recordings_for_uri({channel:?}, stream={stream_id}) returned no descriptor after {MAX_ATTEMPTS} attempts"
+    )))
 }

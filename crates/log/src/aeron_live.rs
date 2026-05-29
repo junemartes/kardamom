@@ -194,13 +194,16 @@ impl AeronRuntime {
         let aeron_dir_c = std::ffi::CString::new(aeron_dir_str.clone()).map_err(|_| {
             LogError::Aeron(format!("aeron.dir contains a NUL byte: {aeron_dir_str}"))
         })?;
-        Self::spawn_with(move || {
-            let ctx = rusteron_client::AeronContext::new()
-                .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
-            ctx.set_dir(aeron_dir_c.as_c_str())
-                .map_err(|e| LogError::Aeron(format!("set_dir: {e}")))?;
-            Ok(ctx)
-        })
+        Self::spawn_with_impl(
+            move || {
+                let ctx = rusteron_client::AeronContext::new()
+                    .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
+                ctx.set_dir(aeron_dir_c.as_c_str())
+                    .map_err(|e| LogError::Aeron(format!("set_dir: {e}")))?;
+                Ok(ctx)
+            },
+            Some(aeron_dir_str),
+        )
     }
 
     /// Spawn the Aeron thread, building the `AeronContext` inside the thread
@@ -209,10 +212,17 @@ impl AeronRuntime {
     /// crossing the `!Send + !Sync` boundary that AeronContext sits on.
     ///
     /// After the Aeron client is started, a parallel `AeronArchive` connection
-    /// is attempted using the default `AeronArchiveContext` (control channel
-    /// `aeron:udp?endpoint=localhost:8010`). If the archive is not running, the
-    /// runtime still starts successfully but archive commands will return errors.
+    /// is attempted (control channel `aeron:udp?endpoint=localhost:8010`). If
+    /// the archive is not running, the runtime still starts successfully but
+    /// archive commands will return errors.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
+    where
+        F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
+    {
+        Self::spawn_with_impl(make_ctx, None)
+    }
+
+    fn spawn_with_impl<F>(make_ctx: F, archive_aeron_dir: Option<String>) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
     {
@@ -231,16 +241,17 @@ impl AeronRuntime {
                 };
                 // Attempt to open a parallel AeronArchive client on this same
                 // thread. Archive is `!Send + !Sync`, so it must stay here.
-                let archive_client: Option<Archive> = match build_archive() {
-                    Ok(a) => Some(a),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "archive client connect failed; archive commands will return errors"
-                        );
-                        None
-                    }
-                };
+                let archive_client: Option<Archive> =
+                    match build_archive(archive_aeron_dir.as_deref()) {
+                        Ok(a) => Some(a),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "archive client connect failed; archive commands will return errors"
+                            );
+                            None
+                        }
+                    };
                 let _ = started_tx.send(Ok(()));
                 if let Err(e) = run_aeron_thread(aeron, archive_client, cmd_rx) {
                     error!(error = %e, "aeron runtime thread exited with error");
@@ -425,16 +436,45 @@ fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, Lo
     Ok(Rc::new(aeron))
 }
 
-/// Attempt to connect to the Aeron Archive using the default context.
+/// Attempt to connect to the Aeron Archive.
 ///
-/// The default `AeronArchiveContext` uses `aeron:udp?endpoint=localhost:8010`
-/// for control requests and `aeron:udp?endpoint=localhost:8011` for responses.
-/// Callers that need custom archive endpoints should extend this via a new
-/// `spawn_with_archive` variant; for now the defaults cover the production and
-/// Docker-e2e cases.
-pub(crate) fn build_archive() -> Result<Archive, LogError> {
+/// The `aeron_archive_context_init()` C function does NOT fill in default
+/// channel strings — `control_request_channel` starts as NULL and
+/// `aeron_archive_context_conclude()` (called during connect) immediately
+/// returns an error if it remains NULL.  We therefore set the well-known
+/// defaults explicitly here.  The channels are:
+///
+/// - control request:  `aeron:udp?endpoint=localhost:8010`
+/// - control response: `aeron:udp?endpoint=localhost:8011`
+///
+/// When `aeron_dir` is provided it is applied to the archive context so
+/// that the archive client finds the same Media Driver as the Aeron client.
+/// In production (no custom dir) the archive init picks up the
+/// `AERON_DIR` environment variable automatically.
+pub(crate) fn build_archive(aeron_dir: Option<&str>) -> Result<Archive, LogError> {
     let ctx = rusteron_archive::AeronArchiveContext::new()
         .map_err(|e| LogError::Aeron(format!("AeronArchiveContext::new: {e}")))?;
+
+    // Set the aeron dir so the archive client joins the same Media Driver.
+    if let Some(dir) = aeron_dir {
+        let dir_c = std::ffi::CString::new(dir)
+            .map_err(|_| LogError::Aeron(format!("aeron_dir contains NUL: {dir}")))?;
+        ctx.set_aeron_directory_name(dir_c.as_c_str())
+            .map_err(|e| LogError::Aeron(format!("set_aeron_directory_name: {e}")))?;
+    }
+
+    // `aeron_archive_context_conclude` requires control_request_channel to
+    // be set; it does not have a built-in default.
+    let req_ch =
+        std::ffi::CString::new("aeron:udp?endpoint=localhost:8010").expect("static str");
+    ctx.set_control_request_channel(req_ch.as_c_str())
+        .map_err(|e| LogError::Aeron(format!("set_control_request_channel: {e}")))?;
+
+    let resp_ch =
+        std::ffi::CString::new("aeron:udp?endpoint=localhost:8011").expect("static str");
+    ctx.set_control_response_channel(resp_ch.as_c_str())
+        .map_err(|e| LogError::Aeron(format!("set_control_response_channel: {e}")))?;
+
     // Use a 3-second timeout rather than the full 10 seconds: the outer
     // `started_rx.recv_timeout` in `spawn_with` is also 10 s, and archive
     // failure is non-fatal.  A reachable daemon responds well within 3 s,

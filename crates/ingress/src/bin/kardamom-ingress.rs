@@ -127,15 +127,22 @@ async fn main() -> Result<()> {
     // SOURCE_LOCATION_LOCAL: ingress is co-located with the tx_data publisher
     // (it *is* the publisher), so local recording is correct.
     let archive_dir = log_cfg.aeron.archive_dir.clone();
+    let aeron_dir_for_rec = args
+        .aeron_dir
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .map(str::to_string);
     let mut _recorder_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     for sid in 0..args.shards as u8 {
         let ch_clone = channels.clone();
         let dir_clone = archive_dir.clone();
         let recorder_id = args.recorder_id;
+        let aeron_dir_rec = aeron_dir_for_rec.clone();
         let handle = std::thread::Builder::new()
             .name(format!("kardamom-rec-a-{sid}"))
             .spawn(move || {
-                let archive = match kardamom_log::connect_archive_client() {
+                let archive = match kardamom_log::connect_archive_client(aeron_dir_rec.as_deref())
+                {
                     Ok(a) => a,
                     Err(e) => {
                         tracing::warn!(shard = sid, error = %e, "ingress: archive connect failed; tx_data[{sid}] not recorded");

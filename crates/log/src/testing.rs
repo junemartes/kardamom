@@ -632,6 +632,10 @@ mod docker {
         container: ContainerAsync<GenericImage>,
         aeron_dir_host: PathBuf,
         archive_dir_host: PathBuf,
+        /// When true, the container runs with `--network=host`, so archive
+        /// ports are the fixed well-known ports (8010/8011) rather than
+        /// dynamically-allocated host ports.
+        host_net: bool,
     }
 
     impl Node {
@@ -683,6 +687,40 @@ mod docker {
             Ok(Self { nodes: vec![node] })
         }
 
+        /// Like [`single_node`] but runs the container with `--network=host`.
+        ///
+        /// This is required for tests that exercise the Aeron Archive
+        /// bootstrap (Replay) code path. The `rusteron-archive` Rust binding
+        /// hardcodes the archive control endpoint to `localhost:8010` —
+        /// there are no setter methods — so with random port mapping the
+        /// archive client can never reach the daemon and every bootstrap
+        /// silently degrades to the `Connected` fallback. Host networking
+        /// makes the container's `localhost:8010` identical to the host's
+        /// `localhost:8010`, so `archive_control_endpoint(0)` returns the
+        /// deterministic `"127.0.0.1:8010"` and archive connect succeeds.
+        ///
+        /// **Linux only.** macOS Docker doesn't support `--network=host`.
+        /// If `KARDAMOM_AERON_DIR` is set the external-driver path is used
+        /// (same as `single_node`) and host-net is irrelevant.
+        pub async fn single_node_host_net() -> Result<Self, Box<dyn std::error::Error>> {
+            if let Ok(dir) = std::env::var("KARDAMOM_AERON_DIR") {
+                let aeron_dir = PathBuf::from(dir);
+                let archive_dir = aeron_dir
+                    .parent()
+                    .map(|p| p.join("archive"))
+                    .unwrap_or_else(|| aeron_dir.clone());
+                return Ok(Self {
+                    nodes: vec![Node::External {
+                        aeron_dir,
+                        archive_dir,
+                    }],
+                });
+            }
+            ensure_image_built().await?;
+            let node = spawn_node_host_net().await?;
+            Ok(Self { nodes: vec![node] })
+        }
+
         /// Bring up `n` Aeron nodes for multi-recorder tests.
         pub async fn multi_node(n: usize) -> Result<Self, Box<dyn std::error::Error>> {
             ensure_image_built().await?;
@@ -695,11 +733,12 @@ mod docker {
 
         /// "host:port" the test should pass as the Aeron Archive control
         /// channel endpoint for node `i`. Container mode resolves the
-        /// dynamically-allocated host port; external mode returns the
-        /// fixed port `just aeron-driver-up` configures (8010).
+        /// dynamically-allocated host port; external mode (and host-net
+        /// container mode) returns the fixed port `just aeron-driver-up`
+        /// configures (8010).
         pub async fn archive_control_endpoint(&self, i: usize) -> String {
             match &self.nodes[i] {
-                Node::Container(c) => {
+                Node::Container(c) if !c.host_net => {
                     let port = c
                         .container
                         .get_host_port_ipv4(8010_u16.udp())
@@ -707,13 +746,13 @@ mod docker {
                         .unwrap();
                     format!("127.0.0.1:{port}")
                 }
-                Node::External { .. } => "127.0.0.1:8010".to_string(),
+                Node::Container(_) | Node::External { .. } => "127.0.0.1:8010".to_string(),
             }
         }
 
         pub async fn archive_response_endpoint(&self, i: usize) -> String {
             match &self.nodes[i] {
-                Node::Container(c) => {
+                Node::Container(c) if !c.host_net => {
                     let port = c
                         .container
                         .get_host_port_ipv4(8011_u16.udp())
@@ -721,7 +760,7 @@ mod docker {
                         .unwrap();
                     format!("127.0.0.1:{port}")
                 }
-                Node::External { .. } => "127.0.0.1:8011".to_string(),
+                Node::Container(_) | Node::External { .. } => "127.0.0.1:8011".to_string(),
             }
         }
 
@@ -811,7 +850,106 @@ mod docker {
             container,
             aeron_dir_host: aeron_dir,
             archive_dir_host: archive_dir,
+            host_net: false,
         })))
+    }
+
+    /// Like [`spawn_node`] but starts the container with `--network=host`.
+    ///
+    /// In host-network mode the container shares the host's network
+    /// namespace, so the Aeron Archive daemon's fixed ports (8010/8011 for
+    /// archive control/response, 8020/8021 for media driver) are directly
+    /// accessible on `localhost` from host processes. This is what allows
+    /// the `rusteron-archive` binding (which hardcodes `localhost:8010`) to
+    /// actually reach the archive daemon.
+    ///
+    /// Port-mapping and `with_exposed_port` calls are omitted because they
+    /// have no effect in host-network mode; the ports are directly shared.
+    async fn spawn_node_host_net() -> Result<Node, Box<dyn std::error::Error>> {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::path::PathBuf::from(format!("/tmp/kardamom-aeron-{suffix:x}"));
+        let aeron_dir = root.join("dir");
+        let archive_dir = root.join("archive").join("dir");
+        std::fs::create_dir_all(root.join("archive"))?;
+        for d in [&root, &root.join("archive")] {
+            let mut p = std::fs::metadata(d)?.permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                p.set_mode(0o777);
+            }
+            std::fs::set_permissions(d, p)?;
+        }
+
+        let root_str = root.to_str().ok_or("mount path not utf-8")?.to_string();
+        let aeron_dir_in_container = format!("{root_str}/dir");
+        let archive_dir_in_container = format!("{root_str}/archive/dir");
+
+        // Before starting the container, wait for the archive control port
+        // (UDP 8010) to be clear. In host-network mode only one archive
+        // daemon can own the port at a time.  If a previous test's container
+        // is still shutting down when the next test starts, Docker reports
+        // "ArchiveAgent: started" but the Aeron clients can't reach the new
+        // daemon because the old one's socket hasn't been released yet.
+        wait_for_host_port_free(8010).await?;
+
+        // `with_network("host")` sets Docker's `HostConfig.NetworkMode =
+        // "host"`, giving the container the host's network namespace.
+        // Port mapping is neither needed nor effective in this mode.
+        let image = GenericImage::new(AERON_IMAGE_NAME, AERON_IMAGE_TAG)
+            .with_wait_for(WaitFor::message_on_stdout("ArchiveAgent: started"))
+            .with_mount(Mount::bind_mount(root_str.clone(), root_str.clone()))
+            .with_env_var("AERON_DIR", aeron_dir_in_container)
+            .with_env_var("AERON_ARCHIVE_DIR", archive_dir_in_container);
+
+        let container = image
+            .with_shm_size(256 * 1024 * 1024)
+            .with_network("host")
+            .start()
+            .await?;
+
+        Ok(Node::Container(Box::new(ContainerNode {
+            container,
+            aeron_dir_host: aeron_dir,
+            archive_dir_host: archive_dir,
+            host_net: true,
+        })))
+    }
+
+    /// Poll until the given UDP port is not in use on the host (or timeout).
+    ///
+    /// With `--network=host` only one process can own a UDP port at a time.
+    /// Between sequential tests the previous container may still be stopping
+    /// when the next test tries to start. We check with `ss` (or `lsof` as a
+    /// fallback) and wait up to 10 seconds for the port to be free before
+    /// handing off to Docker.
+    async fn wait_for_host_port_free(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+        use tokio::process::Command;
+        const MAX_WAIT_MS: u64 = 10_000;
+        const POLL_MS: u64 = 200;
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_millis(MAX_WAIT_MS);
+        loop {
+            let out = Command::new("ss")
+                .args(["-lnuH", &format!("sport = :{port}")])
+                .output()
+                .await;
+            let in_use = match out {
+                Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+                // `ss` not available (rare): assume free and let Docker tell us
+                Err(_) => false,
+            };
+            if !in_use {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!("host UDP port {port} still in use after {MAX_WAIT_MS}ms").into());
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(POLL_MS)).await;
+        }
     }
 
     /// `docker build`s the Aeron image once per test run, idempotent.

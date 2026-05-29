@@ -73,9 +73,10 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
     // ----- doesn't race the `cargo build` from `--features full-pipeline-e2e`.
     build_service_bins();
 
-    // ----- Bring up Aeron in a container, with the host bind-mount path
-    // ----- we'll point each service at via `--aeron-dir`.
-    let cluster = AeronTestCluster::single_node()
+    // ----- Bring up Aeron in a container with --network=host so that the
+    // ----- rusteron-archive binding's hardcoded localhost:8010 endpoint
+    // ----- actually reaches the archive daemon (exercising the Replay path).
+    let cluster = AeronTestCluster::single_node_host_net()
         .await
         .expect("aeron container up");
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
@@ -260,7 +261,7 @@ async fn multiprocess_e2e_deposit_round_trip() {
 
     build_service_bins();
 
-    let cluster = AeronTestCluster::single_node()
+    let cluster = AeronTestCluster::single_node_host_net()
         .await
         .expect("aeron container up");
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
@@ -575,7 +576,7 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
     // -------- Kardamom: 5 services, including da-watcher ----------------
     build_service_bins_with_da_watcher();
 
-    let cluster = AeronTestCluster::single_node()
+    let cluster = AeronTestCluster::single_node_host_net()
         .await
         .expect("aeron container up");
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();

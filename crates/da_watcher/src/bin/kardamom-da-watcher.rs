@@ -80,10 +80,16 @@ fn main() -> anyhow::Result<()> {
     // SOURCE_LOCATION_LOCAL: da-watcher is co-located with the tx_deposits publisher.
     let archive_dir = log_cfg.aeron.archive_dir.clone();
     let ch_for_rec = channels.clone();
+    let aeron_dir_for_rec = args
+        .aeron_dir
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .map(str::to_string);
     let _tx_deposits_recorder_thread = std::thread::Builder::new()
         .name("kardamom-rec-c".into())
         .spawn(move || {
-            let archive = match kardamom_log::connect_archive_client() {
+            let archive = match kardamom_log::connect_archive_client(aeron_dir_for_rec.as_deref())
+            {
                 Ok(a) => a,
                 Err(e) => {
                     tracing::warn!(error = %e, "da-watcher: archive connect failed; tx_deposits not recorded");

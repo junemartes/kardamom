@@ -51,12 +51,19 @@ pub use error::LogError;
 /// thread — typically the recorder thread that owns the [`recorder::Recorder`]
 /// it will be handed to.
 ///
-/// Uses the default `AeronArchiveContext` (control on
-/// `aeron:udp?endpoint=localhost:8010`, responses on
-/// `aeron:udp?endpoint=localhost:8011`). This matches the Aeron Archive
-/// daemon defaults used in the Docker-e2e and production deployments.
-pub fn connect_archive_client() -> Result<rusteron_archive::AeronArchive, LogError> {
-    aeron_live::build_archive()
+/// `aeron_dir` is the Aeron Media Driver directory (`aeron.dir`). When
+/// provided it is applied to the archive context so the archive client finds
+/// the same Media Driver instance as the Aeron runtime. Pass `None` to use
+/// the default (typically `/dev/shm/aeron-dev`, or whatever is set in the
+/// `AERON_DIR` environment variable).
+///
+/// The control channels default to `aeron:udp?endpoint=localhost:8010` /
+/// `localhost:8011` — the fixed well-known ports the Aeron Archive daemon
+/// listens on.
+pub fn connect_archive_client(
+    aeron_dir: Option<&str>,
+) -> Result<rusteron_archive::AeronArchive, LogError> {
+    aeron_live::build_archive(aeron_dir)
 }
 
 // Re-export the shared types so existing call sites can `use kardamom_log::types::*`
