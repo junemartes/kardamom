@@ -26,6 +26,7 @@ async-trait = "0.1"
 
 [dev-dependencies]
 alloy-signer-local.workspace = true
+kardamom-obs = { path = "../obs" }
 metrics-exporter-prometheus.workspace = true
 alloy-provider.workspace = true
 alloy-contract.workspace = true

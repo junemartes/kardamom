@@ -18,12 +18,6 @@ pub const BLOCK_NUMBER: &str = "kardamom_block_number";
 /// Gauge: build info, always 1, labeled with version + git_sha.
 pub const BUILD_INFO: &str = "kardamom_build_info";
 
-/// Shared bucket boundaries (seconds) for every duration histogram.
-/// 100 µs → 5 s, exponential.
-pub const DURATION_BUCKETS: &[f64] = &[
-    0.0001, 0.00025, 0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
-];
-
 /// RAII guard that records a histogram observation for a single stage when
 /// dropped. Used by the `stage!` macro so `?` inside the instrumented block
 /// still records the elapsed time on early return.

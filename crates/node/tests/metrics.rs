@@ -18,6 +18,7 @@ use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 use kardamom_node::genesis::{AllocEntry, Genesis};
 use kardamom_node::metrics as kmetrics;
 use kardamom_node::{Node, rpc};
+use kardamom_obs;
 
 /// One global recorder per test process. Subsequent calls return the same
 /// handle so parallel tests don't race on `install_recorder`.
@@ -25,7 +26,7 @@ fn recorder() -> &'static PrometheusHandle {
     static H: OnceLock<PrometheusHandle> = OnceLock::new();
     H.get_or_init(|| {
         PrometheusBuilder::new()
-            .set_buckets(kmetrics::DURATION_BUCKETS)
+            .set_buckets(kardamom_obs::DURATION_BUCKETS)
             .unwrap()
             .install_recorder()
             .expect("install recorder")
