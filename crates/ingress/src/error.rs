@@ -42,6 +42,18 @@ impl From<IngressError> for ErrorObjectOwned {
     }
 }
 
+/// JSON-RPC error code returned by write methods while the node is still
+/// bootstrapping. Falls in the implementation-defined -32000..-32099 range.
+pub const NODE_BOOTSTRAPPING_CODE: i32 = -32099;
+
+pub fn node_bootstrapping_error() -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(
+        NODE_BOOTSTRAPPING_CODE,
+        "node bootstrapping: not yet caught up to canonical log",
+        Option::<()>::None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

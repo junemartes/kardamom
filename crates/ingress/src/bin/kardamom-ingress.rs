@@ -16,11 +16,12 @@ use clap::Parser;
 use kardamom_ingress::channels::{InMemoryStateDb, IngressPublication, IngressSubscription};
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::IngressError;
-use kardamom_ingress::proxy::IngressProxy;
+use kardamom_ingress::proxy::{IngressProxy, IngressReadiness};
 use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, QuorumSubscriberHandle, TxDataPublisherHandle,
     TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
 };
+use kardamom_log::bootstrap::BootstrapPolicy;
 use kardamom_log::config::LogConfig;
 use kardamom_types::{
     BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
@@ -119,11 +120,14 @@ async fn main() -> Result<()> {
 
     let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
         .context("open IngressPublication")?;
-    let subscription = LiveIngressSubscription::open(&rt, &channels, args.recorder_id)
-        .context("open IngressSubscription")?;
+    let (subscription, readiness) =
+        LiveIngressSubscription::open(&rt, &channels, args.recorder_id)
+            .context("open IngressSubscription")?;
     let state_db = Arc::new(InMemoryStateDb::new());
 
-    let proxy = IngressProxy::new(cfg, publication, subscription, state_db);
+    let mut proxy = IngressProxy::new(cfg, publication, subscription, state_db);
+    proxy.set_readiness(readiness);
+
     let handle = proxy.start().await.context("IngressProxy::start")?;
     tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
 
@@ -198,11 +202,17 @@ struct LiveIngressSubscription {
 }
 
 impl LiveIngressSubscription {
+    /// Opens all ingress subscriptions using the bootstrapped constructors
+    /// (Connected policy — these are tail/RAM-only streams).
+    ///
+    /// Returns the subscription and a pre-wired [`IngressReadiness`]. The
+    /// internal readiness task is already spawned; the caller only needs to
+    /// call `proxy.set_readiness(readiness)` before starting the server.
     fn open(
         rt: &AeronRuntime,
         channels: &kardamom_log::config::ChannelsConfig,
         recorder_id: u8,
-    ) -> Result<Self, IngressError> {
+    ) -> Result<(Self, IngressReadiness), IngressError> {
         let (receipts_tx, _) = broadcast::channel::<Receipt>(1024);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(1024);
         let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(1024);
@@ -210,8 +220,10 @@ impl LiveIngressSubscription {
         let (tx_errors_tx, _) = broadcast::channel::<TxError>(1024);
 
         // tx_receipts → Receipt fan-out
-        let mut receipts_sub = TxReceiptsSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?;
+        let mut receipts_sub =
+            TxReceiptsSubscriberHandle::open_bootstrapped(rt, channels, BootstrapPolicy::default_connected())
+                .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?;
+        let receipts_watch = receipts_sub.caught_up_watch();
         let tx = receipts_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, r)) = receipts_sub.recv().await {
@@ -220,8 +232,10 @@ impl LiveIngressSubscription {
         });
 
         // Quorum watermark
-        let mut q_sub = QuorumSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open quorum watermark: {e}")))?;
+        let mut q_sub =
+            QuorumSubscriberHandle::open_bootstrapped(rt, channels, BootstrapPolicy::default_connected())
+                .map_err(|e| IngressError::Internal(format!("open quorum watermark: {e}")))?;
+        let quorum_watch = q_sub.caught_up_watch();
         let tx = watermarks_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, w)) = q_sub.recv().await {
@@ -230,8 +244,10 @@ impl LiveIngressSubscription {
         });
 
         // Per-recorder fsync watermark
-        let mut fsync_sub = FsyncWatermarkSubscriberHandle::open(rt, channels, recorder_id)
-            .map_err(|e| IngressError::Internal(format!("open fsync watermark: {e}")))?;
+        let mut fsync_sub =
+            FsyncWatermarkSubscriberHandle::open_bootstrapped(rt, channels, recorder_id, BootstrapPolicy::default_connected())
+                .map_err(|e| IngressError::Internal(format!("open fsync watermark: {e}")))?;
+        let fsync_watch = fsync_sub.caught_up_watch();
         let tx = local_fsync_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, w)) = fsync_sub.recv().await {
@@ -240,8 +256,10 @@ impl LiveIngressSubscription {
         });
 
         // tx_receipts → BlockBoundary fan-out
-        let mut boundary_sub = TxReceiptsBoundarySubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
+        let mut boundary_sub =
+            TxReceiptsBoundarySubscriberHandle::open_bootstrapped(rt, channels, BootstrapPolicy::default_connected())
+                .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
+        let boundary_watch = boundary_sub.caught_up_watch();
         let tx = block_boundaries_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, b)) = boundary_sub.recv().await {
@@ -250,8 +268,10 @@ impl LiveIngressSubscription {
         });
 
         // tx_errors → TxError fan-out
-        let mut errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open tx_errors: {e}")))?;
+        let mut errors_sub =
+            TxErrorsSubscriberHandle::open_bootstrapped(rt, channels, BootstrapPolicy::default_connected())
+                .map_err(|e| IngressError::Internal(format!("open tx_errors: {e}")))?;
+        let errors_watch = errors_sub.caught_up_watch();
         let tx = tx_errors_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, e)) = errors_sub.recv().await {
@@ -259,13 +279,42 @@ impl LiveIngressSubscription {
             }
         });
 
-        Ok(Self {
-            receipts: receipts_tx,
-            watermarks: watermarks_tx,
-            local_fsync: local_fsync_tx,
-            block_boundaries: block_boundaries_tx,
-            tx_errors: tx_errors_tx,
-        })
+        let gated = vec![
+            "tx_receipts".to_string(),
+            "tx_receipts_boundary".to_string(),
+            "tx_errors".to_string(),
+            "fsync_watermark".to_string(),
+            "quorum_watermark".to_string(),
+        ];
+        let (readiness, ready_tx) = IngressReadiness::new(gated);
+
+        // Spawn the task that AND's all caught-up watches and feeds the
+        // readiness sender. Exits once all streams are caught up.
+        tokio::spawn(async move {
+            loop {
+                let all = *receipts_watch.borrow()
+                    && *boundary_watch.borrow()
+                    && *errors_watch.borrow()
+                    && *fsync_watch.borrow()
+                    && *quorum_watch.borrow();
+                let _ = ready_tx.send(all);
+                if all {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        });
+
+        Ok((
+            Self {
+                receipts: receipts_tx,
+                watermarks: watermarks_tx,
+                local_fsync: local_fsync_tx,
+                block_boundaries: block_boundaries_tx,
+                tx_errors: tx_errors_tx,
+            },
+            readiness,
+        ))
     }
 }
 

@@ -23,6 +23,35 @@ use crate::receipt_cache::ReceiptCache;
 use crate::routing::partition_for;
 use crate::sig_verify::BatchVerifier;
 
+/// Aggregates caught-up signals from ingress's bootstrapped subscriptions.
+/// `is_ready()` returns true once every gated sub has flipped to caught-up.
+#[derive(Clone)]
+pub struct IngressReadiness {
+    rx: tokio::sync::watch::Receiver<bool>,
+    gated_streams: std::sync::Arc<Vec<String>>,
+}
+
+impl IngressReadiness {
+    pub fn new(gated_streams: Vec<String>) -> (Self, tokio::sync::watch::Sender<bool>) {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        (
+            Self {
+                rx,
+                gated_streams: std::sync::Arc::new(gated_streams),
+            },
+            tx,
+        )
+    }
+
+    pub fn is_ready(&self) -> bool {
+        *self.rx.borrow()
+    }
+
+    pub fn gated_streams(&self) -> &[String] {
+        &self.gated_streams
+    }
+}
+
 /// Drains a `broadcast::Receiver<T>` and forwards each item to `f`, swallowing
 /// `Lagged` and exiting on `Closed`. Used by the four proxy watcher tasks.
 fn spawn_broadcast_watcher<T, F, Fut>(mut rx: broadcast::Receiver<T>, mut f: F)
@@ -75,6 +104,10 @@ where
     /// (still stubbed pending the S6 reader interface). The receipt path is
     /// now served entirely from the in-memory [`ReceiptCache`].
     pub(crate) state_db: Arc<DB>,
+    /// Optional readiness aggregator. When `None` the write-side gate is
+    /// bypassed (used by tests that construct `IngressProxy` directly without
+    /// bootstrap orchestration).
+    pub(crate) readiness: Option<IngressReadiness>,
 }
 
 impl<P, S, DB> Clone for IngressProxy<P, S, DB>
@@ -95,6 +128,7 @@ where
             correlation_seq: self.correlation_seq.clone(),
             latest_block_number: self.latest_block_number.clone(),
             state_db: self.state_db.clone(),
+            readiness: self.readiness.clone(),
         }
     }
 }
@@ -127,6 +161,7 @@ where
             correlation_seq: Arc::new(AtomicU64::new(0)),
             latest_block_number: Arc::new(AtomicU64::new(0)),
             state_db,
+            readiness: None,
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
@@ -289,6 +324,18 @@ where
     #[inline]
     pub fn config(&self) -> &IngressConfig {
         &self.cfg
+    }
+
+    /// Attach a readiness aggregator. Call this before `start()`. When set,
+    /// write-side methods are gated on `readiness.is_ready()`.
+    pub fn set_readiness(&mut self, r: IngressReadiness) {
+        self.readiness = Some(r);
+    }
+
+    /// Access the readiness aggregator. Returns `None` if not wired up (test
+    /// paths that skip bootstrap orchestration).
+    pub fn readiness(&self) -> Option<&IngressReadiness> {
+        self.readiness.as_ref()
     }
 
     /// Start all configured listeners (jsonrpsee HTTP+WS, optional TCP,

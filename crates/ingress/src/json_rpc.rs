@@ -100,6 +100,11 @@ where
     }
 
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256> {
+        if let Some(readiness) = self.proxy.readiness() {
+            if !readiness.is_ready() {
+                return Err(crate::error::node_bootstrapping_error());
+            }
+        }
         let client_ip = PEER_ADDR
             .try_with(|c| c.get())
             .ok()
@@ -118,6 +123,38 @@ where
         // libmdbx-backed impl; v0 + tests use `InMemoryStateDb`. Returns
         // `null` per JSON-RPC convention if not yet committed.
         Ok(self.proxy.lookup_receipt_by_hash(hash).map(receipt_to_rpc))
+    }
+}
+
+/// Response returned by `kardamom_isReady`.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct ReadinessReport {
+    pub ready: bool,
+    pub gated_streams: Vec<String>,
+}
+
+#[rpc(server, namespace = "kardamom")]
+pub trait KardamomAdminApi {
+    #[method(name = "isReady")]
+    async fn is_ready(&self) -> RpcResult<ReadinessReport>;
+}
+
+#[async_trait::async_trait]
+impl<P, S, DB> KardamomAdminApiServer for IngressHandlers<P, S, DB>
+where
+    P: IngressPublication + Clone + 'static,
+    S: IngressSubscription + Clone + 'static,
+    DB: StateDatabase + 'static,
+{
+    async fn is_ready(&self) -> RpcResult<ReadinessReport> {
+        let (ready, gated) = match self.proxy.readiness() {
+            Some(r) => (r.is_ready(), r.gated_streams().to_vec()),
+            None => (true, vec![]),
+        };
+        Ok(ReadinessReport {
+            ready,
+            gated_streams: gated,
+        })
     }
 }
 
@@ -198,7 +235,10 @@ where
     let local = server
         .local_addr()
         .map_err(|e| IngressError::Internal(format!("local_addr: {e}")))?;
-    let module = IngressHandlers::new(proxy).into_rpc();
+    let mut module = IngressEthApiServer::into_rpc(IngressHandlers::new(proxy.clone()));
+    module
+        .merge(KardamomAdminApiServer::into_rpc(IngressHandlers::new(proxy)))
+        .map_err(|e| IngressError::Internal(format!("merge admin module: {e}")))?;
     Ok((local, server.start(module)))
 }
 
