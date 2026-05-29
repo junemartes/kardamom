@@ -17,6 +17,7 @@ use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
     TxOrderingPublisherHandle,
 };
+use kardamom_log::bootstrap::{BootstrapPolicy, BootstrappedSubscriberHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::deposit::{DepositSubscriber, process_deposit};
@@ -94,14 +95,27 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let shard_id = cfg.sequencer_id;
-    let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
-        .context("open TxDataSubscriberHandle")?;
+    let mut tx_data_sub =
+        TxDataSubscriberHandle::open_bootstrapped(&rt, &channels, shard_id, BootstrapPolicy::default_tx_data())
+            .context("open TxDataSubscriberHandle (bootstrapped)")?;
     let tx_ordering_pub = TxOrderingPublisherHandle::open(&rt, &channels)
         .context("open TxOrderingPublisherHandle")?;
-    let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
-        .context("open TxDepositsSubscriberHandle")?;
+    let mut tx_deposits_sub =
+        TxDepositsSubscriberHandle::open_bootstrapped(&rt, &channels, BootstrapPolicy::default_tx_deposits())
+            .context("open TxDepositsSubscriberHandle (bootstrapped)")?;
     let tx_errors_pub =
         TxErrorsPublisherHandle::open(&rt, &channels).context("open TxErrorsPublisherHandle")?;
+
+    tracing::info!("sequencer waiting for tx_data + tx_deposits bootstrap");
+    tx_data_sub
+        .wait_caught_up()
+        .await
+        .map_err(|e| anyhow::anyhow!("tx_data bootstrap failed: {e}"))?;
+    tx_deposits_sub
+        .wait_caught_up()
+        .await
+        .map_err(|e| anyhow::anyhow!("tx_deposits bootstrap failed: {e}"))?;
+    tracing::info!("sequencer bootstrap complete, accepting txs");
 
     let shutdown = Shutdown::new();
     let shutdown_for_main = shutdown.clone();
@@ -180,11 +194,11 @@ async fn main() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 struct LiveTxDataSub {
-    handle: TxDataSubscriberHandle,
+    handle: BootstrappedSubscriberHandle<TxEnvelope>,
 }
 
 impl LiveTxDataSub {
-    fn new(handle: TxDataSubscriberHandle) -> Self {
+    fn new(handle: BootstrappedSubscriberHandle<TxEnvelope>) -> Self {
         Self { handle }
     }
 }
@@ -198,11 +212,11 @@ impl TxDataSubscriber for LiveTxDataSub {
 }
 
 struct LiveDepositSub {
-    handle: TxDepositsSubscriberHandle,
+    handle: BootstrappedSubscriberHandle<Deposit>,
 }
 
 impl LiveDepositSub {
-    fn new(handle: TxDepositsSubscriberHandle) -> Self {
+    fn new(handle: BootstrappedSubscriberHandle<Deposit>) -> Self {
         Self { handle }
     }
 }
