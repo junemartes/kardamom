@@ -4,6 +4,7 @@
 //! tx_ordering subscriber (to bootstrap `block_number` from the tail), and
 //! runs [`Sealer::run_forever`] until SIGTERM / Ctrl-C.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +15,7 @@ use kardamom_log::aeron_live::{
     AeronRuntime, TxOrderingPublisherHandle, TxOrderingSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_obs;
 use kardamom_sealer::clock::SystemClock;
 use kardamom_sealer::emitter::{BoundaryPublisher, PublishError};
 use kardamom_sealer::{Sealer, SealerConfig};
@@ -34,12 +36,25 @@ struct Args {
     /// `/dev/shm/aeron-<user>`).
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9003")]
+    metrics_addr: SocketAddr,
+    /// Host identifier; stamped as a global label on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    kardamom_obs::init(
+        "sealer",
+        args.metrics_addr,
+        &args.host_id,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+    )?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let cfg: SealerConfig = toml::from_str(&raw).context("parse config")?;
     cfg.validate().context("validate config")?;

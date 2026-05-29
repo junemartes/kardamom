@@ -52,19 +52,15 @@ pub struct BoundaryEmitter<C: WallClock, P: BoundaryPublisher> {
     clock: Arc<C>,
     block_number: u64,
     tick_interval_ms: u64,
-    /// Pre-formatted `host_id` for the per-emit metric labels, so we don't
-    /// allocate a fresh `String` every tick.
-    host_id_str: String,
 }
 
 impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
-    pub fn new(publisher: P, clock: C, initial_block: u64, tick_ms: u64, host_id: u8) -> Self {
+    pub fn new(publisher: P, clock: C, initial_block: u64, tick_ms: u64) -> Self {
         Self {
             publisher,
             clock: Arc::new(clock),
             block_number: initial_block,
             tick_interval_ms: tick_ms,
-            host_id_str: host_id.to_string(),
         }
     }
 
@@ -109,23 +105,14 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
                 Ok(_pos) => {
                     let emitted = self.block_number;
                     self.block_number += 1;
-                    metrics::counter!(
-                        "sealer_boundaries_emitted_total",
-                        "host_id" => self.host_id_str.clone(),
-                    )
-                    .increment(1);
-                    metrics::gauge!(
-                        "sealer_block_number",
-                        "host_id" => self.host_id_str.clone(),
-                    )
-                    .set(emitted as f64);
+                    metrics::counter!("kardamom_sealer_boundaries_emitted_total").increment(1);
+                    metrics::gauge!("kardamom_sealer_block_number").set(emitted as f64);
                     return Ok(emitted);
                 }
                 Err(PublishError::BackPressure) => {
                     if std::time::Instant::now() >= deadline {
                         metrics::counter!(
-                            "sealer_tick_skipped_total",
-                            "host_id" => self.host_id_str.clone(),
+                            "kardamom_sealer_tick_skipped_total",
                             "reason" => "backpressure",
                         )
                         .increment(1);
@@ -236,7 +223,7 @@ mod tests {
         let bus = FakeBus::new();
         let publisher = fakes::FakeBoundaryPublisher::new(bus, "ch", 1);
         let cloned = publisher.clone();
-        let emitter = BoundaryEmitter::new(publisher, clock, initial, 250, 1);
+        let emitter = BoundaryEmitter::new(publisher, clock, initial, 250);
         (emitter, cloned)
     }
 
