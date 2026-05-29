@@ -47,6 +47,7 @@
 //! - L1-attributes / system txs (OP `is_system_transaction = true`).
 
 pub mod derive;
+pub mod metrics;
 pub mod publisher;
 pub mod rpc_source;
 pub mod source;
