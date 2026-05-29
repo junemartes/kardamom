@@ -153,13 +153,19 @@ enum RuntimeCmd {
         stream_id: i32,
         reply: CbSender<Result<i64, LogError>>,
     },
-    /// Start a replay anchored at `start_position` for `(channel, stream_id)`.
-    /// Returns an [`ArchiveReplayHandle`] the caller uses to open a normal
-    /// subscription on the replay channel.
-    ArchiveStartReplay {
+    /// Atomically open a subscription on the replay channel THEN start the
+    /// replay — all within one `handle_cmd` call so no loop iteration can
+    /// deliver a replay frame before the subscription is registered.
+    ///
+    /// The `deliver` closure is installed into `subs` BEFORE `start_replay`
+    /// is called, eliminating the race where a short recording (≤ 1 frame)
+    /// would be fully replayed before the next `OpenSubscription` command
+    /// could be processed.
+    ArchiveStartReplayAndSubscribe {
         channel: String,
         stream_id: i32,
         start_position: i64,
+        deliver: DeliverFn,
         reply: CbSender<Result<ArchiveReplayHandle, LogError>>,
     },
     /// Stop the loop, drop everything.
@@ -365,24 +371,51 @@ impl AeronRuntime {
     ///
     /// Returns an [`ArchiveReplayHandle`] containing the session id and the
     /// replay channel/stream the caller should subscribe on.
-    pub(crate) fn archive_start_replay(
+    /// Atomically register the replay subscription and start the replay in one
+    /// Aeron-thread command, eliminating the race where a short recording
+    /// (single frame) could be replayed before a subsequent `open_subscription`
+    /// command was processed.
+    ///
+    /// Returns the typed receiver and the replay handle.  The subscription is
+    /// always installed BEFORE `start_replay` is called.
+    pub(crate) fn archive_start_replay_and_subscribe<T>(
         &self,
         channel: &str,
         stream_id: i32,
         start_position: i64,
-    ) -> Result<ArchiveReplayHandle, LogError> {
+    ) -> Result<(UnboundedReceiver<(BPosition, T)>, ArchiveReplayHandle), LogError>
+    where
+        T: rkyv::Archive + Send + 'static,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
+            match codec::materialize::<T>(bytes) {
+                Ok(v) => {
+                    if msg_tx.send((pos, v)).is_err() {}
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on replay subscription delivery");
+                }
+            }
+        });
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         self.cmd_tx
-            .send(RuntimeCmd::ArchiveStartReplay {
+            .send(RuntimeCmd::ArchiveStartReplayAndSubscribe {
                 channel: channel.to_string(),
                 stream_id,
                 start_position,
+                deliver,
                 reply: reply_tx,
             })
             .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
-        reply_rx
+        let handle = reply_rx
             .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| LogError::Aeron("archive_start_replay timed out".into()))?
+            .map_err(|_| LogError::Aeron("archive_start_replay_and_subscribe timed out".into()))??;
+        Ok((msg_rx, handle))
     }
 
     /// Open a typed subscription, returning an mpsc receiver of decoded
@@ -639,12 +672,18 @@ fn handle_cmd(
             };
             let _ = reply.send(res);
         }
-        RuntimeCmd::ArchiveStartReplay {
+        RuntimeCmd::ArchiveStartReplayAndSubscribe {
             channel,
             stream_id,
             start_position,
+            deliver,
             reply,
         } => {
+            // Install the subscription BEFORE starting the replay so no
+            // replay frame can be published to the channel before the
+            // subscription is registered.  Both operations happen in a
+            // single `handle_cmd` call — the Aeron thread loop never polls
+            // subscriptions between them.
             let res = match archive_client {
                 None => Err(LogError::Aeron("archive client not available".into())),
                 Some(archive) => {
@@ -653,6 +692,15 @@ fn handle_cmd(
                             let replay_channel =
                                 format!("aeron:ipc?alias=replay-{recording_id}");
                             let replay_stream_id = stream_id + REPLAY_STREAM_OFFSET;
+
+                            // Step 1: open subscription FIRST.
+                            open_sub(aeron, &replay_channel, replay_stream_id).map(|sub| {
+                                subs.push(SubEntry { sub, deliver });
+                                (recording_id, replay_channel, replay_stream_id)
+                            })
+                        })
+                        .and_then(|(recording_id, replay_channel, replay_stream_id)| {
+                            // Step 2: start replay after subscription is registered.
                             let replay_channel_c =
                                 CString::new(replay_channel.as_str()).map_err(|e| {
                                     LogError::Aeron(format!("replay channel NUL: {e}"))
@@ -1072,36 +1120,21 @@ where
                         }
                     }
 
-                    // Start replay; open the replay subscription.
-                    let replay_handle = match rt_for_thread.archive_start_replay(
-                        &channel_for_thread,
-                        stream_id,
-                        anchor,
-                    ) {
-                        Ok(h) => h,
+                    // Open the subscription and start the replay atomically
+                    // (single Aeron-thread command).  The subscription is
+                    // installed BEFORE start_replay is called so no replay
+                    // frame can be published before the subscriber is ready.
+                    let replay_rx = match rt_for_thread
+                        .archive_start_replay_and_subscribe::<T>(
+                            &channel_for_thread,
+                            stream_id,
+                            anchor,
+                        ) {
+                        Ok((rx, _handle)) => rx,
                         Err(e) => {
                             error!(
                                 error = %e,
-                                "bootstrap: archive_start_replay failed; degrading"
-                            );
-                            run_connected_bootstrap(
-                                live_rx,
-                                frame_tx,
-                                caught_up_tx,
-                                catch_up_timeout,
-                            );
-                            return;
-                        }
-                    };
-                    let replay_rx = match rt_for_thread.open_subscription::<T>(
-                        &replay_handle.replay_channel,
-                        replay_handle.replay_stream_id,
-                    ) {
-                        Ok(rx) => rx,
-                        Err(e) => {
-                            error!(
-                                error = %e,
-                                "bootstrap: replay subscription open failed; degrading"
+                                "bootstrap: archive_start_replay_and_subscribe failed; degrading"
                             );
                             run_connected_bootstrap(
                                 live_rx,
@@ -1229,14 +1262,32 @@ fn run_replay_bootstrap<T: Send + 'static>(
             }
         }
 
-        // V1 catch-up check: replay quiet for QUIET_WINDOW AND either we've
-        // seen at least one replay frame OR `catch_up_timeout / 4` has
-        // elapsed without one (cold-ish bootstrap that found no history).
+        // V1 catch-up check.
+        //
+        // Two exit conditions:
+        //
+        // A) `quiet && saw_any_replay`: replay delivered at least one frame
+        //    and has been quiet for QUIET_WINDOW — the historical backlog is
+        //    drained.  This is the normal path for a late-joining subscriber.
+        //
+        // B) `!saw_any_replay && start.elapsed() >= catch_up_timeout / 4`:
+        //    no replay frame has arrived yet within the first quarter of the
+        //    budget.  This handles the case of an *empty* active recording:
+        //    `archive_latest_position` returned `Some(0)` (recording exists
+        //    but nothing was written yet) so we chose Replay mode, but there
+        //    is genuinely nothing to replay.  Exiting early avoids a 30-second
+        //    stall that would otherwise buffer live frames in `live_buffer` and
+        //    then re-deliver them after the open-ended replay has already
+        //    forwarded them — causing duplicate delivery to the consumer.
+        //    The hard 30 s `catch_up_timeout` below still fires if the replay
+        //    subscription itself is stuck (e.g. archive not reachable).
         let now = std::time::Instant::now();
         let quiet = now.duration_since(last_replay_frame) >= QUIET_WINDOW;
-        let warmed_up = saw_any_replay
-            || start.elapsed() >= catch_up_timeout / 4;
-        if quiet && warmed_up {
+        if quiet && saw_any_replay {
+            break;
+        }
+        if !saw_any_replay && start.elapsed() >= catch_up_timeout / 4 {
+            // Empty recording: nothing to replay.  Treat as caught-up.
             break;
         }
         if start.elapsed() >= catch_up_timeout {
@@ -1251,14 +1302,29 @@ fn run_replay_bootstrap<T: Send + 'static>(
         }
     }
 
-    // Flush any buffered live frames in arrival order, then signal caught-up
-    // and continue forwarding live indefinitely.
+    // Signal caught-up, then route live frames.
+    //
+    // When `saw_any_replay` is true the open-ended replay followed the
+    // active recording and already forwarded every live frame to
+    // `frame_tx`.  The `live_buffer` is therefore a complete duplicate of
+    // what the replay delivered — flushing it would re-deliver all the
+    // same `BoundaryStart` frames, causing the executor's
+    // `BoundaryMisaligned` check to abort after the first live transaction.
+    // Discard the buffer in this case.
+    //
+    // When `saw_any_replay` is false the recording was empty (or the replay
+    // subscription never received any frame) so the replay delivered
+    // nothing.  The `live_buffer` holds the only copy of those frames and
+    // must be forwarded.
     let _ = caught_up_tx.send(true);
-    while let Some(f) = live_buffer.pop_front() {
-        if frame_tx.send(f).is_err() {
-            return;
+    if !saw_any_replay {
+        while let Some(f) = live_buffer.pop_front() {
+            if frame_tx.send(f).is_err() {
+                return;
+            }
         }
     }
+    // (If saw_any_replay, live_buffer is silently dropped here.)
     while let Some(frame) = live_rx.blocking_recv() {
         if frame_tx.send(frame).is_err() {
             break;

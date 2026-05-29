@@ -201,8 +201,25 @@ async fn main() -> Result<()> {
     let sw_queue = WriterApplyingQueue::new(db);
     let sw_signal = ImmediateSignal;
 
+    // Yield to the tokio runtime so the pump tasks spawned above get a
+    // chance to drain any backlogged frames from the bootstrap into the
+    // sync mpsc channels before the executor's OS threads start reading.
+    // Without this, the tx_ordering reader can process a replayed TxRef
+    // and call wait_for_envelope() before the tx_data pump task has had
+    // a scheduler slice to insert the corresponding envelope into the
+    // JoinBuffer — a race that manifests as a spurious JoinTimeout when
+    // the executor restarts after a gap (late-joiner / live restart).
+    tokio::task::yield_now().await;
+
     let cfg = ExecutorConfig {
         chain_id,
+        reader: kardamom_executor::ReaderConfig {
+            // Keep a generous join_timeout as a safety net for the live
+            // delivery path (µs lag from sequencer) and any OS scheduling
+            // jitter not covered by the yield_now above.
+            join_timeout: std::time::Duration::from_secs(10),
+            ..Default::default()
+        },
         ..ExecutorConfig::default()
     };
     let initial_block = args.initial_block;

@@ -842,6 +842,229 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
 }
 
 // ============================================================================
+// Late-joiner archive-replay test (issue #31)
+// ============================================================================
+
+/// Late-joiner replay test: start the cluster MINUS the executor, submit a
+/// transaction, then start the executor and verify it catches up via archive
+/// replay and produces a receipt for the historical tx.
+///
+/// This is the canonical regression for issue #31 — without archive-backed
+/// replay, the late-joining executor would never see the tx_data the
+/// ingress already published nor the TxRef the sequencer already ordered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker + cargo-built kardamom-* bins; run with `cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e -- --ignored --nocapture multiprocess_e2e_late_joiner_replays_history`"]
+async fn multiprocess_e2e_late_joiner_replays_history() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    if !docker_available().await {
+        eprintln!("skipping: docker not available");
+        return;
+    }
+
+    // Build all service bins before spawning any processes.
+    build_service_bins();
+
+    // ---- Phase 1: Bring up Aeron + three services (NO executor yet) --------
+    let cluster = AeronTestCluster::single_node_host_net()
+        .await
+        .expect("aeron container up");
+    let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
+    tracing::info!(aeron_dir = %aeron_dir.display(), "aeron container running");
+
+    let cfg_dir = TempDir::new().expect("cfg tempdir");
+    let sealer_cfg = write_sealer_config(cfg_dir.path());
+    let sequencer_cfg = write_sequencer_config(cfg_dir.path());
+    let executor_cfg = write_executor_config(cfg_dir.path());
+    let ingress_cfg = write_ingress_config(cfg_dir.path());
+
+    // Fund Alice so the executor's revm can debit her balance.
+    let alice = signer_from_seed(0x11);
+    let alice_addr = alice.address();
+    let bob_addr = Address::repeat_byte(0x22);
+    let genesis_path = write_genesis_toml(cfg_dir.path(), CHAIN_ID, alice_addr);
+
+    let target_bin = workspace_target_bin();
+
+    // Spawn sealer, sequencer, and ingress — but NOT the executor.
+    let sealer = ChildGuard::spawn(
+        "kardamom-sealer",
+        Command::new(target_bin.join("kardamom-sealer"))
+            .arg("--config")
+            .arg(&sealer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let sequencer = ChildGuard::spawn(
+        "kardamom-sequencer",
+        Command::new(target_bin.join("kardamom-sequencer"))
+            .arg("--config")
+            .arg(&sequencer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let ingress = ChildGuard::spawn(
+        "kardamom-ingress",
+        Command::new(target_bin.join("kardamom-ingress"))
+            .arg("--config")
+            .arg(&ingress_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--jsonrpc-bind")
+            .arg(format!("127.0.0.1:{JSONRPC_PORT}"))
+            // Release submit_raw waiters as soon as the receipt arrives;
+            // no quorum-watermark publisher in this test.
+            .arg("--ack-policy")
+            .arg("on-offer")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+
+    // ---- Phase 2: Wait for ingress JSON-RPC + readiness gate ---------------
+    let rpc_url = format!("http://127.0.0.1:{JSONRPC_PORT}");
+    wait_for_jsonrpc(&rpc_url, Duration::from_secs(30))
+        .await
+        .expect("ingress JSON-RPC ready");
+
+    // ingress's tx_receipts subscription will timeout (no executor publishing)
+    // but readiness still flips true once bootstrapped subs report caught-up.
+    wait_for_ready(&rpc_url, Duration::from_secs(60))
+        .await
+        .expect("ingress bootstrap did not complete");
+
+    // Wait for the sequencer to finish its own bootstrap. The sequencer
+    // subscribes to tx_deposits with BootstrapPolicy::Replay; on a cold start
+    // (no recording yet) this degrades to the Connected policy which waits up
+    // to 30 s for a first deposit frame or its timeout to fire.  Until the
+    // sequencer bootstrap completes it does not accept tx_data frames, so T1
+    // would be dropped/ignored.  Waiting 35 s from cluster start (the ingress
+    // ready gate fires at ~10 s) gives the sequencer ample time to pass its
+    // bootstrap phase before we send the transaction.
+    tracing::info!("waiting for sequencer bootstrap to complete (~25 s additional settle)");
+    tokio::time::sleep(Duration::from_secs(25)).await;
+    tracing::info!("sequencer bootstrap settle done; ingress ready; submitting T1");
+
+    // ---- Phase 3: Submit T1 via eth_sendRawTransaction (don't wait for receipt) ---
+    // We submit and fire-and-forget — there's no executor to produce a receipt.
+    // Use a short request timeout so we don't block waiting for ingress to
+    // respond with a receipt that will never come.
+    let raw_t1 = signed_transfer(&alice, bob_addr, U256::from(1u64), 0);
+    let t1_hash = {
+        let env = ConsensusEnvelope::decode(&mut raw_t1.as_slice()).expect("decode T1");
+        *env.tx_hash()
+    };
+    let raw_t1_hex = format!("0x{}", hex::encode(&raw_t1));
+
+    // Fire-and-forget in a background task — ingress will block on the
+    // receipt because no executor is running yet.
+    let rpc_url_clone = rpc_url.clone();
+    let submit_handle = tokio::spawn(async move {
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_secs(120))
+            .build(&rpc_url_clone)
+            .expect("http client for T1 submit");
+        let res: Result<B256, _> = client
+            .request("eth_sendRawTransaction", rpc_params![&raw_t1_hex])
+            .await;
+        tracing::info!(?res, "background T1 submit resolved");
+        res
+    });
+
+    // ---- Phase 4: Wait for sequencer to record T1 to the archive -----------
+    // The sequencer processes tx_data → publishes TxRef on tx_ordering, which
+    // the archive records.  Give the sequencer 5 s to process T1 and for the
+    // archive to persist the TxRef frame so the late-joining executor will see
+    // it via Replay rather than the live-buffer path (which creates a join race).
+    tracing::info!(tx_hash = ?t1_hash, "T1 submitted; waiting 5 s for sequencer to archive TxRef");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    tracing::info!("archive settle done; spawning late-joining executor");
+
+    // ---- Phase 5: Spawn the executor LATE ----------------------------------
+    let _executor = ChildGuard::spawn(
+        "kardamom-executor",
+        Command::new(target_bin.join("kardamom-executor"))
+            .arg("--config")
+            .arg(&executor_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--chain-id")
+            .arg(CHAIN_ID.to_string())
+            .arg("--chain")
+            .arg(&genesis_path)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    tracing::info!("executor spawned late; polling for T1 receipt via archive replay");
+
+    // ---- Phase 6: Poll for receipt (proves archive-replay path works) ------
+    let receipt = wait_for_receipt(&rpc_url, t1_hash, Duration::from_secs(90))
+        .await
+        .expect("T1 receipt arrived via late-joiner archive replay");
+
+    let status = receipt
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert_eq!(
+        status, "0x1",
+        "T1 receipt status not success ({receipt})"
+    );
+    tracing::info!(tx_hash = ?t1_hash, "T1 receipt verified — late-joiner replayed history successfully");
+
+    // Cancel the background submit task (it may have already resolved).
+    submit_handle.abort();
+
+    // ---- Teardown ----------------------------------------------------------
+    drop(ingress);
+    drop(_executor);
+    drop(sequencer);
+    drop(sealer);
+    drop(cluster);
+}
+
+/// Polls `eth_getTransactionReceipt` until the receipt is non-null or `timeout` elapses.
+///
+/// Used by the late-joiner replay test to verify the executor catches up via
+/// archive replay and produces a receipt for a transaction submitted before
+/// the executor was started.
+async fn wait_for_receipt(
+    url: &str,
+    tx_hash: B256,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_secs(5))
+        .build(url)
+        .map_err(|e| format!("http client: {e}"))?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        let res: Result<Value, _> = client
+            .request("eth_getTransactionReceipt", rpc_params![tx_hash])
+            .await;
+        if let Ok(v) = res {
+            if !v.is_null() {
+                return Ok(v);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(format!("timed out waiting for receipt for {tx_hash:?}"))
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
