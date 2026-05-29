@@ -5,6 +5,53 @@ point that feeds both Prometheus metrics and `tracing-flame` flamegraphs. The
 local stack — Prometheus + Grafana — is wired up with `docker compose`, and a
 `kardamom-bench` binary drives load so the dashboard panels move.
 
+## Metrics
+
+Every kardamom service binary exports Prometheus metrics on its own HTTP listener.
+Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
+
+| Service | Default address | Dashboard UID |
+| --- | --- | --- |
+| `kardamom` (RPC node) | `127.0.0.1:9000` | `kardamom-node` |
+| `kardamom-sequencer` | `127.0.0.1:9001` | `kardamom-sequencer` |
+| `kardamom-batcher` | `127.0.0.1:9002` | `kardamom-batcher` |
+| `kardamom-sealer` | `127.0.0.1:9003` | `kardamom-sealer` |
+| `kardamom-executor` | `127.0.0.1:9004` | `kardamom-executor` |
+| `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
+| `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
+
+Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default `local`).
+It's stamped on every emitted metric as the `host_id` label, alongside an automatic
+`service` label set by `kardamom_obs::init`. The top-level `Kardamom Overview`
+dashboard exposes a `host` template variable; per-service dashboards inherit it.
+
+### Naming convention
+
+`kardamom_<service>_<subsystem>_<name>_<unit>` (e.g. `kardamom_sequencer_tx_ingested_total`,
+`kardamom_executor_block_apply_duration_seconds`). The RPC node uses
+`kardamom_rpc_*` for handler-level metrics and `kardamom_block_number` for the
+chain head (predates the convention).
+
+### Scaling to multiple hosts
+
+Each scrape job in `deploy/prometheus.yml` is a static-targets list. To add a
+second host running every service, append `host-2:<port>` to each of the seven
+target lists. Every metric is already labelled with `host_id`, so dashboards
+group by host without relabel rules.
+
+### Rename map (from before this PR)
+
+| Old | New |
+| --- | --- |
+| `batcher.blocks_observed_total` | `kardamom_batcher_blocks_observed_total` |
+| `batcher.batches_posted_total` | `kardamom_batcher_batches_posted_total` |
+| `batcher.blobs_posted_total` | `kardamom_batcher_blobs_posted_total` |
+| `sealer_boundaries_emitted_total` | `kardamom_sealer_boundaries_emitted_total` |
+| `sealer_block_number` | `kardamom_sealer_block_number` |
+| `sealer_tick_skipped_total` | `kardamom_sealer_tick_skipped_total` |
+
+The sealer's per-emission `host_id` label is gone — `host_id` is now a recorder-level global.
+
 ## What is instrumented
 
 Per-stage spans + histograms (`kardamom_rpc_stage_duration_seconds`):
