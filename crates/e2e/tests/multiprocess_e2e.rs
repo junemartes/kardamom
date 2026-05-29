@@ -995,6 +995,33 @@ async fn wait_for_jsonrpc(url: &str, timeout: Duration) -> Result<(), String> {
     Err("timed out waiting for ingress JSON-RPC".into())
 }
 
+/// Polls `kardamom_isReady` on the ingress JSON-RPC endpoint until the
+/// response reports `ready == true`, or `timeout` elapses.
+///
+/// `kardamom_isReady` is served by the ingress's `KardamomAdminApi`; it
+/// returns `{"ready": bool, "gated_streams": [...]}`. When `ready` is true
+/// every bootstrapped subscriber has caught up with the archive, and the
+/// ingress is accepting new transactions. This helper is the correct
+/// replacement for the 5 s unconditional sleep used in the original tests
+/// (see issue #31).
+async fn wait_for_ready(url: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_secs(2))
+        .build(url)
+        .map_err(|e| format!("http client: {e}"))?;
+    while tokio::time::Instant::now() < deadline {
+        let res: Result<Value, _> = client.request("kardamom_isReady", rpc_params![]).await;
+        if let Ok(v) = res {
+            if v.get("ready").and_then(|r| r.as_bool()).unwrap_or(false) {
+                return Ok(());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("timed out waiting for kardamom_isReady".into())
+}
+
 // ============================================================================
 // Child-process RAII
 // ============================================================================
