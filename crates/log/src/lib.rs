@@ -39,8 +39,8 @@ pub mod watermark;
 pub mod testing;
 
 pub use bootstrap::{
-    ArchiveSource, BootstrapError, BootstrapPolicy, LiveImage, ReplaySource, ReplayWindow,
-    StreamPosition,
+    ArchiveSource, BootstrapDriver, BootstrapError, BootstrapPolicy, LiveImage, ReplaySource,
+    ReplayWindow, StreamPosition,
 };
 pub use error::LogError;
 
