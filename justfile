@@ -9,6 +9,10 @@
 #   * the `deployer`/`node` build scripts shell out to Foundry's `forge` to
 #     compile the Solidity contracts.
 # `just bootstrap` installs all of the above for your platform.
+#
+# The multi-node cluster under `deploy/cluster/` needs a different set of HOST
+# tools (Vagrant + a VM provider, Ansible, Docker). `just cluster-bootstrap`
+# installs those; `just cluster-doctor` checks them.
 
 _default:
     @just --list
@@ -254,3 +258,107 @@ test-e2e-local: aeron-driver-up
             multiprocess_e2e_signed_transfer_round_trip \
             multiprocess_e2e_deposit_round_trip \
             anvil_pipeline_e2e_l1_deposit_and_l2_round_trip
+
+# ---------------------------------------------------------------------------
+# Multi-node cluster (deploy/cluster) — HOST dependencies.
+#
+# These recipes install the tools needed on this machine to run
+# `cd deploy/cluster && make up`: Vagrant + a VM provider, Ansible (+ the
+# ansible.posix / community.docker collections), and Docker with BuildKit.
+# Nomad and Consul are installed *inside* the VMs by Ansible, not here.
+# See deploy/cluster/README.md.
+# ---------------------------------------------------------------------------
+
+# Install everything the HOST needs for the deploy/cluster workflow.
+cluster-bootstrap:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    os="$(uname -s)"
+    case "$os" in
+    Darwin)
+        command -v brew >/dev/null 2>&1 || { echo "Homebrew required — https://brew.sh" >&2; exit 1; }
+        echo ">> installing Vagrant + VirtualBox + Docker + Ansible via brew"
+        # VirtualBox is the practical Vagrant provider on macOS (libvirt is
+        # Linux-only). Casks may prompt for sudo / a kernel-extension approval.
+        brew install --cask vagrant virtualbox docker || true
+        brew install ansible
+        echo "   NOTE: VirtualBox support on Apple Silicon is limited; a Linux"
+        echo "   host with libvirt/qemu is the best-supported environment."
+        echo "   Start Docker Desktop before running 'make up'."
+        ;;
+    Linux)
+        . /etc/os-release 2>/dev/null || true
+        echo ">> installing cluster host deps (distro: ${ID:-unknown})"
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update
+            # vagrant + libvirt/qemu provider, build deps for the
+            # vagrant-libvirt plugin (ruby-dev/libvirt-dev/gcc/make),
+            # ansible, and docker + buildx (BuildKit).
+            sudo apt-get install -y \
+                vagrant qemu-kvm libvirt-daemon-system libvirt-clients libvirt-dev \
+                dnsmasq-base ebtables ruby-dev gcc make \
+                ansible docker.io docker-buildx
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y vagrant @virtualization libvirt libvirt-devel qemu-kvm \
+                ansible docker gcc make ruby-devel
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --needed --noconfirm vagrant libvirt qemu-full dnsmasq \
+                ansible docker
+        else
+            echo "Unsupported Linux distro. Install manually: vagrant, libvirt+qemu," >&2
+            echo "ansible, docker (see deploy/cluster/README.md)." >&2
+            exit 1
+        fi
+        # vagrant-libvirt provider plugin (idempotent).
+        if ! vagrant plugin list 2>/dev/null | grep -q vagrant-libvirt; then
+            echo ">> installing vagrant-libvirt plugin"
+            vagrant plugin install vagrant-libvirt
+        fi
+        # Group membership so libvirt + docker work without sudo (needs re-login).
+        for grp in libvirt kvm docker; do
+            getent group "$grp" >/dev/null 2>&1 && sudo usermod -aG "$grp" "$USER" || true
+        done
+        sudo systemctl enable --now libvirtd docker 2>/dev/null || true
+        echo "   NOTE: log out/in (or run 'newgrp docker') so the libvirt/kvm/docker"
+        echo "   group memberships take effect."
+        ;;
+    *)
+        echo "Unsupported platform: $os. See deploy/cluster/README.md." >&2
+        exit 1
+        ;;
+    esac
+    # Ansible Galaxy collections the playbook depends on.
+    echo ">> installing ansible collections (ansible.posix, community.docker)"
+    ansible-galaxy collection install ansible.posix community.docker
+    echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
+
+# Check that the HOST has everything deploy/cluster needs.
+cluster-doctor:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    rc=0
+    have() { command -v "$1" >/dev/null 2>&1; }
+    chk() { if have "$1"; then echo "  ok    $1 — $("$1" --version 2>&1 | head -1)"; else echo "  MISS  $1 ($2)"; rc=1; fi; }
+    echo ">> deploy/cluster host dependencies:"
+    chk vagrant "run 'just cluster-bootstrap'"
+    chk ansible "run 'just cluster-bootstrap'"
+    chk ansible-galaxy "ships with ansible"
+    chk docker "run 'just cluster-bootstrap'"
+    if have virsh || have VBoxManage; then
+        echo "  ok    vm provider (libvirt or virtualbox)"
+    else
+        echo "  MISS  vm provider — install libvirt+qemu (Linux) or VirtualBox (macOS)"; rc=1
+    fi
+    for col in ansible.posix community.docker; do
+        if ansible-galaxy collection list 2>/dev/null | grep -q "^$col "; then
+            echo "  ok    ansible collection $col"
+        else
+            echo "  MISS  ansible collection $col — run 'just cluster-bootstrap'"; rc=1
+        fi
+    done
+    if [[ "$rc" == "0" ]]; then
+        echo ">> all good — 'cd deploy/cluster && make up'"
+    else
+        echo ">> missing dependencies; run 'just cluster-bootstrap'" >&2
+    fi
+    exit "$rc"

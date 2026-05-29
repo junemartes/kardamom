@@ -29,6 +29,9 @@ defined once in [`ansible/group_vars/all.yml`](./ansible/group_vars/all.yml).
 
 ## Host prerequisites
 
+**Quickest path:** from the repo root, `just cluster-bootstrap` installs all of
+the host tools below for your platform, and `just cluster-doctor` verifies them.
+
 Install on the **host** machine (the cluster installs Nomad/Consul itself):
 
 - [Vagrant](https://www.vagrantup.com/) + a provider: **libvirt** (primary) or
