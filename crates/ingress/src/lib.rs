@@ -21,6 +21,7 @@ pub mod channels;
 pub mod config;
 pub mod error;
 pub mod json_rpc;
+pub mod metrics;
 pub mod pending;
 pub mod proxy;
 pub mod rate_limit;
