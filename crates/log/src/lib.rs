@@ -24,6 +24,7 @@
 //!   `testing`.
 
 pub mod aeron_live;
+pub mod bootstrap;
 pub mod codec;
 pub mod config;
 pub mod error;
@@ -37,6 +38,7 @@ pub mod watermark;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
+pub use bootstrap::{BootstrapError, BootstrapPolicy, ReplayWindow};
 pub use error::LogError;
 
 // Re-export the shared types so existing call sites can `use kardamom_log::types::*`
