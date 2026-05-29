@@ -8,6 +8,7 @@ edition.workspace = true
 # : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
+kardamom-obs = { path = "../obs" }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
@@ -16,6 +17,7 @@ alloy-rlp.workspace = true
 anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
+metrics = { workspace = true }
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
@@ -39,7 +41,9 @@ tempfile = { workspace = true }
 criterion = { workspace = true, features = ["html_reports"] }
 rand = "0.9"
 rand_chacha = "0.9"
-tokio = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+metrics = { workspace = true }
 
 [[bench]]
 name = "sequential_throughput"
