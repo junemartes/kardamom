@@ -59,6 +59,7 @@ use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{error, warn};
 
+use crate::bootstrap::{BootstrapPolicy, BootstrappedSubscriberHandle, ReplayWindow};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
@@ -884,6 +885,348 @@ impl PubHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Bootstrap glue: spawn a thread that runs the BootstrapPolicy state machine
+// against an existing typed subscription.
+// ---------------------------------------------------------------------------
+
+/// Anchor for `ReplayWindow::PositionBytes`, given a `latest` archive
+/// position. Returns `max(0, latest - bytes)`.
+fn anchor_for_window(latest: i64, window: ReplayWindow) -> i64 {
+    match window {
+        ReplayWindow::PositionBytes { bytes } => (latest - bytes as i64).max(0),
+        // V1: no boundary-scan support yet. Fall back to a fixed 16 MiB
+        // byte window. The proper boundary scan is a follow-up; see
+        // `docs/superpowers/specs/2026-05-29-aeron-archive-bootstrap-design.md`
+        // (T11). Block-boundary anchoring matters mostly for `tx_ordering`,
+        // and is exercised by the docker-e2e harness, not unit tests.
+        ReplayWindow::BlockBoundaries { safety: _ } => (latest - 16 * 1024 * 1024).max(0),
+    }
+}
+
+/// Open a typed live subscription + a typed replay subscription (if the
+/// policy requires it), spawn an OS thread that forwards both into the
+/// returned `BootstrappedSubscriberHandle<T>`, and signal caught-up at the
+/// appropriate point.
+///
+/// ## V1 catch-up heuristic (Replay policy)
+///
+/// The state machine in `crate::bootstrap` requires per-frame archive
+/// positions to declare "replay caught up to live". Surfacing those
+/// positions across the Aeron-thread boundary is a follow-up. V1 uses this
+/// approximation: declare caught-up once the replay subscription has been
+/// quiet (no frames delivered) for `quiet_window` ms AND at least one frame
+/// has been observed (or `catch_up_timeout / 4` has elapsed since open).
+/// Then drain any frames buffered during replay into the output and
+/// continue forwarding live.
+///
+/// Documented as "V1 heuristic; archive-position-based catch-up is a
+/// follow-up." Handlers must already be idempotent (replay/live overlap is
+/// expected; see the bootstrap spec).
+fn open_bootstrapped_typed<T>(
+    rt: &AeronRuntime,
+    channel: String,
+    stream_id: i32,
+    policy: BootstrapPolicy,
+) -> Result<BootstrappedSubscriberHandle<T>, LogError>
+where
+    T: rkyv::Archive + Send + 'static,
+    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    // Typed output channel + caught-up watch handed back to the caller.
+    let (frame_tx, frame_rx) = unbounded_channel::<(BPosition, T)>();
+    let (caught_up_tx, caught_up_rx) = tokio::sync::watch::channel(false);
+
+    // Always open the live subscription. The replay subscription is opened
+    // inside the bootstrap thread only for `Replay` policy.
+    let live_rx = rt.open_subscription::<T>(&channel, stream_id)?;
+
+    let rt_for_thread = rt.clone();
+    let channel_for_thread = channel.clone();
+
+    std::thread::Builder::new()
+        .name("kardamom-bootstrap".into())
+        .spawn(move || {
+            match policy {
+                BootstrapPolicy::Connected { timeout } => {
+                    run_connected_bootstrap(live_rx, frame_tx, caught_up_tx, timeout);
+                }
+                BootstrapPolicy::Replay {
+                    window,
+                    catch_up_timeout,
+                } => {
+                    // Look up the archive head. If no recording exists yet,
+                    // degrade to Connected behavior (cold start).
+                    let latest = match rt_for_thread
+                        .archive_latest_position(&channel_for_thread, stream_id)
+                    {
+                        Ok(Some(p)) => p,
+                        Ok(None) => {
+                            warn!(
+                                channel = %channel_for_thread,
+                                stream_id,
+                                "bootstrap: no recording yet; cold-start as Connected"
+                            );
+                            run_connected_bootstrap(
+                                live_rx,
+                                frame_tx,
+                                caught_up_tx,
+                                catch_up_timeout,
+                            );
+                            return;
+                        }
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                channel = %channel_for_thread,
+                                stream_id,
+                                "bootstrap: archive_latest_position failed; \
+                                 degrading to Connected"
+                            );
+                            run_connected_bootstrap(
+                                live_rx,
+                                frame_tx,
+                                caught_up_tx,
+                                catch_up_timeout,
+                            );
+                            return;
+                        }
+                    };
+
+                    let anchor = anchor_for_window(latest, window);
+
+                    // Verify anchor is at or above earliest archived position.
+                    match rt_for_thread
+                        .archive_earliest_position(&channel_for_thread, stream_id)
+                    {
+                        Ok(earliest) if anchor < earliest => {
+                            warn!(
+                                channel = %channel_for_thread,
+                                stream_id,
+                                anchor,
+                                earliest,
+                                "bootstrap: anchor below earliest archived position; \
+                                 degrading to Connected (history loss)"
+                            );
+                            run_connected_bootstrap(
+                                live_rx,
+                                frame_tx,
+                                caught_up_tx,
+                                catch_up_timeout,
+                            );
+                            return;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                "bootstrap: archive_earliest_position failed; degrading"
+                            );
+                            run_connected_bootstrap(
+                                live_rx,
+                                frame_tx,
+                                caught_up_tx,
+                                catch_up_timeout,
+                            );
+                            return;
+                        }
+                    }
+
+                    // Start replay; open the replay subscription.
+                    let replay_handle = match rt_for_thread.archive_start_replay(
+                        &channel_for_thread,
+                        stream_id,
+                        anchor,
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                "bootstrap: archive_start_replay failed; degrading"
+                            );
+                            run_connected_bootstrap(
+                                live_rx,
+                                frame_tx,
+                                caught_up_tx,
+                                catch_up_timeout,
+                            );
+                            return;
+                        }
+                    };
+                    let replay_rx = match rt_for_thread.open_subscription::<T>(
+                        &replay_handle.replay_channel,
+                        replay_handle.replay_stream_id,
+                    ) {
+                        Ok(rx) => rx,
+                        Err(e) => {
+                            error!(
+                                error = %e,
+                                "bootstrap: replay subscription open failed; degrading"
+                            );
+                            run_connected_bootstrap(
+                                live_rx,
+                                frame_tx,
+                                caught_up_tx,
+                                catch_up_timeout,
+                            );
+                            return;
+                        }
+                    };
+
+                    run_replay_bootstrap(
+                        live_rx,
+                        replay_rx,
+                        frame_tx,
+                        caught_up_tx,
+                        catch_up_timeout,
+                    );
+                }
+            }
+        })
+        .map_err(|e| LogError::Aeron(format!("spawn bootstrap thread: {e}")))?;
+
+    Ok(BootstrappedSubscriberHandle::new(frame_rx, caught_up_rx))
+}
+
+/// Connected policy: forward live frames; signal caught-up after first
+/// frame OR after `timeout`, whichever first. Continues forwarding live
+/// indefinitely.
+fn run_connected_bootstrap<T: Send + 'static>(
+    mut live_rx: UnboundedReceiver<(BPosition, T)>,
+    frame_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, T)>,
+    caught_up_tx: tokio::sync::watch::Sender<bool>,
+    timeout: Duration,
+) {
+    let start = std::time::Instant::now();
+    let mut signaled = false;
+
+    // Phase 1: poll with try_recv until first frame OR timeout.
+    while !signaled {
+        match live_rx.try_recv() {
+            Ok(frame) => {
+                let _ = frame_tx.send(frame);
+                let _ = caught_up_tx.send(true);
+                signaled = true;
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                if start.elapsed() >= timeout {
+                    let _ = caught_up_tx.send(true);
+                    signaled = true;
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                let _ = caught_up_tx.send(true);
+                return;
+            }
+        }
+    }
+
+    // Phase 2: forward live frames indefinitely.
+    while let Some(frame) = live_rx.blocking_recv() {
+        if frame_tx.send(frame).is_err() {
+            // Receiver dropped — subscription torn down.
+            break;
+        }
+    }
+}
+
+/// Replay policy: drain `replay_rx` while buffering live frames, then
+/// flush buffered live + continue forwarding live. Catch-up heuristic
+/// described on `open_bootstrapped_typed`.
+fn run_replay_bootstrap<T: Send + 'static>(
+    mut live_rx: UnboundedReceiver<(BPosition, T)>,
+    mut replay_rx: UnboundedReceiver<(BPosition, T)>,
+    frame_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, T)>,
+    caught_up_tx: tokio::sync::watch::Sender<bool>,
+    catch_up_timeout: Duration,
+) {
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    let start = std::time::Instant::now();
+    // V1 heuristic constants.
+    const QUIET_WINDOW: Duration = Duration::from_millis(500);
+    const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+    let mut live_buffer: std::collections::VecDeque<(BPosition, T)> =
+        std::collections::VecDeque::new();
+    let mut last_replay_frame = std::time::Instant::now();
+    let mut saw_any_replay = false;
+
+    loop {
+        // Drain replay first — they're history; they always precede live
+        // in delivery order for the same record.
+        let mut got_replay = false;
+        loop {
+            match replay_rx.try_recv() {
+                Ok(frame) => {
+                    if frame_tx.send(frame).is_err() {
+                        return;
+                    }
+                    got_replay = true;
+                    saw_any_replay = true;
+                    last_replay_frame = std::time::Instant::now();
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // Drain live into the buffer.
+        loop {
+            match live_rx.try_recv() {
+                Ok(frame) => live_buffer.push_back(frame),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Live closed — flush buffer and signal caught-up.
+                    let _ = caught_up_tx.send(true);
+                    while let Some(f) = live_buffer.pop_front() {
+                        let _ = frame_tx.send(f);
+                    }
+                    return;
+                }
+            }
+        }
+
+        // V1 catch-up check: replay quiet for QUIET_WINDOW AND either we've
+        // seen at least one replay frame OR `catch_up_timeout / 4` has
+        // elapsed without one (cold-ish bootstrap that found no history).
+        let now = std::time::Instant::now();
+        let quiet = now.duration_since(last_replay_frame) >= QUIET_WINDOW;
+        let warmed_up = saw_any_replay
+            || start.elapsed() >= catch_up_timeout / 4;
+        if quiet && warmed_up {
+            break;
+        }
+        if start.elapsed() >= catch_up_timeout {
+            warn!(
+                elapsed_ms = start.elapsed().as_millis() as u64,
+                "bootstrap: catch-up timeout elapsed; declaring caught-up anyway"
+            );
+            break;
+        }
+        if !got_replay {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    // Flush any buffered live frames in arrival order, then signal caught-up
+    // and continue forwarding live indefinitely.
+    let _ = caught_up_tx.send(true);
+    while let Some(f) = live_buffer.pop_front() {
+        if frame_tx.send(f).is_err() {
+            return;
+        }
+    }
+    while let Some(frame) = live_rx.blocking_recv() {
+        if frame_tx.send(frame).is_err() {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // TxData: per-shard envelope channel (proxy → seq/exec/batcher).
 // ---------------------------------------------------------------------------
 
@@ -933,6 +1276,23 @@ impl TxDataSubscriberHandle {
                 ch.tx_data_stream_id(sequencer_id),
             )?,
         })
+    }
+
+    /// Open with the supplied [`BootstrapPolicy`]. See
+    /// [`BootstrappedSubscriberHandle`] for the returned API.
+    /// Default policy for tx_data is [`BootstrapPolicy::default_tx_data`].
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        sequencer_id: u8,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<TxEnvelope>, LogError> {
+        open_bootstrapped_typed::<TxEnvelope>(
+            rt,
+            ch.tx_data_channel(sequencer_id),
+            ch.tx_data_stream_id(sequencer_id),
+            policy,
+        )
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, TxEnvelope)> {
@@ -993,6 +1353,23 @@ impl TxOrderingSubscriberHandle {
         })
     }
 
+    /// Open with the supplied [`BootstrapPolicy`]. Default policy for
+    /// `tx_ordering` is [`BootstrapPolicy::default_tx_ordering`]. NOTE:
+    /// the V1 anchor for `ReplayWindow::BlockBoundaries` falls back to a
+    /// fixed 16 MiB byte window (the proper boundary scan is a follow-up).
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<TxOrderingMessage>, LogError> {
+        open_bootstrapped_typed::<TxOrderingMessage>(
+            rt,
+            ch.tx_ordering_channel.clone(),
+            ch.tx_ordering_stream_id,
+            policy,
+        )
+    }
+
     pub async fn recv(&mut self) -> Option<(BPosition, TxOrderingMessage)> {
         self.rx.recv().await
     }
@@ -1045,6 +1422,22 @@ impl TxReceiptsSubscriberHandle {
         })
     }
 
+    /// Open with the supplied [`BootstrapPolicy`]. `tx_receipts` is a tail
+    /// stream (RAM-only, not archived); use
+    /// [`BootstrapPolicy::default_connected`].
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<Receipt>, LogError> {
+        open_bootstrapped_typed::<Receipt>(
+            rt,
+            ch.tx_receipts_channel.clone(),
+            ch.tx_receipts_stream_id,
+            policy,
+        )
+    }
+
     pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
         self.rx.recv().await
     }
@@ -1067,6 +1460,21 @@ impl TxReceiptsBoundarySubscriberHandle {
                 ch.tx_receipts_stream_id + 1,
             )?,
         })
+    }
+
+    /// Open with the supplied [`BootstrapPolicy`]. `tx_receipts` boundaries
+    /// are RAM-only; use [`BootstrapPolicy::default_connected`].
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<BlockBoundary>, LogError> {
+        open_bootstrapped_typed::<BlockBoundary>(
+            rt,
+            ch.tx_receipts_channel.clone(),
+            ch.tx_receipts_stream_id + 1,
+            policy,
+        )
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, BlockBoundary)> {
@@ -1112,6 +1520,21 @@ impl TxErrorsSubscriberHandle {
         Ok(Self {
             rx: rt.open_subscription::<TxError>(&ch.tx_errors_channel, ch.tx_errors_stream_id)?,
         })
+    }
+
+    /// Open with the supplied [`BootstrapPolicy`]. `tx_errors` is a tail
+    /// stream; use [`BootstrapPolicy::default_connected`].
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<TxError>, LogError> {
+        open_bootstrapped_typed::<TxError>(
+            rt,
+            ch.tx_errors_channel.clone(),
+            ch.tx_errors_stream_id,
+            policy,
+        )
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, TxError)> {
@@ -1160,6 +1583,22 @@ impl TxDepositsSubscriberHandle {
         })
     }
 
+    /// Open with the supplied [`BootstrapPolicy`]. Default policy for
+    /// `tx_deposits` is [`BootstrapPolicy::default_tx_deposits`] (Replay
+    /// with a 4 MiB window).
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<Deposit>, LogError> {
+        open_bootstrapped_typed::<Deposit>(
+            rt,
+            ch.tx_deposits_channel.clone(),
+            ch.tx_deposits_stream_id,
+            policy,
+        )
+    }
+
     pub async fn recv(&mut self) -> Option<(BPosition, Deposit)> {
         self.rx.recv().await
     }
@@ -1201,6 +1640,22 @@ impl FsyncWatermarkSubscriberHandle {
         Ok(Self {
             rx: rt.open_subscription::<FsyncWatermark>(&channel, ch.fsync_watermark_stream_id)?,
         })
+    }
+
+    /// Open with the supplied [`BootstrapPolicy`]. Fsync watermarks are
+    /// tail streams (RAM-only); use [`BootstrapPolicy::default_connected`].
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        recorder_id: u8,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<FsyncWatermark>, LogError> {
+        open_bootstrapped_typed::<FsyncWatermark>(
+            rt,
+            ch.fsync_watermark_channel(recorder_id),
+            ch.fsync_watermark_stream_id,
+            policy,
+        )
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, FsyncWatermark)> {
@@ -1246,6 +1701,21 @@ impl QuorumSubscriberHandle {
                 ch.quorum_watermark_stream_id,
             )?,
         })
+    }
+
+    /// Open with the supplied [`BootstrapPolicy`]. The quorum watermark is
+    /// a tail stream; use [`BootstrapPolicy::default_connected`].
+    pub fn open_bootstrapped(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        policy: BootstrapPolicy,
+    ) -> Result<BootstrappedSubscriberHandle<QuorumWatermark>, LogError> {
+        open_bootstrapped_typed::<QuorumWatermark>(
+            rt,
+            ch.quorum_watermark_channel.clone(),
+            ch.quorum_watermark_stream_id,
+            policy,
+        )
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, QuorumWatermark)> {

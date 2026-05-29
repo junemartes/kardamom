@@ -4,6 +4,79 @@
 
 use std::time::Duration;
 
+use kardamom_types::BPosition;
+use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::watch;
+
+/// Typed frame stream + caught-up signal for one bootstrapped subscription.
+///
+/// Returned by `open_bootstrapped()` on each subscriber handle. Two channels
+/// flow through it:
+///
+/// 1. A `tokio::sync::mpsc::UnboundedReceiver<(BPosition, T)>` of decoded
+///    frames. With the `Replay` policy, frames may include records that were
+///    archived before the subscriber attached AND records delivered live; the
+///    handler must tolerate duplicates (idempotency is a per-stream invariant
+///    documented in the bootstrap spec).
+/// 2. A `tokio::sync::watch::Receiver<bool>` that flips to `true` once the
+///    bootstrap thread judges the subscription has caught up to the live
+///    image. Use [`Self::wait_caught_up`] for the awaitable form, or clone
+///    the watch via [`Self::caught_up_watch`] for AND-ing several
+///    subscriptions.
+pub struct BootstrappedSubscriberHandle<T> {
+    rx: UnboundedReceiver<(BPosition, T)>,
+    caught_up_rx: watch::Receiver<bool>,
+}
+
+impl<T> BootstrappedSubscriberHandle<T> {
+    /// Construct from the frame receiver + caught-up watch. Used by the
+    /// `open_bootstrapped()` constructors in `aeron_live`.
+    pub fn new(
+        rx: UnboundedReceiver<(BPosition, T)>,
+        caught_up_rx: watch::Receiver<bool>,
+    ) -> Self {
+        Self { rx, caught_up_rx }
+    }
+
+    /// Await the next decoded frame. `None` if the bootstrap thread has
+    /// exited (subscription torn down).
+    pub async fn recv(&mut self) -> Option<(BPosition, T)> {
+        self.rx.recv().await
+    }
+
+    /// Non-blocking variant of [`Self::recv`].
+    pub fn try_recv(&mut self) -> Option<(BPosition, T)> {
+        self.rx.try_recv().ok()
+    }
+
+    /// Non-blocking check: has the bootstrap thread signalled caught-up?
+    pub fn is_caught_up(&self) -> bool {
+        *self.caught_up_rx.borrow()
+    }
+
+    /// Resolves once the bootstrap thread signals caught-up. Errors if the
+    /// sender side is dropped before then (bootstrap thread died).
+    pub async fn wait_caught_up(&mut self) -> Result<(), BootstrapError> {
+        loop {
+            if *self.caught_up_rx.borrow() {
+                return Ok(());
+            }
+            if self.caught_up_rx.changed().await.is_err() {
+                return Err(BootstrapError::ArchiveClient(
+                    "caught-up sender dropped".into(),
+                ));
+            }
+        }
+    }
+
+    /// Clone the underlying watch receiver. Useful when a caller wants to
+    /// AND-together caught-up signals from multiple subscriptions without
+    /// taking `&mut` of any of them.
+    pub fn caught_up_watch(&self) -> watch::Receiver<bool> {
+        self.caught_up_rx.clone()
+    }
+}
+
 /// Policy controlling how a subscription is brought online.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootstrapPolicy {
