@@ -1,0 +1,236 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "5s",
+  "schemaVersion": 38,
+  "tags": ["kardamom", "sequencer"],
+  "time": {"from": "now-15m", "to": "now"},
+  "timepicker": {},
+  "timezone": "",
+  "title": "Kardamom Sequencer",
+  "uid": "kardamom-sequencer",
+  "version": 1,
+  "weekStart": "",
+  "templating": {
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(kardamom_service_up, host_id)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "host",
+        "multi": true,
+        "name": "host",
+        "options": [],
+        "query": {"query": "label_values(kardamom_service_up, host_id)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      },
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(kardamom_sequencer_tx_ingested_total{host_id=~\"$host\"}, partition)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "partition",
+        "multi": true,
+        "name": "partition",
+        "options": [],
+        "query": {"query": "label_values(kardamom_sequencer_tx_ingested_total{host_id=~\"$host\"}, partition)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
+  },
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_ingested_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Ingest rate (rps by partition)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_published_to_b_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Publish-to-B rate (rps by partition)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 3,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_buffered_future_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tx buffered (future) rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 4,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_dropped_past_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Tx dropped (past) rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 5,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition) (rate(kardamom_sequencer_backpressure_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Backpressure events",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "µs"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 6,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.5, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_microseconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
+          "legendFormat": "{{partition}} p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.9, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_microseconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
+          "legendFormat": "{{partition}} p90",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.99, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_microseconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
+          "legendFormat": "{{partition}} p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Nonce check P50/P90/P99 (by partition)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 24},
+      "id": 7,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition) (rate(kardamom_sequencer_pending_evictions_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Pending evictions rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "id": 8,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_sequencer_standby_replay_lag{host_id=~\"$host\", partition=~\"$partition\"}",
+          "legendFormat": "{{partition}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Standby replay lag",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 32},
+      "id": 9,
+      "options": {"showHeader": true},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_build_info{service=\"sequencer\", host_id=~\"$host\"}",
+          "format": "table",
+          "instant": true,
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Build info",
+      "transformations": [{"id": "organize", "options": {"excludeByName": {"Time": true, "Value": true, "__name__": true, "instance": true, "job": true}, "indexByName": {}, "renameByName": {}}}],
+      "type": "table"
+    }
+  ]
+}
