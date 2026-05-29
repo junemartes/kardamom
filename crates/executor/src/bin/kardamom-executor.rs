@@ -56,12 +56,26 @@ struct Args {
     /// state to debit on the first transaction from each sender.
     #[arg(long)]
     chain: Option<PathBuf>,
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9004")]
+    metrics_addr: std::net::SocketAddr,
+    /// Host identifier; stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    kardamom_obs::init(
+        "executor",
+        args.metrics_addr,
+        &args.host_id,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+    )?;
+    kardamom_executor::metrics::describe();
     // Validate the config file exists so misconfigured deployments fail
     // fast. v0 doesn't yet drive ExecutorConfig from the TOML — operators
     // tune via the CLI flags above.

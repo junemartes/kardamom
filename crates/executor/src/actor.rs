@@ -40,6 +40,7 @@
 //! crossbeam channels.
 
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::debug;
@@ -268,6 +269,10 @@ where
             let mut last_processed_position: Option<BPosition> = None;
             // Sanity: tx_idx assigned by the tx_ordering reader is monotone.
             let mut expected_tx_idx = TxIndex::ZERO;
+            // Block-apply wall-clock: set on first tx in a block, recorded
+            // when the BoundaryStart closes that block. `None` for empty
+            // blocks (no txs before the boundary).
+            let mut block_apply_start: Option<Instant> = None;
 
             loop {
                 let msg = match rx.recv() {
@@ -287,12 +292,17 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        // Start the block-apply clock on the first tx in
+                        // each block.
+                        if block_apply_start.is_none() {
+                            block_apply_start = Some(Instant::now());
+                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
-                        let (receipt, ws) = execute_tx(
+                        let result = execute_tx(
                             &snapshot,
                             &delta,
                             env,
@@ -301,7 +311,14 @@ where
                             &envelope,
                             tx_index_in_block,
                             cumulative_gas_used,
-                        )?;
+                        );
+                        let outcome = if result.is_ok() { "ok" } else { "error" };
+                        metrics::counter!(
+                            crate::metrics::TX_APPLIED_TOTAL,
+                            "outcome" => outcome
+                        )
+                        .increment(1);
+                        let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
@@ -322,12 +339,17 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        // Start the block-apply clock on the first tx/deposit
+                        // in each block.
+                        if block_apply_start.is_none() {
+                            block_apply_start = Some(Instant::now());
+                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
-                        let (receipt, ws) = execute_deposit_tx(
+                        let result = execute_deposit_tx(
                             &snapshot,
                             &delta,
                             env,
@@ -336,7 +358,14 @@ where
                             &deposit,
                             tx_index_in_block,
                             cumulative_gas_used,
-                        )?;
+                        );
+                        let outcome = if result.is_ok() { "ok" } else { "error" };
+                        metrics::counter!(
+                            crate::metrics::TX_APPLIED_TOTAL,
+                            "outcome" => outcome
+                        )
+                        .increment(1);
+                        let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
@@ -363,6 +392,16 @@ where
                             });
                         }
 
+                        // Record block-apply wall time (first-tx to
+                        // BoundaryStart). Only recorded when the block had
+                        // at least one tx; empty blocks are skipped.
+                        if let Some(start) = block_apply_start.take() {
+                            metrics::histogram!(
+                                crate::metrics::BLOCK_APPLY_DURATION_SECONDS
+                            )
+                            .record(start.elapsed().as_secs_f64());
+                        }
+
                         // S0: NO state-root computation. The sealed
                         // BlockBoundary on tx_receipts is slim — three
                         // fields, no commitment.
@@ -379,6 +418,10 @@ where
                         // receives has an empty receipts vec.
                         let pending = std::mem::take(&mut delta);
                         let bd: BlockDelta = pending.finalize(block_number);
+
+                        // Time the state-commit: submit to writer queue +
+                        // wait for durable ack from the writer signal.
+                        let commit_start = Instant::now();
                         sw_queue.submit(boundary.clone(), bd)?;
 
                         if tx.send(ExecToCommit::Boundary(boundary)).is_err() {
@@ -387,6 +430,13 @@ where
 
                         // Wait for the writer to durably commit.
                         let committed = sw_signal.wait_committed(block_number)?;
+                        metrics::histogram!(
+                            crate::metrics::STATE_COMMIT_DURATION_SECONDS
+                        )
+                        .record(commit_start.elapsed().as_secs_f64());
+                        metrics::gauge!(crate::metrics::BLOCK_NUMBER)
+                            .set(block_number as f64);
+
                         debug!(
                             target: "executor",
                             committed,

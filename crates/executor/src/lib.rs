@@ -41,6 +41,7 @@ pub mod delta;
 pub mod error;
 pub mod exec_types;
 pub mod executor;
+pub mod metrics;
 pub mod reader;
 pub mod state;
 
