@@ -163,13 +163,22 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
         .await
         .expect("ingress JSON-RPC ready");
 
-    // Pipeline settle: the ingress's JSON-RPC is up as soon as its tokio
-    // task binds, but the sequencer's tx_data subscription opens 1–2 s
-    // later (Aeron client + MD handshake). Aeron IPC late-joiners do not
-    // replay pre-subscription history, so a tx published before the
-    // sequencer subscribes is silently dropped. Sleep so every downstream
-    // sub is connected before we offer anything.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Bootstrap gate: ingress only flips kardamom_isReady to true once all of
+    // its bootstrapped subscriptions report caught-up. See #31.
+    //
+    // Known caveat (follow-up): the service binaries connect to the Aeron
+    // Archive via AeronArchiveContext::new() which defaults to localhost:8010.
+    // In this test cluster the archive's control port is mapped to a random
+    // host port and the binaries are not (yet) configured to use it, so the
+    // archive client connect fails and all bootstrapped subs degrade to the
+    // Connected policy. wait_for_ready() still exercises the readiness gate
+    // (Connected signals caught-up after the first live frame), but the
+    // archive-Replay path is NOT exercised end-to-end here. The dedicated
+    // archive_bootstrap_e2e test (or a configured docker harness) should
+    // cover the Replay path before this work is considered complete.
+    wait_for_ready(&rpc_url, Duration::from_secs(60))
+        .await
+        .expect("ingress bootstrap did not complete");
 
     // ----- Submit N signed transfers via eth_sendRawTransaction. The
     // ----- proxy waits for the receipt via its in-memory tx_receipts cache
@@ -338,11 +347,22 @@ async fn multiprocess_e2e_deposit_round_trip() {
     let mut receipts_sub =
         TxReceiptsSubscriberHandle::open(&aeron_rt, &channels).expect("receipts sub");
 
-    // Pipeline + Aeron handshake settle: the bin processes' subscriptions
-    // open ~1–2 s after their starting log line; our own publisher /
-    // subscriber must also handshake against the MD. 5 s covers both
-    // (matches the L2-transfer test).
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Bootstrap gate: ingress only flips kardamom_isReady to true once all of
+    // its bootstrapped subscriptions report caught-up. See #31.
+    //
+    // Known caveat (follow-up): the service binaries connect to the Aeron
+    // Archive via AeronArchiveContext::new() which defaults to localhost:8010.
+    // In this test cluster the archive's control port is mapped to a random
+    // host port and the binaries are not (yet) configured to use it, so the
+    // archive client connect fails and all bootstrapped subs degrade to the
+    // Connected policy. wait_for_ready() still exercises the readiness gate
+    // (Connected signals caught-up after the first live frame), but the
+    // archive-Replay path is NOT exercised end-to-end here. The dedicated
+    // archive_bootstrap_e2e test (or a configured docker harness) should
+    // cover the Replay path before this work is considered complete.
+    wait_for_ready(&rpc_url, Duration::from_secs(60))
+        .await
+        .expect("ingress bootstrap did not complete");
 
     // Synthesise a Deposit. `from` is the aliased L1 sender (any address
     // works for this test — there's no signature on the deposit envelope);
@@ -650,9 +670,22 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
     wait_for_jsonrpc(&rpc_url, Duration::from_secs(30))
         .await
         .expect("ingress JSON-RPC ready");
-    // Pipeline settle: same Aeron-handshake race as the L2-only test —
-    // see issue #31 for the upstream fix.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Bootstrap gate: ingress only flips kardamom_isReady to true once all of
+    // its bootstrapped subscriptions report caught-up. See #31.
+    //
+    // Known caveat (follow-up): the service binaries connect to the Aeron
+    // Archive via AeronArchiveContext::new() which defaults to localhost:8010.
+    // In this test cluster the archive's control port is mapped to a random
+    // host port and the binaries are not (yet) configured to use it, so the
+    // archive client connect fails and all bootstrapped subs degrade to the
+    // Connected policy. wait_for_ready() still exercises the readiness gate
+    // (Connected signals caught-up after the first live frame), but the
+    // archive-Replay path is NOT exercised end-to-end here. The dedicated
+    // archive_bootstrap_e2e test (or a configured docker harness) should
+    // cover the Replay path before this work is considered complete.
+    wait_for_ready(&rpc_url, Duration::from_secs(60))
+        .await
+        .expect("ingress bootstrap did not complete");
 
     // Test-side: subscribe to tx_receipts so we can wait for the deposit's
     // executor receipt by source_hash.
