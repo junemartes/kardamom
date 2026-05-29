@@ -22,6 +22,7 @@ docker-e2e = ["testing", "kardamom-log/docker-e2e"]
 anyhow.workspace = true
 clap.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
 rkyv.workspace = true
@@ -39,7 +40,10 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 # Re-pull our own `testing` feature so tests under `tests/` always have the
 # in-memory fakes without needing `cargo test --features testing`.
 kardamom-sealer = { path = ".", features = ["testing"] }
+kardamom-obs = { path = "../obs" }
+metrics = { workspace = true }
 proptest = "1"
+reqwest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 
 [[bench]]
