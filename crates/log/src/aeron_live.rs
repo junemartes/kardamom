@@ -71,6 +71,7 @@ type AeronClient = rusteron_client::Aeron;
 type Pub = rusteron_client::AeronPublication;
 type Sub = rusteron_client::AeronSubscription;
 type Header = rusteron_client::AeronHeader;
+type Archive = rusteron_archive::AeronArchive;
 
 /// Closure that decodes one Aeron fragment + position and forwards the
 /// decoded value (or its raw bytes) somewhere Send-friendly. Boxed so
@@ -79,6 +80,24 @@ pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition) + Send>;
 
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Offset added to the source `stream_id` to produce the replay stream id.
+/// Callers open a normal subscription on `(replay_channel, stream_id + REPLAY_STREAM_OFFSET)`
+/// to consume replayed frames.
+pub const REPLAY_STREAM_OFFSET: i32 = 10_000;
+
+/// Metadata returned by [`AeronRuntime::archive_start_replay`]. The caller
+/// opens a normal subscription on `(replay_channel, replay_stream_id)` to
+/// consume replayed frames.
+#[derive(Clone, Debug)]
+pub struct ArchiveReplayHandle {
+    /// The session id assigned by the archive for this replay.
+    pub session_id: i64,
+    /// The Aeron channel URI to subscribe on for replayed frames.
+    pub replay_channel: String,
+    /// The stream id to use for the replay subscription.
+    pub replay_stream_id: i32,
+}
 
 // ---------------------------------------------------------------------------
 // AeronRuntime: the single Aeron thread + command bus.
@@ -119,6 +138,28 @@ enum RuntimeCmd {
         stream_id: i32,
         deliver: DeliverFn,
         ack: CbSender<Result<(), LogError>>,
+    },
+    /// Query the latest (highest) archived position for `(channel, stream_id)`.
+    /// Returns `Ok(None)` if no recording exists yet.
+    ArchiveLatestPosition {
+        channel: String,
+        stream_id: i32,
+        reply: CbSender<Result<Option<i64>, LogError>>,
+    },
+    /// Query the earliest (start) archived position for `(channel, stream_id)`.
+    ArchiveEarliestPosition {
+        channel: String,
+        stream_id: i32,
+        reply: CbSender<Result<i64, LogError>>,
+    },
+    /// Start a replay anchored at `start_position` for `(channel, stream_id)`.
+    /// Returns an [`ArchiveReplayHandle`] the caller uses to open a normal
+    /// subscription on the replay channel.
+    ArchiveStartReplay {
+        channel: String,
+        stream_id: i32,
+        start_position: i64,
+        reply: CbSender<Result<ArchiveReplayHandle, LogError>>,
     },
     /// Stop the loop, drop everything.
     Shutdown,
@@ -165,6 +206,11 @@ impl AeronRuntime {
     /// via the caller-supplied closure. The closure runs on the Aeron thread
     /// — this is the only way to feed it custom configuration without
     /// crossing the `!Send + !Sync` boundary that AeronContext sits on.
+    ///
+    /// After the Aeron client is started, a parallel `AeronArchive` connection
+    /// is attempted using the default `AeronArchiveContext` (control channel
+    /// `aeron:udp?endpoint=localhost:8010`). If the archive is not running, the
+    /// runtime still starts successfully but archive commands will return errors.
     pub fn spawn_with<F>(make_ctx: F) -> Result<Self, LogError>
     where
         F: FnOnce() -> Result<rusteron_client::AeronContext, LogError> + Send + 'static,
@@ -182,8 +228,20 @@ impl AeronRuntime {
                         return;
                     }
                 };
+                // Attempt to open a parallel AeronArchive client on this same
+                // thread. Archive is `!Send + !Sync`, so it must stay here.
+                let archive_client: Option<Archive> = match build_archive() {
+                    Ok(a) => Some(a),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "archive client connect failed; archive commands will return errors"
+                        );
+                        None
+                    }
+                };
                 let _ = started_tx.send(Ok(()));
-                if let Err(e) = run_aeron_thread(aeron, cmd_rx) {
+                if let Err(e) = run_aeron_thread(aeron, archive_client, cmd_rx) {
                     error!(error = %e, "aeron runtime thread exited with error");
                 }
             })
@@ -248,6 +306,73 @@ impl AeronRuntime {
         Ok(())
     }
 
+    /// Return the latest archived position for `(channel, stream_id)`.
+    ///
+    /// Delegates to the archive client on the Aeron thread; returns
+    /// `Ok(None)` if no recording for that channel+stream exists yet.
+    pub(crate) fn archive_latest_position(
+        &self,
+        channel: &str,
+        stream_id: i32,
+    ) -> Result<Option<i64>, LogError> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::ArchiveLatestPosition {
+                channel: channel.to_string(),
+                stream_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("archive_latest_position timed out".into()))?
+    }
+
+    /// Return the earliest archived position for `(channel, stream_id)`.
+    ///
+    /// Returns `Err` if no recording for that channel+stream exists.
+    pub(crate) fn archive_earliest_position(
+        &self,
+        channel: &str,
+        stream_id: i32,
+    ) -> Result<i64, LogError> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::ArchiveEarliestPosition {
+                channel: channel.to_string(),
+                stream_id,
+                reply: reply_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("archive_earliest_position timed out".into()))?
+    }
+
+    /// Start a replay from `start_position` for `(channel, stream_id)`.
+    ///
+    /// Returns an [`ArchiveReplayHandle`] containing the session id and the
+    /// replay channel/stream the caller should subscribe on.
+    pub(crate) fn archive_start_replay(
+        &self,
+        channel: &str,
+        stream_id: i32,
+        start_position: i64,
+    ) -> Result<ArchiveReplayHandle, LogError> {
+        let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::ArchiveStartReplay {
+                channel: channel.to_string(),
+                stream_id,
+                start_position,
+                reply: reply_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        reply_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("archive_start_replay timed out".into()))?
+    }
+
     /// Open a typed subscription, returning an mpsc receiver of decoded
     /// messages.
     pub fn open_subscription<T>(
@@ -299,18 +424,49 @@ fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, Lo
     Ok(Rc::new(aeron))
 }
 
+/// Attempt to connect to the Aeron Archive using the default context.
+///
+/// The default `AeronArchiveContext` uses `aeron:udp?endpoint=localhost:8010`
+/// for control requests and `aeron:udp?endpoint=localhost:8011` for responses.
+/// Callers that need custom archive endpoints should extend this via a new
+/// `spawn_with_archive` variant; for now the defaults cover the production and
+/// Docker-e2e cases.
+fn build_archive() -> Result<Archive, LogError> {
+    let ctx = rusteron_archive::AeronArchiveContext::new()
+        .map_err(|e| LogError::Aeron(format!("AeronArchiveContext::new: {e}")))?;
+    // Use a 3-second timeout rather than the full 10 seconds: the outer
+    // `started_rx.recv_timeout` in `spawn_with` is also 10 s, and archive
+    // failure is non-fatal.  A reachable daemon responds well within 3 s,
+    // while an unreachable one will return quickly so the remaining 7 s of
+    // budget are available for the runtime to signal started.
+    ctx.aeron_archive_connect(Duration::from_secs(3))
+        .map_err(|e| LogError::Aeron(format!("aeron_archive_connect: {e}")))
+}
+
 fn run_aeron_thread(
     aeron: Rc<AeronClient>,
+    archive_client: Option<Archive>,
     cmd_rx: CbReceiver<RuntimeCmd>,
 ) -> Result<(), LogError> {
     let mut pubs: Vec<Pub> = Vec::new();
     let mut subs: Vec<SubEntry> = Vec::new();
+    // Lazy recording-id cache: maps `(channel, stream_id)` → `recording_id`.
+    // Populated on first lookup and reused for subsequent calls.
+    let mut recording_id_cache: std::collections::HashMap<(String, i32), i64> =
+        std::collections::HashMap::new();
 
     loop {
         loop {
             match cmd_rx.try_recv() {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, cmd)?,
+                Ok(cmd) => handle_cmd(
+                    &aeron,
+                    archive_client.as_ref(),
+                    &mut recording_id_cache,
+                    &mut pubs,
+                    &mut subs,
+                    cmd,
+                )?,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -330,7 +486,14 @@ fn run_aeron_thread(
         if subs.is_empty() {
             match cmd_rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, cmd)?,
+                Ok(cmd) => handle_cmd(
+                    &aeron,
+                    archive_client.as_ref(),
+                    &mut recording_id_cache,
+                    &mut pubs,
+                    &mut subs,
+                    cmd,
+                )?,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -342,6 +505,8 @@ fn run_aeron_thread(
 
 fn handle_cmd(
     aeron: &Rc<AeronClient>,
+    archive_client: Option<&Archive>,
+    recording_id_cache: &mut std::collections::HashMap<(String, i32), i64>,
     pubs: &mut Vec<Pub>,
     subs: &mut Vec<SubEntry>,
     cmd: RuntimeCmd,
@@ -385,9 +550,228 @@ fn handle_cmd(
             });
             let _ = ack.send(res);
         }
+        RuntimeCmd::ArchiveLatestPosition {
+            channel,
+            stream_id,
+            reply,
+        } => {
+            let res = match archive_client {
+                None => Err(LogError::Aeron("archive client not available".into())),
+                Some(archive) => {
+                    lookup_recording_id(archive, recording_id_cache, &channel, stream_id)
+                        .and_then(|recording_id| {
+                            archive
+                                .get_recording_position(recording_id)
+                                .map(|pos| {
+                                    // -1 means "no active recording position recorded yet"
+                                    if pos < 0 { None } else { Some(pos) }
+                                })
+                                .map_err(|e| {
+                                    LogError::Aeron(format!("get_recording_position: {e}"))
+                                })
+                        })
+                        .or_else(|e| {
+                            // If recording not found, return None instead of error
+                            if e.to_string().contains("no recording") {
+                                Ok(None)
+                            } else {
+                                Err(e)
+                            }
+                        })
+                }
+            };
+            let _ = reply.send(res);
+        }
+        RuntimeCmd::ArchiveEarliestPosition {
+            channel,
+            stream_id,
+            reply,
+        } => {
+            let res = match archive_client {
+                None => Err(LogError::Aeron("archive client not available".into())),
+                Some(archive) => {
+                    lookup_recording_id(archive, recording_id_cache, &channel, stream_id)
+                        .and_then(|recording_id| {
+                            fetch_start_position(archive, recording_id)
+                        })
+                }
+            };
+            let _ = reply.send(res);
+        }
+        RuntimeCmd::ArchiveStartReplay {
+            channel,
+            stream_id,
+            start_position,
+            reply,
+        } => {
+            let res = match archive_client {
+                None => Err(LogError::Aeron("archive client not available".into())),
+                Some(archive) => {
+                    lookup_recording_id(archive, recording_id_cache, &channel, stream_id)
+                        .and_then(|recording_id| {
+                            let replay_channel =
+                                format!("aeron:ipc?alias=replay-{recording_id}");
+                            let replay_stream_id = stream_id + REPLAY_STREAM_OFFSET;
+                            let replay_channel_c =
+                                CString::new(replay_channel.as_str()).map_err(|e| {
+                                    LogError::Aeron(format!("replay channel NUL: {e}"))
+                                })?;
+                            let params = rusteron_archive::AeronArchiveReplayParams::new(
+                                -1,        // bounding_limit_counter_id: no bound
+                                0,         // file_io_max_length: archive default
+                                start_position,
+                                i64::MAX,  // length: open-ended replay
+                                0,         // replay_token: no token
+                                -1,        // subscription_registration_id: no binding
+                            )
+                            .map_err(|e| {
+                                LogError::Aeron(format!("AeronArchiveReplayParams::new: {e}"))
+                            })?;
+                            let session_id = archive
+                                .start_replay(
+                                    recording_id,
+                                    replay_channel_c.as_c_str(),
+                                    replay_stream_id,
+                                    &params,
+                                )
+                                .map_err(|e| {
+                                    LogError::Aeron(format!("start_replay: {e}"))
+                                })?;
+                            Ok(ArchiveReplayHandle {
+                                session_id,
+                                replay_channel,
+                                replay_stream_id,
+                            })
+                        })
+                }
+            };
+            let _ = reply.send(res);
+        }
         RuntimeCmd::Shutdown => {}
     }
     Ok(())
+}
+
+/// Look up the `recording_id` for `(channel, stream_id)`, using the cache if
+/// available or scanning via `list_recordings_for_uri` otherwise.
+///
+/// The channel is matched as a URI fragment (substring match), which is how
+/// the Aeron Archive C API works: pass the alias or channel URI and it does a
+/// "contains" match against the original channel stored at recording time.
+fn lookup_recording_id(
+    archive: &Archive,
+    cache: &mut std::collections::HashMap<(String, i32), i64>,
+    channel: &str,
+    stream_id: i32,
+) -> Result<i64, LogError> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use rusteron_archive::{
+        AeronArchiveRecordingDescriptor,
+        AeronArchiveRecordingDescriptorConsumerFuncCallback, Handler,
+    };
+
+    let key = (channel.to_string(), stream_id);
+    if let Some(&id) = cache.get(&key) {
+        return Ok(id);
+    }
+
+    #[derive(Default)]
+    struct Found {
+        recording_id: i64,
+        seen: bool,
+    }
+
+    struct Consumer {
+        found: Rc<RefCell<Found>>,
+    }
+
+    impl AeronArchiveRecordingDescriptorConsumerFuncCallback for Consumer {
+        fn handle_aeron_archive_recording_descriptor_consumer_func(
+            &mut self,
+            desc: AeronArchiveRecordingDescriptor,
+        ) {
+            let mut g = self.found.borrow_mut();
+            // Take the last (most recent) recording that matches.
+            g.recording_id = desc.recording_id();
+            g.seen = true;
+        }
+    }
+
+    let channel_c = CString::new(channel)
+        .map_err(|e| LogError::Aeron(format!("channel contains NUL: {e}")))?;
+
+    let found: Rc<RefCell<Found>> = Rc::new(RefCell::new(Found::default()));
+    let handler = Handler::leak(Consumer {
+        found: found.clone(),
+    });
+
+    archive
+        .list_recordings_for_uri(
+            0,             // from_recording_id: scan from the beginning
+            i32::MAX,      // record_count: return all matches
+            channel_c.as_c_str(),
+            stream_id,
+            Some(&handler),
+        )
+        .map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+
+    let g = found.borrow();
+    if !g.seen {
+        return Err(LogError::Aeron(format!(
+            "no recording for channel={channel} stream_id={stream_id}"
+        )));
+    }
+    let recording_id = g.recording_id;
+    drop(g);
+    cache.insert(key, recording_id);
+    Ok(recording_id)
+}
+
+/// Fetch the `start_position` for a recording (the earliest position).
+fn fetch_start_position(archive: &Archive, recording_id: i64) -> Result<i64, LogError> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use rusteron_archive::{
+        AeronArchiveRecordingDescriptor,
+        AeronArchiveRecordingDescriptorConsumerFuncCallback, Handler,
+    };
+
+    #[derive(Default)]
+    struct Captured {
+        start_position: i64,
+        seen: bool,
+    }
+
+    struct Consumer {
+        captured: Rc<RefCell<Captured>>,
+    }
+
+    impl AeronArchiveRecordingDescriptorConsumerFuncCallback for Consumer {
+        fn handle_aeron_archive_recording_descriptor_consumer_func(
+            &mut self,
+            desc: AeronArchiveRecordingDescriptor,
+        ) {
+            let mut g = self.captured.borrow_mut();
+            g.start_position = desc.start_position();
+            g.seen = true;
+        }
+    }
+
+    let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
+    let handler = Handler::leak(Consumer {
+        captured: captured.clone(),
+    });
+    archive
+        .list_recording(recording_id, Some(&handler))
+        .map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
+    let g = captured.borrow();
+    if !g.seen {
+        return Err(LogError::Aeron(format!(
+            "list_recording({recording_id}) returned no descriptor"
+        )));
+    }
+    Ok(g.start_position)
 }
 
 fn open_pub(aeron: &Rc<AeronClient>, uri: &str, stream_id: i32) -> Result<Pub, LogError> {
