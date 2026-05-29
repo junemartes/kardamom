@@ -9,8 +9,8 @@
   "schemaVersion": 38,
   "tags": ["kardamom"],
   "timezone": "browser",
-  "title": "Kardamom RPC",
-  "uid": "kardamom-rpc",
+  "title": "Kardamom Node (RPC)",
+  "uid": "kardamom-node",
   "version": 1,
   "refresh": "5s",
   "time": {
@@ -18,7 +18,25 @@
     "to": "now"
   },
   "templating": {
-    "list": []
+    "list": [
+      {
+        "current": {"selected": false, "text": "All", "value": "$__all"},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(kardamom_service_up, host_id)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "host",
+        "multi": true,
+        "name": "host",
+        "options": [],
+        "query": {"query": "label_values(kardamom_service_up, host_id)", "refId": "StandardVariableQuery"},
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 0,
+        "type": "query"
+      }
+    ]
   },
   "panels": [
     {
@@ -29,8 +47,10 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "sum by (method) (rate(kardamom_rpc_requests_total[30s]))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (method) (rate(kardamom_rpc_requests_total{host_id=~\"$host\"}[30s]))",
           "legendFormat": "{{method}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -49,8 +69,10 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "sum by (method) (rate(kardamom_rpc_requests_total{outcome=\"err\"}[30s]))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (method) (rate(kardamom_rpc_requests_total{outcome=\"err\", host_id=~\"$host\"}[30s]))",
           "legendFormat": "{{method}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -69,18 +91,24 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "histogram_quantile(0.50, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket[30s])))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.50, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket{host_id=~\"$host\"}[30s])))",
           "legendFormat": "p50 {{method}}",
+          "range": true,
           "refId": "A"
         },
         {
-          "expr": "histogram_quantile(0.90, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket[30s])))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.90, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket{host_id=~\"$host\"}[30s])))",
           "legendFormat": "p90 {{method}}",
+          "range": true,
           "refId": "B"
         },
         {
-          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket[30s])))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "histogram_quantile(0.99, sum by (le, method) (rate(kardamom_rpc_duration_seconds_bucket{host_id=~\"$host\"}[30s])))",
           "legendFormat": "p99 {{method}}",
+          "range": true,
           "refId": "C"
         }
       ],
@@ -99,8 +127,10 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_sum{method=\"eth_sendRawTransaction\"}[30s])) / sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_count{method=\"eth_sendRawTransaction\"}[30s]))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_sum{method=\"eth_sendRawTransaction\", host_id=~\"$host\"}[30s])) / sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_count{method=\"eth_sendRawTransaction\", host_id=~\"$host\"}[30s]))",
           "legendFormat": "{{stage}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -122,8 +152,10 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_sum{method=\"eth_call\"}[30s])) / sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_count{method=\"eth_call\"}[30s]))",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_sum{method=\"eth_call\", host_id=~\"$host\"}[30s])) / sum by (stage) (rate(kardamom_rpc_stage_duration_seconds_count{method=\"eth_call\", host_id=~\"$host\"}[30s]))",
           "legendFormat": "{{stage}}",
+          "range": true,
           "refId": "A"
         }
       ],
@@ -145,7 +177,9 @@
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "targets": [
         {
-          "expr": "kardamom_block_number",
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "kardamom_block_number{host_id=~\"$host\"}",
+          "range": true,
           "refId": "A"
         }
       ],
