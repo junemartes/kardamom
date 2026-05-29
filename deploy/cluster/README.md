@@ -108,7 +108,7 @@ deploy/cluster/
 The multi-host UDP topology depends on service-side work that is **not yet in the
 codebase** (these are deployment prerequisites, tracked separately from this PR):
 
-1. **Channels config plumbing.** Several binaries currently derive channels from
+1. **Channels config plumbing.** *(tracked in #36)* Several binaries currently derive channels from
    `LogConfig::default().channels` (IPC URIs hardcoded) — e.g. `kardamom-da-watcher`
    uses `LogConfig::default().channels`, and `ingress`/`executor` build channels
    from defaults. To run over UDP across hosts, each service must accept a
@@ -118,13 +118,13 @@ codebase** (these are deployment prerequisites, tracked separately from this PR)
    mount a channels config (`config/channels.toml.tpl`) in anticipation of this
    flag; until the flag exists, the services ignore it and use IPC defaults
    (single-host only).
-2. **Batcher is offline.** `kardamom-batcher` today reads Aeron Archive segment
+2. **Batcher is offline.** *(tracked in #39)* `kardamom-batcher` today reads Aeron Archive segment
    files in `--dry-run` (default) rather than running as a live service with L1
    broadcast. Its Nomad job is therefore modeled as a **periodic/batch** job
    pointed at the recorders' archive segments, not an always-on service. Wiring
    the live L1 broadcast path is a follow-up.
 
-3. **No standalone recorder/quorum process.** The durability story
+3. **No standalone recorder/quorum process.** *(tracked in #38)* The durability story
    (`recorder_id`, `QuorumConfig`, fsync-watermark + quorum-watermark channels,
    and ingress `--ack-policy on-quorum`) has no dedicated deployable binary in the
    workspace today — the recorder/quorum logic lives in `kardamom-log` as library
@@ -134,7 +134,7 @@ codebase** (these are deployment prerequisites, tracked separately from this PR)
    `on-quorum` ack path won't be satisfied. Set ingress `--ack-policy on-offer`
    for an initial bring-up, as `multiprocess_e2e` does.
 
-4. **Per-node channel rendering.** With two sequencers on different VMs (w1/w2),
+4. **Per-node channel rendering.** *(tracked in #37)* With two sequencers on different VMs (w1/w2),
    the per-sequencer (`{sid}`) and per-recorder (`{rid}`) channel URI *templates*
    can't encode a distinct per-host IP from a single file. The current
    `channels.toml.tpl` uses Aeron MDC (`control-mode=dynamic`) for those and fixed
