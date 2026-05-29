@@ -17,7 +17,10 @@ async fn ingress_metrics_endpoint_serves_expected_counters() {
         body.contains("kardamom_ingress_tx_received_total"),
         "missing ingress counter; got:\n{body}"
     );
-    assert!(body.contains("service=\"ingress\""), "missing service label");
+    assert!(
+        body.contains("service=\"ingress\""),
+        "missing service label"
+    );
 }
 
 fn free_port() -> SocketAddr {

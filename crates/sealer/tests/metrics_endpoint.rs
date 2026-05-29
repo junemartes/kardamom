@@ -6,8 +6,7 @@ use std::net::{SocketAddr, TcpListener};
 #[tokio::test]
 async fn sealer_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
-    kardamom_obs::init("sealer", addr, "local", "test", "test")
-        .expect("init");
+    kardamom_obs::init("sealer", addr, "local", "test", "test").expect("init");
 
     // Touch every counter the sealer crate is expected to publish so
     // describe_counter calls don't require us to also drive the binary.
