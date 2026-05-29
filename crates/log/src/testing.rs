@@ -21,17 +21,34 @@ use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 
+use crate::bootstrap::{ArchiveSource, BootstrapError, LiveImage, ReplaySource, StreamPosition};
 use crate::error::LogError;
 use kardamom_types::{BPosition, FsyncWatermark};
 
 /// Map from `(channel, stream_id)` to shared per-stream state.
 type StreamMap = HashMap<(String, i32), Arc<Mutex<StreamState>>>;
 
+/// In-memory frame log for archive-replay testing. Append-only; ordered by
+/// caller-supplied position.
+#[derive(Default)]
+struct FakeArchiveLog {
+    frames: Vec<(StreamPosition, Vec<u8>)>,
+}
+
+/// Map from `(channel, stream_id)` to the raw archive log for that stream.
+type ArchiveLogMap = HashMap<(String, i32), FakeArchiveLog>;
+
 /// In-memory bus shared by all `FakePublication` / `FakeSubscription` handles
 /// that target the same `(channel, stream_id)` pair. Clone is cheap (an `Arc`).
+///
+/// The `archive_logs` field is a parallel store for raw bytes seeded via
+/// `publish_raw`. It does not interact with the typed pub/sub path (`streams`).
 #[derive(Clone, Default)]
 pub struct FakeBus {
     streams: Arc<Mutex<StreamMap>>,
+    /// Parallel raw-bytes log used by archive-replay tests. Does not affect
+    /// the existing typed pub/sub path.
+    archive_logs: Arc<Mutex<ArchiveLogMap>>,
 }
 
 #[derive(Default)]
@@ -45,6 +62,34 @@ struct StreamState {
 impl FakeBus {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Append a raw frame to the test archive log for `(channel, stream_id)`.
+    /// Used to seed history for bootstrap-path tests. Does not affect the
+    /// existing typed pub/sub path.
+    pub fn publish_raw(
+        &self,
+        channel: &str,
+        stream_id: i32,
+        position: StreamPosition,
+        payload: Vec<u8>,
+    ) {
+        let key = (channel.to_string(), stream_id);
+        let mut map = self.archive_logs.lock().unwrap();
+        map.entry(key)
+            .or_insert_with(FakeArchiveLog::default)
+            .frames
+            .push((position, payload));
+    }
+
+    /// Return an [`ArchiveSource`] view over the in-memory log for
+    /// `(channel, stream_id)`. Used by bootstrap-path unit tests.
+    pub fn archive_for(&self, channel: &str, stream_id: i32) -> FakeArchive {
+        FakeArchive {
+            bus: self.clone(),
+            channel: channel.to_string(),
+            stream_id,
+        }
     }
 
     fn stream(&self, channel: &str, stream_id: i32) -> Arc<Mutex<StreamState>> {
@@ -398,6 +443,142 @@ impl FakeFsyncWatermarkStream {
         g.get_mut(&recorder_id)
             .map(|q| q.drain(..).collect())
             .unwrap_or_default()
+    }
+}
+
+// ============================================================================
+// FakeArchive / FakeLiveImage — bootstrap-path test helpers.
+//
+// These types implement the bootstrap traits defined in `crate::bootstrap` so
+// unit tests can drive `BootstrapDriver` without a real Aeron daemon.
+// ============================================================================
+
+/// An `ArchiveSource` backed by in-memory frames seeded via `FakeBus::publish_raw`.
+#[derive(Clone)]
+pub struct FakeArchive {
+    bus: FakeBus,
+    channel: String,
+    stream_id: i32,
+}
+
+impl ArchiveSource for FakeArchive {
+    fn latest_recording_position(&self) -> Result<Option<StreamPosition>, BootstrapError> {
+        let map = self.bus.archive_logs.lock().unwrap();
+        let Some(log) = map.get(&(self.channel.clone(), self.stream_id)) else {
+            return Ok(None);
+        };
+        Ok(log.frames.last().map(|(p, _)| *p))
+    }
+
+    fn earliest_recording_position(&self) -> Result<StreamPosition, BootstrapError> {
+        let map = self.bus.archive_logs.lock().unwrap();
+        let Some(log) = map.get(&(self.channel.clone(), self.stream_id)) else {
+            return Ok(StreamPosition(0));
+        };
+        Ok(log.frames.first().map(|(p, _)| *p).unwrap_or(StreamPosition(0)))
+    }
+
+    /// `FakeArchive` does not model block-boundary semantics — it returns `at`
+    /// unchanged. Real boundary scanning is exercised by the
+    /// `archive_bootstrap_e2e` integration test (T11).
+    fn last_block_boundary(
+        &self,
+        at: StreamPosition,
+        _safety: u32,
+    ) -> Result<Option<StreamPosition>, BootstrapError> {
+        Ok(Some(at))
+    }
+
+    fn start_replay(
+        &self,
+        start: StreamPosition,
+    ) -> Result<Box<dyn ReplaySource>, BootstrapError> {
+        let map = self.bus.archive_logs.lock().unwrap();
+        let frames: VecDeque<(StreamPosition, Vec<u8>)> = map
+            .get(&(self.channel.clone(), self.stream_id))
+            .map(|log| {
+                log.frames
+                    .iter()
+                    .filter(|(p, _)| *p >= start)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Box::new(FakeReplay { pos: start, frames }))
+    }
+}
+
+struct FakeReplay {
+    pos: StreamPosition,
+    frames: VecDeque<(StreamPosition, Vec<u8>)>,
+}
+
+impl ReplaySource for FakeReplay {
+    fn current_position(&self) -> StreamPosition {
+        self.pos
+    }
+
+    fn poll(&mut self, f: &mut dyn FnMut(StreamPosition, Vec<u8>)) {
+        while let Some((p, b)) = self.frames.pop_front() {
+            self.pos = p;
+            f(p, b);
+        }
+    }
+
+    fn stop(&mut self) {
+        self.frames.clear();
+    }
+}
+
+/// Minimal `LiveImage` for unit tests that don't need real frame delivery.
+/// Construct with `FakeLiveImage::empty_at(pos)`.
+pub struct FakeLiveImage {
+    pos: StreamPosition,
+}
+
+impl FakeLiveImage {
+    /// Create an image that reports `pos` as both its join and current
+    /// position, and delivers no frames on `poll`.
+    pub fn empty_at(pos: StreamPosition) -> Self {
+        Self { pos }
+    }
+}
+
+impl LiveImage for FakeLiveImage {
+    fn current_position(&self) -> Option<StreamPosition> {
+        Some(self.pos)
+    }
+
+    fn join_position(&self) -> Option<StreamPosition> {
+        Some(self.pos)
+    }
+
+    fn poll(&mut self, _f: &mut dyn FnMut(StreamPosition, Vec<u8>)) {}
+}
+
+#[cfg(test)]
+mod fake_archive_tests {
+    use super::*;
+
+    #[test]
+    fn fake_archive_replays_published_history() {
+        let bus = FakeBus::new();
+        let ch = "aeron:ipc?alias=test";
+        let stream = 42;
+        bus.publish_raw(ch, stream, StreamPosition(10), vec![1]);
+        bus.publish_raw(ch, stream, StreamPosition(20), vec![2]);
+        bus.publish_raw(ch, stream, StreamPosition(30), vec![3]);
+
+        let archive = bus.archive_for(ch, stream);
+        assert_eq!(
+            archive.latest_recording_position().unwrap(),
+            Some(StreamPosition(30))
+        );
+
+        let mut replay = archive.start_replay(StreamPosition(15)).unwrap();
+        let mut seen = vec![];
+        replay.poll(&mut |_, b| seen.push(b[0]));
+        assert_eq!(seen, vec![2, 3]);
     }
 }
 
