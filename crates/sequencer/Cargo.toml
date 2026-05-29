@@ -26,6 +26,7 @@ clap.workspace = true
 core_affinity = "0.8"
 ctrlc = { version = "3", features = ["termination"] }
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
 rkyv.workspace = true
@@ -40,6 +41,9 @@ tracing-subscriber.workspace = true
 alloy-network.workspace = true
 alloy-signer-local.workspace = true
 criterion.workspace = true
+metrics = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # Pull in our own `testing` feature so integration tests under `tests/`
 # always have access to the `fakes` modules without needing
 # `cargo test --features testing` (matches the convention CI uses).
