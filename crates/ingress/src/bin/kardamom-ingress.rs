@@ -23,6 +23,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::bootstrap::BootstrapPolicy;
 use kardamom_log::config::LogConfig;
+use kardamom_log::recorder::Recorder;
 use kardamom_types::{
     BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
@@ -112,11 +113,54 @@ async fn main() -> Result<()> {
         "kardamom-ingress starting"
     );
 
-    let channels = LogConfig::default().channels;
+    let log_cfg = LogConfig::default();
+    let channels = log_cfg.channels.clone();
     let rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
+
+    // Spawn one Recorder per tx_data shard. Each Recorder runs on its own
+    // dedicated thread because AeronArchive is !Send + !Sync. The threads are
+    // kept alive until main() returns (via the JoinHandle Vec).
+    //
+    // SOURCE_LOCATION_LOCAL: ingress is co-located with the tx_data publisher
+    // (it *is* the publisher), so local recording is correct.
+    let archive_dir = log_cfg.aeron.archive_dir.clone();
+    let mut _recorder_threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
+    for sid in 0..args.shards as u8 {
+        let ch_clone = channels.clone();
+        let dir_clone = archive_dir.clone();
+        let recorder_id = args.recorder_id;
+        let handle = std::thread::Builder::new()
+            .name(format!("kardamom-rec-a-{sid}"))
+            .spawn(move || {
+                let archive = match kardamom_log::connect_archive_client() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        tracing::warn!(shard = sid, error = %e, "ingress: archive connect failed; tx_data[{sid}] not recorded");
+                        return;
+                    }
+                };
+                match Recorder::start_a(archive, &ch_clone, recorder_id, sid, dir_clone) {
+                    Ok(rec) => {
+                        tracing::info!(shard = sid, recording_id = rec.recording_id(), "ingress: tx_data[{sid}] recording started");
+                        // Hold the Recorder alive. Parking the thread is sufficient
+                        // — the recording runs inside the Archive daemon; we just
+                        // need to keep the handle from dropping (which would stop
+                        // the recording).
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(shard = sid, error = %e, "ingress: start_a for tx_data[{sid}] failed");
+                    }
+                }
+            })
+            .expect("spawn recorder thread");
+        _recorder_threads.push(handle);
+    }
 
     let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
         .context("open IngressPublication")?;

@@ -432,7 +432,7 @@ fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, Lo
 /// Callers that need custom archive endpoints should extend this via a new
 /// `spawn_with_archive` variant; for now the defaults cover the production and
 /// Docker-e2e cases.
-fn build_archive() -> Result<Archive, LogError> {
+pub(crate) fn build_archive() -> Result<Archive, LogError> {
     let ctx = rusteron_archive::AeronArchiveContext::new()
         .map_err(|e| LogError::Aeron(format!("AeronArchiveContext::new: {e}")))?;
     // Use a 3-second timeout rather than the full 10 seconds: the outer

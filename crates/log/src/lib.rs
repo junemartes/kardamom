@@ -44,6 +44,21 @@ pub use bootstrap::{
 };
 pub use error::LogError;
 
+/// Construct a fresh Aeron Archive client connection.
+///
+/// The returned `AeronArchive` is `!Send + !Sync` (it wraps the C archive
+/// client via raw pointers). The caller **must** keep it on a single dedicated
+/// thread — typically the recorder thread that owns the [`recorder::Recorder`]
+/// it will be handed to.
+///
+/// Uses the default `AeronArchiveContext` (control on
+/// `aeron:udp?endpoint=localhost:8010`, responses on
+/// `aeron:udp?endpoint=localhost:8011`). This matches the Aeron Archive
+/// daemon defaults used in the Docker-e2e and production deployments.
+pub fn connect_archive_client() -> Result<rusteron_archive::AeronArchive, LogError> {
+    aeron_live::build_archive()
+}
+
 // Re-export the shared types so existing call sites can `use kardamom_log::types::*`
 // transparently (they import from kardamom-types under the hood).
 pub mod types {

@@ -19,6 +19,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::bootstrap::{BootstrapPolicy, BootstrappedSubscriberHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_log::recorder::Recorder;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::deposit::{DepositSubscriber, process_deposit};
 use kardamom_sequencer::error::SequencerError;
@@ -88,11 +89,43 @@ async fn main() -> anyhow::Result<()> {
         "kardamom-sequencer starting"
     );
 
-    let channels: ChannelsConfig = LogConfig::default().channels;
+    let log_cfg = LogConfig::default();
+    let channels: ChannelsConfig = log_cfg.channels.clone();
     let rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
+
+    // Spawn a Recorder for tx_ordering on a dedicated thread.
+    // AeronArchive is !Send + !Sync, so it must stay on its own OS thread.
+    // SOURCE_LOCATION_LOCAL: sequencer is co-located with the tx_ordering publisher.
+    let archive_dir = log_cfg.aeron.archive_dir.clone();
+    let ch_for_rec = channels.clone();
+    let recorder_id = cfg.sequencer_id; // use sequencer_id as recorder_id (unique per host)
+    let _tx_ordering_recorder_thread = std::thread::Builder::new()
+        .name("kardamom-rec-b".into())
+        .spawn(move || {
+            let archive = match kardamom_log::connect_archive_client() {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(error = %e, "sequencer: archive connect failed; tx_ordering not recorded");
+                    return;
+                }
+            };
+            match Recorder::start_b(archive, &ch_for_rec, recorder_id, archive_dir) {
+                Ok(rec) => {
+                    tracing::info!(recording_id = rec.recording_id(), "sequencer: tx_ordering recording started");
+                    // Hold the Recorder alive until the process exits.
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "sequencer: start_b for tx_ordering failed");
+                }
+            }
+        })
+        .expect("spawn tx_ordering recorder thread");
 
     let shard_id = cfg.sequencer_id;
     let mut tx_data_sub =

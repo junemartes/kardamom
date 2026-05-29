@@ -22,6 +22,7 @@ use kardamom_da_watcher::{
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
 use kardamom_log::config::LogConfig;
+use kardamom_log::recorder::Recorder;
 use kardamom_types::{BPosition, Deposit};
 
 #[derive(Debug, Parser)]
@@ -67,11 +68,45 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let channels = LogConfig::default().channels;
+    let log_cfg = LogConfig::default();
+    let channels = log_cfg.channels.clone();
     let aeron_rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
+
+    // Spawn a Recorder for tx_deposits on a dedicated thread.
+    // AeronArchive is !Send + !Sync, so it must stay on its own OS thread.
+    // SOURCE_LOCATION_LOCAL: da-watcher is co-located with the tx_deposits publisher.
+    let archive_dir = log_cfg.aeron.archive_dir.clone();
+    let ch_for_rec = channels.clone();
+    let _tx_deposits_recorder_thread = std::thread::Builder::new()
+        .name("kardamom-rec-c".into())
+        .spawn(move || {
+            let archive = match kardamom_log::connect_archive_client() {
+                Ok(a) => a,
+                Err(e) => {
+                    tracing::warn!(error = %e, "da-watcher: archive connect failed; tx_deposits not recorded");
+                    return;
+                }
+            };
+            // recorder_id 0: da-watcher runs as a singleton; there is exactly
+            // one tx_deposits recorder per deployment.
+            match Recorder::start_c(archive, &ch_for_rec, 0, archive_dir) {
+                Ok(rec) => {
+                    tracing::info!(recording_id = rec.recording_id(), "da-watcher: tx_deposits recording started");
+                    // Hold the Recorder alive until the process exits.
+                    loop {
+                        std::thread::park();
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "da-watcher: start_c for tx_deposits failed");
+                }
+            }
+        })
+        .expect("spawn tx_deposits recorder thread");
+
     let tx_deposits_pub = TxDepositsPublisherHandle::open(&aeron_rt, &channels)
         .context("open TxDepositsPublisherHandle")?;
 
