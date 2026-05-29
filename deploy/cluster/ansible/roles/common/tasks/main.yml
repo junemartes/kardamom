@@ -1,0 +1,65 @@
+---
+# Base packages, Aeron-friendly sysctls, on-node directory layout, and the
+# tmpfs aeron.dir mount. Values derive from group_vars/all.yml.
+
+- name: Update apt cache and upgrade base packages
+  ansible.builtin.apt:
+    update_cache: true
+    upgrade: safe
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - unzip
+      - gnupg
+      - ca-certificates
+    state: present
+
+- name: Install Aeron-friendly socket-buffer sysctls
+  ansible.builtin.template:
+    src: 99-kardamom-aeron.conf.j2
+    dest: /etc/sysctl.d/99-kardamom-aeron.conf
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reload sysctl
+
+- name: Apply each Aeron sysctl now
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-kardamom-aeron.conf
+    state: present
+    reload: true
+  loop:
+    - { name: net.core.rmem_max, value: "16777216" }
+    - { name: net.core.wmem_max, value: "16777216" }
+    - { name: net.core.rmem_default, value: "16777216" }
+    - { name: net.core.wmem_default, value: "16777216" }
+
+- name: Create on-node kardamom directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0777"
+  loop:
+    - "{{ paths.base }}"
+    - "{{ paths.archive_dir }}"
+    - "{{ paths.state_dir }}"
+    - "{{ paths.config_dir }}"
+
+- name: Create the Aeron tmpfs mount point
+  ansible.builtin.file:
+    path: "{{ paths.aeron_mount }}"
+    state: directory
+    mode: "0777"
+
+- name: Mount a tmpfs at the Aeron media-driver shared-memory dir
+  ansible.posix.mount:
+    path: "{{ paths.aeron_mount }}"
+    src: tmpfs
+    fstype: tmpfs
+    opts: "size={{ aeron_tmpfs_size }},mode=0777"
+    state: mounted

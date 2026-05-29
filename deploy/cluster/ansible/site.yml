@@ -1,0 +1,19 @@
+---
+# Provision the kardamom cluster substrate: base config, Docker, Consul, Nomad
+# on every node; the local Docker registry on the control node only.
+# All variables derive from group_vars/all.yml (single source of truth).
+
+- name: Provision base substrate on all cluster nodes
+  hosts: all
+  become: true
+  roles:
+    - common
+    - docker
+    - consul
+    - nomad
+
+- name: Provision the local Docker registry on the control node
+  hosts: control
+  become: true
+  roles:
+    - registry

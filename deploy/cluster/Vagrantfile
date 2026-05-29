@@ -1,0 +1,51 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# 5-node kardamom cluster. Mirrors ansible/group_vars/all.yml (the canonical
+# contract). libvirt is the primary provider; VirtualBox is a best-effort
+# fallback. Static private IPs on 192.168.56.0/24.
+#
+#   vagrant up           # boot all 5 VMs
+#   vagrant up r1        # boot one
+#   vagrant destroy -f   # tear down
+
+NODES = [
+  { name: "r1", ip: "192.168.56.11", cpus: 2, mem: 3072, role: "recorder" },
+  { name: "r2", ip: "192.168.56.12", cpus: 2, mem: 3072, role: "recorder" },
+  { name: "r3", ip: "192.168.56.13", cpus: 2, mem: 3072, role: "recorder" },
+  { name: "w1", ip: "192.168.56.21", cpus: 2, mem: 3072, role: "worker"   },
+  { name: "w2", ip: "192.168.56.22", cpus: 2, mem: 3072, role: "worker"   },
+]
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "generic/ubuntu2204"   # works for both libvirt and virtualbox
+  config.ssh.insert_key = true
+
+  NODES.each_with_index do |node, idx|
+    config.vm.define node[:name] do |vm|
+      vm.vm.hostname = node[:name]
+      vm.vm.network "private_network", ip: node[:ip]
+
+      vm.vm.provider :libvirt do |lv|
+        lv.cpus   = node[:cpus]
+        lv.memory = node[:mem]
+      end
+
+      vm.vm.provider :virtualbox do |vb|
+        vb.cpus   = node[:cpus]
+        vb.memory = node[:mem]
+      end
+
+      # Provision with Ansible only once, from the last VM, so the playbook
+      # sees the whole inventory in a single run.
+      if idx == NODES.size - 1
+        vm.vm.provision :ansible do |ansible|
+          ansible.playbook       = "ansible/site.yml"
+          ansible.inventory_path = "ansible/inventory.ini"
+          ansible.limit          = "all"
+          ansible.compatibility_mode = "2.0"
+        end
+      end
+    end
+  end
+end

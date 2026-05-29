@@ -1,0 +1,63 @@
+---
+# Install and configure Consul. Server runs on the control node only; every
+# node runs a client agent. Values derive from group_vars/all.yml.
+
+- name: Create the consul system group
+  ansible.builtin.group:
+    name: consul
+    system: true
+
+- name: Create the consul system user
+  ansible.builtin.user:
+    name: consul
+    group: consul
+    system: true
+    shell: /usr/sbin/nologin
+    home: /opt/consul
+    create_home: false
+
+- name: Create consul directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: consul
+    group: consul
+    mode: "0750"
+  loop:
+    - /etc/consul.d
+    - /opt/consul
+
+- name: Download and install the Consul binary
+  ansible.builtin.unarchive:
+    src: "https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_amd64.zip"
+    dest: /usr/local/bin
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/consul
+
+- name: Render the Consul configuration
+  ansible.builtin.template:
+    src: consul.hcl.j2
+    dest: /etc/consul.d/consul.hcl
+    owner: consul
+    group: consul
+    mode: "0640"
+  notify: Restart consul
+
+- name: Install the Consul systemd unit
+  ansible.builtin.template:
+    src: consul.service.j2
+    dest: /etc/systemd/system/consul.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart consul
+
+- name: Enable and start Consul
+  ansible.builtin.systemd:
+    name: consul
+    enabled: true
+    state: started
+    daemon_reload: true

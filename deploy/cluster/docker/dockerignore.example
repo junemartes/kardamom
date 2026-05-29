@@ -1,0 +1,30 @@
+# Example .dockerignore for the kardamom workspace root.
+#
+# A .dockerignore MUST live at the build context root (= the repo root) to take
+# effect; it cannot live under deploy/cluster/docker/. Copy this file there:
+#
+#     cp deploy/cluster/docker/dockerignore.example .dockerignore
+#
+# It keeps large, build-irrelevant trees out of the context sent to the Docker
+# daemon for `service.Dockerfile` (which uses the repo root as context),
+# dramatically shrinking the upload and speeding up builds. The cargo build
+# inside the image regenerates target/ via BuildKit cache mounts, so excluding
+# the host target/ here is safe (and important — it can be many GB).
+
+# Rust build output (rebuilt inside the image)
+target/
+
+# Git metadata (not needed for the build)
+.git/
+.gitignore
+
+# Claude / agent workspace + worktrees (not part of the build)
+.claude/
+
+# The cluster deployment tree itself — Dockerfiles are passed via -f, none of
+# the Vagrant/Ansible/Nomad assets are needed inside the build context.
+deploy/cluster/
+
+# Editor/OS cruft
+.DS_Store
+*.swp
