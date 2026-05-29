@@ -78,22 +78,28 @@ async fn split_architecture_m_plus_one_e2e() {
         .expect("aeron container started");
 
     let endpoint = cluster.archive_control_endpoint(0).await;
+    let aeron_dir = cluster.aeron_dir_host(0).to_string_lossy().to_string();
     eprintln!("aeron archive control: {endpoint}");
+    eprintln!("aeron.dir (host): {aeron_dir}");
 
-    // Per-A streams are IPC-aliased per sequencer; tx_ordering is the UDP
-    // endpoint the container exposes. Stream-id arithmetic matches the
-    // ChannelsConfig defaults.
+    // Both tx_data and tx_ordering ride IPC over the bind-mounted aeron.dir:
+    // the host client is a peer of the container's Media Driver via shared
+    // memory, so UDP routing isn't required (and the archive-control endpoint
+    // can't be reused as a data endpoint anyway). Same pattern as the v1
+    // sibling test (`aeron_live_e2e.rs`).
     let mut cfg = LogConfig::default();
-    cfg.channels.tx_ordering_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
+    cfg.channels.tx_ordering_channel = "aeron:ipc?alias=b".to_string();
     cfg.channels.tx_ordering_stream_id = 1001;
-    // TxData stays on IPC inside the container's media driver (this test
-    // runs the client *against* the container, so the per-A streams need to
-    // be reachable from outside too — use UDP with distinct endpoints).
-    cfg.channels.tx_data_channel_template =
-        format!("aeron:udp?endpoint={endpoint}|alias=a-{{sid}}");
+    cfg.channels.tx_data_channel_template = "aeron:ipc?alias=a-{sid}".to_string();
     cfg.channels.tx_data_stream_id_base = 2000;
 
+    // Point the client at the container's bind-mounted aeron.dir so it joins
+    // the container's Media Driver instead of defaulting to /dev/shm/aeron-dev.
+    let aeron_dir_c =
+        std::ffi::CString::new(aeron_dir.clone()).expect("aeron.dir contains a NUL byte");
     let ctx = rusteron_client::AeronContext::new().expect("aeron context");
+    ctx.set_dir(aeron_dir_c.as_c_str())
+        .expect("aeron context set_dir");
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));
     aeron.start().expect("aeron start");
 
@@ -112,19 +118,68 @@ async fn split_architecture_m_plus_one_e2e() {
     let b_pub = TxOrderingPublisher::open(&aeron, &cfg.channels).unwrap();
     let mut b_sub = subs.tx_ordering().unwrap();
 
-    // Publish TXS_PER_SEQ envelopes per sequencer; remember each
-    // (sequencer_id, tx_data_position, expected correlation_id).
-    let mut publish_plan: Vec<(u8, BPosition, u64)> = Vec::new();
+    // Publish TXS_PER_SEQ envelopes per sequencer. Note we intentionally do
+    // NOT use the position returned by `TxDataPublisher::publish` to build
+    // the `TxRef` — production matches the sequencer's flow, which only ever
+    // republishes positions it observed via its own tx_data subscriber (see
+    // `sequencer::sequencer::run_inbound` + `executor::reader::take`). Aeron's
+    // post-offer position and the subscriber's pre-fragment term_offset are
+    // not the same number on the same fragment, so the join key has to come
+    // from the subscriber side.
     for n in 0..TXS_PER_SEQ {
         for sid in 0..M {
-            let env = env(sid, n);
-            let pos_a = a_pubs[sid as usize].publish(&env).unwrap();
-            publish_plan.push((sid, pos_a, env.correlation_id));
+            let _ = a_pubs[sid as usize].publish(&env(sid, n)).unwrap();
         }
     }
 
-    // Interleave TxRefs onto tx_ordering in a non-trivial order so we exercise
-    // the per-A-buffer / B-canonical-order join.
+    // Drain tx_data subscriptions into per-A buffers (executor model:
+    // M+1 reader threads — here, polled sequentially for test determinism).
+    // Capture the subscriber-observed (position, envelope) in the order
+    // Aeron delivers them per shard; Aeron preserves per-publication order,
+    // so the n-th entry in shard `sid` corresponds to the n-th publish on
+    // that shard above.
+    let mut per_sid: Vec<Vec<(BPosition, TxEnvelope)>> =
+        (0..M as usize).map(|_| Vec::new()).collect();
+    let total_a = (TXS_PER_SEQ as usize) * (M as usize);
+    let mut received = 0usize;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while received < total_a && std::time::Instant::now() < deadline {
+        for (i, sub) in a_subs.iter_mut().enumerate() {
+            let sid = i as u8;
+            sub.poll(
+                |env, pos| {
+                    per_sid[sid as usize].push((pos, env));
+                    received += 1;
+                },
+                256,
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        received, total_a,
+        "expected {total_a} tx_data envelopes, got {received}",
+    );
+
+    // Rebuild the canonical publish plan + the A-buffer using
+    // subscriber-observed positions. Replays the original interleave by
+    // walking `per_sid` in the same (n, sid) order the publish loop used.
+    let mut publish_plan: Vec<(u8, BPosition, u64)> = Vec::with_capacity(total_a);
+    let mut a_buffer: HashMap<(u8, BPosition), TxEnvelope> = HashMap::new();
+    let mut idx = vec![0usize; M as usize];
+    for _n in 0..TXS_PER_SEQ {
+        for sid in 0..M {
+            let i = &mut idx[sid as usize];
+            let (pos, env) = per_sid[sid as usize][*i].clone();
+            publish_plan.push((sid, pos, env.correlation_id));
+            a_buffer.insert((sid, pos), env);
+            *i += 1;
+        }
+    }
+
+    // Interleave TxRefs onto tx_ordering in canonical order so we exercise
+    // the per-A-buffer / B-canonical-order join. All publication offers happen
+    // after the subscriber has been opened above, so back-pressure stays low.
     for (sid, pos_a, _corr) in &publish_plan {
         b_pub
             .publish_ref(&TxRef {
@@ -134,30 +189,6 @@ async fn split_architecture_m_plus_one_e2e() {
             })
             .unwrap();
     }
-
-    // Drain tx_data subscriptions into per-A buffers (executor model:
-    // M+1 reader threads — here, polled sequentially for test determinism).
-    let mut a_buffer: HashMap<(u8, BPosition), TxEnvelope> = HashMap::new();
-    let total_a = (TXS_PER_SEQ as usize) * (M as usize);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while a_buffer.len() < total_a && std::time::Instant::now() < deadline {
-        for (i, sub) in a_subs.iter_mut().enumerate() {
-            let sid = i as u8;
-            sub.poll(
-                |env, pos| {
-                    a_buffer.insert((sid, pos), env);
-                },
-                256,
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    assert_eq!(
-        a_buffer.len(),
-        total_a,
-        "expected {total_a} tx_data envelopes, got {}",
-        a_buffer.len()
-    );
 
     // Walk tx_ordering in canonical order. For each TxRef, join against the
     // A-buffer; recover the canonical sequence of correlation_ids and
