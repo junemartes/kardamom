@@ -17,8 +17,7 @@ const EXPECTED_DASHBOARDS: &[&str] = &[
 ];
 
 fn dashboards_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_WORKSPACE_DIR"))
-        .join("deploy/grafana/provisioning/dashboards-json")
+    PathBuf::from(env!("CARGO_WORKSPACE_DIR")).join("deploy/grafana/provisioning/dashboards-json")
 }
 
 #[test]
@@ -28,8 +27,8 @@ fn every_dashboard_is_present_valid_and_schema_38() {
         let path = dir.join(format!("{stem}.json"));
         let body = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
+        let v: serde_json::Value =
+            serde_json::from_str(&body).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()));
 
         assert_eq!(v["schemaVersion"], 38, "{path:?} schemaVersion");
         assert_eq!(v["uid"].as_str(), Some(*stem), "{path:?} uid != {stem}");

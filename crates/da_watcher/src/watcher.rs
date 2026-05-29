@@ -14,9 +14,9 @@ use bytes::Bytes;
 use kardamom_types::Deposit;
 
 use crate::derive::{alias_l1_address, source_hash};
+use crate::metrics;
 use crate::publisher::{DepositPublisher, PublishError};
 use crate::source::{DepositLog, L1Source, L1SourceError};
-use crate::metrics;
 
 /// Watcher configuration.
 #[derive(Debug, Clone, Copy)]

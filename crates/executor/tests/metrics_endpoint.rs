@@ -6,8 +6,7 @@ use std::net::{SocketAddr, TcpListener};
 #[tokio::test]
 async fn executor_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
-    kardamom_obs::init("executor", addr, "local", "test", "test")
-        .expect("init");
+    kardamom_obs::init("executor", addr, "local", "test", "test").expect("init");
 
     // Touch the counter the executor crate is expected to publish so
     // describe_counter calls don't require us to also drive the binary.
@@ -18,7 +17,10 @@ async fn executor_metrics_endpoint_serves_expected_counters() {
         body.contains("kardamom_executor_tx_applied_total"),
         "missing executor counter; got:\n{body}"
     );
-    assert!(body.contains("service=\"executor\""), "missing service label");
+    assert!(
+        body.contains("service=\"executor\""),
+        "missing service label"
+    );
 }
 
 fn free_port() -> SocketAddr {

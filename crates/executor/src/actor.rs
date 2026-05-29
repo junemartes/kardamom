@@ -396,10 +396,8 @@ where
                         // BoundaryStart). Only recorded when the block had
                         // at least one tx; empty blocks are skipped.
                         if let Some(start) = block_apply_start.take() {
-                            metrics::histogram!(
-                                crate::metrics::BLOCK_APPLY_DURATION_SECONDS
-                            )
-                            .record(start.elapsed().as_secs_f64());
+                            metrics::histogram!(crate::metrics::BLOCK_APPLY_DURATION_SECONDS)
+                                .record(start.elapsed().as_secs_f64());
                         }
 
                         // S0: NO state-root computation. The sealed
@@ -430,12 +428,9 @@ where
 
                         // Wait for the writer to durably commit.
                         let committed = sw_signal.wait_committed(block_number)?;
-                        metrics::histogram!(
-                            crate::metrics::STATE_COMMIT_DURATION_SECONDS
-                        )
-                        .record(commit_start.elapsed().as_secs_f64());
-                        metrics::gauge!(crate::metrics::BLOCK_NUMBER)
-                            .set(block_number as f64);
+                        metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
+                            .record(commit_start.elapsed().as_secs_f64());
+                        metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(block_number as f64);
 
                         debug!(
                             target: "executor",
