@@ -232,19 +232,38 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<ReceiptResponse, IngressError> {
-        self.rate_limiter
-            .check(client_ip)
-            .map_err(|_| IngressError::RateLimited(client_ip.to_string()))?;
+        metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
 
-        let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref())
-            .map_err(|e| IngressError::Decode(e.to_string()))?;
+        if let Err(e) = self.rate_limiter.check(client_ip) {
+            let _ = e; // unit error
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "rate-limited")
+                .increment(1);
+            return Err(IngressError::RateLimited(client_ip.to_string()));
+        }
+
+        let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "decode-error")
+                .increment(1);
+            IngressError::Decode(e.to_string())
+        })?;
         let nonce = env.nonce();
 
         //: the proxy is the *only* place `sender` and
         // `tx_hash` are computed. Both fields are stamped into the envelope
         // before any downstream consumer observes the tx, and the sig-verify
         // failure path returns *before* we publish to Aeron.
-        let (sender, tx_hash) = self.verifier.recover(env, raw_tx.clone()).await?;
+        let (sender, tx_hash) = self.verifier.recover(env, raw_tx.clone()).await.map_err(
+            |e| {
+                if matches!(e, IngressError::SignatureInvalid) {
+                    metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "signature-invalid")
+                        .increment(1);
+                } else {
+                    metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "internal")
+                        .increment(1);
+                }
+                e
+            },
+        )?;
 
         if let Some(prev) = self.cache.lookup(sender, nonce) {
             return Ok(ReceiptResponse { receipt: prev });
@@ -253,6 +272,9 @@ where
         // Park *before* publishing — the receipt can arrive on the cache
         // channel before we'd otherwise have registered, especially under load.
         let wait = self.pending.register(sender, nonce);
+
+        // Update queue depth after parking.
+        metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(self.pending.len() as f64);
 
         // Publish onto tx_data[shard]. The shard is selected by sender-
         // address hash (`partition_for(sender, K)`) so every tx from a given
@@ -272,10 +294,31 @@ where
                     tx_hash,
                 },
             )
-            .await?;
-
-        wait.await_with_timeout(self.cfg.pending_receipt_timeout)
             .await
+            .map_err(|e| {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "partition-unavailable")
+                    .increment(1);
+                e
+            })?;
+
+        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+
+        let result = wait
+            .await_with_timeout(self.cfg.pending_receipt_timeout)
+            .await;
+
+        // Update queue depth after the wait completes (slot removed on receipt or timeout).
+        metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(self.pending.len() as f64);
+
+        if let Err(IngressError::Timeout) = &result {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "timeout")
+                .increment(1);
+        } else if let Err(IngressError::Duplicate(_)) = &result {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "duplicate")
+                .increment(1);
+        }
+
+        result
     }
 
     /// Resolves the partition this proxy would route `sender` to. Used by

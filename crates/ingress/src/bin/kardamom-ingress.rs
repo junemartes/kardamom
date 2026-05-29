@@ -59,6 +59,12 @@ struct Args {
     ///   - `on-local-fsync-and-quorum`: both.
     #[arg(long, default_value = "on-quorum")]
     ack_policy: AckPolicyArg,
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9006")]
+    metrics_addr: SocketAddr,
+    /// Host identifier; stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -85,6 +91,14 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
 async fn main() -> Result<()> {
     init_tracing();
     let args = Args::parse();
+    kardamom_obs::init(
+        "ingress",
+        args.metrics_addr,
+        &args.host_id,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+    )?;
+    kardamom_ingress::metrics::describe();
     // v0 config loading: validate the path exists; runtime tunables come
     // from defaults + CLI flags. A future revision will derive Deserialize
     // for IngressConfig (Duration via humantime_serde) so the TOML drives

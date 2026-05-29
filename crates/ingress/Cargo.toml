@@ -27,6 +27,7 @@ governor = "0.10"
 hyper = { version = "1", features = ["http1", "server"] }
 jsonrpsee.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
 nonzero_ext = "0.3"
@@ -50,7 +51,10 @@ futures.workspace = true
 jsonrpsee = { version = "0.26", features = ["server", "macros", "client", "http-client"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
 kardamom-log = { workspace = true, features = ["testing"] }
+metrics = { workspace = true }
 rand = "0.9"
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
 
 [[bench]]
