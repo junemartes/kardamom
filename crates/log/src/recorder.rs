@@ -64,6 +64,8 @@ pub enum RecorderKind {
     TxData { sequencer_id: u8 },
     /// TxOrdering canonical-orderer recorder (carries tiny TxRefs).
     TxOrdering,
+    /// L1 → L2 deposit stream from da-watcher.
+    TxDeposits,
 }
 
 pub struct Recorder {
@@ -120,6 +122,24 @@ impl Recorder {
             RecorderKind::TxData { sequencer_id },
             archive_dir,
             "A",
+        )
+    }
+
+    /// Start recording tx_deposits. One per da-watcher host.
+    pub fn start_c(
+        archive: Archive,
+        ch: &ChannelsConfig,
+        recorder_id: RecorderId,
+        archive_dir: PathBuf,
+    ) -> Result<Self, LogError> {
+        Self::start_inner(
+            archive,
+            &ch.tx_deposits_channel,
+            ch.tx_deposits_stream_id,
+            recorder_id,
+            RecorderKind::TxDeposits,
+            archive_dir,
+            "C",
         )
     }
 
