@@ -21,6 +21,7 @@ use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxOrderingSubscriberHandle,
     TxReceiptsPublisherHandle,
 };
+use kardamom_log::bootstrap::{BootstrapPolicy, BootstrappedSubscriberHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_types::{BPosition, Deposit, TxEnvelope, TxOrderingMessage};
 
@@ -81,14 +82,51 @@ async fn main() -> Result<()> {
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
 
-    // M tx_data subscriptions, one per shard. We bridge each handle's
-    // async `recv()` to a synchronous `next()` (what the executor's reader
-    // thread expects) through a `std::sync::mpsc::channel`, with a
-    // dedicated tokio pump task per shard.
-    let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(args.shards as usize);
+    // M tx_data subscriptions, one per shard. Open all handles with
+    // bootstrap support first, wait for caught-up on each, then wire
+    // them into the async→sync mpsc bridge the executor's reader thread
+    // expects.
+    let mut tx_data_handles: Vec<BootstrappedSubscriberHandle<TxEnvelope>> =
+        Vec::with_capacity(args.shards as usize);
     for shard_id in 0..args.shards {
-        let mut handle = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
-            .with_context(|| format!("open TxDataSubscriberHandle shard={shard_id}"))?;
+        let handle =
+            TxDataSubscriberHandle::open_bootstrapped(&rt, &channels, shard_id, BootstrapPolicy::default_tx_data())
+                .with_context(|| format!("open TxDataSubscriberHandle (bootstrapped) shard={shard_id}"))?;
+        tx_data_handles.push(handle);
+    }
+
+    // 1 tx_ordering subscription — bootstrapped.
+    let mut tx_ordering_handle =
+        TxOrderingSubscriberHandle::open_bootstrapped(&rt, &channels, BootstrapPolicy::default_tx_ordering())
+            .context("open TxOrderingSubscriberHandle (bootstrapped)")?;
+
+    // 1 tx_deposits subscription — bootstrapped.
+    let mut tx_deposits_handle =
+        TxDepositsSubscriberHandle::open_bootstrapped(&rt, &channels, BootstrapPolicy::default_tx_deposits())
+            .context("open TxDepositsSubscriberHandle (bootstrapped)")?;
+
+    // Gate first-block execution: wait for all bootstrapped subs to
+    // report caught-up before handing control to the executor loop.
+    tracing::info!("executor waiting for all bootstrapped subs to catch up");
+    tx_ordering_handle
+        .wait_caught_up()
+        .await
+        .map_err(|e| anyhow::anyhow!("tx_ordering bootstrap failed: {e}"))?;
+    tx_deposits_handle
+        .wait_caught_up()
+        .await
+        .map_err(|e| anyhow::anyhow!("tx_deposits bootstrap failed: {e}"))?;
+    for (i, h) in tx_data_handles.iter_mut().enumerate() {
+        h.wait_caught_up()
+            .await
+            .map_err(|e| anyhow::anyhow!("tx_data[{i}] bootstrap failed: {e}"))?;
+    }
+    tracing::info!("executor bootstrap complete, executing canonical log");
+
+    // Now wire each handle into the async→sync mpsc bridge.
+    let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(args.shards as usize);
+    for (shard_id, mut handle) in tx_data_handles.into_iter().enumerate() {
+        let shard_id = shard_id as u8;
         let (tx, rx) = sync_mpsc::channel::<(BPosition, TxEnvelope)>();
         tokio::spawn(async move {
             while let Some(item) = handle.recv().await {
@@ -103,9 +141,7 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // 1 tx_ordering subscription, same async→sync bridge.
-    let mut tx_ordering_handle = TxOrderingSubscriberHandle::open(&rt, &channels)
-        .context("open TxOrderingSubscriberHandle")?;
+    // Wire tx_ordering into async→sync bridge.
     let (b_tx, b_rx) = sync_mpsc::channel::<(BPosition, TxOrderingMessage)>();
     tokio::spawn(async move {
         while let Some(item) = tx_ordering_handle.recv().await {
@@ -116,12 +152,10 @@ async fn main() -> Result<()> {
     });
     let b_sub: Box<dyn TxOrderingSubscription> = Box::new(LiveTxOrderingSub { rx: b_rx });
 
-    // 1 tx_deposits subscription. The executor's deposit reader thread
-    // joins `(deposit_position, Deposit)` envelopes against the
-    // `DepositRef`s observed on tx_ordering; `source_hash` is the dedup
-    // key. Same async→sync bridge as tx_ordering above.
-    let mut tx_deposits_handle = TxDepositsSubscriberHandle::open(&rt, &channels)
-        .context("open TxDepositsSubscriberHandle")?;
+    // Wire tx_deposits into async→sync bridge. The executor's deposit
+    // reader thread joins `(deposit_position, Deposit)` envelopes against
+    // the `DepositRef`s observed on tx_ordering; `source_hash` is the
+    // dedup key.
     let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
     tokio::spawn(async move {
         while let Some(item) = tx_deposits_handle.recv().await {
