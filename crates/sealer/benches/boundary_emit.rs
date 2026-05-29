@@ -25,7 +25,7 @@ fn bench_emit(c: &mut Criterion) {
                 let bus = FakeBus::new();
                 let pubh = FakeBoundaryPublisher::new(bus, "ch", 2);
                 let clock = MockClock::new(1_000);
-                (BoundaryEmitter::new(pubh, clock, 1, 250, 1),)
+                (BoundaryEmitter::new(pubh, clock, 1, 250),)
             },
             |(mut emitter,)| async move {
                 emitter.run_one_tick().await.unwrap();

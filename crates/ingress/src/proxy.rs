@@ -295,10 +295,9 @@ where
                 },
             )
             .await
-            .map_err(|e| {
+            .inspect_err(|_| {
                 metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "partition-unavailable")
                     .increment(1);
-                e
             })?;
 
         metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);

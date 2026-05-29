@@ -15,7 +15,6 @@ use kardamom_log::aeron_live::{
     AeronRuntime, TxOrderingPublisherHandle, TxOrderingSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
-use kardamom_obs;
 use kardamom_sealer::clock::SystemClock;
 use kardamom_sealer::emitter::{BoundaryPublisher, PublishError};
 use kardamom_sealer::{Sealer, SealerConfig};
