@@ -81,6 +81,57 @@ impl BootstrapPolicy {
     }
 }
 
+/// Position of a frame on its Aeron stream (or replay session). Newtype so
+/// the state-machine code can't accidentally mix it with other integers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StreamPosition(pub i64);
+
+/// Source of frames for the state machine — abstracts over a live Aeron
+/// subscription so we can drive the state machine against a `FakeBus` in
+/// unit tests.
+pub trait LiveImage: Send {
+    /// Current end position of the live image. None if the image has not
+    /// attached yet.
+    fn current_position(&self) -> Option<StreamPosition>;
+    /// Position at which this image first became attached. None until then.
+    fn join_position(&self) -> Option<StreamPosition>;
+    /// Pull all currently-available frames, calling `f` for each.
+    fn poll(&mut self, f: &mut dyn FnMut(StreamPosition, Vec<u8>));
+}
+
+/// Source of replayed frames — abstracts over a rusteron replay session.
+pub trait ReplaySource: Send {
+    /// Current position of the replay cursor. Equal to anchor at start;
+    /// advances as `poll` is called.
+    fn current_position(&self) -> StreamPosition;
+    /// Pull all currently-available frames, calling `f` for each.
+    fn poll(&mut self, f: &mut dyn FnMut(StreamPosition, Vec<u8>));
+    /// Stop the replay session.
+    fn stop(&mut self);
+}
+
+/// Bootstrap-time queries against the archive: position lookup and replay
+/// session creation. The state machine calls these once at startup; live
+/// frames flow through `LiveImage` and `ReplaySource`.
+pub trait ArchiveSource {
+    /// `latest_recording_position` for the recording mapped to this stream.
+    /// Returns `None` if no recording exists yet (cold-start fallback).
+    fn latest_recording_position(&self) -> Result<Option<StreamPosition>, BootstrapError>;
+    /// Earliest position still archived for this stream (used to detect
+    /// `AnchorBelowArchiveHead`).
+    fn earliest_recording_position(&self) -> Result<StreamPosition, BootstrapError>;
+    /// Walk back from `at` to the last `BoundaryStart` <= `at`, then back
+    /// `safety` additional boundaries. Returns `None` if no boundaries
+    /// exist before `at`. Only meaningful for `tx_ordering`.
+    fn last_block_boundary(
+        &self,
+        at: StreamPosition,
+        safety: u32,
+    ) -> Result<Option<StreamPosition>, BootstrapError>;
+    /// Start a replay anchored at `start` and return the session.
+    fn start_replay(&self, start: StreamPosition) -> Result<Box<dyn ReplaySource>, BootstrapError>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,5 +154,11 @@ mod tests {
             ReplayWindow::BlockBoundaries { safety: 0 },
             ReplayWindow::PositionBytes { bytes: 0 },
         );
+    }
+
+    #[test]
+    fn stream_position_ordered() {
+        assert!(StreamPosition(10) < StreamPosition(11));
+        assert!(StreamPosition(0) <= StreamPosition(0));
     }
 }
