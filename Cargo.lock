@@ -3939,6 +3939,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-obs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "reqwest 0.13.4",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-sealer"
 version = "0.1.0"
 dependencies = [
