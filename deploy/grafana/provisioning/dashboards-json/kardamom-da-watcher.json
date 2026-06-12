@@ -41,44 +41,20 @@
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
       "fieldConfig": {"defaults": {"custom": {"lineWidth": 1, "fillOpacity": 10}, "unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
       "id": 1,
       "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "kardamom_da_watcher_l1_head_block_number{host_id=~\"$host\"}",
-          "legendFormat": "head",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {"type": "prometheus", "uid": "prometheus"},
           "expr": "kardamom_da_watcher_l1_finalized_block_number{host_id=~\"$host\"}",
           "legendFormat": "finalized",
           "range": true,
-          "refId": "B"
-        }
-      ],
-      "title": "L1 head + finalized",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
-      "id": 2,
-      "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "kardamom_da_watcher_l1_head_block_number{host_id=~\"$host\"} - kardamom_da_watcher_l1_finalized_block_number{host_id=~\"$host\"}",
-          "range": true,
           "refId": "A"
         }
       ],
-      "title": "L1 lag (head − finalized)",
-      "type": "stat"
+      "title": "L1 finalized block",
+      "type": "timeseries"
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},

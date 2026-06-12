@@ -52,6 +52,10 @@ pub struct BoundaryEmitter<C: WallClock, P: BoundaryPublisher> {
     clock: Arc<C>,
     block_number: u64,
     tick_interval_ms: u64,
+    // Handles resolved once at construction: the emit path runs every tick,
+    // so skip the per-emit registry lookup the macros would do.
+    boundaries_emitted: metrics::Counter,
+    block_number_gauge: metrics::Gauge,
 }
 
 impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
@@ -61,6 +65,8 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
             clock: Arc::new(clock),
             block_number: initial_block,
             tick_interval_ms: tick_ms,
+            boundaries_emitted: metrics::counter!(crate::metrics::BOUNDARIES_EMITTED_TOTAL),
+            block_number_gauge: metrics::gauge!(crate::metrics::BLOCK_NUMBER),
         }
     }
 
@@ -105,14 +111,14 @@ impl<C: WallClock, P: BoundaryPublisher> BoundaryEmitter<C, P> {
                 Ok(_pos) => {
                     let emitted = self.block_number;
                     self.block_number += 1;
-                    metrics::counter!("kardamom_sealer_boundaries_emitted_total").increment(1);
-                    metrics::gauge!("kardamom_sealer_block_number").set(emitted as f64);
+                    self.boundaries_emitted.increment(1);
+                    self.block_number_gauge.set(emitted as f64);
                     return Ok(emitted);
                 }
                 Err(PublishError::BackPressure) => {
                     if std::time::Instant::now() >= deadline {
                         metrics::counter!(
-                            "kardamom_sealer_tick_skipped_total",
+                            crate::metrics::TICK_SKIPPED_TOTAL,
                             "reason" => "backpressure",
                         )
                         .increment(1);

@@ -266,6 +266,9 @@ where
         )?;
 
         if let Some(prev) = self.cache.lookup(sender, nonce) {
+            // A resubmission served from the receipt cache succeeds; count it
+            // so received == accepted + rejected holds on every path.
+            metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
             return Ok(ReceiptResponse { receipt: prev });
         }
 
@@ -300,8 +303,6 @@ where
                     .increment(1);
             })?;
 
-        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
-
         let result = wait
             .await_with_timeout(self.cfg.pending_receipt_timeout)
             .await;
@@ -309,12 +310,24 @@ where
         // Update queue depth after the wait completes (slot removed on receipt or timeout).
         metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(self.pending.len() as f64);
 
-        if let Err(IngressError::Timeout) = &result {
-            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "timeout")
-                .increment(1);
-        } else if let Err(IngressError::Duplicate(_)) = &result {
-            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "duplicate")
-                .increment(1);
+        // Count accepted/rejected on the terminal outcome (not at publish
+        // time) so a single submission never increments both.
+        match &result {
+            Ok(_) => {
+                metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+            }
+            Err(IngressError::Timeout) => {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "timeout")
+                    .increment(1);
+            }
+            Err(IngressError::Duplicate(_)) => {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "duplicate")
+                    .increment(1);
+            }
+            Err(_) => {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "internal")
+                    .increment(1);
+            }
         }
 
         result

@@ -95,7 +95,6 @@ where
 
     // Emit the finalized tip gauge on every successful tip fetch.
     ::metrics::gauge!(metrics::L1_FINALIZED).set(tip as f64);
-    ::metrics::gauge!(metrics::L1_HEAD).set(tip as f64);
 
     let from_block = match cursor {
         None => {

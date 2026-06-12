@@ -271,8 +271,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
 
         let t0 = std::time::Instant::now();
         let result = self.state.process(sender, nonce, meta);
-        let elapsed_us = t0.elapsed().as_micros() as f64;
-        metrics::record_nonce_check_latency(self.cfg.partition_index, elapsed_us);
+        metrics::record_nonce_check_latency(self.cfg.partition_index, t0.elapsed().as_secs_f64());
 
         match result.outcome {
             NonceOutcome::Matched => {}

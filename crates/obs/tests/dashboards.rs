@@ -39,8 +39,10 @@ fn every_dashboard_is_present_valid_and_schema_38() {
                 p["title"].as_str().is_some_and(|s| !s.is_empty()),
                 "{path:?} panel[{i}] missing title"
             );
-            // Every PromQL target must reference at least one kardamom_*
-            // metric. Text panels have no targets (skip them).
+            // Every PromQL target must be kardamom-scoped: either a
+            // kardamom_* metric or a kardamom-* job selector (e.g. the
+            // overview's `up{job=~"kardamom-.+"}` liveness panel). Text
+            // panels have no targets (skip them).
             let panel_type = p["type"].as_str().unwrap_or("");
             if panel_type == "text" {
                 continue;
@@ -49,8 +51,8 @@ fn every_dashboard_is_present_valid_and_schema_38() {
             for (j, t) in targets.iter().enumerate() {
                 let expr = t["expr"].as_str().unwrap_or("");
                 assert!(
-                    expr.contains("kardamom_"),
-                    "{path:?} panel[{i}] target[{j}] expr does not reference any kardamom_* metric: {expr}"
+                    expr.contains("kardamom"),
+                    "{path:?} panel[{i}] target[{j}] expr is not kardamom-scoped: {expr}"
                 );
             }
         }

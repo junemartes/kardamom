@@ -10,11 +10,12 @@ async fn ingress_metrics_endpoint_serves_expected_counters() {
 
     // Touch the counter the ingress crate is expected to publish so the
     // describe_counter call doesn't require driving the full binary.
-    metrics::counter!("kardamom_ingress_tx_received_total").increment(0);
+    // Uses the crate's constants so a rename in src/metrics.rs fails here.
+    metrics::counter!(kardamom_ingress::metrics::TX_RECEIVED_TOTAL).increment(0);
 
     let body = scrape(&format!("http://{addr}/metrics")).await;
     assert!(
-        body.contains("kardamom_ingress_tx_received_total"),
+        body.contains(kardamom_ingress::metrics::TX_RECEIVED_TOTAL),
         "missing ingress counter; got:\n{body}"
     );
     assert!(

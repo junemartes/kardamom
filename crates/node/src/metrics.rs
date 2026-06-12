@@ -15,9 +15,6 @@ pub const RPC_STAGE_DURATION_SECONDS: &str = "kardamom_rpc_stage_duration_second
 /// Gauge: the current block number.
 pub const BLOCK_NUMBER: &str = "kardamom_block_number";
 
-/// Gauge: build info, always 1, labeled with version + git_sha.
-pub const BUILD_INFO: &str = "kardamom_build_info";
-
 /// RAII guard that records a histogram observation for a single stage when
 /// dropped. Used by the `stage!` macro so `?` inside the instrumented block
 /// still records the elapsed time on early return.

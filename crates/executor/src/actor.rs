@@ -40,7 +40,7 @@
 //! crossbeam channels.
 
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::debug;
@@ -269,10 +269,16 @@ where
             let mut last_processed_position: Option<BPosition> = None;
             // Sanity: tx_idx assigned by the tx_ordering reader is monotone.
             let mut expected_tx_idx = TxIndex::ZERO;
-            // Block-apply wall-clock: set on first tx in a block, recorded
-            // when the BoundaryStart closes that block. `None` for empty
-            // blocks (no txs before the boundary).
-            let mut block_apply_start: Option<Instant> = None;
+            // Wall time spent executing the block's txs/deposits (excludes
+            // channel idle time between txs), recorded when the BoundaryStart
+            // closes the block. `None` for empty blocks.
+            let mut block_apply_elapsed: Option<Duration> = None;
+            // Pre-resolved counter handles: this loop is the executor's
+            // hottest path, so skip the per-event registry lookup.
+            let tx_applied_ok =
+                metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok");
+            let tx_applied_error =
+                metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error");
 
             loop {
                 let msg = match rx.recv() {
@@ -292,16 +298,12 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
-                        // Start the block-apply clock on the first tx in
-                        // each block.
-                        if block_apply_start.is_none() {
-                            block_apply_start = Some(Instant::now());
-                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
+                        let apply_start = Instant::now();
                         let result = execute_tx(
                             &snapshot,
                             &delta,
@@ -312,16 +314,16 @@ where
                             tx_index_in_block,
                             cumulative_gas_used,
                         );
-                        let outcome = if result.is_ok() { "ok" } else { "error" };
-                        metrics::counter!(
-                            crate::metrics::TX_APPLIED_TOTAL,
-                            "outcome" => outcome
-                        )
-                        .increment(1);
+                        if result.is_ok() {
+                            tx_applied_ok.increment(1);
+                        } else {
+                            tx_applied_error.increment(1);
+                        }
                         let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
+                        *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
                         last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
@@ -339,16 +341,12 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
-                        // Start the block-apply clock on the first tx/deposit
-                        // in each block.
-                        if block_apply_start.is_none() {
-                            block_apply_start = Some(Instant::now());
-                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
+                        let apply_start = Instant::now();
                         let result = execute_deposit_tx(
                             &snapshot,
                             &delta,
@@ -359,16 +357,16 @@ where
                             tx_index_in_block,
                             cumulative_gas_used,
                         );
-                        let outcome = if result.is_ok() { "ok" } else { "error" };
-                        metrics::counter!(
-                            crate::metrics::TX_APPLIED_TOTAL,
-                            "outcome" => outcome
-                        )
-                        .increment(1);
+                        if result.is_ok() {
+                            tx_applied_ok.increment(1);
+                        } else {
+                            tx_applied_error.increment(1);
+                        }
                         let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
+                        *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
                         last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
@@ -392,12 +390,12 @@ where
                             });
                         }
 
-                        // Record block-apply wall time (first-tx to
-                        // BoundaryStart). Only recorded when the block had
-                        // at least one tx; empty blocks are skipped.
-                        if let Some(start) = block_apply_start.take() {
+                        // Record the block's accumulated execution time.
+                        // Only recorded when the block had at least one tx;
+                        // empty blocks are skipped.
+                        if let Some(elapsed) = block_apply_elapsed.take() {
                             metrics::histogram!(crate::metrics::BLOCK_APPLY_DURATION_SECONDS)
-                                .record(start.elapsed().as_secs_f64());
+                                .record(elapsed.as_secs_f64());
                         }
 
                         // S0: NO state-root computation. The sealed

@@ -14,7 +14,7 @@
       "id": 1,
       "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "value_and_name"},
       "pluginVersion": "10.4.0",
-      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "max by (service) (kardamom_service_up{host_id=~\"$host\"})", "legendFormat": "{{service}}", "range": true, "refId": "A"}],
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "up{job=~\"kardamom-.+\"}", "legendFormat": "{{job}}", "range": true, "refId": "A"}],
       "title": "Services up",
       "type": "stat"
     },
@@ -48,8 +48,8 @@
       "gridPos": {"h": 5, "w": 12, "x": 0, "y": 12},
       "id": 4,
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto"},
-      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "kardamom_da_watcher_l1_head_block_number{host_id=~\"$host\"} - kardamom_da_watcher_l1_finalized_block_number{host_id=~\"$host\"}", "legendFormat": "L1 lag", "range": true, "refId": "A"}],
-      "title": "L1 head − finalized",
+      "targets": [{"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "kardamom_da_watcher_l1_finalized_block_number{host_id=~\"$host\"}", "legendFormat": "L1 finalized", "range": true, "refId": "A"}],
+      "title": "L1 finalized block",
       "type": "stat"
     },
     {

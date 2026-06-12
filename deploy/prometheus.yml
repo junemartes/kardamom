@@ -7,6 +7,11 @@ global:
 # `host-N:<port>` to the matching job's `targets` — every metric is already
 # labelled with `host_id` (set via `--host-id` on the binary), so Prometheus
 # can group by host without relabel rules.
+#
+# `host.docker.internal` reaches loopback-bound services on Docker Desktop
+# (macOS/Windows) only. On Linux it resolves to the bridge gateway, so start
+# each service with `--metrics-addr 0.0.0.0:<port>` to make these targets
+# reachable.
 scrape_configs:
   - job_name: kardamom-node
     metrics_path: /metrics

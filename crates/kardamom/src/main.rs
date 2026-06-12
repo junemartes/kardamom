@@ -35,7 +35,7 @@ struct Args {
     rpc_addr: SocketAddr,
 
     /// Address to bind the Prometheus `/metrics` endpoint on.
-    #[arg(long, default_value = "127.0.0.1:9000")]
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9000")]
     metrics_addr: SocketAddr,
 
     /// Host identifier; stamped on every metric.
@@ -81,6 +81,8 @@ fn init_tracing() -> Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
+    let _flame_guard = init_tracing();
+
     let git_sha = option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown");
     kardamom_obs::init(
         "node",
@@ -89,8 +91,6 @@ async fn main() -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         git_sha,
     )?;
-
-    let _flame_guard = init_tracing();
 
     let genesis = chain::load(&args.chain)?;
     let alloc_entries = genesis.alloc.len();

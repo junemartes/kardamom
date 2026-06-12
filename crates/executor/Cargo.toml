@@ -43,7 +43,6 @@ rand = "0.9"
 rand_chacha = "0.9"
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
-metrics = { workspace = true }
 
 [[bench]]
 name = "sequential_throughput"

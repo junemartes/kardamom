@@ -5,6 +5,11 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.retention.time=24h
+      # The overview dashboard rates a multi-metric selector
+      # ({__name__=~"kardamom_.+_total"}); without delayed name removal,
+      # Prometheus rejects it with "vector cannot contain metrics with the
+      # same labelset" once a service exports two label-less counters.
+      - --enable-feature=promql-delayed-name-removal
     ports:
       - "9090:9090"
     volumes:

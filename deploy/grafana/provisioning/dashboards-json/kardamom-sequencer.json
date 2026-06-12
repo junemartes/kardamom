@@ -147,28 +147,28 @@
     },
     {
       "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "µs"}, "overrides": []},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
       "id": 6,
       "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "histogram_quantile(0.5, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_microseconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
+          "expr": "histogram_quantile(0.5, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_duration_seconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
           "legendFormat": "{{partition}} p50",
           "range": true,
           "refId": "A"
         },
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "histogram_quantile(0.9, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_microseconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
+          "expr": "histogram_quantile(0.9, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_duration_seconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
           "legendFormat": "{{partition}} p90",
           "range": true,
           "refId": "B"
         },
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "histogram_quantile(0.99, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_microseconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
+          "expr": "histogram_quantile(0.99, sum by (le, partition) (rate(kardamom_sequencer_nonce_check_duration_seconds_bucket{host_id=~\"$host\", partition=~\"$partition\"}[1m])))",
           "legendFormat": "{{partition}} p99",
           "range": true,
           "refId": "C"
@@ -193,24 +193,6 @@
         }
       ],
       "title": "Pending evictions rate",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {"type": "prometheus", "uid": "prometheus"},
-      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
-      "id": 8,
-      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
-      "targets": [
-        {
-          "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "kardamom_sequencer_standby_replay_lag{host_id=~\"$host\", partition=~\"$partition\"}",
-          "legendFormat": "{{partition}}",
-          "range": true,
-          "refId": "A"
-        }
-      ],
-      "title": "Standby replay lag",
       "type": "timeseries"
     },
     {

@@ -20,8 +20,19 @@ Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
 | `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
 | `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
 
-Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default `local`).
-It's stamped on every emitted metric as the `host_id` label, alongside an automatic
+All seven binaries read the same `KARDAMOM_METRICS_ADDR` env var, so a value
+shared across colocated services makes them race for one socket — prefer the
+per-service `--metrics-addr` flag when overriding more than one service.
+
+The services bind loopback by default. The compose-managed Prometheus scrapes
+them through `host.docker.internal`, which works as-is on Docker Desktop
+(macOS/Windows); on Linux that name resolves to the bridge gateway, so each
+service must be started with `--metrics-addr 0.0.0.0:<port>` (or another
+non-loopback bind) to be reachable.
+
+Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
+`local`; the sealer defaults to its config file's `host_id` instead). It's
+stamped on every emitted metric as the `host_id` label, alongside an automatic
 `service` label set by `kardamom_obs::init`. The top-level `Kardamom Overview`
 dashboard exposes a `host` template variable; per-service dashboards inherit it.
 
@@ -50,7 +61,9 @@ group by host without relabel rules.
 | `sealer_block_number` | `kardamom_sealer_block_number` |
 | `sealer_tick_skipped_total` | `kardamom_sealer_tick_skipped_total` |
 
-The sealer's per-emission `host_id` label is gone — `host_id` is now a recorder-level global.
+The sealer's per-emission `host_id` label is gone — `host_id` is now a
+recorder-level global, sourced from `--host-id`/`KARDAMOM_HOST_ID` and falling
+back to the sealer config's `host_id`.
 
 ## What is instrumented
 
@@ -69,7 +82,8 @@ method** (so the flamegraph nests the per-stage spans under e.g.
 `method`, `outcome` (`ok` or `err`).
 
 Plus `kardamom_block_number` (gauge) and `kardamom_build_info` (gauge, always
-1, labeled with `version` and `git_sha`).
+1, labeled with `version` and `sha` — set `KARDAMOM_GIT_SHA` at build time to
+populate the latter).
 
 ## Quick start
 
@@ -284,7 +298,8 @@ per-signer presign for main starting at nonce `WARMUP`.
 
 ## Dashboard panels
 
-The provisioned dashboard (`deploy/grafana/dashboards/kardamom-rpc.json`) has
+The provisioned dashboard
+(`deploy/grafana/provisioning/dashboards-json/kardamom-node.json`) has
 six panels in a 2×3 grid plus a footer:
 
 1. **Request rate** — `sum by (method) (rate(kardamom_rpc_requests_total[30s]))`

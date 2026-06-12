@@ -40,8 +40,6 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 # Re-pull our own `testing` feature so tests under `tests/` always have the
 # in-memory fakes without needing `cargo test --features testing`.
 kardamom-sealer = { path = ".", features = ["testing"] }
-kardamom-obs = { path = "../obs" }
-metrics = { workspace = true }
 proptest = "1"
 reqwest = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

@@ -1008,6 +1008,10 @@ struct ChildGuard {
 
 impl ChildGuard {
     fn spawn(name: &'static str, cmd: &mut Command) -> Self {
+        // Ephemeral metrics port: the bins' fixed 900X defaults would
+        // AddrInUse-crash a service when tests run in parallel or a local
+        // stack already owns the port.
+        cmd.env("KARDAMOM_METRICS_ADDR", "127.0.0.1:0");
         let child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {name}: {e}"));
         tracing::info!(name, pid = child.id(), "spawned");
         Self {

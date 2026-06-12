@@ -12,7 +12,10 @@ pub const QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
 
 pub fn describe() {
     metrics::describe_counter!(TX_RECEIVED_TOTAL, "tx submissions received");
-    metrics::describe_counter!(TX_ACCEPTED_TOTAL, "tx submissions accepted into the pool");
+    metrics::describe_counter!(
+        TX_ACCEPTED_TOTAL,
+        "tx submissions that returned a receipt (incl. cached resubmissions)"
+    );
     metrics::describe_counter!(
         TX_REJECTED_TOTAL,
         "tx submissions rejected, labelled by reason"

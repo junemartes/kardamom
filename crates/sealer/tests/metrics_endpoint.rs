@@ -10,11 +10,12 @@ async fn sealer_metrics_endpoint_serves_expected_counters() {
 
     // Touch every counter the sealer crate is expected to publish so
     // describe_counter calls don't require us to also drive the binary.
-    metrics::counter!("kardamom_sealer_boundaries_emitted_total").increment(0);
+    // Uses the crate's constants so a rename in src/metrics.rs fails here.
+    metrics::counter!(kardamom_sealer::metrics::BOUNDARIES_EMITTED_TOTAL).increment(0);
 
     let body = scrape(&format!("http://{addr}/metrics")).await;
     assert!(
-        body.contains("kardamom_sealer_boundaries_emitted_total"),
+        body.contains(kardamom_sealer::metrics::BOUNDARIES_EMITTED_TOTAL),
         "missing sealer counter; got:\n{body}"
     );
     assert!(body.contains("service=\"sealer\""), "missing service label");
