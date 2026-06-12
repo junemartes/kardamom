@@ -325,7 +325,7 @@ fn flamegraph_options() -> pprof::flamegraph::Options<'static> {
 
 /// Substring matched against demangled symbol names to decide whether a
 /// pprof stack belongs to "the node." Matches `kardamom_node::node::...`,
-/// `kardamom_node::executor::...`, etc.
+/// `kardamom_node::kardamom_executor::...`, etc.
 const NODE_FRAME_NEEDLE: &str = "kardamom_node";
 
 struct FilteredReport {

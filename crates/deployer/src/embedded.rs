@@ -28,6 +28,11 @@ pub fn eth_lockbox_creation() -> Bytes {
     Bytes::from_static(ETH_LOCKBOX_CREATION)
 }
 
+/// Creation bytecode of `KardamomL2Settlement` — the S7 DA sink contract.
+pub fn kardamom_l2_settlement_creation() -> Bytes {
+    Bytes::from_static(KARDAMOM_L2_SETTLEMENT_CREATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -45,5 +50,10 @@ mod tests {
     #[test]
     fn eth_lockbox_creation_is_nonempty() {
         assert!(!eth_lockbox_creation().is_empty());
+    }
+
+    #[test]
+    fn kardamom_l2_settlement_creation_is_nonempty() {
+        assert!(!kardamom_l2_settlement_creation().is_empty());
     }
 }

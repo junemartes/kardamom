@@ -1,0 +1,61 @@
+[package]
+name = "e2e"
+version.workspace = true
+edition.workspace = true
+publish = false
+
+[features]
+default = []
+# Run the full-pipeline cross-component test under real Aeron in Docker.
+# Implies the `docker-e2e` testcontainers harness. Off by default so the
+# standard CI stays fast; the dedicated docker-e2e CI job opts in.
+full-pipeline-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kardamom-log.workspace = true
+kardamom-types.workspace = true
+
+alloy-primitives.workspace = true
+bytes.workspace = true
+rkyv.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Note: docker-e2e is activated only when the `full-pipeline-e2e`
+# feature is enabled (see [features] above).
+alloy-consensus.workspace = true
+alloy-contract.workspace = true
+alloy-network.workspace = true
+alloy-node-bindings.workspace = true
+alloy-provider.workspace = true
+alloy-rlp.workspace = true
+alloy-signer-local.workspace = true
+alloy-sol-types.workspace = true
+anyhow.workspace = true
+async-trait = "0.1"
+criterion.workspace = true
+crossbeam-channel.workspace = true
+hex = "0.4"
+libc.workspace = true
+hdrhistogram.workspace = true
+jsonrpsee = { workspace = true, features = ["http-client"] }
+kardamom-da-watcher = { path = "../da_watcher" }
+kardamom-deployer = { path = "../deployer" }
+kardamom-executor = { path = "../executor" }
+kardamom-ingress = { path = "../ingress" }
+kardamom-sealer = { path = "../sealer" }
+kardamom-sequencer = { path = "../sequencer", features = ["testing"] }
+kardamom-state = { path = "../state" }
+serde_json.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
+
+[[bench]]
+name = "e2e_throughput"
+harness = false
+# Bench only compiles when full-pipeline-e2e is enabled (real Aeron + Docker).
+required-features = ["full-pipeline-e2e"]

@@ -39,6 +39,25 @@ alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
+kardamom-types = { path = "crates/types" }
+kardamom-log = { path = "crates/log" }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
+io-uring = "0.7"
+rusteron-client = "0.1"
+rusteron-archive = "0.1"
+testcontainers = "0.20"
+criterion = "0.5"
+tempfile = "3"
+bytes = "1"
+libc = "0.2"
+futures = "0.3"
+# Lock-free concurrent map for the executor's tx_data → tx_ordering join buffer
+#: M tx_data reader threads insert
+# `(sequencer_id, BPosition) → TxEnvelope` entries; the tx_ordering reader thread
+# pops them as each `TxRef` arrives. Many writers + one reader → DashMap.
+dashmap = "6"
+crossbeam-channel = "0.5"
+
 [profile.release]
 debug = true
 lto = "thin"

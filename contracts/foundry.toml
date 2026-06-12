@@ -18,6 +18,14 @@ libs = ["lib"]
 solc = "0.8.26"
 optimizer = true
 optimizer_runs = 200
+# Strip the solc metadata footer (IPFS CID of compiler inputs/outputs) so the
+# compiled bytecode is byte-identical across build hosts. Without this, solc
+# bakes in a hash that depends on absolute source paths — `/home/runner/...`
+# on CI vs `/home/dev/...` locally — and the deployer's CREATE2-derived
+# FACTORY address diverges, breaking `factory_address_sync`. Matches the
+# embedded.rs doc comment ("both forge and the cargo-side `foundry-compilers`
+# compile with `bytecode_hash = none`").
+bytecode_hash = "none"
 fuzz = { runs = 256 }
 remappings = [
     "@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/",
