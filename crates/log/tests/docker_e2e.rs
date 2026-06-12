@@ -52,22 +52,26 @@ async fn aeron_publish_record_subscribe_e2e() {
         .expect("aeron container started");
 
     let endpoint = cluster.archive_control_endpoint(0).await;
+    let aeron_dir = cluster.aeron_dir_host(0).to_string_lossy().to_string();
     eprintln!("aeron archive control: {endpoint}");
+    eprintln!("aeron.dir (host): {aeron_dir}");
 
+    // tx_ordering rides IPC over the bind-mounted aeron.dir — the host client
+    // and the container's Media Driver share the same shared-memory directory,
+    // so no UDP is required (the archive-control endpoint can't be reused as
+    // a data endpoint anyway). Same pattern as `aeron_live_e2e_arch_v2.rs`.
     let mut cfg = LogConfig::default();
-    cfg.channels.tx_ordering_channel = format!("aeron:udp?endpoint={endpoint}|alias=b");
+    cfg.channels.tx_ordering_channel = "aeron:ipc?alias=b".to_string();
     cfg.channels.tx_ordering_stream_id = 1001;
 
-    // Connect a host-side Aeron client to the container's Media Driver.
-    // The rusteron 0.1.16x API is: build an AeronContext, set the aeron
-    // directory (where the container exposes its CnC file via a bind mount —
-    // or, alternatively, a UDP channel URI carries the endpoint and the
-    // client uses the default dir). For the V0 e2e test we use the default
-    // aeron dir and rely on the channel URIs in `cfg.channels` to point at
-    // the container's UDP endpoint; if a future variant needs a bind-mounted
-    // CnC, call `ctx.set_dir(...)` here.
-    let _ = &endpoint;
+    // Connect a host-side Aeron client to the container's Media Driver via
+    // the bind-mounted aeron.dir; without `set_dir`, rusteron defaults to
+    // `/dev/shm/aeron-dev` which the container does not expose.
+    let aeron_dir_c =
+        std::ffi::CString::new(aeron_dir.clone()).expect("aeron.dir contains a NUL byte");
     let ctx = rusteron_client::AeronContext::new().expect("aeron context");
+    ctx.set_dir(aeron_dir_c.as_c_str())
+        .expect("aeron context set_dir");
     // `Aeron` is `!Send + !Sync` (the C client is thread-confined). Use
     // `Rc`, not `Arc`, to share it between the publisher and Subscribers.
     let aeron = Rc::new(rusteron_client::Aeron::new(&ctx).expect("aeron connect to container"));

@@ -333,8 +333,7 @@ async fn multiprocess_e2e_deposit_round_trip() {
     // tx_receipts (so we can match the executor's deposit Receipt).
     let aeron_rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
     let channels = LogConfig::default().channels;
-    let deposits_pub =
-        TxDepositsPublisherHandle::open(&aeron_rt, &channels).expect("deposits pub");
+    let deposits_pub = TxDepositsPublisherHandle::open(&aeron_rt, &channels).expect("deposits pub");
     let mut receipts_sub =
         TxReceiptsSubscriberHandle::open(&aeron_rt, &channels).expect("receipts sub");
 
@@ -476,11 +475,7 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
     // each new block (default value lags `latest` by ~64 blocks, mirroring
     // mainnet finality). The da-watcher reads only finalized blocks, so
     // without this the watcher would never see the deposit.
-    let anvil = match Anvil::new()
-        .arg("--slots-in-an-epoch")
-        .arg("1")
-        .try_spawn()
-    {
+    let anvil = match Anvil::new().arg("--slots-in-an-epoch").arg("1").try_spawn() {
         Ok(a) => a,
         Err(e) => {
             eprintln!("skipping: anvil unavailable: {e}");
@@ -541,10 +536,7 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
         .await
         .expect("deploy ETHLockbox");
 
-    let entries = deployer
-        .addresses(Some(CHAIN_ID))
-        .await
-        .expect("addresses");
+    let entries = deployer.addresses(Some(CHAIN_ID)).await.expect("addresses");
     let lockbox_addr = entries
         .iter()
         .find(|e| e.id == ContractId::EthLockbox.id())
@@ -748,7 +740,11 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
             .await
             .expect("eth_sendRawTransaction (transfer)");
         let env = ConsensusEnvelope::decode(&mut raw.as_slice()).expect("decode my tx");
-        assert_eq!(tx_hash, *env.tx_hash(), "transfer nonce={nonce} hash mismatch");
+        assert_eq!(
+            tx_hash,
+            *env.tx_hash(),
+            "transfer nonce={nonce} hash mismatch"
+        );
         let receipt: Value = client
             .request("eth_getTransactionReceipt", rpc_params![tx_hash])
             .await
@@ -860,7 +856,10 @@ fn build_service_bins_with_da_watcher() {
         .stderr(Stdio::inherit())
         .status()
         .expect("cargo build status");
-    assert!(st.success(), "failed to build kardamom service bins (+ da-watcher)");
+    assert!(
+        st.success(),
+        "failed to build kardamom service bins (+ da-watcher)"
+    );
 }
 
 /// Resolve `<workspace>/target/<profile>` where the service bins live.
