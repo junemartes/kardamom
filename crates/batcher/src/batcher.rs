@@ -22,9 +22,9 @@ use crate::frame::{BlockFrame, Kar1Payload, TxFrame, encode as frame_encode};
 /// Metric names. Use `metrics::Recorder` to scrape; the runtime wires up a
 /// Prometheus exporter via `metrics-exporter-prometheus`.
 pub mod metric_names {
-    pub const BLOCKS_OBSERVED: &str = "batcher.blocks_observed_total";
-    pub const BATCHES_POSTED: &str = "batcher.batches_posted_total";
-    pub const BLOBS_POSTED: &str = "batcher.blobs_posted_total";
+    pub const BLOCKS_OBSERVED: &str = "kardamom_batcher_blocks_observed_total";
+    pub const BATCHES_POSTED: &str = "kardamom_batcher_batches_posted_total";
+    pub const BLOBS_POSTED: &str = "kardamom_batcher_blobs_posted_total";
 }
 
 /// Configuration for the batching loop.

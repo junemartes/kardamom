@@ -30,10 +30,8 @@ impl<C: WallClock + Clone, P: BoundaryPublisher> Sealer<C, P> {
     /// what the bootstrap module produced from tx_ordering's tail.
     pub fn new(cfg: SealerConfig, clock: C, publisher: P, initial_block: u64) -> Result<Self> {
         cfg.validate()?;
-        let host_id = cfg.host_id;
         let tick_ms = cfg.tick_interval_ms;
-        let emitter =
-            BoundaryEmitter::new(publisher, clock.clone(), initial_block, tick_ms, host_id);
+        let emitter = BoundaryEmitter::new(publisher, clock.clone(), initial_block, tick_ms);
         Ok(Self {
             cfg,
             clock,

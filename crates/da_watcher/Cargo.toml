@@ -9,6 +9,7 @@ testing = []
 
 [dependencies]
 kardamom-types = { workspace = true }
+kardamom-obs = { path = "../obs" }
 
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
@@ -18,6 +19,7 @@ alloy-sol-types.workspace = true
 
 bytes.workspace = true
 async-trait = "0.1"
+metrics = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
@@ -34,6 +36,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 alloy-primitives.workspace = true
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bin]]
 name = "kardamom-da-watcher"

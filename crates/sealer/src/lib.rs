@@ -17,12 +17,14 @@
 //! - [`bootstrap`] — read the most recent `BlockBoundaryStart` from tx_ordering's
 //!   tail to seed `block_number`.
 //! - [`emitter`] — publish loop.
+//! - [`metrics`] — metric names + `describe` registration.
 //! - [`sealer`] — top-level supervisor wrapping the emitter on a tick loop.
 
 pub mod bootstrap;
 pub mod clock;
 pub mod config;
 pub mod emitter;
+pub mod metrics;
 pub mod sealer;
 pub mod tick;
 

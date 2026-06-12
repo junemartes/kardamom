@@ -25,7 +25,7 @@ fn recorder() -> &'static PrometheusHandle {
     static H: OnceLock<PrometheusHandle> = OnceLock::new();
     H.get_or_init(|| {
         PrometheusBuilder::new()
-            .set_buckets(kmetrics::DURATION_BUCKETS)
+            .set_buckets(kardamom_obs::DURATION_BUCKETS)
             .unwrap()
             .install_recorder()
             .expect("install recorder")

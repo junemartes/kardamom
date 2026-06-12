@@ -56,12 +56,25 @@ struct Args {
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9001")]
+    metrics_addr: std::net::SocketAddr,
+    /// Host identifier; stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     init_tracing();
     let args = Args::parse();
+    kardamom_obs::init(
+        "sequencer",
+        args.metrics_addr,
+        &args.host_id,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+    )?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
 

@@ -15,6 +15,7 @@
 //! `--dry-run` flag so the binary stays usable for archive inspection from
 //! day one.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -50,11 +51,26 @@ struct Cli {
     /// Skip L1 broadcast; only inspect the archive.
     #[arg(long, default_value_t = true)]
     dry_run: bool,
+
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9002")]
+    metrics_addr: SocketAddr,
+
+    /// Host identifier; stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt().with_env_filter("info").init();
     let cli = Cli::parse();
+    kardamom_obs::init(
+        "batcher",
+        cli.metrics_addr,
+        &cli.host_id,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+    )?;
 
     if !cli.dry_run {
         warn!("live L1 broadcast path not yet wired; falling back to dry-run");

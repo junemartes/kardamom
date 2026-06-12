@@ -755,7 +755,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -766,7 +766,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -2384,7 +2384,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3371,7 +3371,7 @@ checksum = "3640c1c38b8e4e43584d8df18be5fc6b0aa314ce6ebf51b53313d4306cca8e46"
 dependencies = [
  "hermit-abi",
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3704,8 +3704,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kardamom-node",
- "metrics",
- "metrics-exporter-prometheus",
+ "kardamom-obs",
  "tokio",
  "toml",
  "tracing",
@@ -3732,9 +3731,11 @@ dependencies = [
  "criterion 0.7.0",
  "kardamom-deployer",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-types",
  "metrics",
  "proptest",
+ "reqwest 0.13.4",
  "rkyv",
  "rusteron-archive",
  "serde_json",
@@ -3787,7 +3788,10 @@ dependencies = [
  "clap",
  "humantime-serde",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-types",
+ "metrics",
+ "reqwest 0.13.4",
  "serde",
  "thiserror 2.0.18",
  "tokio",
@@ -3840,9 +3844,12 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-types",
+ "metrics",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
+ "reqwest 0.13.4",
  "revm",
  "tempfile",
  "thiserror 2.0.18",
@@ -3873,10 +3880,12 @@ dependencies = [
  "jsonrpsee",
  "k256",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-types",
  "metrics",
  "nonzero_ext",
  "rand 0.9.4",
+ "reqwest 0.13.4",
  "secp256k1 0.31.1",
  "serde",
  "serde_json",
@@ -3926,6 +3935,7 @@ dependencies = [
  "async-trait",
  "jsonrpsee",
  "kardamom-deployer",
+ "kardamom-obs",
  "kardamom-types",
  "metrics",
  "metrics-exporter-prometheus",
@@ -3939,6 +3949,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-obs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "metrics",
+ "metrics-exporter-prometheus",
+ "reqwest 0.13.4",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-sealer"
 version = "0.1.0"
 dependencies = [
@@ -3946,10 +3969,12 @@ dependencies = [
  "clap",
  "criterion 0.7.0",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-sealer",
  "kardamom-types",
  "metrics",
  "proptest",
+ "reqwest 0.13.4",
  "rkyv",
  "serde",
  "thiserror 2.0.18",
@@ -3975,11 +4000,13 @@ dependencies = [
  "criterion 0.5.1",
  "ctrlc",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-sequencer",
  "kardamom-types",
  "metrics",
  "proptest",
  "rand 0.9.4",
+ "reqwest 0.13.4",
  "rkyv",
  "serde",
  "thiserror 2.0.18",
@@ -4393,7 +4420,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5869,7 +5896,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5985,7 +6012,7 @@ dependencies = [
  "security-framework 3.7.0",
  "security-framework-sys",
  "webpki-root-certs 1.0.7",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6502,7 +6529,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6722,7 +6749,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7468,7 +7495,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
