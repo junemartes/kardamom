@@ -9,17 +9,32 @@
 #   vagrant up r1        # boot one
 #   vagrant destroy -f   # tear down
 
+# Memory sizing: each VM must fit the sum of the Nomad task `memory`
+# reservations placed on it (see nomad/*.nomad.hcl) plus OS/agent overhead.
+# Worker w1 carries the largest set (aeron 768 + sequencer 512 + executor 1536
+# + ingress 512 = 3328 MB), hence 4096 on workers; recorders only run the
+# Aeron archive (+ anvil/batcher on r1, 1536 MB total), hence 3072.
 NODES = [
   { name: "r1", ip: "192.168.56.11", cpus: 2, mem: 3072, role: "recorder" },
   { name: "r2", ip: "192.168.56.12", cpus: 2, mem: 3072, role: "recorder" },
   { name: "r3", ip: "192.168.56.13", cpus: 2, mem: 3072, role: "recorder" },
-  { name: "w1", ip: "192.168.56.21", cpus: 2, mem: 3072, role: "worker"   },
-  { name: "w2", ip: "192.168.56.22", cpus: 2, mem: 3072, role: "worker"   },
+  { name: "w1", ip: "192.168.56.21", cpus: 2, mem: 4096, role: "worker"   },
+  { name: "w2", ip: "192.168.56.22", cpus: 2, mem: 4096, role: "worker"   },
 ]
 
 Vagrant.configure("2") do |config|
-  config.vm.box = "generic/ubuntu2204"   # works for both libvirt and virtualbox
-  config.ssh.insert_key = true
+  # generic/ubuntu2204 is the one widely-mirrored box that publishes BOTH
+  # libvirt and virtualbox providers (bento/ubuntu-22.04 has no libvirt build).
+  # The "generic" box project is in maintenance mode; if it disappears, pick a
+  # jammy box per provider and update ubuntu_codename in group_vars/all.yml.
+  config.vm.box = "generic/ubuntu2204"
+
+  # Use the shared Vagrant insecure key on every VM instead of per-machine
+  # generated keys: ansible/site.yml is run ONCE against all 5 hosts (see the
+  # provisioner below and `make provision`), and a single run can only
+  # authenticate everywhere if all hosts accept the same key
+  # (~/.vagrant.d/insecure_private_key, wired up in ansible/ansible.cfg).
+  config.ssh.insert_key = false
 
   NODES.each_with_index do |node, idx|
     config.vm.define node[:name] do |vm|

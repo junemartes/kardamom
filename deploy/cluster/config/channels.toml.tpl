@@ -6,8 +6,9 @@
 # URIs) — see deploy/cluster/README.md "Required service changes" (item 1).
 # This config is provisioned and mounted in anticipation of the forthcoming
 # `--log-config <toml>` flag; until that flag lands the services ignore it and
-# fall back to IPC defaults (single-host only). It is rendered now so the wiring
-# is reviewable and so the flag, once added, has a config to point at.
+# fall back to IPC defaults (single-host only). nomad/ingress.nomad.hcl renders
+# THIS file into its alloc via file() so the wiring is reviewable and the flag,
+# once added, has a config to point at.
 # =========================================================================
 #
 # Schema: crates/log/src/config.rs (ChannelsConfig). Stream-id values mirror

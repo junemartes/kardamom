@@ -20,6 +20,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 NOMAD_DIR="${CLUSTER_DIR}/nomad"
 
+# The job specs pull their template payloads with file("config/...") — those
+# paths resolve against the CLI's working directory, so run from CLUSTER_DIR.
+cd "${CLUSTER_DIR}"
+
 export NOMAD_ADDR="${NOMAD_ADDR:-http://192.168.56.11:4646}"
 LOCKBOX_ADDRESS="${LOCKBOX_ADDRESS:-}"
 
@@ -40,27 +44,28 @@ run_job() {
   nomad job run "$@" "${NOMAD_DIR}/${file}"
 }
 
-# Poll until a job's allocations are all running (or timeout). For system/batch
-# jobs that span multiple nodes this waits for every alloc.
+# Poll until a job has at least one running allocation and none pending (or
+# timeout). A `failed` alloc that has been replaced stays in the job's alloc
+# history forever, so "every alloc is running" would never become true after
+# a single restart — instead treat "nothing pending + something running" as
+# converged and surface any failed allocs as a warning.
 wait_running() {
   local job="$1"
   local timeout="${2:-120}"
   local waited=0
   echo "==> Waiting for job '${job}' allocations to be running (timeout ${timeout}s)..."
   while true; do
-    # Count allocs not in 'running' client status for the latest deployment.
-    local statuses
-    statuses="$(nomad job status -short "${job}" 2>/dev/null || true)"
-    if nomad job allocs -t '{{range .}}{{.ClientStatus}}{{"\n"}}{{end}}' "${job}" 2>/dev/null \
-        | grep -qx 'running'; then
-      # at least one running; ensure none are pending/failed-and-retrying
-      local bad
-      bad="$(nomad job allocs -t '{{range .}}{{.ClientStatus}}{{"\n"}}{{end}}' "${job}" 2>/dev/null \
-              | grep -vx 'running' | grep -vx 'complete' || true)"
-      if [[ -z "${bad}" ]]; then
-        echo "    job '${job}': all allocations running."
-        return 0
+    local statuses running pending failed
+    statuses="$(nomad job allocs -t '{{range .}}{{.ClientStatus}}{{"\n"}}{{end}}' "${job}" 2>/dev/null || true)"
+    running="$(grep -cx 'running' <<<"${statuses}" || true)"
+    pending="$(grep -cx 'pending' <<<"${statuses}" || true)"
+    failed="$(grep -cx 'failed' <<<"${statuses}" || true)"
+    if (( running >= 1 && pending == 0 )); then
+      echo "    job '${job}': ${running} allocation(s) running."
+      if (( failed > 0 )); then
+        echo "    WARNING: job '${job}' also has ${failed} failed alloc(s) in its history." >&2
       fi
+      return 0
     fi
     if (( waited >= timeout )); then
       echo "ERROR: timed out waiting for '${job}' (last ${timeout}s)." >&2
@@ -102,7 +107,9 @@ run_job "sealer.nomad.hcl"
 run_job "sequencer.nomad.hcl"
 run_job "executor.nomad.hcl"
 run_job "ingress.nomad.hcl"
-run_job "da-watcher.nomad.hcl" "${DA_WATCHER_ARGS[@]}"
+# (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
+# /bin/bash — where expanding an empty array is an "unbound variable" error.)
+run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 
 wait_running "sealer" 120
 wait_running "sequencer" 120

@@ -42,22 +42,17 @@ job "sealer" {
         ]
       }
 
-      # Mirrors config/sealer.toml.tpl. channel_b_uri is the tx_ordering UDP
-      # endpoint on this (sealer) node, w2 192.168.56.22:40001.
+      # Single-sourced from config/sealer.toml.tpl (submit from deploy/cluster/
+      # — scripts/deploy.sh does this). channel_b_uri there is the tx_ordering
+      # UDP endpoint on this (sealer) node, w2 192.168.56.22:40001.
       template {
         destination = "local/sealer.toml"
-        data        = <<EOF
-host_id = 1
-channel_b_uri = "aeron:udp?endpoint=192.168.56.22:40001"
-channel_b_tx_stream_id = 1
-channel_b_boundary_stream_id = 1001
-tick_interval_ms = 250
-EOF
+        data        = file("config/sealer.toml.tpl")
       }
 
       resources {
-        cpu    = 1000
-        memory = 1024
+        cpu    = 750
+        memory = 512
       }
     }
   }

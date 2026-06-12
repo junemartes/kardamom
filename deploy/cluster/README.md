@@ -32,7 +32,8 @@ defined once in [`ansible/group_vars/all.yml`](./ansible/group_vars/all.yml).
 **Quickest path:** from the repo root, `just cluster-bootstrap` installs all of
 the host tools below for your platform, and `just cluster-doctor` verifies them.
 
-Install on the **host** machine (the cluster installs Nomad/Consul itself):
+Install on the **host** machine (the in-VM Nomad/Consul agents are installed
+by Ansible):
 
 - [Vagrant](https://www.vagrantup.com/) + a provider: **libvirt** (primary) or
   VirtualBox (fallback).
@@ -42,14 +43,24 @@ Install on the **host** machine (the cluster installs Nomad/Consul itself):
   service/Aeron images. Note: each service image compiles the workspace
   (including the bundled Aeron C/Java sources via rusteron) — the first build is
   slow and needs the full native toolchain (baked into the builder stage).
-- ~16 GB RAM free (5 VMs; recorders run a JVM archive + the executor runs revm).
+- The **host Docker daemon must allow the in-cluster registry as insecure**
+  (it is plain HTTP): add `{ "insecure-registries": ["192.168.56.11:5000"] }`
+  to `/etc/docker/daemon.json` (Linux) or Docker Desktop → Settings → Docker
+  Engine, then restart Docker. `make images` pushes fail without this.
+- The **Nomad CLI** on the host — `scripts/deploy.sh` drives the cluster's
+  Nomad HTTP API from the host (`just cluster-bootstrap` installs a pinned
+  version).
+- Foundry's `cast` for the smoke test (the repo-level `just bootstrap`
+  installs Foundry).
+- ~18 GB RAM free (3×3 GB recorder VMs + 2×4 GB worker VMs; recorders run a
+  JVM archive + the executor runs revm).
 
 ## Quick start
 
 ```sh
 cd deploy/cluster
-make up        # vagrant up → ansible → build+push images → nomad run → smoke
-make smoke     # re-run the pipeline smoke test against ingress
+make up        # vagrant up → ansible → build+push images → nomad run
+make smoke     # pipeline smoke test against ingress (see note below)
 make status    # nomad/consul/job health
 make down      # stop jobs + vagrant destroy
 ```
@@ -61,10 +72,15 @@ make down      # stop jobs + vagrant destroy
    the local registry, the tmpfs `aeron.dir`, and tags Nomad nodes with their role.
 3. `make images` — build the per-service + Aeron images on the host and push them
    to the registry on `r1`.
-4. `make deploy` — `nomad run` the Aeron **system** jobs (driver everywhere,
-   archive on recorders), wait for the quorum, then the service jobs.
-5. `make smoke` — submit `eth_sendRawTransaction` through ingress and assert
-   receipts (see `scripts/smoke.sh`).
+4. `make deploy` — `nomad run` the Aeron **system** job (ArchivingMediaDriver on
+   every node), the anvil L1, then the service jobs.
+
+`make smoke` submits `eth_sendRawTransaction` through ingress and asserts
+receipts (see `scripts/smoke.sh`). It is intentionally **not** chained into
+`make up`: until the channels-config plumbing lands (issue #36, item 1 under
+[Required service changes](#required-service-changes)) the services use
+single-host IPC channel defaults, so the cross-host pipeline — and therefore
+the smoke test — is **expected to fail**.
 
 ## Layout
 
@@ -72,7 +88,9 @@ make down      # stop jobs + vagrant destroy
 deploy/cluster/
   DESIGN.md                 design rationale
   Vagrantfile               5 libvirt/VirtualBox VMs, static IPs, role tags
-  Makefile                  up / vms / provision / images / deploy / smoke / down
+  Makefile                  up / vms / provision / images / deploy / smoke /
+                            validate / check-contract / down
+  .yamllint                 lint config (matches ansible-lint's yaml rule)
   ansible/
     ansible.cfg, inventory.ini
     group_vars/all.yml      ← canonical contract (IPs, ports, versions, paths)
@@ -80,16 +98,24 @@ deploy/cluster/
     roles/{common,docker,consul,nomad,registry}/
   docker/
     service.Dockerfile      multi-stage cargo build → slim runtime (BIN arg)
-    aeron.Dockerfile        wrapper over crates/log/docker/aeron
+                            (the Aeron image builds straight from the canonical
+                            crates/log/docker/aeron/Dockerfile — no copy here)
   nomad/
-    aeron-driver.system.nomad.hcl   media driver, system job (all nodes)
-    aeron-archive.system.nomad.hcl  archive, system job (role=recorder)
-    anvil.nomad.hcl                 in-cluster L1 for the smoke test
+    aeron.system.nomad.hcl  ArchivingMediaDriver (driver+archive), system job,
+                            all nodes
+    anvil.nomad.hcl         in-cluster L1 for the smoke test
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     sealer.nomad.hcl   da-watcher.nomad.hcl  batcher.nomad.hcl
-  config/                   *.toml.tpl rendered by Nomad templates
-  scripts/smoke.sh          transfers smoke test against the ingress endpoint
+  config/                   *.toml(.tpl) pulled into the job specs via file()
+  scripts/
+    deploy.sh               submit jobs in dependency order, wait for allocs
+    smoke.sh                transfers smoke test against the ingress endpoint
+    check-contract.py       fail if any mirror of group_vars/all.yml drifts
 ```
+
+The Nomad job specs pull their config payloads from `config/` with HCL2
+`file()`, so submit them **from `deploy/cluster/`** (`scripts/deploy.sh` and
+`make validate` already do).
 
 ## Aeron-in-Docker
 
@@ -131,8 +157,9 @@ codebase** (these are deployment prerequisites, tracked separately from this PR)
    code, and recording is done by the Aeron Archive. Until the recorder/quorum
    role has a process home (or is confirmed embedded in a specific service), the
    "3-recorder quorum" is topology intent: the Archive runs on all nodes, but the
-   `on-quorum` ack path won't be satisfied. Set ingress `--ack-policy on-offer`
-   for an initial bring-up, as `multiprocess_e2e` does.
+   `on-quorum` ack path won't be satisfied. The ingress job therefore defaults
+   `--ack-policy` to `on-offer` (as `multiprocess_e2e` does); once #38 lands,
+   submit with `nomad job run -var ack_policy=on-quorum ingress.nomad.hcl`.
 
 4. **Per-node channel rendering.** *(tracked in #37)* With two sequencers on different VMs (w1/w2),
    the per-sequencer (`{sid}`) and per-recorder (`{rid}`) channel URI *templates*
@@ -154,10 +181,12 @@ codebase** (these are deployment prerequisites, tracked separately from this PR)
 |-------|--------|
 | Design reviewed & approved | ✅ (`DESIGN.md`) |
 | Artifacts authored | ✅ |
-| `make up` on a real virtualization host | ⛔ not run (no libvirt/Nomad in authoring env) |
-| `nomad job validate` / `ansible-lint` / `yamllint` | ⛔ tools unavailable in authoring env |
+| `nomad job validate` (all 8 specs, Nomad 1.9.5) | ✅ pass; also in CI (`cluster-validate`) |
+| `yamllint` / `ansible-lint` (production profile) | ✅ pass; also in CI (`cluster-validate`) |
+| Contract drift (`scripts/check-contract.py`) | ✅ pass; also in CI (`cluster-validate`) |
+| `make up` on a real virtualization host | ⛔ not run (no libvirt in authoring env) |
 | Multi-host Aeron UDP pipeline | ⛔ blocked on [required service changes](#required-service-changes) |
 
-Run the static validators and `make up` on a host with the toolchain before
-relying on this. The Aeron UDP-over-Docker-host-networking path (MTU, SO_RCVBUF,
-archive fsync on VM disk) is the highest-risk area to exercise first.
+Run `make up` on a host with the toolchain before relying on this. The Aeron
+UDP-over-Docker-host-networking path (MTU, SO_RCVBUF, archive fsync on VM disk)
+is the highest-risk area to exercise first.

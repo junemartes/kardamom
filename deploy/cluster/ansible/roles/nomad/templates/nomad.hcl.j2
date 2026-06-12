@@ -31,14 +31,14 @@ consul {
   address = "127.0.0.1:{{ ports.consul_http }}"
 }
 
+# volumes.enabled is REQUIRED: it defaults to false, and every kardamom job
+# bind-mounts host paths (the shared Aeron tmpfs, archive/state dirs) via the
+# docker driver's `volumes` list — placements fail without it. Nothing needs
+# privileged containers or raw_exec, so neither is enabled.
 plugin "docker" {
   config {
-    allow_privileged = true
-  }
-}
-
-plugin "raw_exec" {
-  config {
-    enabled = true
+    volumes {
+      enabled = true
+    }
   }
 }

@@ -61,9 +61,11 @@ job "aeron" {
         AERON_IPC_TERM_BUFFER_LENGTH = "4194304"
       }
 
+      # Sized for the small test-tuned term buffers (4 MB); the per-node VM
+      # memory budget in the Vagrantfile assumes these reservations.
       resources {
-        cpu    = 1000
-        memory = 1024
+        cpu    = 500
+        memory = 768
       }
     }
   }

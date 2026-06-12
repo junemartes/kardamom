@@ -32,7 +32,7 @@ job "batcher" {
   # Run hourly. The batcher is dry-run/offline, so this is just a periodic
   # archive inspection until the live L1 broadcast path is wired.
   periodic {
-    cron             = "0 * * * *"
+    crons            = ["0 * * * *"]
     prohibit_overlap = true
   }
 
@@ -68,8 +68,8 @@ job "batcher" {
       }
 
       resources {
-        cpu    = 500
-        memory = 512
+        cpu    = 300
+        memory = 256
       }
     }
   }

@@ -49,22 +49,18 @@ job "sequencer" {
         ]
       }
 
-      # Mirrors config/sequencer.toml.tpl. partition_index / sequencer_id here
-      # are placeholders overridden per-node by the CLI flags above.
+      # Single-sourced from config/sequencer.toml.tpl (submit from
+      # deploy/cluster/ — scripts/deploy.sh does this). partition_index /
+      # sequencer_id in that file are placeholders overridden per-node by the
+      # CLI flags above.
       template {
         destination = "local/sequencer.toml"
-        data        = <<EOF
-partition_count = 2
-partition_index = 0
-sequencer_id = 0
-max_pending_per_sender = 16
-backpressure_policy = "return_immediately"
-EOF
+        data        = file("config/sequencer.toml.tpl")
       }
 
       resources {
-        cpu    = 1000
-        memory = 1024
+        cpu    = 750
+        memory = 512
       }
     }
   }

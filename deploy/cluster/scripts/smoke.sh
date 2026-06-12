@@ -30,8 +30,16 @@ fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
 if command -v cast >/dev/null 2>&1; then
   echo "==> Using foundry 'cast'."
 
+  CAST_ERR="$(mktemp)"
+  trap 'rm -f "${CAST_ERR}"' EXIT
+
   # cast send signs + submits and (without --async) waits for the receipt,
   # printing it as JSON with --json. status is "0x1" on success.
+  #
+  # --gas-price/--gas-limit are passed EXPLICITLY: ingress implements only
+  # eth_chainId/blockNumber/getBalance/getTransactionCount/sendRawTransaction/
+  # getTransactionReceipt (crates/ingress/src/json_rpc.rs), so cast's usual
+  # eth_gasPrice + eth_estimateGas fill calls would fail with method-not-found.
   set +e
   RECEIPT_JSON="$(cast send "${TO}" \
       --value "${VALUE}" \
@@ -39,12 +47,14 @@ if command -v cast >/dev/null 2>&1; then
       --rpc-url "${RPC_URL}" \
       --chain "${CHAIN_ID}" \
       --legacy \
-      --json 2>cast.err)"
+      --gas-price "${GAS_PRICE:-1000000000}" \
+      --gas-limit 21000 \
+      --json 2>"${CAST_ERR}")"
   rc=$?
   set -e
   if [[ ${rc} -ne 0 ]]; then
     echo "---- cast stderr ----" >&2
-    cat cast.err >&2 || true
+    cat "${CAST_ERR}" >&2 || true
     fail "cast send returned ${rc}"
   fi
 
