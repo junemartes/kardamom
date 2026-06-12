@@ -468,7 +468,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
         reader: ReaderConfig {
             join_timeout: Duration::from_millis(500),
             join_poll_interval: Duration::from_micros(100),
-            buffer_warn_threshold: 10_000,
+            ..ReaderConfig::default()
         },
     };
 

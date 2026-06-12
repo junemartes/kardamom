@@ -54,10 +54,15 @@ struct Args {
     ///   - `on-offer`: release as soon as the receipt arrives (lowest
     ///     latency, weakest guarantee).
     ///   - `on-local-fsync`: wait for this node's recorder fsync watermark.
-    ///   - `on-quorum`: wait for Q-of-N recorders to fsync (default,
-    ///     production-correct).
+    ///   - `on-quorum`: wait for Q-of-N recorders to fsync.
     ///   - `on-local-fsync-and-quorum`: both.
-    #[arg(long, default_value = "on-quorum")]
+    ///
+    /// Defaults to `on-offer` because no process in the deployed topology
+    /// runs a `QuorumAggregator` yet — nothing publishes the quorum
+    /// watermark, so the quorum-gated policies would park every submit
+    /// indefinitely. Flip the default back to `on-quorum` (the design's
+    /// production default) once the aggregator is wired in.
+    #[arg(long, default_value = "on-offer")]
     ack_policy: AckPolicyArg,
 }
 

@@ -196,6 +196,13 @@ pub struct ReaderConfig {
     /// Soft warn threshold on the join buffer's size; emits a `warn!` log
     /// when crossed (no back-pressure — that's the publisher's job).
     pub buffer_warn_threshold: usize,
+    /// Capacity of the canonical-id dedup window on the tx_ordering reader.
+    /// Duplicates of one canonical id are the P racing sequencers'
+    /// republications, which land within the sequencers' publish spread of
+    /// each other — the window only has to outlive that spread, not the
+    /// whole stream. 2^20 ids (~32 MiB of hashes) gives ~10 s of headroom
+    /// even at 100k tx/s.
+    pub dedup_window: usize,
 }
 
 impl Default for ReaderConfig {
@@ -204,6 +211,7 @@ impl Default for ReaderConfig {
             join_timeout: Duration::from_millis(100),
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
+            dedup_window: 1 << 20,
         }
     }
 }
@@ -281,6 +289,42 @@ where
         .expect("spawn tx_deposits reader")
 }
 
+/// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
+///
+/// `first_seen` returns `false` for an id already in the window. Once more
+/// than `capacity` ids are held, the oldest is evicted — safe because the
+/// duplicates of one canonical id (the racing sequencers' republications)
+/// arrive within the publish spread of each other, far inside the window.
+struct DedupWindow {
+    seen: std::collections::HashSet<alloy_primitives::B256>,
+    fifo: std::collections::VecDeque<alloy_primitives::B256>,
+    capacity: usize,
+}
+
+impl DedupWindow {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            fifo: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    /// Records `id`; returns `false` if it is already in the window.
+    fn first_seen(&mut self, id: alloy_primitives::B256) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.fifo.push_back(id);
+        if self.fifo.len() > self.capacity
+            && let Some(evicted) = self.fifo.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        true
+    }
+}
+
 /// Spawn the single tx_ordering reader thread. Pulls
 /// [`TxOrderingMessage`] records in canonical order; for each
 /// `TxRef`, joins against `buffer` (with a bounded wait) and forwards
@@ -308,13 +352,8 @@ where
             // republish the same `DepositRef(source_hash, …)` onto tx_ordering.
             // Only the first occurrence drives a join-buffer take + exec
             // dispatch; the rest are silently dropped. tx_hash and source_hash
-            // share a flat namespace (both B256) so we use one set.
-            //
-            // TODO: this set grows unboundedly. Switch to an LRU keyed by
-            // canonical id with a window large enough to outlive the longest
-            // possible in-flight reorder, then evict by age.
-            let mut seen_canonical_ids: std::collections::HashSet<alloy_primitives::B256> =
-                std::collections::HashSet::new();
+            // share a flat namespace (both B256) so we use one window.
+            let mut seen_canonical_ids = DedupWindow::new(cfg.dedup_window);
             loop {
                 let (position, msg) = match b_sub.next() {
                     Ok(p) => p,
@@ -323,7 +362,7 @@ where
                 };
                 match msg {
                     TxOrderingMessage::TxRef(tx_ref) => {
-                        if !seen_canonical_ids.insert(tx_ref.tx_hash) {
+                        if !seen_canonical_ids.first_seen(tx_ref.tx_hash) {
                             // Duplicate from racing sequencers — drop.
                             debug!(
                                 target: "kardamom_executor::reader",
@@ -385,7 +424,7 @@ where
                         }
                     }
                     TxOrderingMessage::DepositRef(dep_ref) => {
-                        if !seen_canonical_ids.insert(dep_ref.source_hash) {
+                        if !seen_canonical_ids.first_seen(dep_ref.source_hash) {
                             // Duplicate from racing sequencers (MDS) — drop.
                             debug!(
                                 target: "executor::reader",
@@ -679,7 +718,7 @@ mod tests {
         let cfg = ReaderConfig {
             join_timeout: Duration::from_millis(500),
             join_poll_interval: Duration::from_micros(100),
-            buffer_warn_threshold: 10_000,
+            ..ReaderConfig::default()
         };
 
         // TxOrdering has the ref ready immediately. TxData's insert is
@@ -721,7 +760,7 @@ mod tests {
         let cfg = ReaderConfig {
             join_timeout: Duration::from_millis(50),
             join_poll_interval: Duration::from_millis(5),
-            buffer_warn_threshold: 10_000,
+            ..ReaderConfig::default()
         };
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![Ok((
@@ -739,5 +778,62 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Duplicate `TxRef`s (the MDS racing-sequencer republications) collapse
+    /// to a single exec dispatch; the join-buffer entry is taken only once.
+    #[test]
+    fn channel_b_reader_dedups_racing_sequencer_txrefs() {
+        let signer = PrivateKeySigner::random();
+        let buf = JoinBuffer::new();
+        let env = envelope(&signer, 0);
+        buf.insert(2, pos(0), env.clone());
+
+        let dup = TxOrderingMessage::TxRef(TxRef::new(env.tx_hash, 2, pos(0)));
+        let b = VecTxOrderingSub {
+            queue: VecDeque::from(vec![
+                Ok((pos(0), dup.clone())),
+                Ok((pos(16), dup.clone())),
+                Ok((pos(32), dup)),
+            ]),
+        };
+        let (tx, rx) = bounded::<ReaderToExec>(4);
+        let h = spawn_tx_ordering_reader(
+            b,
+            buf,
+            DepositJoinBuffer::new(),
+            ReaderConfig::default(),
+            tx,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let mut out = Vec::new();
+        while let Ok(m) = rx.recv() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 1, "P duplicates must collapse to one dispatch");
+        match &out[0] {
+            ReaderToExec::Tx { envelope: e, .. } => assert_eq!(e.tx_hash, env.tx_hash),
+            _ => panic!("expected Tx"),
+        }
+    }
+
+    #[test]
+    fn dedup_window_rejects_known_ids_and_evicts_fifo() {
+        let id = |b: u8| alloy_primitives::B256::repeat_byte(b);
+        let mut w = DedupWindow::new(2);
+
+        assert!(w.first_seen(id(1)));
+        assert!(!w.first_seen(id(1)), "second sighting is a duplicate");
+        assert!(w.first_seen(id(2)));
+        // Window is [1, 2]; inserting 3 evicts 1 (oldest first).
+        assert!(w.first_seen(id(3)));
+        assert!(!w.first_seen(id(2)), "2 still inside the window");
+        assert!(!w.first_seen(id(3)), "3 still inside the window");
+        // 1 was evicted above, so it counts as fresh again (and its
+        // insertion evicts 2, keeping the window at capacity).
+        assert!(w.first_seen(id(1)), "evicted id is fresh again");
+        assert_eq!(w.seen.len(), 2);
+        assert_eq!(w.fifo.len(), 2);
     }
 }

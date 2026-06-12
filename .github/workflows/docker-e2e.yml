@@ -30,7 +30,9 @@ jobs:
       contains(github.event.pull_request.labels.*.name, 'run-docker-e2e')
     name: full-pipeline-e2e
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Headroom for the two deposit round-trips on top of the original
+    # transfer + smoke tests.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -44,6 +46,11 @@ jobs:
             cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
 
       - uses: dtolnay/rust-toolchain@stable
+      # Foundry supplies `forge` (the deployer crate's build script shells
+      # out to it to embed contract bytecode — `-p e2e --tests` builds the
+      # deployer) and `anvil` for the L1-backed deposit round-trip. Without
+      # anvil that test skips itself and passes vacuously.
+      - uses: foundry-rs/foundry-toolchain@v1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docker-e2e
@@ -84,6 +91,26 @@ jobs:
             -p e2e \
             --features 'full-pipeline-e2e' \
             --test multiprocess_e2e -- --ignored --nocapture multiprocess_e2e_signed_transfer_round_trip
+
+      # Deposit round-trip: da-watcher feeds a deposit through the
+      # tx_deposits stream, the executor mints it on L2 and the receipt
+      # surfaces over JSON-RPC.
+      - name: full-pipeline-e2e deposit round-trip
+        run: |
+          cargo test \
+            -p e2e \
+            --features 'full-pipeline-e2e' \
+            --test multiprocess_e2e -- --ignored --nocapture multiprocess_e2e_deposit_round_trip
+
+      # L1-backed variant: real anvil L1, ETHLockbox deployed via the
+      # factory, deposit observed at `finalized` by the da-watcher and
+      # minted on L2.
+      - name: full-pipeline-e2e anvil L1 deposit round-trip
+        run: |
+          cargo test \
+            -p e2e \
+            --features 'full-pipeline-e2e' \
+            --test multiprocess_e2e -- --ignored --nocapture anvil_pipeline_e2e_l1_deposit_and_l2_round_trip
 
       # Per-component docker_e2e smoke tests (gate-only today; they bring up
       # AeronTestCluster and assert the harness comes up). Run after the
