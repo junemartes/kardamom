@@ -21,6 +21,14 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Harden the heavy cargo build against transient crates.io download drops
+  # ("curl failed [56] ... unexpected eof while reading"): retry more, and
+  # disable HTTP/2 multiplexing (the known trigger for those mid-stream EOFs
+  # against the crates.io CDN in CI).
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   cluster-e2e:
     if: >-
