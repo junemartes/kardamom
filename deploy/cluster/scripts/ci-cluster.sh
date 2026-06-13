@@ -96,9 +96,10 @@ dump_diagnostics() {
   ip -d link show "${BRIDGE_NAME:-kardamom-br0}" 2>/dev/null || true
   cat "/sys/class/net/${BRIDGE_NAME:-kardamom-br0}/bridge/multicast_snooping" 2>/dev/null \
     | sed 's/^/  multicast_snooping=/' || true
-  for n in r1 w1; do
-    echo "----- ${n}: multicast groups (ip maddr) -----"
-    docker exec "kardamom-${n}" ip maddr show dev eth0 2>/dev/null || true
+  for n in r1 r2 r3 w1 w2; do
+    echo "----- ${n}: joined multicast groups (ip maddr, 239.x only) -----"
+    docker exec "kardamom-${n}" ip maddr show dev eth0 2>/dev/null \
+      | awk '/inet 239\./{print "  "$2}' | sort || true
   done
   # Direct raw-UDP multicast probe w2 -> r1 on a throwaway group, INDEPENDENT of
   # Aeron. If r1 receives 0, the bridge isn't forwarding multicast at all (a
@@ -111,10 +112,14 @@ dump_diagnostics() {
   # are subscribers' Status Messages reaching the derived CONTROL group (.12)?
   # Capture all cluster multicast for a few seconds and summarise by src->dst so
   # we can see which streams actually flow and in which direction.
-  echo "===== tcpdump ${BRIDGE_NAME:-kardamom-br0}: cluster multicast (≤6s) ====="
-  sudo timeout 6 tcpdump -i "${BRIDGE_NAME:-kardamom-br0}" -nn -t -c 80 \
+  echo "===== tcpdump ${BRIDGE_NAME:-kardamom-br0}: cluster multicast src->dst (≤8s) ====="
+  # Show src -> dst so we can see DATA frames (-> .13/.21/.25 = odd data groups)
+  # AND Status Messages (-> .12/.20/.24 = even control groups). If publications
+  # never connect, we'll see data going out but NO Status Messages coming back to
+  # the control groups.
+  sudo timeout 8 tcpdump -i "${BRIDGE_NAME:-kardamom-br0}" -nn -t -c 250 \
     'udp and dst net 239.192.56.0/24' 2>/dev/null \
-    | awk '{print $1, $2, $3}' | sort | uniq -c | sort -rn | head -30 \
+    | awk '{d=$4; sub(/:$/,"",d); print $2" -> "d}' | sort | uniq -c | sort -rn | head -40 \
     || echo "(tcpdump unavailable or no multicast captured)"
   export NOMAD_ADDR="http://192.168.56.11:4646"
   nomad job status 2>/dev/null || true
