@@ -14,10 +14,18 @@
     dest: /etc/apt/keyrings/docker.asc
     mode: "0644"
 
+# Resolve the dpkg architecture (amd64 / arm64) rather than hardcoding it, so
+# the same role works on amd64 hosts/runners and arm64 (Apple-silicon dev VMs,
+# arm64 CI containers). Docker's apt repo is published for both.
+- name: Resolve dpkg architecture
+  ansible.builtin.command: dpkg --print-architecture
+  register: dpkg_arch
+  changed_when: false
+
 - name: Add Docker apt repository
   ansible.builtin.apt_repository:
     repo: >-
-      deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc]
+      deb [arch={{ dpkg_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc]
       https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} {{ docker_apt_channel }}
     filename: docker
     state: present
