@@ -16,7 +16,7 @@
 host_id = 1
 
 # channel_b_uri: the multicast tx_ordering channel (matches channels.toml.tpl).
-channel_b_uri = "aeron:udp?endpoint=239.192.56.11:40010|interface=192.168.56.0/24|ttl=1"
+channel_b_uri = "aeron:udp?endpoint=239.192.56.13:40010|interface=192.168.56.0/24|ttl=1"
 
 # Tx records on stream 1; sealer-emitted boundary markers on a distinct
 # stream so subscribers can demultiplex by type on the same channel.
