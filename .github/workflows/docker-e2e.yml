@@ -112,6 +112,17 @@ jobs:
             --features 'full-pipeline-e2e' \
             --test multiprocess_e2e -- --ignored --nocapture anvil_pipeline_e2e_l1_deposit_and_l2_round_trip
 
+      # Recorder/quorum durability (#36 + #38): full pipeline + 3
+      # kardamom-recorder processes + the quorum aggregator, ingress at
+      # --ack-policy on-quorum. Proves acks gate on the quorum watermark, then
+      # kills one recorder and re-verifies acks still flow (2-of-3 redundancy).
+      - name: full-pipeline-e2e recorder quorum + redundancy
+        run: |
+          cargo test \
+            -p e2e \
+            --features 'full-pipeline-e2e' \
+            --test multiprocess_e2e -- --ignored --nocapture multiprocess_quorum_e2e_recorder_quorum_and_redundancy
+
       # Per-component docker_e2e smoke tests (gate-only today; they bring up
       # AeronTestCluster and assert the harness comes up). Run after the
       # headline test so a failure there is the headline failure.

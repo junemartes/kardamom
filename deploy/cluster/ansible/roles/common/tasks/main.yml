@@ -20,6 +20,11 @@
 
 # The sysctl module both persists each entry to sysctl_file and applies it
 # immediately (reload: true) — one mechanism, one place for the values.
+#
+# `net.core.*mem_*` are NOT network-namespaced, so a container cannot set them
+# (the write would either fail or leak to the host). The container-based CI
+# cluster (cluster-e2e) sets these once on the runner host and passes
+# `kardamom_in_container=true` to skip this task; VMs leave it false (default).
 - name: Install and apply Aeron-friendly socket-buffer sysctls
   ansible.posix.sysctl:
     name: "{{ item.name }}"
@@ -36,6 +41,7 @@
       value: "16777216"
     - name: net.core.wmem_default
       value: "16777216"
+  when: not (kardamom_in_container | default(false) | bool)
 
 - name: Create on-node kardamom directories
   ansible.builtin.file:

@@ -79,6 +79,18 @@ for name, ip in nodes.items():
         f"{name} ansible_host={ip}",
         f"inventory entry for {name}",
     )
+    # The container-node inventory (cluster-e2e) keeps the same node/role/id
+    # layout; the static IP is assigned by ci-cluster.sh instead.
+    must_contain(
+        CLUSTER / "ansible" / "inventory.containers.ini",
+        f"{name} ansible_host=kardamom-{name}",
+        f"container inventory entry for {name}",
+    )
+    must_contain(
+        CLUSTER / "scripts" / "ci-cluster.sh",
+        f"[{name}]={ip}",
+        f"ci-cluster.sh static IP of {name}",
+    )
 
 # --- Makefile -----------------------------------------------------------------
 must_contain(CLUSTER / "Makefile", f"REGISTRY := {registry}", "registry host:port")
