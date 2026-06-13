@@ -178,7 +178,8 @@ impl Recorder {
         ch: &ChannelsConfig,
         recorder_id: RecorderId,
         archive_dir: PathBuf,
-    ) -> Result<Self, LogError> {
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Self>, LogError> {
         Self::start_inner(
             archive,
             &ch.tx_ordering_channel,
@@ -187,6 +188,7 @@ impl Recorder {
             RecorderKind::TxOrdering,
             archive_dir,
             "B",
+            should_stop,
         )
     }
 
@@ -198,7 +200,8 @@ impl Recorder {
         recorder_id: RecorderId,
         sequencer_id: u8,
         archive_dir: PathBuf,
-    ) -> Result<Self, LogError> {
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Self>, LogError> {
         Self::start_inner(
             archive,
             &ch.tx_data_channel(sequencer_id),
@@ -207,9 +210,13 @@ impl Recorder {
             RecorderKind::TxData { sequencer_id },
             archive_dir,
             "A",
+            should_stop,
         )
     }
 
+    /// Returns `Ok(None)` if `should_stop` fired before a recording appeared
+    /// (clean shutdown during startup), `Ok(Some(recorder))` once recording.
+    #[allow(clippy::too_many_arguments)] // private helper; start_b/start_a are the public surface
     fn start_inner(
         archive: Archive,
         channel: &str,
@@ -218,31 +225,28 @@ impl Recorder {
         kind: RecorderKind,
         archive_dir: PathBuf,
         ctx: &str,
-    ) -> Result<Self, LogError> {
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Self>, LogError> {
         let channel_c = CString::new(channel)
             .map_err(|e| LogError::Aeron(format!("{ctx} channel contains NUL: {e}")))?;
 
-        // Idempotent start: a recording started with auto_stop=false outlives
-        // the client that started it, so a recorder that restarts (or a fresh
-        // client against a long-lived ArchivingMediaDriver, as in the cluster)
-        // must ADOPT the already-active recording — a second start_recording on
-        // the same (channel, stream) is rejected by the archive.
-        //
-        // find-then-start is check-then-act, so when several recorders target
-        // the *same* (channel, stream) on *one* archive (e.g. the single-host
-        // quorum e2e: N recorders all recording tx_ordering) two can both see
-        // "none" and race start_recording. We resolve the race by retrying:
-        // on a start_recording rejection, re-find and adopt the winner's
-        // recording. Bounded so a genuinely broken control channel still fails.
-        let recording_id =
-            Self::find_or_start_recording(&archive, channel_c.as_c_str(), stream_id, kind, ctx)?;
+        let recording_id = match Self::find_or_start_recording(
+            &archive,
+            channel_c.as_c_str(),
+            stream_id,
+            kind,
+            should_stop,
+        )? {
+            Some(id) => id,
+            None => return Ok(None), // shutdown before a recording appeared
+        };
 
         // Pull the descriptor once at startup so we can compute segment file
         // paths without a control-channel round-trip on every fsync tick.
         let (start_position, term_buffer_length, segment_file_length) =
             fetch_descriptor(&archive, recording_id)?;
 
-        Ok(Self {
+        Ok(Some(Self {
             archive,
             recorder_id,
             kind,
@@ -251,25 +255,35 @@ impl Recorder {
             start_position,
             term_buffer_length,
             segment_file_length,
-        })
+        }))
     }
 
-    /// Resolve the recording id for `stream_id`: adopt the active recording if
-    /// one exists, else start one — retrying across the find↔start race when
-    /// multiple recorders target the same stream on one archive (see
-    /// `start_inner`).
+    /// Resolve the recording id for `stream_id`: initiate the recording, then
+    /// wait for it to appear in the archive catalog and return its id. Returns
+    /// `Ok(None)` if `should_stop` fires first.
     ///
-    /// Adoption uses `list_recordings_for_uri` rather than
-    /// `find_last_matching_recording`: the latter matches on `sessionId`, which
-    /// a recorder doesn't know (the publishers — sealer/sequencers — own the
-    /// sessions), so it never matches. Listing by stream + active state does.
+    /// A recording started with auto_stop=false outlives the client that
+    /// started it, so a recorder that restarts (or a fresh client against a
+    /// long-lived ArchivingMediaDriver, as in the cluster) ADOPTs the existing
+    /// recording — a second start_recording on the same (channel, stream) is
+    /// rejected, which is fine.
+    ///
+    /// The catalog descriptor only materializes once a PUBLISHER connects to
+    /// the stream (Aeron lists in-progress recordings, not idle ones). In a
+    /// cluster the recorders come up BEFORE the sealer/sequencers publish
+    /// tx_ordering, so this WAITS (indefinitely, until `should_stop`) rather
+    /// than timing out — the process staying alive is what keeps the Nomad
+    /// alloc "running" so the rest of the pipeline can be deployed and start
+    /// publishing. Discovery uses `list_recordings_for_uri` (matches by stream,
+    /// no sessionId — which the recorder doesn't know — unlike
+    /// `find_last_matching_recording`).
     fn find_or_start_recording(
         archive: &Archive,
         channel: &std::ffi::CStr,
         stream_id: i32,
         kind: RecorderKind,
-        ctx: &str,
-    ) -> Result<i64, LogError> {
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<i64>, LogError> {
         // Initiate the recording. The first caller wins; a second start on the
         // same (channel, stream) is rejected — harmless, the recording exists.
         //
@@ -289,28 +303,27 @@ impl Recorder {
             }
         }
 
-        // Discover the actual catalog recording id — same path for the recorder
-        // that won the start and for those that adopt. The descriptor only
-        // materializes once a PUBLISHER connects to the stream (Aeron lists
-        // in-progress recordings, not idle ones), so a recorder that comes up
-        // before the sealer publishes tx_ordering polls until it appears (~30s).
-        const ATTEMPTS: usize = 60;
-        for attempt in 0..ATTEMPTS {
+        let mut logged_waiting = false;
+        while !should_stop() {
             match active_recording_for_stream(archive, stream_id) {
                 Ok(Some(id)) => {
                     info!(recording_id = id, ?kind, "recording ready");
-                    return Ok(id);
+                    return Ok(Some(id));
                 }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(error = %e, ?kind, attempt, "list_recordings_for_uri failed; retrying")
+                Ok(None) => {
+                    if !logged_waiting {
+                        info!(
+                            ?kind,
+                            "waiting for a publisher on the stream so the recording materializes"
+                        );
+                        logged_waiting = true;
+                    }
                 }
+                Err(e) => warn!(error = %e, ?kind, "list_recordings_for_uri failed; retrying"),
             }
             std::thread::sleep(Duration::from_millis(500));
         }
-        Err(LogError::Aeron(format!(
-            "{ctx} recording: no recording appeared on stream {stream_id} after {ATTEMPTS} polls"
-        )))
+        Ok(None)
     }
 
     pub fn recorder_id(&self) -> RecorderId {

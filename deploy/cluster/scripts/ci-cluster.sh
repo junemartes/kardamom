@@ -38,6 +38,30 @@ declare -A NODE_IP=( [r1]=192.168.56.11 [r2]=192.168.56.12 [r3]=192.168.56.13 [w
 
 log() { echo "==> $*"; }
 
+# On failure, dump every job's status + each allocation's stdout/stderr BEFORE
+# teardown — otherwise the container removal below erases the only evidence of
+# why an alloc failed (the workflow's post-step runs after this script's EXIT
+# trap, too late). Best-effort; never let diagnostics mask the real exit code.
+dump_diagnostics() {
+  log "FAILURE diagnostics — Nomad job + allocation logs"
+  export NOMAD_ADDR="http://192.168.56.11:4646"
+  nomad job status 2>/dev/null || true
+  for job in aeron recorder quorum anvil sealer sequencer executor ingress batcher; do
+    local allocs
+    allocs="$(nomad job allocs -t '{{range .}}{{.ID}}{{"\n"}}{{end}}' "${job}" 2>/dev/null || true)"
+    [[ -z "${allocs}" ]] && continue
+    while read -r alloc; do
+      [[ -z "${alloc}" ]] && continue
+      echo "----- ${job} alloc ${alloc}: status -----"
+      nomad alloc status "${alloc}" 2>/dev/null | sed -n '1,40p' || true
+      echo "----- ${job} alloc ${alloc}: stderr -----"
+      nomad alloc logs -stderr "${alloc}" 2>/dev/null | tail -50 || true
+      echo "----- ${job} alloc ${alloc}: stdout -----"
+      nomad alloc logs "${alloc}" 2>/dev/null | tail -50 || true
+    done <<<"${allocs}"
+  done
+}
+
 cleanup() {
   [[ "${KEEP:-0}" == "1" ]] && { log "KEEP=1; leaving containers up"; return; }
   log "tearing down containers + network + docker volumes"
@@ -47,7 +71,13 @@ cleanup() {
   done
   docker network rm "${NET}" >/dev/null 2>&1 || true
 }
-trap cleanup EXIT
+
+on_exit() {
+  local rc="$1"
+  [[ "${rc}" != "0" ]] && dump_diagnostics
+  cleanup
+}
+trap 'on_exit "$?"' EXIT
 
 # --- 1. Host sysctls (NOT namespaced; can't be set from inside a container) --
 log "applying Aeron socket-buffer sysctls on the host"

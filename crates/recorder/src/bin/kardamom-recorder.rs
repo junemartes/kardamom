@@ -146,7 +146,7 @@ fn run_record(
     args: &Args,
     cfg: &LogConfig,
     poll: Duration,
-    should_stop: impl FnMut() -> bool,
+    mut should_stop: impl FnMut() -> bool,
 ) -> Result<()> {
     // Archive control client + a separate publishing client, both joined to
     // the node-local Media Driver (rusteron splits the archive and client
@@ -155,6 +155,10 @@ fn run_record(
         connect_archive(args.aeron_dir.as_deref(), &cfg.aeron).context("connect archive")?;
     let client = connect_client(args.aeron_dir.as_deref()).context("connect aeron client")?;
 
+    // start_b/start_a wait (gated by should_stop) until the recording
+    // materializes — i.e. until a publisher connects to the stream, which in a
+    // cluster happens only after the rest of the pipeline is deployed. They
+    // return None if shutdown arrives during that wait.
     let recorder = match args.kind {
         KindArg::TxOrdering => {
             tracing::info!(recorder_id = args.recorder_id, "recording tx_ordering (B)");
@@ -163,6 +167,7 @@ fn run_record(
                 &cfg.channels,
                 args.recorder_id,
                 cfg.aeron.archive_dir.clone(),
+                &mut should_stop,
             )
             .context("start_b")?
         }
@@ -181,8 +186,17 @@ fn run_record(
                 args.recorder_id,
                 sid,
                 cfg.aeron.archive_dir.clone(),
+                &mut should_stop,
             )
             .context("start_a")?
+        }
+    };
+
+    let recorder = match recorder {
+        Some(r) => r,
+        None => {
+            tracing::info!("kardamom-recorder: shutdown before a recording appeared");
+            return Ok(());
         }
     };
 
