@@ -38,8 +38,17 @@ job "sealer" {
         ]
         args = [
           "--config", "/local/sealer.toml",
+          "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
         ]
+      }
+
+      # Cluster LogConfig: the sealer's own channel_b_uri still wins for
+      # tx_ordering, but the other channels (tx_receipts subscribe, etc.) come
+      # from here. Consumed via --log-config.
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
       }
 
       # Single-sourced from config/sealer.toml.tpl (submit from deploy/cluster/

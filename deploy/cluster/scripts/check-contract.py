@@ -98,6 +98,16 @@ must_contain(
     f"{registry}/kardamom-aeron:{image_tag}",
     "aeron image ref",
 )
+# The recorder image (issue #38) is shared by the record + aggregate jobs.
+for job in ("recorder.system.nomad.hcl", "quorum.nomad.hcl"):
+    must_contain(
+        jobs / job,
+        f"{registry}/kardamom-recorder:{image_tag}",
+        "recorder image ref",
+    )
+# recorder must be in the Makefile's build/push SERVICES list, else its image
+# is never built.
+must_contain(CLUSTER / "Makefile", "recorder", "recorder in Makefile SERVICES")
 must_contain(jobs / "anvil.nomad.hcl", f'"{anvil_l1}"', "anvil L1 port")
 must_contain(
     jobs / "da-watcher.nomad.hcl",
@@ -108,16 +118,48 @@ must_contain(jobs / "ingress.nomad.hcl", f"static = {ingress_rpc}", "ingress RPC
 must_contain(jobs / "executor.nomad.hcl", f'"{chain_id}"', "L2 chain id")
 
 # --- config templates -----------------------------------------------------------
-must_contain(
+# The sealer overrides tx_ordering from its own channel_b_uri, so it MUST be
+# byte-identical to channels.toml.tpl's tx_ordering_channel (else the sealer
+# publishes to a different group than the sequencers/recorders subscribe).
+import re as _re
+
+
+def _extract(path, pattern, label):
+    rel = path.relative_to(REPO)
+    if not path.exists():
+        err(f"{rel}: file missing ({label})")
+        return None
+    m = _re.search(pattern, path.read_text(), _re.M)
+    if not m:
+        err(f"{rel}: could not find {label}")
+        return None
+    return m.group(1).strip()
+
+
+sealer_b = _extract(
     CLUSTER / "config" / "sealer.toml.tpl",
-    f"aeron:udp?endpoint={sealer_ip}:",
-    "tx_ordering publisher endpoint on the sealer node",
+    r'^channel_b_uri\s*=\s*"([^"]+)"',
+    "sealer channel_b_uri",
 )
-must_contain(
+channels_ordering = _extract(
     CLUSTER / "config" / "channels.toml.tpl",
-    f"aeron:udp?endpoint={sealer_ip}:",
-    "tx_ordering endpoint",
+    r'^tx_ordering_channel\s*=\s*"([^"]+)"',
+    "channels tx_ordering_channel",
 )
+if sealer_b is not None and channels_ordering is not None and sealer_b != channels_ordering:
+    err(
+        "sealer channel_b_uri != channels tx_ordering_channel "
+        f"({sealer_b!r} vs {channels_ordering!r}) — the sealer would publish "
+        "tx_ordering to a different channel than subscribers/recorders use"
+    )
+# channels.toml.tpl is consumed via --log-config by every pipeline service +
+# the recorder/quorum jobs; spot-check the flag is actually wired.
+for job in ("ingress", "sequencer", "executor", "sealer", "da-watcher"):
+    must_contain(
+        jobs / f"{job}.nomad.hcl",
+        "--log-config",
+        "channels config passed via --log-config (issue #36)",
+    )
 must_contain(
     CLUSTER / "config" / "genesis" / "dev.toml",
     f"chain_id = {chain_id}",

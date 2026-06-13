@@ -42,11 +42,18 @@ job "sequencer" {
         ]
         args = [
           "--config", "/local/sequencer.toml",
+          "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--partition-count", "2",
           "--partition-index", "${meta.sequencer_id}",
           "--sequencer-id", "${meta.sequencer_id}",
         ]
+      }
+
+      # Cluster LogConfig (UDP multicast channels), consumed via --log-config.
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
       }
 
       # Single-sourced from config/sequencer.toml.tpl (submit from

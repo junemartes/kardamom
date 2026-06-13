@@ -1,13 +1,14 @@
 # kardamom-ingress — eth JSON-RPC proxy. Placed on w1 (192.168.56.21).
 #
-# Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-ingress --config <ingress.toml> --aeron-dir <dir> --shards 2 \
-#       --jsonrpc-bind 0.0.0.0:8545 --ack-policy on-offer
+# Invocation:
+#   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
+#       --aeron-dir <dir> --shards 2 --jsonrpc-bind 0.0.0.0:8545 \
+#       --ack-policy on-quorum
 #
 # ingress.toml is presence-checked only; runtime tuning is via flags.
-# The channels.toml is rendered + mounted in anticipation of the future
-# --log-config flag (see README "Required service changes"); ingress ignores it
-# today and uses IPC defaults.
+# channels.toml (issue #36) supplies the UDP multicast channels — including the
+# quorum_watermark stream ingress subscribes to for the on-quorum ack gate,
+# published by the quorum job (issue #38).
 #
 # Shares the node's Aeron media driver via the bind-mounted tmpfs aeron.dir.
 # Host networking so :8545 binds on the w1 VM IP.
@@ -17,8 +18,8 @@
 
 variable "ack_policy" {
   type        = string
-  description = "Ingress ack durability gate. Defaults to on-offer because the recorder/quorum role has no deployable process yet (issue #38; README 'Required service changes' item 3) — with on-quorum and no quorum-watermark publisher, ingress would never ack. Switch to on-quorum once #38 lands: nomad job run -var ack_policy=on-quorum ingress.nomad.hcl"
-  default     = "on-offer"
+  description = "Ingress ack durability gate. Defaults to on-quorum: the recorder + quorum jobs (issue #38) publish the quorum watermark, so Q-of-N fsync gating is satisfied. Override for an Aeron-substrate-only bring-up with: nomad job run -var ack_policy=on-offer ingress.nomad.hcl"
+  default     = "on-quorum"
 }
 
 job "ingress" {
@@ -51,6 +52,7 @@ job "ingress" {
         ]
         args = [
           "--config", "/local/ingress.toml",
+          "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--shards", "2",
           "--jsonrpc-bind", "0.0.0.0:8545",
@@ -64,8 +66,8 @@ job "ingress" {
         data        = file("config/ingress.toml")
       }
 
-      # Provisioned for the forthcoming --log-config flag; not consumed yet.
-      # Single-sourced from config/channels.toml.tpl.
+      # Cluster LogConfig (UDP multicast channels), single-sourced from
+      # config/channels.toml.tpl and consumed via --log-config.
       template {
         destination = "local/channels.toml"
         data        = file("config/channels.toml.tpl")

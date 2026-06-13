@@ -18,14 +18,18 @@ See [`DESIGN.md`](./DESIGN.md) for the full design rationale.
 
 | Node | IP | Role | Workloads |
 |------|----|------|-----------|
-| `r1` | 192.168.56.11 | recorder + control | Nomad/Consul **server**, Docker registry, anvil (L1), media driver, archive, recorder (id 0) |
-| `r2` | 192.168.56.12 | recorder | media driver, archive, recorder (id 1) |
-| `r3` | 192.168.56.13 | recorder | media driver, archive, recorder (id 2) |
+| `r1` | 192.168.56.11 | recorder + control | Nomad/Consul **server**, Docker registry, anvil (L1), media driver, archive, `kardamom-recorder` (id 0), quorum aggregator |
+| `r2` | 192.168.56.12 | recorder | media driver, archive, `kardamom-recorder` (id 1) |
+| `r3` | 192.168.56.13 | recorder | media driver, archive, `kardamom-recorder` (id 2) |
 | `w1` | 192.168.56.21 | worker | media driver, sequencer #0, executor (+state), ingress (JSON-RPC :8545) |
 | `w2` | 192.168.56.22 | worker | media driver, sequencer #1, sealer, da_watcher, batcher |
 
-The 3 recorders form the Aeron quorum (tolerates 1 failure). All values are
-defined once in [`ansible/group_vars/all.yml`](./ansible/group_vars/all.yml).
+The 3 `kardamom-recorder` processes record `tx_ordering` and publish their
+fsync watermarks; the quorum aggregator (a single `kardamom-recorder
+--aggregate` on r1) combines them into the quorum watermark that ingress
+gates on with `--ack-policy on-quorum` (tolerates 1 recorder failure). All
+values are defined once in
+[`ansible/group_vars/all.yml`](./ansible/group_vars/all.yml).
 
 ## Host prerequisites
 
@@ -103,10 +107,15 @@ deploy/cluster/
   nomad/
     aeron.system.nomad.hcl  ArchivingMediaDriver (driver+archive), system job,
                             all nodes
+    recorder.system.nomad.hcl  kardamom-recorder, records tx_ordering +
+                            publishes fsync watermark (role=recorder)
+    quorum.nomad.hcl        kardamom-recorder --aggregate (quorum watermark,
+                            count=1)
     anvil.nomad.hcl         in-cluster L1 for the smoke test
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     sealer.nomad.hcl   da-watcher.nomad.hcl  batcher.nomad.hcl
-  config/                   *.toml(.tpl) pulled into the job specs via file()
+  config/                   *.toml(.tpl) pulled into the job specs via file();
+                            channels.toml.tpl is the shared LogConfig
   scripts/
     deploy.sh               submit jobs in dependency order, wait for allocs
     smoke.sh                transfers smoke test against the ingress endpoint
@@ -124,50 +133,43 @@ The Nomad job specs pull their config payloads from `config/` with HCL2
   same path so they share the CnC file + mmap'd ring buffers.
 - **Host networking:** all Aeron + service containers run `network_mode = "host"`,
   so Aeron UDP channel endpoints are just the VM IP — no Docker port mapping.
-- **Channels:** `aeron:ipc?…` (single host) → `aeron:udp?endpoint=<node-ip>:<port>`.
-  Endpoints are rendered from the contract in `config/channels.toml.tpl`.
-- **Archive** runs only on recorders, sharing `aeron.dir` + a persistent
-  `archive_dir` volume.
+- **Channels:** `aeron:ipc?…` (single-host default) → `aeron:udp?endpoint=<mcast-group>:<port>|interface=192.168.56.0/24`.
+  The whole `LogConfig` (channels + quorum + archive control) is rendered once
+  in `config/channels.toml.tpl` and consumed by every service + the recorder
+  via `--log-config` (issue #36). One shared file works on every node because
+  channels are **UDP multicast**: per-stream identity is the stream id, so the
+  `{sid}`/`{rid}` template substitutions only label the `alias` — no per-node
+  rendering needed (this is what closes #37).
+- **Archive** runs on all nodes; `kardamom-recorder` records `tx_ordering` only
+  on the recorders, sharing `aeron.dir` + a persistent `archive_dir` volume.
 
 ## Required service changes
 
-The multi-host UDP topology depends on service-side work that is **not yet in the
-codebase** (these are deployment prerequisites, tracked separately from this PR):
+The deployment originally depended on four service-side changes. **#36 and #38
+are now implemented in this PR** (so the multi-host UDP pipeline and the
+on-quorum durability path are wired end-to-end); #37 is dissolved by the
+multicast channel layout; only the batcher (#39) remains out of scope.
 
-1. **Channels config plumbing.** *(tracked in #36)* Several binaries currently derive channels from
-   `LogConfig::default().channels` (IPC URIs hardcoded) — e.g. `kardamom-da-watcher`
-   uses `LogConfig::default().channels`, and `ingress`/`executor` build channels
-   from defaults. To run over UDP across hosts, each service must accept a
-   `--log-config <toml>` (or `KARDAMOM_LOG_CONFIG`) that supplies the
-   `[channels]`/`[aeron]` config (UDP endpoints). Only `kardamom-sealer` currently
-   takes a channel URI in its own config. The Nomad jobs here already render and
-   mount a channels config (`config/channels.toml.tpl`) in anticipation of this
-   flag; until the flag exists, the services ignore it and use IPC defaults
-   (single-host only).
-2. **Batcher is offline.** *(tracked in #39)* `kardamom-batcher` today reads Aeron Archive segment
-   files in `--dry-run` (default) rather than running as a live service with L1
-   broadcast. Its Nomad job is therefore modeled as a **periodic/batch** job
-   pointed at the recorders' archive segments, not an always-on service. Wiring
-   the live L1 broadcast path is a follow-up.
-
-3. **No standalone recorder/quorum process.** *(tracked in #38)* The durability story
-   (`recorder_id`, `QuorumConfig`, fsync-watermark + quorum-watermark channels,
-   and ingress `--ack-policy on-quorum`) has no dedicated deployable binary in the
-   workspace today — the recorder/quorum logic lives in `kardamom-log` as library
-   code, and recording is done by the Aeron Archive. Until the recorder/quorum
-   role has a process home (or is confirmed embedded in a specific service), the
-   "3-recorder quorum" is topology intent: the Archive runs on all nodes, but the
-   `on-quorum` ack path won't be satisfied. The ingress job therefore defaults
-   `--ack-policy` to `on-offer` (as `multiprocess_e2e` does); once #38 lands,
-   submit with `nomad job run -var ack_policy=on-quorum ingress.nomad.hcl`.
-
-4. **Per-node channel rendering.** *(tracked in #37)* With two sequencers on different VMs (w1/w2),
-   the per-sequencer (`{sid}`) and per-recorder (`{rid}`) channel URI *templates*
-   can't encode a distinct per-host IP from a single file. The current
-   `channels.toml.tpl` uses Aeron MDC (`control-mode=dynamic`) for those and fixed
-   unicast endpoints for the singleton streams; the eventual `--log-config` flow
-   will likely need the channels config rendered **per node** (one file per
-   worker) rather than one shared file.
+1. ✅ **Channels config plumbing (#36).** Every pipeline binary
+   (`ingress`/`sequencer`/`executor`/`sealer`/`da-watcher`) and the new
+   `kardamom-recorder` now accept `--log-config <toml>` (env
+   `KARDAMOM_LOG_CONFIG`) and load a `LogConfig` from it, falling back to the
+   built-in single-host IPC defaults when unset (so `multiprocess_e2e` and local
+   runs are unchanged). The Nomad jobs render `config/channels.toml.tpl` and pass
+   `--log-config /local/channels.toml`.
+2. ⛔ **Batcher is offline (#39).** `kardamom-batcher` still reads Aeron Archive
+   segment files in `--dry-run`; its Nomad job remains a periodic/batch job, not
+   an always-on service. Wiring the live L1 broadcast path is a follow-up.
+3. ✅ **Deployable recorder/quorum process (#38).** `kardamom-recorder` records
+   `tx_ordering` on each recorder (`recorder.system.nomad.hcl`, one per
+   `role=recorder` node, reading `${meta.recorder_id}`) and publishes its fsync
+   watermark; a single `--aggregate --no-record` instance (`quorum.nomad.hcl`)
+   publishes the Q-of-N quorum watermark. The ingress job therefore defaults
+   `--ack-policy` to **`on-quorum`** (override to `on-offer` for an
+   Aeron-substrate-only bring-up).
+4. ✅ **Per-node channel rendering (#37) — not needed.** The multicast layout
+   uses one shared `channels.toml` for all nodes (stream-id, not per-host IP,
+   distinguishes publishers), so there is nothing to render per node.
 
 > Note: there is **no `aeron-live` feature** to toggle — `rusteron` is an
 > unconditional dependency of `kardamom-log`, so a plain `cargo build` already
@@ -179,14 +181,17 @@ codebase** (these are deployment prerequisites, tracked separately from this PR)
 
 | Check | Status |
 |-------|--------|
-| Design reviewed & approved | ✅ (`DESIGN.md`) |
-| Artifacts authored | ✅ |
-| `nomad job validate` (all 8 specs, Nomad 1.9.5) | ✅ pass; also in CI (`cluster-validate`) |
+| Design reviewed & approved | ✅ (`DESIGN.md`, `docs/agents/log-config-and-recorder-spec.md`) |
+| `--log-config` (#36) + `kardamom-recorder` (#38) | ✅ implemented; unit + config tests pass |
+| `nomad job validate` (all 10 specs, Nomad 1.9.5) | ✅ pass; also in CI (`cluster-validate`) |
 | `yamllint` / `ansible-lint` (production profile) | ✅ pass; also in CI (`cluster-validate`) |
 | Contract drift (`scripts/check-contract.py`) | ✅ pass; also in CI (`cluster-validate`) |
+| Pipeline + on-quorum + redundancy in containers | ⚙️ `cluster-e2e` workflow (gated; see below) |
 | `make up` on a real virtualization host | ⛔ not run (no libvirt in authoring env) |
-| Multi-host Aeron UDP pipeline | ⛔ blocked on [required service changes](#required-service-changes) |
 
-Run `make up` on a host with the toolchain before relying on this. The Aeron
-UDP-over-Docker-host-networking path (MTU, SO_RCVBUF, archive fsync on VM disk)
-is the highest-risk area to exercise first.
+The **single biggest thing to validate** is whether Aeron preserves the
+canonical `tx_ordering` order across multiple cross-host publishers (2
+sequencers + the sealer) over UDP multicast — this is the property the
+container `cluster-e2e` job exercises. The single-host IPC defaults (no
+`--log-config`) remain the known-good path. Also exercise the
+UDP-over-host-networking tuning (MTU, `SO_RCVBUF`, archive fsync on VM disk).

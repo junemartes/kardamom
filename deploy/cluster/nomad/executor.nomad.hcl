@@ -44,11 +44,18 @@ job "executor" {
         ]
         args = [
           "--config", "/local/executor.toml",
+          "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
         ]
+      }
+
+      # Cluster LogConfig (UDP multicast channels), consumed via --log-config.
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
       }
 
       # Presence-checked config (content lives in config/executor.toml).

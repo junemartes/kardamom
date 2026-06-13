@@ -8,7 +8,7 @@ NOMAD_ADDR := http://192.168.56.11:4646
 TAG := dev
 # Workspace root (this file lives in deploy/cluster/).
 ROOT := $(abspath ../..)
-SERVICES := ingress sequencer executor sealer da-watcher batcher
+SERVICES := ingress sequencer executor sealer da-watcher batcher recorder
 
 .PHONY: up vms provision images deploy smoke status down clean validate check-contract
 

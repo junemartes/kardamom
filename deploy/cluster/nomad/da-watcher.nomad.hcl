@@ -49,9 +49,16 @@ job "da-watcher" {
         args = [
           "--l1-rpc", "http://192.168.56.11:8546",
           "--lockbox", "${var.lockbox_address}",
+          "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--poll-interval-secs", "1",
         ]
+      }
+
+      # Cluster LogConfig (UDP multicast channels), consumed via --log-config.
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
       }
 
       resources {

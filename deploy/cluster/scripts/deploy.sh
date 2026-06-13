@@ -83,15 +83,27 @@ echo "### Phase 1: Aeron substrate"
 run_job "aeron.system.nomad.hcl"
 wait_running "aeron" 180
 
-# --- 2. In-cluster L1 (anvil on r1) -----------------------------------------
+# --- 2. Recorder quorum (system job on recorders + the aggregator) ----------
+# The recorders start recording the tx_ordering channel and publish their
+# fsync watermarks; the quorum job aggregates them. Brought up before the
+# service pipeline so the quorum watermark is flowing by the time ingress
+# (on-quorum) needs it (issue #38).
 echo
-echo "### Phase 2: anvil L1"
+echo "### Phase 2: recorder quorum"
+run_job "recorder.system.nomad.hcl"
+wait_running "recorder" 180
+run_job "quorum.nomad.hcl"
+wait_running "quorum" 120
+
+# --- 3. In-cluster L1 (anvil on r1) -----------------------------------------
+echo
+echo "### Phase 3: anvil L1"
 run_job "anvil.nomad.hcl"
 wait_running "anvil" 120
 
-# --- 3. Service pipeline ----------------------------------------------------
+# --- 4. Service pipeline ----------------------------------------------------
 echo
-echo "### Phase 3: service pipeline"
+echo "### Phase 4: service pipeline"
 
 # da-watcher needs the chain-specific Lockbox address. If not supplied, fall
 # back to the job's PLACEHOLDER default (won't work against a real chain).
@@ -117,9 +129,9 @@ wait_running "executor" 120
 wait_running "ingress" 120
 wait_running "da-watcher" 120
 
-# --- 4. Batcher periodic job (offline/dry-run) ------------------------------
+# --- 5. Batcher periodic job (offline/dry-run) ------------------------------
 echo
-echo "### Phase 4: batcher (periodic, dry-run)"
+echo "### Phase 5: batcher (periodic, dry-run)"
 run_job "batcher.nomad.hcl"
 echo "    batcher registered as a periodic job (next run on its cron schedule)."
 
