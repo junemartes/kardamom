@@ -106,6 +106,16 @@ dump_diagnostics() {
   # record, the problem is Aeron-specific. Distinct group/port so it can't
   # collide with the media driver's sockets. Fully best-effort.
   multicast_probe || true
+  # Observe the ACTUAL Aeron multicast frames on the bridge: are the sealer's
+  # SETUP/DATA frames reaching the tx_ordering DATA group (239.192.56.13), and
+  # are subscribers' Status Messages reaching the derived CONTROL group (.12)?
+  # Capture all cluster multicast for a few seconds and summarise by src->dst so
+  # we can see which streams actually flow and in which direction.
+  echo "===== tcpdump ${BRIDGE_NAME:-kardamom-br0}: cluster multicast (≤6s) ====="
+  sudo timeout 6 tcpdump -i "${BRIDGE_NAME:-kardamom-br0}" -nn -t -c 80 \
+    'udp and dst net 239.192.56.0/24' 2>/dev/null \
+    | awk '{print $1, $2, $3}' | sort | uniq -c | sort -rn | head -30 \
+    || echo "(tcpdump unavailable or no multicast captured)"
   export NOMAD_ADDR="http://192.168.56.11:4646"
   nomad job status 2>/dev/null || true
   for job in aeron recorder quorum anvil sealer sequencer executor ingress batcher; do
