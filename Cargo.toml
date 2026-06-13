@@ -43,8 +43,13 @@ kardamom-types = { path = "crates/types" }
 kardamom-log = { path = "crates/log" }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
 io-uring = "0.7"
-rusteron-client = "0.1"
-rusteron-archive = "0.1"
+# `static` links the Aeron C library into each binary so deployable images
+# don't need libaeron.so / libaeron_archive_c_client.so at runtime (a plain
+# slim runtime image just works; otherwise the binary fails at startup with
+# "libaeron.so: cannot open shared object file"). Local/cargo runs are
+# unaffected.
+rusteron-client = { version = "0.1", features = ["static"] }
+rusteron-archive = { version = "0.1", features = ["static"] }
 testcontainers = "0.20"
 criterion = "0.5"
 tempfile = "3"
