@@ -18,6 +18,13 @@
       - ca-certificates
     state: present
 
+# HashiCorp publishes linux_amd64 + linux_arm64; pick the one matching this
+# host so the consul/nomad roles download a binary that actually execs (amd64
+# VMs/runners and arm64 containers/dev machines alike).
+- name: Resolve HashiCorp release architecture
+  ansible.builtin.set_fact:
+    hashicorp_arch: "{{ 'arm64' if ansible_architecture in ['aarch64', 'arm64'] else 'amd64' }}"
+
 # The sysctl module both persists each entry to sysctl_file and applies it
 # immediately (reload: true) — one mechanism, one place for the values.
 #
