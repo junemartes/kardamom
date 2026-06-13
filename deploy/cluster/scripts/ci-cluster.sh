@@ -138,6 +138,21 @@ log "building + pushing service images to ${REGISTRY}"
 docker build -f "${ROOT}/crates/log/docker/aeron/Dockerfile" \
   -t "${REGISTRY}/kardamom-aeron:${TAG}" "${ROOT}/crates/log/docker/aeron"
 docker push "${REGISTRY}/kardamom-aeron:${TAG}"
+
+# The binaries link Aeron DYNAMICALLY (rusteron's static feature is broken on
+# Linux), so the thin runtime image must carry libaeron.so /
+# libaeron_archive_c_client.so. rusteron builds them under the cargo build dir;
+# stage them into the image build context (target/release) so the Dockerfile
+# can COPY them in. ldconfig in the image then makes them resolvable.
+staging="${ROOT}/target/release/_aeronlibs"
+rm -rf "${staging}"; mkdir -p "${staging}"
+found=0
+while IFS= read -r so; do
+  cp -f "${so}" "${staging}/"; found=$((found + 1))
+done < <(find "${ROOT}/target/release/build" -path '*/out/build/lib/libaeron*.so' 2>/dev/null)
+log "staged ${found} Aeron shared lib(s): $(ls "${staging}" 2>/dev/null | tr '\n' ' ')"
+[[ "${found}" -gt 0 ]] || { echo "ERROR: no libaeron*.so found under target/release/build" >&2; exit 1; }
+
 for svc in "${SERVICES[@]}"; do
   bin="kardamom-${svc}"
   docker build -f docker/ci-service.Dockerfile --build-arg "BIN=${bin}" \
