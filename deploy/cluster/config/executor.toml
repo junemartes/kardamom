@@ -1,0 +1,6 @@
+# kardamom-executor config — intentionally empty of settings.
+#
+# The binary presence-checks --config but takes all runtime tuning via CLI
+# flags (see nomad/executor.nomad.hcl, which renders this file into the alloc
+# via file()). This comment also keeps the rendered Nomad template non-empty,
+# which job validation requires.

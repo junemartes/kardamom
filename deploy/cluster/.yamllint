@@ -1,0 +1,17 @@
+# yamllint config for the cluster Ansible tree (see cluster-validate CI).
+# The non-default rules below match what ansible-lint's bundled yaml rule
+# requires, so both tools agree.
+extends: default
+
+rules:
+  # Prose-heavy comments and templated URLs don't fit in 80 columns.
+  line-length:
+    max: 120
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: false
+  braces:
+    max-spaces-inside: 1
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true

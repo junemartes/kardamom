@@ -1,0 +1,82 @@
+name: cluster-validate
+
+# Static validation for the deploy/cluster scaffold (DESIGN.md §10): the full
+# VM cluster can't run in CI (needs nested virtualization), but the linters,
+# job-spec validation, and the group_vars contract check are cheap.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/cluster/**'
+      - 'justfile'
+      - 'crates/log/docker/aeron/Dockerfile'
+      - '.github/workflows/cluster-validate.yml'
+  pull_request:
+    paths:
+      - 'deploy/cluster/**'
+      - 'justfile'
+      - 'crates/log/docker/aeron/Dockerfile'
+      - '.github/workflows/cluster-validate.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: yamllint + ansible-lint + contract
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: deploy/cluster
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install linters
+        run: pip install yamllint ansible-lint
+      - name: Install Ansible collections (module resolution for ansible-lint)
+        run: ansible-galaxy collection install ansible.posix community.docker
+      - name: yamllint
+        run: yamllint ansible/
+      - name: ansible-lint
+        run: ansible-lint ansible/
+      - name: Shell script syntax
+        run: for s in scripts/*.sh; do echo "== $s =="; bash -n "$s"; done
+      - name: Contract drift check (group_vars/all.yml vs mirrors)
+        run: ./scripts/check-contract.py
+
+  nomad-validate:
+    name: nomad job validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nomad (version from the cluster contract)
+        run: |
+          ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+          curl -fsSL "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
+          sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
+          nomad version
+      - name: Start a dev agent (job validation needs the API)
+        run: |
+          nomad agent -dev -bind 127.0.0.1 > /tmp/nomad-dev.log 2>&1 &
+          for _ in $(seq 1 30); do
+            nomad node status > /dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "nomad dev agent failed to start" >&2
+          cat /tmp/nomad-dev.log >&2
+          exit 1
+      - name: Validate job specs
+        # Run from deploy/cluster: the specs resolve file("config/...") against
+        # the CLI working directory.
+        working-directory: deploy/cluster
+        run: |
+          rc=0
+          for j in nomad/*.hcl; do
+            echo "== $j =="
+            nomad job validate "$j" || rc=1
+          done
+          exit $rc

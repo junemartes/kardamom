@@ -37,6 +37,12 @@ struct Args {
     /// Path to the TOML config file (schema: `IngressConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Optional path to a `LogConfig` TOML supplying the Aeron `[channels]`
+    /// (and `[aeron]`/`[quorum]`) config. When unset, the built-in single-host
+    /// IPC defaults are used (preserving local/e2e behaviour). Multi-host
+    /// deployments point this at the rendered UDP channels config.
+    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
+    log_config: Option<PathBuf>,
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
@@ -130,7 +136,9 @@ async fn main() -> Result<()> {
         "kardamom-ingress starting"
     );
 
-    let channels = LogConfig::default().channels;
+    let channels = LogConfig::resolve(args.log_config.as_deref())
+        .context("resolve log config")?
+        .channels;
     let rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,

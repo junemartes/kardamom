@@ -30,6 +30,13 @@ struct Args {
     /// Path to a TOML config file (schema: `SealerConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
+    /// Unset ⇒ built-in single-host IPC defaults. The sealer's own
+    /// `channel_b_uri` / `channel_b_boundary_stream_id` (from `--config`)
+    /// always take precedence for the tx_ordering channel it publishes, so
+    /// this only supplies the other channels' transport.
+    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
+    log_config: Option<PathBuf>,
     /// Aeron Media Driver directory (`aeron.dir`). If unset, uses the
     /// default location embedded in the C client (typically
     /// `/dev/shm/aeron-<user>`).
@@ -71,9 +78,13 @@ async fn main() -> Result<()> {
         "kardamom-sealer starting"
     );
 
-    // Build a minimal ChannelsConfig pointing at the configured tx_ordering URI.
-    // Other channels stay at their defaults — the sealer never touches them.
-    let mut channels = LogConfig::default().channels;
+    // Start from the resolved channels (UDP from --log-config, or IPC
+    // defaults), then let the sealer's own config win for the tx_ordering
+    // channel it publishes — the SealerConfig is the single source of truth
+    // for channel B's URI / boundary stream id.
+    let mut channels = LogConfig::resolve(args.log_config.as_deref())
+        .context("resolve log config")?
+        .channels;
     channels.tx_ordering_channel = cfg.channel_b_uri.clone();
     channels.tx_ordering_stream_id = cfg.channel_b_boundary_stream_id;
 

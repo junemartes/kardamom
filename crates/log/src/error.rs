@@ -12,6 +12,9 @@ pub enum LogError {
     #[error("supervisor: {0}")]
     Supervisor(String),
 
+    #[error("config: {0}")]
+    Config(String),
+
     #[error("quorum stalled: only {present} of {required} recorders reporting")]
     QuorumStalled { present: usize, required: usize },
 }

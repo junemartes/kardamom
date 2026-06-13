@@ -1,0 +1,90 @@
+# Canonical cluster contract — single source of truth for the whole deploy.
+# Vagrantfile, Ansible roles, Nomad job templates, and config templates all
+# derive their values from here (or mirror it; see deploy/cluster/README.md).
+---
+# --- versions -------------------------------------------------------------
+nomad_version: "1.9.5"
+consul_version: "1.20.1"
+docker_apt_channel: "stable"
+aeron_version: "1.45.0"          # must match rusteron-archive 0.1.x
+ubuntu_codename: "jammy"         # 22.04, matches the Aeron image base (temurin jammy)
+
+# --- image registry -------------------------------------------------------
+registry_host: "192.168.56.11"   # r1
+registry_port: 5000
+image_tag: "dev"
+# Fully-qualified image refs used by Nomad job specs.
+image_prefix: "{{ registry_host }}:{{ registry_port }}/kardamom"
+
+# --- L2 chain -------------------------------------------------------------
+chain_id: 412346                 # matches chains/dev.toml
+partition_count: 2               # M sequencers
+
+# --- ports ----------------------------------------------------------------
+ports:
+  nomad_http: 4646
+  nomad_rpc: 4647
+  nomad_serf: 4648
+  consul_http: 8500
+  consul_dns: 8600
+  consul_server: 8300
+  consul_serf_lan: 8301
+  consul_serf_wan: 8302
+  registry: 5000
+  ingress_rpc: 8545            # eth JSON-RPC on the ingress node
+  anvil_l1: 8546              # in-cluster L1 (anvil) for the smoke test
+  # Aeron archive control/response/replication (see aeron image EXPOSE).
+  aeron_archive_control: 8010
+  aeron_archive_control_response: 8011
+  aeron_archive_recording_events: 8020
+  aeron_archive_replication: 8021
+  # Base UDP port for kardamom data/ordering channels; per-channel offsets
+  # are assigned in config/channels.toml.tpl.
+  aeron_channel_base: 40000
+
+# --- on-node filesystem layout (bind-mounted into containers) -------------
+paths:
+  base: /opt/kardamom
+  aeron_mount: /opt/kardamom/aeron-mount   # tmpfs; aeron.dir = <mount>/dir
+  archive_dir: /opt/kardamom/archive       # recorder Archive segments (persistent)
+  state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
+  config_dir: /opt/kardamom/config         # rendered service configs + genesis
+
+# tmpfs size for the Aeron media-driver shared-memory dir.
+aeron_tmpfs_size: "1g"
+
+# --- cluster topology -----------------------------------------------------
+# `recorder_id` is unique+stable per recorder (quorum identity).
+# `sequencer_id` is set on worker nodes that run a sequencer.
+cluster_nodes:
+  r1:
+    ip: 192.168.56.11
+    role: recorder
+    recorder_id: 0
+    control_plane: true          # nomad+consul server + docker registry + anvil L1
+  r2:
+    ip: 192.168.56.12
+    role: recorder
+    recorder_id: 1
+  r3:
+    ip: 192.168.56.13
+    role: recorder
+    recorder_id: 2
+  w1:
+    ip: 192.168.56.21
+    role: worker
+    sequencer_id: 0
+    services: [sequencer, executor, ingress]
+  w2:
+    ip: 192.168.56.22
+    role: worker
+    sequencer_id: 1
+    services: [sequencer, sealer, da_watcher, batcher]
+
+# Convenience derived lists (used by templates / job placement).
+recorder_ips: ["192.168.56.11", "192.168.56.12", "192.168.56.13"]
+worker_ips: ["192.168.56.21", "192.168.56.22"]
+ingress_ip: "192.168.56.21"      # w1
+sealer_ip: "192.168.56.22"       # w2 (publishes tx_ordering)
+executor_ip: "192.168.56.21"     # w1
+control_ip: "192.168.56.11"      # r1

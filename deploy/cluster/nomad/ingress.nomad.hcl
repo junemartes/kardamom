@@ -1,0 +1,96 @@
+# kardamom-ingress — eth JSON-RPC proxy. Placed on w1 (192.168.56.21).
+#
+# Invocation:
+#   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
+#       --aeron-dir <dir> --shards 2 --jsonrpc-bind 0.0.0.0:8545 \
+#       --ack-policy on-quorum
+#
+# ingress.toml is presence-checked only; runtime tuning is via flags.
+# channels.toml (issue #36) supplies the UDP multicast channels — including the
+# quorum_watermark stream ingress subscribes to for the on-quorum ack gate,
+# published by the quorum job (issue #38).
+#
+# Shares the node's Aeron media driver via the bind-mounted tmpfs aeron.dir.
+# Host networking so :8545 binds on the w1 VM IP.
+#
+# NOTE: this job uses file() for its templates, so submit it from the
+# deploy/cluster/ directory (scripts/deploy.sh does this).
+
+variable "ack_policy" {
+  type        = string
+  description = "Ingress ack durability gate. Defaults to on-quorum: the recorder + quorum jobs (issue #38) publish the quorum watermark, so Q-of-N fsync gating is satisfied. Override for an Aeron-substrate-only bring-up with: nomad job run -var ack_policy=on-offer ingress.nomad.hcl"
+  default     = "on-quorum"
+}
+
+job "ingress" {
+  datacenters = ["dc1"]
+  type        = "service"
+
+  constraint {
+    attribute = "${meta.kardamom_node}"
+    value     = "w1"
+  }
+
+  group "ingress" {
+    count = 1
+
+    network {
+      mode = "host"
+      port "jsonrpc" {
+        static = 8545
+      }
+    }
+
+    task "ingress" {
+      driver = "docker"
+
+      config {
+        image        = "192.168.56.11:5000/kardamom-ingress:dev"
+        network_mode = "host"
+        volumes = [
+          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+        ]
+        args = [
+          "--config", "/local/ingress.toml",
+          "--log-config", "/local/channels.toml",
+          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          "--shards", "2",
+          "--jsonrpc-bind", "0.0.0.0:8545",
+          "--ack-policy", "${var.ack_policy}",
+        ]
+      }
+
+      # Presence-checked config (content lives in config/ingress.toml).
+      template {
+        destination = "local/ingress.toml"
+        data        = file("config/ingress.toml")
+      }
+
+      # Cluster LogConfig (UDP multicast channels), single-sourced from
+      # config/channels.toml.tpl and consumed via --log-config.
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
+      }
+
+      resources {
+        cpu    = 500
+        memory = 512
+      }
+
+      service {
+        name     = "ingress-jsonrpc"
+        port     = "jsonrpc"
+        provider = "consul"
+
+        # The JSON-RPC server only answers POSTs, so a TCP connect check is
+        # the right liveness signal here.
+        check {
+          type     = "tcp"
+          interval = "10s"
+          timeout  = "2s"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,35 @@
+---
+# Local Docker registry on the control node. The host builds and pushes the
+# kardamom/Aeron images here; every VM's Docker treats it as insecure (see
+# roles/docker daemon.json). Values derive from group_vars/all.yml.
+#
+# NOTE: this registry is served over plain HTTP. The host pushing images must
+# have "{{ registry_host }}:{{ registry_port }}" listed as an insecure-registry
+# (and `docker login` is not required — no auth is configured for the test
+# cluster). On-node Docker is already configured for the insecure registry by
+# the docker role.
+
+# community.docker.docker_container drives the Docker API via the Docker SDK
+# for Python on the TARGET host — without it the task fails with
+# "Failed to import docker". docker-ce itself does not pull it in.
+- name: Install the Docker SDK for Python (required by community.docker)
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present
+
+- name: Create the registry data directory
+  ansible.builtin.file:
+    path: "{{ paths.base }}/registry"
+    state: directory
+    mode: "0755"
+
+- name: Run the local Docker registry container
+  community.docker.docker_container:
+    name: kardamom-registry
+    image: registry:2
+    state: started
+    restart_policy: unless-stopped
+    published_ports:
+      - "{{ registry_port }}:5000"
+    volumes:
+      - "{{ paths.base }}/registry:/var/lib/registry"

@@ -1,0 +1,63 @@
+---
+# Install and configure Nomad. Server runs on the control node only; every node
+# runs a client with role/id node metadata. Values derive from group_vars/all.yml.
+
+- name: Create the nomad system group
+  ansible.builtin.group:
+    name: nomad
+    system: true
+
+- name: Create the nomad system user
+  ansible.builtin.user:
+    name: nomad
+    group: nomad
+    system: true
+    shell: /usr/sbin/nologin
+    home: /opt/nomad
+    create_home: false
+
+- name: Create nomad directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: nomad
+    group: nomad
+    mode: "0750"
+  loop:
+    - /etc/nomad.d
+    - /opt/nomad
+
+- name: Download and install the Nomad binary
+  ansible.builtin.unarchive:
+    src: "https://releases.hashicorp.com/nomad/{{ nomad_version }}/nomad_{{ nomad_version }}_linux_amd64.zip"
+    dest: /usr/local/bin
+    remote_src: true
+    owner: root
+    group: root
+    mode: "0755"
+    creates: /usr/local/bin/nomad
+
+- name: Render the Nomad configuration
+  ansible.builtin.template:
+    src: nomad.hcl.j2
+    dest: /etc/nomad.d/nomad.hcl
+    owner: nomad
+    group: nomad
+    mode: "0640"
+  notify: Restart nomad
+
+- name: Install the Nomad systemd unit
+  ansible.builtin.template:
+    src: nomad.service.j2
+    dest: /etc/systemd/system/nomad.service
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Restart nomad
+
+- name: Enable and start Nomad
+  ansible.builtin.systemd:
+    name: nomad
+    enabled: true
+    state: started
+    daemon_reload: true

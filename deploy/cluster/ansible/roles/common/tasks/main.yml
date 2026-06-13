@@ -1,0 +1,69 @@
+---
+# Base packages, Aeron-friendly sysctls, on-node directory layout, and the
+# tmpfs aeron.dir mount. Values derive from group_vars/all.yml.
+
+# No blanket `upgrade:` here — provisioning should be fast and deterministic;
+# base-image currency is the box's concern, not the playbook's.
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - curl
+      - unzip
+      - gnupg
+      - ca-certificates
+    state: present
+
+# The sysctl module both persists each entry to sysctl_file and applies it
+# immediately (reload: true) — one mechanism, one place for the values.
+#
+# `net.core.*mem_*` are NOT network-namespaced, so a container cannot set them
+# (the write would either fail or leak to the host). The container-based CI
+# cluster (cluster-e2e) sets these once on the runner host and passes
+# `kardamom_in_container=true` to skip this task; VMs leave it false (default).
+- name: Install and apply Aeron-friendly socket-buffer sysctls
+  ansible.posix.sysctl:
+    name: "{{ item.name }}"
+    value: "{{ item.value }}"
+    sysctl_file: /etc/sysctl.d/99-kardamom-aeron.conf
+    state: present
+    reload: true
+  loop:
+    - name: net.core.rmem_max
+      value: "16777216"
+    - name: net.core.wmem_max
+      value: "16777216"
+    - name: net.core.rmem_default
+      value: "16777216"
+    - name: net.core.wmem_default
+      value: "16777216"
+  when: not (kardamom_in_container | default(false) | bool)
+
+- name: Create on-node kardamom directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0777"
+  loop:
+    - "{{ paths.base }}"
+    - "{{ paths.archive_dir }}"
+    - "{{ paths.state_dir }}"
+    - "{{ paths.config_dir }}"
+
+- name: Create the Aeron tmpfs mount point
+  ansible.builtin.file:
+    path: "{{ paths.aeron_mount }}"
+    state: directory
+    mode: "0777"
+
+- name: Mount a tmpfs at the Aeron media-driver shared-memory dir
+  ansible.posix.mount:
+    path: "{{ paths.aeron_mount }}"
+    src: tmpfs
+    fstype: tmpfs
+    opts: "size={{ aeron_tmpfs_size }},mode=0777"
+    state: mounted

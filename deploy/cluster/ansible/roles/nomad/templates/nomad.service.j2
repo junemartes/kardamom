@@ -1,0 +1,23 @@
+# Managed by Ansible (roles/nomad).
+# Runs as root: the Nomad client drives the Docker and raw_exec task drivers.
+[Unit]
+Description=Nomad
+Documentation=https://www.nomadproject.io/
+Wants=consul.service docker.service
+After=consul.service docker.service network-online.target
+Requires=network-online.target
+ConditionFileNotEmpty=/etc/nomad.d/nomad.hcl
+
+[Service]
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStart=/usr/local/bin/nomad agent -config /etc/nomad.d
+KillMode=process
+KillSignal=SIGINT
+LimitNOFILE=65536
+LimitNPROC=infinity
+Restart=on-failure
+RestartSec=2
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

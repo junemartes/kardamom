@@ -1,0 +1,44 @@
+# Managed by Ansible (roles/nomad). Derives from group_vars/all.yml.
+datacenter = "dc1"
+data_dir   = "/opt/nomad"
+
+bind_addr = "{{ cluster_nodes[kardamom_node].ip }}"
+
+advertise {
+  http = "{{ cluster_nodes[kardamom_node].ip }}"
+  rpc  = "{{ cluster_nodes[kardamom_node].ip }}"
+  serf = "{{ cluster_nodes[kardamom_node].ip }}"
+}
+
+server {
+  enabled          = {{ 'true' if inventory_hostname in groups['control'] else 'false' }}
+  bootstrap_expect = 1
+}
+
+client {
+  enabled    = true
+  servers    = ["{{ control_ip }}:{{ ports.nomad_rpc }}"]
+
+  meta {
+    kardamom_node = "{{ kardamom_node }}"
+    role          = "{{ role }}"
+    recorder_id   = "{{ recorder_id | default('') }}"
+    sequencer_id  = "{{ sequencer_id | default('') }}"
+  }
+}
+
+consul {
+  address = "127.0.0.1:{{ ports.consul_http }}"
+}
+
+# volumes.enabled is REQUIRED: it defaults to false, and every kardamom job
+# bind-mounts host paths (the shared Aeron tmpfs, archive/state dirs) via the
+# docker driver's `volumes` list — placements fail without it. Nothing needs
+# privileged containers or raw_exec, so neither is enabled.
+plugin "docker" {
+  config {
+    volumes {
+      enabled = true
+    }
+  }
+}

@@ -34,6 +34,12 @@ struct Args {
     /// Path to the TOML config file (schema: `ExecutorConfig`).
     #[arg(long)]
     config: PathBuf,
+    /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
+    /// Unset ⇒ built-in single-host IPC defaults (preserves local/e2e
+    /// behaviour); multi-host deployments point this at the rendered UDP
+    /// channels config.
+    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
+    log_config: Option<PathBuf>,
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
@@ -89,7 +95,9 @@ async fn main() -> Result<()> {
         "kardamom-executor starting"
     );
 
-    let channels = LogConfig::default().channels;
+    let channels = LogConfig::resolve(args.log_config.as_deref())
+        .context("resolve log config")?
+        .channels;
     let rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,

@@ -41,6 +41,12 @@ struct Args {
     /// Polling cadence in seconds (default 12).
     #[arg(long, default_value_t = 12)]
     poll_interval_secs: u64,
+    /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
+    /// Unset ⇒ built-in single-host IPC defaults (preserves local/e2e
+    /// behaviour); multi-host deployments point this at the rendered UDP
+    /// channels config.
+    #[arg(long, env = "KARDAMOM_LOG_CONFIG")]
+    log_config: Option<PathBuf>,
     /// Aeron Media Driver directory (`aeron.dir`). When omitted, falls
     /// back to the Aeron client's default lookup (`AERON_DIR` env / OS
     /// default). The local-e2e `just` recipe always passes this explicitly.
@@ -84,7 +90,9 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let channels = LogConfig::default().channels;
+    let channels = LogConfig::resolve(args.log_config.as_deref())
+        .context("resolve log config")?
+        .channels;
     let aeron_rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
