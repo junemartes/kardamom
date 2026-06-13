@@ -50,6 +50,11 @@ jobs:
       # deployer) and `anvil` for the L1-backed deposit round-trip. Without
       # anvil that test skips itself and passes vacuously.
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pin a concrete version: `stable`/`latest` make foundryup hit the
+          # GitHub releases API, which 403s under the unauthenticated per-IP
+          # rate limit on Actions runners. A concrete tag downloads directly.
+          version: v1.7.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: docker-e2e
