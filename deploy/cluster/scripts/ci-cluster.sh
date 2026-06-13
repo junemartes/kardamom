@@ -44,6 +44,22 @@ log() { echo "==> $*"; }
 # trap, too late). Best-effort; never let diagnostics mask the real exit code.
 dump_diagnostics() {
   log "FAILURE diagnostics — Nomad job + allocation logs"
+  # Host network state first: the cross-node Aeron data plane is UDP multicast,
+  # and the usual failure is the bridge/netfilter dropping it. These reveal
+  # whether bridged frames bypass iptables, whether FORWARD is dropping (counts),
+  # and the bridge's multicast flags + joined groups per node.
+  echo "===== host: bridge-nf-call-iptables ====="
+  cat /proc/sys/net/bridge/bridge-nf-call-iptables 2>/dev/null || echo "(br_netfilter not loaded)"
+  echo "===== host: iptables FORWARD (counters) ====="
+  sudo iptables -nvL FORWARD 2>/dev/null | head -25 || true
+  echo "===== host: bridge ${BRIDGE_NAME:-kardamom-br0} ====="
+  ip -d link show "${BRIDGE_NAME:-kardamom-br0}" 2>/dev/null || true
+  cat "/sys/class/net/${BRIDGE_NAME:-kardamom-br0}/bridge/multicast_snooping" 2>/dev/null \
+    | sed 's/^/  multicast_snooping=/' || true
+  for n in r1 w1; do
+    echo "----- ${n}: multicast groups (ip maddr) -----"
+    docker exec "kardamom-${n}" ip maddr show dev eth0 2>/dev/null || true
+  done
   export NOMAD_ADDR="http://192.168.56.11:4646"
   nomad job status 2>/dev/null || true
   for job in aeron recorder quorum anvil sealer sequencer executor ingress batcher; do
@@ -92,6 +108,27 @@ trap 'on_exit "$?"' EXIT
 log "applying Aeron socket-buffer sysctls on the host"
 sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 \
                 net.core.rmem_default=16777216 net.core.wmem_default=16777216
+
+# Let bridged frames bypass iptables. With br_netfilter loaded and
+# bridge-nf-call-iptables=1 (docker's default), L2-bridged IP frames traverse
+# the iptables FORWARD chain — whose policy docker sets to DROP, with ACCEPT
+# rules only for the traffic it recognises. Flooded UDP multicast (Aeron's
+# cross-node tx_ordering + fsync/quorum watermarks) doesn't match those rules,
+# so it's dropped in FORWARD even though IGMP snooping is off — unicast TCP
+# (Consul/Nomad/ingress RPC) is unaffected because docker DOES allow it, which
+# is exactly why the recorders log "recording initiated" but never "recording
+# ready". Setting bridge-nf-call-iptables=0 makes bridged frames pure L2, so the
+# bridge floods multicast between node containers unimpeded. Safe here: one
+# isolated test network, no inter-network isolation to preserve.
+sudo modprobe br_netfilter 2>/dev/null || true
+if [[ -e /proc/sys/net/bridge/bridge-nf-call-iptables ]]; then
+  sudo sysctl -w net.bridge.bridge-nf-call-iptables=0 \
+                 net.bridge.bridge-nf-call-ip6tables=0 \
+    && log "bridge-nf-call-iptables=0 (bridged multicast bypasses iptables)" \
+    || log "WARN: could not clear bridge-nf-call-iptables"
+else
+  log "br_netfilter not present; bridged frames already bypass iptables"
+fi
 
 # --- 2. Bridge network with the contract subnet -----------------------------
 docker network rm "${NET}" >/dev/null 2>&1 || true
