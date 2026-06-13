@@ -43,19 +43,26 @@ job "aeron" {
       config {
         image        = "192.168.56.11:5000/kardamom-aeron:dev"
         network_mode = "host"
-        # host tmpfs aeron.dir -> container /aeron-mount (matches image AERON_DIR
-        # = /aeron-mount/dir), and persistent archive dir.
+        # CRITICAL: the media driver and every service container must see
+        # aeron.dir at the SAME ABSOLUTE PATH. Aeron records absolute paths in
+        # its CnC metadata (e.g. publications/<id>.logbuffer), so a client that
+        # mounts the same host dir at a DIFFERENT path can't map the buffers
+        # ("Failed to open file: /aeron-mount/dir/publications/24.logbuffer").
+        # The services bind /opt/kardamom/aeron-mount -> /opt/kardamom/aeron-mount
+        # and use --aeron-dir /opt/kardamom/aeron-mount/dir, so the driver must
+        # use that exact path too (NOT the image's /aeron-mount default).
         volumes = [
-          "/opt/kardamom/aeron-mount:/aeron-mount",
-          "/opt/kardamom/archive:/aeron-mount/archive",
+          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+          "/opt/kardamom/archive:/opt/kardamom/archive",
         ]
       }
 
-      # Mirror the image defaults explicitly so the contract is visible here.
+      # Override the image's /aeron-mount defaults so the path matches the
+      # services (see the volumes note above).
       env {
-        AERON_DIR                   = "/aeron-mount/dir"
-        AERON_ARCHIVE_MOUNT         = "/aeron-mount/archive"
-        AERON_ARCHIVE_DIR           = "/aeron-mount/archive/dir"
+        AERON_DIR                   = "/opt/kardamom/aeron-mount/dir"
+        AERON_ARCHIVE_MOUNT         = "/opt/kardamom/archive"
+        AERON_ARCHIVE_DIR           = "/opt/kardamom/archive/dir"
         AERON_ARCHIVE_CLASS         = "io.aeron.archive.ArchivingMediaDriver"
         AERON_TERM_BUFFER_LENGTH    = "4194304"
         AERON_IPC_TERM_BUFFER_LENGTH = "4194304"
