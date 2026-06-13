@@ -9,7 +9,7 @@
 //! advancing, and the quorum stalls past it once Q-1 survivors have moved
 //! beyond it. The supervisor is responsible for restarting dead recorders.
 
-use kardamom_types::{BPosition, FsyncWatermark};
+use kardamom_types::{BPosition, FsyncWatermark, QuorumWatermark};
 
 #[derive(Clone, Debug)]
 pub struct QuorumState {
@@ -65,11 +65,51 @@ impl QuorumState {
 }
 
 // ---------------------------------------------------------------------------
-// QuorumAggregator runner task (gated behind `aeron-live`)
+// Shared aggregation loop + runner task.
 // ---------------------------------------------------------------------------
+
+/// How long the loop idles when no subscription yielded a fragment, to avoid
+/// a busy-spin. Small enough that quorum-advance tail latency stays low.
+const IDLE_BACKOFF: std::time::Duration = std::time::Duration::from_micros(50);
+
+/// Drain all N per-recorder fsync-watermark subscriptions and republish the
+/// aggregated quorum position whenever it advances, until `should_stop`.
+///
+/// Synchronous and thread-confined: `subs`/`publisher` wrap thread-confined
+/// Aeron handles, so this must run on the thread that owns them. Both the
+/// tokio [`QuorumAggregator`] (via `spawn_blocking`) and the standalone
+/// `kardamom-recorder --aggregate` process call this — one loop, one place to
+/// reason about the quorum-advance/publish semantics.
+pub fn run_quorum_loop(
+    subs: &mut [crate::subscriber::WatermarkSubscriber],
+    state: &mut QuorumState,
+    publisher: &crate::publisher::QuorumPublisher,
+    mut should_stop: impl FnMut() -> bool,
+) {
+    let mut last_published = None;
+    while !should_stop() {
+        let mut any = false;
+        for sub in subs.iter_mut() {
+            any |= sub.poll(|w, _| state.observe(w), 64) > 0;
+        }
+        if any
+            && let Some(p) = state.quorum()
+            && last_published != Some(p)
+        {
+            if let Err(e) = publisher.publish(&QuorumWatermark { position: p }) {
+                tracing::error!(error = %e, "quorum publish failed");
+            } else {
+                last_published = Some(p);
+            }
+        }
+        if !any {
+            std::thread::sleep(IDLE_BACKOFF);
+        }
+    }
+}
+
 mod aggregator {
     use std::sync::Arc;
-    use std::time::Duration;
 
     use tokio::task::JoinHandle;
 
@@ -77,9 +117,8 @@ mod aggregator {
     use crate::error::LogError;
     use crate::publisher::QuorumPublisher;
     use crate::subscriber::Subscribers;
-    use kardamom_types::QuorumWatermark;
 
-    use super::QuorumState;
+    use super::{QuorumState, run_quorum_loop};
 
     /// Tokio task that drains all N per-recorder watermark subscriptions and
     /// republishes the quorum position whenever it advances.
@@ -99,26 +138,8 @@ mod aggregator {
                 .collect::<Result<_, _>>()?;
 
             let handle = tokio::task::spawn_blocking(move || {
-                let mut last_published = None;
-                loop {
-                    let mut any = false;
-                    for sub in subs.iter_mut() {
-                        any |= sub.poll(|w, _| state.observe(w), 64) > 0;
-                    }
-                    if any
-                        && let Some(p) = state.quorum()
-                        && last_published != Some(p)
-                    {
-                        if let Err(e) = publisher.publish(&QuorumWatermark { position: p }) {
-                            tracing::error!(error = %e, "quorum publish failed");
-                        } else {
-                            last_published = Some(p);
-                        }
-                    }
-                    if !any {
-                        std::thread::sleep(Duration::from_micros(50));
-                    }
-                }
+                // Never stops on its own; the task is aborted on shutdown.
+                run_quorum_loop(&mut subs, &mut state, &publisher, || false);
             });
             Ok(Self { handle })
         }

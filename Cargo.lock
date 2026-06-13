@@ -3913,6 +3913,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -3959,6 +3960,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kardamom-recorder"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "kardamom-log",
+ "kardamom-types",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

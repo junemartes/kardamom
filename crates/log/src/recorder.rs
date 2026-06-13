@@ -41,18 +41,111 @@
 
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Duration;
 
 use tracing::{info, warn};
 
-use crate::config::{ChannelsConfig, RecorderId};
+use crate::config::{AeronConfig, ChannelsConfig, RecorderId};
 use crate::error::LogError;
 use crate::publisher::WatermarkPublisher;
 use kardamom_types::FsyncWatermark;
 
 type Archive = rusteron_archive::AeronArchive;
+type AeronClient = rusteron_client::Aeron;
+
+/// Connect an Aeron client to the node-local Media Driver. When `aeron_dir`
+/// is `Some`, the client joins the driver at that shared-memory directory
+/// (the cluster's per-node tmpfs); otherwise the C client's default lookup
+/// applies. Thread-confined: the returned client is `!Send` and must be used
+/// on the calling thread (see the module's thread-confinement note).
+pub fn connect_client(aeron_dir: Option<&Path>) -> Result<AeronClient, LogError> {
+    let ctx = rusteron_client::AeronContext::new()
+        .map_err(|e| LogError::Aeron(format!("AeronContext::new: {e}")))?;
+    if let Some(dir) = aeron_dir {
+        let dir_s = dir
+            .to_str()
+            .ok_or_else(|| LogError::Aeron(format!("aeron.dir not UTF-8: {dir:?}")))?;
+        let dir_c = CString::new(dir_s)
+            .map_err(|_| LogError::Aeron(format!("aeron.dir contains NUL: {dir_s}")))?;
+        ctx.set_dir(dir_c.as_c_str())
+            .map_err(|e| LogError::Aeron(format!("set_dir: {e}")))?;
+    }
+    let aeron = AeronClient::new(&ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
+    aeron
+        .start()
+        .map_err(|e| LogError::Aeron(format!("Aeron::start: {e}")))?;
+    Ok(aeron)
+}
+
+/// A connected Archive control session plus the archive-side Aeron client that
+/// must outlive it. `rusteron_archive` bundles its own `Aeron` type (distinct
+/// from `rusteron_client::Aeron`), so the recorder runs two client conductors
+/// against the same Media Driver: this one for archive control, and a
+/// [`connect_client`] one for publishing the fsync watermark.
+pub struct ArchiveSession {
+    /// Held only to keep the archive's client conductor alive; never used
+    /// directly (the `archive` drives all control calls).
+    _aeron: rusteron_archive::Aeron,
+    pub archive: Archive,
+}
+
+/// Connect an `AeronArchive` control session over the configured archive
+/// control request/response channels, joining the Media Driver at `aeron_dir`.
+/// The recorder uses this to drive `start_recording` and poll the durable
+/// recording position. Thread-confined: use the returned session only on the
+/// calling thread.
+pub fn connect_archive(
+    aeron_dir: Option<&Path>,
+    cfg: &AeronConfig,
+) -> Result<ArchiveSession, LogError> {
+    let ctx = rusteron_archive::AeronContext::new()
+        .map_err(|e| LogError::Aeron(format!("archive AeronContext::new: {e}")))?;
+    if let Some(dir) = aeron_dir {
+        let dir_s = dir
+            .to_str()
+            .ok_or_else(|| LogError::Aeron(format!("aeron.dir not UTF-8: {dir:?}")))?;
+        let dir_c = CString::new(dir_s)
+            .map_err(|_| LogError::Aeron(format!("aeron.dir contains NUL: {dir_s}")))?;
+        ctx.set_dir(dir_c.as_c_str())
+            .map_err(|e| LogError::Aeron(format!("archive set_dir: {e}")))?;
+    }
+    let aeron = rusteron_archive::Aeron::new(&ctx)
+        .map_err(|e| LogError::Aeron(format!("archive Aeron::new: {e}")))?;
+    aeron
+        .start()
+        .map_err(|e| LogError::Aeron(format!("archive Aeron::start: {e}")))?;
+
+    let actx = rusteron_archive::AeronArchiveContext::new()
+        .map_err(|e| LogError::Aeron(format!("AeronArchiveContext::new: {e}")))?;
+    actx.set_aeron(&aeron)
+        .map_err(|e| LogError::Aeron(format!("archive set_aeron: {e}")))?;
+    let req = CString::new(cfg.archive_control_request_channel.as_str())
+        .map_err(|_| LogError::Aeron("archive control request channel NUL".into()))?;
+    let resp = CString::new(cfg.archive_control_response_channel.as_str())
+        .map_err(|_| LogError::Aeron("archive control response channel NUL".into()))?;
+    actx.set_control_request_channel(req.as_c_str())
+        .map_err(|e| LogError::Aeron(format!("set_control_request_channel: {e}")))?;
+    actx.set_control_response_channel(resp.as_c_str())
+        .map_err(|e| LogError::Aeron(format!("set_control_response_channel: {e}")))?;
+    actx.set_message_timeout_ns(60_000_000_000)
+        .map_err(|e| LogError::Aeron(format!("set_message_timeout_ns: {e}")))?;
+    let archive = rusteron_archive::AeronArchiveAsyncConnect::new_with_aeron(&actx, &aeron)
+        .map_err(|e| LogError::Aeron(format!("archive async connect: {e}")))?
+        .poll_blocking(Duration::from_secs(30))
+        .map_err(|e| LogError::Aeron(format!("archive connect poll: {e}")))?;
+    Ok(ArchiveSession {
+        _aeron: aeron,
+        archive,
+    })
+}
+
+/// Aeron's `AERON_NULL_VALUE` sentinel (the bindings module is private, so it
+/// is restated here). Used as the "match any session" wildcard for
+/// [`rusteron_archive::AeronArchive::find_last_matching_recording`] and as the
+/// "no recording found" return.
+const AERON_NULL_VALUE: i64 = -1;
 
 /// Which logical tx_data recorder is tailing. TxOrdering feeds the
 /// quorum aggregator (N recorders, Q-of-N watermark). TxData[i] feeds
@@ -135,17 +228,41 @@ impl Recorder {
         let channel_c = CString::new(channel)
             .map_err(|e| LogError::Aeron(format!("{ctx} channel contains NUL: {e}")))?;
 
-        // start_recording: (channel, stream_id, source_location, auto_stop)
-        // SOURCE_LOCATION_LOCAL -> we are co-located with the publisher.
-        let recording_id = archive
-            .start_recording(
+        // Idempotent start: a recording started with auto_stop=false outlives
+        // the client that started it, so a recorder process that restarts (or
+        // a fresh client against a long-lived ArchivingMediaDriver, as in the
+        // cluster) finds its recording already active and must ADOPT it — a
+        // second start_recording on the same (channel, stream) is rejected by
+        // the archive. session_id = AERON_NULL_VALUE (-1) matches any session.
+        let existing = archive
+            .find_last_matching_recording(
+                0,
                 channel_c.as_c_str(),
                 stream_id,
-                rusteron_archive::SOURCE_LOCATION_LOCAL,
-                false,
+                AERON_NULL_VALUE as i32,
             )
-            .map_err(|e| LogError::Aeron(format!("start_recording {ctx}: {e}")))?;
-        info!(recording_id, ?kind, "started recording");
+            .unwrap_or(AERON_NULL_VALUE);
+        let recording_id = if existing >= 0 {
+            info!(
+                recording_id = existing,
+                ?kind,
+                "adopting existing recording"
+            );
+            existing
+        } else {
+            // start_recording: (channel, stream_id, source_location, auto_stop)
+            // SOURCE_LOCATION_LOCAL -> we are co-located with the publisher.
+            let id = archive
+                .start_recording(
+                    channel_c.as_c_str(),
+                    stream_id,
+                    rusteron_archive::SOURCE_LOCATION_LOCAL,
+                    false,
+                )
+                .map_err(|e| LogError::Aeron(format!("start_recording {ctx}: {e}")))?;
+            info!(recording_id = id, ?kind, "started recording");
+            id
+        };
 
         // Pull the descriptor once at startup so we can compute segment file
         // paths without a control-channel round-trip on every fsync tick.
