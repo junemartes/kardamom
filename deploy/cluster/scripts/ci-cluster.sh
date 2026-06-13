@@ -96,7 +96,31 @@ sudo sysctl -w net.core.rmem_max=16777216 net.core.wmem_max=16777216 \
 # --- 2. Bridge network with the contract subnet -----------------------------
 docker network rm "${NET}" >/dev/null 2>&1 || true
 log "creating bridge ${NET} (${SUBNET})"
-docker network create --driver bridge --subnet "${SUBNET}" "${NET}"
+# Name the underlying Linux bridge so its /sys path is deterministic (otherwise
+# docker derives br-<network-id[:12]>). We disable IGMP snooping on it next.
+BRIDGE_NAME=kardamom-br0
+docker network create --driver bridge \
+  -o "com.docker.network.bridge.name=${BRIDGE_NAME}" \
+  --subnet "${SUBNET}" "${NET}"
+
+# Aeron's cross-node data plane is UDP MULTICAST (tx_ordering: sealer ->
+# recorders + executor; the per-recorder fsync watermarks and the aggregated
+# quorum watermark). This bridge is an isolated L2 segment with NO IGMP querier,
+# so with the kernel default (multicast_snooping=1) the bridge stops flooding
+# group traffic once its snooping state lapses — multicast then never crosses
+# between node containers. The symptom is precise: each recorder logs "recording
+# initiated" for TxOrdering but never "recording ready" (the archive's recording
+# subscription gets no image), so no fsync watermark is published, the quorum
+# watermark never advances, and ingress (--ack-policy on-quorum) times out with
+# "timed out waiting for receipt or watermark". Disabling snooping makes the
+# bridge flood multicast to every port — correct and reliable for a 5-node test
+# segment. (Best-effort: warn but continue if /sys isn't writable.)
+SNOOP_PATH="/sys/class/net/${BRIDGE_NAME}/bridge/multicast_snooping"
+if echo 0 | sudo tee "${SNOOP_PATH}" >/dev/null 2>&1; then
+  log "disabled IGMP snooping on ${BRIDGE_NAME} (multicast flood mode)"
+else
+  log "WARN: could not write ${SNOOP_PATH}; cross-node multicast may be filtered"
+fi
 
 # --- 3. Node image + 5 systemd containers -----------------------------------
 log "building node image"
