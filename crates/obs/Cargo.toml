@@ -1,0 +1,21 @@
+[package]
+name = "kardamom-obs"
+version = { workspace = true }
+edition = { workspace = true }
+license = "MIT"
+publish = false
+
+[lib]
+name = "kardamom_obs"
+path = "src/lib.rs"
+
+[dependencies]
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

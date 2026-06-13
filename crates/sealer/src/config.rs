@@ -13,7 +13,8 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SealerConfig {
-    /// Identifier for this sealer process, used as a metric label.
+    /// Identifier for this sealer process, used as the `host_id` metric
+    /// label unless overridden via `--host-id`/`KARDAMOM_HOST_ID`.
     pub host_id: u8,
     /// Aeron channel URI for tx_ordering (publish + subscribe on the same channel).
     pub channel_b_uri: String,

@@ -40,6 +40,7 @@
 //! crossbeam channels.
 
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::debug;
@@ -268,6 +269,16 @@ where
             let mut last_processed_position: Option<BPosition> = None;
             // Sanity: tx_idx assigned by the tx_ordering reader is monotone.
             let mut expected_tx_idx = TxIndex::ZERO;
+            // Wall time spent executing the block's txs/deposits (excludes
+            // channel idle time between txs), recorded when the BoundaryStart
+            // closes the block. `None` for empty blocks.
+            let mut block_apply_elapsed: Option<Duration> = None;
+            // Pre-resolved counter handles: this loop is the executor's
+            // hottest path, so skip the per-event registry lookup.
+            let tx_applied_ok =
+                metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok");
+            let tx_applied_error =
+                metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error");
 
             loop {
                 let msg = match rx.recv() {
@@ -292,7 +303,8 @@ where
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
-                        let (receipt, ws) = execute_tx(
+                        let apply_start = Instant::now();
+                        let result = execute_tx(
                             &snapshot,
                             &delta,
                             env,
@@ -301,10 +313,17 @@ where
                             &envelope,
                             tx_index_in_block,
                             cumulative_gas_used,
-                        )?;
+                        );
+                        if result.is_ok() {
+                            tx_applied_ok.increment(1);
+                        } else {
+                            tx_applied_error.increment(1);
+                        }
+                        let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
+                        *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
                         last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
@@ -327,7 +346,8 @@ where
                             block_number: current_block,
                             l2_timestamp: current_l2_ts,
                         };
-                        let (receipt, ws) = execute_deposit_tx(
+                        let apply_start = Instant::now();
+                        let result = execute_deposit_tx(
                             &snapshot,
                             &delta,
                             env,
@@ -336,10 +356,17 @@ where
                             &deposit,
                             tx_index_in_block,
                             cumulative_gas_used,
-                        )?;
+                        );
+                        if result.is_ok() {
+                            tx_applied_ok.increment(1);
+                        } else {
+                            tx_applied_error.increment(1);
+                        }
+                        let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
+                        *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
                         last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
@@ -363,6 +390,14 @@ where
                             });
                         }
 
+                        // Record the block's accumulated execution time.
+                        // Only recorded when the block had at least one tx;
+                        // empty blocks are skipped.
+                        if let Some(elapsed) = block_apply_elapsed.take() {
+                            metrics::histogram!(crate::metrics::BLOCK_APPLY_DURATION_SECONDS)
+                                .record(elapsed.as_secs_f64());
+                        }
+
                         // S0: NO state-root computation. The sealed
                         // BlockBoundary on tx_receipts is slim — three
                         // fields, no commitment.
@@ -379,6 +414,10 @@ where
                         // receives has an empty receipts vec.
                         let pending = std::mem::take(&mut delta);
                         let bd: BlockDelta = pending.finalize(block_number);
+
+                        // Time the state-commit: submit to writer queue +
+                        // wait for durable ack from the writer signal.
+                        let commit_start = Instant::now();
                         sw_queue.submit(boundary.clone(), bd)?;
 
                         if tx.send(ExecToCommit::Boundary(boundary)).is_err() {
@@ -387,6 +426,10 @@ where
 
                         // Wait for the writer to durably commit.
                         let committed = sw_signal.wait_committed(block_number)?;
+                        metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
+                            .record(commit_start.elapsed().as_secs_f64());
+                        metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(block_number as f64);
+
                         debug!(
                             target: "executor",
                             committed,

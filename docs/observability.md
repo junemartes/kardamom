@@ -5,6 +5,66 @@ point that feeds both Prometheus metrics and `tracing-flame` flamegraphs. The
 local stack — Prometheus + Grafana — is wired up with `docker compose`, and a
 `kardamom-bench` binary drives load so the dashboard panels move.
 
+## Metrics
+
+Every kardamom service binary exports Prometheus metrics on its own HTTP listener.
+Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
+
+| Service | Default address | Dashboard UID |
+| --- | --- | --- |
+| `kardamom` (RPC node) | `127.0.0.1:9000` | `kardamom-node` |
+| `kardamom-sequencer` | `127.0.0.1:9001` | `kardamom-sequencer` |
+| `kardamom-batcher` | `127.0.0.1:9002` | `kardamom-batcher` |
+| `kardamom-sealer` | `127.0.0.1:9003` | `kardamom-sealer` |
+| `kardamom-executor` | `127.0.0.1:9004` | `kardamom-executor` |
+| `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
+| `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
+
+All seven binaries read the same `KARDAMOM_METRICS_ADDR` env var, so a value
+shared across colocated services makes them race for one socket — prefer the
+per-service `--metrics-addr` flag when overriding more than one service.
+
+The services bind loopback by default. The compose-managed Prometheus scrapes
+them through `host.docker.internal`, which works as-is on Docker Desktop
+(macOS/Windows); on Linux that name resolves to the bridge gateway, so each
+service must be started with `--metrics-addr 0.0.0.0:<port>` (or another
+non-loopback bind) to be reachable.
+
+Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
+`local`; the sealer defaults to its config file's `host_id` instead). It's
+stamped on every emitted metric as the `host_id` label, alongside an automatic
+`service` label set by `kardamom_obs::init`. The top-level `Kardamom Overview`
+dashboard exposes a `host` template variable; per-service dashboards inherit it.
+
+### Naming convention
+
+`kardamom_<service>_<subsystem>_<name>_<unit>` (e.g. `kardamom_sequencer_tx_ingested_total`,
+`kardamom_executor_block_apply_duration_seconds`). The RPC node uses
+`kardamom_rpc_*` for handler-level metrics and `kardamom_block_number` for the
+chain head (predates the convention).
+
+### Scaling to multiple hosts
+
+Each scrape job in `deploy/prometheus.yml` is a static-targets list. To add a
+second host running every service, append `host-2:<port>` to each of the seven
+target lists. Every metric is already labelled with `host_id`, so dashboards
+group by host without relabel rules.
+
+### Rename map (from before this PR)
+
+| Old | New |
+| --- | --- |
+| `batcher.blocks_observed_total` | `kardamom_batcher_blocks_observed_total` |
+| `batcher.batches_posted_total` | `kardamom_batcher_batches_posted_total` |
+| `batcher.blobs_posted_total` | `kardamom_batcher_blobs_posted_total` |
+| `sealer_boundaries_emitted_total` | `kardamom_sealer_boundaries_emitted_total` |
+| `sealer_block_number` | `kardamom_sealer_block_number` |
+| `sealer_tick_skipped_total` | `kardamom_sealer_tick_skipped_total` |
+
+The sealer's per-emission `host_id` label is gone — `host_id` is now a
+recorder-level global, sourced from `--host-id`/`KARDAMOM_HOST_ID` and falling
+back to the sealer config's `host_id`.
+
 ## What is instrumented
 
 Per-stage spans + histograms (`kardamom_rpc_stage_duration_seconds`):
@@ -22,7 +82,8 @@ method** (so the flamegraph nests the per-stage spans under e.g.
 `method`, `outcome` (`ok` or `err`).
 
 Plus `kardamom_block_number` (gauge) and `kardamom_build_info` (gauge, always
-1, labeled with `version` and `git_sha`).
+1, labeled with `version` and `sha` — set `KARDAMOM_GIT_SHA` at build time to
+populate the latter).
 
 ## Quick start
 
@@ -237,7 +298,8 @@ per-signer presign for main starting at nonce `WARMUP`.
 
 ## Dashboard panels
 
-The provisioned dashboard (`deploy/grafana/dashboards/kardamom-rpc.json`) has
+The provisioned dashboard
+(`deploy/grafana/provisioning/dashboards-json/kardamom-node.json`) has
 six panels in a 2×3 grid plus a footer:
 
 1. **Request rate** — `sum by (method) (rate(kardamom_rpc_requests_total[30s]))`

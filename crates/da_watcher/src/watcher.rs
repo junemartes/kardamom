@@ -14,6 +14,7 @@ use bytes::Bytes;
 use kardamom_types::Deposit;
 
 use crate::derive::{alias_l1_address, source_hash};
+use crate::metrics;
 use crate::publisher::{DepositPublisher, PublishError};
 use crate::source::{DepositLog, L1Source, L1SourceError};
 
@@ -92,6 +93,9 @@ where
         Err(e) => return Err(MonitorError::Tip(e)),
     };
 
+    // Emit the finalized tip gauge on every successful tip fetch.
+    ::metrics::gauge!(metrics::L1_FINALIZED).set(tip as f64);
+
     let from_block = match cursor {
         None => {
             // Seed: skip historical deposits per spec Non-Goals.
@@ -113,6 +117,7 @@ where
         match publisher.publish(&dep) {
             Ok(pos) => {
                 published += 1;
+                ::metrics::counter!(metrics::DEPOSITS_DETECTED_TOTAL).increment(1);
                 debug!(
                     target: "da_watcher",
                     source_hash = ?dep.source_hash,
@@ -196,18 +201,28 @@ where
                 }
                 _ = interval.tick() => {
                     match process_once(publisher.as_ref(), source.as_ref(), config.lockbox, &mut cursor).await {
-                        Ok(0) => {}
+                        Ok(0) => {
+                            ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
+                        }
                         Ok(n) => {
+                            ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
                             info!(target: "da_watcher", published = n, "deposits published");
                         }
                         Err(MonitorError::NotFinalized) => {
+                            ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "ok").increment(1);
                             debug!(target: "da_watcher", "L1 has no finalized block yet");
                         }
                         Err(MonitorError::PublisherClosed) => {
                             warn!(target: "da_watcher", "publisher closed; exiting");
                             break;
                         }
+                        Err(ref e @ MonitorError::Tip(L1SourceError::Decode(_)))
+                        | Err(ref e @ MonitorError::Logs(L1SourceError::Decode(_))) => {
+                            ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "parse_error").increment(1);
+                            warn!(target: "da_watcher", error = %e, "tick failed (parse error)");
+                        }
                         Err(e) => {
+                            ::metrics::counter!(metrics::TICK_TOTAL, "outcome" => "rpc_error").increment(1);
                             warn!(target: "da_watcher", error = %e, "tick failed");
                         }
                     }

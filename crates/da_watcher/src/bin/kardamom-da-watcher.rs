@@ -7,6 +7,7 @@
 //! onto the `tx_deposits` Aeron channel via the live
 //! [`LiveTxDepositsPublisher`] adapter (wraps `kardamom_log::TxDepositsPublisherHandle`).
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
@@ -45,6 +46,12 @@ struct Args {
     /// default). The local-e2e `just` recipe always passes this explicitly.
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
+    /// Address for the Prometheus /metrics HTTP listener.
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9005")]
+    metrics_addr: SocketAddr,
+    /// Host identifier; stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -62,6 +69,16 @@ fn main() -> anyhow::Result<()> {
         lockbox,
         poll_interval: Duration::from_secs(args.poll_interval_secs),
     };
+
+    kardamom_obs::init(
+        "da-watcher",
+        args.metrics_addr,
+        &args.host_id,
+        env!("CARGO_PKG_VERSION"),
+        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+    )
+    .context("init prometheus exporter")?;
+    kardamom_da_watcher::metrics::describe();
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

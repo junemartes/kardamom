@@ -3,13 +3,12 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
-use metrics_exporter_prometheus::PrometheusBuilder;
 use tracing_flame::FlameLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, fmt};
 
-use kardamom_node::{Node, metrics as kmetrics, start_server};
+use kardamom_node::{Node, start_server};
 
 mod chain;
 
@@ -36,8 +35,12 @@ struct Args {
     rpc_addr: SocketAddr,
 
     /// Address to bind the Prometheus `/metrics` endpoint on.
-    #[arg(long, default_value = "127.0.0.1:9000")]
+    #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9000")]
     metrics_addr: SocketAddr,
+
+    /// Host identifier; stamped on every metric.
+    #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
+    host_id: String,
 }
 
 fn init_tracing() -> Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs::File>>> {
@@ -78,19 +81,16 @@ fn init_tracing() -> Option<tracing_flame::FlushGuard<std::io::BufWriter<std::fs
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    PrometheusBuilder::new()
-        .with_http_listener(args.metrics_addr)
-        .set_buckets(kmetrics::DURATION_BUCKETS)?
-        .install()?;
-
     let _flame_guard = init_tracing();
 
-    metrics::gauge!(
-        kmetrics::BUILD_INFO,
-        "version" => env!("CARGO_PKG_VERSION"),
-        "git_sha" => option_env!("GIT_SHA").unwrap_or("unknown"),
-    )
-    .set(1.0);
+    let git_sha = option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown");
+    kardamom_obs::init(
+        "node",
+        args.metrics_addr,
+        &args.host_id,
+        env!("CARGO_PKG_VERSION"),
+        git_sha,
+    )?;
 
     let genesis = chain::load(&args.chain)?;
     let alloc_entries = genesis.alloc.len();
