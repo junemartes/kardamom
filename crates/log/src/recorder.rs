@@ -229,40 +229,19 @@ impl Recorder {
             .map_err(|e| LogError::Aeron(format!("{ctx} channel contains NUL: {e}")))?;
 
         // Idempotent start: a recording started with auto_stop=false outlives
-        // the client that started it, so a recorder process that restarts (or
-        // a fresh client against a long-lived ArchivingMediaDriver, as in the
-        // cluster) finds its recording already active and must ADOPT it — a
-        // second start_recording on the same (channel, stream) is rejected by
-        // the archive. session_id = AERON_NULL_VALUE (-1) matches any session.
-        let existing = archive
-            .find_last_matching_recording(
-                0,
-                channel_c.as_c_str(),
-                stream_id,
-                AERON_NULL_VALUE as i32,
-            )
-            .unwrap_or(AERON_NULL_VALUE);
-        let recording_id = if existing >= 0 {
-            info!(
-                recording_id = existing,
-                ?kind,
-                "adopting existing recording"
-            );
-            existing
-        } else {
-            // start_recording: (channel, stream_id, source_location, auto_stop)
-            // SOURCE_LOCATION_LOCAL -> we are co-located with the publisher.
-            let id = archive
-                .start_recording(
-                    channel_c.as_c_str(),
-                    stream_id,
-                    rusteron_archive::SOURCE_LOCATION_LOCAL,
-                    false,
-                )
-                .map_err(|e| LogError::Aeron(format!("start_recording {ctx}: {e}")))?;
-            info!(recording_id = id, ?kind, "started recording");
-            id
-        };
+        // the client that started it, so a recorder that restarts (or a fresh
+        // client against a long-lived ArchivingMediaDriver, as in the cluster)
+        // must ADOPT the already-active recording — a second start_recording on
+        // the same (channel, stream) is rejected by the archive.
+        //
+        // find-then-start is check-then-act, so when several recorders target
+        // the *same* (channel, stream) on *one* archive (e.g. the single-host
+        // quorum e2e: N recorders all recording tx_ordering) two can both see
+        // "none" and race start_recording. We resolve the race by retrying:
+        // on a start_recording rejection, re-find and adopt the winner's
+        // recording. Bounded so a genuinely broken control channel still fails.
+        let recording_id =
+            Self::find_or_start_recording(&archive, channel_c.as_c_str(), stream_id, kind, ctx)?;
 
         // Pull the descriptor once at startup so we can compute segment file
         // paths without a control-channel round-trip on every fsync tick.
@@ -279,6 +258,67 @@ impl Recorder {
             term_buffer_length,
             segment_file_length,
         })
+    }
+
+    /// Resolve the recording id for `(channel, stream_id)`: adopt an existing
+    /// recording if one is active, else start one — retrying across the
+    /// find↔start race when multiple recorders target the same stream on one
+    /// archive (see `start_inner`). `session_id = AERON_NULL_VALUE` matches any
+    /// session.
+    fn find_or_start_recording(
+        archive: &Archive,
+        channel: &std::ffi::CStr,
+        stream_id: i32,
+        kind: RecorderKind,
+        ctx: &str,
+    ) -> Result<i64, LogError> {
+        const ATTEMPTS: usize = 5;
+        for attempt in 0..ATTEMPTS {
+            match archive.find_last_matching_recording(
+                0,
+                channel,
+                stream_id,
+                AERON_NULL_VALUE as i32,
+            ) {
+                Ok(id) if id >= 0 => {
+                    info!(recording_id = id, ?kind, "adopting existing recording");
+                    return Ok(id);
+                }
+                Ok(_) => {} // none yet — try to start it below
+                Err(e) => {
+                    // Don't mask a real lookup failure as "not found": log it,
+                    // then still attempt start_recording (which will surface a
+                    // definitive error if the control channel is broken).
+                    warn!(error = %e, ?kind, "find_last_matching_recording failed; will try start");
+                }
+            }
+
+            // start_recording: (channel, stream_id, source_location, auto_stop)
+            // SOURCE_LOCATION_LOCAL -> we are co-located with the publisher.
+            match archive.start_recording(
+                channel,
+                stream_id,
+                rusteron_archive::SOURCE_LOCATION_LOCAL,
+                false,
+            ) {
+                Ok(id) => {
+                    info!(recording_id = id, ?kind, "started recording");
+                    return Ok(id);
+                }
+                Err(e) if attempt + 1 < ATTEMPTS => {
+                    // Likely lost the race (another recorder just registered
+                    // this stream). Re-find + adopt on the next iteration.
+                    warn!(error = %e, ?kind, attempt, "start_recording rejected; re-checking for an existing recording");
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(e) => {
+                    return Err(LogError::Aeron(format!("start_recording {ctx}: {e}")));
+                }
+            }
+        }
+        Err(LogError::Aeron(format!(
+            "{ctx} recording: exhausted {ATTEMPTS} find/start attempts"
+        )))
     }
 
     pub fn recorder_id(&self) -> RecorderId {

@@ -14,10 +14,10 @@
 //!
 //! ## Feature gates
 //!
-//! - `aeron-live` — pulls in the real `rusteron-client` / `rusteron-archive`
-//!   crates and exposes the Aeron-backed publishers, subscribers, recorder,
-//!   and supervisor. Off by default so the crate compiles in environments
-//!   without the Aeron C library installed.
+//! `rusteron-client` / `rusteron-archive` are **unconditional** dependencies —
+//! there is no `aeron-live` feature; a plain build already produces the
+//! Aeron-backed publishers, subscribers, recorder, and supervisor.
+//!
 //! - `testing` — exposes in-memory pub/sub fakes that mirror the Aeron-backed
 //!   channel surface for downstream crates' unit tests.
 //! - `docker-e2e` — gates the testcontainers-driven Aeron e2e harness; implies
