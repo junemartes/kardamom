@@ -258,6 +258,14 @@ test-e2e-local: aeron-driver-up
             multiprocess_e2e_signed_transfer_round_trip \
             multiprocess_e2e_deposit_round_trip \
             anvil_pipeline_e2e_l1_deposit_and_l2_round_trip
+    # NOTE: multiprocess_quorum_e2e_recorder_quorum_and_redundancy is run
+    # explicitly (not here): the on-quorum gate keys off the archive's recording
+    # position, whose catch-up latency on a single shared host archive is timing
+    # -sensitive. True 3-archive quorum + recorder-loss redundancy is validated
+    # by the cluster-e2e workflow. Run the single-host variant by name with:
+    #   just aeron-driver-up && KARDAMOM_AERON_DIR=/tmp/kardamom-aeron-local/dir \
+    #     cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e \
+    #     -- --ignored --nocapture multiprocess_quorum
 
 # ---------------------------------------------------------------------------
 # Multi-node cluster (deploy/cluster) — HOST dependencies.

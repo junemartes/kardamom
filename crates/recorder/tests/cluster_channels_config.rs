@@ -27,8 +27,11 @@ fn cluster_channels_tpl_is_a_valid_log_config() {
     assert_eq!(cfg.channels.tx_ordering_stream_id, 1001);
     assert_eq!(cfg.quorum.n, 3);
     assert_eq!(cfg.quorum.q, 2);
+    // Archive control is IPC: the recorder is co-located with its node's
+    // ArchivingMediaDriver and shares its aeron.dir.
     assert!(
-        cfg.aeron.archive_control_request_channel.contains("8010"),
-        "archive control endpoint should target the archive control port"
+        cfg.aeron.archive_control_request_channel.starts_with("aeron:ipc"),
+        "archive control should ride IPC (co-located recorder), got {}",
+        cfg.aeron.archive_control_request_channel
     );
 }

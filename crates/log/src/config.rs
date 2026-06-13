@@ -80,15 +80,17 @@ pub struct AeronConfig {
     pub catalog_file_sync_level: u8,
 
     /// Archive control **request** channel — where a client (e.g.
-    /// `kardamom-recorder`) sends commands to the Archive. For the cluster's
-    /// ArchivingMediaDriver image this is the archive's control endpoint
-    /// (`aeron:udp?endpoint=localhost:8010`); single-host/local setups can use
-    /// IPC. Only the recorder connects an `AeronArchive`, so this is unused by
-    /// the pipeline services.
+    /// `kardamom-recorder`) sends commands to the Archive. Defaults to `aeron:ipc`:
+    /// the recorder is always co-located with its node's ArchivingMediaDriver
+    /// and shares its `aeron.dir`, so control rides the local IPC channel over
+    /// the shared media driver. This is both simpler and avoids the UDP control
+    /// handshake (whose response can't reliably route back to a co-located
+    /// client). Only the recorder connects an `AeronArchive`, so this is unused
+    /// by the pipeline services.
     pub archive_control_request_channel: String,
 
-    /// Archive control **response** channel — where the Archive sends replies.
-    /// `endpoint=localhost:0` lets the OS pick an ephemeral UDP port.
+    /// Archive control **response** channel. Also `aeron:ipc` — responses ride
+    /// the shared media driver back to the recorder.
     pub archive_control_response_channel: String,
 }
 
@@ -196,8 +198,8 @@ impl Default for AeronConfig {
             archive_cmd: vec!["aeron-archive".into()],
             file_sync_level: 1,
             catalog_file_sync_level: 1,
-            archive_control_request_channel: "aeron:udp?endpoint=localhost:8010".into(),
-            archive_control_response_channel: "aeron:udp?endpoint=localhost:0".into(),
+            archive_control_request_channel: "aeron:ipc".into(),
+            archive_control_response_channel: "aeron:ipc".into(),
         }
     }
 }

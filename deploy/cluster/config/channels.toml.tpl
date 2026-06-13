@@ -29,12 +29,14 @@
 # traffic on-segment):
 
 [aeron]
-# The recorder connects its Archive control session here. With host networking
-# the node-local ArchivingMediaDriver's control endpoint is reachable at
-# localhost:8010 on every recorder (ports.aeron_archive_control in
-# group_vars/all.yml).
-archive_control_request_channel = "aeron:udp?endpoint=localhost:8010"
-archive_control_response_channel = "aeron:udp?endpoint=localhost:0"
+# Archive control rides aeron:ipc (the LogConfig default — restated here for
+# visibility): each kardamom-recorder is co-located with its node's
+# ArchivingMediaDriver and shares its aeron.dir, so it reaches the archive over
+# the local IPC control channel. (UDP archive control would time out — the
+# control response can't be reliably routed back to a co-located client; see
+# crates/log/src/recorder.rs::connect_archive.)
+archive_control_request_channel = "aeron:ipc"
+archive_control_response_channel = "aeron:ipc"
 # Where the recorder's segment files live (bind-mounted; paths.archive_dir).
 archive_dir = "/opt/kardamom/archive"
 

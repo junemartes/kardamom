@@ -826,10 +826,25 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
 /// Then it kills one recorder and submits again: with 2 of 3 survivors the
 /// quorum still advances, proving the cluster tolerates a recorder loss
 /// (the "redundant instances" property). Single-host IPC throughout (UDP
-/// multicast doesn't round-trip macOS loopback); the recorders reach the
-/// Archive over the container's mapped control endpoint.
+/// multicast doesn't round-trip macOS loopback).
+///
+/// The recorders connect an `AeronArchive` and drive `start_recording` — over
+/// the archive's `aeron:ipc` control channel (the default), which works
+/// because the recorder shares the archive's media driver via the bind-mounted
+/// aeron.dir. (A UDP archive-control session would time out: its response
+/// can't route back across the testcontainers host↔container boundary to a
+/// host-spawned recorder. IPC control sidesteps that entirely.)
+///
+/// TIMING-SENSITIVE ON A SINGLE HOST, so it is NOT in any auto-gating CI lane
+/// (run it explicitly by name). On one shared archive all three recorders
+/// adopt the *same* recording, and the on-quorum gate keys off that recording's
+/// fsync position, whose catch-up latency under a single host-native
+/// ArchivingMediaDriver varies run to run. The genuine property — three
+/// independent archives, one per node, surviving a recorder loss — is what the
+/// cluster-e2e workflow validates; this test documents and exercises the
+/// single-host wiring end to end.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires Docker + cargo-built kardamom-* bins; run with `cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e -- --ignored --nocapture multiprocess_quorum`"]
+#[ignore = "manual/diagnostic — single-host timing-sensitive; run by name (see doc comment). True quorum redundancy is validated by cluster-e2e."]
 async fn multiprocess_quorum_e2e_recorder_quorum_and_redundancy() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
@@ -849,18 +864,17 @@ async fn multiprocess_quorum_e2e_recorder_quorum_and_redundancy() {
         .await
         .expect("aeron container up");
     let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
-    let archive_endpoint = cluster.archive_control_endpoint(0).await;
-    tracing::info!(aeron_dir = %aeron_dir.display(), %archive_endpoint, "aeron + archive up");
+    tracing::info!(aeron_dir = %aeron_dir.display(), "aeron + archive up");
 
     let cfg_dir = TempDir::new().expect("cfg tempdir");
     let sealer_cfg = write_sealer_config(cfg_dir.path());
     let sequencer_cfg = write_sequencer_config(cfg_dir.path());
     let executor_cfg = write_executor_config(cfg_dir.path());
     let ingress_cfg = write_ingress_config(cfg_dir.path());
-    // The recorders need the Archive control endpoint; everything else stays
-    // at the IPC defaults (single host) so the recorder records the same
-    // `aeron:ipc?alias=tx-ordering` / stream 1001 the sealer publishes.
-    let recorder_log_cfg = write_recorder_log_config(cfg_dir.path(), &archive_endpoint);
+    // Recorders record the same `aeron:ipc?alias=tx-ordering` / stream 1001 the
+    // sealer publishes (IPC defaults), and reach the archive over the IPC
+    // control channel — all over the shared aeron.dir.
+    let recorder_log_cfg = write_recorder_log_config(cfg_dir.path());
 
     let target_bin = workspace_target_bin();
     let alice = signer_from_seed(0x11);
@@ -1032,17 +1046,18 @@ async fn submit_and_assert_receipt(
     );
 }
 
-/// Write a `LogConfig` for the recorder/quorum processes: IPC channels (single
-/// host, matching the pipeline defaults) plus the `[aeron]` archive control
-/// endpoint the container exposes. `archive_dir` is only used for diagnostics
-/// (segment-path computation), not the watermark loop, so the cfg dir suffices.
-fn write_recorder_log_config(dir: &Path, archive_control_endpoint: &str) -> PathBuf {
+/// Write a `LogConfig` for the recorder/quorum processes. Channels stay at the
+/// IPC defaults (single host, matching the pipeline); archive control also
+/// rides `aeron:ipc` over the shared media driver (the default), so the
+/// recorder reaches its co-located archive without any UDP endpoint — works
+/// identically under the host-native driver and inside a container. Only
+/// `archive_dir` is set (diagnostics; the watermark loop polls the recording
+/// position over the control session, not the filesystem).
+fn write_recorder_log_config(dir: &Path) -> PathBuf {
     let p = dir.join("recorder-log.toml");
     let body = format!(
         r#"
 [aeron]
-archive_control_request_channel = "aeron:udp?endpoint={archive_control_endpoint}"
-archive_control_response_channel = "aeron:udp?endpoint=localhost:0"
 archive_dir = "{}"
 
 [quorum]
