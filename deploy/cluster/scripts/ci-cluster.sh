@@ -42,6 +42,46 @@ log() { echo "==> $*"; }
 # teardown — otherwise the container removal below erases the only evidence of
 # why an alloc failed (the workflow's post-step runs after this script's EXIT
 # trap, too late). Best-effort; never let diagnostics mask the real exit code.
+# Raw-UDP multicast reachability check from w2 (192.168.56.22) to r1
+# (192.168.56.11) on a throwaway group, bypassing Aeron entirely. Prints how
+# many of 30 sent packets r1 received: 0 means the bridge drops cross-node
+# multicast (kernel/bridge issue); >0 means forwarding works and any remaining
+# failure is Aeron-specific. python3 ships in the node image.
+multicast_probe() {
+  local grp=239.192.99.99 port=45999 rip=192.168.56.11 sip=192.168.56.22
+  echo "===== multicast probe ${sip} -> ${rip} (grp ${grp}:${port}) ====="
+  docker exec -d kardamom-r1 python3 -c "
+import socket,struct
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+s.bind(('',${port}))
+mreq=struct.pack('4s4s',socket.inet_aton('${grp}'),socket.inet_aton('${rip}'))
+s.setsockopt(socket.IPPROTO_IP,socket.IP_ADD_MEMBERSHIP,mreq)
+s.settimeout(5)
+n=0
+try:
+    while True:
+        s.recvfrom(2048); n+=1
+except socket.timeout:
+    pass
+open('/tmp/mcast_probe','w').write(str(n))
+" >/dev/null 2>&1 || true
+  sleep 1
+  docker exec kardamom-w2 python3 -c "
+import socket
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+s.setsockopt(socket.IPPROTO_IP,socket.IP_MULTICAST_IF,socket.inet_aton('${sip}'))
+s.setsockopt(socket.IPPROTO_IP,socket.IP_MULTICAST_TTL,1)
+for _ in range(30):
+    s.sendto(b'probe',('${grp}',${port}))
+print('probe: w2 sent 30 packets')
+" 2>&1 || true
+  sleep 5
+  local got
+  got="$(docker exec kardamom-r1 cat /tmp/mcast_probe 2>/dev/null || echo '?')"
+  echo "probe: r1 received ${got}/30 packets (0 => bridge not forwarding multicast)"
+}
+
 dump_diagnostics() {
   log "FAILURE diagnostics — Nomad job + allocation logs"
   # Host network state first: the cross-node Aeron data plane is UDP multicast,
@@ -60,6 +100,12 @@ dump_diagnostics() {
     echo "----- ${n}: multicast groups (ip maddr) -----"
     docker exec "kardamom-${n}" ip maddr show dev eth0 2>/dev/null || true
   done
+  # Direct raw-UDP multicast probe w2 -> r1 on a throwaway group, INDEPENDENT of
+  # Aeron. If r1 receives 0, the bridge isn't forwarding multicast at all (a
+  # kernel/bridge problem); if it receives packets but Aeron still doesn't
+  # record, the problem is Aeron-specific. Distinct group/port so it can't
+  # collide with the media driver's sockets. Fully best-effort.
+  multicast_probe || true
   export NOMAD_ADDR="http://192.168.56.11:4646"
   nomad job status 2>/dev/null || true
   for job in aeron recorder quorum anvil sealer sequencer executor ingress batcher; do

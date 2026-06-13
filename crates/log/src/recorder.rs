@@ -230,11 +230,28 @@ impl Recorder {
         let channel_c = CString::new(channel)
             .map_err(|e| LogError::Aeron(format!("{ctx} channel contains NUL: {e}")))?;
 
+        // SourceLocation selects HOW the archive subscribes to record the
+        // stream. LOCAL records via a "spy" subscription that taps a publication
+        // on the SAME media driver — correct for IPC (the publisher is always
+        // co-located) and what the single-host e2e relies on. But a spy never
+        // opens a network subscription and never joins the multicast group, so
+        // for the UDP channels in the multi-host cluster — where the publisher
+        // is on ANOTHER node (e.g. tx_ordering is published by the sealer; the
+        // recorders run on separate hosts) — LOCAL means the recording never
+        // materializes (the recorder logs "waiting for a publisher …" forever).
+        // Record UDP channels with REMOTE so the archive opens a real network
+        // subscription that joins the group; multicast loopback means REMOTE
+        // also works when the UDP publisher happens to be co-located. (Passed as
+        // a bool because rusteron's SourceLocation enum type is not public — the
+        // SOURCE_LOCATION_* consts are, so the value is chosen inside.)
+        let record_remote = !channel.trim_start().starts_with("aeron:ipc");
+
         let recording_id = match Self::find_or_start_recording(
             &archive,
             channel_c.as_c_str(),
             stream_id,
             kind,
+            record_remote,
             should_stop,
         )? {
             Some(id) => id,
@@ -282,6 +299,7 @@ impl Recorder {
         channel: &std::ffi::CStr,
         stream_id: i32,
         kind: RecorderKind,
+        record_remote: bool,
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<Option<i64>, LogError> {
         // Initiate the recording. The first caller wins; a second start on the
@@ -291,12 +309,12 @@ impl Recorder {
         // id. The recording id is assigned by the archive and must be looked up
         // from the catalog (below). Using the subscription id with
         // get_recording_position would silently never advance.
-        match archive.start_recording(
-            channel,
-            stream_id,
-            rusteron_archive::SOURCE_LOCATION_LOCAL,
-            false,
-        ) {
+        let source_location = if record_remote {
+            rusteron_archive::SOURCE_LOCATION_REMOTE
+        } else {
+            rusteron_archive::SOURCE_LOCATION_LOCAL
+        };
+        match archive.start_recording(channel, stream_id, source_location, false) {
             Ok(sub_id) => info!(subscription_id = sub_id, ?kind, "recording initiated"),
             Err(e) => {
                 info!(error = %e, ?kind, "start_recording rejected (another recorder owns this stream)")
