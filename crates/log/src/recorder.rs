@@ -461,13 +461,18 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
     }
 
     let captured: Rc<RefCell<Captured>> = Rc::new(RefCell::new(Captured::default()));
-    let handler = Handler::leak(Consumer {
+    let mut handler = Handler::leak(Consumer {
         captured: captured.clone(),
     });
 
-    archive
-        .list_recording(recording_id, Some(&handler))
-        .map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
+    // `list_recording` invokes the consumer synchronously and does not retain
+    // the callback pointer once it returns, so release the leaked handler
+    // immediately afterwards — on both the ok and error paths (release before
+    // `?`), else every call leaks the boxed `Consumer` and the rusteron `Drop`
+    // guard logs a "release() was never called" error.
+    let res = archive.list_recording(recording_id, Some(&handler));
+    handler.release();
+    res.map_err(|e| LogError::Aeron(format!("list_recording: {e}")))?;
 
     let g = captured.borrow();
     if !g.seen {
@@ -517,14 +522,21 @@ fn active_recording_for_stream(archive: &Archive, stream_id: i32) -> Result<Opti
     }
 
     let found: Rc<RefCell<Found>> = Rc::new(RefCell::new(Found { latest: None }));
-    let handler = Handler::leak(Consumer {
+    let mut handler = Handler::leak(Consumer {
         found: found.clone(),
     });
     // Empty channel fragment matches any channel; stream_id narrows to ours.
     let any_channel = CString::new("").expect("empty fragment has no NUL");
-    archive
-        .list_recordings_for_uri(0, 100, any_channel.as_c_str(), stream_id, Some(&handler))
-        .map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+    // This runs every poll tick in `find_or_start_recording`'s wait loop;
+    // `list_recordings_for_uri` calls the consumer synchronously and drops the
+    // pointer on return, so release the leaked handler right away (before `?`,
+    // so the error path frees it too). Without this each tick leaked a boxed
+    // `Consumer` and the rusteron `Drop` guard logged a "release() was never
+    // called" error at ~2 Hz, drowning the recorder's logs.
+    let res =
+        archive.list_recordings_for_uri(0, 100, any_channel.as_c_str(), stream_id, Some(&handler));
+    handler.release();
+    res.map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
 
     let g = found.borrow();
     Ok(g.latest)
