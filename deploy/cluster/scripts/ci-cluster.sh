@@ -54,10 +54,19 @@ dump_diagnostics() {
       [[ -z "${alloc}" ]] && continue
       echo "----- ${job} alloc ${alloc}: status -----"
       nomad alloc status "${alloc}" 2>/dev/null | sed -n '1,40p' || true
-      echo "----- ${job} alloc ${alloc}: stderr -----"
-      nomad alloc logs -stderr "${alloc}" 2>/dev/null | tail -50 || true
-      echo "----- ${job} alloc ${alloc}: stdout -----"
-      nomad alloc logs "${alloc}" 2>/dev/null | tail -50 || true
+      # stderr carries the tracing logs. Show the HEAD (startup: channel setup,
+      # "recording ready", "aggregating quorum watermark" — the markers that say
+      # whether multicast carried data and quorum advanced) AND the tail (most
+      # recent state), since the interesting events are at startup but failures
+      # surface at the end.
+      local err
+      err="$(nomad alloc logs -stderr "${alloc}" 2>/dev/null || true)"
+      echo "----- ${job} alloc ${alloc}: stderr (head 30) -----"
+      printf '%s\n' "${err}" | head -30 || true
+      echo "----- ${job} alloc ${alloc}: stderr (tail 40) -----"
+      printf '%s\n' "${err}" | tail -40 || true
+      echo "----- ${job} alloc ${alloc}: stdout (tail 40) -----"
+      nomad alloc logs "${alloc}" 2>/dev/null | tail -40 || true
     done <<<"${allocs}"
   done
 }
@@ -175,6 +184,9 @@ docker exec kardamom-r3 bash -lc 'export NOMAD_ADDR=http://192.168.56.13:4646; \
   alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" recorder 2>/dev/null | head -c 36); \
   [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
 sleep 5
-./scripts/smoke.sh
+# Second transfer from the same signer: account #0's nonce 0 was consumed by
+# the first smoke, so this one MUST use nonce 1 (the ingress can't fill it; see
+# smoke.sh).
+NONCE=1 ./scripts/smoke.sh
 
 log "cluster-e2e PASSED"

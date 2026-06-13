@@ -19,8 +19,16 @@ PK="${PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 # Burn / sink address for the transfer.
 TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 VALUE="${VALUE:-1}"   # wei
+# Nonce for the signer. The ingress JSON-RPC surface deliberately does NOT
+# implement eth_getTransactionCount (it errors "deferred to S6 state writer";
+# see crates/ingress/src/json_rpc.rs), exactly like the e2e tests which sign
+# raw txs with explicit nonces. So we MUST pass the nonce ourselves — otherwise
+# `cast send` calls eth_getTransactionCount to fill it and fails. Account #0
+# starts at nonce 0; the caller bumps NONCE per send (the redundancy re-smoke
+# in ci-cluster.sh passes NONCE=1).
+NONCE="${NONCE:-0}"
 
-echo "==> Smoke test against ingress: ${RPC_URL} (chain-id ${CHAIN_ID})"
+echo "==> Smoke test against ingress: ${RPC_URL} (chain-id ${CHAIN_ID}, nonce ${NONCE})"
 
 fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
 
@@ -36,10 +44,13 @@ if command -v cast >/dev/null 2>&1; then
   # cast send signs + submits and (without --async) waits for the receipt,
   # printing it as JSON with --json. status is "0x1" on success.
   #
-  # --gas-price/--gas-limit are passed EXPLICITLY: ingress implements only
-  # eth_chainId/blockNumber/getBalance/getTransactionCount/sendRawTransaction/
-  # getTransactionReceipt (crates/ingress/src/json_rpc.rs), so cast's usual
-  # eth_gasPrice + eth_estimateGas fill calls would fail with method-not-found.
+  # nonce/gas-price/gas-limit/chain are ALL passed EXPLICITLY so cast does not
+  # issue its usual fill calls (eth_getTransactionCount / eth_gasPrice /
+  # eth_estimateGas) — the ingress implements only eth_chainId / eth_blockNumber
+  # / eth_sendRawTransaction / eth_getTransactionReceipt and returns an error
+  # for eth_getTransactionCount + eth_getBalance ("deferred to S6 state writer",
+  # crates/ingress/src/json_rpc.rs). With every field provided, cast's only RPC
+  # calls are eth_sendRawTransaction + eth_getTransactionReceipt.
   set +e
   RECEIPT_JSON="$(cast send "${TO}" \
       --value "${VALUE}" \
@@ -47,6 +58,7 @@ if command -v cast >/dev/null 2>&1; then
       --rpc-url "${RPC_URL}" \
       --chain "${CHAIN_ID}" \
       --legacy \
+      --nonce "${NONCE}" \
       --gas-price "${GAS_PRICE:-1000000000}" \
       --gas-limit 21000 \
       --json 2>"${CAST_ERR}")"
