@@ -1,20 +1,21 @@
 name: cluster-e2e
 
-# EXPERIMENTAL container-based cluster end-to-end (Ansible → Nomad → Consul).
-# Brings up the 5-"node" cluster as privileged systemd+DinD containers on a
-# 192.168.56.0/24 bridge (the VM-less analogue of `make up`), provisions them
-# with the UNMODIFIED site.yml, deploys the Nomad jobs, and runs the pipeline
-# smoke + a recorder-kill redundancy check. See deploy/cluster/scripts/ci-cluster.sh.
+# Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
+# 5-"node" cluster as privileged systemd+DinD containers on a 192.168.56.0/24
+# bridge (the VM-less analogue of `make up`), provisions them with the
+# UNMODIFIED site.yml, deploys the Nomad jobs, and runs the pipeline smoke + a
+# recorder-kill redundancy check. See deploy/cluster/scripts/ci-cluster.sh.
 #
-# Gated to manual dispatch / the `run-cluster-e2e` label only: it is heavy and
-# (unlike cluster-validate / docker-e2e) has not yet been run green end to end —
-# the first real runs are expected to need iteration on the runner. The static
-# cluster-validate workflow remains the always-on gate.
+# Runs on every PR (and pushes to main); opt out with the `skip-cluster-e2e`
+# label for changes that can't affect the cluster. This is the only gate that
+# exercises the full orchestration stack (Ansible/Nomad/Consul) + multi-host
+# Aeron + the recorder/quorum redundancy path end to end.
 
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled]
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,8 +24,7 @@ concurrency:
 jobs:
   cluster-e2e:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'run-cluster-e2e')
+      !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
     name: container cluster e2e
     runs-on: ubuntu-latest
     timeout-minutes: 60
