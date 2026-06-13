@@ -14,8 +14,13 @@
 #       --build-arg BIN=kardamom-<svc> \
 #       -t <registry>/kardamom-<svc>:dev target/release
 #
-# Runtime libs mirror service.Dockerfile's runtime stage (Aeron C/C++ deps).
-FROM debian:bookworm-slim
+# Runtime base is ubuntu:24.04 to MATCH the GitHub runner (ubuntu-24.04) where
+# the binaries + libaeron.so are built: a slim debian (bookworm, glibc 2.36)
+# can't load a libaeron.so built against the runner's newer glibc ("version
+# `GLIBC_2.38' not found"). cluster-e2e.yml pins runs-on to ubuntu-24.04 to keep
+# the build and runtime glibc aligned. (The production service.Dockerfile builds
+# and runs on bookworm throughout, so it stays self-consistent.)
+FROM ubuntu:24.04
 
 ARG BIN
 ENV SERVICE_BIN=${BIN}

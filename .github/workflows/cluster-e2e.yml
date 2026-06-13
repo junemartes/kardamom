@@ -26,7 +26,10 @@ jobs:
     if: >-
       !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
     name: container cluster e2e
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest): the binaries + libaeron.so built here run in
+    # the ubuntu:24.04 ci-service image, so the runner glibc must match that
+    # base (see deploy/cluster/docker/ci-service.Dockerfile).
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
