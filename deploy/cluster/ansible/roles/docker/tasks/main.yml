@@ -19,13 +19,13 @@
 # arm64 CI containers). Docker's apt repo is published for both.
 - name: Resolve dpkg architecture
   ansible.builtin.command: dpkg --print-architecture
-  register: dpkg_arch
+  register: docker_dpkg_arch
   changed_when: false
 
 - name: Add Docker apt repository
   ansible.builtin.apt_repository:
     repo: >-
-      deb [arch={{ dpkg_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc]
+      deb [arch={{ docker_dpkg_arch.stdout }} signed-by=/etc/apt/keyrings/docker.asc]
       https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} {{ docker_apt_channel }}
     filename: docker
     state: present
