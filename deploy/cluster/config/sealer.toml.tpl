@@ -23,5 +23,11 @@ channel_b_uri = "aeron:udp?endpoint=239.192.56.13:40010|interface=192.168.56.0/2
 channel_b_tx_stream_id = 1
 channel_b_boundary_stream_id = 1001
 
-# Sealer tick cadence (block boundary emission interval).
-tick_interval_ms = 250
+# Sealer tick cadence (block boundary emission interval). Slowed from 250ms to
+# 2s for the container cluster-e2e: on an 8-core host running a whole cluster
+# (3 EVM executors + their recorders + 8 Aeron drivers) the executors can't
+# replay 4 empty blocks/sec under CPU contention and fall behind. At 1 block/2s
+# there are ~8x fewer empty blocks to process, so the executors keep pace; the
+# added block latency is irrelevant to the smoke. (A latency-tuned single-host
+# deployment can lower this.)
+tick_interval_ms = 2000

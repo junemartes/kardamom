@@ -2,7 +2,7 @@
 # Pipeline smoke test: submit a transfer through the kardamom ingress JSON-RPC
 # proxy and assert a receipt with status 0x1 comes back.
 #
-# Ingress endpoint: http://192.168.56.21:8545 (ingress_ip:ingress_rpc from
+# Ingress endpoint: http://192.168.56.31:8545 (ingress_ip:ingress_rpc from
 # ansible/group_vars/all.yml). Signer: Anvil account #0 (prefunded with 1000
 # ETH in config/genesis/dev.toml).
 #
@@ -12,7 +12,7 @@
 # Prints PASS/FAIL; exits nonzero on failure.
 set -euo pipefail
 
-RPC_URL="${RPC_URL:-http://192.168.56.21:8545}"
+RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 CHAIN_ID="${CHAIN_ID:-412346}"
 # Anvil account #0 private key (public, dev only).
 PK="${PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"

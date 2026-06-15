@@ -20,8 +20,8 @@ job "quorum" {
   # Pin to recorder r1 (any node on the multicast segment works; r1 is the
   # control node and always present).
   constraint {
-    attribute = "${meta.kardamom_node}"
-    value     = "r1"
+    attribute = "${meta.tier}"
+    value     = "worker"
   }
 
   group "quorum" {
@@ -35,7 +35,7 @@ job "quorum" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-recorder:dev"
+        image        = "192.168.56.10:5000/kardamom-recorder:dev"
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",

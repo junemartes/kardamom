@@ -1,4 +1,4 @@
-# kardamom-ingress — eth JSON-RPC proxy. Placed on w1 (192.168.56.21).
+# kardamom-ingress — eth JSON-RPC proxy. Placed on ingress1 (192.168.56.32).
 #
 # Invocation:
 #   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
@@ -11,7 +11,7 @@
 # published by the quorum job (issue #38).
 #
 # Shares the node's Aeron media driver via the bind-mounted tmpfs aeron.dir.
-# Host networking so :8545 binds on the w1 VM IP.
+# Host networking so :8545 binds on the ingress1 VM IP.
 #
 # NOTE: this job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory (scripts/deploy.sh does this).
@@ -27,8 +27,8 @@ job "ingress" {
   type        = "service"
 
   constraint {
-    attribute = "${meta.kardamom_node}"
-    value     = "w1"
+    attribute = "${meta.role}"
+    value     = "ingress"
   }
 
   group "ingress" {
@@ -45,7 +45,7 @@ job "ingress" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-ingress:dev"
+        image        = "192.168.56.10:5000/kardamom-ingress:dev"
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",

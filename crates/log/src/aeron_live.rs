@@ -49,10 +49,11 @@
 //!
 //! (unconditional dep on rusteron.)
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use rkyv::util::AlignedVec;
@@ -62,6 +63,7 @@ use tracing::{error, warn};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
+use crate::offer_retry::{offer_code_str, OFFER_TIMEOUT};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
     Receipt, TxEnvelope, TxError, TxOrderingMessage,
@@ -114,10 +116,25 @@ enum RuntimeCmd {
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and arranges
     /// for the supplied `deliver` closure to be invoked on each fragment.
+    /// Replies with the assigned `sub_id` (needed to attach MDS destinations).
     OpenSubscription {
         uri: String,
         stream_id: i32,
         deliver: DeliverFn,
+        ack: CbSender<Result<u32, LogError>>,
+    },
+    /// Attach a source endpoint to a multi-destination (`control-mode=manual`)
+    /// subscription. Used to aggregate per-publisher streams (e.g. one ingress
+    /// MDS subscription pulling receipts from every executor replica).
+    SubAddDestination {
+        sub_id: u32,
+        uri: String,
+        ack: CbSender<Result<(), LogError>>,
+    },
+    /// Detach a previously-attached source endpoint from an MDS subscription.
+    SubRemoveDestination {
+        sub_id: u32,
+        uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
     /// Stop the loop, drop everything.
@@ -128,6 +145,34 @@ enum RuntimeCmd {
 struct SubEntry {
     sub: Sub,
     deliver: DeliverFn,
+}
+
+/// A publish awaiting delivery on the Aeron thread.
+///
+/// Why this queue exists: the Aeron thread is **single-threaded** and shared by
+/// every publication *and* subscription on a process. If a publish is offered
+/// in a blocking spin/sleep loop (the old `offer_blocking`, up to
+/// [`OFFER_TIMEOUT`]), that same thread stops polling its subscriptions for the
+/// whole back-pressure window. In the cluster that starves the executor's
+/// `tx_ordering` subscription long enough (> Aeron's MIN flow-control receiver
+/// timeout, ~2 s) that the sealer drops it from flow control, advances, and the
+/// subscription's image develops an unfillable gap and goes end-of-stream — a
+/// permanent freeze (the executor uses `no_unavailable_image_handler` and never
+/// re-subscribes). A *must-deliver publish* must never starve a *must-deliver
+/// subscribe*.
+///
+/// So a back-pressured offer is parked here and retried **one attempt per loop
+/// iteration** instead of blocking: the poll loop keeps draining subscriptions
+/// between attempts. Per-publication FIFO order is preserved (a publication with
+/// an older pending frame is not skipped ahead).
+struct PendingPublish {
+    pub_id: u32,
+    bytes: AlignedVec,
+    /// `Some` for an ack'd publish (`publish_bytes`); `None` for best-effort.
+    ack: Option<CbSender<Result<BPosition, LogError>>>,
+    /// Give up (ack an error / log) once this instant passes — bounds a publish
+    /// to a never-connecting subscriber, matching the old blocking deadline.
+    deadline: Instant,
 }
 
 impl AeronRuntime {
@@ -227,12 +272,14 @@ impl AeronRuntime {
 
     /// Open a raw subscription with a caller-supplied delivery closure.
     /// Used by adapters that need to demultiplex fragments themselves.
+    /// Open a subscription with a raw deliver closure, returning the assigned
+    /// `sub_id` (used to attach MDS destinations; most callers ignore it).
     pub fn open_subscription_with_deliver(
         &self,
         uri: &str,
         stream_id: i32,
         deliver: DeliverFn,
-    ) -> Result<(), LogError> {
+    ) -> Result<u32, LogError> {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.cmd_tx
             .send(RuntimeCmd::OpenSubscription {
@@ -244,8 +291,39 @@ impl AeronRuntime {
             .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
         ack_rx
             .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| LogError::Aeron("open_subscription timed out".into()))??;
-        Ok(())
+            .map_err(|_| LogError::Aeron("open_subscription timed out".into()))?
+    }
+
+    /// Attach a source endpoint to a multi-destination subscription (one opened
+    /// `control-mode=manual`). Blocks until the driver confirms the attach.
+    /// Idempotent — re-adding an already-attached `uri` is a no-op.
+    pub fn add_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::SubAddDestination {
+                sub_id,
+                uri: uri.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("add_destination timed out".into()))?
+    }
+
+    /// Detach a previously-attached source endpoint from an MDS subscription.
+    pub fn remove_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::SubRemoveDestination {
+                sub_id,
+                uri: uri.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("remove_destination timed out".into()))?
     }
 
     /// Open a typed subscription, returning an mpsc receiver of decoded
@@ -278,6 +356,37 @@ impl AeronRuntime {
         self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         Ok(msg_rx)
     }
+
+    /// Like [`open_subscription`](Self::open_subscription) but also returns the
+    /// `sub_id`, so the caller can attach MDS source endpoints via
+    /// [`add_destination`](Self::add_destination). Open the subscription on a
+    /// `control-mode=manual` channel to make it multi-destination.
+    pub fn open_subscription_with_id<T>(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<(u32, UnboundedReceiver<(BPosition, T)>), LogError>
+    where
+        T: rkyv::Archive + Send + 'static,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
+            match codec::materialize::<T>(bytes) {
+                Ok(v) => {
+                    let _ = msg_tx.send((pos, v));
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on subscription delivery");
+                }
+            }
+        });
+        let sub_id = self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        Ok((sub_id, msg_rx))
+    }
 }
 
 impl Drop for AeronRuntime {
@@ -305,17 +414,33 @@ fn run_aeron_thread(
 ) -> Result<(), LogError> {
     let mut pubs: Vec<Pub> = Vec::new();
     let mut subs: Vec<SubEntry> = Vec::new();
+    let mut pending: VecDeque<PendingPublish> = VecDeque::new();
+    // Live MDS destinations. The rusteron `AeronAsyncDestination` removes its
+    // destination when dropped, so we must retain each one for as long as the
+    // attachment should stay active; keyed by (sub_id, uri) for removal.
+    let mut dests: Vec<(u32, String, rusteron_client::AeronAsyncDestination)> = Vec::new();
 
     loop {
+        // 1. Drain all queued commands (non-blocking). Publishes are *enqueued*
+        //    onto `pending`, never offered inline, so a back-pressured offer can
+        //    never block this loop (see `PendingPublish`).
         loop {
             match cmd_rx.try_recv() {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, cmd)?,
+                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
         }
 
+        // 2. Attempt one offer per pending publish, preserving per-publication
+        //    FIFO order. Successful/expired entries are removed.
+        drain_pending(&pubs, &mut pending);
+
+        // 3. Poll every subscription. This runs on *every* iteration — even
+        //    while a publish is back-pressured in `pending` — so a slow/stalled
+        //    publish can never starve a subscription's image. This is the fix
+        //    for the cluster `tx_ordering` freeze.
         for entry in subs.iter_mut() {
             let _ = entry.sub.poll_once(
                 |bytes: &[u8], header: Header| {
@@ -327,10 +452,13 @@ fn run_aeron_thread(
             );
         }
 
-        if subs.is_empty() {
+        // 4. Idle. Block only when there is genuinely nothing to do — nothing to
+        //    poll and nothing pending; otherwise a short sleep keeps the
+        //    poll/retry cadence tight without busy-spinning a core.
+        if subs.is_empty() && pending.is_empty() {
             match cmd_rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, cmd)?,
+                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -344,24 +472,28 @@ fn handle_cmd(
     aeron: &Rc<AeronClient>,
     pubs: &mut Vec<Pub>,
     subs: &mut Vec<SubEntry>,
+    pending: &mut VecDeque<PendingPublish>,
+    dests: &mut Vec<(u32, String, rusteron_client::AeronAsyncDestination)>,
     cmd: RuntimeCmd,
 ) -> Result<(), LogError> {
     match cmd {
+        // Publishes are never offered here — they are enqueued and retried by
+        // `drain_pending` so a back-pressured offer can't block the poll loop.
         RuntimeCmd::Publish { pub_id, bytes, ack } => {
-            let res = match pubs.get(pub_id as usize) {
-                Some(p) => offer_blocking(p, bytes.as_slice()),
-                None => Err(LogError::Aeron(format!("publish: unknown pub_id {pub_id}"))),
-            };
-            let _ = ack.send(res);
+            pending.push_back(PendingPublish {
+                pub_id,
+                bytes,
+                ack: Some(ack),
+                deadline: Instant::now() + OFFER_TIMEOUT,
+            });
         }
         RuntimeCmd::PublishBestEffort { pub_id, bytes } => {
-            if let Some(p) = pubs.get(pub_id as usize) {
-                if let Err(e) = offer_blocking(p, bytes.as_slice()) {
-                    warn!(error = %e, pub_id, "best-effort publish failed");
-                }
-            } else {
-                warn!(pub_id, "best-effort publish to unknown pub_id");
-            }
+            pending.push_back(PendingPublish {
+                pub_id,
+                bytes,
+                ack: None,
+                deadline: Instant::now() + OFFER_TIMEOUT,
+            });
         }
         RuntimeCmd::OpenPublication {
             uri,
@@ -382,7 +514,27 @@ fn handle_cmd(
         } => {
             let res = open_sub(aeron, &uri, stream_id).map(|sub| {
                 subs.push(SubEntry { sub, deliver });
+                (subs.len() - 1) as u32
             });
+            let _ = ack.send(res);
+        }
+        RuntimeCmd::SubAddDestination { sub_id, uri, ack } => {
+            let res = add_sub_destination(aeron, subs, dests, sub_id, &uri);
+            let _ = ack.send(res);
+        }
+        RuntimeCmd::SubRemoveDestination { sub_id, uri, ack } => {
+            // Dropping the retained `AeronAsyncDestination` issues the async
+            // remove command to the driver. Best-effort: a removed source's
+            // image also times out on its own.
+            let before = dests.len();
+            dests.retain(|(s, u, _)| !(*s == sub_id && *u == uri));
+            let res = if dests.len() < before {
+                Ok(())
+            } else {
+                Err(LogError::Aeron(format!(
+                    "remove destination: no attached {uri} on sub {sub_id}"
+                )))
+            };
             let _ = ack.send(res);
         }
         RuntimeCmd::Shutdown => {}
@@ -410,23 +562,142 @@ fn open_sub(aeron: &Rc<AeronClient>, uri: &str, stream_id: i32) -> Result<Sub, L
         .map_err(|e| LogError::Aeron(format!("add_subscription {uri}: {e}")))
 }
 
-fn offer_blocking(p: &Pub, bytes: &[u8]) -> Result<BPosition, LogError> {
-    for attempt in 0..1024 {
-        let r = p.offer(
-            bytes,
-            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-        );
-        if r >= 0 {
-            return Ok(decode_position(r));
-        }
-        if attempt % 64 == 63 {
-            warn!(attempt, "aeron back-pressure, retrying");
-        }
-        std::hint::spin_loop();
+/// Attach a source endpoint (`uri`, e.g. `aeron:udp?endpoint=10.0.0.5:9000`) to
+/// a `control-mode=manual` MDS subscription and retain the returned
+/// `AeronAsyncDestination` so the attachment stays live (dropping it issues the
+/// async remove). Idempotent. Blocks the Aeron thread only briefly to poll the
+/// driver's async completion — destination changes are infrequent (membership
+/// churn), unlike steady-state publishing.
+fn add_sub_destination(
+    aeron: &Rc<AeronClient>,
+    subs: &[SubEntry],
+    dests: &mut Vec<(u32, String, rusteron_client::AeronAsyncDestination)>,
+    sub_id: u32,
+    uri: &str,
+) -> Result<(), LogError> {
+    let sub = subs
+        .get(sub_id as usize)
+        .ok_or_else(|| LogError::Aeron(format!("add destination: unknown sub_id {sub_id}")))?;
+    if dests.iter().any(|(s, u, _)| *s == sub_id && u == uri) {
+        return Ok(()); // already attached
     }
-    Err(LogError::Aeron(
-        "back-pressure timeout after 1024 retries".into(),
-    ))
+    let c = CString::new(uri).map_err(|e| LogError::Aeron(format!("destination uri NUL: {e}")))?;
+    let dest = rusteron_client::AeronAsyncDestination::aeron_subscription_async_add_destination(
+        &**aeron,
+        &sub.sub,
+        c.as_c_str(),
+    )
+    .map_err(|e| LogError::Aeron(format!("add destination {uri}: {e}")))?;
+    let start = Instant::now();
+    loop {
+        match dest.aeron_subscription_async_destination_poll() {
+            Ok(1) => break,
+            Ok(_) => {}
+            Err(e) => return Err(LogError::Aeron(format!("destination poll {uri}: {e}"))),
+        }
+        if start.elapsed() > ADD_SUB_TIMEOUT {
+            return Err(LogError::Aeron(format!("add destination {uri} timed out")));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    dests.push((sub_id, uri.to_string(), dest));
+    Ok(())
+}
+
+/// Attempt one offer for each pending publish, oldest first, preserving
+/// per-publication FIFO order: once a publication back-pressures this pass, its
+/// later frames are held too so the stream never reorders. Successful and
+/// expired (past-deadline) entries are removed; transiently-failing entries are
+/// retained for the next loop iteration.
+///
+/// Crucially this performs **one** offer attempt per entry and returns — it
+/// never spins/sleeps — so the caller ([`run_aeron_thread`]) goes straight back
+/// to polling subscriptions. That is what stops a back-pressured publish from
+/// starving a subscription image (see [`PendingPublish`]).
+fn drain_pending(pubs: &[Pub], pending: &mut VecDeque<PendingPublish>) {
+    drain_pending_inner(pending, Instant::now(), |item| {
+        match pubs.get(item.pub_id as usize) {
+            None => OfferResult::UnknownPub,
+            Some(p) => OfferResult::Code(p.offer(
+                item.bytes.as_slice(),
+                rusteron_client::Handlers::no_reserved_value_supplier_handler(),
+            )),
+        }
+    })
+}
+
+/// Outcome of attempting one offer for a [`PendingPublish`].
+enum OfferResult {
+    /// The publication id is not registered (programming error / use-after-close).
+    UnknownPub,
+    /// Aeron's raw offer return: `>= 0` is a stream position, `< 0` a status code.
+    Code(i64),
+}
+
+/// Pure core of [`drain_pending`], with the Aeron offer injected so the FIFO /
+/// deadline / back-pressure decisions are unit-testable without a media driver.
+/// `now` is threaded in for the same reason (deterministic deadline checks).
+fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, mut offer: F)
+where
+    F: FnMut(&PendingPublish) -> OfferResult,
+{
+    if pending.is_empty() {
+        return;
+    }
+    // Publications that already back-pressured this pass; their remaining frames
+    // wait so we never deliver a stream out of order.
+    let mut blocked: Vec<u32> = Vec::new();
+    let mut keep: VecDeque<PendingPublish> = VecDeque::with_capacity(pending.len());
+
+    while let Some(mut item) = pending.pop_front() {
+        if blocked.contains(&item.pub_id) {
+            keep.push_back(item);
+            continue;
+        }
+        match offer(&item) {
+            OfferResult::UnknownPub => {
+                // Fail/log immediately, never retry.
+                match item.ack.take() {
+                    Some(ack) => {
+                        let _ = ack.send(Err(LogError::Aeron(format!(
+                            "publish: unknown pub_id {}",
+                            item.pub_id
+                        ))));
+                    }
+                    None => warn!(pub_id = item.pub_id, "best-effort publish to unknown pub_id"),
+                }
+            }
+            OfferResult::Code(code) if code >= 0 => {
+                // Delivered. Ack the stream position; best-effort needs no ack.
+                // Don't block this pub_id: a later frame for it may also go now.
+                if let Some(ack) = item.ack.take() {
+                    let _ = ack.send(Ok(decode_position(code)));
+                }
+            }
+            OfferResult::Code(code) if now >= item.deadline => {
+                // Gave up (e.g. a subscriber that never joined). Surface the error
+                // so an ack'd must-deliver caller can decide to re-submit.
+                let msg = format!("aeron offer failed: {} ({code})", offer_code_str(code));
+                match item.ack.take() {
+                    Some(ack) => {
+                        let _ = ack.send(Err(LogError::Aeron(msg)));
+                    }
+                    None => warn!(
+                        code = offer_code_str(code),
+                        pub_id = item.pub_id,
+                        "best-effort publish failed (deadline)"
+                    ),
+                }
+            }
+            OfferResult::Code(_) => {
+                // Transient NOT_CONNECTED / BACK_PRESSURED: hold this frame and
+                // every later frame on the same publication; retry next iteration.
+                blocked.push(item.pub_id);
+                keep.push_back(item);
+            }
+        }
+    }
+    *pending = keep;
 }
 
 fn decode_position(p: i64) -> BPosition {
@@ -902,3 +1173,151 @@ const _: fn() = || {
     assert_send_sync::<QuorumPublisherHandle>();
     assert_send::<QuorumSubscriberHandle>();
 };
+
+// ---------------------------------------------------------------------------
+// Unit tests for the publish-retry scheduler (no media driver required).
+//
+// These pin the behaviour that fixes the cluster `tx_ordering` freeze: a
+// back-pressured publish is *parked and retried*, never blocking the loop, and
+// per-publication FIFO order is preserved across retries. The matching real-
+// Aeron end-to-end proof (a back-pressured publish must not delay a live
+// subscription's delivery) lives in `tests/offer_starvation.rs`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod drain_pending_tests {
+    use super::*;
+    use crossbeam_channel::Receiver as CbReceiver;
+
+    /// Build a pending publish with a one-byte payload tagged `marker` (so a test
+    /// can identify which frame an offer is being asked about) and a deadline
+    /// `dl_ms` from `base`. Returns the entry and its ack receiver.
+    fn pending(
+        pub_id: u32,
+        marker: u8,
+        base: Instant,
+        dl_ms: u64,
+    ) -> (PendingPublish, CbReceiver<Result<BPosition, LogError>>) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut bytes = AlignedVec::new();
+        bytes.extend_from_slice(&[marker]);
+        (
+            PendingPublish {
+                pub_id,
+                bytes,
+                ack: Some(tx),
+                deadline: base + Duration::from_millis(dl_ms),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn delivers_and_acks_then_empties_queue() {
+        let now = Instant::now();
+        let (p, rx) = pending(0, 0xAA, now, 5_000);
+        let mut q = VecDeque::from([p]);
+        // Offer always succeeds with a stream position.
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(64));
+        assert!(q.is_empty(), "delivered frame must be removed");
+        match rx.try_recv() {
+            Ok(Ok(_pos)) => {}
+            other => panic!("expected an Ok position ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_pressure_retains_frame_for_next_iteration() {
+        // The crux of the fix: a back-pressured offer (whose deadline has NOT
+        // passed) is kept in the queue and retried — never dropped, never
+        // blocking. The ack must stay pending.
+        let now = Instant::now();
+        let (p, rx) = pending(0, 0xAA, now, 5_000);
+        let mut q = VecDeque::from([p]);
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(-2 /* BACK_PRESSURED */));
+        assert_eq!(q.len(), 1, "back-pressured frame must be retained");
+        assert!(rx.try_recv().is_err(), "must not ack a retained frame");
+
+        // Next iteration the subscriber has drained — now it delivers.
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(0));
+        assert!(q.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Ok(_))));
+    }
+
+    #[test]
+    fn preserves_per_publication_fifo_under_back_pressure() {
+        // Two frames on pub 0 (A then B). The first attempt back-pressures A; B
+        // must NOT be offered ahead of A (would reorder the stream). We assert by
+        // recording which markers the offer fn is asked about.
+        let now = Instant::now();
+        let (a, _ra) = pending(0, 0xA1, now, 5_000);
+        let (b, _rb) = pending(0, 0xB2, now, 5_000);
+        let mut q = VecDeque::from([a, b]);
+
+        let mut offered: Vec<u8> = Vec::new();
+        drain_pending_inner(&mut q, now, |item| {
+            offered.push(item.bytes.as_slice()[0]);
+            OfferResult::Code(-2) // A back-pressures
+        });
+        assert_eq!(
+            offered,
+            vec![0xA1],
+            "only the head-of-line frame may be offered; B must not jump ahead"
+        );
+        assert_eq!(q.len(), 2, "both frames retained, still in order");
+        assert_eq!(q[0].bytes.as_slice()[0], 0xA1);
+        assert_eq!(q[1].bytes.as_slice()[0], 0xB2);
+    }
+
+    #[test]
+    fn independent_publications_do_not_block_each_other() {
+        // Pub 0 back-pressures but pub 1 is fine — pub 1 must still deliver.
+        let now = Instant::now();
+        let (a, ra) = pending(0, 0xA1, now, 5_000);
+        let (b, rb) = pending(1, 0xB2, now, 5_000);
+        let mut q = VecDeque::from([a, b]);
+
+        drain_pending_inner(&mut q, now, |item| {
+            if item.pub_id == 0 {
+                OfferResult::Code(-2)
+            } else {
+                OfferResult::Code(0)
+            }
+        });
+        assert_eq!(q.len(), 1, "only the back-pressured pub-0 frame is retained");
+        assert_eq!(q[0].pub_id, 0);
+        assert!(ra.try_recv().is_err(), "pub 0 still pending");
+        assert!(matches!(rb.try_recv(), Ok(Ok(_))), "pub 1 delivered");
+    }
+
+    #[test]
+    fn expired_frame_acks_an_error_and_is_dropped() {
+        // A frame still failing once its deadline has passed must error out (so a
+        // must-deliver caller can re-submit) rather than spin forever.
+        let now = Instant::now();
+        let (p, rx) = pending(0, 0xAA, now, 0 /* deadline == now */);
+        let mut q = VecDeque::from([p]);
+        // `now` already >= deadline, offer still negative.
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(-1 /* NOT_CONNECTED */));
+        assert!(q.is_empty(), "expired frame must be dropped");
+        match rx.try_recv() {
+            Ok(Err(LogError::Aeron(m))) => {
+                assert!(m.contains("NOT_CONNECTED"), "error should name the code: {m}")
+            }
+            other => panic!("expected an Aeron error ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_publication_id_fails_immediately() {
+        let now = Instant::now();
+        let (p, rx) = pending(9, 0xAA, now, 5_000);
+        let mut q = VecDeque::from([p]);
+        drain_pending_inner(&mut q, now, |_| OfferResult::UnknownPub);
+        assert!(q.is_empty(), "unknown-pub frame must not be retried");
+        match rx.try_recv() {
+            Ok(Err(LogError::Aeron(m))) => assert!(m.contains("unknown pub_id")),
+            other => panic!("expected unknown-pub error, got {other:?}"),
+        }
+    }
+}

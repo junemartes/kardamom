@@ -5,14 +5,14 @@
 # =============================================================================
 #
 # ⚠ EXPERIMENTAL / NOT YET RUN GREEN. This drives the full Ansible → Nomad →
-# Consul orchestration on a single host using 5 privileged systemd containers
+# Consul orchestration on a single host using 11 privileged systemd containers
 # (Docker-in-Docker for Nomad's docker driver) on a 192.168.56.0/24 bridge with
 # the contract's static IPs — so the UNMODIFIED site.yml provisions them. It is
 # expected to need iteration on a real runner; the static `cluster-validate`
 # workflow is the always-green gate.
 #
 # Prereqs (the workflow sets these up): docker + buildx on the host; the host
-# docker daemon trusts 192.168.56.11:5000 as an insecure registry; ansible with
+# docker daemon trusts 192.168.56.10:5000 as an insecure registry; ansible with
 # the community.docker collection; the kardamom release binaries already built
 # under target/release (BIN-per-service); the nomad CLI on PATH.
 #
@@ -27,30 +27,113 @@ cd "${CLUSTER_DIR}"
 
 NET=kardamom-net
 SUBNET=192.168.56.0/24
-REGISTRY=192.168.56.11:5000
+REGISTRY=192.168.56.10:5000
 TAG=dev
 NODE_IMAGE=kardamom-node:ci
 SERVICES=(ingress sequencer executor sealer da-watcher batcher recorder)
 
-# node name -> static IP (mirrors ansible/group_vars/all.yml cluster_nodes).
-NODES=(r1 r2 r3 w1 w2)
-declare -A NODE_IP=( [r1]=192.168.56.11 [r2]=192.168.56.12 [r3]=192.168.56.13 [w1]=192.168.56.21 [w2]=192.168.56.22 )
+# Node instances are GENERATED from the class model in group_vars/all.yml
+# (node_classes: class -> {count, ip_start}) — the single source of truth. For
+# each class we materialise `count` instances named <class>-<i>, each with a
+# static IP from the class's ip_start lane on ip_prefix.0/24. Scaling a class is
+# a one-line `count` change in group_vars; there is no node list / IP map / Ansible
+# inventory to hand-maintain here (the inventory is generated below too). Parsed
+# with a plain regex (no PyYAML), so it runs anywhere python3 does.
+NODES=(); declare -A NODE_IP=(); declare -A NODE_ROLE=(); declare -A NODE_TIER=()
+while read -r _name _ip _role _tier; do
+  [[ -z "${_name}" ]] && continue
+  NODES+=("${_name}"); NODE_IP[${_name}]="${_ip}"
+  NODE_ROLE[${_name}]="${_role}"; NODE_TIER[${_name}]="${_tier}"
+done < <(python3 - <<'PY'
+# Parse node_classes with a plain regex (no PyYAML dependency — same approach as
+# scripts/check-contract.py, so this runs anywhere python3 does). Each class line:
+#   <name>: { count: N, ip_start: M, tier: T }
+import re
+text = open('ansible/group_vars/all.yml').read()
+pref = re.search(r'^ip_prefix:\s*"([\d.]+)"', text, re.M).group(1)
+for m in re.finditer(
+        r'^\s{2}(\w+):\s*\{\s*count:\s*(\d+),\s*ip_start:\s*(\d+),\s*tier:\s*(\w+)',
+        text, re.M):
+    cls, count, ip_start, tier = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
+    for i in range(count):
+        print(f"{cls}-{i} {pref}.{ip_start + i} {cls} {tier}")
+PY
+)
+[[ "${#NODES[@]}" -gt 0 ]] || { echo "ERROR: no nodes generated from node_classes" >&2; exit 1; }
+
+# Generate the Ansible container inventory from the instances above: one group
+# per role (site.yml provisions `all` + `control`), every host carrying its
+# node_ip (consul/nomad bind_addr) + role (Nomad node meta for ${meta.role}
+# placement). Written to a temp file so the repo carries no hand-maintained
+# container inventory.
+CONTAINER_INVENTORY="/tmp/kardamom-inventory.containers.ini"
+gen_container_inventory() {
+  : >"${CONTAINER_INVENTORY}"
+  local roles_seen=() r n extra
+  for n in "${NODES[@]}"; do
+    r="${NODE_ROLE[$n]}"
+    [[ " ${roles_seen[*]} " == *" ${r} "* ]] || roles_seen+=("${r}")
+  done
+  for r in "${roles_seen[@]}"; do
+    echo "[${r}]" >>"${CONTAINER_INVENTORY}"
+    for n in "${NODES[@]}"; do
+      [[ "${NODE_ROLE[$n]}" == "${r}" ]] || continue
+      extra=""; [[ "${r}" == "control" ]] && extra=" control_plane=true"
+      echo "${n} ansible_host=kardamom-${n} kardamom_node=${n} node_ip=${NODE_IP[$n]} role=${r} tier=${NODE_TIER[$n]}${extra}" >>"${CONTAINER_INVENTORY}"
+    done
+    echo "" >>"${CONTAINER_INVENTORY}"
+  done
+  cat >>"${CONTAINER_INVENTORY}" <<EOF
+[all:vars]
+ansible_connection=community.docker.docker
+ansible_python_interpreter=/usr/bin/python3
+kardamom_in_container=true
+EOF
+}
 
 log() { echo "==> $*"; }
+
+# Push a locally-built image to the in-cluster registry.
+#
+# On a CI runner the host docker daemon reaches 192.168.56.10:5000 directly, so
+# this is a plain `docker push` (REGISTRY_PUSH_NODE unset → unchanged behavior).
+#
+# On the local Docker-Desktop harness (local-cluster.sh) the VM daemon's registry
+# traffic is hijacked by Docker Desktop's transparent HTTP proxy
+# (http.docker.internal:3128), whose bypass list does NOT include the VM-internal
+# 192.168.56.0/24 bridge — so a direct push routes through that proxy, which can't
+# reach the bridge IP, and hangs until "context deadline exceeded" (the registry
+# never receives the request). Side-step the proxy entirely by moving the image
+# engine-to-engine over the docker socket (`docker save | docker exec … docker
+# load`) into REGISTRY_PUSH_NODE's inner docker, then pushing from THERE: that node
+# is co-located with the registry (cp1), so its push is node-local and never touches
+# the proxy. The other nodes still pull from the registry over the bridge as usual.
+push_image() {
+  local img="$1"
+  if [[ -n "${REGISTRY_PUSH_NODE:-}" ]]; then
+    log "push ${img} via kardamom-${REGISTRY_PUSH_NODE} (proxy-safe engine-to-engine load)"
+    docker save "${img}" | docker exec -i "kardamom-${REGISTRY_PUSH_NODE}" docker load
+    docker exec "kardamom-${REGISTRY_PUSH_NODE}" docker push "${img}"
+  else
+    docker push "${img}"
+  fi
+}
 
 # On failure, dump every job's status + each allocation's stdout/stderr BEFORE
 # teardown — otherwise the container removal below erases the only evidence of
 # why an alloc failed (the workflow's post-step runs after this script's EXIT
 # trap, too late). Best-effort; never let diagnostics mask the real exit code.
-# Raw-UDP multicast reachability check from w2 (192.168.56.22) to r1
-# (192.168.56.11) on a throwaway group, bypassing Aeron entirely. Prints how
-# many of 30 sent packets r1 received: 0 means the bridge drops cross-node
-# multicast (kernel/bridge issue); >0 means forwarding works and any remaining
-# failure is Aeron-specific. python3 ships in the node image.
+# Raw-UDP multicast reachability check from sealer-0 (192.168.56.51) to
+# ingress-0 (192.168.56.31) on a throwaway group, bypassing Aeron entirely.
+# Prints how many of 30 sent packets ingress-0 received: 0 means the bridge
+# drops cross-node multicast (kernel/bridge issue); >0 means forwarding works and
+# any remaining failure is Aeron-specific. python3 ships in the node image.
 multicast_probe() {
-  local grp=239.192.99.99 port=45999 rip=192.168.56.11 sip=192.168.56.22
+  local grp=239.192.99.99 port=45999 rip=192.168.56.31 sip=192.168.56.51
+  local rnode=kardamom-ingress-0  # worker node on the segment (receiver)
+  local snode=kardamom-sealer-0    # worker on the segment (sender)
   echo "===== multicast probe ${sip} -> ${rip} (grp ${grp}:${port}) ====="
-  docker exec -d kardamom-r1 python3 -c "
+  docker exec -d "${rnode}" python3 -c "
 import socket,struct
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
 s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
@@ -67,19 +150,19 @@ except socket.timeout:
 open('/tmp/mcast_probe','w').write(str(n))
 " >/dev/null 2>&1 || true
   sleep 1
-  docker exec kardamom-w2 python3 -c "
+  docker exec "${snode}" python3 -c "
 import socket
 s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
 s.setsockopt(socket.IPPROTO_IP,socket.IP_MULTICAST_IF,socket.inet_aton('${sip}'))
 s.setsockopt(socket.IPPROTO_IP,socket.IP_MULTICAST_TTL,1)
 for _ in range(30):
     s.sendto(b'probe',('${grp}',${port}))
-print('probe: w2 sent 30 packets')
+print('probe: ${snode} sent 30 packets')
 " 2>&1 || true
   sleep 5
   local got
-  got="$(docker exec kardamom-r1 cat /tmp/mcast_probe 2>/dev/null || echo '?')"
-  echo "probe: r1 received ${got}/30 packets (0 => bridge not forwarding multicast)"
+  got="$(docker exec "${rnode}" cat /tmp/mcast_probe 2>/dev/null || echo '?')"
+  echo "probe: ingress-0 received ${got}/30 packets (0 => bridge not forwarding multicast)"
 }
 
 dump_diagnostics() {
@@ -96,12 +179,13 @@ dump_diagnostics() {
   ip -d link show "${BRIDGE_NAME:-kardamom-br0}" 2>/dev/null || true
   cat "/sys/class/net/${BRIDGE_NAME:-kardamom-br0}/bridge/multicast_snooping" 2>/dev/null \
     | sed 's/^/  multicast_snooping=/' || true
-  for n in r1 r2 r3 w1 w2; do
+  for n in "${NODES[@]}"; do
+    [[ "${NODE_ROLE[$n]}" == "control" ]] && continue   # no media driver on cp
     echo "----- ${n}: joined multicast groups (ip maddr, 239.x only) -----"
     docker exec "kardamom-${n}" ip maddr show dev eth0 2>/dev/null \
       | awk '/inet 239\./{print "  "$2}' | sort || true
   done
-  # Direct raw-UDP multicast probe w2 -> r1 on a throwaway group, INDEPENDENT of
+  # Direct raw-UDP multicast probe sealer1 -> r1 on a throwaway group, INDEPENDENT of
   # Aeron. If r1 receives 0, the bridge isn't forwarding multicast at all (a
   # kernel/bridge problem); if it receives packets but Aeron still doesn't
   # record, the problem is Aeron-specific. Distinct group/port so it can't
@@ -121,7 +205,7 @@ dump_diagnostics() {
     'udp and dst net 239.192.56.0/24' 2>/dev/null \
     | awk '{d=$4; sub(/:$/,"",d); print $2" -> "d}' | sort | uniq -c | sort -rn | head -40 \
     || echo "(tcpdump unavailable or no multicast captured)"
-  export NOMAD_ADDR="http://192.168.56.11:4646"
+  export NOMAD_ADDR="http://192.168.56.10:4646"
   nomad job status 2>/dev/null || true
   for job in aeron recorder quorum anvil sealer sequencer executor ingress batcher; do
     local allocs
@@ -257,9 +341,10 @@ for n in "${NODES[@]}"; do
 done
 
 # --- 4. Provision with the UNMODIFIED site.yml over the docker connection ----
-log "ansible-playbook site.yml (container inventory)"
+gen_container_inventory
+log "ansible-playbook site.yml (generated container inventory: ${CONTAINER_INVENTORY})"
 ANSIBLE_HOST_KEY_CHECKING=False \
-  ansible-playbook -i ansible/inventory.containers.ini ansible/site.yml
+  ansible-playbook -i "${CONTAINER_INVENTORY}" ansible/site.yml
 
 # --- 5. Build thin service images from prebuilt binaries, push to r1 ---------
 # The workflow ran `cargo build --release` for each BIN; wrap each into a thin
@@ -268,7 +353,7 @@ log "building + pushing service images to ${REGISTRY}"
 # Aeron image (same canonical Dockerfile as make images).
 docker build -f "${ROOT}/crates/log/docker/aeron/Dockerfile" \
   -t "${REGISTRY}/kardamom-aeron:${TAG}" "${ROOT}/crates/log/docker/aeron"
-docker push "${REGISTRY}/kardamom-aeron:${TAG}"
+push_image "${REGISTRY}/kardamom-aeron:${TAG}"
 
 # The binaries link Aeron DYNAMICALLY (rusteron's static feature is broken on
 # Linux), so the thin runtime image must carry libaeron.so /
@@ -288,11 +373,11 @@ for svc in "${SERVICES[@]}"; do
   bin="kardamom-${svc}"
   docker build -f docker/ci-service.Dockerfile --build-arg "BIN=${bin}" \
     -t "${REGISTRY}/${bin}:${TAG}" "${ROOT}/target/release"
-  docker push "${REGISTRY}/${bin}:${TAG}"
+  push_image "${REGISTRY}/${bin}:${TAG}"
 done
 
 # --- 6. Deploy the Nomad jobs + smoke ---------------------------------------
-export NOMAD_ADDR="http://192.168.56.11:4646"
+export NOMAD_ADDR="http://192.168.56.10:4646"
 log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 ./scripts/deploy.sh
 
@@ -301,8 +386,9 @@ log "smoke test"
 
 # --- 7. Redundancy: kill one recorder alloc, re-smoke (2-of-3 quorum) -------
 log "redundancy: stopping one recorder alloc and re-running smoke"
-# Stop the recorder system job on r3 by deregistering then re-checking quorum.
-docker exec kardamom-r3 bash -lc 'export NOMAD_ADDR=http://192.168.56.13:4646; \
+# Stop one of the 3 collocated recorder allocs (the recorder job is count=3 on the
+# worker tier) via the Nomad server on the control node, then re-check quorum.
+docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
   alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" recorder 2>/dev/null | head -c 36); \
   [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
 sleep 5

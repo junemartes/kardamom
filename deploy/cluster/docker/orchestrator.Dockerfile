@@ -26,7 +26,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # are what ci-cluster.sh / deploy.sh / smoke.sh shell out to.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         docker.io ansible python3-docker \
-        curl unzip sudo iproute2 jq ca-certificates iptables kmod \
+        curl unzip sudo iproute2 jq ca-certificates iptables kmod git \
     && rm -rf /var/lib/apt/lists/*
 
 # Same connection plugin the cluster-e2e workflow installs.
@@ -39,6 +39,16 @@ RUN arch="$(dpkg --print-architecture)" && \
     curl -fsSL "https://releases.hashicorp.com/nomad/${NOMAD_VERSION}/nomad_${NOMAD_VERSION}_linux_${arch}.zip" \
         -o /tmp/nomad.zip && \
     unzip -o /tmp/nomad.zip -d /usr/local/bin && rm /tmp/nomad.zip
+
+# foundry `cast` for smoke.sh's preferred Path A (signed eth_sendRawTransaction +
+# receipt poll). The cluster-e2e workflow installs this via foundry-toolchain on
+# the runner; bundle it here so the LOCAL smoke matches CI instead of falling back
+# to smoke.sh's curl path, which needs a nonce-specific pre-signed RAW_TX and so
+# can't do the NONCE=1 redundancy re-smoke. foundryup downloads a prebuilt binary
+# for the image arch (amd64/arm64).
+RUN curl -L https://foundry.paradigm.xyz | bash && \
+    /root/.foundry/bin/foundryup && \
+    install -m0755 /root/.foundry/bin/cast /usr/local/bin/cast
 
 WORKDIR /work
 ENTRYPOINT ["sleep", "infinity"]

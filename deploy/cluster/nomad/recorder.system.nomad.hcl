@@ -19,15 +19,27 @@
 
 job "recorder" {
   datacenters = ["dc1"]
-  type        = "system"
+  type        = "service"
 
-  # Land on every recorder node (r1/r2/r3).
+  # Collocate ONE recorder per executor node (role==executor), 1:1: each executor
+  # is a state machine and its co-located recorder durably logs the canonical
+  # order it applies. distinct_hosts puts exactly one on each of the 3 executor
+  # nodes, so the recorder count tracks the executor count.
   constraint {
     attribute = "${meta.role}"
-    value     = "recorder"
+    value     = "executor"
   }
 
   group "recorder" {
+    # Quorum N (must match quorum.n in config/channels.toml.tpl + the executor
+    # count in group_vars). distinct_hosts → one per distinct executor node, so
+    # losing one executor node loses at most one recorder.
+    count = 3
+    constraint {
+      operator = "distinct_hosts"
+      value    = "true"
+    }
+
     network {
       mode = "host"
     }
@@ -36,7 +48,7 @@ job "recorder" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-recorder:dev"
+        image        = "192.168.56.10:5000/kardamom-recorder:dev"
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
@@ -45,7 +57,7 @@ job "recorder" {
         args = [
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
-          "--recorder-id", "${meta.recorder_id}",
+          "--recorder-id", "${NOMAD_ALLOC_INDEX}",
           "--kind", "tx-ordering",
         ]
       }

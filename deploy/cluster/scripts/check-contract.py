@@ -68,7 +68,11 @@ nomad_addr = f"http://{control_ip}:{nomad_http}"
 
 # Node name -> ip from the cluster_nodes mapping.
 nodes = dict(re.findall(r"^\s{2}(\w+):\n\s{4}ip:\s*([\d.]+)", gv, re.M))
-if sorted(nodes) != ["r1", "r2", "r3", "w1", "w2"]:
+EXPECTED_NODES = [
+    "batcher1", "cp1", "dawatcher1", "exec1", "ingress1",
+    "r1", "r2", "r3", "sealer1", "sq1", "sq2",
+]
+if sorted(nodes) != EXPECTED_NODES:
     err(f"group_vars/all.yml: unexpected cluster_nodes set: {sorted(nodes)}")
 
 # --- Vagrantfile + inventory mirror the node IPs -----------------------------

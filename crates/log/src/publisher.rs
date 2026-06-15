@@ -27,11 +27,11 @@ use rkyv::api::high::HighSerializer;
 use rkyv::rancor;
 use rkyv::ser::allocator::ArenaHandle;
 use rkyv::util::AlignedVec;
-use tracing::warn;
 
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
+use crate::offer_retry::{offer_with_deadline, OFFER_TIMEOUT};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
     Receipt, TxEnvelope, TxError, TxOrderingMessage, TxRef,
@@ -345,25 +345,16 @@ where
 {
     let bytes: AlignedVec = codec::encode(msg)?;
     let len = bytes.len();
-    // `AeronPublication::offer` returns the new stream position (>=0) or
-    // a negative back-pressure code. Retry up to 1024 times on back-pressure.
-    for attempt in 0..1024 {
-        let r = p.offer_bytes(bytes.as_slice());
-        if r >= 0 {
-            // Aeron returns the position *after* the message; callers
-            // want the fragment's *start* (so the value embedded in a
-            // TxRef matches what the subscriber later sees as the
-            // fragment's term_offset).
-            return Ok(decode_position(r - len as i64));
-        }
-        if attempt % 64 == 63 {
-            warn!(attempt, "aeron back-pressure, retrying");
-        }
-        std::hint::spin_loop();
-    }
-    Err(LogError::Aeron(
-        "back-pressure timeout after 1024 retries".into(),
-    ))
+    // `AeronPublication::offer` returns the new stream position (>=0) or a
+    // negative status code. `offer_with_deadline` retries on any negative —
+    // crucially waiting out NOT_CONNECTED so a frame published before the
+    // subscriber's image forms (the multi-host connect race) is delivered rather
+    // than dropped. See crate::offer_retry for the full rationale.
+    let r = offer_with_deadline(|| p.offer_bytes(bytes.as_slice()), OFFER_TIMEOUT)?;
+    // Aeron returns the position *after* the message; callers want the
+    // fragment's *start* (so the value embedded in a TxRef matches what the
+    // subscriber later sees as the fragment's term_offset).
+    Ok(decode_position(r - len as i64))
 }
 
 /// Aeron returns a stream position as `(term_id << 32) | term_offset` packed

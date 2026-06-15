@@ -111,8 +111,30 @@ pub struct ChannelsConfig {
     pub tx_ordering_stream_id: i32,
 
     /// TxReceipts: receipts + block boundaries. Not recorded.
+    ///
+    /// Single-host / IPC default: one shared channel (`tx_receipts_channel`)
+    /// that the lone executor publishes to and ingress subscribes to directly.
     pub tx_receipts_channel: String,
     pub tx_receipts_stream_id: i32,
+
+    /// TxReceipts MDS (multi-host fan-in). When `tx_receipts_control_channel`
+    /// is non-empty, receipts use a **multi-destination subscription**: each
+    /// executor replica publishes to its own UDP endpoint
+    /// (`tx_receipts_endpoint_host:tx_receipts_endpoint_base_port + replica`),
+    /// and ingress opens ONE `control-mode=manual` subscription
+    /// (`tx_receipts_control_channel`) and attaches each executor endpoint as a
+    /// destination (discovered via Consul), deduping receipts by tx hash. Empty
+    /// (the default) keeps the single-channel IPC path above.
+    #[serde(default)]
+    pub tx_receipts_control_channel: String,
+    /// Host (ingress's receive address) every executor replica sends receipts
+    /// to in MDS mode. Empty unless MDS is enabled.
+    #[serde(default)]
+    pub tx_receipts_endpoint_host: String,
+    /// Base UDP port for per-replica receipt endpoints; replica `i` uses
+    /// `base_port + i`. 0 unless MDS is enabled.
+    #[serde(default)]
+    pub tx_receipts_endpoint_base_port: i32,
 
     /// TxErrors: sequencer-emitted rejection signals (duplicate / past-nonce
     /// today; more variants in the future). RAM only, not recorded —
@@ -150,6 +172,27 @@ impl ChannelsConfig {
     pub fn tx_data_channel(&self, sequencer_id: u8) -> String {
         self.tx_data_channel_template
             .replace("{sid}", &sequencer_id.to_string())
+    }
+
+    /// True when receipts use the multi-destination-subscription (fan-in) path
+    /// — i.e. a `tx_receipts_control_channel` is configured. False = the
+    /// single-channel IPC default (`tx_receipts_channel`).
+    pub fn tx_receipts_mds_enabled(&self) -> bool {
+        !self.tx_receipts_control_channel.is_empty()
+    }
+
+    /// The UDP endpoint executor replica `replica_idx` publishes receipts to —
+    /// and that ingress attaches as an MDS destination. Single source of truth
+    /// for the formula on both sides. `None` when MDS is disabled.
+    pub fn tx_receipts_endpoint(&self, replica_idx: u32) -> Option<String> {
+        if !self.tx_receipts_mds_enabled() {
+            return None;
+        }
+        let port = self.tx_receipts_endpoint_base_port as u32 + replica_idx;
+        Some(format!(
+            "aeron:udp?endpoint={}:{port}",
+            self.tx_receipts_endpoint_host
+        ))
     }
 
     /// TxData[i] stream id (`tx_data_stream_id_base + sequencer_id`).
@@ -221,6 +264,11 @@ impl Default for ChannelsConfig {
             tx_ordering_stream_id: 1001,
             tx_receipts_channel: "aeron:ipc?alias=tx-receipts".into(),
             tx_receipts_stream_id: 1002,
+            // MDS disabled by default (single-host IPC uses tx_receipts_channel
+            // above). The cluster's channels.toml sets these to enable fan-in.
+            tx_receipts_control_channel: String::new(),
+            tx_receipts_endpoint_host: String::new(),
+            tx_receipts_endpoint_base_port: 0,
             tx_errors_channel: "aeron:ipc?alias=tx-errors".into(),
             // 1003 collides with `tx_receipts_stream_id + 1` (the
             // BlockBoundary side-stream); Aeron IPC routes by
@@ -360,6 +408,31 @@ mod tests {
         assert_eq!(
             back.aeron.archive_control_request_channel,
             original.aeron.archive_control_request_channel
+        );
+    }
+
+    #[test]
+    fn tx_receipts_mds_off_by_default() {
+        let ch = ChannelsConfig::default();
+        assert!(!ch.tx_receipts_mds_enabled(), "default must be legacy IPC");
+        assert_eq!(ch.tx_receipts_endpoint(0), None);
+    }
+
+    #[test]
+    fn tx_receipts_endpoint_offsets_port_by_replica() {
+        let mut ch = ChannelsConfig::default();
+        ch.tx_receipts_control_channel = "aeron:udp?control-mode=manual".into();
+        ch.tx_receipts_endpoint_host = "192.168.56.31".into();
+        ch.tx_receipts_endpoint_base_port = 40020;
+        assert!(ch.tx_receipts_mds_enabled());
+        assert_eq!(
+            ch.tx_receipts_endpoint(0).as_deref(),
+            Some("aeron:udp?endpoint=192.168.56.31:40020")
+        );
+        assert_eq!(
+            ch.tx_receipts_endpoint(2).as_deref(),
+            Some("aeron:udp?endpoint=192.168.56.31:40022"),
+            "replica i must publish to base_port + i"
         );
     }
 }

@@ -11,3 +11,7 @@ flame.svg
 results/
 
 .claude
+
+# solc compiler blob (fetched, not source)
+soljson-latest.js
+contracts/soljson-latest.js

@@ -1,7 +1,7 @@
 # Managed by Ansible (roles/consul). Derives from group_vars/all.yml.
 datacenter   = "dc1"
 data_dir     = "/opt/consul"
-bind_addr    = "{{ cluster_nodes[kardamom_node].ip }}"
+bind_addr    = "{{ node_ip }}"
 client_addr  = "0.0.0.0"
 retry_join   = ["{{ control_ip }}"]
 

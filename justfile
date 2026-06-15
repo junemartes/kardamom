@@ -366,7 +366,7 @@ cluster-bootstrap:
     echo
     echo "   MANUAL STEP: 'make images' pushes over plain HTTP to the in-cluster"
     echo "   registry, so this HOST's Docker daemon must list it as insecure:"
-    echo "       { \"insecure-registries\": [\"192.168.56.11:5000\"] }"
+    echo "       { \"insecure-registries\": [\"192.168.56.10:5000\"] }"
     echo "   (Linux: /etc/docker/daemon.json + restart docker; Docker Desktop:"
     echo "   Settings > Docker Engine.) 'just cluster-doctor' checks this."
 
@@ -396,13 +396,13 @@ cluster-doctor:
         fi
     done
     # Pushing images needs the in-cluster registry allowed as insecure (HTTP)
-    # in THIS host's Docker daemon. 192.168.56.11:5000 mirrors registry_host/
+    # in THIS host's Docker daemon. 192.168.56.10:5000 mirrors registry_host/
     # registry_port in deploy/cluster/ansible/group_vars/all.yml.
     if docker info >/dev/null 2>&1; then
         if docker info 2>/dev/null | grep -qE '^\s*192\.168\.56\.11:5000$'; then
-            echo "  ok    docker insecure-registry 192.168.56.11:5000"
+            echo "  ok    docker insecure-registry 192.168.56.10:5000"
         else
-            echo "  MISS  docker insecure-registry 192.168.56.11:5000 — add to the daemon's"
+            echo "  MISS  docker insecure-registry 192.168.56.10:5000 — add to the daemon's"
             echo "        insecure-registries and restart Docker (see cluster-bootstrap notes)"; rc=1
         fi
     else

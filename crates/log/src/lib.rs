@@ -27,6 +27,7 @@ pub mod aeron_live;
 pub mod codec;
 pub mod config;
 pub mod error;
+mod offer_retry;
 pub mod publisher;
 pub mod recorder;
 pub mod subscriber;
