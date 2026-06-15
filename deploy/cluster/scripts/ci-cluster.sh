@@ -106,8 +106,19 @@ export NOMAD_ADDR="http://192.168.56.11:4646"
 log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 ./scripts/deploy.sh
 
-log "smoke test"
+log "smoke test (gate: single-tx must pass before load smoke runs)"
 ./scripts/smoke.sh
+
+# --- 6b. Exhaustive load smoke (sustained stream; must-deliver + keep-pace) --
+# Only runs once the single-tx smoke above has passed — that is the cheap gate.
+# Sends a sustained tx stream and asserts every tx is receipted and the
+# executor keeps pace with the sealer (no freeze / unbounded gap). Knobs come
+# from the environment (SMOKE_DURATION_S / SMOKE_TPS / SMOKE_SENDERS / ...);
+# defaults are 60s @ 5 tx/s across 4 senders. Scrapes executor/sealer metrics
+# via `docker exec kardamom-<node> curl 127.0.0.1:<port>` (same node-reach
+# mechanism this script already uses), so it needs the node containers up.
+log "load smoke (sustained stream; must-deliver + keep-pace)"
+./scripts/smoke-load.sh
 
 # --- 7. Redundancy: kill one recorder alloc, re-smoke (2-of-3 quorum) -------
 log "redundancy: stopping one recorder alloc and re-running smoke"
