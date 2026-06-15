@@ -47,6 +47,10 @@ job "sequencer" {
           "--partition-count", "2",
           "--partition-index", "${meta.sequencer_id}",
           "--sequencer-id", "${meta.sequencer_id}",
+          # This node's tx_ordering MDC publisher control endpoint (ip:port).
+          # Set per-node by Ansible Nomad node meta (group_vars/all.yml); must
+          # match an entry in tx_ordering_mdc_publishers in channels.toml.tpl.
+          "--tx-ordering-mdc-control", "${meta.tx_ordering_mdc_control}",
         ]
       }
 

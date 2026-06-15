@@ -24,6 +24,9 @@ client {
     role          = "{{ role }}"
     recorder_id   = "{{ recorder_id | default('') }}"
     sequencer_id  = "{{ sequencer_id | default('') }}"
+    # tx_ordering MDC control endpoint for this node's sequencer publisher
+    # (ip:port). Empty on non-worker nodes. Consumed by sequencer.nomad.hcl.
+    tx_ordering_mdc_control = "{{ cluster_nodes[kardamom_node].tx_ordering_mdc_control | default('') }}"
   }
 }
 

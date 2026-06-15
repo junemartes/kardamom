@@ -3963,19 +3963,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kardamom-recorder"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "kardamom-log",
- "kardamom-types",
- "tracing",
- "tracing-subscriber 0.3.23",
-]
-
-[[package]]
 name = "kardamom-sealer"
 version = "0.1.0"
 dependencies = [

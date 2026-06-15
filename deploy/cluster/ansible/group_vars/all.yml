@@ -54,8 +54,15 @@ paths:
 aeron_tmpfs_size: "1g"
 
 # --- cluster topology -----------------------------------------------------
-# `recorder_id` is unique+stable per recorder (quorum identity).
+# `recorder_id` is unique+stable per recorder. NOTE: the r1/r2/r3 "recorder"
+# nodes no longer run kardamom-recorder (removed with the custom recorders +
+# Q-of-N quorum aggregator); durability is now archive-at-the-sealer. They are
+# kept as plain Aeron-substrate nodes (media driver on the multicast segment)
+# and as the control plane; `recorder_id` is vestigial.
 # `sequencer_id` is set on worker nodes that run a sequencer.
+# `tx_ordering_mdc_control` is each tx_ordering publisher's MDC control endpoint
+# (ip:port); it MUST match an entry in tx_ordering_mdc_publishers in
+# config/channels.toml.tpl. seq0@w1:40110, seq1@w2:40111, sealer@w2:40112.
 cluster_nodes:
   r1:
     ip: 192.168.56.11
@@ -74,11 +81,13 @@ cluster_nodes:
     ip: 192.168.56.21
     role: worker
     sequencer_id: 0
+    tx_ordering_mdc_control: "192.168.56.21:40110"
     services: [sequencer, executor, ingress]
   w2:
     ip: 192.168.56.22
     role: worker
     sequencer_id: 1
+    tx_ordering_mdc_control: "192.168.56.22:40111"
     services: [sequencer, sealer, da_watcher, batcher]
 
 # Convenience derived lists (used by templates / job placement).

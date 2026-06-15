@@ -1,15 +1,22 @@
 # kardamom-sealer — emits block boundary markers and publishes the canonical
-# tx_ordering stream (channel B). Placed on w2 (192.168.56.22).
+# tx_ordering stream (channel B) via Aeron MDC. Placed on w2 (192.168.56.22).
+# Also runs the ARCHIVE-AT-THE-SEALER durability sidecar (--archive-durability):
+# it records its own tx_ordering MDC publication into the co-located Aeron
+# Archive and publishes the recording's durable position as the single
+# watermark ingress gates on (replacing the removed custom recorders + Q-of-N
+# quorum aggregator).
 #
-# Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-sealer --config <sealer.toml> --aeron-dir <dir>
+# Invocation:
+#   kardamom-sealer --config <sealer.toml> --log-config <channels.toml> \
+#       --aeron-dir <dir> --archive-durability
 #
 # sealer.toml is rendered from config/sealer.toml.tpl (schema:
-# crates/sealer/src/config.rs). It carries the tx_ordering UDP endpoint
-# (channel_b_uri) on the w2 IP — the sealer is the publisher of tx_ordering, so
-# the endpoint lives on this node (port 40001 = aeron_channel_base + 1).
+# crates/sealer/src/config.rs). channel_b_mdc_control there is this sealer's
+# tx_ordering MDC control endpoint (w2 192.168.56.22:40112), which must appear
+# in tx_ordering_mdc_publishers in config/channels.toml.tpl.
 #
-# Shares the node Aeron media driver via the bind-mounted tmpfs aeron.dir.
+# Shares the node Aeron media driver via the bind-mounted tmpfs aeron.dir and
+# the persistent archive dir (segment files for the durability recording).
 
 job "sealer" {
   datacenters = ["dc1"]
@@ -35,11 +42,15 @@ job "sealer" {
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+          "/opt/kardamom/archive:/opt/kardamom/archive",
         ]
         args = [
           "--config", "/local/sealer.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          # Archive-at-the-sealer durability: record this sealer's tx_ordering
+          # MDC publication and publish its durable position as the watermark.
+          "--archive-durability",
         ]
       }
 

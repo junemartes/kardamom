@@ -107,8 +107,48 @@ pub struct ChannelsConfig {
 
     /// TxOrdering: canonical orderer carrying tiny `TxOrderingMessage`
     /// records (TxRef + sealer-emitted boundary markers). Recorded.
+    ///
+    /// In the single-host IPC default this is the one channel every
+    /// publisher (sealer + sequencers) and subscriber (executor) opens. In
+    /// the multi-host cluster it is **superseded by MDC** — see
+    /// `tx_ordering_mdc_control_template` / `tx_ordering_mdc_publishers`
+    /// below: when those are set, each publisher opens its own MDC
+    /// `control-mode=dynamic` publication and each subscriber attaches to
+    /// every publisher's control endpoint. `tx_ordering_channel` is then
+    /// unused for transport (it stays as the IPC fallback the unit tests
+    /// and the single-host path use).
     pub tx_ordering_channel: String,
     pub tx_ordering_stream_id: i32,
+
+    /// TxOrdering **MDC control** URI template. Empty ⇒ MDC disabled (use
+    /// `tx_ordering_channel` as a shared channel — the single-host IPC and
+    /// legacy multicast paths). Non-empty ⇒ tx_ordering runs as Aeron
+    /// multi-destination-cast: `{ctl}` is substituted with a publisher's
+    /// `ip:port` control endpoint.
+    ///
+    /// A **publisher** (sealer / each sequencer) opens this URI with its own
+    /// control endpoint — `control-mode=dynamic` means subscribers attach
+    /// themselves, so the publisher needs no per-subscriber config and a
+    /// dropped subscriber can no longer freeze the others' images (the bug
+    /// this whole change fixes).
+    ///
+    /// A **subscriber** (executor) opens this same URI once per entry in
+    /// `tx_ordering_mdc_publishers`, all on `tx_ordering_stream_id`; the
+    /// images merge into one logical stream exactly as the shared-multicast
+    /// images did, so the executor's canonical merge / dedup / boundary
+    /// alignment is unchanged.
+    ///
+    /// Example:
+    /// `"aeron:udp?control={ctl}|control-mode=dynamic|interface=192.168.56.0/24"`.
+    pub tx_ordering_mdc_control_template: String,
+
+    /// The set of tx_ordering MDC publisher control endpoints (`ip:port`),
+    /// one per publisher (sealer + each sequencer). A subscriber attaches to
+    /// every one of these. Empty when MDC is disabled. Each sequencer/sealer
+    /// publisher selects **its own** endpoint from this list via
+    /// `tx_ordering_mdc_control_for` (keyed on its node identity); the
+    /// executor subscribes to all of them.
+    pub tx_ordering_mdc_publishers: Vec<String>,
 
     /// TxReceipts: receipts + block boundaries. Not recorded.
     pub tx_receipts_channel: String,
@@ -173,6 +213,55 @@ impl ChannelsConfig {
     pub fn fsync_watermark_tx_data_stream_id(&self, sequencer_id: u8) -> i32 {
         self.fsync_watermark_tx_data_stream_id_base + sequencer_id as i32
     }
+
+    /// Whether tx_ordering should use MDC (multi-destination-cast). True iff
+    /// a control template is configured. When false the single-host IPC /
+    /// legacy shared-channel path on `tx_ordering_channel` is used.
+    pub fn tx_ordering_mdc_enabled(&self) -> bool {
+        !self.tx_ordering_mdc_control_template.is_empty()
+    }
+
+    /// Build the MDC control URI for one publisher control endpoint
+    /// (`ip:port`), substituting `{ctl}` in the template. Callers must check
+    /// [`Self::tx_ordering_mdc_enabled`] first.
+    pub fn tx_ordering_mdc_control_uri(&self, control_endpoint: &str) -> String {
+        self.tx_ordering_mdc_control_template
+            .replace("{ctl}", control_endpoint)
+    }
+
+    /// The MDC control URI a **publisher** identified by `control_endpoint`
+    /// (its own `ip:port`) opens. The endpoint must be present in
+    /// `tx_ordering_mdc_publishers`; this is enforced so a misconfigured
+    /// publisher (one whose endpoint subscribers do not attach to) fails
+    /// loudly at open time rather than silently dropping every record.
+    pub fn tx_ordering_mdc_control_for(&self, control_endpoint: &str) -> Result<String, LogError> {
+        if !self.tx_ordering_mdc_enabled() {
+            return Err(LogError::Config(
+                "tx_ordering MDC requested but tx_ordering_mdc_control_template is empty".into(),
+            ));
+        }
+        if !self
+            .tx_ordering_mdc_publishers
+            .iter()
+            .any(|e| e == control_endpoint)
+        {
+            return Err(LogError::Config(format!(
+                "tx_ordering MDC publisher endpoint {control_endpoint:?} is not in \
+                 tx_ordering_mdc_publishers {:?}; subscribers would never attach to it",
+                self.tx_ordering_mdc_publishers
+            )));
+        }
+        Ok(self.tx_ordering_mdc_control_uri(control_endpoint))
+    }
+
+    /// The list of MDC control URIs a **subscriber** (executor) attaches to —
+    /// one per publisher endpoint, all on `tx_ordering_stream_id`.
+    pub fn tx_ordering_mdc_subscriber_uris(&self) -> Vec<String> {
+        self.tx_ordering_mdc_publishers
+            .iter()
+            .map(|ep| self.tx_ordering_mdc_control_uri(ep))
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +308,11 @@ impl Default for ChannelsConfig {
             tx_data_stream_id_base: 2000,
             tx_ordering_channel: "aeron:ipc?alias=tx-ordering".into(),
             tx_ordering_stream_id: 1001,
+            // MDC disabled by default: single-host IPC uses the shared
+            // `tx_ordering_channel` above. The cluster channels.toml sets
+            // these two to switch tx_ordering onto MDC.
+            tx_ordering_mdc_control_template: String::new(),
+            tx_ordering_mdc_publishers: Vec::new(),
             tx_receipts_channel: "aeron:ipc?alias=tx-receipts".into(),
             tx_receipts_stream_id: 1002,
             tx_errors_channel: "aeron:ipc?alias=tx-errors".into(),
@@ -343,6 +437,61 @@ mod tests {
             cfg.channels.tx_ordering_channel,
             LogConfig::default().channels.tx_ordering_channel
         );
+    }
+
+    #[test]
+    fn mdc_disabled_by_default() {
+        let ch = ChannelsConfig::default();
+        assert!(!ch.tx_ordering_mdc_enabled());
+        assert!(ch.tx_ordering_mdc_subscriber_uris().is_empty());
+    }
+
+    #[test]
+    fn mdc_subscriber_uris_substitute_each_publisher() {
+        let ch = ChannelsConfig {
+            tx_ordering_mdc_control_template:
+                "aeron:udp?control={ctl}|control-mode=dynamic".into(),
+            tx_ordering_mdc_publishers: vec![
+                "192.168.56.21:40110".into(),
+                "192.168.56.22:40110".into(),
+                "192.168.56.22:40111".into(),
+            ],
+            ..ChannelsConfig::default()
+        };
+        assert!(ch.tx_ordering_mdc_enabled());
+        let uris = ch.tx_ordering_mdc_subscriber_uris();
+        assert_eq!(uris.len(), 3);
+        assert_eq!(
+            uris[0],
+            "aeron:udp?control=192.168.56.21:40110|control-mode=dynamic"
+        );
+        assert_eq!(
+            uris[2],
+            "aeron:udp?control=192.168.56.22:40111|control-mode=dynamic"
+        );
+    }
+
+    #[test]
+    fn mdc_publisher_endpoint_must_be_registered() {
+        let ch = ChannelsConfig {
+            tx_ordering_mdc_control_template:
+                "aeron:udp?control={ctl}|control-mode=dynamic".into(),
+            tx_ordering_mdc_publishers: vec!["192.168.56.21:40110".into()],
+            ..ChannelsConfig::default()
+        };
+        // Registered endpoint resolves.
+        assert_eq!(
+            ch.tx_ordering_mdc_control_for("192.168.56.21:40110").unwrap(),
+            "aeron:udp?control=192.168.56.21:40110|control-mode=dynamic"
+        );
+        // Unregistered endpoint is rejected (subscribers would never attach).
+        assert!(ch.tx_ordering_mdc_control_for("10.0.0.9:1").is_err());
+    }
+
+    #[test]
+    fn mdc_control_for_errors_when_disabled() {
+        let ch = ChannelsConfig::default();
+        assert!(ch.tx_ordering_mdc_control_for("x:1").is_err());
     }
 
     #[test]

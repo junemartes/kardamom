@@ -262,20 +262,55 @@ impl AeronRuntime {
                 rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
             >,
     {
+        self.open_subscription_merged(std::slice::from_ref(&uri), stream_id)
+    }
+
+    /// Open one or more subscriptions on the **same** `stream_id`, all feeding
+    /// a single mpsc receiver. Each URI becomes its own Aeron subscription
+    /// (its own `SubEntry`); fragments from every one are decoded and merged
+    /// into the returned channel in the Aeron thread's poll order — the same
+    /// merge the shared-multicast path produced from multiple images of one
+    /// subscription.
+    ///
+    /// This is the tx_ordering MDC subscriber primitive: the executor passes
+    /// one MDC control URI per publisher (sealer + each sequencer), and the
+    /// downstream reader sees a single ordered `(BPosition, T)` stream exactly
+    /// as before. With a single URI it is identical to
+    /// [`Self::open_subscription`].
+    pub fn open_subscription_merged<T>(
+        &self,
+        uris: &[&str],
+        stream_id: i32,
+    ) -> Result<UnboundedReceiver<(BPosition, T)>, LogError>
+    where
+        T: rkyv::Archive + Send + 'static,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        if uris.is_empty() {
+            return Err(LogError::Aeron(
+                "open_subscription_merged requires at least one URI".into(),
+            ));
+        }
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
-            match codec::materialize::<T>(bytes) {
-                Ok(v) => {
-                    if msg_tx.send((pos, v)).is_err() {
-                        // Subscriber dropped its receiver.
+        for uri in uris {
+            let msg_tx = msg_tx.clone();
+            let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
+                match codec::materialize::<T>(bytes) {
+                    Ok(v) => {
+                        if msg_tx.send((pos, v)).is_err() {
+                            // Subscriber dropped its receiver.
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "decode failed on subscription delivery");
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "decode failed on subscription delivery");
-                }
-            }
-        });
-        self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+            });
+            self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        }
         Ok(msg_rx)
     }
 }
@@ -572,10 +607,48 @@ pub struct TxOrderingPublisherHandle {
 }
 
 impl TxOrderingPublisherHandle {
+    /// Open the tx_ordering publication on the shared `tx_ordering_channel`
+    /// (single-host IPC / legacy multicast). Use [`Self::open_mdc`] for the
+    /// multi-host MDC path.
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             inner: rt.open_publication(&ch.tx_ordering_channel, ch.tx_ordering_stream_id)?,
         })
+    }
+
+    /// Open the tx_ordering publication as an Aeron MDC
+    /// `control-mode=dynamic` publisher bound to **this publisher's** control
+    /// endpoint (`ip:port`). Subscribers attach themselves to this endpoint;
+    /// no per-subscriber config is needed and a dropped subscriber can no
+    /// longer freeze the other subscribers' images.
+    ///
+    /// `control_endpoint` must be registered in
+    /// `ch.tx_ordering_mdc_publishers` (enforced by
+    /// [`ChannelsConfig::tx_ordering_mdc_control_for`]).
+    pub fn open_mdc(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        control_endpoint: &str,
+    ) -> Result<Self, LogError> {
+        let uri = ch.tx_ordering_mdc_control_for(control_endpoint)?;
+        Ok(Self {
+            inner: rt.open_publication(&uri, ch.tx_ordering_stream_id)?,
+        })
+    }
+
+    /// Open the publisher honouring the config: MDC when enabled (binding to
+    /// `control_endpoint`), the shared channel otherwise. This is the single
+    /// entry point the service binaries call so the IPC fallback is uniform.
+    pub fn open_for(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        control_endpoint: &str,
+    ) -> Result<Self, LogError> {
+        if ch.tx_ordering_mdc_enabled() {
+            Self::open_mdc(rt, ch, control_endpoint)
+        } else {
+            Self::open(rt, ch)
+        }
     }
 
     pub fn publish(&self, msg: &TxOrderingMessage) -> Result<BPosition, LogError> {
@@ -600,13 +673,31 @@ pub struct TxOrderingSubscriberHandle {
 }
 
 impl TxOrderingSubscriberHandle {
+    /// Open the tx_ordering subscriber honouring the config. When MDC is
+    /// enabled it attaches to **every** publisher's control endpoint
+    /// (`tx_ordering_mdc_publishers`) on the shared `tx_ordering_stream_id`,
+    /// merging the images into one ordered stream — exactly the merge the
+    /// shared-multicast images produced, so the executor's downstream
+    /// canonical-order / dedup / boundary-alignment logic is unchanged. When
+    /// MDC is disabled it opens the single shared `tx_ordering_channel` (IPC /
+    /// legacy multicast).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        Ok(Self {
-            rx: rt.open_subscription::<TxOrderingMessage>(
+        let rx = if ch.tx_ordering_mdc_enabled() {
+            let uris = ch.tx_ordering_mdc_subscriber_uris();
+            if uris.is_empty() {
+                return Err(LogError::Config(
+                    "tx_ordering MDC enabled but tx_ordering_mdc_publishers is empty".into(),
+                ));
+            }
+            let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+            rt.open_subscription_merged::<TxOrderingMessage>(&uri_refs, ch.tx_ordering_stream_id)?
+        } else {
+            rt.open_subscription::<TxOrderingMessage>(
                 &ch.tx_ordering_channel,
                 ch.tx_ordering_stream_id,
-            )?,
-        })
+            )?
+        };
+        Ok(Self { rx })
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, TxOrderingMessage)> {

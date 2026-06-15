@@ -14,7 +14,11 @@ use clap::Parser;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxOrderingPublisherHandle, TxOrderingSubscriberHandle,
 };
-use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
+use kardamom_log::publisher::QuorumPublisher;
+use kardamom_log::recorder::{
+    Recorder, connect_archive, connect_client, run_durable_watermark_loop,
+};
 use kardamom_sealer::clock::SystemClock;
 use kardamom_sealer::emitter::{BoundaryPublisher, PublishError};
 use kardamom_sealer::{Sealer, SealerConfig};
@@ -49,6 +53,20 @@ struct Args {
     /// Defaults to the config file's `host_id`.
     #[arg(long, env = "KARDAMOM_HOST_ID")]
     host_id: Option<String>,
+    /// Enable the **archive-at-the-sealer** durability sidecar (the locked
+    /// durability decision, replacing the custom recorders + Q-of-N quorum
+    /// aggregator). When set, the sealer connects its co-located Aeron
+    /// Archive, records its own tx_ordering MDC publication, and publishes the
+    /// recording's byte-durable position as the single durable watermark
+    /// (`QuorumWatermark` on `quorum_watermark_channel`) that ingress's
+    /// `--ack-policy on-quorum` gate consumes. Requires MDC to be enabled in
+    /// the `--log-config` and `channel_b_mdc_control` to be set. Off by
+    /// default so the single-host IPC path is unaffected.
+    #[arg(long, env = "KARDAMOM_ARCHIVE_DURABILITY", default_value_t = false)]
+    archive_durability: bool,
+    /// Poll cadence (ms) for the durable-watermark sidecar.
+    #[arg(long, default_value_t = 1)]
+    durable_poll_interval_ms: u64,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -78,15 +96,22 @@ async fn main() -> Result<()> {
         "kardamom-sealer starting"
     );
 
-    // Start from the resolved channels (UDP from --log-config, or IPC
-    // defaults), then let the sealer's own config win for the tx_ordering
-    // channel it publishes — the SealerConfig is the single source of truth
-    // for channel B's URI / boundary stream id.
+    // Start from the resolved channels (UDP/MDC from --log-config, or IPC
+    // defaults). The boundary stream id is always the sealer's
+    // `channel_b_boundary_stream_id` (the single source of truth). For the
+    // *channel*: in the legacy shared-channel path the sealer's own
+    // `channel_b_uri` wins (it must be byte-identical to the subscribers'
+    // tx_ordering_channel); in the MDC path the resolved channels already
+    // carry the MDC publisher list, so we leave `tx_ordering_channel`
+    // untouched and the sealer publishes via its own MDC control endpoint.
     let mut channels = LogConfig::resolve(args.log_config.as_deref())
         .context("resolve log config")?
         .channels;
-    channels.tx_ordering_channel = cfg.channel_b_uri.clone();
     channels.tx_ordering_stream_id = cfg.channel_b_boundary_stream_id;
+    let mdc = channels.tx_ordering_mdc_enabled();
+    if !mdc {
+        channels.tx_ordering_channel = cfg.channel_b_uri.clone();
+    }
 
     let rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
@@ -94,15 +119,55 @@ async fn main() -> Result<()> {
     };
 
     // Bootstrap: drain the tx_ordering tail and pick `max(block_number) + 1`.
+    // (Under MDC this subscribes to every publisher's control endpoint.)
     let initial_block = bootstrap_block_number(&rt, &channels).await?;
     tracing::info!(
         initial_block,
+        mdc,
         "tx_ordering bootstrap complete; this sealer resumes from block_number"
     );
 
-    let publisher = TxOrderingPublisherHandle::open(&rt, &channels)
-        .context("open TxOrderingPublisherHandle")?;
+    let publisher = if mdc {
+        let ctl = cfg.channel_b_mdc_control.as_deref().context(
+            "tx_ordering MDC is enabled in the log config but the sealer config did not set \
+             channel_b_mdc_control (this sealer's ip:port control endpoint)",
+        )?;
+        TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
+            .context("open TxOrderingPublisherHandle (MDC)")?
+    } else {
+        TxOrderingPublisherHandle::open(&rt, &channels)
+            .context("open TxOrderingPublisherHandle")?
+    };
     let adapter = TxOrderingBoundaryAdapter::new(publisher);
+
+    // Archive-at-the-sealer durability sidecar (the locked durability
+    // decision). Runs on its own OS thread because the AeronArchive +
+    // QuorumPublisher are thread-confined (`!Send`). It records this sealer's
+    // own tx_ordering MDC publication and publishes the recording's durable
+    // position as the single durable watermark ingress gates on.
+    let mut durability_handle: Option<std::thread::JoinHandle<()>> = None;
+    let durability_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if args.archive_durability {
+        anyhow::ensure!(
+            mdc,
+            "--archive-durability requires tx_ordering MDC (set tx_ordering_mdc_* in --log-config)"
+        );
+        let control_uri = channels.tx_ordering_mdc_control_for(
+            cfg.channel_b_mdc_control
+                .as_deref()
+                .context("--archive-durability requires channel_b_mdc_control in the sealer config")?,
+        )?;
+        let resolved = LogConfig::resolve(args.log_config.as_deref())
+            .context("resolve log config for durability")?;
+        durability_handle = Some(spawn_durability_sidecar(
+            args.aeron_dir.clone(),
+            control_uri,
+            channels.clone(),
+            resolved.aeron,
+            Duration::from_millis(args.durable_poll_interval_ms),
+            durability_stop.clone(),
+        ));
+    }
 
     // Spawn a tail-tracker: subscribe to tx_ordering, forward every
     // observed fragment's position into the adapter's `last_pos`. The
@@ -132,7 +197,74 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-sealer: shutdown signal received; aborting run loop");
     run_handle.abort();
     let _ = run_handle.await;
+    durability_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(h) = durability_handle {
+        let _ = h.join();
+    }
     drop(rt);
+    Ok(())
+}
+
+/// Spawn the archive-at-the-sealer durability sidecar on a dedicated OS
+/// thread. Connects the co-located Aeron Archive, records the sealer's own
+/// tx_ordering MDC publication (`control_uri`), and publishes the recording's
+/// byte-durable position as the single durable watermark on
+/// `quorum_watermark_channel`. The thread runs `run_durable_watermark_loop`
+/// until `stop` is set. Errors are logged (the sidecar is best-effort liveness
+/// — if it dies, ingress's `on-quorum` acks stall but no committed data is at
+/// risk, mirroring the old quorum aggregator's liveness-only contract).
+fn spawn_durability_sidecar(
+    aeron_dir: Option<PathBuf>,
+    control_uri: String,
+    channels: ChannelsConfig,
+    aeron_cfg: AeronConfig,
+    poll_interval: Duration,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("sealer-durability".into())
+        .spawn(move || {
+            if let Err(e) = run_durability_sidecar(
+                aeron_dir.as_deref(),
+                &control_uri,
+                &channels,
+                &aeron_cfg,
+                poll_interval,
+                stop,
+            ) {
+                tracing::error!(error = %e, "sealer durability sidecar exited with error");
+            }
+        })
+        .expect("spawn sealer durability sidecar thread")
+}
+
+fn run_durability_sidecar(
+    aeron_dir: Option<&std::path::Path>,
+    control_uri: &str,
+    channels: &ChannelsConfig,
+    aeron_cfg: &AeronConfig,
+    poll_interval: Duration,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let session = connect_archive(aeron_dir, aeron_cfg).context("connect archive")?;
+    let client = connect_client(aeron_dir).context("connect aeron client")?;
+    // recorder_id 0: there is exactly one archive (single durable watermark).
+    let recorder = Recorder::start_b_mdc(
+        session.archive,
+        control_uri,
+        channels,
+        0,
+        aeron_cfg.archive_dir.clone(),
+    )
+    .context("start_b_mdc recording")?;
+    let publisher = QuorumPublisher::open(&client, channels).context("open QuorumPublisher")?;
+    tracing::info!(
+        recording_id = recorder.recording_id(),
+        "sealer durability sidecar: recording tx_ordering MDC; publishing durable watermark"
+    );
+    let should_stop = move || stop.load(std::sync::atomic::Ordering::SeqCst);
+    run_durable_watermark_loop(&recorder, &publisher, poll_interval, should_stop)
+        .context("durable watermark loop")?;
     Ok(())
 }
 

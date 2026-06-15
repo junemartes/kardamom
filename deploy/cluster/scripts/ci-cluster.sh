@@ -30,7 +30,9 @@ SUBNET=192.168.56.0/24
 REGISTRY=192.168.56.11:5000
 TAG=dev
 NODE_IMAGE=kardamom-node:ci
-SERVICES=(ingress sequencer executor sealer da-watcher batcher recorder)
+# NOTE: kardamom-recorder was removed (durability is now archive-at-the-sealer);
+# the sealer image carries the durability sidecar.
+SERVICES=(ingress sequencer executor sealer da-watcher batcher)
 
 # node name -> static IP (mirrors ansible/group_vars/all.yml cluster_nodes).
 NODES=(r1 r2 r3 w1 w2)
@@ -109,11 +111,17 @@ log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 log "smoke test"
 ./scripts/smoke.sh
 
-# --- 7. Redundancy: kill one recorder alloc, re-smoke (2-of-3 quorum) -------
-log "redundancy: stopping one recorder alloc and re-running smoke"
-# Stop the recorder system job on r3 by deregistering then re-checking quorum.
-docker exec kardamom-r3 bash -lc 'export NOMAD_ADDR=http://192.168.56.13:4646; \
-  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" recorder 2>/dev/null | head -c 36); \
+# --- 7. Subscriber-churn resilience: kill an executor alloc, re-smoke --------
+# The Q-of-N recorder-redundancy test is GONE: durability is now a single
+# archive at the sealer (no quorum to tolerate a recorder loss). The property
+# this change is actually about is that a tx_ordering *subscriber* dropping no
+# longer freezes the other subscribers' images (the MDC fix). Kill one executor
+# alloc on w1 and re-smoke: ingress + the sealer durability sidecar must keep
+# advancing (under the old shared-multicast group, a dropped subscriber froze
+# every tx_ordering image; under MDC it does not).
+log "subscriber-churn: stopping one executor alloc and re-running smoke"
+docker exec kardamom-w1 bash -lc 'export NOMAD_ADDR=http://192.168.56.21:4646; \
+  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
   [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
 sleep 5
 ./scripts/smoke.sh
