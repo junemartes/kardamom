@@ -21,6 +21,7 @@ use crate::pending::{PendingReceipts, ReceiptResponse};
 use crate::rate_limit::PerIpLimiter;
 use crate::receipt_cache::ReceiptCache;
 use crate::routing::partition_for;
+use crate::seen_receipts::SeenReceipts;
 use crate::sig_verify::BatchVerifier;
 
 /// Drains a `broadcast::Receiver<T>` and forwards each item to `f`, swallowing
@@ -64,6 +65,11 @@ where
     pub(crate) verifier: Arc<BatchVerifier>,
     pub(crate) pending: Arc<PendingReceipts>,
     pub(crate) cache: Arc<ReceiptCache>,
+    /// First-wins tx-hash dedup for the tx_receipts MDS fan-in: drops the
+    /// duplicate receipt copies the N executor replicas emit so a tx's
+    /// must-deliver ack fires exactly once. No-op on the single-executor IPC
+    /// path. See [`crate::seen_receipts`].
+    pub(crate) seen_receipts: Arc<SeenReceipts>,
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
@@ -90,6 +96,7 @@ where
             verifier: self.verifier.clone(),
             pending: self.pending.clone(),
             cache: self.cache.clone(),
+            seen_receipts: self.seen_receipts.clone(),
             publication: self.publication.clone(),
             subscription: self.subscription.clone(),
             correlation_seq: self.correlation_seq.clone(),
@@ -116,12 +123,14 @@ where
         ));
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
+        let seen_receipts = Arc::new(SeenReceipts::default());
         let me = Self {
             cfg,
             rate_limiter,
             verifier,
             pending,
             cache,
+            seen_receipts,
             publication,
             subscription,
             correlation_seq: Arc::new(AtomicU64::new(0)),
@@ -191,13 +200,32 @@ where
         // (sender, nonce) retry-dedup index and the tx_hash → Receipt index
         // used by `eth_getTransactionReceipt`. It also drives client release
         // through `pending.on_receipt`.
+        //
+        // MDS FAN-IN DEDUP (first-wins by tx hash): with the multi-destination
+        // subscription, ALL N executor replicas replay the same canonical order
+        // and emit IDENTICAL receipts, so each receipt arrives up to N times on
+        // this stream. We dedup by `tx_hash` here so a tx's must-deliver ack
+        // fires exactly once: the first receipt for a hash is processed, every
+        // later copy is dropped before it reaches `pending`/`cache`. (Both
+        // `pending.on_receipt` — keyed by (sender, nonce), removed on resolve —
+        // and `cache.insert` are already individually idempotent/panic-free, so
+        // this set is the explicit, cheap first line that also avoids redundant
+        // work; it is a no-op in the single-executor IPC path.)
         let rx = self.subscription.subscribe_receipts();
         let pending = self.pending.clone();
         let cache = self.cache.clone();
+        let seen = self.seen_receipts.clone();
         spawn_broadcast_watcher(rx, move |receipt: Receipt| {
             let pending = pending.clone();
             let cache = cache.clone();
+            let seen = seen.clone();
             async move {
+                // First-wins: `insert` returns false if the hash was already
+                // present, i.e. this is a duplicate replica copy → drop it.
+                if !seen.insert(receipt.tx_hash) {
+                    metrics::counter!(crate::metrics::RECEIPT_DUPLICATE_TOTAL).increment(1);
+                    return;
+                }
                 let sender = receipt.from;
                 let nonce = receipt.nonce;
                 cache.insert(receipt.clone());

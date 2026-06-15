@@ -896,6 +896,19 @@ impl TxOrderingSubscriberHandle {
 /// TxReceipts publisher. The executor uses `publish_receipt` and
 /// `publish_boundary` on the same channel, but with separate stream ids so
 /// subscribers can demultiplex without an in-band tag.
+///
+/// Two open modes:
+/// - [`open`](Self::open): the legacy **single shared channel**
+///   (`tx_receipts_channel`) — the lone executor publishes, ingress subscribes
+///   directly. This is the single-host IPC default.
+/// - [`open_mds`](Self::open_mds): the **multi-destination-subscription**
+///   (fan-in) path. Each executor replica publishes to its OWN unicast UDP
+///   endpoint (`ch.tx_receipts_endpoint(replica_idx)`), and the single ingress
+///   attaches every replica's endpoint to one `control-mode=manual`
+///   subscription. Both modes publish receipts on `tx_receipts_stream_id` and
+///   boundaries on `tx_receipts_stream_id + 1`; only the channel URI differs,
+///   so `publish_receipt`/`publish_boundary` (and the executor commit thread's
+///   must-deliver retry that drives them) are identical across modes.
 #[derive(Clone)]
 pub struct TxReceiptsPublisherHandle {
     inner: PubHandle,
@@ -903,10 +916,35 @@ pub struct TxReceiptsPublisherHandle {
 }
 
 impl TxReceiptsPublisherHandle {
+    /// Legacy single-shared-channel publisher (IPC default). Use when
+    /// `ch.tx_receipts_mds_enabled()` is false.
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             inner: rt.open_publication(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?,
             boundary: rt.open_publication(&ch.tx_receipts_channel, ch.tx_receipts_stream_id + 1)?,
+        })
+    }
+
+    /// MDS (fan-in) publisher: this replica publishes BOTH streams to its own
+    /// per-replica unicast endpoint `ch.tx_receipts_endpoint(replica_idx)`,
+    /// which ingress attaches as a destination on its aggregating subscription.
+    /// `replica_idx` is the executor's recorder-id (`NOMAD_ALLOC_INDEX`).
+    ///
+    /// Errors if MDS is not configured (no `tx_receipts_control_channel`), so a
+    /// misconfigured executor fails fast instead of silently using IPC.
+    pub fn open_mds(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        replica_idx: u32,
+    ) -> Result<Self, LogError> {
+        let endpoint = ch.tx_receipts_endpoint(replica_idx).ok_or_else(|| {
+            LogError::Aeron(format!(
+                "open_mds: tx_receipts MDS not configured (replica {replica_idx})"
+            ))
+        })?;
+        Ok(Self {
+            inner: rt.open_publication(&endpoint, ch.tx_receipts_stream_id)?,
+            boundary: rt.open_publication(&endpoint, ch.tx_receipts_stream_id + 1)?,
         })
     }
 
@@ -920,16 +958,71 @@ impl TxReceiptsPublisherHandle {
 }
 
 /// TxReceipts subscriber for receipts.
+///
+/// In the legacy IPC path ([`open`](Self::open)) this is a plain subscription
+/// on the shared `tx_receipts_channel`. In the MDS fan-in path
+/// ([`open_mds`](Self::open_mds)) it is opened on the `control-mode=manual`
+/// `tx_receipts_control_channel`; the caller then attaches each executor
+/// replica's endpoint via [`add_destination`](Self::add_destination). The
+/// retained `sub_id` is what `add_destination`/`remove_destination` target.
 pub struct TxReceiptsSubscriberHandle {
     rx: UnboundedReceiver<(BPosition, Receipt)>,
+    /// `Some` only in the MDS path — the subscription id MDS destinations
+    /// attach to. `None` for the legacy single-channel subscription.
+    sub_id: Option<u32>,
+    rt: AeronRuntime,
 }
 
 impl TxReceiptsSubscriberHandle {
+    /// Legacy single-shared-channel subscriber (IPC default).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             rx: rt
                 .open_subscription::<Receipt>(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?,
+            sub_id: None,
+            rt: rt.clone(),
         })
+    }
+
+    /// MDS (fan-in) subscriber: one `control-mode=manual` subscription on
+    /// `ch.tx_receipts_control_channel` that the caller attaches per-replica
+    /// executor endpoints to. Errors if MDS is not configured.
+    pub fn open_mds(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        if !ch.tx_receipts_mds_enabled() {
+            return Err(LogError::Aeron(
+                "open_mds: tx_receipts MDS not configured (empty control channel)".into(),
+            ));
+        }
+        let (sub_id, rx) = rt.open_subscription_with_id::<Receipt>(
+            &ch.tx_receipts_control_channel,
+            ch.tx_receipts_stream_id,
+        )?;
+        Ok(Self {
+            rx,
+            sub_id: Some(sub_id),
+            rt: rt.clone(),
+        })
+    }
+
+    /// Attach an executor replica's endpoint as an MDS destination. Only valid
+    /// on a handle opened via [`open_mds`](Self::open_mds). Idempotent.
+    pub fn add_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.add_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "add_destination on a non-MDS receipts subscription".into(),
+            )),
+        }
+    }
+
+    /// Detach a previously-attached executor endpoint (membership churn).
+    pub fn remove_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.remove_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "remove_destination on a non-MDS receipts subscription".into(),
+            )),
+        }
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
@@ -941,9 +1034,15 @@ impl TxReceiptsSubscriberHandle {
     }
 }
 
-/// TxReceipts subscriber for boundaries.
+/// TxReceipts subscriber for boundaries. Mirrors
+/// [`TxReceiptsSubscriberHandle`] but for the `tx_receipts_stream_id + 1`
+/// boundary side-stream: [`open`](Self::open) for the legacy shared channel,
+/// [`open_mds`](Self::open_mds) + [`add_destination`](Self::add_destination)
+/// for the fan-in path.
 pub struct TxReceiptsBoundarySubscriberHandle {
     rx: UnboundedReceiver<(BPosition, BlockBoundary)>,
+    sub_id: Option<u32>,
+    rt: AeronRuntime,
 }
 
 impl TxReceiptsBoundarySubscriberHandle {
@@ -953,7 +1052,47 @@ impl TxReceiptsBoundarySubscriberHandle {
                 &ch.tx_receipts_channel,
                 ch.tx_receipts_stream_id + 1,
             )?,
+            sub_id: None,
+            rt: rt.clone(),
         })
+    }
+
+    /// MDS (fan-in) boundary subscriber on `ch.tx_receipts_control_channel`,
+    /// stream `tx_receipts_stream_id + 1`. Errors if MDS is not configured.
+    pub fn open_mds(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        if !ch.tx_receipts_mds_enabled() {
+            return Err(LogError::Aeron(
+                "open_mds: tx_receipts MDS not configured (empty control channel)".into(),
+            ));
+        }
+        let (sub_id, rx) = rt.open_subscription_with_id::<BlockBoundary>(
+            &ch.tx_receipts_control_channel,
+            ch.tx_receipts_stream_id + 1,
+        )?;
+        Ok(Self {
+            rx,
+            sub_id: Some(sub_id),
+            rt: rt.clone(),
+        })
+    }
+
+    /// Attach an executor replica's endpoint as an MDS destination. Idempotent.
+    pub fn add_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.add_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "add_destination on a non-MDS boundary subscription".into(),
+            )),
+        }
+    }
+
+    pub fn remove_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.remove_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "remove_destination on a non-MDS boundary subscription".into(),
+            )),
+        }
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, BlockBoundary)> {

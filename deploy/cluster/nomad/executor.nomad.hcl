@@ -52,6 +52,11 @@ job "executor" {
           "--config", "/local/executor.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          # This replica's index — selects its per-replica tx_receipts MDS
+          # endpoint (channels.toml tx_receipts_endpoint_base_port + index).
+          # The job is count-based with distinct_hosts, so ${NOMAD_ALLOC_INDEX}
+          # is stable 0..N and matches the co-located recorder's id.
+          "--recorder-id", "${NOMAD_ALLOC_INDEX}",
           "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",

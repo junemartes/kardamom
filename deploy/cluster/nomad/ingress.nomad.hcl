@@ -10,6 +10,14 @@
 # quorum_watermark stream ingress subscribes to for the on-quorum ack gate,
 # published by the quorum job (issue #38).
 #
+# tx_receipts MDS fan-in: channels.toml's tx_receipts_control_channel +
+# tx_receipts_executor_count drive ingress to open one control-mode=manual
+# subscription and attach each executor replica's per-replica endpoint (0..N),
+# deduping the N identical receipt copies by tx hash. executor_count comes from
+# the log config; override at runtime with --executor-count / KARDAMOM_EXECUTOR_COUNT.
+# TODO(consul-watch): swap the static count for a Consul watch on an
+# `executor-receipts` service so membership changes add/remove destinations live.
+#
 # Shares the node's Aeron media driver via the bind-mounted tmpfs aeron.dir.
 # Host networking so :8545 binds on the ingress1 VM IP.
 #

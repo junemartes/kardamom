@@ -135,6 +135,23 @@ pub struct ChannelsConfig {
     /// `base_port + i`. 0 unless MDS is enabled.
     #[serde(default)]
     pub tx_receipts_endpoint_base_port: i32,
+    /// Number of executor replicas whose endpoints ingress attaches to its MDS
+    /// subscription at startup (`tx_receipts_endpoint(0..N)`).
+    ///
+    /// This is the **static-membership fallback** for the Consul watch the MDS
+    /// design ultimately wants: today ingress simply attaches replicas `0..N`
+    /// once at startup. It works because the executor job is a fixed `count`
+    /// with `distinct_hosts`, so replica indices are stable `0..N`. A replica
+    /// that restarts keeps its index and its endpoint, so the static attach
+    /// stays correct across restarts.
+    ///
+    /// TODO(consul-watch): register each executor as a Consul service
+    /// (`executor-receipts`) and have ingress watch it, calling
+    /// `add_destination`/`remove_destination` on membership change instead of
+    /// this static count. Until then this must match the executor job `count`.
+    /// 0 (the default) is fine when MDS is disabled.
+    #[serde(default)]
+    pub tx_receipts_executor_count: u32,
 
     /// TxErrors: sequencer-emitted rejection signals (duplicate / past-nonce
     /// today; more variants in the future). RAM only, not recorded —
@@ -269,6 +286,7 @@ impl Default for ChannelsConfig {
             tx_receipts_control_channel: String::new(),
             tx_receipts_endpoint_host: String::new(),
             tx_receipts_endpoint_base_port: 0,
+            tx_receipts_executor_count: 0,
             tx_errors_channel: "aeron:ipc?alias=tx-errors".into(),
             // 1003 collides with `tx_receipts_stream_id + 1` (the
             // BlockBoundary side-stream); Aeron IPC routes by
@@ -434,5 +452,42 @@ mod tests {
             Some("aeron:udp?endpoint=192.168.56.31:40022"),
             "replica i must publish to base_port + i"
         );
+    }
+
+    #[test]
+    fn mds_contract_parses_from_toml_and_aligns_both_sides() {
+        // The deploy channels.toml MDS contract. The executor publishes to
+        // `tx_receipts_endpoint(replica)` and ingress attaches the SAME
+        // `tx_receipts_endpoint(i)` for i in 0..executor_count — this single
+        // helper is the source of truth on both sides, so a round-trip parse
+        // must yield identical endpoints for a given index.
+        let f = write_tmp(
+            r#"
+            [channels]
+            tx_receipts_control_channel = "aeron:udp?control-mode=manual|interface=192.168.56.0/24"
+            tx_receipts_endpoint_host = "192.168.56.31"
+            tx_receipts_endpoint_base_port = 40020
+            tx_receipts_executor_count = 3
+            tx_receipts_stream_id = 1002
+            "#,
+        );
+        let ch = LogConfig::from_toml_path(f.path()).expect("load MDS").channels;
+        assert!(ch.tx_receipts_mds_enabled());
+        assert_eq!(ch.tx_receipts_executor_count, 3);
+        // Executor side (replica 1) and ingress side (destination index 1)
+        // resolve to the exact same endpoint.
+        assert_eq!(
+            ch.tx_receipts_endpoint(1).as_deref(),
+            Some("aeron:udp?endpoint=192.168.56.31:40021")
+        );
+        // The boundary stream rides `tx_receipts_stream_id + 1` on that same
+        // endpoint (the publisher/subscriber handles encode this).
+        assert_eq!(ch.tx_receipts_stream_id, 1002);
+    }
+
+    #[test]
+    fn executor_count_defaults_to_zero() {
+        // Default (IPC) config never attaches MDS destinations.
+        assert_eq!(ChannelsConfig::default().tx_receipts_executor_count, 0);
     }
 }

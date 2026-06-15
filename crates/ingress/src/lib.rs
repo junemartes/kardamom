@@ -27,6 +27,7 @@ pub mod proxy;
 pub mod rate_limit;
 pub mod receipt_cache;
 pub mod routing;
+pub mod seen_receipts;
 pub mod sig_verify;
 
 pub use channels::{InMemoryStateDb, IngressPublication, IngressSubscription, MockChannels};

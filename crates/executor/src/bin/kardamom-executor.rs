@@ -43,6 +43,14 @@ struct Args {
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
+    /// This replica's index, used as the per-replica tx_receipts MDS endpoint
+    /// selector (`channels.tx_receipts_endpoint(recorder_id)`). In the cluster
+    /// this is wired from `${NOMAD_ALLOC_INDEX}` (the executor job is
+    /// count-based with `distinct_hosts`), matching the co-located recorder's
+    /// id. Only consulted when `tx_receipts_mds_enabled()`; the legacy shared
+    /// single-channel path ignores it.
+    #[arg(long, env = "KARDAMOM_RECORDER_ID", default_value_t = 0)]
+    recorder_id: u32,
     /// Number of tx_data shards to subscribe to (defaults to 8 — matches
     /// the default `partition_count` in the sequencer).
     #[arg(long, default_value_t = 8)]
@@ -154,9 +162,25 @@ async fn main() -> Result<()> {
     });
     let dep_sub: Box<dyn DepositSubscription> = Box::new(LiveTxDepositsSub { rx: d_rx });
 
-    // tx_receipts publication.
-    let c_handle = TxReceiptsPublisherHandle::open(&rt, &channels)
-        .context("open TxReceiptsPublisherHandle")?;
+    // tx_receipts publication. With MDS (fan-in) enabled, this replica
+    // publishes both the receipt stream and the boundary side-stream to its
+    // OWN per-replica unicast endpoint (selected by --recorder-id); ingress
+    // aggregates every replica's endpoint onto one multi-destination
+    // subscription. Without MDS (the IPC default), fall back to the shared
+    // single-channel path so single-host/local behaviour is unchanged. Either
+    // way the commit thread's must-deliver retry drives the same
+    // publish_receipt/publish_boundary surface.
+    let c_handle = if channels.tx_receipts_mds_enabled() {
+        tracing::info!(
+            replica_idx = args.recorder_id,
+            endpoint = channels.tx_receipts_endpoint(args.recorder_id).as_deref(),
+            "tx_receipts MDS publish (per-replica endpoint)"
+        );
+        TxReceiptsPublisherHandle::open_mds(&rt, &channels, args.recorder_id)
+            .context("open TxReceiptsPublisherHandle (MDS)")?
+    } else {
+        TxReceiptsPublisherHandle::open(&rt, &channels).context("open TxReceiptsPublisherHandle")?
+    };
     let c_pub = LiveTxReceiptsPub { handle: c_handle };
 
     // Load genesis if provided; seed the in-memory state DB and adopt

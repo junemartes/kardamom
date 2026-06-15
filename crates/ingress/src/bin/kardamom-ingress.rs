@@ -53,6 +53,17 @@ struct Args {
     /// `ack_policy` includes a local-fsync gate). Defaults to 0.
     #[arg(long, default_value_t = 0)]
     recorder_id: u8,
+    /// Number of executor replicas to attach to the tx_receipts MDS
+    /// (fan-in) subscription at startup. Only used when MDS is enabled
+    /// (`tx_receipts_control_channel` set). When unset on the CLI it falls
+    /// back to `channels.tx_receipts_executor_count` from the log config.
+    ///
+    /// STATIC-MEMBERSHIP FALLBACK: ingress attaches replicas `0..N` once at
+    /// startup. The real design watches Consul for `executor-receipts` service
+    /// membership and add/removes destinations dynamically — see the
+    /// TODO(consul-watch) on `ChannelsConfig::tx_receipts_executor_count`.
+    #[arg(long, env = "KARDAMOM_EXECUTOR_COUNT")]
+    executor_count: Option<u32>,
     /// Number of tx_data shards (M). Defaults to 8.
     #[arg(long, default_value_t = 8)]
     shards: u32,
@@ -144,10 +155,17 @@ async fn main() -> Result<()> {
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
 
+    // tx_receipts MDS membership: prefer the CLI/env `--executor-count`, else
+    // the log-config field. Only consulted when MDS is enabled.
+    let executor_count = args
+        .executor_count
+        .unwrap_or(channels.tx_receipts_executor_count);
+
     let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
         .context("open IngressPublication")?;
-    let subscription = LiveIngressSubscription::open(&rt, &channels, args.recorder_id)
-        .context("open IngressSubscription")?;
+    let subscription =
+        LiveIngressSubscription::open(&rt, &channels, args.recorder_id, executor_count)
+            .context("open IngressSubscription")?;
     let state_db = Arc::new(InMemoryStateDb::new());
 
     let proxy = IngressProxy::new(cfg, publication, subscription, state_db);
@@ -229,6 +247,7 @@ impl LiveIngressSubscription {
         rt: &AeronRuntime,
         channels: &kardamom_log::config::ChannelsConfig,
         recorder_id: u8,
+        executor_count: u32,
     ) -> Result<Self, IngressError> {
         let (receipts_tx, _) = broadcast::channel::<Receipt>(1024);
         let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(1024);
@@ -236,9 +255,36 @@ impl LiveIngressSubscription {
         let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(1024);
         let (tx_errors_tx, _) = broadcast::channel::<TxError>(1024);
 
-        // tx_receipts → Receipt fan-out
-        let mut receipts_sub = TxReceiptsSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?;
+        let mds = channels.tx_receipts_mds_enabled();
+        if mds {
+            tracing::info!(
+                executor_count,
+                control_channel = %channels.tx_receipts_control_channel,
+                "tx_receipts MDS fan-in: aggregating per-replica executor endpoints"
+            );
+        }
+
+        // tx_receipts → Receipt fan-out.
+        //
+        // MDS (fan-in): open ONE control-mode=manual subscription on
+        // `tx_receipts_control_channel` and attach each executor replica's
+        // unicast endpoint (0..executor_count) as a destination. N executors
+        // replay the SAME canonical order and emit IDENTICAL receipts, so the
+        // proxy dedups by tx hash downstream (first-wins) — this layer just
+        // aggregates the streams. Legacy IPC: a plain subscription on the
+        // shared `tx_receipts_channel`.
+        let mut receipts_sub = if mds {
+            let sub = TxReceiptsSubscriberHandle::open_mds(rt, channels)
+                .map_err(|e| IngressError::Internal(format!("open tx_receipts (MDS): {e}")))?;
+            attach_executor_endpoints(channels, executor_count, |uri| sub.add_destination(uri))
+                .map_err(|e| {
+                    IngressError::Internal(format!("attach tx_receipts destination: {e}"))
+                })?;
+            sub
+        } else {
+            TxReceiptsSubscriberHandle::open(rt, channels)
+                .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?
+        };
         let tx = receipts_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, r)) = receipts_sub.recv().await {
@@ -266,9 +312,23 @@ impl LiveIngressSubscription {
             }
         });
 
-        // tx_receipts → BlockBoundary fan-out
-        let mut boundary_sub = TxReceiptsBoundarySubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
+        // tx_receipts → BlockBoundary fan-out (the `tx_receipts_stream_id + 1`
+        // side-stream). Same MDS vs IPC branch as the receipt stream above:
+        // attach the same per-replica executor endpoints to the boundary MDS
+        // subscription.
+        let mut boundary_sub = if mds {
+            let sub = TxReceiptsBoundarySubscriberHandle::open_mds(rt, channels).map_err(|e| {
+                IngressError::Internal(format!("open tx_receipts boundaries (MDS): {e}"))
+            })?;
+            attach_executor_endpoints(channels, executor_count, |uri| sub.add_destination(uri))
+                .map_err(|e| {
+                    IngressError::Internal(format!("attach tx_receipts boundary destination: {e}"))
+                })?;
+            sub
+        } else {
+            TxReceiptsBoundarySubscriberHandle::open(rt, channels)
+                .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?
+        };
         let tx = block_boundaries_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, b)) = boundary_sub.recv().await {
@@ -312,6 +372,44 @@ impl IngressSubscription for LiveIngressSubscription {
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
         self.tx_errors.subscribe()
     }
+}
+
+/// Attach each executor replica's per-replica receipt endpoint
+/// (`channels.tx_receipts_endpoint(0..executor_count)`) to one MDS
+/// subscription via `attach` (a closure over the handle's `add_destination`).
+///
+/// STATIC MEMBERSHIP (Consul-watch fallback): this runs once at startup over
+/// the fixed `0..executor_count` index space. The executor job is a count-based
+/// Nomad job with `distinct_hosts`, so replica indices are stable and a
+/// restarting replica keeps its index/endpoint — the static attach therefore
+/// stays correct across restarts. The full design watches the
+/// `executor-receipts` Consul service and add/removes destinations on
+/// membership change; see TODO(consul-watch) on
+/// `ChannelsConfig::tx_receipts_executor_count`.
+fn attach_executor_endpoints<F>(
+    channels: &kardamom_log::config::ChannelsConfig,
+    executor_count: u32,
+    mut attach: F,
+) -> Result<(), IngressError>
+where
+    F: FnMut(&str) -> Result<(), kardamom_log::error::LogError>,
+{
+    if executor_count == 0 {
+        tracing::warn!(
+            "tx_receipts MDS enabled but executor_count is 0 — ingress will receive no \
+             receipts; set --executor-count / KARDAMOM_EXECUTOR_COUNT or \
+             channels.tx_receipts_executor_count"
+        );
+    }
+    for i in 0..executor_count {
+        let endpoint = channels.tx_receipts_endpoint(i).ok_or_else(|| {
+            IngressError::Internal(format!("tx_receipts_endpoint({i}) is None (MDS misconfigured)"))
+        })?;
+        attach(&endpoint)
+            .map_err(|e| IngressError::Internal(format!("add_destination {endpoint}: {e}")))?;
+        tracing::info!(replica = i, %endpoint, "attached executor receipt endpoint to MDS");
+    }
+    Ok(())
 }
 
 fn init_tracing() {

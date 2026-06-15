@@ -65,6 +65,26 @@ tx_ordering_channel = "aeron:udp?endpoint=239.192.56.13:40010|interface=192.168.
 tx_ordering_stream_id = 1001
 
 # --- TxReceipts: receipts + block boundaries. Not recorded. ------------------
+# MDS FAN-IN (multi-destination subscription): each executor replica publishes
+# BOTH the receipt stream (1002) and the boundary side-stream (1003) to its OWN
+# unicast endpoint `tx_receipts_endpoint_host:tx_receipts_endpoint_base_port +
+# replica_idx` (replica_idx = the executor's --recorder-id = ${NOMAD_ALLOC_INDEX}).
+# Ingress opens ONE control-mode=manual subscription on
+# `tx_receipts_control_channel` and attaches each executor endpoint (0..N) as a
+# destination, deduping the N identical receipt copies by tx hash (first-wins).
+# This replaces the old shared multicast group for receipts (subscriber churn
+# could freeze the shared image). `tx_receipts_channel` below is now the
+# single-host IPC fallback only — unused while MDS is enabled.
+#
+# host = ingress_ip (192.168.56.31, group_vars/all.yml). base_port 40020; the
+# executor count must match the executor job `count` (nomad/executor.nomad.hcl).
+# TODO(consul-watch): replace the static `tx_receipts_executor_count` with a
+# Consul watch on an `executor-receipts` service so ingress add/removes
+# destinations on membership change.
+tx_receipts_control_channel = "aeron:udp?control-mode=manual|interface=192.168.56.0/24"
+tx_receipts_endpoint_host = "192.168.56.31"
+tx_receipts_endpoint_base_port = 40020
+tx_receipts_executor_count = 3
 tx_receipts_channel = "aeron:udp?endpoint=239.192.56.15:40020|interface=192.168.56.0/24|ttl=1"
 tx_receipts_stream_id = 1002
 
