@@ -97,3 +97,9 @@ control_ip: "192.168.56.10"      # control-0 — consul/nomad server, registry, 
 ingress_ip: "192.168.56.31"      # ingress-0 — smoke.sh default RPC target
 executor_ip: "192.168.56.41"     # executor-0
 sealer_ip: "192.168.56.51"       # sealer-0 (publishes tx_ordering)
+
+# tx_ordering MDC publisher control endpoints. Each publisher binds <node_ip>:40110
+# (uniform port — uniqueness comes from the node IP), and subscribers attach to
+# all of them. These MUST match tx_ordering_mdc_publishers in
+# config/channels.toml.tpl: seq0@.21, seq1@.22, sealer@.51, all on port 40110.
+tx_ordering_mdc_port: 40110

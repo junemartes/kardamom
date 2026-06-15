@@ -36,6 +36,9 @@ client {
     kardamom_node = "{{ kardamom_node }}"
     role          = "{{ role }}"
     tier          = "{{ tier }}"
+    # node_ip: this node's cluster IP. Used by sequencer.nomad.hcl / sealer to
+    # form the tx_ordering MDC control endpoint <node_ip>:{{ tx_ordering_mdc_port }}.
+    node_ip       = "{{ node_ip }}"
   }
 }
 

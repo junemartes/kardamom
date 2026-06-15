@@ -349,10 +349,14 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
                 .publish_receipt(&r)
                 .map(|_| ())
                 .map_err(|e| ExecutorError::State(format!("publish_receipt: {e}"))),
+            // BEST-EFFORT: a block-boundary marker. Ingress acks on the receipt /
+            // durable watermark, not on this — and blocking the commit thread
+            // here (e.g. at startup before ingress's MDS destinations attach)
+            // would freeze ALL state progress. Fire-and-forget so empty blocks
+            // never stall the executor; a dropped boundary is harmless.
             CMessage::BlockBoundary(b) => self
                 .handle
-                .publish_boundary(&b)
-                .map(|_| ())
+                .publish_boundary_best_effort(&b)
                 .map_err(|e| ExecutorError::State(format!("publish_boundary: {e}"))),
         }
     }

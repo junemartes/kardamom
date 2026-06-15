@@ -79,6 +79,7 @@ mod tests {
         SealerConfig {
             host_id: 1,
             channel_b_uri: "ch".into(),
+            channel_b_mdc_control: None,
             channel_b_tx_stream_id: 1,
             channel_b_boundary_stream_id: 2,
             tick_interval_ms: 250,

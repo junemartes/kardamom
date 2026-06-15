@@ -30,7 +30,9 @@ SUBNET=192.168.56.0/24
 REGISTRY=192.168.56.10:5000
 TAG=dev
 NODE_IMAGE=kardamom-node:ci
-SERVICES=(ingress sequencer executor sealer da-watcher batcher recorder)
+# NOTE: kardamom-recorder was removed (durability is now archive-at-the-sealer);
+# the sealer image carries the durability sidecar.
+SERVICES=(ingress sequencer executor sealer da-watcher batcher)
 
 # Node instances are GENERATED from the class model in group_vars/all.yml
 # (node_classes: class -> {count, ip_start}) — the single source of truth. For
@@ -207,7 +209,7 @@ dump_diagnostics() {
     || echo "(tcpdump unavailable or no multicast captured)"
   export NOMAD_ADDR="http://192.168.56.10:4646"
   nomad job status 2>/dev/null || true
-  for job in aeron recorder quorum anvil sealer sequencer executor ingress batcher; do
+  for job in aeron anvil sealer sequencer executor ingress batcher da-watcher; do
     local allocs
     allocs="$(nomad job allocs -t '{{range .}}{{.ID}}{{"\n"}}{{end}}' "${job}" 2>/dev/null || true)"
     [[ -z "${allocs}" ]] && continue
@@ -381,20 +383,35 @@ export NOMAD_ADDR="http://192.168.56.10:4646"
 log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 ./scripts/deploy.sh
 
-log "smoke test"
+log "smoke test (gate: single-tx must pass before load smoke runs)"
 ./scripts/smoke.sh
 
-# --- 7. Redundancy: kill one recorder alloc, re-smoke (2-of-3 quorum) -------
-log "redundancy: stopping one recorder alloc and re-running smoke"
-# Stop one of the 3 collocated recorder allocs (the recorder job is count=3 on the
-# worker tier) via the Nomad server on the control node, then re-check quorum.
+# --- 6b. Exhaustive load smoke (sustained stream; must-deliver + keep-pace) --
+# Runs only after the single-tx smoke above passes (the cheap gate). Sends a
+# sustained tx stream and asserts every tx is receipted and the executors keep
+# pace with the sealer (no freeze / unbounded gap). Knobs via env
+# (SMOKE_DURATION_S / SMOKE_TPS / SMOKE_SENDERS / ...); defaults 60s @ 5 tx/s.
+# Scrapes executor/sealer block metrics via `docker exec kardamom-<node> curl`.
+log "load smoke (sustained stream; must-deliver + keep-pace)"
+./scripts/smoke-load.sh
+
+# --- 7. Subscriber-churn resilience: kill one executor alloc, re-smoke -------
+# The old Q-of-N recorder-redundancy test is GONE: durability is now a single
+# archive at the sealer (no recorder quorum). What the MDC change guarantees is
+# that a tx_ordering *subscriber* dropping no longer freezes the other
+# subscribers' images. Kill one executor alloc (via the control-node Nomad
+# server) and re-smoke: ingress + the sealer durability sidecar must keep
+# advancing (the old shared-multicast group froze every image on a dropped
+# subscriber; under MDC it does not).
+log "subscriber-churn: stopping one executor alloc and re-running smoke"
 docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
-  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" recorder 2>/dev/null | head -c 36); \
+  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
   [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
 sleep 5
-# Second transfer from the same signer: account #0's nonce 0 was consumed by
-# the first smoke, so this one MUST use nonce 1 (the ingress can't fill it; see
-# smoke.sh).
+# Re-smoke after the churn. account #0 nonce 0 was used by the first smoke; the
+# load smoke uses its own senders. TODO(nonce): coordinate nonces across the
+# basic/load/churn smokes once load-smoke's sender set is finalized; for now the
+# churn re-smoke uses nonce 1 (the ingress can't fill it; see smoke.sh).
 NONCE=1 ./scripts/smoke.sh
 
 log "cluster-e2e PASSED"

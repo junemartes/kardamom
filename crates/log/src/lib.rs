@@ -1,12 +1,14 @@
-//! Kardamom canonical log: Aeron-backed channels B and C and the quorum
-//! watermark aggregator that give tx_ordering its durability guarantee.
+//! Kardamom canonical log: Aeron-backed channels B and C and the
+//! archive-at-the-sealer durability path for tx_ordering.
 //!
 //! Durability model: the Aeron Archive daemon is configured with
-//! `fileSyncLevel=1` so it fdatasyncs each recorded frame inline. The
-//! recorder's `get_recording_position()` therefore returns a position that
-//! is byte-durable on local storage. Per-recorder positions are aggregated
-//! into a Q-of-N quorum watermark — surviving correlated power loss requires
-//! Q nodes to have fsynced past the watermarked position.
+//! `fileSyncLevel=1` so it fdatasyncs each recorded frame inline. A single
+//! Aeron Archive co-located with the **sealer** records the sealer's
+//! tx_ordering MDC publication; its `get_recording_position()` returns a
+//! position that is byte-durable on local storage, and the sealer publishes
+//! that one position as the durable watermark ingress gates its must-deliver
+//! ack on (see [`recorder::run_durable_watermark_loop`]). The previous N-way
+//! Q-of-N quorum aggregator + custom recorders have been removed.
 //!
 //! This crate owns the **transport implementation** only. Wire data types live
 //! in [`types`] (re-exported from there). Do not add new wire types

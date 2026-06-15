@@ -2,9 +2,12 @@
 //! *or* a tx_data[i] per) and exposes the current durable
 //! recording position.
 //!
-//! Topology after:
-//!   - One `Recorder` with `RecorderKind::TxOrdering` per tx_ordering recorder host
-//!     (N total; quorum-fsynced via the `QuorumAggregator`).
+//! Topology after the move to **archive-at-the-sealer** durability:
+//!   - One `Recorder` with `RecorderKind::TxOrdering` co-located with the
+//!     **sealer**, recording the sealer's tx_ordering MDC publication (see
+//!     [`Recorder::start_b_mdc`]); its durable position is THE watermark
+//!     (published by [`run_durable_watermark_loop`]). The old N-recorder
+//!     Q-of-N quorum aggregator has been removed.
 //!   - One `Recorder` with `RecorderKind::TxData { sequencer_id }` per sequencer
 //!     host (M total; single-host fsync each).
 //!
@@ -18,10 +21,12 @@
 //! file after every recorded frame. As a consequence,
 //! [`rusteron_archive::AeronArchive::get_recording_position`] returns a
 //! position that is byte-durable on local storage — no separate fsync
-//! sidecar is required. The per-recorder watermark loop
-//! ([`run_watermark_loop`]) periodically polls this position and republishes
-//! it as a [`kardamom_types::FsyncWatermark`] for the quorum aggregator
-//! ([`crate::watermark::QuorumAggregator`]) to combine.
+//! sidecar is required. The durable-watermark loop
+//! ([`run_durable_watermark_loop`]) periodically polls this position and
+//! republishes it as the single [`kardamom_types::QuorumWatermark`] ingress
+//! gates its must-deliver ack on. (The legacy per-recorder
+//! [`run_watermark_loop`] publishing [`kardamom_types::FsyncWatermark`]
+//! remains for the independent per-sequencer tx_data fsync sidecars.)
 //!
 //! ## Design note: thread confinement
 //!
@@ -49,8 +54,8 @@ use tracing::{info, warn};
 
 use crate::config::{AeronConfig, ChannelsConfig, RecorderId};
 use crate::error::LogError;
-use crate::publisher::WatermarkPublisher;
-use kardamom_types::FsyncWatermark;
+use crate::publisher::{QuorumPublisher, WatermarkPublisher};
+use kardamom_types::{FsyncWatermark, QuorumWatermark};
 
 type Archive = rusteron_archive::AeronArchive;
 type AeronClient = rusteron_client::Aeron;
@@ -141,10 +146,9 @@ pub fn connect_archive(
     })
 }
 
-/// Which logical tx_data recorder is tailing. TxOrdering feeds the
-/// quorum aggregator (N recorders, Q-of-N watermark). TxData[i] feeds
-/// the per-sequencer single-host fsync (no quorum by default — see
-/// rationale).
+/// Which logical stream a recorder is tailing. TxOrdering (recorded once, at
+/// the sealer) feeds the single durable watermark. TxData[i] feeds the
+/// per-sequencer single-host fsync sidecar.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
     /// Per-sequencer tx_data recorder (carries full TxEnvelopes).
@@ -188,6 +192,36 @@ impl Recorder {
             RecorderKind::TxOrdering,
             archive_dir,
             "B",
+            should_stop,
+        )
+    }
+
+    /// Start recording the sealer's tx_ordering **MDC** publication — the
+    /// archive-at-the-sealer durability path (the locked durability decision:
+    /// "archive once at the sealer"). The recording subscribes to the sealer's
+    /// own MDC control endpoint (`control_uri`, e.g.
+    /// `aeron:udp?control=<sealer-ip>:<port>|control-mode=dynamic`) on
+    /// `tx_ordering_stream_id`; its byte-durable `get_recording_position()`
+    /// becomes THE durable watermark ingress gates its must-deliver ack on.
+    ///
+    /// `recorder_id` is retained for the `FsyncWatermark`/diagnostics shape but
+    /// is conventionally 0 here (there is exactly one archive).
+    pub fn start_b_mdc(
+        archive: Archive,
+        control_uri: &str,
+        ch: &ChannelsConfig,
+        recorder_id: RecorderId,
+        archive_dir: PathBuf,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Self>, LogError> {
+        Self::start_inner(
+            archive,
+            control_uri,
+            ch.tx_ordering_stream_id,
+            recorder_id,
+            RecorderKind::TxOrdering,
+            archive_dir,
+            "B-MDC",
             should_stop,
         )
     }
@@ -431,6 +465,42 @@ pub fn run_watermark_loop(
                 };
                 if let Err(e) = publisher.publish(&wm) {
                     warn!(error = %e, "watermark publish failed");
+                } else {
+                    last_pos = pos;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => warn!(error = %e, "get_recording_position failed"),
+        }
+        std::thread::sleep(poll_interval);
+    }
+    Ok(())
+}
+
+/// Poll the sealer's tx_ordering archive recording position and republish it
+/// as the single **durable watermark** (`QuorumWatermark` — repurposed to
+/// carry the one archive-at-the-sealer durable position, NOT a Q-of-N
+/// aggregate) whenever it advances. This is the producer ingress's
+/// `on-quorum` ack gate consumes after the custom recorders + quorum
+/// aggregator were removed.
+///
+/// Like [`run_watermark_loop`], runs on the calling thread because
+/// `AeronArchive` and the publisher are thread-confined.
+pub fn run_durable_watermark_loop(
+    recorder: &Recorder,
+    publisher: &QuorumPublisher,
+    poll_interval: Duration,
+    mut should_stop: impl FnMut() -> bool,
+) -> Result<(), LogError> {
+    let mut last_pos: i64 = -1;
+    while !should_stop() {
+        match recorder.current_position() {
+            Ok(pos) if pos > last_pos => {
+                let wm = QuorumWatermark {
+                    position: recorder.to_bposition(pos),
+                };
+                if let Err(e) = publisher.publish(&wm) {
+                    warn!(error = %e, "durable watermark publish failed");
                 } else {
                     last_pos = pos;
                 }

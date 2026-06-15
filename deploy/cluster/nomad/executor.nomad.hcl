@@ -43,6 +43,10 @@ job "executor" {
 
       config {
         image        = "192.168.56.10:5000/kardamom-executor:dev"
+        # Always pull the freshly-built image: the mutable :dev tag would otherwise
+        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy).
+        force_pull    = true
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",

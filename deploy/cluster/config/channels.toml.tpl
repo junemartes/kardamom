@@ -1,89 +1,106 @@
-# kardamom LogConfig — multi-host cluster (Aeron UDP multicast).
+# kardamom LogConfig — multi-host cluster (Aeron UDP multicast + tx_ordering MDC
+# + tx_receipts MDS).
 #
-# CONSUMED via `--log-config` (issue #36): every pipeline service and the
-# recorder/quorum process is launched with `--log-config /local/channels.toml`,
-# which deserializes this whole file into a `kardamom_log::config::LogConfig`
-# (schema: crates/log/src/config.rs). Any field omitted here inherits the
-# built-in default; unknown keys are rejected.
+# CONSUMED via `--log-config` (issue #36): every pipeline service is launched
+# with `--log-config /local/channels.toml`, which deserializes this whole file
+# into a `kardamom_log::config::LogConfig` (schema: crates/log/src/config.rs).
+# Any field omitted here inherits the built-in default; unknown keys are
+# rejected.
 #
-# ── Why multicast ────────────────────────────────────────────────────────────
-# The pipeline has channels with multiple publishers and/or multiple
-# subscribers spread across hosts (tx_ordering: 2 sequencers + the sealer;
-# fsync watermark: 3 recorders → the aggregator; the 3 recorder archives all
-# subscribe tx_ordering). UDP unicast can't express multi-publisher/
-# multi-subscriber, and MDC needs one control endpoint per publisher host.
-# A single UDP **multicast** URI is valid on every node, so one shared file
-# serves the whole cluster — this is also why there is no per-node rendering
-# (closes issue #37). `{sid}`/`{rid}` survive only in the `alias` label;
-# per-stream identity is the stream id, so one multicast group carries both
-# sequencers / all three recorders.
+# ── Transport model ──────────────────────────────────────────────────────────
+# Most fan-out/fan-in channels use UDP **multicast** (one shared URI valid on
+# every node, no per-node rendering). Two channels are point-to-point multi-
+# destination instead, because a shared multicast group's subscriber-churn froze
+# images (killing one recorder froze every executor):
 #
-# ⚠ HIGHEST-RISK AREA TO VALIDATE. Whether Aeron preserves the canonical
-# tx_ordering order across multiple cross-host publishers over UDP multicast is
-# exactly what the cluster e2e (.github/workflows/cluster-e2e.yml) exercises;
-# the single-host IPC defaults (no --log-config) remain the known-good path for
-# local/e2e. See deploy/cluster/README.md.
+#  • **tx_ordering** → Aeron **MDC** (multi-destination-cast). Each publisher
+#    (sealer + each sequencer) opens its OWN `control-mode=dynamic` publication
+#    bound to its node IP + a fixed control port; subscribers (executor + the
+#    sealer's archive-durability sidecar) attach to EVERY publisher's control
+#    endpoint and merge the images. The executor's canonical merge / dedup /
+#    boundary alignment is unchanged (per-image subscriber positions match the
+#    old shared-multicast case).
 #
-# Multicast group / port plan (odd groups 239.192.56.11‥25 on the cluster subnet;
-# `interface` pins egress to the 192.168.56.0/24 host-only network, ttl=1 keeps
-# traffic on-segment):
+#  • **tx_receipts** → Aeron **MDS** (multi-destination-subscription) fan-in.
+#    Each executor replica publishes receipts (+the boundary side-stream) to its
+#    own unicast endpoint; ingress attaches them all to ONE control-mode=manual
+#    subscription and dedups the N identical replica copies by tx hash.
+#
+# ⚠ HIGHEST-RISK AREA TO VALIDATE: that Aeron preserves the canonical
+# tx_ordering order across the merged MDC images. The cluster e2e
+# (.github/workflows/cluster-e2e.yml) exercises it. Single-host IPC defaults (no
+# --log-config) remain the known-good local/e2e path. See README.md.
+#
+# Address plan: multicast DATA groups are ODD on 192.168.56.0/24 (the driver
+# derives the even control address as data-1), spaced by 2 so derived control
+# addresses never collide; `interface` pins egress, ttl=1 keeps traffic on-
+# segment. tx_ordering MDC control ports (unicast on the publisher nodes):
+# 40110 (seq0@.21), 40111 (seq1@.22), 40112 (sealer@.51). tx_receipts MDS
+# unicast endpoints: 192.168.56.31:40020+replica (on the ingress node).
 
 [aeron]
 # Archive control rides aeron:ipc (the LogConfig default — restated here for
-# visibility): each kardamom-recorder is co-located with its node's
+# visibility): the sealer's durability sidecar is co-located with its node's
 # ArchivingMediaDriver and shares its aeron.dir, so it reaches the archive over
 # the local IPC control channel. (UDP archive control would time out — the
 # control response can't be reliably routed back to a co-located client; see
 # crates/log/src/recorder.rs::connect_archive.)
 archive_control_request_channel = "aeron:ipc"
 archive_control_response_channel = "aeron:ipc"
-# Where the recorder's segment files live (bind-mounted; paths.archive_dir).
+# Where the sealer-archive segment files live (bind-mounted; paths.archive_dir).
 archive_dir = "/opt/kardamom/archive"
 
 [quorum]
-# 3 recorders, tolerate 1 loss (Q-of-N fsync gate for ingress --ack-policy
-# on-quorum). Mirrors cluster_nodes recorder count in group_vars/all.yml.
-n = 3
-q = 2
+# VESTIGIAL after the move to archive-at-the-sealer durability. There is no
+# longer a Q-of-N quorum aggregator; the single sealer archive's durable
+# position is THE watermark. Retained only so a channels.toml carrying a
+# [quorum] section still parses (deny_unknown_fields). n=q=1 = "one durable copy".
+n = 1
+q = 1
 
 [channels]
-# Aeron multicast DATA addresses must be ODD ("multicast data address must be
-# odd" — the driver derives the even control address as data-1). So every
-# endpoint below is odd and they are spaced by 2; the derived control addresses
-# land on the disjoint even addresses and never collide. `interface` pins the
-# join to the cluster NIC; `ttl=1` keeps traffic on-segment.
-#
 # --- TxData: per-sequencer exclusive publisher of full TxEnvelope bytes. ------
-# One multicast group; stream id = base + sequencer_id distinguishes w1/w2.
+# One multicast group; stream id = base + sequencer_id distinguishes the seqs.
 tx_data_channel_template = "aeron:udp?endpoint=239.192.56.11:40000|interface=192.168.56.0/24|ttl=1|alias=a-{sid}"
 tx_data_stream_id_base = 2000
 
-# --- TxOrdering: canonical orderer, RECORDED. Multi-publisher (sequencers +
-# sealer). The sealer's own channel_b_uri (config/sealer.toml.tpl) MUST match
-# this group/port/stream so all publishers and the recorders agree.
-tx_ordering_channel = "aeron:udp?endpoint=239.192.56.13:40010|interface=192.168.56.0/24|ttl=1"
+# --- TxOrdering: canonical orderer, via MDC (see header). --------------------
+# `tx_ordering_channel` is the single-host IPC fallback ONLY — UNUSED in the
+# cluster because tx_ordering_mdc_control_template below is set.
+tx_ordering_channel = "aeron:ipc?alias=tx-ordering"
 tx_ordering_stream_id = 1001
+# MDC control template: `{ctl}` ← each publisher's ip:port control endpoint.
+tx_ordering_mdc_control_template = "aeron:udp?control={ctl}|control-mode=dynamic|interface=192.168.56.0/24"
+# Every tx_ordering publisher's control endpoint. Subscribers attach to all of
+# them; each publisher selects its own (sealer via channel_b_mdc_control in
+# sealer.toml; each sequencer via --tx-ordering-mdc-control / env in
+# sequencer.nomad.hcl). Order: seq0@.21, seq1@.22, sealer@.51 (node-class IPs).
+tx_ordering_mdc_publishers = [
+  "192.168.56.21:40110",
+  "192.168.56.22:40110",
+  "192.168.56.51:40110",
+]
 
-# --- TxReceipts: receipts + block boundaries. Not recorded. ------------------
-# MDS FAN-IN (multi-destination subscription): each executor replica publishes
-# BOTH the receipt stream (1002) and the boundary side-stream (1003) to its OWN
-# unicast endpoint `tx_receipts_endpoint_host:tx_receipts_endpoint_base_port +
-# replica_idx` (replica_idx = the executor's --recorder-id = ${NOMAD_ALLOC_INDEX}).
-# Ingress opens ONE control-mode=manual subscription on
-# `tx_receipts_control_channel` and attaches each executor endpoint (0..N) as a
+# --- TxReceipts: receipts + block boundaries. MDS fan-in (see header). --------
+# Each executor replica publishes BOTH the receipt stream (1002) and the
+# boundary side-stream (1003) to its OWN unicast endpoint
+# `tx_receipts_endpoint_host:tx_receipts_endpoint_base_port + replica_idx`
+# (replica_idx = the executor's --recorder-id = ${NOMAD_ALLOC_INDEX}). Ingress
+# opens ONE control-mode=manual subscription on `tx_receipts_control_channel`
+# and attaches each executor endpoint (0..tx_receipts_executor_count) as a
 # destination, deduping the N identical receipt copies by tx hash (first-wins).
-# This replaces the old shared multicast group for receipts (subscriber churn
-# could freeze the shared image). `tx_receipts_channel` below is now the
-# single-host IPC fallback only — unused while MDS is enabled.
-#
-# host = ingress_ip (192.168.56.31, group_vars/all.yml). base_port 40020; the
-# executor count must match the executor job `count` (nomad/executor.nomad.hcl).
+# host = ingress_ip (192.168.56.31, group_vars/all.yml); base_port 40020;
+# executor_count must match the executor job `count` (nomad/executor.nomad.hcl).
 # TODO(consul-watch): replace the static `tx_receipts_executor_count` with a
 # Consul watch on an `executor-receipts` service so ingress add/removes
-# destinations on membership change.
+# destinations on membership change. `tx_receipts_channel` is the IPC fallback.
 tx_receipts_control_channel = "aeron:udp?control-mode=manual|interface=192.168.56.0/24"
 tx_receipts_endpoint_host = "192.168.56.31"
 tx_receipts_endpoint_base_port = 40020
+# Pin the per-replica endpoints to the cluster NIC (like every other UDP channel);
+# without this the executor's unicast publish picks the wrong source NIC and the
+# boundary/receipt connection to ingress never forms.
+tx_receipts_endpoint_interface = "192.168.56.0/24"
 tx_receipts_executor_count = 3
 tx_receipts_channel = "aeron:udp?endpoint=239.192.56.15:40020|interface=192.168.56.0/24|ttl=1"
 tx_receipts_stream_id = 1002
@@ -98,23 +115,16 @@ tx_errors_stream_id = 1015
 tx_deposits_channel = "aeron:udp?endpoint=239.192.56.19:40040|interface=192.168.56.0/24|ttl=1"
 tx_deposits_stream_id = 1016
 
-# --- fsync watermark (tx_ordering), per-recorder. `{rid}` in alias only;
-# stream id is shared (1010) and recorder_id rides inside the FsyncWatermark
-# payload, so one multicast group serves all 3 recorders → the aggregator.
-# fc=max: watermarks are latest-wins/low-rate; with the default MIN multicast flow
-# control the publisher stalls (BACK_PRESSURED) on a slow/not-yet-connected
-# aggregator and the quorum never advances. MAX lets each recorder publish without
-# waiting on receiver acks; the aggregator simply reads the most recent value.
-fsync_watermark_channel_template = "aeron:udp?endpoint=239.192.56.21:40050|interface=192.168.56.0/24|ttl=1|fc=max|alias=fsync-wm-{rid}"
-fsync_watermark_stream_id = 1010
-
 # --- fsync watermark (tx_data), per-sequencer. RAM only; single-host fsync. ---
+# (The per-RECORDER tx_ordering fsync watermark + the Q-of-N aggregated quorum
+# watermark channels were REMOVED with the custom recorders; the tx_data fsync
+# sidecars are an independent, still-supported feature and stay. Odd group .23.)
 fsync_watermark_tx_data_channel_template = "aeron:udp?endpoint=239.192.56.23:40060|interface=192.168.56.0/24|ttl=1|alias=fsync-wm-a-{sid}"
 fsync_watermark_tx_data_stream_id_base = 1030
 
-# --- Aggregated quorum watermark (tx_ordering). Published by the --aggregate
-# recorder; subscribed by ingress for the on-quorum ack gate. fc=max for the same
-# reason as the fsync watermark above: the aggregator must not stall publishing
-# the quorum position when ingress's subscription is slow/just-connected.
-quorum_watermark_channel = "aeron:udp?endpoint=239.192.56.25:40070|interface=192.168.56.0/24|ttl=1|fc=max"
+# --- Durable watermark (tx_ordering). Repurposed from the old "quorum
+# watermark": now the SINGLE archive-at-the-sealer durable position, published
+# by `kardamom-sealer --archive-durability` and subscribed by ingress for the
+# (unchanged) --ack-policy on-quorum ack gate. Own odd group .25.
+quorum_watermark_channel = "aeron:udp?endpoint=239.192.56.25:40070|interface=192.168.56.0/24|ttl=1"
 quorum_watermark_stream_id = 1020

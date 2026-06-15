@@ -276,10 +276,10 @@ impl LiveIngressSubscription {
         let mut receipts_sub = if mds {
             let sub = TxReceiptsSubscriberHandle::open_mds(rt, channels)
                 .map_err(|e| IngressError::Internal(format!("open tx_receipts (MDS): {e}")))?;
-            attach_executor_endpoints(channels, executor_count, |uri| sub.add_destination(uri))
-                .map_err(|e| {
-                    IngressError::Internal(format!("attach tx_receipts destination: {e}"))
-                })?;
+            attach_executor_endpoints(channels, executor_count, false, |uri| {
+                sub.add_destination(uri)
+            })
+            .map_err(|e| IngressError::Internal(format!("attach tx_receipts destination: {e}")))?;
             sub
         } else {
             TxReceiptsSubscriberHandle::open(rt, channels)
@@ -320,7 +320,9 @@ impl LiveIngressSubscription {
             let sub = TxReceiptsBoundarySubscriberHandle::open_mds(rt, channels).map_err(|e| {
                 IngressError::Internal(format!("open tx_receipts boundaries (MDS): {e}"))
             })?;
-            attach_executor_endpoints(channels, executor_count, |uri| sub.add_destination(uri))
+            attach_executor_endpoints(channels, executor_count, true, |uri| {
+                sub.add_destination(uri)
+            })
                 .map_err(|e| {
                     IngressError::Internal(format!("attach tx_receipts boundary destination: {e}"))
                 })?;
@@ -389,6 +391,7 @@ impl IngressSubscription for LiveIngressSubscription {
 fn attach_executor_endpoints<F>(
     channels: &kardamom_log::config::ChannelsConfig,
     executor_count: u32,
+    boundary: bool,
     mut attach: F,
 ) -> Result<(), IngressError>
 where
@@ -401,13 +404,24 @@ where
              channels.tx_receipts_executor_count"
         );
     }
+    // Receipts and boundaries are distinct streams on distinct endpoints (ports):
+    // each manual subscription binds its destination socket, so they must not
+    // share an endpoint. See ChannelsConfig::tx_receipts_endpoint.
+    let kind = if boundary { "boundary" } else { "receipt" };
     for i in 0..executor_count {
-        let endpoint = channels.tx_receipts_endpoint(i).ok_or_else(|| {
-            IngressError::Internal(format!("tx_receipts_endpoint({i}) is None (MDS misconfigured)"))
+        let endpoint = if boundary {
+            channels.tx_receipts_boundary_endpoint(i)
+        } else {
+            channels.tx_receipts_endpoint(i)
+        }
+        .ok_or_else(|| {
+            IngressError::Internal(format!(
+                "tx_receipts {kind} endpoint({i}) is None (MDS misconfigured)"
+            ))
         })?;
         attach(&endpoint)
             .map_err(|e| IngressError::Internal(format!("add_destination {endpoint}: {e}")))?;
-        tracing::info!(replica = i, %endpoint, "attached executor receipt endpoint to MDS");
+        tracing::info!(replica = i, kind, %endpoint, "attached executor endpoint to MDS");
     }
     Ok(())
 }

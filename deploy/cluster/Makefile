@@ -8,7 +8,9 @@ NOMAD_ADDR := http://192.168.56.10:4646
 TAG := dev
 # Workspace root (this file lives in deploy/cluster/).
 ROOT := $(abspath ../..)
-SERVICES := ingress sequencer executor sealer da-watcher batcher recorder
+# kardamom-recorder removed: durability is archive-at-the-sealer (the sealer
+# image carries the --archive-durability sidecar).
+SERVICES := ingress sequencer executor sealer da-watcher batcher
 
 .PHONY: up vms provision images deploy smoke status down clean validate check-contract
 
@@ -45,7 +47,7 @@ images:
 		docker push $(REGISTRY)/kardamom-$$svc:$(TAG) || exit 1; \
 	done
 
-## deploy: run the Aeron system jobs, wait for quorum, then the service jobs
+## deploy: run the Aeron system job, then the service jobs (sealer first — it
 deploy:
 	./scripts/deploy.sh
 

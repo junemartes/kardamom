@@ -56,11 +56,12 @@ build_binaries() {
       cargo build --release \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
-        -p kardamom-recorder --bins
+        --bins
       # Stage exactly where ci-cluster.sh looks: the binaries in target/release,
       # and libaeron*.so under a build/*/out/build/lib path it greps for.
+      # (kardamom-recorder removed — durability is archive-at-the-sealer.)
       mkdir -p /work/target/release/build/aeronstage/out/build/lib
-      for b in ingress sequencer executor sealer da-watcher batcher recorder; do
+      for b in ingress sequencer executor sealer da-watcher batcher; do
         cp -f "/ltarget/release/kardamom-$b" /work/target/release/
       done
       find /ltarget/release/build -path "*/out/build/lib/libaeron*.so" \

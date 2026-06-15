@@ -44,6 +44,10 @@ job "sequencer" {
 
       config {
         image        = "192.168.56.10:5000/kardamom-sequencer:dev"
+        # Always pull the freshly-built image: the mutable :dev tag would otherwise
+        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy).
+        force_pull    = true
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
@@ -55,6 +59,10 @@ job "sequencer" {
           "--partition-count", "2",
           "--partition-index", "${NOMAD_ALLOC_INDEX}",
           "--sequencer-id", "${NOMAD_ALLOC_INDEX}",
+          # This node's tx_ordering MDC publisher control endpoint. Uniform port
+          # 40110 on this node's IP; uniqueness comes from node_ip. Must match an
+          # entry in tx_ordering_mdc_publishers in channels.toml.tpl.
+          "--tx-ordering-mdc-control", "${meta.node_ip}:40110",
         ]
       }
 
