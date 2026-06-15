@@ -43,7 +43,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource};
 
@@ -477,7 +477,25 @@ where
                     ExecToCommit::Receipt(r) => CMessage::Receipt(r),
                     ExecToCommit::Boundary(b) => CMessage::BlockBoundary(b),
                 };
-                c_pub.publish(c_msg)?;
+                // tx_receipts is MUST-DELIVER: a transaction's receipt has to make
+                // it back to the ingress that is parking the client. A transient
+                // publish failure — NOT_CONNECTED while the ingress's subscription
+                // is still forming during multi-host bring-up — must NOT drop the
+                // receipt or kill this thread. Killing it would close the bounded
+                // exec→commit channel, back-pressure the exec thread, stop
+                // tx_ordering consumption, and freeze ALL state progress. So retry
+                // until it lands; the offer itself waits out a single connect race,
+                // and this outer loop covers a connect window longer than one offer
+                // timeout. (Deploy order brings the ingress up first, so this
+                // normally succeeds on the first attempt.)
+                let mut attempts: u32 = 0;
+                while let Err(e) = c_pub.publish(c_msg.clone()) {
+                    attempts += 1;
+                    if attempts == 1 || attempts % 20 == 0 {
+                        warn!(error = %e, attempts, "tx_receipts publish failed; retrying (must-deliver)");
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
         })
         .expect("spawn commit")
@@ -716,5 +734,63 @@ mod commit_tests {
         assert_eq!(l.len(), 2);
         assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
         assert!(matches!(&l[1], CMessage::BlockBoundary(b) if b.block_number == 1));
+    }
+
+    /// Rejects the first `fails_left` publish attempts (a transient
+    /// NOT_CONNECTED while the ingress subscription is forming), then records.
+    struct FlakyPub {
+        fails_left: u32,
+        log: Arc<Mutex<Vec<CMessage>>>,
+    }
+    impl TxReceiptsPublication for FlakyPub {
+        fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+            if self.fails_left > 0 {
+                self.fails_left -= 1;
+                return Err(ExecutorError::TxReceiptsClosed);
+            }
+            self.log.lock().unwrap().push(msg);
+            Ok(())
+        }
+    }
+
+    // tx_receipts is must-deliver: a transient publish failure (subscriber not
+    // yet connected during multi-host bring-up) must neither drop the receipt
+    // nor kill the commit thread — it must retry until the receipt lands.
+    #[test]
+    fn commit_thread_retries_until_delivered() {
+        let (tx, rx) = bounded::<ExecToCommit>(8);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pos0 = BPosition {
+            term_id: 0,
+            term_offset: 0,
+        };
+        tx.send(ExecToCommit::Receipt(Receipt {
+            tx_idx: pos0,
+            tx_hash: B256::repeat_byte(0xAB),
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(tx);
+
+        // The publisher rejects the first 3 attempts, then accepts.
+        let h = spawn_commit(
+            FlakyPub {
+                fails_left: 3,
+                log: log.clone(),
+            },
+            rx,
+        );
+        // Must return Ok — the thread survived the transient failures.
+        h.join()
+            .expect("no panic")
+            .expect("commit thread must not die on a transient publish failure");
+
+        let l = log.lock().unwrap();
+        assert_eq!(l.len(), 1, "the receipt must be delivered, not dropped");
+        assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
     }
 }

@@ -81,7 +81,11 @@ tx_deposits_stream_id = 1016
 # --- fsync watermark (tx_ordering), per-recorder. `{rid}` in alias only;
 # stream id is shared (1010) and recorder_id rides inside the FsyncWatermark
 # payload, so one multicast group serves all 3 recorders → the aggregator.
-fsync_watermark_channel_template = "aeron:udp?endpoint=239.192.56.21:40050|interface=192.168.56.0/24|ttl=1|alias=fsync-wm-{rid}"
+# fc=max: watermarks are latest-wins/low-rate; with the default MIN multicast flow
+# control the publisher stalls (BACK_PRESSURED) on a slow/not-yet-connected
+# aggregator and the quorum never advances. MAX lets each recorder publish without
+# waiting on receiver acks; the aggregator simply reads the most recent value.
+fsync_watermark_channel_template = "aeron:udp?endpoint=239.192.56.21:40050|interface=192.168.56.0/24|ttl=1|fc=max|alias=fsync-wm-{rid}"
 fsync_watermark_stream_id = 1010
 
 # --- fsync watermark (tx_data), per-sequencer. RAM only; single-host fsync. ---
@@ -89,6 +93,8 @@ fsync_watermark_tx_data_channel_template = "aeron:udp?endpoint=239.192.56.23:400
 fsync_watermark_tx_data_stream_id_base = 1030
 
 # --- Aggregated quorum watermark (tx_ordering). Published by the --aggregate
-# recorder; subscribed by ingress for the on-quorum ack gate.
-quorum_watermark_channel = "aeron:udp?endpoint=239.192.56.25:40070|interface=192.168.56.0/24|ttl=1"
+# recorder; subscribed by ingress for the on-quorum ack gate. fc=max for the same
+# reason as the fsync watermark above: the aggregator must not stall publishing
+# the quorum position when ingress's subscription is slow/just-connected.
+quorum_watermark_channel = "aeron:udp?endpoint=239.192.56.25:40070|interface=192.168.56.0/24|ttl=1|fc=max"
 quorum_watermark_stream_id = 1020

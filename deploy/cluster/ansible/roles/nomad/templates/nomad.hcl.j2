@@ -2,12 +2,12 @@
 datacenter = "dc1"
 data_dir   = "/opt/nomad"
 
-bind_addr = "{{ cluster_nodes[kardamom_node].ip }}"
+bind_addr = "{{ node_ip }}"
 
 advertise {
-  http = "{{ cluster_nodes[kardamom_node].ip }}"
-  rpc  = "{{ cluster_nodes[kardamom_node].ip }}"
-  serf = "{{ cluster_nodes[kardamom_node].ip }}"
+  http = "{{ node_ip }}"
+  rpc  = "{{ node_ip }}"
+  serf = "{{ node_ip }}"
 }
 
 server {
@@ -19,11 +19,23 @@ client {
   enabled    = true
   servers    = ["{{ control_ip }}:{{ ports.nomad_rpc }}"]
 
+  # Pin the CPU fingerprint. Nomad derives a node's total CPU compute from
+  # /proc/cpuinfo's "cpu MHz", which is ABSENT on arm64 (Apple Silicon under
+  # Docker Desktop) — so the fingerprint collapses to ~0 and every task's `cpu`
+  # reservation "exhausts" the node ("Dimension cpu exhausted"). A fixed compute
+  # budget lets the scheduler place the collocated jobs; over-subscription across
+  # the co-resident node containers is fine (the kernel time-shares the cores).
+  cpu_total_compute = 16000
+
+  # role  = node class (unique placement: ${meta.role} == ingress, …)
+  # tier  = coarse group (collocation/exclusion: recorders + aeron target
+  #         ${meta.tier} == worker; aeron excludes ${meta.tier} == control).
+  # Per-replica identity (recorder_id, partition-index) comes from
+  # ${NOMAD_ALLOC_INDEX} in the count-based jobs, not node meta.
   meta {
     kardamom_node = "{{ kardamom_node }}"
     role          = "{{ role }}"
-    recorder_id   = "{{ recorder_id | default('') }}"
-    sequencer_id  = "{{ sequencer_id | default('') }}"
+    tier          = "{{ tier }}"
   }
 }
 

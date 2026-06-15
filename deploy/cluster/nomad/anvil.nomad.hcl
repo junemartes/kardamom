@@ -2,7 +2,7 @@
 #
 # Runs on the control node r1 (192.168.56.11), exposing JSON-RPC on
 # 0.0.0.0:8546 (ports.anvil_l1 in group_vars/all.yml). da_watcher points its
-# --l1-rpc at http://192.168.56.11:8546.
+# --l1-rpc at http://192.168.56.10:8546.
 #
 # Uses the upstream Foundry image (not the local registry) since anvil is not a
 # kardamom service. Host networking so :8546 is reachable as the VM IP.
@@ -13,8 +13,8 @@ job "anvil" {
 
   # Pin to the control-plane recorder r1.
   constraint {
-    attribute = "${meta.kardamom_node}"
-    value     = "r1"
+    attribute = "${meta.role}"
+    value     = "control"
   }
 
   group "anvil" {

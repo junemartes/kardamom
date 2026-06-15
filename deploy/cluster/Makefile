@@ -3,8 +3,8 @@
 # (`make check-contract` verifies the mirrors below stay in sync).
 
 SHELL := /bin/bash
-REGISTRY := 192.168.56.11:5000
-NOMAD_ADDR := http://192.168.56.11:4646
+REGISTRY := 192.168.56.10:5000
+NOMAD_ADDR := http://192.168.56.10:4646
 TAG := dev
 # Workspace root (this file lives in deploy/cluster/).
 ROOT := $(abspath ../..)

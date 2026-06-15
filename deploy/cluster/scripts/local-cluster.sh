@@ -25,9 +25,9 @@
 #   deploy/cluster/scripts/local-cluster.sh build      # only build binaries + images
 #   deploy/cluster/scripts/local-cluster.sh up         # only run ci-cluster.sh
 #
-# NOTE: smoke.sh prefers foundry `cast`; the orchestrator does not ship it, so
-# the smoke step falls back to its curl path. Run with KEEP=1 and inspect the
-# cluster (or `docker exec kardamom-orch ...`) for the multi-host Aeron work.
+# NOTE: the orchestrator ships foundry `cast`, so smoke.sh uses its preferred
+# signed-tx Path A (like CI). Run with KEEP=1 and inspect the cluster (or
+# `docker exec kardamom-orch ...`) for the multi-host Aeron work.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,23 +76,18 @@ build_orchestrator() {
 }
 
 ensure_registry_trusted() {
+  # Informational only — never fatal. ci-cluster.sh pushes via REGISTRY_PUSH_NODE
+  # (engine-to-engine: `docker save | docker exec control-0 docker load`, then the
+  # push runs INSIDE control-0 against its own registry). The host/VM docker daemon
+  # never sends registry traffic, so its insecure-registry trust is irrelevant here
+  # — only the in-node dockers need it, and Ansible configures those. (The old hard
+  # gate was also racy: a transient `docker info` hiccup during a Docker Desktop
+  # restart aborted the whole run before it began.)
   if docker info 2>/dev/null | grep -q "${REGISTRY_CIDR}"; then
-    log "insecure registry ${REGISTRY_CIDR} already trusted by the docker daemon"
-    return 0
+    log "host daemon trusts insecure registry ${REGISTRY_CIDR} (not required for the in-node push)"
+  else
+    log "note: host daemon doesn't list ${REGISTRY_CIDR} as insecure — fine; the in-node push doesn't route registry traffic through it"
   fi
-  cat >&2 <<EOF
-==> The in-cluster registry (192.168.56.11:5000) is plain HTTP and is NOT in the
-    docker daemon's insecure-registries. ci-cluster.sh's image push will fail.
-    Add it and restart docker, e.g. on Docker Desktop:
-
-      jq '.["insecure-registries"]=((.["insecure-registries"]//[])+["${REGISTRY_CIDR}"]|unique)' \\
-          ~/.docker/daemon.json > /tmp/d.json && mv /tmp/d.json ~/.docker/daemon.json
-      docker desktop restart && sleep 30
-
-    Then re-run. (Set SKIP_REGISTRY_CHECK=1 to proceed anyway.)
-EOF
-  [[ "${SKIP_REGISTRY_CHECK:-0}" == "1" ]] && return 0
-  exit 1
 }
 
 run_cluster() {
@@ -105,7 +100,11 @@ run_cluster() {
     -v "${ROOT}:/work" \
     kardamom-orchestrator:latest >/dev/null
   log "running ci-cluster.sh inside orchestrator (KEEP=${KEEP:-0})"
-  docker exec -e KEEP="${KEEP:-0}" kardamom-orch \
+  # REGISTRY_PUSH_NODE makes ci-cluster.sh's push_image() side-step Docker
+  # Desktop's HTTP proxy (which can't reach the VM-internal registry IP and would
+  # otherwise hang the push): the image is loaded engine-to-engine into cp1's inner
+  # docker and pushed from there, co-located with the registry. No-op on CI.
+  docker exec -e KEEP="${KEEP:-0}" -e REGISTRY_PUSH_NODE=control-0 kardamom-orch \
     bash -lc 'cd /work && deploy/cluster/scripts/ci-cluster.sh'
 }
 

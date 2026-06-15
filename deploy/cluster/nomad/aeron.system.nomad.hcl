@@ -3,7 +3,7 @@
 # AND workers): the media driver must be local to every service that shares the
 # tmpfs aeron.dir.
 #
-# Image: 192.168.56.11:5000/kardamom-aeron:dev (built from
+# Image: 192.168.56.10:5000/kardamom-aeron:dev (built from
 # crates/log/docker/aeron/Dockerfile). Its entrypoint starts
 # io.aeron.archive.ArchivingMediaDriver with AERON_DIR=/aeron-mount/dir and the
 # archive under /aeron-mount/archive (see the image's ENV).
@@ -30,6 +30,16 @@ job "aeron" {
   datacenters = ["dc1"]
   type        = "system"
 
+  # Keep the media driver OFF the control-plane node: cp1 runs only the
+  # consul/nomad servers + registry + anvil (no kardamom pipeline service shares
+  # its aeron.dir), so a driver there is wasted JVM memory. Every other node
+  # (recorders, sequencers, workers) runs a service that needs a local driver.
+  constraint {
+    attribute = "${meta.tier}"
+    operator  = "!="
+    value     = "control"
+  }
+
   group "aeron" {
     network {
       mode = "host"
@@ -41,7 +51,7 @@ job "aeron" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-aeron:dev"
+        image        = "192.168.56.10:5000/kardamom-aeron:dev"
         network_mode = "host"
         # CRITICAL: the media driver and every service container must see
         # aeron.dir at the SAME ABSOLUTE PATH. Aeron records absolute paths in
@@ -66,13 +76,20 @@ job "aeron" {
         AERON_ARCHIVE_CLASS         = "io.aeron.archive.ArchivingMediaDriver"
         AERON_TERM_BUFFER_LENGTH    = "4194304"
         AERON_IPC_TERM_BUFFER_LENGTH = "4194304"
+        # Cap the ArchivingMediaDriver JVM heap so the task fits its trimmed
+        # memory reservation below. The driver's hot data (4 MB term buffers) is
+        # off-heap in the tmpfs aeron.dir, so a small heap is plenty; _JAVA_OPTIONS
+        # is honoured by the JVM regardless of the image entrypoint.
+        _JAVA_OPTIONS = "-Xmx160m"
       }
 
-      # Sized for the small test-tuned term buffers (4 MB); the per-node VM
-      # memory budget in the Vagrantfile assumes these reservations.
+      # Trimmed from 768 MB: one media driver runs on every non-control node
+      # (the sequencer + worker tiers), so the per-driver footprint is the
+      # dominant cluster-wide memory cost. 384 MB holds the 160 MB heap + the
+      # driver's off-heap buffers/metaspace/threads.
       resources {
-        cpu    = 500
-        memory = 768
+        cpu    = 400
+        memory = 384
       }
     }
   }
