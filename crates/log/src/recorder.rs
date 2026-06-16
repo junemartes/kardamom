@@ -1,15 +1,12 @@
-//! Drives an Aeron Archive instance to record a single stream (tx_ordering
-//! *or* a tx_data[i] per) and exposes the current durable
-//! recording position.
+//! Drives an Aeron Archive instance to record the tx_ordering stream and
+//! exposes the current durable recording position.
 //!
-//! Topology after the move to **archive-at-the-sealer** durability:
-//!   - One `Recorder` with `RecorderKind::TxOrdering` co-located with the
-//!     **sealer**, recording the sealer's tx_ordering MDC publication (see
-//!     [`Recorder::start_b_mdc`]); its durable position is THE watermark
-//!     (published by [`run_durable_watermark_loop`]). The old N-recorder
-//!     Q-of-N quorum aggregator has been removed.
-//!   - One `Recorder` with `RecorderKind::TxData { sequencer_id }` per sequencer
-//!     host (M total; single-host fsync each).
+//! Topology after the move to **archive-at-the-sealer** durability: one
+//! `Recorder` with `RecorderKind::TxOrdering` co-located with the **sealer**,
+//! recording the sealer's tx_ordering MDC publication (see
+//! [`Recorder::start_b_mdc`]); its durable position is THE watermark
+//! (published by [`run_durable_watermark_loop`]). The old N-recorder Q-of-N
+//! quorum aggregator has been removed.
 //!
 //! (unconditional dep on rusteron.)
 //!
@@ -24,25 +21,14 @@
 //! sidecar is required. The durable-watermark loop
 //! ([`run_durable_watermark_loop`]) periodically polls this position and
 //! republishes it as the single [`kardamom_types::QuorumWatermark`] ingress
-//! gates its must-deliver ack on. (The legacy per-recorder
-//! [`run_watermark_loop`] publishing [`kardamom_types::FsyncWatermark`]
-//! remains for the independent per-sequencer tx_data fsync sidecars.)
+//! gates its must-deliver ack on.
 //!
 //! ## Design note: thread confinement
 //!
 //! `AeronArchive` is `!Send + !Sync` (it wraps `Rc` + raw pointers — the C
 //! client is thread-confined). Both the recording-position poll and the
-//! watermark publish therefore happen on the Recorder thread; cross-thread
-//! sharing of the archive handle is not supported.
-//!
-//! ## Segment file path
-//!
-//! The Aeron Archive stores its segment files at
-//! `<archive_dir>/<recording_id>-<segmentBasePosition>.rec`. For the active
-//! segment the base position is the largest multiple of
-//! `segment_file_length` that is `<=` `start_position`. We learn
-//! `start_position`, `term_buffer_length`, and `segment_file_length` from
-//! the recording descriptor (one call to `list_recording` at startup).
+//! durable-watermark publish therefore happen on the Recorder thread;
+//! cross-thread sharing of the archive handle is not supported.
 
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -54,8 +40,8 @@ use tracing::{info, warn};
 
 use crate::config::{AeronConfig, ChannelsConfig, RecorderId};
 use crate::error::LogError;
-use crate::publisher::{QuorumPublisher, WatermarkPublisher};
-use kardamom_types::{FsyncWatermark, QuorumWatermark};
+use crate::publisher::QuorumPublisher;
+use kardamom_types::QuorumWatermark;
 
 type Archive = rusteron_archive::AeronArchive;
 type AeronClient = rusteron_client::Aeron;
@@ -147,12 +133,9 @@ pub fn connect_archive(
 }
 
 /// Which logical stream a recorder is tailing. TxOrdering (recorded once, at
-/// the sealer) feeds the single durable watermark. TxData[i] feeds the
-/// per-sequencer single-host fsync sidecar.
+/// the sealer) feeds the single durable watermark.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
-    /// Per-sequencer tx_data recorder (carries full TxEnvelopes).
-    TxData { sequencer_id: u8 },
     /// TxOrdering canonical-orderer recorder (carries tiny TxRefs).
     TxOrdering,
 }
@@ -160,42 +143,14 @@ pub enum RecorderKind {
 pub struct Recorder {
     /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
     /// the field is intentionally not exposed as `Arc<Archive>`; the
-    /// recording-position poll and watermark publish in
-    /// [`run_watermark_loop`] both run on this thread.
+    /// recording-position poll and the durable-watermark publish in
+    /// [`run_durable_watermark_loop`] both run on this thread.
     archive: Archive,
-    recorder_id: RecorderId,
-    kind: RecorderKind,
     recording_id: i64,
-    /// Cached archive directory (where segment files live).
-    archive_dir: PathBuf,
-    /// Recording descriptor fields we need to compute segment file paths.
-    start_position: i64,
     term_buffer_length: i32,
-    segment_file_length: i32,
 }
 
 impl Recorder {
-    /// Start recording tx_ordering on this host. Used by the N tx_ordering
-    /// recorder hosts that participate in the quorum.
-    pub fn start_b(
-        archive: Archive,
-        ch: &ChannelsConfig,
-        recorder_id: RecorderId,
-        archive_dir: PathBuf,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> Result<Option<Self>, LogError> {
-        Self::start_inner(
-            archive,
-            &ch.tx_ordering_channel,
-            ch.tx_ordering_stream_id,
-            recorder_id,
-            RecorderKind::TxOrdering,
-            archive_dir,
-            "B",
-            should_stop,
-        )
-    }
-
     /// Start recording the sealer's tx_ordering **MDC** publication — the
     /// archive-at-the-sealer durability path (the locked durability decision:
     /// "archive once at the sealer"). The recording subscribes to the sealer's
@@ -204,8 +159,9 @@ impl Recorder {
     /// `tx_ordering_stream_id`; its byte-durable `get_recording_position()`
     /// becomes THE durable watermark ingress gates its must-deliver ack on.
     ///
-    /// `recorder_id` is retained for the `FsyncWatermark`/diagnostics shape but
-    /// is conventionally 0 here (there is exactly one archive).
+    /// `recorder_id` and `archive_dir` are retained in the signature for
+    /// caller compatibility (there is exactly one archive, conventionally
+    /// recorder 0); the durable-watermark path no longer needs either.
     pub fn start_b_mdc(
         archive: Archive,
         control_uri: &str,
@@ -214,50 +170,24 @@ impl Recorder {
         archive_dir: PathBuf,
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<Option<Self>, LogError> {
+        let _ = (recorder_id, archive_dir);
         Self::start_inner(
             archive,
             control_uri,
             ch.tx_ordering_stream_id,
-            recorder_id,
             RecorderKind::TxOrdering,
-            archive_dir,
             "B-MDC",
-            should_stop,
-        )
-    }
-
-    /// Start recording tx_data[sequencer_id]. Per, each sequencer
-    /// host runs one of these recording its own exclusive-publisher stream.
-    pub fn start_a(
-        archive: Archive,
-        ch: &ChannelsConfig,
-        recorder_id: RecorderId,
-        sequencer_id: u8,
-        archive_dir: PathBuf,
-        should_stop: &mut dyn FnMut() -> bool,
-    ) -> Result<Option<Self>, LogError> {
-        Self::start_inner(
-            archive,
-            &ch.tx_data_channel(sequencer_id),
-            ch.tx_data_stream_id(sequencer_id),
-            recorder_id,
-            RecorderKind::TxData { sequencer_id },
-            archive_dir,
-            "A",
             should_stop,
         )
     }
 
     /// Returns `Ok(None)` if `should_stop` fired before a recording appeared
     /// (clean shutdown during startup), `Ok(Some(recorder))` once recording.
-    #[allow(clippy::too_many_arguments)] // private helper; start_b/start_a are the public surface
     fn start_inner(
         archive: Archive,
         channel: &str,
         stream_id: i32,
-        recorder_id: RecorderId,
         kind: RecorderKind,
-        archive_dir: PathBuf,
         ctx: &str,
         should_stop: &mut dyn FnMut() -> bool,
     ) -> Result<Option<Self>, LogError> {
@@ -292,20 +222,15 @@ impl Recorder {
             None => return Ok(None), // shutdown before a recording appeared
         };
 
-        // Pull the descriptor once at startup so we can compute segment file
-        // paths without a control-channel round-trip on every fsync tick.
-        let (start_position, term_buffer_length, segment_file_length) =
-            fetch_descriptor(&archive, recording_id)?;
+        // Pull the descriptor once at startup so the term buffer length is
+        // available to decode positions without a control-channel round-trip
+        // on every watermark tick.
+        let term_buffer_length = fetch_descriptor(&archive, recording_id)?;
 
         Ok(Some(Self {
             archive,
-            recorder_id,
-            kind,
             recording_id,
-            archive_dir,
-            start_position,
             term_buffer_length,
-            segment_file_length,
         }))
     }
 
@@ -378,45 +303,8 @@ impl Recorder {
         Ok(None)
     }
 
-    pub fn recorder_id(&self) -> RecorderId {
-        self.recorder_id
-    }
-
-    pub fn kind(&self) -> RecorderKind {
-        self.kind
-    }
-
     pub fn recording_id(&self) -> i64 {
         self.recording_id
-    }
-
-    /// Borrow the underlying archive handle. The borrow stays on the
-    /// Recorder thread; cross-thread sharing is intentionally not supported
-    /// — the watermark publish runs on this same thread (see
-    /// [`run_watermark_loop`]).
-    pub fn archive(&self) -> &Archive {
-        &self.archive
-    }
-
-    /// Path to the active segment file on disk. Returned for diagnostics
-    /// and for offline consumers (e.g. the L1 batcher) that prefer to read
-    /// segment files directly instead of via the Archive replay API.
-    ///
-    /// We rely on Aeron's canonical naming convention:
-    ///   `<archive_dir>/<recording_id>-<segmentBasePosition>.rec`
-    /// where `segmentBasePosition` comes from the static utility
-    /// [`rusteron_archive::AeronArchive::segment_file_base_position`].
-    pub fn active_segment_path(&self) -> Result<PathBuf, LogError> {
-        let cur = self.current_position()?;
-        let base = Archive::segment_file_base_position(
-            self.start_position,
-            cur,
-            self.term_buffer_length,
-            self.segment_file_length,
-        );
-        Ok(self
-            .archive_dir
-            .join(format!("{}-{}.rec", self.recording_id, base)))
     }
 
     /// Current (committed-to-archive-buffer) position for this recording.
@@ -443,40 +331,6 @@ impl Recorder {
     }
 }
 
-/// Poll the archive's recording position on a fixed cadence and republish it
-/// as an `FsyncWatermark` whenever it advances. Runs on the calling thread
-/// because `AeronArchive` and the publisher are both thread-confined.
-///
-/// `poll_interval` controls the watermark cadence — higher = lower CPU, more
-/// tail latency on quorum advancement. 1ms is a reasonable default.
-pub fn run_watermark_loop(
-    recorder: &Recorder,
-    publisher: &WatermarkPublisher,
-    poll_interval: Duration,
-    mut should_stop: impl FnMut() -> bool,
-) -> Result<(), LogError> {
-    let mut last_pos: i64 = -1;
-    while !should_stop() {
-        match recorder.current_position() {
-            Ok(pos) if pos > last_pos => {
-                let wm = FsyncWatermark {
-                    recorder_id: recorder.recorder_id,
-                    position: recorder.to_bposition(pos),
-                };
-                if let Err(e) = publisher.publish(&wm) {
-                    warn!(error = %e, "watermark publish failed");
-                } else {
-                    last_pos = pos;
-                }
-            }
-            Ok(_) => {}
-            Err(e) => warn!(error = %e, "get_recording_position failed"),
-        }
-        std::thread::sleep(poll_interval);
-    }
-    Ok(())
-}
-
 /// Poll the sealer's tx_ordering archive recording position and republish it
 /// as the single **durable watermark** (`QuorumWatermark` — repurposed to
 /// carry the one archive-at-the-sealer durable position, NOT a Q-of-N
@@ -484,8 +338,8 @@ pub fn run_watermark_loop(
 /// `on-quorum` ack gate consumes after the custom recorders + quorum
 /// aggregator were removed.
 ///
-/// Like [`run_watermark_loop`], runs on the calling thread because
-/// `AeronArchive` and the publisher are thread-confined.
+/// Runs on the calling thread because `AeronArchive` and the publisher are
+/// thread-confined.
 pub fn run_durable_watermark_loop(
     recorder: &Recorder,
     publisher: &QuorumPublisher,
@@ -513,11 +367,12 @@ pub fn run_durable_watermark_loop(
     Ok(())
 }
 
-/// One-shot descriptor fetch via `list_recording`. We implement the
-/// `AeronArchiveRecordingDescriptorConsumerFuncCallback` trait on a small
-/// `Rc<RefCell<Captured>>` shim. Single-thread access is enforced by the
-/// fact that `AeronArchive` itself is `!Send + !Sync`.
-fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i32), LogError> {
+/// One-shot descriptor fetch via `list_recording`, returning the recording's
+/// term buffer length (needed to decode absolute positions into `BPosition`).
+/// We implement the `AeronArchiveRecordingDescriptorConsumerFuncCallback`
+/// trait on a small `Rc<RefCell<Captured>>` shim. Single-thread access is
+/// enforced by the fact that `AeronArchive` itself is `!Send + !Sync`.
+fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<i32, LogError> {
     use rusteron_archive::{
         AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
         Handler,
@@ -525,9 +380,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
 
     #[derive(Default)]
     struct Captured {
-        start_position: i64,
         term_buffer_length: i32,
-        segment_file_length: i32,
         seen: bool,
     }
 
@@ -541,9 +394,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
             desc: AeronArchiveRecordingDescriptor,
         ) {
             let mut g = self.captured.borrow_mut();
-            g.start_position = desc.start_position();
             g.term_buffer_length = desc.term_buffer_length();
-            g.segment_file_length = desc.segment_file_length();
             g.seen = true;
         }
     }
@@ -568,11 +419,7 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<(i64, i32, i
             "list_recording({recording_id}) returned no descriptor"
         )));
     }
-    Ok((
-        g.start_position,
-        g.term_buffer_length,
-        g.segment_file_length,
-    ))
+    Ok(g.term_buffer_length)
 }
 
 /// Return the id of the most recent recording for `stream_id`, if any. Used to

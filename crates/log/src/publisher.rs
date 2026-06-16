@@ -9,8 +9,7 @@
 //!   Many publisher handles (M sequencers + the sealer) may offer to the
 //!   same Aeron stream; Aeron serialises them into a single byte order, and
 //!   that order *is* the canonical L2 ordering (system invariant I1).
-//! - **TxReceipts** — receipts + boundaries. RAM only.
-//! - **Watermark / quorum-watermark / receipt-cache** — auxiliary streams.
+//! - **QuorumWatermark** — the single archive-at-the-sealer durable position.
 //!
 //! Channel URIs in [`crate::config::ChannelsConfig`] are stored as `String`
 //! for ergonomics; we convert to `CString`/`&CStr` at the FFI boundary since
@@ -20,7 +19,6 @@
 //! `cargo test` runs.
 
 use std::ffi::CString;
-use std::rc::Rc;
 use std::time::Duration;
 
 use rkyv::api::high::HighSerializer;
@@ -33,8 +31,7 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::offer_retry::{offer_with_deadline, OFFER_TIMEOUT};
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
-    Receipt, TxEnvelope, TxError, TxOrderingMessage, TxRef,
+    BPosition, BlockBoundaryStart, QuorumWatermark, TxEnvelope, TxOrderingMessage, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
@@ -170,125 +167,7 @@ impl TxOrderingPublisher {
     }
 }
 
-/// TxReceipts: receipts + boundaries. RAM only.
-pub struct TxReceiptsPublisher {
-    pub_handle: Pub,
-}
-
-impl TxReceiptsPublisher {
-    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(
-            aeron,
-            &ch.tx_receipts_channel,
-            ch.tx_receipts_stream_id,
-            "C",
-        )?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish_receipt(&self, r: &Receipt) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, r)
-    }
-
-    pub fn publish_boundary(&self, b: &BlockBoundary) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, b)
-    }
-}
-
-/// TxErrors: sequencer-emitted rejection signals (e.g. duplicate / past-nonce).
-/// RAM only, consumed by ingress to release parked client submissions early.
-pub struct TxErrorsPublisher {
-    pub_handle: Pub,
-}
-
-impl TxErrorsPublisher {
-    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(aeron, &ch.tx_errors_channel, ch.tx_errors_stream_id, "err")?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish(&self, e: &TxError) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, e)
-    }
-}
-
-/// TxDeposits: DA-watcher → sequencer channel for L1 deposit envelopes.
-/// RAM only.
-pub struct TxDepositsPublisher {
-    pub_handle: Pub,
-}
-
-impl TxDepositsPublisher {
-    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(
-            aeron,
-            &ch.tx_deposits_channel,
-            ch.tx_deposits_stream_id,
-            "dep",
-        )?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish(&self, d: &Deposit) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, d)
-    }
-}
-
-/// Per-tx_ordering-recorder fsync-watermark publisher. Each B-recorder host
-/// opens one of these; the quorum aggregator subscribes to all N.
-pub struct WatermarkPublisher {
-    pub_handle: Pub,
-}
-
-impl WatermarkPublisher {
-    pub fn open(
-        aeron: &AeronClient,
-        ch: &ChannelsConfig,
-        recorder_id: u8,
-    ) -> Result<Self, LogError> {
-        let pub_handle = add_pub(
-            aeron,
-            &ch.fsync_watermark_channel(recorder_id),
-            ch.fsync_watermark_stream_id,
-            "wm",
-        )?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish(&self, w: &FsyncWatermark) -> Result<(), LogError> {
-        offer(&self.pub_handle, w).map(|_| ())
-    }
-}
-
-/// Per-tx_data fsync-watermark publisher. One per sequencer
-/// host; downstream consumers (ack-path coordinator, executor) subscribe
-/// to whichever A-watermarks they care about. TxData is single-host
-/// durability by default — there is no quorum aggregator for A.
-pub struct WatermarkAPublisher {
-    pub_handle: Pub,
-}
-
-impl WatermarkAPublisher {
-    pub fn open(
-        aeron: &AeronClient,
-        ch: &ChannelsConfig,
-        sequencer_id: u8,
-    ) -> Result<Self, LogError> {
-        let pub_handle = add_pub(
-            aeron,
-            &ch.fsync_watermark_tx_data_channel(sequencer_id),
-            ch.fsync_watermark_tx_data_stream_id(sequencer_id),
-            "wm-a",
-        )?;
-        Ok(Self { pub_handle })
-    }
-
-    pub fn publish(&self, w: &FsyncWatermark) -> Result<(), LogError> {
-        offer(&self.pub_handle, w).map(|_| ())
-    }
-}
-
-/// Shared quorum-watermark publisher, used by the aggregator.
+/// Shared quorum-watermark publisher, used by the durable-watermark loop.
 pub struct QuorumPublisher {
     pub_handle: Pub,
 }
@@ -368,16 +247,3 @@ fn decode_position(p: i64) -> BPosition {
     }
 }
 
-/// Bundle of all publishers a single host might need. Uses `Rc` (not `Arc`)
-/// because `AeronClient` is thread-confined (`!Send + !Sync`) and the whole
-/// publisher set lives on one Aeron-client thread by design.
-///
-/// `a` is the per-sequencer tx_data publisher — only the sequencer hosts
-/// populate it; executor / batcher / sealer hosts leave it `None`.
-#[derive(Clone)]
-pub struct Publishers {
-    pub aeron: Rc<AeronClient>,
-    pub a: Option<Rc<TxDataPublisher>>,
-    pub b: Rc<TxOrderingPublisher>,
-    pub c: Rc<TxReceiptsPublisher>,
-}

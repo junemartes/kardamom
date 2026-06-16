@@ -17,8 +17,6 @@ testing = []
 docker-e2e = ["testing", "dep:testcontainers"]
 
 [dependencies]
-alloy-primitives.workspace = true
-bytes.workspace = true
 crossbeam-channel.workspace = true
 futures.workspace = true
 kardamom-types.workspace = true
@@ -33,6 +31,10 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# alloy-primitives / bytes are used only by the integration tests in tests/,
+# not by the library crate itself.
+alloy-primitives.workspace = true
+bytes.workspace = true
 tempfile.workspace = true
 testcontainers.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
