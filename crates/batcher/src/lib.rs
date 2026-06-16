@@ -23,7 +23,6 @@
 //! `` / / for
 //! the cross-cutting decisions that shape this crate.
 
-pub mod archive_live;
 pub mod archive_reader;
 pub mod batch;
 pub mod batcher;

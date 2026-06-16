@@ -130,20 +130,6 @@ impl MultiArchiveReader {
         })
     }
 
-    /// Open the tx_ordering reader only, with **explicitly-supplied**
-    /// per-A indexes. Useful for tests that synthesise an in-memory index
-    /// rather than write a segment file to disk.
-    pub fn with_indexes(
-        b_segment: &Path,
-        a_indexes: HashMap<u8, PerASegmentIndex>,
-    ) -> Result<Self, BatcherError> {
-        let b_reader = TxOrderingSegmentReader::open(b_segment)?;
-        Ok(Self {
-            b_reader,
-            a_indexes,
-        })
-    }
-
     /// Number of tx_data archives this reader is resolving against.
     pub fn a_archive_count(&self) -> usize {
         self.a_indexes.len()
