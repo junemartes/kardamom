@@ -3887,8 +3887,6 @@ dependencies = [
  "rand 0.9.4",
  "reqwest 0.13.4",
  "secp256k1 0.31.1",
- "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tower",

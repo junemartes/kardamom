@@ -74,10 +74,6 @@ impl PendingReceipts {
         }
     }
 
-    pub fn policy(&self) -> AckPolicy {
-        self.policy
-    }
-
     /// Two-phase register: returns a `PendingWait` the caller awaits with a
     /// timeout. Calling code must `register` *before* publishing the tx so
     /// the receipt cannot beat the registration.
