@@ -239,26 +239,13 @@ fn m4_canonical_b_order_drives_receipts() {
             .publish_ref(&TxRef::new(*h, *sid, *pos_a))
             .expect("publish ref");
     }
-    // Sealer-emitted boundary: closes block 1 at the last B position.
-    // The fake bus serializes appends, so the boundary's BPosition will
-    // be after every TxRef; we synthesize end_tx_idx to match the LAST
-    // ref's actual BPosition by snooping at the bus state via the
-    // subscription poll. Simpler: open a peek subscription, drain to
-    // last position. Even simpler: we don't have to assert end_tx_idx in
-    // this test since the executor's misalignment check fires only if it
-    // doesn't match; here we want it to match.
-    //
-    // Workaround: drain a temporary subscription to find the last
-    // position the bus assigned to a TxRef.
-    let mut peek = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
-    let mut last_pos: Option<BPosition> = None;
-    peek.poll(
-        |pos, _msg| {
-            last_pos = Some(pos);
-        },
-        4096,
-    );
-    let end_tx_idx = last_pos.expect("at least one TxRef");
+    // Sealer-emitted boundary: closes block 1. end_tx_idx is the cumulative
+    // COUNT of canonical records (TxRef/DepositRef) through this block — the
+    // publisher- and position-independent alignment key the executor matches
+    // against its own processed-record count. Every plan entry is a distinct
+    // tx (unique sender/nonce ⇒ unique tx_hash), so no dedup drops occur and
+    // the count is exactly `plan.len()`.
+    let end_tx_idx = BPosition::from_index(plan.len() as u64);
     b_pub
         .publish_boundary(&BlockBoundaryStart {
             block_number: 1,
@@ -426,10 +413,8 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     b_pub
         .publish_boundary(&BlockBoundaryStart {
             block_number: 1,
-            end_tx_idx: BPosition {
-                term_id: 0,
-                term_offset: 0,
-            },
+            // One canonical record applied ⇒ cumulative count 1.
+            end_tx_idx: BPosition::from_index(1),
             l2_timestamp: 1_700_000_000,
         })
         .expect("publish boundary");

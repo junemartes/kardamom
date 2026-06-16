@@ -34,17 +34,33 @@ fn cluster_channels_tpl_parses_as_logconfig() {
 fn cluster_channels_tpl_mdc_publishers_and_uris() {
     let cfg = LogConfig::from_toml_path(&cluster_channels_tpl()).expect("parse");
     let pubs = &cfg.channels.tx_ordering_mdc_publishers;
-    // seq0@w1, seq1@w2, sealer@w2.
-    assert_eq!(pubs.len(), 3, "expected 3 tx_ordering MDC publishers");
+    // Sequencer INPUT publishers only: seq0@.21, seq1@.22. The sealer is the
+    // sole CANONICAL publisher (tx_ordering_canonical_publisher), NOT in this
+    // list.
+    assert_eq!(pubs.len(), 2, "expected 2 tx_ordering MDC sequencer inputs");
     assert!(
         pubs.iter().all(|e| e.contains(':')),
         "every MDC publisher must be ip:port: {pubs:?}"
     );
-    // Subscriber URIs are well-formed MDC dynamic-control URIs.
-    let uris = cfg.channels.tx_ordering_mdc_subscriber_uris();
+    let canonical = &cfg.channels.tx_ordering_canonical_publisher;
+    assert!(
+        canonical.contains(':') && !pubs.contains(canonical),
+        "canonical (sealer) publisher must be ip:port and distinct from the inputs: {canonical:?}"
+    );
+    // The sealer's input subscriber URIs are well-formed MDC dynamic-control
+    // URIs, one per sequencer.
+    let uris = cfg.channels.tx_ordering_input_subscriber_uris();
     assert_eq!(uris.len(), pubs.len());
     for (uri, ep) in uris.iter().zip(pubs.iter()) {
         assert!(uri.contains("control-mode=dynamic"), "MDC URI: {uri}");
         assert!(uri.contains(&format!("control={ep}")), "control endpoint: {uri}");
     }
+    // The canonical subscriber URI (executor/durability/bootstrap) targets the
+    // single sealer endpoint.
+    let canon_uri = cfg
+        .channels
+        .tx_ordering_canonical_subscriber_uri()
+        .expect("canonical subscriber URI present");
+    assert!(canon_uri.contains("control-mode=dynamic"));
+    assert!(canon_uri.contains(&format!("control={canonical}")));
 }

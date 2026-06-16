@@ -142,13 +142,29 @@ pub struct ChannelsConfig {
     /// `"aeron:udp?control={ctl}|control-mode=dynamic|interface=192.168.56.0/24"`.
     pub tx_ordering_mdc_control_template: String,
 
-    /// The set of tx_ordering MDC publisher control endpoints (`ip:port`),
-    /// one per publisher (sealer + each sequencer). A subscriber attaches to
-    /// every one of these. Empty when MDC is disabled. Each sequencer/sealer
-    /// publisher selects **its own** endpoint from this list via
-    /// `tx_ordering_mdc_control_for` (keyed on its node identity); the
-    /// executor subscribes to all of them.
+    /// The set of tx_ordering MDC **input** publisher control endpoints
+    /// (`ip:port`), one per **sequencer**. The sealer (the sole canonical
+    /// publisher) subscribes to every one of these to gather the raw
+    /// TxRef/DepositRef stream; each sequencer selects **its own** endpoint
+    /// via `tx_ordering_mdc_control_for`. Empty when MDC is disabled.
+    ///
+    /// NOTE: the sealer's own canonical publication endpoint is
+    /// `tx_ordering_canonical_publisher` (NOT in this list). Executors do
+    /// **not** subscribe to these input endpoints — they read only the
+    /// sealer's canonical stream. This is what restores a single total order:
+    /// the sealer merges the sequencer inputs, defines the one canonical
+    /// interleaving, and republishes it; every executor reads that identical
+    /// single-publisher stream, so positions (and thus boundary alignment) are
+    /// well-defined.
     pub tx_ordering_mdc_publishers: Vec<String>,
+
+    /// The sealer's **canonical** tx_ordering MDC publisher control endpoint
+    /// (`ip:port`). The sealer republishes the merged+ordered
+    /// TxRef/DepositRef stream and the block boundaries here; executors, the
+    /// durability sidecar, and the sealer's own bootstrap all subscribe to
+    /// this single endpoint. Empty when MDC is disabled. Must NOT appear in
+    /// `tx_ordering_mdc_publishers` (it is the output, not an input).
+    pub tx_ordering_canonical_publisher: String,
 
     /// TxReceipts: receipts + block boundaries. Not recorded.
     ///
@@ -333,27 +349,44 @@ impl ChannelsConfig {
                 "tx_ordering MDC requested but tx_ordering_mdc_control_template is empty".into(),
             ));
         }
-        if !self
+        let is_input = self
             .tx_ordering_mdc_publishers
             .iter()
-            .any(|e| e == control_endpoint)
-        {
+            .any(|e| e == control_endpoint);
+        let is_canonical = self.tx_ordering_canonical_publisher == control_endpoint;
+        if !is_input && !is_canonical {
             return Err(LogError::Config(format!(
-                "tx_ordering MDC publisher endpoint {control_endpoint:?} is not in \
-                 tx_ordering_mdc_publishers {:?}; subscribers would never attach to it",
-                self.tx_ordering_mdc_publishers
+                "tx_ordering MDC publisher endpoint {control_endpoint:?} is neither in \
+                 tx_ordering_mdc_publishers {:?} (sequencer inputs) nor the \
+                 tx_ordering_canonical_publisher {:?} (sealer); subscribers would never \
+                 attach to it",
+                self.tx_ordering_mdc_publishers, self.tx_ordering_canonical_publisher
             )));
         }
         Ok(self.tx_ordering_mdc_control_uri(control_endpoint))
     }
 
-    /// The list of MDC control URIs a **subscriber** (executor) attaches to —
-    /// one per publisher endpoint, all on `tx_ordering_stream_id`.
-    pub fn tx_ordering_mdc_subscriber_uris(&self) -> Vec<String> {
+    /// The MDC control URIs the **sealer** subscribes to for its republish
+    /// input — one per sequencer endpoint in `tx_ordering_mdc_publishers`, all
+    /// on `tx_ordering_stream_id`. The sealer merges these, defines the
+    /// canonical interleaving, dedups, and republishes onto its own canonical
+    /// publication.
+    pub fn tx_ordering_input_subscriber_uris(&self) -> Vec<String> {
         self.tx_ordering_mdc_publishers
             .iter()
             .map(|ep| self.tx_ordering_mdc_control_uri(ep))
             .collect()
+    }
+
+    /// The single MDC control URI a **canonical subscriber** (executor,
+    /// durability sidecar, sealer bootstrap) attaches to: the sealer's
+    /// `tx_ordering_canonical_publisher`. `None` when MDC is disabled or the
+    /// canonical endpoint is unset.
+    pub fn tx_ordering_canonical_subscriber_uri(&self) -> Option<String> {
+        if !self.tx_ordering_mdc_enabled() || self.tx_ordering_canonical_publisher.is_empty() {
+            return None;
+        }
+        Some(self.tx_ordering_mdc_control_uri(&self.tx_ordering_canonical_publisher))
     }
 }
 
@@ -406,6 +439,7 @@ impl Default for ChannelsConfig {
             // these two to switch tx_ordering onto MDC.
             tx_ordering_mdc_control_template: String::new(),
             tx_ordering_mdc_publishers: Vec::new(),
+            tx_ordering_canonical_publisher: String::new(),
             tx_receipts_channel: "aeron:ipc?alias=tx-receipts".into(),
             tx_receipts_stream_id: 1002,
             // MDS disabled by default (single-host IPC uses tx_receipts_channel
@@ -543,31 +577,39 @@ mod tests {
     fn mdc_disabled_by_default() {
         let ch = ChannelsConfig::default();
         assert!(!ch.tx_ordering_mdc_enabled());
-        assert!(ch.tx_ordering_mdc_subscriber_uris().is_empty());
+        assert!(ch.tx_ordering_input_subscriber_uris().is_empty());
+        assert!(ch.tx_ordering_canonical_subscriber_uri().is_none());
     }
 
     #[test]
-    fn mdc_subscriber_uris_substitute_each_publisher() {
+    fn mdc_input_uris_substitute_each_sequencer() {
         let ch = ChannelsConfig {
             tx_ordering_mdc_control_template:
                 "aeron:udp?control={ctl}|control-mode=dynamic".into(),
             tx_ordering_mdc_publishers: vec![
                 "192.168.56.21:40110".into(),
                 "192.168.56.22:40110".into(),
-                "192.168.56.22:40111".into(),
             ],
+            tx_ordering_canonical_publisher: "192.168.56.51:40110".into(),
             ..ChannelsConfig::default()
         };
         assert!(ch.tx_ordering_mdc_enabled());
-        let uris = ch.tx_ordering_mdc_subscriber_uris();
-        assert_eq!(uris.len(), 3);
+        // The sealer's input subscription merges the sequencer endpoints only.
+        let uris = ch.tx_ordering_input_subscriber_uris();
+        assert_eq!(uris.len(), 2);
         assert_eq!(
             uris[0],
             "aeron:udp?control=192.168.56.21:40110|control-mode=dynamic"
         );
         assert_eq!(
-            uris[2],
-            "aeron:udp?control=192.168.56.22:40111|control-mode=dynamic"
+            uris[1],
+            "aeron:udp?control=192.168.56.22:40110|control-mode=dynamic"
+        );
+        // Canonical subscribers (executor, durability, bootstrap) attach to the
+        // single sealer endpoint.
+        assert_eq!(
+            ch.tx_ordering_canonical_subscriber_uri().unwrap(),
+            "aeron:udp?control=192.168.56.51:40110|control-mode=dynamic"
         );
     }
 
@@ -577,12 +619,19 @@ mod tests {
             tx_ordering_mdc_control_template:
                 "aeron:udp?control={ctl}|control-mode=dynamic".into(),
             tx_ordering_mdc_publishers: vec!["192.168.56.21:40110".into()],
+            tx_ordering_canonical_publisher: "192.168.56.51:40110".into(),
             ..ChannelsConfig::default()
         };
-        // Registered endpoint resolves.
+        // Registered sequencer-input endpoint resolves.
         assert_eq!(
             ch.tx_ordering_mdc_control_for("192.168.56.21:40110").unwrap(),
             "aeron:udp?control=192.168.56.21:40110|control-mode=dynamic"
+        );
+        // The canonical (sealer) endpoint also resolves — it is a valid
+        // publisher even though it is not in tx_ordering_mdc_publishers.
+        assert_eq!(
+            ch.tx_ordering_mdc_control_for("192.168.56.51:40110").unwrap(),
+            "aeron:udp?control=192.168.56.51:40110|control-mode=dynamic"
         );
         // Unregistered endpoint is rejected (subscribers would never attach).
         assert!(ch.tx_ordering_mdc_control_for("10.0.0.9:1").is_err());

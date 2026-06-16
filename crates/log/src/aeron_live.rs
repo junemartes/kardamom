@@ -944,20 +944,45 @@ pub struct TxOrderingSubscriberHandle {
 }
 
 impl TxOrderingSubscriberHandle {
-    /// Open the tx_ordering subscriber honouring the config. When MDC is
-    /// enabled it attaches to **every** publisher's control endpoint
-    /// (`tx_ordering_mdc_publishers`) on the shared `tx_ordering_stream_id`,
-    /// merging the images into one ordered stream — exactly the merge the
-    /// shared-multicast images produced, so the executor's downstream
-    /// canonical-order / dedup / boundary-alignment logic is unchanged. When
-    /// MDC is disabled it opens the single shared `tx_ordering_channel` (IPC /
-    /// legacy multicast).
+    /// Open the **canonical** tx_ordering subscriber (executor, durability
+    /// sidecar, sealer bootstrap). When MDC is enabled it attaches to the
+    /// **single** `tx_ordering_canonical_publisher` (the sealer) — one image,
+    /// one total order, so positions are well-defined and the executor's
+    /// boundary alignment holds. When MDC is disabled it opens the single
+    /// shared `tx_ordering_channel` (IPC / legacy multicast).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         let rx = if ch.tx_ordering_mdc_enabled() {
-            let uris = ch.tx_ordering_mdc_subscriber_uris();
+            let uri = ch.tx_ordering_canonical_subscriber_uri().ok_or_else(|| {
+                LogError::Config(
+                    "tx_ordering MDC enabled but tx_ordering_canonical_publisher is empty".into(),
+                )
+            })?;
+            rt.open_subscription_merged::<TxOrderingMessage>(&[&uri], ch.tx_ordering_stream_id)?
+        } else {
+            rt.open_subscription::<TxOrderingMessage>(
+                &ch.tx_ordering_channel,
+                ch.tx_ordering_stream_id,
+            )?
+        };
+        Ok(Self { rx })
+    }
+
+    /// Open the sealer's **input** tx_ordering subscriber: the merge of every
+    /// sequencer's MDC publication (`tx_ordering_mdc_publishers`) on
+    /// `tx_ordering_stream_id`. Only the sealer calls this — it reads the raw
+    /// per-sequencer TxRef/DepositRef stream, defines the canonical
+    /// interleaving, and republishes it onto its own canonical publication.
+    /// The merge order here is the sealer's private business: because the
+    /// sealer is the *single* canonical publisher, whatever order it observes
+    /// becomes THE order for every downstream reader. When MDC is disabled it
+    /// falls back to the shared `tx_ordering_channel` (single-host path).
+    pub fn open_input(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let rx = if ch.tx_ordering_mdc_enabled() {
+            let uris = ch.tx_ordering_input_subscriber_uris();
             if uris.is_empty() {
                 return Err(LogError::Config(
-                    "tx_ordering MDC enabled but tx_ordering_mdc_publishers is empty".into(),
+                    "tx_ordering MDC enabled but tx_ordering_mdc_publishers (sequencer \
+                     inputs) is empty".into(),
                 ));
             }
             let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();

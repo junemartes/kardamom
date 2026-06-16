@@ -111,6 +111,21 @@ async fn main() -> Result<()> {
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
 
+    // SEPARATE Aeron runtime/thread for the tx_receipts PUBLICATION. The
+    // executor's single Aeron thread otherwise services both the tx_ordering
+    // SUBSCRIPTION poll AND the per-tx receipt/boundary publishes; under
+    // sustained load the publish work delays the tx_ordering poll past Aeron's
+    // flow-control Status-Message deadline, the sealer drops this subscriber
+    // from the tx_ordering MDC, its image dies, and the executor freezes
+    // (reader stops, exec blocks reading). Isolating the publisher onto its own
+    // thread keeps the subscription poll timely no matter the receipt load.
+    let rt_pub = match args.aeron_dir.as_ref() {
+        Some(dir) => {
+            AeronRuntime::spawn_with_dir(dir).context("spawn receipts AeronRuntime with dir")?
+        }
+        None => AeronRuntime::spawn_default().context("spawn receipts AeronRuntime")?,
+    };
+
     // M tx_data subscriptions, one per shard. We bridge each handle's
     // async `recv()` to a synchronous `next()` (what the executor's reader
     // thread expects) through a `std::sync::mpsc::channel`, with a
@@ -176,10 +191,11 @@ async fn main() -> Result<()> {
             endpoint = channels.tx_receipts_endpoint(args.recorder_id).as_deref(),
             "tx_receipts MDS publish (per-replica endpoint)"
         );
-        TxReceiptsPublisherHandle::open_mds(&rt, &channels, args.recorder_id)
+        TxReceiptsPublisherHandle::open_mds(&rt_pub, &channels, args.recorder_id)
             .context("open TxReceiptsPublisherHandle (MDS)")?
     } else {
-        TxReceiptsPublisherHandle::open(&rt, &channels).context("open TxReceiptsPublisherHandle")?
+        TxReceiptsPublisherHandle::open(&rt_pub, &channels)
+            .context("open TxReceiptsPublisherHandle")?
     };
     let c_pub = LiveTxReceiptsPub { handle: c_handle };
 

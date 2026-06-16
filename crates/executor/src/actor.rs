@@ -181,15 +181,28 @@ impl Executor {
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
-        // Join in this order: B reader (closes first when tx_ordering is
-        // exhausted), then exec, then commit, then A + deposits readers.
-        // The tx_data + tx_deposits subscriptions may keep producing after
-        // tx_ordering closes; we let them drain to clean shutdown. Errors
-        // from any thread propagate; the first error wins but every join
-        // still runs so threads tear down cleanly.
+        // Join the critical pipeline first: B reader (closes when tx_ordering
+        // is exhausted), then exec, then commit.
         let r_b = b_handle.join().expect("tx_ordering reader panic");
         let r_exec = exec.join().expect("exec panic");
         let r_commit = commit.join().expect("commit panic");
+
+        // If ANY of the pipeline threads errored (e.g. a fatal
+        // BoundaryMisaligned in exec), the executor can no longer make
+        // progress. Return immediately so the process exits and the
+        // orchestrator restarts it. We must NOT fall through to joining the
+        // tx_data (A) + deposit readers: those block in their Aeron `next()`
+        // until the subscription closes, which only happens on process
+        // teardown — so joining them while the process is still up would hang
+        // forever and silently mask the pipeline error (the exact "frozen but
+        // alive" failure this guards against). On the normal Ok path the
+        // subscriptions have already closed (tx_ordering exhausted), so the A
+        // + deposit joins return promptly and we drain them for clean
+        // shutdown.
+        let pipeline = r_b.and(r_exec).and(r_commit);
+        if pipeline.is_err() {
+            return pipeline;
+        }
         let mut r_a: Result<(), ExecutorError> = Ok(());
         for h in a_handles {
             let res = h.join().expect("tx_data reader panic");
@@ -200,7 +213,7 @@ impl Executor {
         let r_dep = dep_handle
             .map(|h| h.join().expect("tx_deposits reader panic"))
             .unwrap_or(Ok(()));
-        r_b.and(r_exec).and(r_commit).and(r_a).and(r_dep)
+        pipeline.and(r_a).and(r_dep)
     }
 }
 
@@ -263,11 +276,19 @@ where
             // Per-block RPC enrichment counters; reset at each BoundaryStart.
             let mut tx_index_in_block: u64 = 0;
             let mut cumulative_gas_used: u64 = 0;
-            // Last tx_ordering position the exec thread folded into a
-            // receipt. Used to validate alignment with
-            // `BlockBoundaryStart.end_tx_idx`.
-            let mut last_processed_position: Option<BPosition> = None;
-            // Sanity: tx_idx assigned by the tx_ordering reader is monotone.
+            // Cumulative count of canonical records (TxRef + DepositRef) this
+            // exec thread has folded into a receipt. This is the boundary
+            // alignment key: `BlockBoundaryStart.end_tx_idx` carries the
+            // sealer's cumulative count of republished canonical records
+            // (encoded via `BPosition::from_index`), and at each boundary the
+            // two counts MUST match. `expected_tx_idx` already tracks exactly
+            // this (it advances once per applied Tx/Deposit and never resets
+            // across blocks), so we compare against it directly.
+            //
+            // (Count, not Aeron byte position: positions are per-publication
+            // term spaces under the canonical-publisher MDC merge and ambiguous
+            // between offer-return and frame-start frames — the old position
+            // key broke under load for exactly that reason.)
             let mut expected_tx_idx = TxIndex::ZERO;
             // Wall time spent executing the block's txs/deposits (excludes
             // channel idle time between txs), recorded when the BoundaryStart
@@ -292,6 +313,7 @@ where
                         position,
                     } => {
                         if tx_idx != expected_tx_idx {
+                            tracing::error!(block = current_block, ?position, ?tx_idx, ?expected_tx_idx, "exec ERROR: OutOfOrderTx (Tx)");
                             return Err(ExecutorError::OutOfOrderTx {
                                 got: tx_idx,
                                 expected: expected_tx_idx,
@@ -319,12 +341,14 @@ where
                         } else {
                             tx_applied_error.increment(1);
                         }
+                        if let Err(ref e) = result {
+                            tracing::error!(block = current_block, ?position, error = ?e, "exec ERROR: execute_tx failed");
+                        }
                         let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-                        last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -335,6 +359,7 @@ where
                         position,
                     } => {
                         if tx_idx != expected_tx_idx {
+                            tracing::error!(block = current_block, ?position, ?tx_idx, ?expected_tx_idx, "exec ERROR: OutOfOrderTx (Deposit)");
                             return Err(ExecutorError::OutOfOrderTx {
                                 got: tx_idx,
                                 expected: expected_tx_idx,
@@ -367,7 +392,6 @@ where
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-                        last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -377,16 +401,29 @@ where
                         end_tx_idx,
                         l2_timestamp,
                     }) => {
-                        // Alignment: BlockBoundaryStart.end_tx_idx is a
-                        // BPosition identifying the LAST tx_ordering record
-                        // that belongs to the closing block. It must match
-                        // the executor's most recent processed position.
-                        if let Some(lp) = last_processed_position
-                            && lp != end_tx_idx
-                        {
+                        // Alignment: BlockBoundaryStart.end_tx_idx carries the
+                        // sealer's cumulative COUNT of canonical records
+                        // (TxRef + DepositRef) republished through the end of
+                        // this block, encoded via BPosition::from_index. The
+                        // executor must have applied exactly that many records
+                        // — i.e. `expected_tx_idx` (which advances once per
+                        // applied Tx/Deposit and never resets) must equal it.
+                        // A mismatch means the executor's view of the canonical
+                        // stream diverged from the sealer's (a lost / extra /
+                        // reordered record) — fatal: return so the process
+                        // crash-loops rather than committing a wrong block.
+                        let want = end_tx_idx.as_index();
+                        let have = expected_tx_idx.0;
+                        if want != have {
+                            tracing::error!(
+                                block = block_number,
+                                want_count = want,
+                                have_count = have,
+                                "exec ERROR: BoundaryMisaligned (canonical record count)"
+                            );
                             return Err(ExecutorError::BoundaryMisaligned {
                                 end: end_tx_idx,
-                                last_seen: lp,
+                                last_seen: BPosition::from_index(have),
                             });
                         }
 
@@ -591,9 +628,11 @@ mod exec_tests {
             })
             .unwrap();
         tx_r2e
+            // Two canonical records applied ⇒ cumulative count 2. end_tx_idx
+            // encodes that count (pos(2) == BPosition::from_index(2)).
             .send(ReaderToExec::Boundary(BlockBoundaryStart {
                 block_number: 1,
-                end_tx_idx: pos(1),
+                end_tx_idx: pos(2),
                 l2_timestamp: 1_700_000_000,
             }))
             .unwrap();
@@ -616,7 +655,7 @@ mod exec_tests {
         assert_eq!(log.len(), 1);
         let (boundary, delta) = &log[0];
         assert_eq!(boundary.block_number, 1);
-        assert_eq!(boundary.end_tx_idx, pos(1));
+        assert_eq!(boundary.end_tx_idx, pos(2));
         assert_eq!(boundary.l2_timestamp, 1_700_000_000);
         // The recipient received 150 total across both transfers — verify
         // by iterating the canonical Vec<AccountChange> the wire form holds.
@@ -650,7 +689,8 @@ mod exec_tests {
                 position: pos(0),
             })
             .unwrap();
-        // Boundary claims end_tx_idx at offset 5 but we only processed offset 0.
+        // Boundary claims 5 canonical records (pos(5) == from_index(5)) but we
+        // only applied 1 ⇒ count mismatch ⇒ BoundaryMisaligned.
         tx_r2e
             .send(ReaderToExec::Boundary(BlockBoundaryStart {
                 block_number: 1,

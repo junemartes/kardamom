@@ -169,19 +169,79 @@ async fn main() -> Result<()> {
         ));
     }
 
-    // Spawn a tail-tracker: subscribe to tx_ordering, forward every
-    // observed fragment's position into the adapter's `last_pos`. The
-    // executor checks `BoundaryStart.end_tx_idx == last_processed_pos`
-    // for alignment, so the sealer must stamp the boundary with the
-    // actual stream tail — not just positions it has itself published.
-    let mut tail_sub = TxOrderingSubscriberHandle::open(&rt, &channels)
-        .context("open TxOrderingSubscriberHandle for tail tracker")?;
-    let last_pos = adapter.last_pos_handle();
-    tokio::spawn(async move {
-        while let Some((pos, _msg)) = tail_sub.recv().await {
-            *last_pos.lock().unwrap() = pos;
-        }
-    });
+    // tx_ordering canonicalisation. The sealer is the SOLE publisher of the
+    // canonical tx_ordering stream (the one executors read), so it must define
+    // the single total order every downstream reader observes. The boundary
+    // alignment key (`end_tx_idx`) is the cumulative COUNT of canonical
+    // TxRef/DepositRef records — a logical, publisher- and position-independent
+    // index (see BPosition::from_index) the executor matches against its own
+    // processed-record count.
+    if mdc {
+        // CANONICAL REPUBLISH (cluster / MDC). Subscribe to the merged
+        // sequencer INPUT publications, dedup the racing-replica TxRef/
+        // DepositRef copies, and republish each survivor onto our own
+        // canonical publication — incrementing `canonical_count` under
+        // `publish_lock` so the boundary emitter stamps `end_tx_idx` exactly
+        // between records (no record can be republished between the count read
+        // and the boundary offer). Executors subscribe to our canonical
+        // endpoint only (a single image → one total order), and count the same
+        // deduped record set, so the counts match exactly.
+        let mut input_sub = TxOrderingSubscriberHandle::open_input(&rt, &channels)
+            .context("open TxOrderingSubscriberHandle (canonical republish input)")?;
+        let republish_pub = adapter.pub_handle_clone();
+        let count = adapter.count_handle();
+        let publish_lock = adapter.publish_lock_handle();
+        tokio::spawn(async move {
+            // 8192 ids ≫ the publish spread of a tx's replica copies.
+            let mut dedup = CanonicalDedup::new(8192);
+            while let Some((_in_pos, msg)) = input_sub.recv().await {
+                // Sequencers only emit TxRef/DepositRef; drop any stray
+                // boundary, and collapse replica duplicates.
+                let keep = match &msg {
+                    TxOrderingMessage::TxRef(r) => dedup.first_seen(r.tx_hash.0),
+                    TxOrderingMessage::DepositRef(d) => dedup.first_seen(d.source_hash.0),
+                    TxOrderingMessage::BoundaryStart(_) => false,
+                };
+                if !keep {
+                    continue;
+                }
+                // Hold publish_lock across the offer AND the count bump so the
+                // boundary emitter can't read a count that doesn't match the
+                // records on the wire. Count ONLY on a successful offer: a
+                // dropped record never reaches the executor, so neither side
+                // counts it — the alignment stays consistent.
+                let _g = publish_lock.lock().unwrap();
+                match republish_pub.publish(&msg) {
+                    Ok(_pos) => *count.lock().unwrap() += 1,
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "canonical tx_ordering republish failed; dropping record"
+                    ),
+                }
+            }
+            tracing::info!("tx_ordering canonical republish loop exited (input closed)");
+        });
+    } else {
+        // SINGLE-HOST / IPC fallback. Sequencers and the sealer share one
+        // ordered tx_ordering channel; the executor reads that same stream. A
+        // passive tail-tracker counts the canonical records (TxRef/DepositRef)
+        // it observes so `end_tx_idx` carries the same cumulative count the
+        // executor computes — without republishing (republishing onto the
+        // shared channel we also read would loop).
+        let mut tail_sub = TxOrderingSubscriberHandle::open(&rt, &channels)
+            .context("open TxOrderingSubscriberHandle for tail tracker")?;
+        let count = adapter.count_handle();
+        tokio::spawn(async move {
+            while let Some((_pos, msg)) = tail_sub.recv().await {
+                if matches!(
+                    msg,
+                    TxOrderingMessage::TxRef(_) | TxOrderingMessage::DepositRef(_)
+                ) {
+                    *count.lock().unwrap() += 1;
+                }
+            }
+        });
+    }
 
     let sealer = Sealer::new(cfg.clone(), SystemClock, adapter, initial_block)
         .context("construct Sealer")?;
@@ -302,47 +362,115 @@ async fn bootstrap_block_number(rt: &AeronRuntime, channels: &ChannelsConfig) ->
     Ok(max_seen.map_or(1, |n| n + 1))
 }
 
-/// `BoundaryPublisher` impl over a `TxOrderingPublisherHandle`. Tracks the
-/// last published position so `current_tx_tail` returns a sensible value —
-/// in the MDS topology the same stream carries both `TxRef` (from racing
-/// sequencers) and `BoundaryStart` (from this sealer), so the "tail" we
-/// know about is the position we last published into. Acceptable proxy for
-/// `end_tx_idx` since downstream consumers reconstruct block membership
-/// from in-stream order anyway.
+/// `BoundaryPublisher` impl over the sealer's **canonical**
+/// `TxOrderingPublisherHandle`. The sealer is the SOLE publisher of the
+/// canonical tx_ordering stream: the republish loop (see `main`) republishes
+/// every deduped `TxRef`/`DepositRef` here, and this adapter publishes the
+/// block `BoundaryStart`s here. Both share `canonical_count` (the cumulative
+/// count of canonical records published) and `publish_lock`.
+///
+/// `end_tx_idx` correctness: the executor compares its own cumulative
+/// processed-record count against `BoundaryStart.end_tx_idx` (decoded via
+/// `BPosition::as_index`). So the boundary MUST be stamped with the count of
+/// records republished BEFORE it, with NO record interleaved between the count
+/// read and the boundary offer. We guarantee this by (a) re-stamping
+/// `end_tx_idx` from `canonical_count` here (ignoring whatever the emitter
+/// computed) and (b) taking `publish_lock` across both the republish
+/// offer+count bump and this read+boundary offer, so no record can be
+/// published between the read and the boundary. The count (not an Aeron byte
+/// position) sidesteps the per-publication term spaces of an MDC merge and the
+/// offer-return vs frame-start ambiguity that broke the old position key.
 struct TxOrderingBoundaryAdapter {
     pub_handle: TxOrderingPublisherHandle,
-    last_pos: Arc<Mutex<BPosition>>,
+    canonical_count: Arc<Mutex<u64>>,
+    publish_lock: Arc<Mutex<()>>,
 }
 
 impl TxOrderingBoundaryAdapter {
-    /// Hand out a clone of the shared `last_pos` cell so an external
-    /// tail-tracker task can keep it up-to-date as TxRefs land on
-    /// tx_ordering from the racing sequencers.
-    fn last_pos_handle(&self) -> Arc<Mutex<BPosition>> {
-        self.last_pos.clone()
+    /// Shared `canonical_count` cell — the republish loop (MDC) bumps it after
+    /// each successful canonical offer; the IPC tail-tracker bumps it per
+    /// observed TxRef/DepositRef. This adapter reads it to stamp `end_tx_idx`.
+    fn count_handle(&self) -> Arc<Mutex<u64>> {
+        self.canonical_count.clone()
+    }
+
+    /// Lock serialising every offer to the canonical publication (republish
+    /// loop + boundary emitter), so `end_tx_idx` is stamped exactly between
+    /// records.
+    fn publish_lock_handle(&self) -> Arc<Mutex<()>> {
+        self.publish_lock.clone()
+    }
+
+    /// Clone of the canonical publisher handle for the republish loop. The
+    /// underlying Aeron publication is one multi-offer stream and the SDK
+    /// serialises offers internally; `publish_lock` adds the `canonical_count`
+    /// atomicity on top.
+    fn pub_handle_clone(&self) -> TxOrderingPublisherHandle {
+        self.pub_handle.clone()
     }
 
     fn new(pub_handle: TxOrderingPublisherHandle) -> Self {
         Self {
             pub_handle,
-            last_pos: Arc::new(Mutex::new(BPosition::ZERO)),
+            canonical_count: Arc::new(Mutex::new(0)),
+            publish_lock: Arc::new(Mutex::new(())),
         }
     }
 }
 
 impl BoundaryPublisher for TxOrderingBoundaryAdapter {
     fn publish(&mut self, msg: &BlockBoundaryStart) -> Result<BPosition, PublishError> {
-        match self.pub_handle.publish_boundary(msg) {
-            Ok(pos) => {
-                *self.last_pos.lock().unwrap() = pos;
-                Ok(pos)
-            }
+        // Serialise with the republish loop and stamp end_tx_idx (the canonical
+        // record count, encoded as a BPosition) atomically.
+        let _g = self.publish_lock.lock().unwrap();
+        let mut stamped = msg.clone();
+        stamped.end_tx_idx = BPosition::from_index(*self.canonical_count.lock().unwrap());
+        match self.pub_handle.publish_boundary(&stamped) {
+            Ok(pos) => Ok(pos),
             Err(e) => Err(PublishError::Fatal(e.to_string())),
         }
     }
 
     fn current_tx_tail(&self) -> BPosition {
-        *self.last_pos.lock().unwrap()
+        BPosition::from_index(*self.canonical_count.lock().unwrap())
+    }
+}
+
+/// Bounded first-seen window for canonical-id dedup, FIFO-evicted. Mirrors the
+/// executor's reader-side dedup: the P sequencer replicas per shard each
+/// republish the same `(tx_hash)` / `(source_hash)` onto their input
+/// publications, so the sealer must collapse them to one canonical record
+/// before republishing (else `last_pos` would advance on a duplicate the
+/// executor skips, breaking boundary alignment). Single sequencer per shard
+/// today ⇒ no duplicates ⇒ this is a no-op, but it keeps the canonical stream
+/// correct once replicas exist.
+struct CanonicalDedup {
+    seen: std::collections::HashSet<[u8; 32]>,
+    fifo: std::collections::VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl CanonicalDedup {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: std::collections::HashSet::new(),
+            fifo: std::collections::VecDeque::new(),
+            capacity,
+        }
+    }
+
+    /// Records `id`; returns `false` if it is already in the window.
+    fn first_seen(&mut self, id: [u8; 32]) -> bool {
+        if !self.seen.insert(id) {
+            return false;
+        }
+        self.fifo.push_back(id);
+        if self.fifo.len() > self.capacity
+            && let Some(evicted) = self.fifo.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        true
     }
 }
 
