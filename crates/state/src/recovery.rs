@@ -16,8 +16,8 @@ use kardamom_types::BPosition;
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
-    DurableCursors, KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION,
-    KEY_LAST_FSYNCED_B_POSITION, SCHEMA_VERSION, decode_b_position, decode_u64,
+    KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION,
+    decode_b_position, decode_u64,
 };
 use crate::schema::TABLE_META;
 
@@ -28,17 +28,6 @@ pub struct RecoveryPoint {
     pub last_committed_block: u64,
     pub last_committed_end_tx_position: BPosition,
     pub last_fsynced_b_position: BPosition,
-}
-
-impl RecoveryPoint {
-    /// Genesis point — used when no prior data is on disk.
-    pub fn genesis() -> Self {
-        Self {
-            last_committed_block: 0,
-            last_committed_end_tx_position: BPosition::ZERO,
-            last_fsynced_b_position: BPosition::ZERO,
-        }
-    }
 }
 
 pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> {
@@ -65,15 +54,4 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
         last_committed_end_tx_position,
         last_fsynced_b_position,
     })
-}
-
-impl From<RecoveryPoint> for DurableCursors {
-    fn from(p: RecoveryPoint) -> Self {
-        DurableCursors {
-            last_committed_block: p.last_committed_block,
-            last_committed_end_tx_position: p.last_committed_end_tx_position,
-            last_fsynced_b_position: p.last_fsynced_b_position,
-            schema_version: SCHEMA_VERSION,
-        }
-    }
 }

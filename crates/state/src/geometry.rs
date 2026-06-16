@@ -15,15 +15,9 @@
 //! At V0 (sequential executor) the realistic ceiling is ~100k tx/s, so the
 //! same numbers leave a 10× safety margin.
 
-/// Worst-case state delta per virtual block (250 ms @ 1M tx/s × ~100 B/tx).
-pub const BYTES_PER_BLOCK: usize = 25 * 1024 * 1024;
-
 /// Max blocks an executor RO snapshot may be held before the writer must stop.
 /// The writer pauses (or alerts and halts) if the snapshot horizon is exceeded.
 pub const HORIZON_BLOCKS: u32 = 4;
-
-/// Total dirty-page reservation: `BYTES_PER_BLOCK * HORIZON_BLOCKS`.
-pub const HORIZON_BYTES: usize = BYTES_PER_BLOCK * (HORIZON_BLOCKS as usize);
 
 /// mdbx page size — power-of-two between 256B and 64KB.
 /// 16 KB matches the OS page on aarch64 and keeps freelist entries compact.
@@ -57,11 +51,6 @@ pub const MAX_DBS: usize = 16;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn horizon_math_holds() {
-        assert_eq!(HORIZON_BYTES, BYTES_PER_BLOCK * HORIZON_BLOCKS as usize);
-    }
 
     #[test]
     fn growth_step_is_page_aligned() {
