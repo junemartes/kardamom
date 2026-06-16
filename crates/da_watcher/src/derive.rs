@@ -19,11 +19,6 @@
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rlp::{Encodable, Header};
 
-/// EIP-2718 type byte for deposit transactions (OP-compatible). Exposed for
-/// callers that need to recompute a deposit's canonical tx_hash via
-/// `keccak256(0x7E || rlp(deposit))`.
-pub const DEPOSIT_TX_TYPE: u8 = 0x7E;
-
 /// Compute the OP-style source hash for a user deposit:
 ///
 /// ```text
