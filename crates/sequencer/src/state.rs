@@ -1,9 +1,9 @@
 //! Per-partition nonce-check state machine.
 //!
-//! Single-owner: this struct is held by exactly one OS thread (the primary
-//! sequencer event loop or the standby tailer). No locks, no atomics. The
-//! pure-functional design isolates the algorithm from the Aeron I/O surface;
-//! every nontrivial test in this crate exercises it directly.
+//! Single-owner: this struct is held by exactly one OS thread (the sequencer
+//! event loop). No locks, no atomics. The pure-functional design isolates the
+//! algorithm from the Aeron I/O surface; every nontrivial test in this crate
+//! exercises it directly.
 
 use std::collections::HashMap;
 
@@ -59,10 +59,6 @@ impl<T> PartitionState<T> {
     /// against the state DB before falling through to [`Self::process`].
     pub fn next_nonce_known(&self, sender: Address) -> Option<u64> {
         self.next.get(&sender).copied()
-    }
-
-    pub fn iter_next_nonces(&self) -> impl Iterator<Item = (Address, u64)> + '_ {
-        self.next.iter().map(|(a, n)| (*a, *n))
     }
 
     pub fn seed_next_nonce(&mut self, sender: Address, n: u64) {
@@ -130,28 +126,16 @@ impl<T> PartitionState<T> {
         }
     }
 
-    /// Standby-side: a message for `sender` with `nonce` was observed on B.
-    /// Advance our next-nonce map to `nonce + 1`. If we missed earlier nonces
-    /// (joined late), trust B and jump forward.
-    pub fn replay(&mut self, sender: Address, nonce: u64) {
-        let expected = self.next_nonce(sender);
-        let new = nonce.saturating_add(1);
-        if new > expected {
-            self.next.insert(sender, new);
-        }
-    }
-
     /// Push a payload back into the pending buffer so the next call to
     /// `process(sender, nonce, _)` will pick it up and publish it. Also
     /// rewinds `next_nonce` so the retry sees `nonce == expected`.
     ///
-    /// Used by `PrimarySequencer::run_once` when the dual-write
-    /// (`TxDataPublisher::try_publish` + `TxOrderingRefPublisher::try_publish_ref`)
-    /// returns `Backpressure` from either side — we must NOT advance state
-    /// for a message whose canonical `TxRef` did not actually land on B.
-    /// Also marks the sender as "drain-pending" so a subsequent call to
-    /// [`Self::drain_pending`] can resume the publish without needing
-    /// fresh ingress.
+    /// Used by [`crate::sequencer::Sequencer::run_once`] when the canonical
+    /// `TxRef` publish (`TxOrderingRefPublisher::try_publish_ref`) returns
+    /// `Backpressure` — we must NOT advance state for a message whose ref did
+    /// not actually land on B. Also marks the sender as "drain-pending" so a
+    /// subsequent call to [`Self::drain_pending`] can resume the publish
+    /// without needing fresh ingress.
     pub fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
         // Rewind expected nonce so the retry treats it as a Match.
         self.next.insert(sender, nonce);
@@ -281,23 +265,6 @@ mod tests {
             out.outcome,
             NonceOutcome::BufferedEvicting { evicted_nonce: 5 }
         );
-    }
-
-    #[test]
-    fn replay_advances_without_publishing() {
-        let mut st: PartitionState<u32> = PartitionState::new(4);
-        st.replay(s(1), 0);
-        st.replay(s(1), 1);
-        st.replay(s(1), 2);
-        assert_eq!(st.next_nonce(s(1)), 3);
-    }
-
-    #[test]
-    fn replay_with_gap_jumps_to_observed_plus_one() {
-        let mut st: PartitionState<u32> = PartitionState::new(4);
-        st.replay(s(1), 0);
-        st.replay(s(1), 5);
-        assert_eq!(st.next_nonce(s(1)), 6);
     }
 
     #[test]
