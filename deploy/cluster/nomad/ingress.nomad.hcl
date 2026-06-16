@@ -26,8 +26,8 @@
 
 variable "ack_policy" {
   type        = string
-  description = "Ingress ack durability gate. Defaults to on-quorum: the recorder + quorum jobs (issue #38) publish the quorum watermark, so Q-of-N fsync gating is satisfied. Override for an Aeron-substrate-only bring-up with: nomad job run -var ack_policy=on-offer ingress.nomad.hcl"
-  default     = "on-quorum"
+  description = "Ingress ack durability gate. Defaults to on-offer: a tx is acked once it is sequenced (offered), with no durable-watermark gate on the critical path. The strong durability boundary is L1 DA (via the batcher); a stronger pre-confirmation gate returns when the sealer becomes a raft-consensus turn-based system. Override with: nomad job run -var ack_policy=on-quorum ingress.nomad.hcl (requires the sealer's archive-at-sealer durable watermark)."
+  default     = "on-offer"
 }
 
 job "ingress" {
