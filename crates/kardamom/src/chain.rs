@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::Context;
 use kardamom_node::Genesis;
 
-pub fn load(path: &Path) -> anyhow::Result<Genesis> {
+pub(crate) fn load(path: &Path) -> anyhow::Result<Genesis> {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("reading genesis file {}", path.display()))?;
     let genesis: Genesis = toml::from_str(&contents)
