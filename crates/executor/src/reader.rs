@@ -62,8 +62,7 @@ use crate::exec_types::TxIndex;
 ///
 /// One impl per sequencer partition. Implementations:
 /// - in production: `kardamom_log::TxDataSubscriber` on a dedicated OS thread.
-/// - in tests: [`crate::testing::VecTxDataSub`] /
-///   `FakeTxDataSubscription` from `kardamom_log::testing`.
+/// - in tests: `kardamom_log::testing::FakeTxDataSubscription`.
 ///
 /// The contract: `next` blocks until the next `(tx_data_position, envelope)` is
 /// available; returns `Err(ExecutorError::TxDataClosed { sequencer_id })`
@@ -83,8 +82,7 @@ pub trait TxDataSubscription: Send {
 /// `BPosition` is the system's canonical L2 tx ordering (invariant I1).
 ///
 /// In production: `kardamom_log::TxOrderingSubscriber` on a dedicated OS thread.
-/// In tests: see [`crate::testing::VecTxOrderingSub`] or
-/// `kardamom_log::testing::FakeTxOrderingSubscription`.
+/// In tests: see `kardamom_log::testing::FakeTxOrderingSubscription`.
 pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
 }
@@ -170,14 +168,6 @@ impl DepositJoinBuffer {
     /// if it isn't (yet) present.
     pub fn take(&self, source_hash: B256) -> Option<(BPosition, Deposit)> {
         self.inner.remove(&source_hash).map(|kv| kv.1)
-    }
-
-    pub fn len(&self) -> usize {
-        self.inner.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 }
 
