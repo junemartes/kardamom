@@ -15,8 +15,8 @@
 //! exposes `replay_range`; the sealer can use that to skip ahead by a fixed
 //! lookback (e.g. 30 s of boundaries = 120 markers at 250 ms cadence).
 //!
-//! The pure helper [`max_block_number_from_iter`] is what the unit tests
-//! exercise; the supervisor's bootstrap path uses the same helper after
+//! The pure helper [`next_block_number_from_iter`] is what the unit tests
+//! exercise; the supervisor's bootstrap path uses the same logic after
 //! draining the live subscription.
 
 use kardamom_types::BlockBoundaryStart;
@@ -31,13 +31,6 @@ where
 {
     let max = boundaries.into_iter().map(|b| b.block_number).max();
     max.map_or(1, |n| n + 1)
-}
-
-/// Same as [`next_block_number_from_iter`] but takes the max directly. Useful
-/// when the caller has been streaming boundaries and just wants the
-/// next-emitter value.
-pub fn next_after(max_seen: Option<u64>) -> u64 {
-    max_seen.map_or(1, |n| n + 1)
 }
 
 #[cfg(test)]
@@ -74,12 +67,5 @@ mod tests {
         // bootstrap helper only cares about the max.
         let scanned = vec![bs(100), bs(99), bs(101), bs(50)];
         assert_eq!(next_block_number_from_iter(scanned), 102);
-    }
-
-    #[test]
-    fn next_after_helpers_agree() {
-        assert_eq!(next_after(None), 1);
-        assert_eq!(next_after(Some(0)), 1);
-        assert_eq!(next_after(Some(42)), 43);
     }
 }

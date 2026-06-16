@@ -25,7 +25,6 @@ kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
-rkyv.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
