@@ -22,26 +22,6 @@ pub const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// Aggregated snapshot of the durable cursors persisted in the `meta` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DurableCursors {
-    pub last_committed_block: u64,
-    pub last_committed_end_tx_position: BPosition,
-    pub last_fsynced_b_position: BPosition,
-    pub schema_version: u32,
-}
-
-impl Default for DurableCursors {
-    fn default() -> Self {
-        Self {
-            last_committed_block: 0,
-            last_committed_end_tx_position: BPosition::ZERO,
-            last_fsynced_b_position: BPosition::ZERO,
-            schema_version: SCHEMA_VERSION,
-        }
-    }
-}
-
 pub fn encode_u64(v: u64) -> [u8; 8] {
     v.to_be_bytes()
 }

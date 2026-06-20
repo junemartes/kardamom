@@ -6,9 +6,6 @@ edition.workspace = true
 
 [features]
 default = []
-# Bench-only feature that exposes a few internal helpers. The workspace builds
-# fine without it.
-bench-internals = []
 # Gates the real-Aeron Docker e2e test (). Off by default so
 # `cargo test` works in environments without a Docker daemon. CI runs the
 # Docker harness via `--features docker-e2e -- --ignored`.
@@ -18,7 +15,6 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 # `rlp` feature enables RlpEncodable/RlpDecodable on Address, B256, U256.
 alloy-primitives = { workspace = true, features = ["rlp"] }
 alloy-rlp = { workspace = true, features = ["derive"] }
-anyhow.workspace = true
 bytes.workspace = true
 crossbeam-channel = "0.5"
 kardamom-log.workspace = true
@@ -28,7 +24,6 @@ kardamom-types.workspace = true
 # is preferred when the licensing matters. The on-disk format is identical
 # (both wrap upstream libmdbx).
 signet-libmdbx = "0.8"
-metrics.workspace = true
 # rkyv 0.8: receipts and `BlockDelta` are stored as rkyv archives at rest.
 # `Receipt` upstream already derives Archive/Serialize/Deserialize.
 rkyv.workspace = true

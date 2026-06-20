@@ -25,12 +25,8 @@ pub enum StateError {
     },
     #[error("rkyv decode error in table {table}: {detail}")]
     RkyvDecode { table: &'static str, detail: String },
-    #[error("writer channel closed before block {block} was committed")]
-    WriterChannelClosed { block: u64 },
     #[error("recovery failed: {0}")]
     Recovery(String),
-    #[error("snapshot exhausted: writer outran the {horizon}-block version horizon")]
-    SnapshotExhausted { horizon: u32 },
 }
 
 impl From<signet_libmdbx::ReadError> for StateError {
