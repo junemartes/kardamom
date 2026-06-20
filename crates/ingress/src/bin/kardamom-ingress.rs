@@ -323,9 +323,9 @@ impl LiveIngressSubscription {
             attach_executor_endpoints(channels, executor_count, true, |uri| {
                 sub.add_destination(uri)
             })
-                .map_err(|e| {
-                    IngressError::Internal(format!("attach tx_receipts boundary destination: {e}"))
-                })?;
+            .map_err(|e| {
+                IngressError::Internal(format!("attach tx_receipts boundary destination: {e}"))
+            })?;
             sub
         } else {
             TxReceiptsBoundarySubscriberHandle::open(rt, channels)

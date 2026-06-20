@@ -69,7 +69,7 @@ impl SeenReceipts {
     }
 
     #[cfg(test)]
-    pub fn len(&self) -> usize {
+    fn len(&self) -> usize {
         self.inner.lock().unwrap().set.len()
     }
 }

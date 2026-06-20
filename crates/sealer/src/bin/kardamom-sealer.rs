@@ -135,8 +135,7 @@ async fn main() -> Result<()> {
         TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
             .context("open TxOrderingPublisherHandle (MDC)")?
     } else {
-        TxOrderingPublisherHandle::open(&rt, &channels)
-            .context("open TxOrderingPublisherHandle")?
+        TxOrderingPublisherHandle::open(&rt, &channels).context("open TxOrderingPublisherHandle")?
     };
     let adapter = TxOrderingBoundaryAdapter::new(publisher);
 
@@ -152,11 +151,10 @@ async fn main() -> Result<()> {
             mdc,
             "--archive-durability requires tx_ordering MDC (set tx_ordering_mdc_* in --log-config)"
         );
-        let control_uri = channels.tx_ordering_mdc_control_for(
-            cfg.channel_b_mdc_control
-                .as_deref()
-                .context("--archive-durability requires channel_b_mdc_control in the sealer config")?,
-        )?;
+        let control_uri =
+            channels.tx_ordering_mdc_control_for(cfg.channel_b_mdc_control.as_deref().context(
+                "--archive-durability requires channel_b_mdc_control in the sealer config",
+            )?)?;
         let resolved = LogConfig::resolve(args.log_config.as_deref())
             .context("resolve log config for durability")?;
         durability_handle = Some(spawn_durability_sidecar(

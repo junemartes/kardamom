@@ -199,10 +199,11 @@ impl Executor {
         // subscriptions have already closed (tx_ordering exhausted), so the A
         // + deposit joins return promptly and we drain them for clean
         // shutdown.
-        let pipeline = r_b.and(r_exec).and(r_commit);
-        if pipeline.is_err() {
-            return pipeline;
-        }
+        // Surface any pipeline error here, before joining the A / deposit
+        // readers below: on an error path tx_ordering may never close, so
+        // joining those readers would hang (the "frozen but alive" failure
+        // described above). On the Ok path this is a no-op and we fall through.
+        r_b.and(r_exec).and(r_commit)?;
         let mut r_a: Result<(), ExecutorError> = Ok(());
         for h in a_handles {
             let res = h.join().expect("tx_data reader panic");
@@ -213,7 +214,9 @@ impl Executor {
         let r_dep = dep_handle
             .map(|h| h.join().expect("tx_deposits reader panic"))
             .unwrap_or(Ok(()));
-        pipeline.and(r_a).and(r_dep)
+        // `pipeline` was already checked above (Ok by here), so the result is
+        // determined by the A and deposit reader joins.
+        r_a.and(r_dep)
     }
 }
 
@@ -528,7 +531,7 @@ where
                 let mut attempts: u32 = 0;
                 while let Err(e) = c_pub.publish(c_msg.clone()) {
                     attempts += 1;
-                    if attempts == 1 || attempts % 20 == 0 {
+                    if attempts == 1 || attempts.is_multiple_of(20) {
                         warn!(error = %e, attempts, "tx_receipts publish failed; retrying (must-deliver)");
                     }
                     thread::sleep(Duration::from_millis(50));

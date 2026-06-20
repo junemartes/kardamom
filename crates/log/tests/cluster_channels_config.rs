@@ -14,8 +14,7 @@ use kardamom_log::config::LogConfig;
 
 fn cluster_channels_tpl() -> PathBuf {
     // crates/log/tests/ -> repo root is three parents up.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../deploy/cluster/config/channels.toml.tpl")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../deploy/cluster/config/channels.toml.tpl")
 }
 
 #[test]
@@ -53,7 +52,10 @@ fn cluster_channels_tpl_mdc_publishers_and_uris() {
     assert_eq!(uris.len(), pubs.len());
     for (uri, ep) in uris.iter().zip(pubs.iter()) {
         assert!(uri.contains("control-mode=dynamic"), "MDC URI: {uri}");
-        assert!(uri.contains(&format!("control={ep}")), "control endpoint: {uri}");
+        assert!(
+            uri.contains(&format!("control={ep}")),
+            "control endpoint: {uri}"
+        );
     }
     // The canonical subscriber URI (executor/durability/bootstrap) targets the
     // single sealer endpoint.

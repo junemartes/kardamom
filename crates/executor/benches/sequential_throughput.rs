@@ -222,7 +222,11 @@ fn bench_actor_throughput(c: &mut Criterion) {
                 pos(BATCH as i32),
                 TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                     block_number: 1,
-                    end_tx_idx: pos((BATCH as i32) - 1),
+                    // end_tx_idx is the cumulative COUNT of canonical records
+                    // through this block (encoded via BPosition::from_index),
+                    // which the executor compares against its applied-record
+                    // count — here all BATCH txs. (Not the last tx's index.)
+                    end_tx_idx: BPosition::from_index(BATCH),
                     l2_timestamp: 0,
                 }),
             ))

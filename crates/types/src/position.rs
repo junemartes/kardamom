@@ -65,7 +65,15 @@ mod tests {
 
     #[test]
     fn index_round_trips() {
-        for idx in [0u64, 1, 41, 1_000_000, u32::MAX as u64, (u32::MAX as u64) + 1, u64::MAX] {
+        for idx in [
+            0u64,
+            1,
+            41,
+            1_000_000,
+            u32::MAX as u64,
+            (u32::MAX as u64) + 1,
+            u64::MAX,
+        ] {
             assert_eq!(BPosition::from_index(idx).as_index(), idx, "idx={idx}");
         }
         // The zero index is the canonical zero position (existing initialisers).

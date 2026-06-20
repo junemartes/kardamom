@@ -83,8 +83,7 @@ async fn publish_waits_for_a_late_joining_subscriber() {
     // multicast join that breaks the cluster (here forced even over fast IPC by
     // simply opening it late).
     tokio::time::sleep(Duration::from_millis(800)).await;
-    let mut subscriber =
-        TxDataSubscriberHandle::open(&rt, &cfg.channels, sid).expect("subscriber");
+    let mut subscriber = TxDataSubscriberHandle::open(&rt, &cfg.channels, sid).expect("subscriber");
 
     // The publisher must have waited (not dropped) and now succeed.
     pub_task.await.expect("publisher task");

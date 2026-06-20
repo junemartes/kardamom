@@ -810,7 +810,6 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
 /// on its own resolves only against the current package's bin targets
 /// (the `e2e` test crate has none); pass `-p <pkg>` for each so cargo
 /// looks up the right workspace member.
-
 fn build_service_bins() {
     let st = Command::new(env!("CARGO"))
         .args([

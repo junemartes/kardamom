@@ -63,7 +63,7 @@ use tracing::{error, warn};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use crate::offer_retry::{offer_code_str, OFFER_TIMEOUT};
+use crate::offer_retry::{OFFER_TIMEOUT, offer_code_str};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
     Receipt, TxEnvelope, TxError, TxOrderingMessage,
@@ -409,16 +409,17 @@ impl AeronRuntime {
             >,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
-            match codec::materialize::<T>(bytes) {
-                Ok(v) => {
-                    let _ = msg_tx.send((pos, v));
-                }
-                Err(e) => {
-                    error!(error = %e, "decode failed on subscription delivery");
-                }
-            }
-        });
+        let deliver: DeliverFn =
+            Box::new(
+                move |bytes: &[u8], pos: BPosition| match codec::materialize::<T>(bytes) {
+                    Ok(v) => {
+                        let _ = msg_tx.send((pos, v));
+                    }
+                    Err(e) => {
+                        error!(error = %e, "decode failed on subscription delivery");
+                    }
+                },
+            );
         let sub_id = self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         Ok((sub_id, msg_rx))
     }
@@ -618,7 +619,7 @@ fn add_sub_destination(
     }
     let c = CString::new(uri).map_err(|e| LogError::Aeron(format!("destination uri NUL: {e}")))?;
     let dest = rusteron_client::AeronAsyncDestination::aeron_subscription_async_add_destination(
-        &**aeron,
+        aeron,
         &sub.sub,
         c.as_c_str(),
     )
@@ -699,7 +700,10 @@ where
                             item.pub_id
                         ))));
                     }
-                    None => warn!(pub_id = item.pub_id, "best-effort publish to unknown pub_id"),
+                    None => warn!(
+                        pub_id = item.pub_id,
+                        "best-effort publish to unknown pub_id"
+                    ),
                 }
             }
             OfferResult::Code(code) if code >= 0 => {
@@ -982,7 +986,8 @@ impl TxOrderingSubscriberHandle {
             if uris.is_empty() {
                 return Err(LogError::Config(
                     "tx_ordering MDC enabled but tx_ordering_mdc_publishers (sequencer \
-                     inputs) is empty".into(),
+                     inputs) is empty"
+                        .into(),
                 ));
             }
             let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
@@ -1061,11 +1066,13 @@ impl TxReceiptsPublisherHandle {
         // Boundaries publish to a DISTINCT endpoint (port) from receipts, since
         // ingress's two manual subscriptions each bind their destination socket
         // — a shared endpoint collides. See ChannelsConfig::tx_receipts_endpoint.
-        let boundary_endpoint = ch.tx_receipts_boundary_endpoint(replica_idx).ok_or_else(|| {
-            LogError::Aeron(format!(
-                "open_mds: tx_receipts boundary endpoint not configured (replica {replica_idx})"
-            ))
-        })?;
+        let boundary_endpoint = ch
+            .tx_receipts_boundary_endpoint(replica_idx)
+            .ok_or_else(|| {
+                LogError::Aeron(format!(
+                    "open_mds: tx_receipts boundary endpoint not configured (replica {replica_idx})"
+                ))
+            })?;
         Ok(Self {
             inner: rt.open_publication(&endpoint, ch.tx_receipts_stream_id)?,
             boundary: rt.open_publication(&boundary_endpoint, ch.tx_receipts_stream_id + 1)?,
@@ -1510,7 +1517,9 @@ mod drain_pending_tests {
         let now = Instant::now();
         let (p, rx) = pending(0, 0xAA, now, 5_000);
         let mut q = VecDeque::from([p]);
-        drain_pending_inner(&mut q, now, |_| OfferResult::Code(-2 /* BACK_PRESSURED */));
+        drain_pending_inner(&mut q, now, |_| {
+            OfferResult::Code(-2 /* BACK_PRESSURED */)
+        });
         assert_eq!(q.len(), 1, "back-pressured frame must be retained");
         assert!(rx.try_recv().is_err(), "must not ack a retained frame");
 
@@ -1560,7 +1569,11 @@ mod drain_pending_tests {
                 OfferResult::Code(0)
             }
         });
-        assert_eq!(q.len(), 1, "only the back-pressured pub-0 frame is retained");
+        assert_eq!(
+            q.len(),
+            1,
+            "only the back-pressured pub-0 frame is retained"
+        );
         assert_eq!(q[0].pub_id, 0);
         assert!(ra.try_recv().is_err(), "pub 0 still pending");
         assert!(matches!(rb.try_recv(), Ok(Ok(_))), "pub 1 delivered");
@@ -1574,11 +1587,16 @@ mod drain_pending_tests {
         let (p, rx) = pending(0, 0xAA, now, 0 /* deadline == now */);
         let mut q = VecDeque::from([p]);
         // `now` already >= deadline, offer still negative.
-        drain_pending_inner(&mut q, now, |_| OfferResult::Code(-1 /* NOT_CONNECTED */));
+        drain_pending_inner(&mut q, now, |_| {
+            OfferResult::Code(-1 /* NOT_CONNECTED */)
+        });
         assert!(q.is_empty(), "expired frame must be dropped");
         match rx.try_recv() {
             Ok(Err(LogError::Aeron(m))) => {
-                assert!(m.contains("NOT_CONNECTED"), "error should name the code: {m}")
+                assert!(
+                    m.contains("NOT_CONNECTED"),
+                    "error should name the code: {m}"
+                )
             }
             other => panic!("expected an Aeron error ack, got {other:?}"),
         }

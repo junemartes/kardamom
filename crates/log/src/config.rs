@@ -282,7 +282,10 @@ impl ChannelsConfig {
     /// via `|interface=...` when configured (required multi-host — see
     /// `tx_receipts_endpoint_interface`).
     fn tx_receipts_uri(&self, port: u32) -> String {
-        let mut uri = format!("aeron:udp?endpoint={}:{port}", self.tx_receipts_endpoint_host);
+        let mut uri = format!(
+            "aeron:udp?endpoint={}:{port}",
+            self.tx_receipts_endpoint_host
+        );
         if !self.tx_receipts_endpoint_interface.is_empty() {
             uri.push_str("|interface=");
             uri.push_str(&self.tx_receipts_endpoint_interface);
@@ -584,8 +587,7 @@ mod tests {
     #[test]
     fn mdc_input_uris_substitute_each_sequencer() {
         let ch = ChannelsConfig {
-            tx_ordering_mdc_control_template:
-                "aeron:udp?control={ctl}|control-mode=dynamic".into(),
+            tx_ordering_mdc_control_template: "aeron:udp?control={ctl}|control-mode=dynamic".into(),
             tx_ordering_mdc_publishers: vec![
                 "192.168.56.21:40110".into(),
                 "192.168.56.22:40110".into(),
@@ -616,21 +618,22 @@ mod tests {
     #[test]
     fn mdc_publisher_endpoint_must_be_registered() {
         let ch = ChannelsConfig {
-            tx_ordering_mdc_control_template:
-                "aeron:udp?control={ctl}|control-mode=dynamic".into(),
+            tx_ordering_mdc_control_template: "aeron:udp?control={ctl}|control-mode=dynamic".into(),
             tx_ordering_mdc_publishers: vec!["192.168.56.21:40110".into()],
             tx_ordering_canonical_publisher: "192.168.56.51:40110".into(),
             ..ChannelsConfig::default()
         };
         // Registered sequencer-input endpoint resolves.
         assert_eq!(
-            ch.tx_ordering_mdc_control_for("192.168.56.21:40110").unwrap(),
+            ch.tx_ordering_mdc_control_for("192.168.56.21:40110")
+                .unwrap(),
             "aeron:udp?control=192.168.56.21:40110|control-mode=dynamic"
         );
         // The canonical (sealer) endpoint also resolves — it is a valid
         // publisher even though it is not in tx_ordering_mdc_publishers.
         assert_eq!(
-            ch.tx_ordering_mdc_control_for("192.168.56.51:40110").unwrap(),
+            ch.tx_ordering_mdc_control_for("192.168.56.51:40110")
+                .unwrap(),
             "aeron:udp?control=192.168.56.51:40110|control-mode=dynamic"
         );
         // Unregistered endpoint is rejected (subscribers would never attach).
@@ -670,10 +673,12 @@ mod tests {
 
     #[test]
     fn tx_receipts_endpoint_offsets_port_by_replica() {
-        let mut ch = ChannelsConfig::default();
-        ch.tx_receipts_control_channel = "aeron:udp?control-mode=manual".into();
-        ch.tx_receipts_endpoint_host = "192.168.56.31".into();
-        ch.tx_receipts_endpoint_base_port = 40020;
+        let ch = ChannelsConfig {
+            tx_receipts_control_channel: "aeron:udp?control-mode=manual".into(),
+            tx_receipts_endpoint_host: "192.168.56.31".into(),
+            tx_receipts_endpoint_base_port: 40020,
+            ..Default::default()
+        };
         assert!(ch.tx_receipts_mds_enabled());
         // Receipts at base + 2*r, boundaries at base + 2*r + 1 (distinct ports
         // so ingress's two manual subs don't bind the same socket).
@@ -696,7 +701,10 @@ mod tests {
             "replica i boundaries at base_port + 2*i + 1"
         );
         // receipt and boundary endpoints for the same replica must differ.
-        assert_ne!(ch.tx_receipts_endpoint(1), ch.tx_receipts_boundary_endpoint(1));
+        assert_ne!(
+            ch.tx_receipts_endpoint(1),
+            ch.tx_receipts_boundary_endpoint(1)
+        );
     }
 
     #[test]
@@ -716,7 +724,9 @@ mod tests {
             tx_receipts_stream_id = 1002
             "#,
         );
-        let ch = LogConfig::from_toml_path(f.path()).expect("load MDS").channels;
+        let ch = LogConfig::from_toml_path(f.path())
+            .expect("load MDS")
+            .channels;
         assert!(ch.tx_receipts_mds_enabled());
         assert_eq!(ch.tx_receipts_executor_count, 3);
         // Executor side (replica 1) and ingress side (destination index 1)

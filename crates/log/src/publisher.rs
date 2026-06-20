@@ -29,7 +29,7 @@ use rkyv::util::AlignedVec;
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
-use crate::offer_retry::{offer_with_deadline, OFFER_TIMEOUT};
+use crate::offer_retry::{OFFER_TIMEOUT, offer_with_deadline};
 use kardamom_types::{
     BPosition, BlockBoundaryStart, QuorumWatermark, TxEnvelope, TxOrderingMessage, TxRef,
 };
@@ -246,4 +246,3 @@ fn decode_position(p: i64) -> BPosition {
         term_offset,
     }
 }
-

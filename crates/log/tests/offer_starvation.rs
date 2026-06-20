@@ -148,10 +148,9 @@ async fn back_pressured_publish_does_not_starve_a_live_subscription() {
     while got.is_none() && Instant::now() < recv_deadline {
         if let Ok(Some((_p, e))) =
             tokio::time::timeout(Duration::from_millis(25), live_sub.recv()).await
+            && e.correlation_id == 2
         {
-            if e.correlation_id == 2 {
-                got = Some(e);
-            }
+            got = Some(e);
         }
     }
     let elapsed = t0.elapsed();

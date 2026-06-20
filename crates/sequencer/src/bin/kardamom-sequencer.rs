@@ -134,8 +134,7 @@ async fn main() -> anyhow::Result<()> {
         TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
             .context("open TxOrderingPublisherHandle (MDC)")?
     } else {
-        TxOrderingPublisherHandle::open(&rt, &channels)
-            .context("open TxOrderingPublisherHandle")?
+        TxOrderingPublisherHandle::open(&rt, &channels).context("open TxOrderingPublisherHandle")?
     };
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;

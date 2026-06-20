@@ -81,7 +81,7 @@ pub(crate) fn offer_with_deadline(
         } else {
             // Throttled so a long wait (e.g. a subscriber that is slow to join)
             // is visible without flooding the log.
-            if attempt % 1024 == 0 {
+            if attempt.is_multiple_of(1024) {
                 warn!(
                     code = offer_code_str(code),
                     elapsed_ms = start.elapsed().as_millis() as u64,
@@ -127,11 +127,7 @@ mod tests {
             || {
                 let i = n.get();
                 n.set(i + 1);
-                if i < 1100 {
-                    -1
-                } else {
-                    7
-                }
+                if i < 1100 { -1 } else { 7 }
             },
             Duration::from_secs(5),
         )
@@ -149,11 +145,7 @@ mod tests {
             || {
                 let i = n.get();
                 n.set(i + 1);
-                if i < 10 {
-                    -2
-                } else {
-                    99
-                }
+                if i < 10 { -2 } else { 99 }
             },
             Duration::from_secs(1),
         )
@@ -166,8 +158,7 @@ mod tests {
         // A publication whose subscriber never joins must error after the
         // deadline (rather than spin forever or fail in microseconds).
         let start = Instant::now();
-        let err =
-            offer_with_deadline(|| -1, Duration::from_millis(60)).expect_err("must time out");
+        let err = offer_with_deadline(|| -1, Duration::from_millis(60)).expect_err("must time out");
         assert!(
             start.elapsed() >= Duration::from_millis(60),
             "must honour the full deadline, waited {:?}",
@@ -175,7 +166,10 @@ mod tests {
         );
         match err {
             LogError::Aeron(m) => {
-                assert!(m.contains("NOT_CONNECTED"), "error should name the code: {m}")
+                assert!(
+                    m.contains("NOT_CONNECTED"),
+                    "error should name the code: {m}"
+                )
             }
             other => panic!("unexpected error variant: {other:?}"),
         }
