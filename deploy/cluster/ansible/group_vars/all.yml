@@ -80,12 +80,12 @@ aeron_tmpfs_size: "1g"
 #                    (role==executor, distinct_hosts; recorder_id = alloc index)
 ip_prefix: "192.168.56"
 node_classes:
-  control:    { count: 1, ip_start: 10, tier: control }
-  sequencer:  { count: 2, ip_start: 21, tier: sequencer }
-  ingress:    { count: 1, ip_start: 31, tier: worker }
-  executor:   { count: 3, ip_start: 41, tier: worker }   # 3 exec nodes, each with a recorder
-  sealer:     { count: 1, ip_start: 51, tier: worker }
-  aux:        { count: 1, ip_start: 61, tier: worker }   # da_watcher + batcher
+  control: { count: 1, ip_start: 10, tier: control }
+  sequencer: { count: 2, ip_start: 21, tier: sequencer }
+  ingress: { count: 1, ip_start: 31, tier: worker }
+  executor: { count: 3, ip_start: 41, tier: worker } # 3 exec nodes, each with a recorder
+  sealer: { count: 1, ip_start: 51, tier: worker }
+  aux: { count: 1, ip_start: 61, tier: worker } # da_watcher + batcher
 
 # Number of recorders to collocate across the worker tier (quorum N; Q in
 # channels.toml). Must be <= the worker-tier node count (distinct_hosts).
