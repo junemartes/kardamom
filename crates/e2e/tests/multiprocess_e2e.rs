@@ -64,10 +64,10 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
         .with_test_writer()
         .try_init();
 
-    if !docker_available().await {
-        eprintln!("skipping: docker not available");
-        return;
-    }
+    assert!(
+        docker_available().await,
+        "docker not available — e2e tests require a running Docker daemon"
+    );
 
     // ----- Build the service binaries up front so the spawn step below
     // ----- doesn't race the `cargo build` from `--features full-pipeline-e2e`.
@@ -244,10 +244,10 @@ async fn multiprocess_e2e_deposit_round_trip() {
         .with_test_writer()
         .try_init();
 
-    if !docker_available().await {
-        eprintln!("skipping: docker not available");
-        return;
-    }
+    assert!(
+        docker_available().await,
+        "docker not available — e2e tests require a running Docker daemon"
+    );
 
     build_service_bins();
 
@@ -465,23 +465,21 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
         .with_test_writer()
         .try_init();
 
-    if !docker_available().await {
-        eprintln!("skipping: docker not available");
-        return;
-    }
+    assert!(
+        docker_available().await,
+        "docker not available — e2e tests require a running Docker daemon"
+    );
 
     // -------- L1: anvil + ERC-7955 factory + ETHLockbox -----------------
     // `--slots-in-an-epoch 1` makes anvil's `finalized` tag advance after
     // each new block (default value lags `latest` by ~64 blocks, mirroring
     // mainnet finality). The da-watcher reads only finalized blocks, so
     // without this the watcher would never see the deposit.
-    let anvil = match Anvil::new().arg("--slots-in-an-epoch").arg("1").try_spawn() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("skipping: anvil unavailable: {e}");
-            return;
-        }
-    };
+    let anvil = Anvil::new()
+        .arg("--slots-in-an-epoch")
+        .arg("1")
+        .try_spawn()
+        .expect("anvil not available — e2e tests require foundry's anvil on PATH");
     let l1_url = anvil.endpoint();
     tracing::info!(l1_url = %l1_url, "anvil L1 up");
 

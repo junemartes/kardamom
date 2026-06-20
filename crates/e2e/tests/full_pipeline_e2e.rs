@@ -89,10 +89,10 @@ async fn proof_of_pipeline_round_trip() {
         .with_test_writer()
         .try_init();
 
-    if !docker_available().await {
-        eprintln!("skipping: docker not available");
-        return;
-    }
+    assert!(
+        docker_available().await,
+        "docker not available — e2e tests require a running Docker daemon"
+    );
 
     // 1. Bring up real Aeron in Docker.
     let cluster = AeronTestCluster::single_node()
