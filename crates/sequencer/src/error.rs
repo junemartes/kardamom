@@ -12,15 +12,6 @@ pub enum SequencerError {
 
     #[error("malformed tx frame: {0}")]
     MalformedFrame(String),
-
-    #[error("kardamom-log error: {0}")]
-    Log(String),
-}
-
-impl From<kardamom_log::LogError> for SequencerError {
-    fn from(value: kardamom_log::LogError) -> Self {
-        SequencerError::Log(value.to_string())
-    }
 }
 
 #[cfg(test)]
