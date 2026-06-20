@@ -3816,15 +3816,12 @@ dependencies = [
  "anyhow",
  "clap",
  "kardamom-node",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "tracing",
  "tracing-subscriber 0.3.23",
- "url",
 ]
 
 [[package]]

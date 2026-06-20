@@ -73,18 +73,6 @@ pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes
     factory.create2(impl_salt, keccak256(impl_initcode))
 }
 
-/// App proxy address (deployed via the kardamom factory).
-pub fn app_proxy_address(
-    factory: Address,
-    proxy_creation_code: &Bytes,
-    impl_addr: Address,
-    init_data: &Bytes,
-    proxy_salt: B256,
-) -> Address {
-    let full = proxy_full_initcode(proxy_creation_code, impl_addr, init_data);
-    factory.create2(proxy_salt, keccak256(&full))
-}
-
 /// ERC1967 implementation storage slot.
 pub const ERC1967_IMPL_SLOT: B256 =
     b256!("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc");
