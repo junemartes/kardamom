@@ -16,13 +16,17 @@
 # Ansible reaches these over the community.docker connection plugin (see
 # ansible/inventory.containers.ini), so no SSH is installed.
 
-FROM jrei/systemd-ubuntu:22.04
+# geerlingguy's image is the de-facto base for testing Ansible against systemd
+# containers: multi-arch (amd64 + arm64, so it also builds locally on Apple
+# Silicon), runs `/lib/systemd/systemd` as PID 1, and ships python3 + systemctl
+# + sudo preinstalled.
+FROM geerlingguy/docker-ubuntu2204-ansible:latest
 
-# python3 for Ansible modules; ca-certificates/curl/iproute2 for the roles +
-# the HashiCorp downloads. The docker role installs docker-ce itself.
+# Extras the roles + HashiCorp downloads need on top of the base (curl, unzip,
+# iproute2, gnupg, ca-certificates). docker-ce is installed by the docker role.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        python3 python3-apt ca-certificates curl iproute2 sudo gnupg && \
+        ca-certificates curl unzip iproute2 gnupg && \
     rm -rf /var/lib/apt/lists/*
 
-# systemd is the entrypoint (inherited from the base image).
+# systemd (/lib/systemd/systemd) is the CMD, inherited from the base image.

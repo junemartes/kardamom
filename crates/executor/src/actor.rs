@@ -43,7 +43,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource};
 
@@ -181,15 +181,29 @@ impl Executor {
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
-        // Join in this order: B reader (closes first when tx_ordering is
-        // exhausted), then exec, then commit, then A + deposits readers.
-        // The tx_data + tx_deposits subscriptions may keep producing after
-        // tx_ordering closes; we let them drain to clean shutdown. Errors
-        // from any thread propagate; the first error wins but every join
-        // still runs so threads tear down cleanly.
+        // Join the critical pipeline first: B reader (closes when tx_ordering
+        // is exhausted), then exec, then commit.
         let r_b = b_handle.join().expect("tx_ordering reader panic");
         let r_exec = exec.join().expect("exec panic");
         let r_commit = commit.join().expect("commit panic");
+
+        // If ANY of the pipeline threads errored (e.g. a fatal
+        // BoundaryMisaligned in exec), the executor can no longer make
+        // progress. Return immediately so the process exits and the
+        // orchestrator restarts it. We must NOT fall through to joining the
+        // tx_data (A) + deposit readers: those block in their Aeron `next()`
+        // until the subscription closes, which only happens on process
+        // teardown — so joining them while the process is still up would hang
+        // forever and silently mask the pipeline error (the exact "frozen but
+        // alive" failure this guards against). On the normal Ok path the
+        // subscriptions have already closed (tx_ordering exhausted), so the A
+        // + deposit joins return promptly and we drain them for clean
+        // shutdown.
+        // Surface any pipeline error here, before joining the A / deposit
+        // readers below: on an error path tx_ordering may never close, so
+        // joining those readers would hang (the "frozen but alive" failure
+        // described above). On the Ok path this is a no-op and we fall through.
+        r_b.and(r_exec).and(r_commit)?;
         let mut r_a: Result<(), ExecutorError> = Ok(());
         for h in a_handles {
             let res = h.join().expect("tx_data reader panic");
@@ -200,7 +214,9 @@ impl Executor {
         let r_dep = dep_handle
             .map(|h| h.join().expect("tx_deposits reader panic"))
             .unwrap_or(Ok(()));
-        r_b.and(r_exec).and(r_commit).and(r_a).and(r_dep)
+        // `pipeline` was already checked above (Ok by here), so the result is
+        // determined by the A and deposit reader joins.
+        r_a.and(r_dep)
     }
 }
 
@@ -263,11 +279,19 @@ where
             // Per-block RPC enrichment counters; reset at each BoundaryStart.
             let mut tx_index_in_block: u64 = 0;
             let mut cumulative_gas_used: u64 = 0;
-            // Last tx_ordering position the exec thread folded into a
-            // receipt. Used to validate alignment with
-            // `BlockBoundaryStart.end_tx_idx`.
-            let mut last_processed_position: Option<BPosition> = None;
-            // Sanity: tx_idx assigned by the tx_ordering reader is monotone.
+            // Cumulative count of canonical records (TxRef + DepositRef) this
+            // exec thread has folded into a receipt. This is the boundary
+            // alignment key: `BlockBoundaryStart.end_tx_idx` carries the
+            // sealer's cumulative count of republished canonical records
+            // (encoded via `BPosition::from_index`), and at each boundary the
+            // two counts MUST match. `expected_tx_idx` already tracks exactly
+            // this (it advances once per applied Tx/Deposit and never resets
+            // across blocks), so we compare against it directly.
+            //
+            // (Count, not Aeron byte position: positions are per-publication
+            // term spaces under the canonical-publisher MDC merge and ambiguous
+            // between offer-return and frame-start frames — the old position
+            // key broke under load for exactly that reason.)
             let mut expected_tx_idx = TxIndex::ZERO;
             // Wall time spent executing the block's txs/deposits (excludes
             // channel idle time between txs), recorded when the BoundaryStart
@@ -292,6 +316,7 @@ where
                         position,
                     } => {
                         if tx_idx != expected_tx_idx {
+                            tracing::error!(block = current_block, ?position, ?tx_idx, ?expected_tx_idx, "exec ERROR: OutOfOrderTx (Tx)");
                             return Err(ExecutorError::OutOfOrderTx {
                                 got: tx_idx,
                                 expected: expected_tx_idx,
@@ -319,12 +344,14 @@ where
                         } else {
                             tx_applied_error.increment(1);
                         }
+                        if let Err(ref e) = result {
+                            tracing::error!(block = current_block, ?position, error = ?e, "exec ERROR: execute_tx failed");
+                        }
                         let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-                        last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -335,6 +362,7 @@ where
                         position,
                     } => {
                         if tx_idx != expected_tx_idx {
+                            tracing::error!(block = current_block, ?position, ?tx_idx, ?expected_tx_idx, "exec ERROR: OutOfOrderTx (Deposit)");
                             return Err(ExecutorError::OutOfOrderTx {
                                 got: tx_idx,
                                 expected: expected_tx_idx,
@@ -367,7 +395,6 @@ where
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-                        last_processed_position = Some(position);
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -377,16 +404,29 @@ where
                         end_tx_idx,
                         l2_timestamp,
                     }) => {
-                        // Alignment: BlockBoundaryStart.end_tx_idx is a
-                        // BPosition identifying the LAST tx_ordering record
-                        // that belongs to the closing block. It must match
-                        // the executor's most recent processed position.
-                        if let Some(lp) = last_processed_position
-                            && lp != end_tx_idx
-                        {
+                        // Alignment: BlockBoundaryStart.end_tx_idx carries the
+                        // sealer's cumulative COUNT of canonical records
+                        // (TxRef + DepositRef) republished through the end of
+                        // this block, encoded via BPosition::from_index. The
+                        // executor must have applied exactly that many records
+                        // — i.e. `expected_tx_idx` (which advances once per
+                        // applied Tx/Deposit and never resets) must equal it.
+                        // A mismatch means the executor's view of the canonical
+                        // stream diverged from the sealer's (a lost / extra /
+                        // reordered record) — fatal: return so the process
+                        // crash-loops rather than committing a wrong block.
+                        let want = end_tx_idx.as_index();
+                        let have = expected_tx_idx.0;
+                        if want != have {
+                            tracing::error!(
+                                block = block_number,
+                                want_count = want,
+                                have_count = have,
+                                "exec ERROR: BoundaryMisaligned (canonical record count)"
+                            );
                             return Err(ExecutorError::BoundaryMisaligned {
                                 end: end_tx_idx,
-                                last_seen: lp,
+                                last_seen: BPosition::from_index(have),
                             });
                         }
 
@@ -477,7 +517,25 @@ where
                     ExecToCommit::Receipt(r) => CMessage::Receipt(r),
                     ExecToCommit::Boundary(b) => CMessage::BlockBoundary(b),
                 };
-                c_pub.publish(c_msg)?;
+                // tx_receipts is MUST-DELIVER: a transaction's receipt has to make
+                // it back to the ingress that is parking the client. A transient
+                // publish failure — NOT_CONNECTED while the ingress's subscription
+                // is still forming during multi-host bring-up — must NOT drop the
+                // receipt or kill this thread. Killing it would close the bounded
+                // exec→commit channel, back-pressure the exec thread, stop
+                // tx_ordering consumption, and freeze ALL state progress. So retry
+                // until it lands; the offer itself waits out a single connect race,
+                // and this outer loop covers a connect window longer than one offer
+                // timeout. (Deploy order brings the ingress up first, so this
+                // normally succeeds on the first attempt.)
+                let mut attempts: u32 = 0;
+                while let Err(e) = c_pub.publish(c_msg.clone()) {
+                    attempts += 1;
+                    if attempts == 1 || attempts.is_multiple_of(20) {
+                        warn!(error = %e, attempts, "tx_receipts publish failed; retrying (must-deliver)");
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
             }
         })
         .expect("spawn commit")
@@ -573,9 +631,11 @@ mod exec_tests {
             })
             .unwrap();
         tx_r2e
+            // Two canonical records applied ⇒ cumulative count 2. end_tx_idx
+            // encodes that count (pos(2) == BPosition::from_index(2)).
             .send(ReaderToExec::Boundary(BlockBoundaryStart {
                 block_number: 1,
-                end_tx_idx: pos(1),
+                end_tx_idx: pos(2),
                 l2_timestamp: 1_700_000_000,
             }))
             .unwrap();
@@ -598,7 +658,7 @@ mod exec_tests {
         assert_eq!(log.len(), 1);
         let (boundary, delta) = &log[0];
         assert_eq!(boundary.block_number, 1);
-        assert_eq!(boundary.end_tx_idx, pos(1));
+        assert_eq!(boundary.end_tx_idx, pos(2));
         assert_eq!(boundary.l2_timestamp, 1_700_000_000);
         // The recipient received 150 total across both transfers — verify
         // by iterating the canonical Vec<AccountChange> the wire form holds.
@@ -632,7 +692,8 @@ mod exec_tests {
                 position: pos(0),
             })
             .unwrap();
-        // Boundary claims end_tx_idx at offset 5 but we only processed offset 0.
+        // Boundary claims 5 canonical records (pos(5) == from_index(5)) but we
+        // only applied 1 ⇒ count mismatch ⇒ BoundaryMisaligned.
         tx_r2e
             .send(ReaderToExec::Boundary(BlockBoundaryStart {
                 block_number: 1,
@@ -716,5 +777,63 @@ mod commit_tests {
         assert_eq!(l.len(), 2);
         assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
         assert!(matches!(&l[1], CMessage::BlockBoundary(b) if b.block_number == 1));
+    }
+
+    /// Rejects the first `fails_left` publish attempts (a transient
+    /// NOT_CONNECTED while the ingress subscription is forming), then records.
+    struct FlakyPub {
+        fails_left: u32,
+        log: Arc<Mutex<Vec<CMessage>>>,
+    }
+    impl TxReceiptsPublication for FlakyPub {
+        fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+            if self.fails_left > 0 {
+                self.fails_left -= 1;
+                return Err(ExecutorError::TxReceiptsClosed);
+            }
+            self.log.lock().unwrap().push(msg);
+            Ok(())
+        }
+    }
+
+    // tx_receipts is must-deliver: a transient publish failure (subscriber not
+    // yet connected during multi-host bring-up) must neither drop the receipt
+    // nor kill the commit thread — it must retry until the receipt lands.
+    #[test]
+    fn commit_thread_retries_until_delivered() {
+        let (tx, rx) = bounded::<ExecToCommit>(8);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let pos0 = BPosition {
+            term_id: 0,
+            term_offset: 0,
+        };
+        tx.send(ExecToCommit::Receipt(Receipt {
+            tx_idx: pos0,
+            tx_hash: B256::repeat_byte(0xAB),
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(tx);
+
+        // The publisher rejects the first 3 attempts, then accepts.
+        let h = spawn_commit(
+            FlakyPub {
+                fails_left: 3,
+                log: log.clone(),
+            },
+            rx,
+        );
+        // Must return Ok — the thread survived the transient failures.
+        h.join()
+            .expect("no panic")
+            .expect("commit thread must not die on a transient publish failure");
+
+        let l = log.lock().unwrap();
+        assert_eq!(l.len(), 1, "the receipt must be delivered, not dropped");
+        assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
     }
 }

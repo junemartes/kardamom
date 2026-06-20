@@ -14,8 +14,13 @@
 #       --build-arg BIN=kardamom-<svc> \
 #       -t <registry>/kardamom-<svc>:dev target/release
 #
-# Runtime libs mirror service.Dockerfile's runtime stage (Aeron C/C++ deps).
-FROM debian:bookworm-slim
+# Runtime base is ubuntu:24.04 to MATCH the GitHub runner (ubuntu-24.04) where
+# the binaries + libaeron.so are built: a slim debian (bookworm, glibc 2.36)
+# can't load a libaeron.so built against the runner's newer glibc ("version
+# `GLIBC_2.38' not found"). cluster-e2e.yml pins runs-on to ubuntu-24.04 to keep
+# the build and runtime glibc aligned. (The production service.Dockerfile builds
+# and runs on bookworm throughout, so it stays self-consistent.)
+FROM ubuntu:24.04
 
 ARG BIN
 ENV SERVICE_BIN=${BIN}
@@ -24,6 +29,13 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         ca-certificates libbsd0 libuuid1 libstdc++6 && \
     rm -rf /var/lib/apt/lists/*
+
+# The binaries link Aeron dynamically; ci-cluster.sh stages libaeron.so /
+# libaeron_archive_c_client.so (from the cargo build dir) into _aeronlibs/ in
+# the build context. Install them where the dynamic linker looks, else the
+# binary aborts at startup with "libaeron.so: cannot open shared object file".
+COPY _aeronlibs/ /usr/local/lib/
+RUN ldconfig
 
 # The prebuilt binary (build context = target/release).
 COPY ${BIN} /usr/local/bin/${BIN}

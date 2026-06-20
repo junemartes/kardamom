@@ -43,6 +43,14 @@ struct Args {
     /// Aeron Media Driver directory (`aeron.dir`).
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
+    /// This replica's index, used as the per-replica tx_receipts MDS endpoint
+    /// selector (`channels.tx_receipts_endpoint(recorder_id)`). In the cluster
+    /// this is wired from `${NOMAD_ALLOC_INDEX}` (the executor job is
+    /// count-based with `distinct_hosts`), matching the co-located recorder's
+    /// id. Only consulted when `tx_receipts_mds_enabled()`; the legacy shared
+    /// single-channel path ignores it.
+    #[arg(long, env = "KARDAMOM_RECORDER_ID", default_value_t = 0)]
+    recorder_id: u32,
     /// Number of tx_data shards to subscribe to (defaults to 8 — matches
     /// the default `partition_count` in the sequencer).
     #[arg(long, default_value_t = 8)]
@@ -103,6 +111,21 @@ async fn main() -> Result<()> {
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
 
+    // SEPARATE Aeron runtime/thread for the tx_receipts PUBLICATION. The
+    // executor's single Aeron thread otherwise services both the tx_ordering
+    // SUBSCRIPTION poll AND the per-tx receipt/boundary publishes; under
+    // sustained load the publish work delays the tx_ordering poll past Aeron's
+    // flow-control Status-Message deadline, the sealer drops this subscriber
+    // from the tx_ordering MDC, its image dies, and the executor freezes
+    // (reader stops, exec blocks reading). Isolating the publisher onto its own
+    // thread keeps the subscription poll timely no matter the receipt load.
+    let rt_pub = match args.aeron_dir.as_ref() {
+        Some(dir) => {
+            AeronRuntime::spawn_with_dir(dir).context("spawn receipts AeronRuntime with dir")?
+        }
+        None => AeronRuntime::spawn_default().context("spawn receipts AeronRuntime")?,
+    };
+
     // M tx_data subscriptions, one per shard. We bridge each handle's
     // async `recv()` to a synchronous `next()` (what the executor's reader
     // thread expects) through a `std::sync::mpsc::channel`, with a
@@ -154,9 +177,26 @@ async fn main() -> Result<()> {
     });
     let dep_sub: Box<dyn DepositSubscription> = Box::new(LiveTxDepositsSub { rx: d_rx });
 
-    // tx_receipts publication.
-    let c_handle = TxReceiptsPublisherHandle::open(&rt, &channels)
-        .context("open TxReceiptsPublisherHandle")?;
+    // tx_receipts publication. With MDS (fan-in) enabled, this replica
+    // publishes both the receipt stream and the boundary side-stream to its
+    // OWN per-replica unicast endpoint (selected by --recorder-id); ingress
+    // aggregates every replica's endpoint onto one multi-destination
+    // subscription. Without MDS (the IPC default), fall back to the shared
+    // single-channel path so single-host/local behaviour is unchanged. Either
+    // way the commit thread's must-deliver retry drives the same
+    // publish_receipt/publish_boundary surface.
+    let c_handle = if channels.tx_receipts_mds_enabled() {
+        tracing::info!(
+            replica_idx = args.recorder_id,
+            endpoint = channels.tx_receipts_endpoint(args.recorder_id).as_deref(),
+            "tx_receipts MDS publish (per-replica endpoint)"
+        );
+        TxReceiptsPublisherHandle::open_mds(&rt_pub, &channels, args.recorder_id)
+            .context("open TxReceiptsPublisherHandle (MDS)")?
+    } else {
+        TxReceiptsPublisherHandle::open(&rt_pub, &channels)
+            .context("open TxReceiptsPublisherHandle")?
+    };
     let c_pub = LiveTxReceiptsPub { handle: c_handle };
 
     // Load genesis if provided; seed the in-memory state DB and adopt
@@ -325,10 +365,14 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
                 .publish_receipt(&r)
                 .map(|_| ())
                 .map_err(|e| ExecutorError::State(format!("publish_receipt: {e}"))),
+            // BEST-EFFORT: a block-boundary marker. Ingress acks on the receipt /
+            // durable watermark, not on this — and blocking the commit thread
+            // here (e.g. at startup before ingress's MDS destinations attach)
+            // would freeze ALL state progress. Fire-and-forget so empty blocks
+            // never stall the executor; a dropped boundary is harmless.
             CMessage::BlockBoundary(b) => self
                 .handle
-                .publish_boundary(&b)
-                .map(|_| ())
+                .publish_boundary_best_effort(&b)
                 .map_err(|e| ExecutorError::State(format!("publish_boundary: {e}"))),
         }
     }

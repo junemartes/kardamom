@@ -1,32 +1,43 @@
 name: cluster-e2e
 
-# EXPERIMENTAL container-based cluster end-to-end (Ansible → Nomad → Consul).
-# Brings up the 5-"node" cluster as privileged systemd+DinD containers on a
-# 192.168.56.0/24 bridge (the VM-less analogue of `make up`), provisions them
-# with the UNMODIFIED site.yml, deploys the Nomad jobs, and runs the pipeline
-# smoke + a recorder-kill redundancy check. See deploy/cluster/scripts/ci-cluster.sh.
+# Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
+# 5-"node" cluster as privileged systemd+DinD containers on a 192.168.56.0/24
+# bridge (the VM-less analogue of `make up`), provisions them with the
+# UNMODIFIED site.yml, deploys the Nomad jobs, and runs the pipeline smoke + a
+# recorder-kill redundancy check. See deploy/cluster/scripts/ci-cluster.sh.
 #
-# Gated to manual dispatch / the `run-cluster-e2e` label only: it is heavy and
-# (unlike cluster-validate / docker-e2e) has not yet been run green end to end —
-# the first real runs are expected to need iteration on the runner. The static
-# cluster-validate workflow remains the always-on gate.
+# Runs on every PR (and pushes to main); opt out with the `skip-cluster-e2e`
+# label for changes that can't affect the cluster. This is the only gate that
+# exercises the full orchestration stack (Ansible/Nomad/Consul) + multi-host
+# Aeron + the recorder/quorum redundancy path end to end.
 
 on:
   workflow_dispatch:
   pull_request:
-    types: [labeled]
+  push:
+    branches: [main]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # Harden the heavy cargo build against transient crates.io download drops
+  # ("curl failed [56] ... unexpected eof while reading"): retry more, and
+  # disable HTTP/2 multiplexing (the known trigger for those mid-stream EOFs
+  # against the crates.io CDN in CI).
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 jobs:
   cluster-e2e:
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      contains(github.event.pull_request.labels.*.name, 'run-cluster-e2e')
+      !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
     name: container cluster e2e
-    runs-on: ubuntu-latest
+    # Pinned (not ubuntu-latest): the binaries + libaeron.so built here run in
+    # the ubuntu:24.04 ci-service image, so the runner glibc must match that
+    # base (see deploy/cluster/docker/ci-service.Dockerfile).
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -43,6 +54,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pin a concrete version: `stable`/`latest` make foundryup hit the
+          # GitHub releases API, which 403s under the unauthenticated per-IP
+          # rate limit on Actions runners. A concrete tag downloads directly.
+          version: v1.7.1
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: cluster-e2e
@@ -50,7 +66,7 @@ jobs:
       # Trust the in-cluster registry (plain HTTP on the bridge IP).
       - name: Configure host docker for the insecure registry
         run: |
-          echo '{ "insecure-registries": ["192.168.56.11:5000"] }' | sudo tee /etc/docker/daemon.json
+          echo '{ "insecure-registries": ["192.168.56.10:5000"] }' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
@@ -62,7 +78,7 @@ jobs:
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
-            -p kardamom-recorder --bins
+            --bins
 
       - name: Install Nomad CLI
         run: |
@@ -76,9 +92,9 @@ jobs:
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
-          for n in r1 r2 r3 w1 w2; do
+          for n in cp1 r1 r2 r3 sq1 sq2 exec1 ingress1 sealer1 dawatcher1 batcher1; do
             echo "===== kardamom-$n journal ====="
             docker exec "kardamom-$n" journalctl -u nomad -u consul --no-pager -n 100 2>/dev/null || true
           done
-          export NOMAD_ADDR=http://192.168.56.11:4646
+          export NOMAD_ADDR=http://192.168.56.10:4646
           nomad job status 2>/dev/null || true

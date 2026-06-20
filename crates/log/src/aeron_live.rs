@@ -49,10 +49,11 @@
 //!
 //! (unconditional dep on rusteron.)
 
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use rkyv::util::AlignedVec;
@@ -62,6 +63,7 @@ use tracing::{error, warn};
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
+use crate::offer_retry::{OFFER_TIMEOUT, offer_code_str};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
     Receipt, TxEnvelope, TxError, TxOrderingMessage,
@@ -114,10 +116,25 @@ enum RuntimeCmd {
     /// Register a new subscription. The Aeron thread executes
     /// `aeron.add_subscription()`, stores it in the sub table, and arranges
     /// for the supplied `deliver` closure to be invoked on each fragment.
+    /// Replies with the assigned `sub_id` (needed to attach MDS destinations).
     OpenSubscription {
         uri: String,
         stream_id: i32,
         deliver: DeliverFn,
+        ack: CbSender<Result<u32, LogError>>,
+    },
+    /// Attach a source endpoint to a multi-destination (`control-mode=manual`)
+    /// subscription. Used to aggregate per-publisher streams (e.g. one ingress
+    /// MDS subscription pulling receipts from every executor replica).
+    SubAddDestination {
+        sub_id: u32,
+        uri: String,
+        ack: CbSender<Result<(), LogError>>,
+    },
+    /// Detach a previously-attached source endpoint from an MDS subscription.
+    SubRemoveDestination {
+        sub_id: u32,
+        uri: String,
         ack: CbSender<Result<(), LogError>>,
     },
     /// Stop the loop, drop everything.
@@ -128,6 +145,34 @@ enum RuntimeCmd {
 struct SubEntry {
     sub: Sub,
     deliver: DeliverFn,
+}
+
+/// A publish awaiting delivery on the Aeron thread.
+///
+/// Why this queue exists: the Aeron thread is **single-threaded** and shared by
+/// every publication *and* subscription on a process. If a publish is offered
+/// in a blocking spin/sleep loop (the old `offer_blocking`, up to
+/// [`OFFER_TIMEOUT`]), that same thread stops polling its subscriptions for the
+/// whole back-pressure window. In the cluster that starves the executor's
+/// `tx_ordering` subscription long enough (> Aeron's MIN flow-control receiver
+/// timeout, ~2 s) that the sealer drops it from flow control, advances, and the
+/// subscription's image develops an unfillable gap and goes end-of-stream — a
+/// permanent freeze (the executor uses `no_unavailable_image_handler` and never
+/// re-subscribes). A *must-deliver publish* must never starve a *must-deliver
+/// subscribe*.
+///
+/// So a back-pressured offer is parked here and retried **one attempt per loop
+/// iteration** instead of blocking: the poll loop keeps draining subscriptions
+/// between attempts. Per-publication FIFO order is preserved (a publication with
+/// an older pending frame is not skipped ahead).
+struct PendingPublish {
+    pub_id: u32,
+    bytes: AlignedVec,
+    /// `Some` for an ack'd publish (`publish_bytes`); `None` for best-effort.
+    ack: Option<CbSender<Result<BPosition, LogError>>>,
+    /// Give up (ack an error / log) once this instant passes — bounds a publish
+    /// to a never-connecting subscriber, matching the old blocking deadline.
+    deadline: Instant,
 }
 
 impl AeronRuntime {
@@ -227,12 +272,14 @@ impl AeronRuntime {
 
     /// Open a raw subscription with a caller-supplied delivery closure.
     /// Used by adapters that need to demultiplex fragments themselves.
+    /// Open a subscription with a raw deliver closure, returning the assigned
+    /// `sub_id` (used to attach MDS destinations; most callers ignore it).
     pub fn open_subscription_with_deliver(
         &self,
         uri: &str,
         stream_id: i32,
         deliver: DeliverFn,
-    ) -> Result<(), LogError> {
+    ) -> Result<u32, LogError> {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         self.cmd_tx
             .send(RuntimeCmd::OpenSubscription {
@@ -244,8 +291,39 @@ impl AeronRuntime {
             .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
         ack_rx
             .recv_timeout(Duration::from_secs(10))
-            .map_err(|_| LogError::Aeron("open_subscription timed out".into()))??;
-        Ok(())
+            .map_err(|_| LogError::Aeron("open_subscription timed out".into()))?
+    }
+
+    /// Attach a source endpoint to a multi-destination subscription (one opened
+    /// `control-mode=manual`). Blocks until the driver confirms the attach.
+    /// Idempotent — re-adding an already-attached `uri` is a no-op.
+    pub fn add_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::SubAddDestination {
+                sub_id,
+                uri: uri.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("add_destination timed out".into()))?
+    }
+
+    /// Detach a previously-attached source endpoint from an MDS subscription.
+    pub fn remove_destination(&self, sub_id: u32, uri: &str) -> Result<(), LogError> {
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
+        self.cmd_tx
+            .send(RuntimeCmd::SubRemoveDestination {
+                sub_id,
+                uri: uri.to_string(),
+                ack: ack_tx,
+            })
+            .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
+        ack_rx
+            .recv_timeout(Duration::from_secs(10))
+            .map_err(|_| LogError::Aeron("remove_destination timed out".into()))?
     }
 
     /// Open a typed subscription, returning an mpsc receiver of decoded
@@ -262,21 +340,88 @@ impl AeronRuntime {
                 rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
             >,
     {
+        self.open_subscription_merged(std::slice::from_ref(&uri), stream_id)
+    }
+
+    /// Open one or more subscriptions on the **same** `stream_id`, all feeding
+    /// a single mpsc receiver. Each URI becomes its own Aeron subscription
+    /// (its own `SubEntry`); fragments from every one are decoded and merged
+    /// into the returned channel in the Aeron thread's poll order — the same
+    /// merge the shared-multicast path produced from multiple images of one
+    /// subscription.
+    ///
+    /// This is the tx_ordering MDC subscriber primitive: the executor passes
+    /// one MDC control URI per publisher (sealer + each sequencer), and the
+    /// downstream reader sees a single ordered `(BPosition, T)` stream exactly
+    /// as before. With a single URI it is identical to
+    /// [`Self::open_subscription`].
+    pub fn open_subscription_merged<T>(
+        &self,
+        uris: &[&str],
+        stream_id: i32,
+    ) -> Result<UnboundedReceiver<(BPosition, T)>, LogError>
+    where
+        T: rkyv::Archive + Send + 'static,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        if uris.is_empty() {
+            return Err(LogError::Aeron(
+                "open_subscription_merged requires at least one URI".into(),
+            ));
+        }
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
-            match codec::materialize::<T>(bytes) {
-                Ok(v) => {
-                    if msg_tx.send((pos, v)).is_err() {
-                        // Subscriber dropped its receiver.
+        for uri in uris {
+            let msg_tx = msg_tx.clone();
+            let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
+                match codec::materialize::<T>(bytes) {
+                    Ok(v) => {
+                        if msg_tx.send((pos, v)).is_err() {
+                            // Subscriber dropped its receiver.
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "decode failed on subscription delivery");
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, "decode failed on subscription delivery");
-                }
-            }
-        });
-        self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+            });
+            self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        }
         Ok(msg_rx)
+    }
+
+    /// Like [`open_subscription`](Self::open_subscription) but also returns the
+    /// `sub_id`, so the caller can attach MDS source endpoints via
+    /// [`add_destination`](Self::add_destination). Open the subscription on a
+    /// `control-mode=manual` channel to make it multi-destination.
+    pub fn open_subscription_with_id<T>(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<(u32, UnboundedReceiver<(BPosition, T)>), LogError>
+    where
+        T: rkyv::Archive + Send + 'static,
+        T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+            + for<'a> rkyv::bytecheck::CheckBytes<
+                rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>,
+            >,
+    {
+        let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
+        let deliver: DeliverFn =
+            Box::new(
+                move |bytes: &[u8], pos: BPosition| match codec::materialize::<T>(bytes) {
+                    Ok(v) => {
+                        let _ = msg_tx.send((pos, v));
+                    }
+                    Err(e) => {
+                        error!(error = %e, "decode failed on subscription delivery");
+                    }
+                },
+            );
+        let sub_id = self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        Ok((sub_id, msg_rx))
     }
 }
 
@@ -305,17 +450,33 @@ fn run_aeron_thread(
 ) -> Result<(), LogError> {
     let mut pubs: Vec<Pub> = Vec::new();
     let mut subs: Vec<SubEntry> = Vec::new();
+    let mut pending: VecDeque<PendingPublish> = VecDeque::new();
+    // Live MDS destinations. The rusteron `AeronAsyncDestination` removes its
+    // destination when dropped, so we must retain each one for as long as the
+    // attachment should stay active; keyed by (sub_id, uri) for removal.
+    let mut dests: Vec<(u32, String, rusteron_client::AeronAsyncDestination)> = Vec::new();
 
     loop {
+        // 1. Drain all queued commands (non-blocking). Publishes are *enqueued*
+        //    onto `pending`, never offered inline, so a back-pressured offer can
+        //    never block this loop (see `PendingPublish`).
         loop {
             match cmd_rx.try_recv() {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, cmd)?,
+                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
         }
 
+        // 2. Attempt one offer per pending publish, preserving per-publication
+        //    FIFO order. Successful/expired entries are removed.
+        drain_pending(&pubs, &mut pending);
+
+        // 3. Poll every subscription. This runs on *every* iteration — even
+        //    while a publish is back-pressured in `pending` — so a slow/stalled
+        //    publish can never starve a subscription's image. This is the fix
+        //    for the cluster `tx_ordering` freeze.
         for entry in subs.iter_mut() {
             let _ = entry.sub.poll_once(
                 |bytes: &[u8], header: Header| {
@@ -327,10 +488,13 @@ fn run_aeron_thread(
             );
         }
 
-        if subs.is_empty() {
+        // 4. Idle. Block only when there is genuinely nothing to do — nothing to
+        //    poll and nothing pending; otherwise a short sleep keeps the
+        //    poll/retry cadence tight without busy-spinning a core.
+        if subs.is_empty() && pending.is_empty() {
             match cmd_rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, cmd)?,
+                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -344,24 +508,28 @@ fn handle_cmd(
     aeron: &Rc<AeronClient>,
     pubs: &mut Vec<Pub>,
     subs: &mut Vec<SubEntry>,
+    pending: &mut VecDeque<PendingPublish>,
+    dests: &mut Vec<(u32, String, rusteron_client::AeronAsyncDestination)>,
     cmd: RuntimeCmd,
 ) -> Result<(), LogError> {
     match cmd {
+        // Publishes are never offered here — they are enqueued and retried by
+        // `drain_pending` so a back-pressured offer can't block the poll loop.
         RuntimeCmd::Publish { pub_id, bytes, ack } => {
-            let res = match pubs.get(pub_id as usize) {
-                Some(p) => offer_blocking(p, bytes.as_slice()),
-                None => Err(LogError::Aeron(format!("publish: unknown pub_id {pub_id}"))),
-            };
-            let _ = ack.send(res);
+            pending.push_back(PendingPublish {
+                pub_id,
+                bytes,
+                ack: Some(ack),
+                deadline: Instant::now() + OFFER_TIMEOUT,
+            });
         }
         RuntimeCmd::PublishBestEffort { pub_id, bytes } => {
-            if let Some(p) = pubs.get(pub_id as usize) {
-                if let Err(e) = offer_blocking(p, bytes.as_slice()) {
-                    warn!(error = %e, pub_id, "best-effort publish failed");
-                }
-            } else {
-                warn!(pub_id, "best-effort publish to unknown pub_id");
-            }
+            pending.push_back(PendingPublish {
+                pub_id,
+                bytes,
+                ack: None,
+                deadline: Instant::now() + OFFER_TIMEOUT,
+            });
         }
         RuntimeCmd::OpenPublication {
             uri,
@@ -382,7 +550,27 @@ fn handle_cmd(
         } => {
             let res = open_sub(aeron, &uri, stream_id).map(|sub| {
                 subs.push(SubEntry { sub, deliver });
+                (subs.len() - 1) as u32
             });
+            let _ = ack.send(res);
+        }
+        RuntimeCmd::SubAddDestination { sub_id, uri, ack } => {
+            let res = add_sub_destination(aeron, subs, dests, sub_id, &uri);
+            let _ = ack.send(res);
+        }
+        RuntimeCmd::SubRemoveDestination { sub_id, uri, ack } => {
+            // Dropping the retained `AeronAsyncDestination` issues the async
+            // remove command to the driver. Best-effort: a removed source's
+            // image also times out on its own.
+            let before = dests.len();
+            dests.retain(|(s, u, _)| !(*s == sub_id && *u == uri));
+            let res = if dests.len() < before {
+                Ok(())
+            } else {
+                Err(LogError::Aeron(format!(
+                    "remove destination: no attached {uri} on sub {sub_id}"
+                )))
+            };
             let _ = ack.send(res);
         }
         RuntimeCmd::Shutdown => {}
@@ -410,23 +598,145 @@ fn open_sub(aeron: &Rc<AeronClient>, uri: &str, stream_id: i32) -> Result<Sub, L
         .map_err(|e| LogError::Aeron(format!("add_subscription {uri}: {e}")))
 }
 
-fn offer_blocking(p: &Pub, bytes: &[u8]) -> Result<BPosition, LogError> {
-    for attempt in 0..1024 {
-        let r = p.offer(
-            bytes,
-            rusteron_client::Handlers::no_reserved_value_supplier_handler(),
-        );
-        if r >= 0 {
-            return Ok(decode_position(r));
-        }
-        if attempt % 64 == 63 {
-            warn!(attempt, "aeron back-pressure, retrying");
-        }
-        std::hint::spin_loop();
+/// Attach a source endpoint (`uri`, e.g. `aeron:udp?endpoint=10.0.0.5:9000`) to
+/// a `control-mode=manual` MDS subscription and retain the returned
+/// `AeronAsyncDestination` so the attachment stays live (dropping it issues the
+/// async remove). Idempotent. Blocks the Aeron thread only briefly to poll the
+/// driver's async completion — destination changes are infrequent (membership
+/// churn), unlike steady-state publishing.
+fn add_sub_destination(
+    aeron: &Rc<AeronClient>,
+    subs: &[SubEntry],
+    dests: &mut Vec<(u32, String, rusteron_client::AeronAsyncDestination)>,
+    sub_id: u32,
+    uri: &str,
+) -> Result<(), LogError> {
+    let sub = subs
+        .get(sub_id as usize)
+        .ok_or_else(|| LogError::Aeron(format!("add destination: unknown sub_id {sub_id}")))?;
+    if dests.iter().any(|(s, u, _)| *s == sub_id && u == uri) {
+        return Ok(()); // already attached
     }
-    Err(LogError::Aeron(
-        "back-pressure timeout after 1024 retries".into(),
-    ))
+    let c = CString::new(uri).map_err(|e| LogError::Aeron(format!("destination uri NUL: {e}")))?;
+    let dest = rusteron_client::AeronAsyncDestination::aeron_subscription_async_add_destination(
+        aeron,
+        &sub.sub,
+        c.as_c_str(),
+    )
+    .map_err(|e| LogError::Aeron(format!("add destination {uri}: {e}")))?;
+    let start = Instant::now();
+    loop {
+        match dest.aeron_subscription_async_destination_poll() {
+            Ok(1) => break,
+            Ok(_) => {}
+            Err(e) => return Err(LogError::Aeron(format!("destination poll {uri}: {e}"))),
+        }
+        if start.elapsed() > ADD_SUB_TIMEOUT {
+            return Err(LogError::Aeron(format!("add destination {uri} timed out")));
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    dests.push((sub_id, uri.to_string(), dest));
+    Ok(())
+}
+
+/// Attempt one offer for each pending publish, oldest first, preserving
+/// per-publication FIFO order: once a publication back-pressures this pass, its
+/// later frames are held too so the stream never reorders. Successful and
+/// expired (past-deadline) entries are removed; transiently-failing entries are
+/// retained for the next loop iteration.
+///
+/// Crucially this performs **one** offer attempt per entry and returns — it
+/// never spins/sleeps — so the caller ([`run_aeron_thread`]) goes straight back
+/// to polling subscriptions. That is what stops a back-pressured publish from
+/// starving a subscription image (see [`PendingPublish`]).
+fn drain_pending(pubs: &[Pub], pending: &mut VecDeque<PendingPublish>) {
+    drain_pending_inner(pending, Instant::now(), |item| {
+        match pubs.get(item.pub_id as usize) {
+            None => OfferResult::UnknownPub,
+            Some(p) => OfferResult::Code(p.offer(
+                item.bytes.as_slice(),
+                rusteron_client::Handlers::no_reserved_value_supplier_handler(),
+            )),
+        }
+    })
+}
+
+/// Outcome of attempting one offer for a [`PendingPublish`].
+enum OfferResult {
+    /// The publication id is not registered (programming error / use-after-close).
+    UnknownPub,
+    /// Aeron's raw offer return: `>= 0` is a stream position, `< 0` a status code.
+    Code(i64),
+}
+
+/// Pure core of [`drain_pending`], with the Aeron offer injected so the FIFO /
+/// deadline / back-pressure decisions are unit-testable without a media driver.
+/// `now` is threaded in for the same reason (deterministic deadline checks).
+fn drain_pending_inner<F>(pending: &mut VecDeque<PendingPublish>, now: Instant, mut offer: F)
+where
+    F: FnMut(&PendingPublish) -> OfferResult,
+{
+    if pending.is_empty() {
+        return;
+    }
+    // Publications that already back-pressured this pass; their remaining frames
+    // wait so we never deliver a stream out of order.
+    let mut blocked: Vec<u32> = Vec::new();
+    let mut keep: VecDeque<PendingPublish> = VecDeque::with_capacity(pending.len());
+
+    while let Some(mut item) = pending.pop_front() {
+        if blocked.contains(&item.pub_id) {
+            keep.push_back(item);
+            continue;
+        }
+        match offer(&item) {
+            OfferResult::UnknownPub => {
+                // Fail/log immediately, never retry.
+                match item.ack.take() {
+                    Some(ack) => {
+                        let _ = ack.send(Err(LogError::Aeron(format!(
+                            "publish: unknown pub_id {}",
+                            item.pub_id
+                        ))));
+                    }
+                    None => warn!(
+                        pub_id = item.pub_id,
+                        "best-effort publish to unknown pub_id"
+                    ),
+                }
+            }
+            OfferResult::Code(code) if code >= 0 => {
+                // Delivered. Ack the stream position; best-effort needs no ack.
+                // Don't block this pub_id: a later frame for it may also go now.
+                if let Some(ack) = item.ack.take() {
+                    let _ = ack.send(Ok(decode_position(code)));
+                }
+            }
+            OfferResult::Code(code) if now >= item.deadline => {
+                // Gave up (e.g. a subscriber that never joined). Surface the error
+                // so an ack'd must-deliver caller can decide to re-submit.
+                let msg = format!("aeron offer failed: {} ({code})", offer_code_str(code));
+                match item.ack.take() {
+                    Some(ack) => {
+                        let _ = ack.send(Err(LogError::Aeron(msg)));
+                    }
+                    None => warn!(
+                        code = offer_code_str(code),
+                        pub_id = item.pub_id,
+                        "best-effort publish failed (deadline)"
+                    ),
+                }
+            }
+            OfferResult::Code(_) => {
+                // Transient NOT_CONNECTED / BACK_PRESSURED: hold this frame and
+                // every later frame on the same publication; retry next iteration.
+                blocked.push(item.pub_id);
+                keep.push_back(item);
+            }
+        }
+    }
+    *pending = keep;
 }
 
 fn decode_position(p: i64) -> BPosition {
@@ -572,10 +882,48 @@ pub struct TxOrderingPublisherHandle {
 }
 
 impl TxOrderingPublisherHandle {
+    /// Open the tx_ordering publication on the shared `tx_ordering_channel`
+    /// (single-host IPC / legacy multicast). Use [`Self::open_mdc`] for the
+    /// multi-host MDC path.
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             inner: rt.open_publication(&ch.tx_ordering_channel, ch.tx_ordering_stream_id)?,
         })
+    }
+
+    /// Open the tx_ordering publication as an Aeron MDC
+    /// `control-mode=dynamic` publisher bound to **this publisher's** control
+    /// endpoint (`ip:port`). Subscribers attach themselves to this endpoint;
+    /// no per-subscriber config is needed and a dropped subscriber can no
+    /// longer freeze the other subscribers' images.
+    ///
+    /// `control_endpoint` must be registered in
+    /// `ch.tx_ordering_mdc_publishers` (enforced by
+    /// [`ChannelsConfig::tx_ordering_mdc_control_for`]).
+    pub fn open_mdc(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        control_endpoint: &str,
+    ) -> Result<Self, LogError> {
+        let uri = ch.tx_ordering_mdc_control_for(control_endpoint)?;
+        Ok(Self {
+            inner: rt.open_publication(&uri, ch.tx_ordering_stream_id)?,
+        })
+    }
+
+    /// Open the publisher honouring the config: MDC when enabled (binding to
+    /// `control_endpoint`), the shared channel otherwise. This is the single
+    /// entry point the service binaries call so the IPC fallback is uniform.
+    pub fn open_for(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        control_endpoint: &str,
+    ) -> Result<Self, LogError> {
+        if ch.tx_ordering_mdc_enabled() {
+            Self::open_mdc(rt, ch, control_endpoint)
+        } else {
+            Self::open(rt, ch)
+        }
     }
 
     pub fn publish(&self, msg: &TxOrderingMessage) -> Result<BPosition, LogError> {
@@ -600,13 +948,57 @@ pub struct TxOrderingSubscriberHandle {
 }
 
 impl TxOrderingSubscriberHandle {
+    /// Open the **canonical** tx_ordering subscriber (executor, durability
+    /// sidecar, sealer bootstrap). When MDC is enabled it attaches to the
+    /// **single** `tx_ordering_canonical_publisher` (the sealer) — one image,
+    /// one total order, so positions are well-defined and the executor's
+    /// boundary alignment holds. When MDC is disabled it opens the single
+    /// shared `tx_ordering_channel` (IPC / legacy multicast).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        Ok(Self {
-            rx: rt.open_subscription::<TxOrderingMessage>(
+        let rx = if ch.tx_ordering_mdc_enabled() {
+            let uri = ch.tx_ordering_canonical_subscriber_uri().ok_or_else(|| {
+                LogError::Config(
+                    "tx_ordering MDC enabled but tx_ordering_canonical_publisher is empty".into(),
+                )
+            })?;
+            rt.open_subscription_merged::<TxOrderingMessage>(&[&uri], ch.tx_ordering_stream_id)?
+        } else {
+            rt.open_subscription::<TxOrderingMessage>(
                 &ch.tx_ordering_channel,
                 ch.tx_ordering_stream_id,
-            )?,
-        })
+            )?
+        };
+        Ok(Self { rx })
+    }
+
+    /// Open the sealer's **input** tx_ordering subscriber: the merge of every
+    /// sequencer's MDC publication (`tx_ordering_mdc_publishers`) on
+    /// `tx_ordering_stream_id`. Only the sealer calls this — it reads the raw
+    /// per-sequencer TxRef/DepositRef stream, defines the canonical
+    /// interleaving, and republishes it onto its own canonical publication.
+    /// The merge order here is the sealer's private business: because the
+    /// sealer is the *single* canonical publisher, whatever order it observes
+    /// becomes THE order for every downstream reader. When MDC is disabled it
+    /// falls back to the shared `tx_ordering_channel` (single-host path).
+    pub fn open_input(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let rx = if ch.tx_ordering_mdc_enabled() {
+            let uris = ch.tx_ordering_input_subscriber_uris();
+            if uris.is_empty() {
+                return Err(LogError::Config(
+                    "tx_ordering MDC enabled but tx_ordering_mdc_publishers (sequencer \
+                     inputs) is empty"
+                        .into(),
+                ));
+            }
+            let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
+            rt.open_subscription_merged::<TxOrderingMessage>(&uri_refs, ch.tx_ordering_stream_id)?
+        } else {
+            rt.open_subscription::<TxOrderingMessage>(
+                &ch.tx_ordering_channel,
+                ch.tx_ordering_stream_id,
+            )?
+        };
+        Ok(Self { rx })
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, TxOrderingMessage)> {
@@ -625,6 +1017,19 @@ impl TxOrderingSubscriberHandle {
 /// TxReceipts publisher. The executor uses `publish_receipt` and
 /// `publish_boundary` on the same channel, but with separate stream ids so
 /// subscribers can demultiplex without an in-band tag.
+///
+/// Two open modes:
+/// - [`open`](Self::open): the legacy **single shared channel**
+///   (`tx_receipts_channel`) — the lone executor publishes, ingress subscribes
+///   directly. This is the single-host IPC default.
+/// - [`open_mds`](Self::open_mds): the **multi-destination-subscription**
+///   (fan-in) path. Each executor replica publishes to its OWN unicast UDP
+///   endpoint (`ch.tx_receipts_endpoint(replica_idx)`), and the single ingress
+///   attaches every replica's endpoint to one `control-mode=manual`
+///   subscription. Both modes publish receipts on `tx_receipts_stream_id` and
+///   boundaries on `tx_receipts_stream_id + 1`; only the channel URI differs,
+///   so `publish_receipt`/`publish_boundary` (and the executor commit thread's
+///   must-deliver retry that drives them) are identical across modes.
 #[derive(Clone)]
 pub struct TxReceiptsPublisherHandle {
     inner: PubHandle,
@@ -632,10 +1037,45 @@ pub struct TxReceiptsPublisherHandle {
 }
 
 impl TxReceiptsPublisherHandle {
+    /// Legacy single-shared-channel publisher (IPC default). Use when
+    /// `ch.tx_receipts_mds_enabled()` is false.
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             inner: rt.open_publication(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?,
             boundary: rt.open_publication(&ch.tx_receipts_channel, ch.tx_receipts_stream_id + 1)?,
+        })
+    }
+
+    /// MDS (fan-in) publisher: this replica publishes BOTH streams to its own
+    /// per-replica unicast endpoint `ch.tx_receipts_endpoint(replica_idx)`,
+    /// which ingress attaches as a destination on its aggregating subscription.
+    /// `replica_idx` is the executor's recorder-id (`NOMAD_ALLOC_INDEX`).
+    ///
+    /// Errors if MDS is not configured (no `tx_receipts_control_channel`), so a
+    /// misconfigured executor fails fast instead of silently using IPC.
+    pub fn open_mds(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        replica_idx: u32,
+    ) -> Result<Self, LogError> {
+        let endpoint = ch.tx_receipts_endpoint(replica_idx).ok_or_else(|| {
+            LogError::Aeron(format!(
+                "open_mds: tx_receipts MDS not configured (replica {replica_idx})"
+            ))
+        })?;
+        // Boundaries publish to a DISTINCT endpoint (port) from receipts, since
+        // ingress's two manual subscriptions each bind their destination socket
+        // — a shared endpoint collides. See ChannelsConfig::tx_receipts_endpoint.
+        let boundary_endpoint = ch
+            .tx_receipts_boundary_endpoint(replica_idx)
+            .ok_or_else(|| {
+                LogError::Aeron(format!(
+                    "open_mds: tx_receipts boundary endpoint not configured (replica {replica_idx})"
+                ))
+            })?;
+        Ok(Self {
+            inner: rt.open_publication(&endpoint, ch.tx_receipts_stream_id)?,
+            boundary: rt.open_publication(&boundary_endpoint, ch.tx_receipts_stream_id + 1)?,
         })
     }
 
@@ -646,19 +1086,87 @@ impl TxReceiptsPublisherHandle {
     pub fn publish_boundary(&self, b: &BlockBoundary) -> Result<BPosition, LogError> {
         self.boundary.publish(b)
     }
+
+    /// Fire-and-forget boundary publish. The block-boundary side-stream is a
+    /// marker — ingress acks on the receipt / durable watermark, NOT on this —
+    /// so it must NEVER block the executor's commit thread. A must-deliver
+    /// boundary that can't reach a not-yet-connected ingress (e.g. during
+    /// startup before ingress's MDS destinations attach) would back up the
+    /// commit→exec channel and freeze ALL state progress. Encodes and hands the
+    /// frame to the Aeron thread; delivery is best-effort.
+    pub fn publish_boundary_best_effort(&self, b: &BlockBoundary) -> Result<(), LogError> {
+        let bytes = codec::encode(b)?;
+        self.boundary.publish_best_effort(bytes);
+        Ok(())
+    }
 }
 
 /// TxReceipts subscriber for receipts.
+///
+/// In the legacy IPC path ([`open`](Self::open)) this is a plain subscription
+/// on the shared `tx_receipts_channel`. In the MDS fan-in path
+/// ([`open_mds`](Self::open_mds)) it is opened on the `control-mode=manual`
+/// `tx_receipts_control_channel`; the caller then attaches each executor
+/// replica's endpoint via [`add_destination`](Self::add_destination). The
+/// retained `sub_id` is what `add_destination`/`remove_destination` target.
 pub struct TxReceiptsSubscriberHandle {
     rx: UnboundedReceiver<(BPosition, Receipt)>,
+    /// `Some` only in the MDS path — the subscription id MDS destinations
+    /// attach to. `None` for the legacy single-channel subscription.
+    sub_id: Option<u32>,
+    rt: AeronRuntime,
 }
 
 impl TxReceiptsSubscriberHandle {
+    /// Legacy single-shared-channel subscriber (IPC default).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             rx: rt
                 .open_subscription::<Receipt>(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?,
+            sub_id: None,
+            rt: rt.clone(),
         })
+    }
+
+    /// MDS (fan-in) subscriber: one `control-mode=manual` subscription on
+    /// `ch.tx_receipts_control_channel` that the caller attaches per-replica
+    /// executor endpoints to. Errors if MDS is not configured.
+    pub fn open_mds(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        if !ch.tx_receipts_mds_enabled() {
+            return Err(LogError::Aeron(
+                "open_mds: tx_receipts MDS not configured (empty control channel)".into(),
+            ));
+        }
+        let (sub_id, rx) = rt.open_subscription_with_id::<Receipt>(
+            &ch.tx_receipts_control_channel,
+            ch.tx_receipts_stream_id,
+        )?;
+        Ok(Self {
+            rx,
+            sub_id: Some(sub_id),
+            rt: rt.clone(),
+        })
+    }
+
+    /// Attach an executor replica's endpoint as an MDS destination. Only valid
+    /// on a handle opened via [`open_mds`](Self::open_mds). Idempotent.
+    pub fn add_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.add_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "add_destination on a non-MDS receipts subscription".into(),
+            )),
+        }
+    }
+
+    /// Detach a previously-attached executor endpoint (membership churn).
+    pub fn remove_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.remove_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "remove_destination on a non-MDS receipts subscription".into(),
+            )),
+        }
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, Receipt)> {
@@ -670,9 +1178,15 @@ impl TxReceiptsSubscriberHandle {
     }
 }
 
-/// TxReceipts subscriber for boundaries.
+/// TxReceipts subscriber for boundaries. Mirrors
+/// [`TxReceiptsSubscriberHandle`] but for the `tx_receipts_stream_id + 1`
+/// boundary side-stream: [`open`](Self::open) for the legacy shared channel,
+/// [`open_mds`](Self::open_mds) + [`add_destination`](Self::add_destination)
+/// for the fan-in path.
 pub struct TxReceiptsBoundarySubscriberHandle {
     rx: UnboundedReceiver<(BPosition, BlockBoundary)>,
+    sub_id: Option<u32>,
+    rt: AeronRuntime,
 }
 
 impl TxReceiptsBoundarySubscriberHandle {
@@ -682,7 +1196,47 @@ impl TxReceiptsBoundarySubscriberHandle {
                 &ch.tx_receipts_channel,
                 ch.tx_receipts_stream_id + 1,
             )?,
+            sub_id: None,
+            rt: rt.clone(),
         })
+    }
+
+    /// MDS (fan-in) boundary subscriber on `ch.tx_receipts_control_channel`,
+    /// stream `tx_receipts_stream_id + 1`. Errors if MDS is not configured.
+    pub fn open_mds(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        if !ch.tx_receipts_mds_enabled() {
+            return Err(LogError::Aeron(
+                "open_mds: tx_receipts MDS not configured (empty control channel)".into(),
+            ));
+        }
+        let (sub_id, rx) = rt.open_subscription_with_id::<BlockBoundary>(
+            &ch.tx_receipts_control_channel,
+            ch.tx_receipts_stream_id + 1,
+        )?;
+        Ok(Self {
+            rx,
+            sub_id: Some(sub_id),
+            rt: rt.clone(),
+        })
+    }
+
+    /// Attach an executor replica's endpoint as an MDS destination. Idempotent.
+    pub fn add_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.add_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "add_destination on a non-MDS boundary subscription".into(),
+            )),
+        }
+    }
+
+    pub fn remove_destination(&self, uri: &str) -> Result<(), LogError> {
+        match self.sub_id {
+            Some(id) => self.rt.remove_destination(id, uri),
+            None => Err(LogError::Aeron(
+                "remove_destination on a non-MDS boundary subscription".into(),
+            )),
+        }
     }
 
     pub async fn recv(&mut self) -> Option<(BPosition, BlockBoundary)> {
@@ -902,3 +1456,162 @@ const _: fn() = || {
     assert_send_sync::<QuorumPublisherHandle>();
     assert_send::<QuorumSubscriberHandle>();
 };
+
+// ---------------------------------------------------------------------------
+// Unit tests for the publish-retry scheduler (no media driver required).
+//
+// These pin the behaviour that fixes the cluster `tx_ordering` freeze: a
+// back-pressured publish is *parked and retried*, never blocking the loop, and
+// per-publication FIFO order is preserved across retries. The matching real-
+// Aeron end-to-end proof (a back-pressured publish must not delay a live
+// subscription's delivery) lives in `tests/offer_starvation.rs`.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod drain_pending_tests {
+    use super::*;
+    use crossbeam_channel::Receiver as CbReceiver;
+
+    /// Build a pending publish with a one-byte payload tagged `marker` (so a test
+    /// can identify which frame an offer is being asked about) and a deadline
+    /// `dl_ms` from `base`. Returns the entry and its ack receiver.
+    fn pending(
+        pub_id: u32,
+        marker: u8,
+        base: Instant,
+        dl_ms: u64,
+    ) -> (PendingPublish, CbReceiver<Result<BPosition, LogError>>) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let mut bytes = AlignedVec::new();
+        bytes.extend_from_slice(&[marker]);
+        (
+            PendingPublish {
+                pub_id,
+                bytes,
+                ack: Some(tx),
+                deadline: base + Duration::from_millis(dl_ms),
+            },
+            rx,
+        )
+    }
+
+    #[test]
+    fn delivers_and_acks_then_empties_queue() {
+        let now = Instant::now();
+        let (p, rx) = pending(0, 0xAA, now, 5_000);
+        let mut q = VecDeque::from([p]);
+        // Offer always succeeds with a stream position.
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(64));
+        assert!(q.is_empty(), "delivered frame must be removed");
+        match rx.try_recv() {
+            Ok(Ok(_pos)) => {}
+            other => panic!("expected an Ok position ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn back_pressure_retains_frame_for_next_iteration() {
+        // The crux of the fix: a back-pressured offer (whose deadline has NOT
+        // passed) is kept in the queue and retried — never dropped, never
+        // blocking. The ack must stay pending.
+        let now = Instant::now();
+        let (p, rx) = pending(0, 0xAA, now, 5_000);
+        let mut q = VecDeque::from([p]);
+        drain_pending_inner(&mut q, now, |_| {
+            OfferResult::Code(-2 /* BACK_PRESSURED */)
+        });
+        assert_eq!(q.len(), 1, "back-pressured frame must be retained");
+        assert!(rx.try_recv().is_err(), "must not ack a retained frame");
+
+        // Next iteration the subscriber has drained — now it delivers.
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(0));
+        assert!(q.is_empty());
+        assert!(matches!(rx.try_recv(), Ok(Ok(_))));
+    }
+
+    #[test]
+    fn preserves_per_publication_fifo_under_back_pressure() {
+        // Two frames on pub 0 (A then B). The first attempt back-pressures A; B
+        // must NOT be offered ahead of A (would reorder the stream). We assert by
+        // recording which markers the offer fn is asked about.
+        let now = Instant::now();
+        let (a, _ra) = pending(0, 0xA1, now, 5_000);
+        let (b, _rb) = pending(0, 0xB2, now, 5_000);
+        let mut q = VecDeque::from([a, b]);
+
+        let mut offered: Vec<u8> = Vec::new();
+        drain_pending_inner(&mut q, now, |item| {
+            offered.push(item.bytes.as_slice()[0]);
+            OfferResult::Code(-2) // A back-pressures
+        });
+        assert_eq!(
+            offered,
+            vec![0xA1],
+            "only the head-of-line frame may be offered; B must not jump ahead"
+        );
+        assert_eq!(q.len(), 2, "both frames retained, still in order");
+        assert_eq!(q[0].bytes.as_slice()[0], 0xA1);
+        assert_eq!(q[1].bytes.as_slice()[0], 0xB2);
+    }
+
+    #[test]
+    fn independent_publications_do_not_block_each_other() {
+        // Pub 0 back-pressures but pub 1 is fine — pub 1 must still deliver.
+        let now = Instant::now();
+        let (a, ra) = pending(0, 0xA1, now, 5_000);
+        let (b, rb) = pending(1, 0xB2, now, 5_000);
+        let mut q = VecDeque::from([a, b]);
+
+        drain_pending_inner(&mut q, now, |item| {
+            if item.pub_id == 0 {
+                OfferResult::Code(-2)
+            } else {
+                OfferResult::Code(0)
+            }
+        });
+        assert_eq!(
+            q.len(),
+            1,
+            "only the back-pressured pub-0 frame is retained"
+        );
+        assert_eq!(q[0].pub_id, 0);
+        assert!(ra.try_recv().is_err(), "pub 0 still pending");
+        assert!(matches!(rb.try_recv(), Ok(Ok(_))), "pub 1 delivered");
+    }
+
+    #[test]
+    fn expired_frame_acks_an_error_and_is_dropped() {
+        // A frame still failing once its deadline has passed must error out (so a
+        // must-deliver caller can re-submit) rather than spin forever.
+        let now = Instant::now();
+        let (p, rx) = pending(0, 0xAA, now, 0 /* deadline == now */);
+        let mut q = VecDeque::from([p]);
+        // `now` already >= deadline, offer still negative.
+        drain_pending_inner(&mut q, now, |_| {
+            OfferResult::Code(-1 /* NOT_CONNECTED */)
+        });
+        assert!(q.is_empty(), "expired frame must be dropped");
+        match rx.try_recv() {
+            Ok(Err(LogError::Aeron(m))) => {
+                assert!(
+                    m.contains("NOT_CONNECTED"),
+                    "error should name the code: {m}"
+                )
+            }
+            other => panic!("expected an Aeron error ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_publication_id_fails_immediately() {
+        let now = Instant::now();
+        let (p, rx) = pending(9, 0xAA, now, 5_000);
+        let mut q = VecDeque::from([p]);
+        drain_pending_inner(&mut q, now, |_| OfferResult::UnknownPub);
+        assert!(q.is_empty(), "unknown-pub frame must not be retried");
+        match rx.try_recv() {
+            Ok(Err(LogError::Aeron(m))) => assert!(m.contains("unknown pub_id")),
+            other => panic!("expected unknown-pub error, got {other:?}"),
+        }
+    }
+}

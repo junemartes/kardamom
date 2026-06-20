@@ -10,7 +10,7 @@ aeron_version: "1.45.0"          # must match rusteron-archive 0.1.x
 ubuntu_codename: "jammy"         # 22.04, matches the Aeron image base (temurin jammy)
 
 # --- image registry -------------------------------------------------------
-registry_host: "192.168.56.11"   # r1
+registry_host: "192.168.56.10"   # cp1 (control plane)
 registry_port: 5000
 image_tag: "dev"
 # Fully-qualified image refs used by Nomad job specs.
@@ -53,38 +53,53 @@ paths:
 # tmpfs size for the Aeron media-driver shared-memory dir.
 aeron_tmpfs_size: "1g"
 
-# --- cluster topology -----------------------------------------------------
-# `recorder_id` is unique+stable per recorder (quorum identity).
-# `sequencer_id` is set on worker nodes that run a sequencer.
-cluster_nodes:
-  r1:
-    ip: 192.168.56.11
-    role: recorder
-    recorder_id: 0
-    control_plane: true          # nomad+consul server + docker registry + anvil L1
-  r2:
-    ip: 192.168.56.12
-    role: recorder
-    recorder_id: 1
-  r3:
-    ip: 192.168.56.13
-    role: recorder
-    recorder_id: 2
-  w1:
-    ip: 192.168.56.21
-    role: worker
-    sequencer_id: 0
-    services: [sequencer, executor, ingress]
-  w2:
-    ip: 192.168.56.22
-    role: worker
-    sequencer_id: 1
-    services: [sequencer, sealer, da_watcher, batcher]
+# --- cluster topology (node classes) --------------------------------------
+# The cluster is defined as a small set of node CLASSES, each with a replica
+# `count` — NOT a hand-enumerated list of nodes. scripts/ci-cluster.sh
+# materialises `count` instances per class, names them <class>-<i>, assigns each
+# a static IP from the class's `ip_start` lane on `ip_prefix`.0/24, and tags each
+# with two Nomad node-meta attributes: `role` (= the class name, for unique
+# placement) and `tier` (a coarse group, for collocation/exclusion). Scaling a
+# class is a one-line `count` change — no node lists, inventories, or IP mirrors.
+#
+# Each worker-tier class runs ONE pipeline service. The 3 RECORDERS are NOT their
+# own class: they are a count=3 job COLLOCATED onto the worker tier (tier=worker)
+# with `distinct_hosts`, so each lands on a distinct worker node alongside that
+# node's service. (Step toward eventually merging the recorder + worker roles.)
+# Per-replica identity (recorder_id, partition-index) comes from
+# `${NOMAD_ALLOC_INDEX}`, not node meta.
+#
+# Replication semantics:
+#   control     1    singleton: consul+nomad server, registry, anvil L1
+#   sequencer   2    partition_count=2 (partition-index = alloc index)
+#   ingress     1+   scalable RPC front door            (tier: worker)
+#   executor    3    state applier; ONE RECORDER COLLOCATED PER EXECUTOR
+#   sealer      1    PROTOCOL SINGLETON — tx_ordering    (tier: worker)
+#   aux         1    da_watcher + batcher collocated     (tier: worker)
+#   recorder    3    quorum N=3, COLLOCATED 1:1 on the executor nodes
+#                    (role==executor, distinct_hosts; recorder_id = alloc index)
+ip_prefix: "192.168.56"
+node_classes:
+  control: { count: 1, ip_start: 10, tier: control }
+  sequencer: { count: 2, ip_start: 21, tier: sequencer }
+  ingress: { count: 1, ip_start: 31, tier: worker }
+  executor: { count: 3, ip_start: 41, tier: worker } # 3 exec nodes, each with a recorder
+  sealer: { count: 1, ip_start: 51, tier: worker }
+  aux: { count: 1, ip_start: 61, tier: worker } # da_watcher + batcher
 
-# Convenience derived lists (used by templates / job placement).
-recorder_ips: ["192.168.56.11", "192.168.56.12", "192.168.56.13"]
-worker_ips: ["192.168.56.21", "192.168.56.22"]
-ingress_ip: "192.168.56.21"      # w1
-sealer_ip: "192.168.56.22"       # w2 (publishes tx_ordering)
-executor_ip: "192.168.56.21"     # w1
-control_ip: "192.168.56.11"      # r1
+# Number of recorders to collocate across the worker tier (quorum N; Q in
+# channels.toml). Must be <= the worker-tier node count (distinct_hosts).
+recorder_count: 3
+
+# Concrete addresses derived from the class lanes (first instance of each), for
+# the few places that need a fixed target rather than Consul discovery.
+control_ip: "192.168.56.10"      # control-0 — consul/nomad server, registry, anvil
+ingress_ip: "192.168.56.31"      # ingress-0 — smoke.sh default RPC target
+executor_ip: "192.168.56.41"     # executor-0
+sealer_ip: "192.168.56.51"       # sealer-0 (publishes tx_ordering)
+
+# tx_ordering MDC publisher control endpoints. Each publisher binds <node_ip>:40110
+# (uniform port — uniqueness comes from the node IP), and subscribers attach to
+# all of them. These MUST match tx_ordering_mdc_publishers in
+# config/channels.toml.tpl: seq0@.21, seq1@.22, sealer@.51, all on port 40110.
+tx_ordering_mdc_port: 40110

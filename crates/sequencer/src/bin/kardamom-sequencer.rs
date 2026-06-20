@@ -62,6 +62,12 @@ struct Args {
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
+    /// This sequencer's tx_ordering MDC control endpoint (`ip:port`). Required
+    /// when the resolved `LogConfig` enables tx_ordering MDC
+    /// (`tx_ordering_mdc_control_template` set); ignored otherwise. Must match
+    /// one of the `tx_ordering_mdc_publishers` entries in the channels config.
+    #[arg(long, env = "KARDAMOM_TX_ORDERING_MDC_CONTROL")]
+    tx_ordering_mdc_control: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9001")]
     metrics_addr: std::net::SocketAddr,
@@ -117,8 +123,19 @@ async fn main() -> anyhow::Result<()> {
     let shard_id = cfg.sequencer_id;
     let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
         .context("open TxDataSubscriberHandle")?;
-    let tx_ordering_pub = TxOrderingPublisherHandle::open(&rt, &channels)
-        .context("open TxOrderingPublisherHandle")?;
+    // tx_ordering publisher: MDC (per-publisher control endpoint) in the
+    // cluster, shared IPC channel single-host. When MDC is enabled the
+    // control endpoint is mandatory.
+    let tx_ordering_pub = if channels.tx_ordering_mdc_enabled() {
+        let ctl = args.tx_ordering_mdc_control.as_deref().context(
+            "tx_ordering MDC is enabled in the log config but --tx-ordering-mdc-control \
+             (KARDAMOM_TX_ORDERING_MDC_CONTROL) was not supplied",
+        )?;
+        TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
+            .context("open TxOrderingPublisherHandle (MDC)")?
+    } else {
+        TxOrderingPublisherHandle::open(&rt, &channels).context("open TxOrderingPublisherHandle")?
+    };
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;
     let tx_errors_pub =

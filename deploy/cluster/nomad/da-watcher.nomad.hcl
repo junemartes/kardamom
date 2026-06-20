@@ -1,12 +1,12 @@
 # kardamom-da-watcher — polls L1 for deposits and publishes Deposit envelopes
-# onto tx_deposits. Placed on w2 (192.168.56.22).
+# onto tx_deposits. Placed on dawatcher1 (192.168.56.34).
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
-#   kardamom-da-watcher --l1-rpc http://192.168.56.11:8546 --lockbox <addr> \
+#   kardamom-da-watcher --l1-rpc http://192.168.56.10:8546 --lockbox <addr> \
 #       --aeron-dir <dir> --poll-interval-secs 1
 #
 # --l1-rpc points at the in-cluster anvil on r1 (control_ip:anvil_l1 =
-# 192.168.56.11:8546). --lockbox is the chain-specific Lockbox contract
+# 192.168.56.10:8546). --lockbox is the chain-specific Lockbox contract
 # address; it is NOT known until the deployer deploys it, so it is exposed as
 # the HCL variable `lockbox_address` below with a clearly-marked PLACEHOLDER
 # default. Override at submit time:
@@ -26,8 +26,8 @@ job "da-watcher" {
   type        = "service"
 
   constraint {
-    attribute = "${meta.kardamom_node}"
-    value     = "w2"
+    attribute = "${meta.role}"
+    value     = "aux"
   }
 
   group "da-watcher" {
@@ -41,13 +41,17 @@ job "da-watcher" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-da-watcher:dev"
+        image        = "192.168.56.10:5000/kardamom-da-watcher:dev"
+        # Always pull the freshly-built image: the mutable :dev tag would otherwise
+        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy).
+        force_pull    = true
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]
         args = [
-          "--l1-rpc", "http://192.168.56.11:8546",
+          "--l1-rpc", "http://192.168.56.10:8546",
           "--lockbox", "${var.lockbox_address}",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",

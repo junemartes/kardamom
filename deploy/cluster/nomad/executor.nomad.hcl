@@ -1,5 +1,5 @@
 # kardamom-executor — replays the canonical order and applies state (embeds the
-# libmdbx StateWriter). Placed on w1 (192.168.56.21), co-located with sequencer
+# libmdbx StateWriter). Placed on its own node exec1 (192.168.56.31). (Was co-located with sequencer
 # #0 and ingress.
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs):
@@ -21,12 +21,18 @@ job "executor" {
   type        = "service"
 
   constraint {
-    attribute = "${meta.kardamom_node}"
-    value     = "w1"
+    attribute = "${meta.role}"
+    value     = "executor"
   }
 
   group "executor" {
-    count = 1
+    # One executor per executor-class node (3-way redundant state machines, each
+    # with a co-located recorder). distinct_hosts spreads them across the nodes.
+    count = 3
+    constraint {
+      operator = "distinct_hosts"
+      value    = "true"
+    }
 
     network {
       mode = "host"
@@ -36,7 +42,11 @@ job "executor" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-executor:dev"
+        image        = "192.168.56.10:5000/kardamom-executor:dev"
+        # Always pull the freshly-built image: the mutable :dev tag would otherwise
+        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy).
+        force_pull    = true
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
@@ -46,6 +56,11 @@ job "executor" {
           "--config", "/local/executor.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          # This replica's index — selects its per-replica tx_receipts MDS
+          # endpoint (channels.toml tx_receipts_endpoint_base_port + index).
+          # The job is count-based with distinct_hosts, so ${NOMAD_ALLOC_INDEX}
+          # is stable 0..N and matches the co-located recorder's id.
+          "--recorder-id", "${NOMAD_ALLOC_INDEX}",
           "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",

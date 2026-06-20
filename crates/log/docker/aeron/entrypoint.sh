@@ -14,6 +14,23 @@ set -euo pipefail
 # files) are world-writable — the bind-mounted host process needs RW access.
 umask 0000
 
+# CPU thrift. Aeron's default DEDICATED threading runs THREE busy-spinning
+# threads per media driver (conductor/sender/receiver), plus the Archive's own
+# threads — fine for one low-latency host, but a whole CLUSTER of drivers (the
+# container cluster-e2e runs ~6 of them) pins every core. Default to SHARED
+# threading so each driver uses ONE thread instead of three.
+#
+# Idle strategy: deliberately left at Aeron's DEFAULT (a backoff that
+# spins→yields→parks). An earlier experiment forced SleepingMillisIdleStrategy
+# (sleep 1ms when idle) to save more CPU, but that delayed the driver's
+# Status-Message / NAK servicing enough to HURT multicast liveness and made the
+# tx_ordering freeze appear *sooner* — and it was never the real cause anyway.
+# The freeze was a client-side bug (a back-pressured publish starving the shared
+# Aeron thread's subscription polling), fixed in kardamom_log::aeron_live. So we
+# keep the responsive default idle here and only trim the thread COUNT.
+AERON_THREADING_MODE="${AERON_THREADING_MODE:-SHARED}"
+AERON_ARCHIVE_THREADING_MODE="${AERON_ARCHIVE_THREADING_MODE:-SHARED}"
+
 java \
     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
     --add-opens java.base/java.util.zip=ALL-UNNAMED \
@@ -22,6 +39,8 @@ java \
     -Daeron.archive.dir=${AERON_ARCHIVE_DIR} \
     -Daeron.term.buffer.length=${AERON_TERM_BUFFER_LENGTH} \
     -Daeron.ipc.term.buffer.length=${AERON_IPC_TERM_BUFFER_LENGTH} \
+    -Daeron.threading.mode=${AERON_THREADING_MODE} \
+    -Daeron.archive.threading.mode=${AERON_ARCHIVE_THREADING_MODE} \
     -Daeron.archive.control.channel=aeron:udp?endpoint=0.0.0.0:8010 \
     -Daeron.archive.control.response.channel=aeron:udp?endpoint=0.0.0.0:8011 \
     -Daeron.archive.replication.channel=aeron:udp?endpoint=0.0.0.0:8021 \

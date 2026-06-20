@@ -14,8 +14,7 @@ pub struct BlockBoundaryStart {
 }
 
 /// Block-boundary closeout emitted by executors onto tx_receipts once they have
-/// finished executing through `end_tx_idx`. No `state_root_commitment` field
-///.
+/// finished executing through `end_tx_idx`. No `state_root_commitment` field.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct BlockBoundary {

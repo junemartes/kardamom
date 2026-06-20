@@ -227,31 +227,17 @@ impl SnapshotSource for MutatingSnapshotSource {
 #[derive(Debug, Clone)]
 pub struct WriterApplyingQueue {
     db: MockStateDatabase,
-    /// Optional log of (BlockBoundary, BlockDelta) for tests that want to
-    /// inspect what the writer received. Use `take_log()` to drain.
-    log: Arc<RwLock<Vec<(BlockBoundary, BlockDelta)>>>,
 }
 
 impl WriterApplyingQueue {
     pub fn new(db: MockStateDatabase) -> Self {
-        Self {
-            db,
-            log: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    pub fn take_log(&self) -> Vec<(BlockBoundary, BlockDelta)> {
-        std::mem::take(&mut self.log.write().expect("WriterApplyingQueue poisoned"))
+        Self { db }
     }
 }
 
 impl StateWriterQueue for WriterApplyingQueue {
-    fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+    fn submit(&mut self, _block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
         self.db.apply_block_delta(&delta);
-        self.log
-            .write()
-            .expect("WriterApplyingQueue poisoned")
-            .push((block, delta));
         Ok(())
     }
 }

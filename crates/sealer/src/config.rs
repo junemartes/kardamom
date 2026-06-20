@@ -16,8 +16,22 @@ pub struct SealerConfig {
     /// Identifier for this sealer process, used as the `host_id` metric
     /// label unless overridden via `--host-id`/`KARDAMOM_HOST_ID`.
     pub host_id: u8,
-    /// Aeron channel URI for tx_ordering (publish + subscribe on the same channel).
+    /// Aeron channel URI for tx_ordering (publish + subscribe on the same
+    /// channel). Used as the shared single-host IPC / legacy-multicast
+    /// channel. When `channel_b_mdc_control` is set AND the resolved
+    /// `LogConfig` enables tx_ordering MDC, this URI is superseded for the
+    /// sealer's own publication by its MDC control endpoint (it is still used
+    /// for the bootstrap / tail-tracker subscription via the channels config's
+    /// MDC subscriber URIs).
     pub channel_b_uri: String,
+    /// This sealer's tx_ordering MDC control endpoint (`ip:port`). When set
+    /// and the resolved `LogConfig` enables MDC, the sealer publishes its
+    /// boundary markers via this MDC `control-mode=dynamic` endpoint instead
+    /// of the shared `channel_b_uri`. Must match one of the
+    /// `tx_ordering_mdc_publishers` entries in the channels config. `None`
+    /// keeps the legacy shared-channel behaviour.
+    #[serde(default)]
+    pub channel_b_mdc_control: Option<String>,
     /// Aeron stream id carrying `TxEnvelope`s on tx_ordering.
     pub channel_b_tx_stream_id: i32,
     /// Aeron stream id carrying `BlockBoundaryStart`s on tx_ordering. Must differ
@@ -64,6 +78,7 @@ mod tests {
         SealerConfig {
             host_id: 7,
             channel_b_uri: "x".into(),
+            channel_b_mdc_control: None,
             channel_b_tx_stream_id: 1,
             channel_b_boundary_stream_id: 2,
             tick_interval_ms: 250,
@@ -81,6 +96,34 @@ mod tests {
         let cfg: SealerConfig = toml::from_str(toml).unwrap();
         assert_eq!(cfg.host_id, 7);
         assert_eq!(cfg.tick_interval_ms, 250);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn channel_b_mdc_control_defaults_none_and_parses() {
+        // Omitted ⇒ None (legacy shared-channel path).
+        let toml = r#"
+            host_id = 7
+            channel_b_uri = "aeron:udp?endpoint=224.0.0.1:40123"
+            channel_b_tx_stream_id = 1001
+            channel_b_boundary_stream_id = 1002
+        "#;
+        let cfg: SealerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.channel_b_mdc_control, None);
+
+        // Present ⇒ Some(endpoint) (MDC path).
+        let toml = r#"
+            host_id = 7
+            channel_b_uri = "aeron:ipc?alias=tx-ordering"
+            channel_b_mdc_control = "192.168.56.22:40110"
+            channel_b_tx_stream_id = 1001
+            channel_b_boundary_stream_id = 1002
+        "#;
+        let cfg: SealerConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.channel_b_mdc_control.as_deref(),
+            Some("192.168.56.22:40110")
+        );
         cfg.validate().unwrap();
     }
 

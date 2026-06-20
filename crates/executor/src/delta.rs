@@ -33,10 +33,6 @@ pub struct WriteSet {
 }
 
 impl WriteSet {
-    pub fn is_empty(&self) -> bool {
-        self.accounts.is_empty() && self.storage.is_empty() && self.code.is_empty()
-    }
-
     /// Deterministic keccak256 hash of the write set.
     ///
     /// Layout (concatenated, then hashed):
@@ -160,11 +156,6 @@ impl PendingDelta {
     }
 }
 
-/// Convenience for callers who only need the merge behaviour.
-pub fn apply_write_set(delta: &mut PendingDelta, ws: WriteSet) {
-    delta.apply(ws);
-}
-
 //NOTE: No `block_delta_root` / state-root function here. the
 // executor does not compute or publish any state-root commitment. The sealed
 // BlockBoundary on tx_receipts is slim; the state writer flushes the delta to
@@ -256,13 +247,13 @@ mod tests {
         ws1.accounts.insert(addr, sample_account(10, 1));
         ws1.storage
             .insert((addr, B256::from(U256::from(1u64))), U256::from(100u64));
-        apply_write_set(&mut delta, ws1);
+        delta.apply(ws1);
 
         let mut ws2 = WriteSet::default();
         ws2.accounts.insert(addr, sample_account(15, 2));
         ws2.storage
             .insert((addr, B256::from(U256::from(1u64))), U256::from(200u64));
-        apply_write_set(&mut delta, ws2);
+        delta.apply(ws2);
 
         let (nonce, balance, _ch) = delta.accounts[&addr];
         assert_eq!(balance, U256::from(15u64));

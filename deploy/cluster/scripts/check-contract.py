@@ -66,31 +66,40 @@ anvil_l1 = ports.get("anvil_l1", "")
 nomad_http = ports.get("nomad_http", "")
 nomad_addr = f"http://{control_ip}:{nomad_http}"
 
-# Node name -> ip from the cluster_nodes mapping.
+# Node name -> ip from the legacy hand-enumerated cluster_nodes mapping (if any).
 nodes = dict(re.findall(r"^\s{2}(\w+):\n\s{4}ip:\s*([\d.]+)", gv, re.M))
-if sorted(nodes) != ["r1", "r2", "r3", "w1", "w2"]:
-    err(f"group_vars/all.yml: unexpected cluster_nodes set: {sorted(nodes)}")
-
-# --- Vagrantfile + inventory mirror the node IPs -----------------------------
-for name, ip in nodes.items():
-    must_contain(CLUSTER / "Vagrantfile", f'"{ip}"', f"static IP of {name}")
-    must_contain(
-        CLUSTER / "ansible" / "inventory.ini",
-        f"{name} ansible_host={ip}",
-        f"inventory entry for {name}",
-    )
-    # The container-node inventory (cluster-e2e) keeps the same node/role/id
-    # layout; the static IP is assigned by ci-cluster.sh instead.
-    must_contain(
-        CLUSTER / "ansible" / "inventory.containers.ini",
-        f"{name} ansible_host=kardamom-{name}",
-        f"container inventory entry for {name}",
-    )
-    must_contain(
-        CLUSTER / "scripts" / "ci-cluster.sh",
-        f"[{name}]={ip}",
-        f"ci-cluster.sh static IP of {name}",
-    )
+if nodes:
+    # --- legacy cluster_nodes model: Vagrantfile + inventory mirror node IPs ---
+    EXPECTED_NODES = [
+        "batcher1", "cp1", "dawatcher1", "exec1", "ingress1",
+        "r1", "r2", "r3", "sealer1", "sq1", "sq2",
+    ]
+    if sorted(nodes) != EXPECTED_NODES:
+        err(f"group_vars/all.yml: unexpected cluster_nodes set: {sorted(nodes)}")
+    for name, ip in nodes.items():
+        must_contain(CLUSTER / "Vagrantfile", f'"{ip}"', f"static IP of {name}")
+        must_contain(
+            CLUSTER / "ansible" / "inventory.ini",
+            f"{name} ansible_host={ip}",
+            f"inventory entry for {name}",
+        )
+        must_contain(
+            CLUSTER / "ansible" / "inventory.containers.ini",
+            f"{name} ansible_host=kardamom-{name}",
+            f"container inventory entry for {name}",
+        )
+        must_contain(
+            CLUSTER / "scripts" / "ci-cluster.sh",
+            f"[{name}]={ip}",
+            f"ci-cluster.sh static IP of {name}",
+        )
+else:
+    # node-class model: scripts/ci-cluster.sh materialises nodes from
+    # `node_classes` at deploy time (names <class>-<i>, static IPs from each
+    # class's ip_start lane), so there are no hand-written per-node IP mirrors to
+    # cross-check here. Just assert the model is actually declared.
+    if "node_classes:" not in gv:
+        err("group_vars/all.yml: neither cluster_nodes nor node_classes is defined")
 
 # --- Makefile -----------------------------------------------------------------
 must_contain(CLUSTER / "Makefile", f"REGISTRY := {registry}", "registry host:port")
@@ -110,16 +119,15 @@ must_contain(
     f"{registry}/kardamom-aeron:{image_tag}",
     "aeron image ref",
 )
-# The recorder image (issue #38) is shared by the record + aggregate jobs.
-for job in ("recorder.system.nomad.hcl", "quorum.nomad.hcl"):
-    must_contain(
-        jobs / job,
-        f"{registry}/kardamom-recorder:{image_tag}",
-        "recorder image ref",
-    )
-# recorder must be in the Makefile's build/push SERVICES list, else its image
-# is never built.
-must_contain(CLUSTER / "Makefile", "recorder", "recorder in Makefile SERVICES")
+# NOTE: the recorder + quorum jobs were removed (durability is now
+# archive-at-the-sealer via the sealer's --archive-durability sidecar). The
+# sealer job must carry that flag, else nothing publishes the durable watermark
+# ingress --ack-policy on-quorum gates on.
+must_contain(
+    jobs / "sealer.nomad.hcl",
+    "--archive-durability",
+    "sealer archive-at-the-sealer durability sidecar flag",
+)
 must_contain(jobs / "anvil.nomad.hcl", f'"{anvil_l1}"', "anvil L1 port")
 must_contain(
     jobs / "da-watcher.nomad.hcl",
@@ -130,9 +138,12 @@ must_contain(jobs / "ingress.nomad.hcl", f"static = {ingress_rpc}", "ingress RPC
 must_contain(jobs / "executor.nomad.hcl", f'"{chain_id}"', "L2 chain id")
 
 # --- config templates -----------------------------------------------------------
-# The sealer overrides tx_ordering from its own channel_b_uri, so it MUST be
-# byte-identical to channels.toml.tpl's tx_ordering_channel (else the sealer
-# publishes to a different group than the sequencers/recorders subscribe).
+# tx_ordering now uses MDC: each publisher binds its own control endpoint, and
+# subscribers attach to every endpoint in tx_ordering_mdc_publishers. The
+# contract: the sealer's channel_b_mdc_control MUST be one of those endpoints
+# (else the sealer publishes to a control endpoint no subscriber attaches to,
+# silently dropping every boundary), and channel_b_boundary_stream_id MUST equal
+# channels tx_ordering_stream_id (the boundary stream all subscribers read).
 import re as _re
 
 
@@ -148,30 +159,54 @@ def _extract(path, pattern, label):
     return m.group(1).strip()
 
 
-sealer_b = _extract(
+sealer_mdc = _extract(
     CLUSTER / "config" / "sealer.toml.tpl",
-    r'^channel_b_uri\s*=\s*"([^"]+)"',
-    "sealer channel_b_uri",
+    r'^channel_b_mdc_control\s*=\s*"([^"]+)"',
+    "sealer channel_b_mdc_control",
 )
-channels_ordering = _extract(
-    CLUSTER / "config" / "channels.toml.tpl",
-    r'^tx_ordering_channel\s*=\s*"([^"]+)"',
-    "channels tx_ordering_channel",
-)
-if sealer_b is not None and channels_ordering is not None and sealer_b != channels_ordering:
+channels_text = (CLUSTER / "config" / "channels.toml.tpl").read_text()
+mdc_publishers = _re.findall(r'"(\d+\.\d+\.\d+\.\d+:\d+)"', channels_text)
+if sealer_mdc is not None and sealer_mdc not in mdc_publishers:
     err(
-        "sealer channel_b_uri != channels tx_ordering_channel "
-        f"({sealer_b!r} vs {channels_ordering!r}) — the sealer would publish "
-        "tx_ordering to a different channel than subscribers/recorders use"
+        f"sealer channel_b_mdc_control {sealer_mdc!r} is not in "
+        f"tx_ordering_mdc_publishers {mdc_publishers!r} — the sealer would "
+        "publish to a control endpoint no subscriber attaches to"
     )
-# channels.toml.tpl is consumed via --log-config by every pipeline service +
-# the recorder/quorum jobs; spot-check the flag is actually wired.
+
+sealer_bnd = _extract(
+    CLUSTER / "config" / "sealer.toml.tpl",
+    r"^channel_b_boundary_stream_id\s*=\s*(\d+)",
+    "sealer channel_b_boundary_stream_id",
+)
+channels_ordering_sid = _extract(
+    CLUSTER / "config" / "channels.toml.tpl",
+    r"^tx_ordering_stream_id\s*=\s*(\d+)",
+    "channels tx_ordering_stream_id",
+)
+if (
+    sealer_bnd is not None
+    and channels_ordering_sid is not None
+    and sealer_bnd != channels_ordering_sid
+):
+    err(
+        "sealer channel_b_boundary_stream_id != channels tx_ordering_stream_id "
+        f"({sealer_bnd!r} vs {channels_ordering_sid!r}) — publishers and "
+        "subscribers would disagree on the boundary stream"
+    )
+# channels.toml.tpl is consumed via --log-config by every pipeline service;
+# spot-check the flag is actually wired.
 for job in ("ingress", "sequencer", "executor", "sealer", "da-watcher"):
     must_contain(
         jobs / f"{job}.nomad.hcl",
         "--log-config",
         "channels config passed via --log-config (issue #36)",
     )
+# The sequencer publisher control endpoint is injected from Nomad node meta.
+must_contain(
+    jobs / "sequencer.nomad.hcl",
+    "--tx-ordering-mdc-control",
+    "sequencer tx_ordering MDC control endpoint flag",
+)
 must_contain(
     CLUSTER / "config" / "genesis" / "dev.toml",
     f"chain_id = {chain_id}",

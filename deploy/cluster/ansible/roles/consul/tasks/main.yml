@@ -29,7 +29,7 @@
 
 - name: Download and install the Consul binary
   ansible.builtin.unarchive:
-    src: "https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_amd64.zip"
+    src: "https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_{{ common_hashicorp_arch }}.zip"
     dest: /usr/local/bin
     remote_src: true
     owner: root

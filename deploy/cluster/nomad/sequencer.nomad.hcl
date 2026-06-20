@@ -1,6 +1,6 @@
 # kardamom-sequencer — partitions and orders L2 txs. Runs as a Nomad *system*
-# job constrained to worker nodes (${meta.role} == worker), so exactly one
-# instance lands on each of w1 (sequencer_id 0) and w2 (sequencer_id 1).
+# job constrained to worker nodes (${meta.role} == sequencer), so exactly one
+# instance lands on each of sq1 (sequencer_id 0) and sq2 (sequencer_id 1).
 #
 # Invocation (from crates/e2e/tests/multiprocess_e2e.rs + the cluster contract):
 #   kardamom-sequencer --config <sequencer.toml> --aeron-dir <dir>
@@ -18,15 +18,23 @@
 
 job "sequencer" {
   datacenters = ["dc1"]
-  type        = "system"
+  type        = "service"
 
-  # Land on every worker node.
+  # One sequencer per dedicated sequencer node.
   constraint {
     attribute = "${meta.role}"
-    value     = "worker"
+    value     = "sequencer"
   }
 
   group "sequencer" {
+    # partition_count (group_vars/all.yml). distinct_hosts → one sequencer per
+    # distinct sequencer node; partition-index = ${NOMAD_ALLOC_INDEX} (0,1).
+    count = 2
+    constraint {
+      operator = "distinct_hosts"
+      value    = "true"
+    }
+
     network {
       mode = "host"
     }
@@ -35,7 +43,11 @@ job "sequencer" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-sequencer:dev"
+        image        = "192.168.56.10:5000/kardamom-sequencer:dev"
+        # Always pull the freshly-built image: the mutable :dev tag would otherwise
+        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy).
+        force_pull    = true
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
@@ -45,8 +57,12 @@ job "sequencer" {
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--partition-count", "2",
-          "--partition-index", "${meta.sequencer_id}",
-          "--sequencer-id", "${meta.sequencer_id}",
+          "--partition-index", "${NOMAD_ALLOC_INDEX}",
+          "--sequencer-id", "${NOMAD_ALLOC_INDEX}",
+          # This node's tx_ordering MDC publisher control endpoint. Uniform port
+          # 40110 on this node's IP; uniqueness comes from node_ip. Must match an
+          # entry in tx_ordering_mdc_publishers in channels.toml.tpl.
+          "--tx-ordering-mdc-control", "${meta.node_ip}:40110",
         ]
       }
 

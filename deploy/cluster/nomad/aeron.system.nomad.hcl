@@ -3,7 +3,7 @@
 # AND workers): the media driver must be local to every service that shares the
 # tmpfs aeron.dir.
 #
-# Image: 192.168.56.11:5000/kardamom-aeron:dev (built from
+# Image: 192.168.56.10:5000/kardamom-aeron:dev (built from
 # crates/log/docker/aeron/Dockerfile). Its entrypoint starts
 # io.aeron.archive.ArchivingMediaDriver with AERON_DIR=/aeron-mount/dir and the
 # archive under /aeron-mount/archive (see the image's ENV).
@@ -30,6 +30,16 @@ job "aeron" {
   datacenters = ["dc1"]
   type        = "system"
 
+  # Keep the media driver OFF the control-plane node: cp1 runs only the
+  # consul/nomad servers + registry + anvil (no kardamom pipeline service shares
+  # its aeron.dir), so a driver there is wasted JVM memory. Every other node
+  # (recorders, sequencers, workers) runs a service that needs a local driver.
+  constraint {
+    attribute = "${meta.tier}"
+    operator  = "!="
+    value     = "control"
+  }
+
   group "aeron" {
     network {
       mode = "host"
@@ -41,31 +51,45 @@ job "aeron" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-aeron:dev"
+        image        = "192.168.56.10:5000/kardamom-aeron:dev"
         network_mode = "host"
-        # host tmpfs aeron.dir -> container /aeron-mount (matches image AERON_DIR
-        # = /aeron-mount/dir), and persistent archive dir.
+        # CRITICAL: the media driver and every service container must see
+        # aeron.dir at the SAME ABSOLUTE PATH. Aeron records absolute paths in
+        # its CnC metadata (e.g. publications/<id>.logbuffer), so a client that
+        # mounts the same host dir at a DIFFERENT path can't map the buffers
+        # ("Failed to open file: /aeron-mount/dir/publications/24.logbuffer").
+        # The services bind /opt/kardamom/aeron-mount -> /opt/kardamom/aeron-mount
+        # and use --aeron-dir /opt/kardamom/aeron-mount/dir, so the driver must
+        # use that exact path too (NOT the image's /aeron-mount default).
         volumes = [
-          "/opt/kardamom/aeron-mount:/aeron-mount",
-          "/opt/kardamom/archive:/aeron-mount/archive",
+          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+          "/opt/kardamom/archive:/opt/kardamom/archive",
         ]
       }
 
-      # Mirror the image defaults explicitly so the contract is visible here.
+      # Override the image's /aeron-mount defaults so the path matches the
+      # services (see the volumes note above).
       env {
-        AERON_DIR                   = "/aeron-mount/dir"
-        AERON_ARCHIVE_MOUNT         = "/aeron-mount/archive"
-        AERON_ARCHIVE_DIR           = "/aeron-mount/archive/dir"
+        AERON_DIR                   = "/opt/kardamom/aeron-mount/dir"
+        AERON_ARCHIVE_MOUNT         = "/opt/kardamom/archive"
+        AERON_ARCHIVE_DIR           = "/opt/kardamom/archive/dir"
         AERON_ARCHIVE_CLASS         = "io.aeron.archive.ArchivingMediaDriver"
         AERON_TERM_BUFFER_LENGTH    = "4194304"
         AERON_IPC_TERM_BUFFER_LENGTH = "4194304"
+        # Cap the ArchivingMediaDriver JVM heap so the task fits its trimmed
+        # memory reservation below. The driver's hot data (4 MB term buffers) is
+        # off-heap in the tmpfs aeron.dir, so a small heap is plenty; _JAVA_OPTIONS
+        # is honoured by the JVM regardless of the image entrypoint.
+        _JAVA_OPTIONS = "-Xmx160m"
       }
 
-      # Sized for the small test-tuned term buffers (4 MB); the per-node VM
-      # memory budget in the Vagrantfile assumes these reservations.
+      # Trimmed from 768 MB: one media driver runs on every non-control node
+      # (the sequencer + worker tiers), so the per-driver footprint is the
+      # dominant cluster-wide memory cost. 384 MB holds the 160 MB heap + the
+      # driver's off-heap buffers/metaspace/threads.
       resources {
-        cpu    = 500
-        memory = 768
+        cpu    = 400
+        memory = 384
       }
     }
   }

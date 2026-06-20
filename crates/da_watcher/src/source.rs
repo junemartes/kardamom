@@ -72,7 +72,7 @@ pub trait L1Source: Send + Sync + 'static {
     ) -> Result<Vec<DepositLog>, L1SourceError>;
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub mod fakes {
     use std::collections::VecDeque;
     use std::sync::Mutex;

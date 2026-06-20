@@ -240,7 +240,9 @@ fn actor_receipts_match_naive_reference() {
         bpos(pairs.len() as i32),
         TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
             block_number: 1,
-            end_tx_idx: bpos((pairs.len() - 1) as i32),
+            // end_tx_idx = cumulative COUNT of canonical records (= number of
+            // txs applied), encoded via bpos (== BPosition::from_index here).
+            end_tx_idx: bpos(pairs.len() as i32),
             l2_timestamp: 1_700_000_000,
         }),
     ))

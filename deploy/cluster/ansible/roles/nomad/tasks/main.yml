@@ -29,7 +29,7 @@
 
 - name: Download and install the Nomad binary
   ansible.builtin.unarchive:
-    src: "https://releases.hashicorp.com/nomad/{{ nomad_version }}/nomad_{{ nomad_version }}_linux_amd64.zip"
+    src: "https://releases.hashicorp.com/nomad/{{ nomad_version }}/nomad_{{ nomad_version }}_linux_{{ common_hashicorp_arch }}.zip"
     dest: /usr/local/bin
     remote_src: true
     owner: root

@@ -1,7 +1,7 @@
 //! In-memory tx_receipts index used by the ingress proxy.
 //!
-//! Two views over the same receipts, populated by a single background task
-//! that consumes the tx_receipts broadcast (executor → ingress):
+//! Two views over the same receipts, populated by the proxy's tx_receipts
+//! watcher (executor → ingress) via [`ReceiptCache::insert`]:
 //!
 //! - `(Address, u64) → Receipt` for retry-dedup in `submit_raw`.
 //! - `B256 → Receipt` for answering `eth_getTransactionReceipt(tx_hash)`
@@ -15,11 +15,8 @@ use std::sync::Arc;
 
 use alloy_primitives::{Address, B256};
 use dashmap::DashMap;
-use tokio::sync::broadcast;
 
 use kardamom_types::Receipt;
-
-use crate::channels::IngressSubscription;
 
 /// Bounded FIFO eviction. Duplicates outside the window will re-submit and
 /// the sequencer dedupes via the past-nonce path; misses on
@@ -39,26 +36,6 @@ impl ReceiptCache {
             by_tx_hash: Arc::new(DashMap::new()),
             capacity,
         }
-    }
-
-    /// Spawn a background task that consumes the tx_receipts broadcast and
-    /// populates both indexes. Returns once spawned.
-    pub fn spawn_consumer<S: IngressSubscription>(self: &Arc<Self>, sub: &S) {
-        let mut rx: broadcast::Receiver<Receipt> = sub.subscribe_receipts();
-        let me = self.clone();
-        tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(r) => me.insert(r),
-                    Err(broadcast::error::RecvError::Closed) => break,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Best-effort cache: we dropped some entries; keep
-                        // consuming.
-                        continue;
-                    }
-                }
-            }
-        });
     }
 
     /// Insert one receipt into both indexes. Eviction is arbitrary (DashMap
@@ -104,7 +81,6 @@ impl ReceiptCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::MockChannels;
     use kardamom_types::BPosition;
 
     fn make_receipt(sender: Address, nonce: u64, tx_hash: B256, idx: i32) -> Receipt {
@@ -133,19 +109,5 @@ mod tests {
         // Same entry also indexed by tx_hash.
         assert_eq!(c.lookup_by_tx_hash(h).unwrap().tx_hash, h);
         assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x22)).is_none());
-    }
-
-    #[tokio::test]
-    async fn consumer_populates_from_broadcast() {
-        let (mock, _rx) = MockChannels::new(1);
-        let cache = Arc::new(ReceiptCache::new(64));
-        cache.spawn_consumer(&mock);
-        let s = Address::repeat_byte(0x44);
-        let h = B256::repeat_byte(0x77);
-        let _ = mock.receipt_bus.send(make_receipt(s, 9, h, 9));
-        // Allow the spawned task time to consume.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        assert_eq!(cache.lookup(s, 9).unwrap().tx_idx.term_offset, 9);
-        assert_eq!(cache.lookup_by_tx_hash(h).unwrap().tx_idx.term_offset, 9);
     }
 }

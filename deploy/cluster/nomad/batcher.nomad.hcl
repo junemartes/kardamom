@@ -38,8 +38,8 @@ job "batcher" {
 
   # Pin to recorder r1, which holds the Aeron Archive segment files.
   constraint {
-    attribute = "${meta.kardamom_node}"
-    value     = "r1"
+    attribute = "${meta.role}"
+    value     = "aux"
   }
 
   group "batcher" {
@@ -53,7 +53,11 @@ job "batcher" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.11:5000/kardamom-batcher:dev"
+        image        = "192.168.56.10:5000/kardamom-batcher:dev"
+        # Always pull the freshly-built image: the mutable :dev tag would otherwise
+        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy).
+        force_pull    = true
         network_mode = "host"
         # Archive segments (read-only); the batcher only reads them.
         volumes = [

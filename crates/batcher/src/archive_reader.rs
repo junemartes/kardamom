@@ -88,13 +88,6 @@ where
     pub fn segment_path(archive_dir: &Path, recording_id: i64, segment_base: i64) -> PathBuf {
         archive_dir.join(format!("{recording_id}-{segment_base}.rec"))
     }
-
-    /// Drain the reader into a `Vec<TypedRecord<T>>`. Convenience for
-    /// pre-loading an entire (tx_data) segment into the per-A position
-    /// index used by [`crate::multi_archive_reader::MultiArchiveReader`].
-    pub fn collect_all(self) -> Result<Vec<TypedRecord<T>>, BatcherError> {
-        self.collect::<Result<Vec<_>, _>>()
-    }
 }
 
 impl<T> Iterator for TypedSegmentReader<T>

@@ -176,3 +176,90 @@ async fn proxy_parks_until_watermark_advances() {
     );
     h.abort();
 }
+
+/// MDS fan-in dedup: with N executor replicas replaying the same canonical
+/// order, ingress receives the SAME receipt N times. The submit must resolve
+/// exactly once (first-wins by tx hash), with no panic and no double-ack, and
+/// the receipt cache must hold a single entry for the tx_hash. Drives the full
+/// proxy receipt watcher path (which is what the live ingress uses).
+#[tokio::test(flavor = "multi_thread")]
+async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
+    let cfg = IngressConfig {
+        partition_count_m: 2,
+        // OnOffer: release as soon as the (deduped) receipt arrives, so the
+        // test exercises the receipt path without a watermark dependency.
+        ack_policy: kardamom_types::AckPolicy::OnOffer,
+        pending_receipt_timeout: Duration::from_secs(5),
+        ..IngressConfig::default()
+    };
+    let (mock, mut partition_rx) = MockChannels::new(2);
+    let state_db = Arc::new(InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+
+    // Three "executor replicas" all emit the IDENTICAL receipt for the same tx
+    // (same tx_hash / sender / nonce / position) — exactly what N MDS sources
+    // deliver onto the aggregated subscription.
+    const REPLICAS: usize = 3;
+    let receipt_bus = mock.receipt_bus.clone();
+    let rx0 = partition_rx.remove(0);
+    let _rx1 = partition_rx.remove(0);
+    let pos = BPosition {
+        term_id: 0,
+        term_offset: 1,
+    };
+    let h = tokio::spawn(async move {
+        let mut rx0 = rx0;
+        if let Some(envelope) = rx0.recv().await {
+            let nonce = nonce_of(&envelope.raw_tx);
+            let receipt = Receipt {
+                tx_idx: pos,
+                tx_hash: envelope.tx_hash,
+                status: true,
+                gas_used: 21_000,
+                logs: Vec::new(),
+                write_set_hash: B256::ZERO,
+                from: envelope.sender,
+                nonce,
+                ..Default::default()
+            };
+            // Fan-in: the same receipt arrives once per replica.
+            for _ in 0..REPLICAS {
+                let _ = receipt_bus.send(receipt.clone());
+            }
+        }
+    });
+
+    let signer = loop {
+        let s = PrivateKeySigner::random();
+        if partition_for(s.address(), 2) == 0 {
+            break s;
+        }
+    };
+    let raw = common::sign_legacy(&signer, 0);
+    // Resolves exactly once despite REPLICAS identical receipts; no panic.
+    let resp = proxy
+        .submit_raw("127.0.0.1".parse().unwrap(), raw)
+        .await
+        .expect("submit must resolve once under duplicate receipts");
+    assert!(resp.receipt.status);
+    assert_eq!(resp.receipt.from, signer.address());
+
+    // Give the watcher time to (attempt to) process all replica copies; the
+    // dedup must keep the cache at a single entry for this tx.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        proxy.lookup_receipt_by_hash(resp.receipt.tx_hash),
+        Some(resp.receipt.clone()),
+        "receipt indexed by tx_hash"
+    );
+    // A second submit of the same tx is served from cache (idempotent), proving
+    // the duplicate copies didn't corrupt or double-resolve the pending state.
+    let raw_again = common::sign_legacy(&signer, 0);
+    let resp2 = proxy
+        .submit_raw("127.0.0.1".parse().unwrap(), raw_again)
+        .await
+        .expect("cached resubmit");
+    assert_eq!(resp2.receipt.tx_hash, resp.receipt.tx_hash);
+
+    h.abort();
+}

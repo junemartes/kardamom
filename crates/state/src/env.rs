@@ -60,11 +60,6 @@ impl StateEnvBuilder {
         self
     }
 
-    pub fn max_readers(mut self, n: u64) -> Self {
-        self.max_readers = n;
-        self
-    }
-
     pub fn open(self) -> Result<StateEnv, StateError> {
         std::fs::create_dir_all(&self.path)?;
 

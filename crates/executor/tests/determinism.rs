@@ -107,11 +107,15 @@ fn populate(
             a_pos += 200;
             nonce += 1;
         }
+        // end_tx_idx is the cumulative COUNT of canonical records through this
+        // block (alignment key). bpos_off has advanced once per TxRef, so it IS
+        // that count; encode it via bpos() (== BPosition::from_index for these
+        // small term-0 values).
         b_tx.send((
             bpos(bpos_off),
             TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                 block_number: blk,
-                end_tx_idx: bpos(bpos_off - 1),
+                end_tx_idx: bpos(bpos_off),
                 l2_timestamp: 1_700_000_000 + blk,
             }),
         ))

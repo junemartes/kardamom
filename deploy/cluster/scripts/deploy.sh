@@ -11,7 +11,7 @@
 #
 # Usage (robust to being run from anywhere; resolves paths relative to itself):
 #   deploy/cluster/scripts/deploy.sh
-#   NOMAD_ADDR=http://192.168.56.11:4646 deploy/cluster/scripts/deploy.sh
+#   NOMAD_ADDR=http://192.168.56.10:4646 deploy/cluster/scripts/deploy.sh
 #   LOCKBOX_ADDRESS=0x... deploy/cluster/scripts/deploy.sh   # for da-watcher
 set -euo pipefail
 
@@ -24,7 +24,7 @@ NOMAD_DIR="${CLUSTER_DIR}/nomad"
 # paths resolve against the CLI's working directory, so run from CLUSTER_DIR.
 cd "${CLUSTER_DIR}"
 
-export NOMAD_ADDR="${NOMAD_ADDR:-http://192.168.56.11:4646}"
+export NOMAD_ADDR="${NOMAD_ADDR:-http://192.168.56.10:4646}"
 LOCKBOX_ADDRESS="${LOCKBOX_ADDRESS:-}"
 
 echo "==> Nomad endpoint: ${NOMAD_ADDR}"
@@ -41,7 +41,16 @@ run_job() {
   local file="$1"
   shift
   echo "==> nomad run ${file} $*"
-  nomad job run "$@" "${NOMAD_DIR}/${file}"
+  # `nomad job run` exits 2 on "failed to place all allocations". That is
+  # EXPECTED for a system job that constrains itself off some nodes — e.g. aeron
+  # (tier != control) is correctly filtered from the control node, which Nomad
+  # reports as one unplaceable alloc. The job IS registered; wait_running() below
+  # verifies the real placement, so tolerate exit 2 and only fail on other errors.
+  local rc=0
+  nomad job run "$@" "${NOMAD_DIR}/${file}" || rc=$?
+  if [[ "${rc}" -ne 0 && "${rc}" -ne 2 ]]; then
+    return "${rc}"
+  fi
 }
 
 # Poll until a job has at least one running allocation and none pending (or
@@ -83,27 +92,25 @@ echo "### Phase 1: Aeron substrate"
 run_job "aeron.system.nomad.hcl"
 wait_running "aeron" 180
 
-# --- 2. Recorder quorum (system job on recorders + the aggregator) ----------
-# The recorders start recording the tx_ordering channel and publish their
-# fsync watermarks; the quorum job aggregates them. Brought up before the
-# service pipeline so the quorum watermark is flowing by the time ingress
-# (on-quorum) needs it (issue #38).
-echo
-echo "### Phase 2: recorder quorum"
-run_job "recorder.system.nomad.hcl"
-wait_running "recorder" 180
-run_job "quorum.nomad.hcl"
-wait_running "quorum" 120
+# --- (REMOVED) recorder quorum ----------------------------------------------
+# The custom recorders + Q-of-N quorum aggregator were removed in favour of
+# archive-at-the-sealer durability: the sealer (Phase 3, launched first)
+# records its own tx_ordering MDC publication and publishes the durable
+# watermark ingress --ack-policy on-quorum gates on. No separate recorder /
+# quorum jobs to bring up.
 
-# --- 3. In-cluster L1 (anvil on r1) -----------------------------------------
+# --- 2. In-cluster L1 (anvil on r1) -----------------------------------------
 echo
-echo "### Phase 3: anvil L1"
+echo "### Phase 2: anvil L1"
 run_job "anvil.nomad.hcl"
 wait_running "anvil" 120
 
-# --- 4. Service pipeline ----------------------------------------------------
+# --- 3. Service pipeline ----------------------------------------------------
+# The sealer is launched FIRST: besides ordering, it owns the durability
+# sidecar, so its durable watermark must be flowing before ingress (on-quorum)
+# needs it.
 echo
-echo "### Phase 4: service pipeline"
+echo "### Phase 3: service pipeline"
 
 # da-watcher needs the chain-specific Lockbox address. If not supplied, fall
 # back to the job's PLACEHOLDER default (won't work against a real chain).
@@ -117,8 +124,15 @@ fi
 
 run_job "sealer.nomad.hcl"
 run_job "sequencer.nomad.hcl"
-run_job "executor.nomad.hcl"
+# Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
+# SUBSCRIBER and the executor is the must-deliver PUBLISHER; starting the
+# subscriber first means the executor's receipt publications connect immediately
+# instead of stalling against a not-yet-present subscriber during bring-up (which
+# would back-pressure the exec→commit channel and freeze state). The ingress also
+# subscribes the quorum watermark (from the already-running aggregator) here.
 run_job "ingress.nomad.hcl"
+wait_running "ingress" 120
+run_job "executor.nomad.hcl"
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
@@ -126,12 +140,11 @@ run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 wait_running "sealer" 120
 wait_running "sequencer" 120
 wait_running "executor" 120
-wait_running "ingress" 120
 wait_running "da-watcher" 120
 
-# --- 5. Batcher periodic job (offline/dry-run) ------------------------------
+# --- 4. Batcher periodic job (offline/dry-run) ------------------------------
 echo
-echo "### Phase 5: batcher (periodic, dry-run)"
+echo "### Phase 4: batcher (periodic, dry-run)"
 run_job "batcher.nomad.hcl"
 echo "    batcher registered as a periodic job (next run on its cron schedule)."
 

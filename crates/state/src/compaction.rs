@@ -61,16 +61,3 @@ pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
     info!("compaction complete");
     Ok(())
 }
-
-/// Atomic swap: rename live → live.old, dest → live. Caller must have closed
-/// all `StateEnv` clones before calling — otherwise readers will hold file
-/// handles into the renamed directory and observe stale data.
-pub fn swap_compacted(live: &Path, dest: &Path) -> Result<(), StateError> {
-    let backup = live.with_extension("old");
-    if backup.exists() {
-        std::fs::remove_dir_all(&backup)?;
-    }
-    std::fs::rename(live, &backup)?;
-    std::fs::rename(dest, live)?;
-    Ok(())
-}

@@ -92,9 +92,6 @@ pub struct Outputs {
     /// Per-method histograms merged across all tasks. Use for global
     /// p50/p90/p99.
     pub histograms: BTreeMap<String, Histogram<u64>>,
-    /// One per-method histogram map per sender task. Use for per-task
-    /// variance.
-    pub per_task: Vec<BTreeMap<String, Histogram<u64>>>,
     /// Wall-clock from the start of `dispatch` to the moment the last
     /// sender task returned (cancelled or vec-exhausted).
     pub measurement_duration: Duration,
@@ -252,7 +249,6 @@ impl<W: BenchWorkflow> Benchmark<W> {
         Ok(Outputs {
             counters,
             histograms: merged,
-            per_task,
             measurement_duration,
         })
     }

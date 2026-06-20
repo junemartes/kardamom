@@ -115,19 +115,6 @@ pub fn encode_block_key(block_number: u64) -> [u8; 8] {
     block_number.to_be_bytes()
 }
 
-pub fn decode_block_key(bytes: &[u8]) -> Result<u64, StateError> {
-    if bytes.len() != 8 {
-        return Err(StateError::BadEncoding {
-            table: TABLE_HEADERS,
-            expected: 8,
-            got: bytes.len(),
-        });
-    }
-    let mut arr = [0u8; 8];
-    arr.copy_from_slice(bytes);
-    Ok(u64::from_be_bytes(arr))
-}
-
 pub fn encode_header_value(v: &HeaderValue) -> [u8; 20] {
     let mut out = [0u8; 20];
     out[..4].copy_from_slice(&v.end_tx_idx.term_id.to_be_bytes());
@@ -135,29 +122,6 @@ pub fn encode_header_value(v: &HeaderValue) -> [u8; 20] {
     out[8..16].copy_from_slice(&v.l2_timestamp.to_be_bytes());
     // bytes 16..20 reserved (zero-filled) for forward-compat
     out
-}
-
-pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
-    if bytes.len() < 16 {
-        return Err(StateError::BadEncoding {
-            table: TABLE_HEADERS,
-            expected: 16,
-            got: bytes.len(),
-        });
-    }
-    let mut t_id = [0u8; 4];
-    t_id.copy_from_slice(&bytes[..4]);
-    let mut t_off = [0u8; 4];
-    t_off.copy_from_slice(&bytes[4..8]);
-    let mut ts = [0u8; 8];
-    ts.copy_from_slice(&bytes[8..16]);
-    Ok(HeaderValue {
-        end_tx_idx: BPosition {
-            term_id: i32::from_be_bytes(t_id),
-            term_offset: i32::from_be_bytes(t_off),
-        },
-        l2_timestamp: u64::from_be_bytes(ts),
-    })
 }
 
 // ---------- receipts ----------
@@ -260,27 +224,6 @@ mod tests {
         let c = encode_block_key(256);
         assert!(a < b);
         assert!(b < c);
-    }
-
-    #[test]
-    fn block_key_roundtrip() {
-        for n in [0u64, 1, 250, u64::MAX] {
-            assert_eq!(decode_block_key(&encode_block_key(n)).unwrap(), n);
-        }
-    }
-
-    #[test]
-    fn header_value_roundtrip_no_state_root() {
-        //: headers carry NO state_root_commitment.
-        let v = HeaderValue {
-            end_tx_idx: BPosition {
-                term_id: 3,
-                term_offset: 4096,
-            },
-            l2_timestamp: 1_700_000_000,
-        };
-        let bytes = encode_header_value(&v);
-        assert_eq!(decode_header_value(&bytes).unwrap(), v);
     }
 
     #[test]
