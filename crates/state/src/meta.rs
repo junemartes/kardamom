@@ -19,6 +19,11 @@ pub const KEY_LAST_COMMITTED_BLOCK: &[u8] = b"last_committed_block";
 pub const KEY_LAST_COMMITTED_END_TX_POSITION: &[u8] = b"last_committed_end_tx_position";
 pub const KEY_LAST_FSYNCED_B_POSITION: &[u8] = b"last_fsynced_b_position";
 pub const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
+/// Presence-only flag written once when genesis allocations are seeded into a
+/// fresh env (see `crate::genesis::seed_genesis`). Makes genesis seeding
+/// idempotent across restarts independently of the block cursor (genesis is
+/// "block 0", so `last_committed_block` stays 0 until the first real block).
+pub const KEY_GENESIS_APPLIED: &[u8] = b"genesis_applied";
 
 pub const SCHEMA_VERSION: u32 = 1;
 

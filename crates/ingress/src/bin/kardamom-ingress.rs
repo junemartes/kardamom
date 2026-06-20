@@ -9,6 +9,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -21,7 +22,8 @@ use kardamom_log::aeron_live::{
     AeronRuntime, FsyncWatermarkSubscriberHandle, QuorumSubscriberHandle, TxDataPublisherHandle,
     TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
 };
-use kardamom_log::config::LogConfig;
+use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
+use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
 use kardamom_types::{
     BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
@@ -67,6 +69,12 @@ struct Args {
     /// Number of tx_data shards (M). Defaults to 8.
     #[arg(long, default_value_t = 8)]
     shards: u32,
+    /// Record each per-shard tx_data publication to the Aeron Archive so the
+    /// executor can replay full transaction envelopes on crash recovery
+    /// (`kardamom_log::replay`). Off by default (single-host IPC has no
+    /// archive); the cluster sets this where the ArchivingMediaDriver runs.
+    #[arg(long, env = "KARDAMOM_ARCHIVE_DURABILITY", default_value_t = false)]
+    archive_durability: bool,
     /// Durability gate before acking a submit. Mirrors `AckPolicy`:
     ///   - `on-offer`: release as soon as the receipt arrives (lowest
     ///     latency, weakest guarantee).
@@ -147,12 +155,29 @@ async fn main() -> Result<()> {
         "kardamom-ingress starting"
     );
 
-    let channels = LogConfig::resolve(args.log_config.as_deref())
-        .context("resolve log config")?
-        .channels;
+    let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let channels = resolved.channels;
+    let aeron_cfg = resolved.aeron;
     let rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
+    };
+
+    // Archive recorders for tx_data (one per shard), co-located with the
+    // publishers here. They make the full transaction envelopes durable so the
+    // executor can replay them on crash recovery; without them only the
+    // canonical order survives a restart, not the bytes to re-execute.
+    let recorder_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder_handles = if args.archive_durability {
+        spawn_tx_data_recorders(
+            args.aeron_dir.clone(),
+            channels.clone(),
+            aeron_cfg.clone(),
+            args.shards as u8,
+            recorder_stop.clone(),
+        )
+    } else {
+        Vec::new()
     };
 
     // tx_receipts MDS membership: prefer the CLI/env `--executor-count`, else
@@ -176,7 +201,76 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-ingress: shutdown signal received");
     handle.jsonrpc_handle.stop().ok();
     handle.jsonrpc_handle.stopped().await;
+    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    for h in recorder_handles {
+        let _ = h.join();
+    }
     drop(rt);
+    Ok(())
+}
+
+/// Spawn one archive recorder thread per tx_data shard. Each connects its own
+/// (thread-confined) archive session, starts recording its shard's tx_data
+/// publication, and holds the recording alive until `stop` is set. The
+/// recording itself runs in the ArchivingMediaDriver; the thread only keeps the
+/// session connected and re-adopts an existing recording on restart.
+fn spawn_tx_data_recorders(
+    aeron_dir: Option<PathBuf>,
+    channels: ChannelsConfig,
+    aeron_cfg: AeronConfig,
+    shards: u8,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<std::thread::JoinHandle<()>> {
+    (0..shards)
+        .map(|sid| {
+            let aeron_dir = aeron_dir.clone();
+            let channels = channels.clone();
+            let aeron_cfg = aeron_cfg.clone();
+            let stop = stop.clone();
+            std::thread::Builder::new()
+                .name(format!("ingress-tx-data-recorder-{sid}"))
+                .spawn(move || {
+                    if let Err(e) =
+                        run_tx_data_recorder(aeron_dir.as_deref(), &channels, &aeron_cfg, sid, stop)
+                    {
+                        tracing::error!(shard = sid, error = %e, "tx_data recorder exited with error");
+                    }
+                })
+                .expect("spawn tx_data recorder thread")
+        })
+        .collect()
+}
+
+fn run_tx_data_recorder(
+    aeron_dir: Option<&std::path::Path>,
+    channels: &ChannelsConfig,
+    aeron_cfg: &AeronConfig,
+    sid: u8,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let session = connect_archive(aeron_dir, aeron_cfg).context("connect archive")?;
+    let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
+    let recorder = match Recorder::start_stream(
+        session.archive,
+        &channels.tx_data_channel(sid),
+        channels.tx_data_stream_id(sid),
+        RecorderKind::TxData { sequencer_id: sid },
+        &mut should_stop,
+    )
+    .context("start tx_data recording")?
+    {
+        Some(r) => r,
+        None => return Ok(()), // stopped before the recording materialised
+    };
+    tracing::info!(
+        shard = sid,
+        recording_id = recorder.recording_id(),
+        "ingress: recording tx_data shard"
+    );
+    // Hold the recording (and its archive session) alive until shutdown.
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }
 

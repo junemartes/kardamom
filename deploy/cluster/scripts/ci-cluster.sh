@@ -418,6 +418,14 @@ if [[ -x "${LOAD_BIN}" ]]; then
   fi
 
   if [[ "${RUN_CHAOS:-1}" == "1" ]]; then
+    # The chaos suite kills an executor (graceful + hard) under steady load and
+    # asserts it auto-restarts AND every accepted tx still receipts. On the
+    # same-node restart the executor reopens its persistent /opt/kardamom/state
+    # and runs Phase-2 crash recovery (replays tx_ordering + tx_data +
+    # tx_deposits from the archive, skip-counts past its durable cursor) — so a
+    # broken recovery surfaces here as a missed receipt or a crash-loop that
+    # never restores the executor count. (Needs the executor's archive replay
+    # endpoints + ingress/da-watcher --archive-durability, wired in the jobs.)
     log "chaos suite (kills components under steady load; asserts auto-recovery)"
     CHAOS_TPS="${CHAOS_TPS:-50}" CHAOS_CASE_S="${CHAOS_CASE_S:-45}" \
       CHAOS_CASES="${CHAOS_CASES:-graceful-executor hard-executor sealer-graceful}" \

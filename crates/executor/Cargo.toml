@@ -9,6 +9,8 @@ edition.workspace = true
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 kardamom-obs = { path = "../obs" }
+# libmdbx-backed production state backend (StateWriter + snapshot-swap channel).
+kardamom-state = { path = "../state" }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
