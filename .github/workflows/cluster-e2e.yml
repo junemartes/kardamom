@@ -78,7 +78,7 @@ jobs:
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
-            -p kardamom-recorder --bins
+            --bins
 
       - name: Install Nomad CLI
         run: |
