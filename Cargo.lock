@@ -3674,14 +3674,11 @@ dependencies = [
 name = "kardamom-batcher"
 version = "0.1.0"
 dependencies = [
- "alloy-consensus",
  "alloy-contract",
  "alloy-eips 2.0.5",
- "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
- "alloy-rpc-types-eth",
  "alloy-sol-types",
  "anyhow",
  "bytes",
@@ -3695,7 +3692,6 @@ dependencies = [
  "proptest",
  "reqwest 0.13.4",
  "rkyv",
- "rusteron-archive",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",

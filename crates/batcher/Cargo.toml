@@ -25,17 +25,13 @@ kardamom-deployer = { path = "../deployer" }
 
 alloy-primitives.workspace = true
 alloy-eips.workspace = true
-alloy-consensus.workspace = true
-alloy-network.workspace = true
 alloy-provider.workspace = true
-alloy-rpc-types-eth.workspace = true
-alloy-sol-types.workspace = true
 alloy-contract.workspace = true
+alloy-sol-types.workspace = true
 
 bytes.workspace = true
 rkyv.workspace = true
 zstd = "0.13"
-rusteron-archive.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -44,7 +40,6 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 kardamom-obs = { path = "../obs" }
 
-tokio.workspace = true
 clap.workspace = true
 
 [dev-dependencies]

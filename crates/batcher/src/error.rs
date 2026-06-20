@@ -8,8 +8,6 @@ pub enum BatcherError {
     Io(#[from] std::io::Error),
     #[error("codec: {0}")]
     Codec(String),
-    #[error("aeron: {0}")]
-    Aeron(String),
     #[error("compress: {0}")]
     Compress(String),
     #[error("frame: {0}")]
