@@ -136,7 +136,7 @@ impl FakeSubscription {
 }
 
 /// High-level fake publication that consumers can use in place of
-/// `TxOrderingPublisher` / `TxReceiptsPublisher`.
+/// the real Aeron-backed publishers (e.g. `TxOrderingPublisher`).
 pub struct FakePublication {
     pub_handle: FakeConcurrentPublication,
 }

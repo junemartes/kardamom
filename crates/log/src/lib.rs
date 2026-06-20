@@ -34,7 +34,6 @@ pub mod publisher;
 pub mod recorder;
 pub mod subscriber;
 pub mod supervisor;
-pub mod tx_ordering_archive;
 pub mod watermark;
 
 #[cfg(any(test, feature = "testing"))]

@@ -14,7 +14,4 @@ pub enum LogError {
 
     #[error("config: {0}")]
     Config(String),
-
-    #[error("quorum stalled: only {present} of {required} recorders reporting")]
-    QuorumStalled { present: usize, required: usize },
 }
