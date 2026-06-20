@@ -195,3 +195,33 @@ sequencers + the sealer) over UDP multicast — this is the property the
 container `cluster-e2e` job exercises. The single-host IPC defaults (no
 `--log-config`) remain the known-good path. Also exercise the
 UDP-over-host-networking tuning (MTU, `SO_RCVBUF`, archive fsync on VM disk).
+
+## Sustained-load + chaos suite
+
+The `cluster-e2e` workflow runs the full suite on every trigger, **sharded
+across runners** (each shard brings up its own cluster):
+
+| Shard | Exercises |
+|-------|-----------|
+| `load` | 5-min sustained soak (`kardamom-load` ramp→soak; must-deliver + drop accounting + keep-pace) |
+| `chaos-executor` | graceful + hard kill + **node-failure** (Nomad reschedule) |
+| `chaos-ingress` | graceful + hard kill (singleton restart) |
+| `chaos-sequencer` | graceful + hard kill (partition restart) |
+| `chaos-sealer` | graceful restart (SPOF recovery) |
+
+`kardamom-load` is the harness (`crates/bench`, `bin/load.rs`); `chaos.sh`
+injects the failures under steady load and asserts Nomad auto-recovery + that
+the pipeline keeps producing blocks.
+
+### Known resilience gaps
+
+- **Hard sealer crash → executors freeze** ([#58]). After a `docker kill`
+  (SIGKILL) of the singleton sealer under load, the sealer process restarts and
+  resumes sealing, but the executors do **not** re-attach to its restarted
+  canonical `tx_ordering` MDC publication — they freeze and the pipeline stops
+  processing. A **graceful** sealer restart (SIGTERM) recovers cleanly. The
+  sealer is a singleton SPOF (HA is future work), so the `sealer-hard` chaos
+  case is **excluded from the always-on suite** and tracked in [#58]; reproduce
+  it on demand with `CHAOS_CASES=sealer-hard deploy/cluster/scripts/chaos.sh`.
+
+[#58]: https://github.com/junemartes/kardamom/issues/58

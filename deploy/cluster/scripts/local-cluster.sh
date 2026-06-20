@@ -57,6 +57,8 @@ build_binaries() {
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
         --bins
+      # The sustained-load + chaos harness ci-cluster.sh runs from target/release.
+      cargo build --release -p kardamom-bench --bin kardamom-load
       # Stage exactly where ci-cluster.sh looks: the binaries in target/release,
       # and libaeron*.so under a build/*/out/build/lib path it greps for.
       # (kardamom-recorder removed — durability is archive-at-the-sealer.)
@@ -64,6 +66,7 @@ build_binaries() {
       for b in ingress sequencer executor sealer da-watcher batcher; do
         cp -f "/ltarget/release/kardamom-$b" /work/target/release/
       done
+      cp -f /ltarget/release/kardamom-load /work/target/release/
       find /ltarget/release/build -path "*/out/build/lib/libaeron*.so" \
         -exec cp -f {} /work/target/release/build/aeronstage/out/build/lib/ \;
       echo "staged: $(ls /work/target/release/build/aeronstage/out/build/lib/ | tr "\n" " ")"
@@ -105,7 +108,13 @@ run_cluster() {
   # Desktop's HTTP proxy (which can't reach the VM-internal registry IP and would
   # otherwise hang the push): the image is loaded engine-to-engine into cp1's inner
   # docker and pushed from there, co-located with the registry. No-op on CI.
-  docker exec -e KEEP="${KEEP:-0}" -e REGISTRY_PUSH_NODE=control-0 kardamom-orch \
+  # Forward the load/chaos tuning knobs (each `-e VAR` passes the current value
+  # if set, else is a no-op) so a dev can dial the local run down/up.
+  docker exec -e KEEP="${KEEP:-0}" -e REGISTRY_PUSH_NODE=control-0 \
+    -e LOAD_DURATION_S -e LOAD_TARGET_TPS -e LOAD_SENDERS -e LOAD_MAX_GAP \
+    -e CHAOS_TPS -e CHAOS_CASE_S -e CHAOS_CASES \
+    -e CHAOS_RESTART_SLO_S -e CHAOS_RESCHEDULE_SLO_S \
+    kardamom-orch \
     bash -lc 'cd /work && deploy/cluster/scripts/ci-cluster.sh'
 }
 
