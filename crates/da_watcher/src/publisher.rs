@@ -28,7 +28,7 @@ pub trait DepositPublisher: Send + Sync + 'static {
     fn publish(&self, deposit: &Deposit) -> Result<BPosition, PublishError>;
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(test)]
 pub mod fakes {
     use std::sync::{Arc, Mutex};
 
