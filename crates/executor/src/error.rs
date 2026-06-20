@@ -36,9 +36,6 @@ pub enum ExecutorError {
     #[error("tx_receipts publication closed")]
     TxReceiptsClosed,
 
-    #[error("state-writer signal channel closed")]
-    StateWriterClosed,
-
     /// The tx_ordering reader pulled a [`kardamom_types::TxRef`] but the
     /// referenced envelope never appeared on its tx_data within the
     /// configured join timeout. Either the tx_data publisher fell over,

@@ -49,7 +49,7 @@ pub use actor::{
     Executor, ExecutorConfig, StateWriterQueue, StateWriterSignal, TxReceiptsPublication,
 };
 pub use block_env::ExecEnv;
-pub use delta::{PendingDelta, WriteSet, apply_write_set};
+pub use delta::{PendingDelta, WriteSet};
 pub use error::ExecutorError;
 pub use reader::{
     DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,

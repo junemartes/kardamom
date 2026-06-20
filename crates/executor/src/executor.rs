@@ -503,11 +503,6 @@ fn wire_log(log: &Log) -> WireLog {
     }
 }
 
-// Fix write_set's code-bytes copy: WriteSet stores `bytes::Bytes`; revm's
-// Bytecode exposes `original_bytes()` returning `alloy_primitives::Bytes`.
-// `AlloyBytes` derefs to `[u8]`, so `Bytes::copy_from_slice(..)` does the
-// conversion in one allocation.
-
 #[cfg(test)]
 mod tests {
     use super::*;
