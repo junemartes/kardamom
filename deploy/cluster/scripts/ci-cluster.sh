@@ -393,7 +393,11 @@ log "smoke test (gate: single-tx must pass before load smoke runs)"
 # (SMOKE_DURATION_S / SMOKE_TPS / SMOKE_SENDERS / ...); defaults 60s @ 5 tx/s.
 # Scrapes executor/sealer block metrics via `docker exec kardamom-<node> curl`.
 log "load smoke (sustained stream; must-deliver + keep-pace)"
-./scripts/smoke-load.sh
+# Reserve Anvil account #0 for the single-tx smoke (the gate above + the churn
+# re-smoke below both use scripts/smoke.sh @ account #0, nonces 0 then 1). The
+# load smoke therefore starts its sender set at account #1 (offset 1) so its
+# nonces never collide with account #0's.
+SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
 
 # --- 7. Subscriber-churn resilience: kill one executor alloc, re-smoke -------
 # The old Q-of-N recorder-redundancy test is GONE: durability is now a single
@@ -408,10 +412,10 @@ docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:
   alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
   [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
 sleep 5
-# Re-smoke after the churn. account #0 nonce 0 was used by the first smoke; the
-# load smoke uses its own senders. TODO(nonce): coordinate nonces across the
-# basic/load/churn smokes once load-smoke's sender set is finalized; for now the
-# churn re-smoke uses nonce 1 (the ingress can't fill it; see smoke.sh).
+# Re-smoke after the churn. Nonce coordination across the three smokes: the gate
+# smoke used account #0 nonce 0; the load smoke runs with SMOKE_SENDER_OFFSET=1
+# so it never touches account #0; therefore account #0 nonce 1 is free and the
+# churn re-smoke uses it (the ingress can't fill the nonce; see smoke.sh).
 NONCE=1 ./scripts/smoke.sh
 
 log "cluster-e2e PASSED"

@@ -56,6 +56,10 @@
 #   SMOKE_TPS          target tx/sec             (default 5)
 #   SMOKE_TX_COUNT     fixed tx count; if set it OVERRIDES duration*tps
 #   SMOKE_SENDERS      number of sender accounts (default 4, max 16)
+#   SMOKE_SENDER_OFFSET  index of the first sender account in the 16-key table
+#                        (default 0). Set to 1 to reserve account #0 for the
+#                        single-tx smoke (scripts/smoke.sh) so their nonces do
+#                        not collide when both run against the same chain.
 #   SMOKE_NONCE_START  first nonce per sender    (default 0 — fresh chain)
 #   SMOKE_RECEIPT_TIMEOUT_S  per-run receipt drain timeout (default 90)
 #   SMOKE_MAX_GAP      max allowed executor-behind-sealer block gap (default 5)
@@ -103,6 +107,7 @@ SMOKE_DURATION_S="${SMOKE_DURATION_S:-60}"
 SMOKE_TPS="${SMOKE_TPS:-5}"
 SMOKE_TX_COUNT="${SMOKE_TX_COUNT:-}"
 SMOKE_SENDERS="${SMOKE_SENDERS:-4}"
+SMOKE_SENDER_OFFSET="${SMOKE_SENDER_OFFSET:-0}"
 SMOKE_NONCE_START="${SMOKE_NONCE_START:-0}"
 SMOKE_RECEIPT_TIMEOUT_S="${SMOKE_RECEIPT_TIMEOUT_S:-90}"
 SMOKE_MAX_GAP="${SMOKE_MAX_GAP:-5}"
@@ -139,9 +144,15 @@ SENDER_KEYS=(
   0x8166f546bab6da521a8369cab06c5d2b9e46670292d85c875ee9ec20e84ffb61
 )
 
-# Clamp sender count to [1, 16].
+# Clamp the sender offset to [0, 15] and the sender count to [1, 16], keeping the
+# offset+count window inside the 16-key table so senders never wrap back onto a
+# reserved low account (e.g. account #0, reserved for scripts/smoke.sh).
+if (( SMOKE_SENDER_OFFSET < 0 )); then SMOKE_SENDER_OFFSET=0; fi
+if (( SMOKE_SENDER_OFFSET > ${#SENDER_KEYS[@]} - 1 )); then SMOKE_SENDER_OFFSET=$(( ${#SENDER_KEYS[@]} - 1 )); fi
 if (( SMOKE_SENDERS < 1 )); then SMOKE_SENDERS=1; fi
-if (( SMOKE_SENDERS > ${#SENDER_KEYS[@]} )); then SMOKE_SENDERS=${#SENDER_KEYS[@]}; fi
+if (( SMOKE_SENDERS > ${#SENDER_KEYS[@]} - SMOKE_SENDER_OFFSET )); then
+  SMOKE_SENDERS=$(( ${#SENDER_KEYS[@]} - SMOKE_SENDER_OFFSET ))
+fi
 
 # Resolve target tx count.
 if [[ -n "${SMOKE_TX_COUNT}" ]]; then
@@ -261,9 +272,11 @@ for ((s=0; s<SMOKE_SENDERS; s++)); do SENDER_NONCE[s]=$SMOKE_NONCE_START; done
 for ((i=0; i<TX_TOTAL; i++)); do
   s=$(( i % SMOKE_SENDERS ))
   nonce=${SENDER_NONCE[s]}
+  # Logical sender `s` maps to key index `SMOKE_SENDER_OFFSET + s` so the run can
+  # start above reserved accounts (per-sender nonces are tracked by `s`).
   raw="$(cast mktx "${TO}" \
         --value "${VALUE}" \
-        --private-key "${SENDER_KEYS[s]}" \
+        --private-key "${SENDER_KEYS[$(( SMOKE_SENDER_OFFSET + s ))]}" \
         --nonce "${nonce}" \
         --chain "${CHAIN_ID}" \
         --legacy \
@@ -429,7 +442,7 @@ if (( ${#LATENCY[@]} > 0 )); then
         n=NR
         p50i=int((n-1)*0.50)+1
         p99i=int((n-1)*0.99)+1
-        printf "%s %s %s", a[p50i], a[p99i], a[n]
+        printf "%s %s %s\n", a[p50i], a[p99i], a[n]
       }'
   )
 fi
