@@ -65,13 +65,13 @@ impl TxDataSubscription for FakeASubAdapter {
         self.sequencer_id
     }
 
-    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
+    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
         loop {
-            let mut out: Option<(BPosition, KtTxEnvelope)> = None;
+            let mut out: Option<(kardamom_types::TxDataLoc, KtTxEnvelope)> = None;
             self.sub.poll(
-                |pos, env| {
+                |loc, env| {
                     if out.is_none() {
-                        out = Some((pos, env));
+                        out = Some((loc, env));
                     }
                 },
                 1,
@@ -236,7 +236,7 @@ fn m4_canonical_b_order_drives_receipts() {
     }
     for (sid, pos_a, h) in &shuffled {
         b_pub
-            .publish_ref(&TxRef::new(*h, *sid, *pos_a))
+            .publish_ref(&TxRef::new(*h, *sid, *pos_a, 0))
             .expect("publish ref");
     }
     // Sealer-emitted boundary: closes block 1. end_tx_idx is the cumulative
@@ -409,6 +409,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             alloy_primitives::B256::ZERO,
             0,
             tx_data_position,
+            0,
         ))
         .expect("publish ref");
     b_pub

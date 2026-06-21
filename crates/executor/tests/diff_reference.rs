@@ -49,10 +49,13 @@ impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
-            sequencer_id: self.sequencer_id,
-        })
+    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+        self.rx
+            .recv()
+            .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
+            .map_err(|_| ExecutorError::TxDataClosed {
+                sequencer_id: self.sequencer_id,
+            })
     }
 }
 struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
@@ -232,7 +235,7 @@ fn actor_receipts_match_naive_reference() {
         a_tx.send((tx_data_position, env.clone())).unwrap();
         b_tx.send((
             bpos(i as i32),
-            TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position)),
+            TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
         ))
         .unwrap();
     }

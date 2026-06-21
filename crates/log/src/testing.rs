@@ -22,7 +22,7 @@ use rkyv::util::AlignedVec;
 use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::error::LogError;
-use kardamom_types::{BPosition, FsyncWatermark};
+use kardamom_types::{BPosition, FsyncWatermark, TxDataLoc};
 
 /// Map from `(channel, stream_id)` to shared per-stream state.
 type StreamMap = HashMap<(String, i32), Arc<Mutex<StreamState>>>;
@@ -36,8 +36,11 @@ pub struct FakeBus {
 
 #[derive(Default)]
 struct StreamState {
-    /// Append-only log of (offset, bytes). Subscribers track their read cursor.
-    log: Vec<(i64, Vec<u8>)>,
+    /// Append-only log of (offset, session_id, bytes). Subscribers track their
+    /// read cursor. `session_id` lets the tx_data fake model concurrent
+    /// (active/active) publishers with distinct sessions; non-tx_data publishers
+    /// record `0`.
+    log: Vec<(i64, i32, Vec<u8>)>,
     /// Next byte offset (mimics Aeron's stream position).
     next_offset: i64,
 }
@@ -64,9 +67,15 @@ pub struct FakeConcurrentPublication {
 
 impl FakeConcurrentPublication {
     pub fn offer(&self, bytes: &[u8]) -> i64 {
+        self.offer_with_session(bytes, 0)
+    }
+
+    /// `offer` recording an explicit publisher `session_id` on the fragment, so
+    /// the tx_data fake can model concurrent ingress publishers.
+    pub fn offer_with_session(&self, bytes: &[u8], session_id: i32) -> i64 {
         let mut g = self.state.lock().unwrap();
         let off = g.next_offset;
-        g.log.push((off, bytes.to_vec()));
+        g.log.push((off, session_id, bytes.to_vec()));
         g.next_offset += bytes.len() as i64;
         g.next_offset
     }
@@ -78,11 +87,19 @@ impl FakeConcurrentPublication {
     where
         T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
     {
+        self.publish_with_session(msg, 0)
+    }
+
+    /// [`publish`](Self::publish) recording an explicit publisher `session_id`.
+    fn publish_with_session<T>(&self, msg: &T, session_id: i32) -> Result<BPosition, LogError>
+    where
+        T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+    {
         let bytes =
             rkyv::to_bytes::<rancor::Error>(msg).map_err(|e| LogError::Codec(e.to_string()))?;
-        let off = self.offer(bytes.as_slice());
+        let off = self.offer_with_session(bytes.as_slice(), session_id);
         let frag_start = off - bytes.len() as i64;
-        let header = FakeHeader::from_offset(frag_start);
+        let header = FakeHeader::from_offset_session(frag_start, session_id);
         Ok(BPosition {
             term_id: header.term_id(),
             term_offset: header.term_offset(),
@@ -95,14 +112,19 @@ impl FakeConcurrentPublication {
 pub struct FakeHeader {
     term_id: i32,
     term_offset: i32,
+    session_id: i32,
 }
 
 impl FakeHeader {
     pub fn from_offset(off: i64) -> Self {
+        Self::from_offset_session(off, 0)
+    }
+    pub fn from_offset_session(off: i64, session_id: i32) -> Self {
         const TERM_LEN: i64 = 16 * 1024 * 1024;
         Self {
             term_id: (off / TERM_LEN) as i32,
             term_offset: (off % TERM_LEN) as i32,
+            session_id,
         }
     }
     pub fn term_id(&self) -> i32 {
@@ -110,6 +132,9 @@ impl FakeHeader {
     }
     pub fn term_offset(&self) -> i32 {
         self.term_offset
+    }
+    pub fn session_id(&self) -> i32 {
+        self.session_id
     }
 }
 
@@ -125,8 +150,8 @@ impl FakeSubscription {
         let g = self.state.lock().unwrap();
         let mut delivered = 0;
         while delivered < fragment_limit && self.cursor < g.log.len() {
-            let (off, ref bytes) = g.log[self.cursor];
-            let header = FakeHeader::from_offset(off);
+            let (off, session_id, ref bytes) = g.log[self.cursor];
+            let header = FakeHeader::from_offset_session(off, session_id);
             f(bytes.as_slice(), header);
             self.cursor += 1;
             delivered += 1;
@@ -228,6 +253,7 @@ use kardamom_types::{TxEnvelope, TxOrderingMessage, TxRef};
 /// separately.
 pub struct FakeTxDataPublication {
     sequencer_id: u8,
+    session_id: i32,
     pub_handle: FakeConcurrentPublication,
 }
 
@@ -235,10 +261,25 @@ impl FakeTxDataPublication {
     /// Open the tx_data[i] pub on `bus`, using the channel URI/stream-id
     /// convention "<channel>"/"<stream_id>". A real wiring uses
     /// `kardamom_log::config::ChannelsConfig::tx_data_channel_template` to derive
-    /// per-sequencer URIs.
+    /// per-sequencer URIs. Session id defaults to `0` (single publisher).
     pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
+        Self::open_with_session(bus, sequencer_id, 0, channel, stream_id)
+    }
+
+    /// Like [`open`](Self::open) but with an explicit publisher `session_id`, so
+    /// tests can model concurrent (active/active) ingress publishers on one
+    /// shard: distinct session ids keep the executor join key
+    /// `(shard, session, position)` unique even when their `BPosition`s collide.
+    pub fn open_with_session(
+        bus: &FakeBus,
+        sequencer_id: u8,
+        session_id: i32,
+        channel: &str,
+        stream_id: i32,
+    ) -> Self {
         Self {
             sequencer_id,
+            session_id,
             pub_handle: FakeConcurrentPublication {
                 state: bus.stream(channel, stream_id),
             },
@@ -249,11 +290,17 @@ impl FakeTxDataPublication {
         self.sequencer_id
     }
 
+    /// This publisher's Aeron `session_id` (what a real media driver assigns
+    /// per publication).
+    pub fn session_id(&self) -> i32 {
+        self.session_id
+    }
+
     /// Publish a `TxEnvelope` and return its fragment-start `BPosition` on
-    /// tx_data[i]. Sequencers pass this `BPosition` into [`TxRef::new`]
-    /// before writing to tx_ordering.
+    /// tx_data[i]. The subscriber pairs this position with `session_id` into a
+    /// `TxDataLoc`; the sequencer stamps the session into `TxRef`.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
-        self.pub_handle.publish(env)
+        self.pub_handle.publish_with_session(env, self.session_id)
     }
 }
 
@@ -276,10 +323,11 @@ impl FakeTxDataSubscription {
         }
     }
 
-    /// Poll and invoke `f` with `(BPosition, TxEnvelope)` per fragment.
-    /// `BPosition` is the fragment *start* — the same value a sequencer
-    /// emitted as `TxRef.tx_data_position`.
-    pub fn poll<F: FnMut(BPosition, TxEnvelope)>(
+    /// Poll and invoke `f` with `(TxDataLoc, TxEnvelope)` per fragment. The
+    /// `TxDataLoc` pairs the publisher `session_id` with the fragment-*start*
+    /// `BPosition` — exactly what the sequencer stamps into `TxRef`
+    /// (`tx_data_session_id` + `tx_data_position`).
+    pub fn poll<F: FnMut(TxDataLoc, TxEnvelope)>(
         &mut self,
         mut f: F,
         fragment_limit: usize,
@@ -288,10 +336,13 @@ impl FakeTxDataSubscription {
             |bytes: &[u8], header: FakeHeader| {
                 if let Ok(env) = rkyv::from_bytes::<TxEnvelope, rancor::Error>(bytes) {
                     f(
-                        BPosition {
-                            term_id: header.term_id(),
-                            term_offset: header.term_offset(),
-                        },
+                        TxDataLoc::new(
+                            header.session_id(),
+                            BPosition {
+                                term_id: header.term_id(),
+                                term_offset: header.term_offset(),
+                            },
+                        ),
                         env,
                     );
                 }

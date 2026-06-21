@@ -9,7 +9,7 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::inbound::fakes::ScriptedTxData;
@@ -71,7 +71,7 @@ fn match_publishes_ref() {
     let s = signer(1);
     let env = signed_tx_envelope(&s, 0, 7);
     let mut channel_a = ScriptedTxData::default();
-    channel_a.queue.push_back((pos(0), env));
+    channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
     let mut seq = Sequencer::new(
@@ -93,8 +93,10 @@ fn past_nonce_emits_duplicate_notification() {
     let env0 = signed_tx_envelope(&s, 0, 100);
     let env0_dup = signed_tx_envelope(&s, 0, 200);
     let mut channel_a = ScriptedTxData::default();
-    channel_a.queue.push_back((pos(0), env0));
-    channel_a.queue.push_back((pos(64), env0_dup));
+    channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env0));
+    channel_a
+        .queue
+        .push_back((TxDataLoc::new(0, pos(64)), env0_dup));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
     let mut seq = Sequencer::new(
@@ -127,8 +129,10 @@ fn future_nonce_buffered_then_drained() {
     let env1 = signed_tx_envelope(&s, 1, 101);
     let mut channel_a = ScriptedTxData::default();
     // Out of order: nonce 1 first.
-    channel_a.queue.push_back((pos(0), env1));
-    channel_a.queue.push_back((pos(64), env0));
+    channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env1));
+    channel_a
+        .queue
+        .push_back((TxDataLoc::new(0, pos(64)), env0));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
     let mut seq = Sequencer::new(
@@ -152,7 +156,7 @@ fn b_backpressure_rewinds_state_and_retry_succeeds() {
     let s = signer(4);
     let env = signed_tx_envelope(&s, 0, 100);
     let mut channel_a = ScriptedTxData::default();
-    channel_a.queue.push_back((pos(0), env));
+    channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     *b.fail_with_backpressure.lock().unwrap() = true;
     let mut rc = InMemoryTxErrorPublisher::default();
@@ -213,7 +217,7 @@ fn wrong_shard_message_skipped() {
     };
 
     let mut channel_a = ScriptedTxData::default();
-    channel_a.queue.push_back((pos(0), env));
+    channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());

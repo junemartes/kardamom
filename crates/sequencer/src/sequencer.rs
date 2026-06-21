@@ -70,6 +70,11 @@ struct RefMetadata {
     /// envelope onto tx_data. Used by downstream consumers to look up
     /// the envelope on the A archive.
     tx_data_position: BPosition,
+    /// The Aeron publisher `session_id` of that tx_data fragment. Carries
+    /// through to `TxRef.tx_data_session_id` so the executor join key
+    /// `(shard, session, position)` stays unique under concurrent (active/active)
+    /// ingress publishers.
+    tx_data_session_id: i32,
 }
 
 /// Cooperative shutdown signal shared with the loop driver. Cloneable so the
@@ -173,7 +178,12 @@ impl<DB: StateDatabase> Sequencer<DB> {
         // `cfg.sequencer_id` double as the shard id; production
         // configurations with multiple sequencer pools per shard can set
         // these independently and `sequencer_id` here MUST be the shard.
-        let txref = TxRef::new(meta.tx_hash, self.cfg.sequencer_id, meta.tx_data_position);
+        let txref = TxRef::new(
+            meta.tx_hash,
+            self.cfg.sequencer_id,
+            meta.tx_data_position,
+            meta.tx_data_session_id,
+        );
         match b.try_publish_ref(&txref) {
             Ok(()) => {
                 metrics::record_publish(self.cfg.partition_index);
@@ -230,7 +240,7 @@ impl<DB: StateDatabase> Sequencer<DB> {
             return Ok(true);
         }
 
-        let Some((tx_data_position, envelope)) = channel_a.poll()? else {
+        let Some((tx_data_loc, envelope)) = channel_a.poll()? else {
             return Ok(false);
         };
         metrics::record_ingest(self.cfg.partition_index);
@@ -266,7 +276,8 @@ impl<DB: StateDatabase> Sequencer<DB> {
         let meta = RefMetadata {
             correlation_id: envelope.correlation_id,
             tx_hash: envelope.tx_hash,
-            tx_data_position,
+            tx_data_position: tx_data_loc.position,
+            tx_data_session_id: tx_data_loc.session_id,
         };
 
         let t0 = std::time::Instant::now();

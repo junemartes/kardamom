@@ -30,6 +30,29 @@ fn cluster_channels_tpl_parses_as_logconfig() {
 }
 
 #[test]
+fn cluster_channels_tpl_receipts_are_multicast_not_mds() {
+    // Active/active ingress (2a, resilient-ingress-spec.md D2): receipts ride a
+    // shared multicast group, NOT the per-ingress unicast MDS fan-in (which
+    // pinned every executor to ONE ingress IP, so a 2nd ingress got nothing).
+    let cfg = LogConfig::from_toml_path(&cluster_channels_tpl()).expect("parse");
+    let ch = &cfg.channels;
+    assert!(
+        !ch.tx_receipts_mds_enabled(),
+        "tx_receipts MDS must be disabled for active/active ingress (multicast)"
+    );
+    assert!(
+        ch.tx_receipts_channel.contains("endpoint=239.")
+            && ch.tx_receipts_channel.contains("interface="),
+        "tx_receipts must be a NIC-pinned multicast group: {}",
+        ch.tx_receipts_channel
+    );
+    // With MDS off there are no per-replica unicast endpoints on either the
+    // receipt or the boundary side-stream.
+    assert!(ch.tx_receipts_endpoint(0).is_none());
+    assert!(ch.tx_receipts_boundary_endpoint(0).is_none());
+}
+
+#[test]
 fn cluster_channels_tpl_mdc_publishers_and_uris() {
     let cfg = LogConfig::from_toml_path(&cluster_channels_tpl()).expect("parse");
     let pubs = &cfg.channels.tx_ordering_mdc_publishers;

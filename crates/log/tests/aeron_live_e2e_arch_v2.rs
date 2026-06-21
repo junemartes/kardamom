@@ -186,6 +186,7 @@ async fn split_architecture_m_plus_one_e2e() {
                 tx_hash: alloy_primitives::B256::ZERO,
                 shard_id: *sid,
                 tx_data_position: *pos_a,
+                tx_data_session_id: 0,
             })
             .unwrap();
     }

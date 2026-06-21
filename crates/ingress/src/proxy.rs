@@ -43,6 +43,20 @@ where
     });
 }
 
+/// Pack a replica id + per-replica sequence into a globally-unique opaque
+/// `correlation_id`: top 16 bits `ingress_id`, low 48 bits `seq`. See
+/// [`IngressProxy::next_correlation_id`].
+#[inline]
+pub fn pack_correlation_id(ingress_id: u16, seq: u64) -> u64 {
+    ((ingress_id as u64) << 48) | (seq & 0x0000_FFFF_FFFF_FFFF)
+}
+
+/// Extract the originating `ingress_id` from a packed `correlation_id`.
+#[inline]
+pub fn ingress_id_of(correlation_id: u64) -> u16 {
+    (correlation_id >> 48) as u16
+}
+
 /// Handle returned by `IngressProxy::start`. Drop it to shut down listeners
 /// gracefully.
 pub struct IngressHandle {
@@ -155,6 +169,20 @@ where
     #[inline]
     pub fn latest_block_number(&self) -> u64 {
         self.latest_block_number.load(Ordering::Acquire)
+    }
+
+    /// Next globally-unique `correlation_id` for this replica.
+    ///
+    /// `correlation_id` is an opaque pass-through (stamped into `TxRef`, carried
+    /// into the batcher frame, logged) — nothing dedups or orders on it. The
+    /// per-process counter alone collides across active/active replicas, so we
+    /// namespace it: the top 16 bits are `ingress_id`, the low 48 bits a
+    /// per-replica monotonic sequence. 48 bits ≈ 2.8e14 txs before wrap, and
+    /// wrap is benign. The `(replica, sequence)` pair is globally unique.
+    #[inline]
+    pub fn next_correlation_id(&self) -> u64 {
+        let seq = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
+        pack_correlation_id(self.cfg.ingress_id, seq)
     }
 
     /// Lookup a receipt by `tx_hash` in the in-memory tx_receipts index.
@@ -314,7 +342,7 @@ where
         // carries the canonical `tx_hash` so downstream consumers can dedup
         // and re-emit it without recomputing (S0).
         let shard = partition_for(sender, self.cfg.partition_count_m) as usize;
-        let correlation_id = self.correlation_seq.fetch_add(1, Ordering::Relaxed);
+        let correlation_id = self.next_correlation_id();
         self.publication
             .publish_tx_data(
                 shard,
@@ -400,5 +428,35 @@ where
             jsonrpc_addr,
             jsonrpc_handle,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ingress_id_of, pack_correlation_id};
+
+    #[test]
+    fn correlation_id_packs_ingress_id_in_high_bits() {
+        // Low 48 bits are the sequence; top 16 bits are the replica id.
+        assert_eq!(pack_correlation_id(0, 0), 0);
+        assert_eq!(pack_correlation_id(0, 41), 41);
+        assert_eq!(pack_correlation_id(7, 0), 7u64 << 48);
+        assert_eq!(pack_correlation_id(7, 5), (7u64 << 48) | 5);
+        // Round-trips the replica id out.
+        for id in [0u16, 1, 7, 256, u16::MAX] {
+            for seq in [0u64, 1, 1_000_000, (1u64 << 48) - 1] {
+                let c = pack_correlation_id(id, seq);
+                assert_eq!(ingress_id_of(c), id, "id={id} seq={seq}");
+                assert_eq!(c & 0x0000_FFFF_FFFF_FFFF, seq, "seq preserved");
+            }
+        }
+    }
+
+    #[test]
+    fn distinct_replicas_never_collide_for_any_sequence() {
+        // Two replicas emitting the same local sequence produce distinct ids.
+        for seq in [0u64, 1, 99, 1u64 << 40] {
+            assert_ne!(pack_correlation_id(1, seq), pack_correlation_id(2, seq));
+        }
     }
 }

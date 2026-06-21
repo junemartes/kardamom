@@ -25,8 +25,8 @@ use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_types::{
-    BPosition, Deposit, DepositRef, Receipt, StateDatabase, StateError, TxEnvelope, TxError,
-    TxOrderingMessage, TxRef,
+    BPosition, Deposit, DepositRef, Receipt, StateDatabase, StateError, TxDataLoc, TxEnvelope,
+    TxError, TxOrderingMessage, TxRef,
 };
 
 #[derive(Debug, Parser)]
@@ -228,7 +228,7 @@ impl LiveTxDataSub {
 }
 
 impl TxDataSubscriber for LiveTxDataSub {
-    fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
         // try_recv is non-blocking. The Sequencer's run loop handles
         // backoff when poll returns None.
         Ok(self.handle.try_recv())

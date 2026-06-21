@@ -53,7 +53,9 @@ use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
-use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, TxEnvelope, TxOrderingMessage};
+use kardamom_types::{
+    BPosition, BlockBoundaryStart, Deposit, TxDataLoc, TxEnvelope, TxOrderingMessage,
+};
 
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
@@ -72,7 +74,7 @@ pub trait TxDataSubscription: Send {
     /// buffer and surface diagnostics.
     fn sequencer_id(&self) -> u8;
 
-    fn next(&mut self) -> Result<(BPosition, TxEnvelope), ExecutorError>;
+    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError>;
 }
 
 /// Subscription to **tx_ordering** (the canonical orderer).
@@ -98,19 +100,26 @@ pub trait DepositSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError>;
 }
 
-/// Lookup-and-remove join buffer keyed by `(sequencer_id, tx_data_position)`.
+/// Lookup-and-remove join buffer keyed by
+/// `(sequencer_id, session_id, tx_data_position)`.
 ///
 /// TxData reader threads insert via [`JoinBuffer::insert`]. The
 /// tx_ordering reader pulls via [`JoinBuffer::take`] (remove-on-hit). Bounded
 /// by the in-flight window — typically a few thousand entries (~100 MB at
 /// envelope-sized values).
 ///
+/// The `session_id` (Aeron publisher session) is part of the key because Aeron
+/// positions are per-session: under active/active ingress two publishers on one
+/// shard can emit fragments with the same `(term_id, term_offset)`, so
+/// `(sequencer_id, tx_data_position)` alone is ambiguous. The sequencer stamps
+/// the session into `TxRef.tx_data_session_id`; the lookup uses it.
+///
 /// Shared across M+1 threads via `Arc`. `DashMap` over per-shard locks
 /// since the access pattern is M concurrent inserts + one concurrent reader;
 /// we never iterate.
 #[derive(Clone, Default)]
 pub struct JoinBuffer {
-    inner: Arc<DashMap<(u8, BPosition), TxEnvelope>>,
+    inner: Arc<DashMap<(u8, i32, BPosition), TxEnvelope>>,
 }
 
 impl JoinBuffer {
@@ -118,15 +127,28 @@ impl JoinBuffer {
         Self::default()
     }
 
-    pub fn insert(&self, sequencer_id: u8, tx_data_position: BPosition, env: TxEnvelope) {
-        self.inner.insert((sequencer_id, tx_data_position), env);
+    pub fn insert(
+        &self,
+        sequencer_id: u8,
+        session_id: i32,
+        tx_data_position: BPosition,
+        env: TxEnvelope,
+    ) {
+        self.inner
+            .insert((sequencer_id, session_id, tx_data_position), env);
     }
 
-    /// Remove and return the envelope at `(sequencer_id, tx_data_position)`, or
-    /// `None` if it isn't (yet) present.
-    pub fn take(&self, sequencer_id: u8, tx_data_position: BPosition) -> Option<TxEnvelope> {
+    /// Remove and return the envelope at
+    /// `(sequencer_id, session_id, tx_data_position)`, or `None` if it isn't
+    /// (yet) present.
+    pub fn take(
+        &self,
+        sequencer_id: u8,
+        session_id: i32,
+        tx_data_position: BPosition,
+    ) -> Option<TxEnvelope> {
         self.inner
-            .remove(&(sequencer_id, tx_data_position))
+            .remove(&(sequencer_id, session_id, tx_data_position))
             .map(|kv| kv.1)
     }
 
@@ -229,9 +251,9 @@ pub enum ReaderToExec {
 }
 
 /// Spawn one tx_data reader thread for `a_sub`. Inserts every
-/// `(tx_data_position, envelope)` into `buffer` keyed by
-/// `(a_sub.sequencer_id(), tx_data_position)`. Returns when the subscription
-/// closes cleanly (`Ok(())`) or propagates the first error.
+/// `(TxDataLoc, envelope)` into `buffer` keyed by
+/// `(a_sub.sequencer_id(), loc.session_id, loc.position)`. Returns when the
+/// subscription closes cleanly (`Ok(())`) or propagates the first error.
 pub fn spawn_tx_data_reader<A>(
     mut a_sub: A,
     buffer: JoinBuffer,
@@ -245,7 +267,7 @@ where
         .spawn(move || {
             loop {
                 match a_sub.next() {
-                    Ok((tx_data_position, env)) => buffer.insert(sid, tx_data_position, env),
+                    Ok((loc, env)) => buffer.insert(sid, loc.session_id, loc.position, env),
                     Err(ExecutorError::TxDataClosed { .. }) => return Ok(()),
                     Err(e) => return Err(e),
                 }
@@ -365,6 +387,7 @@ where
                         let env = match wait_for_envelope(
                             &buffer,
                             tx_ref.shard_id,
+                            tx_ref.tx_data_session_id,
                             tx_ref.tx_data_position,
                             cfg.join_timeout,
                             cfg.join_poll_interval,
@@ -374,6 +397,7 @@ where
                                 warn!(
                                     target: "kardamom_executor::reader",
                                     sequencer_id = tx_ref.shard_id,
+                                    session_id = tx_ref.tx_data_session_id,
                                     tx_data_position = ?tx_ref.tx_data_position,
                                     timeout_ms = cfg.join_timeout.as_millis() as u64,
                                     "join timeout: TxRef has no envelope on tx_data; aborting"
@@ -480,22 +504,23 @@ where
         .expect("spawn tx_ordering reader")
 }
 
-/// Spin-wait for `(sequencer_id, tx_data_position)` to appear in `buffer`,
-/// returning `Some(env)` on success or `None` after `timeout`.
+/// Spin-wait for `(sequencer_id, session_id, tx_data_position)` to appear in
+/// `buffer`, returning `Some(env)` on success or `None` after `timeout`.
 fn wait_for_envelope(
     buffer: &JoinBuffer,
     sequencer_id: u8,
+    session_id: i32,
     tx_data_position: BPosition,
     timeout: Duration,
     poll_interval: Duration,
 ) -> Option<TxEnvelope> {
-    if let Some(env) = buffer.take(sequencer_id, tx_data_position) {
+    if let Some(env) = buffer.take(sequencer_id, session_id, tx_data_position) {
         return Some(env);
     }
     let deadline = Instant::now() + timeout;
     loop {
         thread::sleep(poll_interval);
-        if let Some(env) = buffer.take(sequencer_id, tx_data_position) {
+        if let Some(env) = buffer.take(sequencer_id, session_id, tx_data_position) {
             return Some(env);
         }
         if Instant::now() >= deadline {
@@ -571,22 +596,28 @@ mod tests {
     }
 
     /// In-memory tx_data subscription: a `VecDeque` of pre-baked
-    /// `(BPosition, TxEnvelope)` records.
+    /// `(TxDataLoc, TxEnvelope)` records.
     struct VecTxDataSub {
         sequencer_id: u8,
-        queue: VecDeque<Result<(BPosition, TxEnvelope), ExecutorError>>,
+        queue: VecDeque<Result<(TxDataLoc, TxEnvelope), ExecutorError>>,
     }
     impl TxDataSubscription for VecTxDataSub {
         fn sequencer_id(&self) -> u8 {
             self.sequencer_id
         }
-        fn next(&mut self) -> Result<(BPosition, TxEnvelope), ExecutorError> {
+        fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
             self.queue
                 .pop_front()
                 .unwrap_or(Err(ExecutorError::TxDataClosed {
                     sequencer_id: self.sequencer_id,
                 }))
         }
+    }
+
+    /// Build a `TxDataLoc` with session `0` (the single-publisher default used
+    /// by tests that don't model concurrent ingress).
+    fn loc(off: i32) -> TxDataLoc {
+        TxDataLoc::new(0, pos(off))
     }
 
     struct VecTxOrderingSub {
@@ -607,15 +638,15 @@ mod tests {
         let a = VecTxDataSub {
             sequencer_id: 3,
             queue: VecDeque::from(vec![
-                Ok((pos(0), envelope(&signer, 0))),
-                Ok((pos(100), envelope(&signer, 1))),
+                Ok((loc(0), envelope(&signer, 0))),
+                Ok((loc(100), envelope(&signer, 1))),
             ]),
         };
         let h = spawn_tx_data_reader(a, buf.clone());
         h.join().expect("no panic").expect("ok");
         assert_eq!(buf.len(), 2);
-        assert!(buf.take(3, pos(0)).is_some());
-        assert!(buf.take(3, pos(100)).is_some());
+        assert!(buf.take(3, 0, pos(0)).is_some());
+        assert!(buf.take(3, 0, pos(100)).is_some());
         assert_eq!(buf.len(), 0);
     }
 
@@ -623,8 +654,8 @@ mod tests {
     fn channel_b_reader_emits_tx_and_boundary_in_canonical_order() {
         let signer = PrivateKeySigner::random();
         let buf = JoinBuffer::new();
-        buf.insert(0, pos(0), envelope(&signer, 0));
-        buf.insert(1, pos(50), envelope(&signer, 1));
+        buf.insert(0, 0, pos(0), envelope(&signer, 0));
+        buf.insert(1, 0, pos(50), envelope(&signer, 1));
 
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![
@@ -634,6 +665,7 @@ mod tests {
                         alloy_primitives::B256::repeat_byte(0xA1),
                         0,
                         pos(0),
+                        0,
                     )),
                 )),
                 Ok((
@@ -642,6 +674,7 @@ mod tests {
                         alloy_primitives::B256::repeat_byte(0xA2),
                         1,
                         pos(50),
+                        0,
                     )),
                 )),
                 Ok((
@@ -717,13 +750,13 @@ mod tests {
         let env_clone = env.clone();
         let a_inserter = thread::spawn(move || {
             thread::sleep(Duration::from_millis(20));
-            buf_for_a.insert(2, pos(0), env_clone);
+            buf_for_a.insert(2, 0, pos(0), env_clone);
         });
 
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![Ok((
                 pos(0),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 2, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 2, pos(0), 0)),
             ))]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(2);
@@ -755,7 +788,7 @@ mod tests {
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![Ok((
                 pos(0),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 7, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 7, pos(0), 0)),
             ))]),
         };
         let (tx, _rx) = bounded::<ReaderToExec>(2);
@@ -777,9 +810,9 @@ mod tests {
         let signer = PrivateKeySigner::random();
         let buf = JoinBuffer::new();
         let env = envelope(&signer, 0);
-        buf.insert(2, pos(0), env.clone());
+        buf.insert(2, 0, pos(0), env.clone());
 
-        let dup = TxOrderingMessage::TxRef(TxRef::new(env.tx_hash, 2, pos(0)));
+        let dup = TxOrderingMessage::TxRef(TxRef::new(env.tx_hash, 2, pos(0), 0));
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![
                 Ok((pos(0), dup.clone())),
@@ -825,5 +858,111 @@ mod tests {
         assert!(w.first_seen(id(1)), "evicted id is fresh again");
         assert_eq!(w.seen.len(), 2);
         assert_eq!(w.fifo.len(), 2);
+    }
+
+    /// I-A core proof: under active/active ingress, two publishers on one shard
+    /// have independent Aeron term spaces, so they can emit fragments at the
+    /// SAME `(term_id, term_offset)`. The join key carries `session_id`, so each
+    /// `TxRef` still resolves to its own envelope — no overwrite, no cross-wire.
+    /// Pre-1a (key was `(shard, position)`) the second insert would clobber the
+    /// first and the executor would join the wrong bytes.
+    #[test]
+    fn join_buffer_distinguishes_colliding_positions() {
+        let signer = PrivateKeySigner::random();
+        let buf = JoinBuffer::new();
+        let env_a = envelope(&signer, 0);
+        let env_b = envelope(&signer, 1);
+        // Same shard, same BPosition, different publisher sessions.
+        let p = pos(0);
+        buf.insert(3, 100, p, env_a.clone());
+        buf.insert(3, 200, p, env_b.clone());
+        assert_eq!(buf.len(), 2, "distinct sessions must not collide");
+
+        // Each session's take returns its own envelope.
+        let got_a = buf.take(3, 100, p).expect("session 100 present");
+        let got_b = buf.take(3, 200, p).expect("session 200 present");
+        assert_eq!(got_a.tx_hash, env_a.tx_hash);
+        assert_eq!(got_b.tx_hash, env_b.tx_hash);
+        assert_eq!(buf.len(), 0);
+
+        // A wrong-session lookup misses (it would have silently returned the
+        // wrong envelope under the old `(shard, position)` key).
+        buf.insert(3, 100, p, env_a.clone());
+        assert!(buf.take(3, 999, p).is_none(), "wrong session must miss");
+        assert!(buf.take(3, 100, p).is_some());
+    }
+
+    /// I-A integration through the real reader threads: two tx_data fragments on
+    /// one shard at the SAME `BPosition` but different publisher sessions (the
+    /// active/active collision). Two `TxRef`s — each carrying its publisher's
+    /// session — must each join the correct envelope, in canonical order.
+    #[test]
+    fn reader_joins_two_sessions_at_same_position() {
+        let signer = PrivateKeySigner::random();
+        let env_a = envelope(&signer, 0);
+        let env_b = envelope(&signer, 1);
+        let buf = JoinBuffer::new();
+
+        // One tx_data reader for shard 5, fed two colliding-position fragments
+        // from two distinct sessions (what two active/active ingresses produce).
+        let a = VecTxDataSub {
+            sequencer_id: 5,
+            queue: VecDeque::from(vec![
+                Ok((TxDataLoc::new(100, pos(0)), env_a.clone())),
+                Ok((TxDataLoc::new(200, pos(0)), env_b.clone())),
+            ]),
+        };
+        spawn_tx_data_reader(a, buf.clone())
+            .join()
+            .expect("no panic")
+            .expect("ok");
+        assert_eq!(buf.len(), 2, "distinct sessions must both be buffered");
+
+        // Canonical order interleaves them: env_b's ref first, then env_a's.
+        // Each ref carries its session, so the join keys on session not position.
+        let b = VecTxOrderingSub {
+            queue: VecDeque::from(vec![
+                Ok((
+                    pos(0),
+                    TxOrderingMessage::TxRef(TxRef::new(env_b.tx_hash, 5, pos(0), 200)),
+                )),
+                Ok((
+                    pos(16),
+                    TxOrderingMessage::TxRef(TxRef::new(env_a.tx_hash, 5, pos(0), 100)),
+                )),
+            ]),
+        };
+        let (tx, rx) = bounded::<ReaderToExec>(4);
+        spawn_tx_ordering_reader(
+            b,
+            buf,
+            DepositJoinBuffer::new(),
+            ReaderConfig::default(),
+            tx,
+        )
+        .join()
+        .expect("no panic")
+        .expect("ok");
+
+        let mut out = Vec::new();
+        while let Ok(m) = rx.recv() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            ReaderToExec::Tx { envelope: e, .. } => {
+                assert_eq!(e.tx_hash, env_b.tx_hash, "first ref → session 200 envelope")
+            }
+            _ => panic!("expected Tx"),
+        }
+        match &out[1] {
+            ReaderToExec::Tx { envelope: e, .. } => {
+                assert_eq!(
+                    e.tx_hash, env_a.tx_hash,
+                    "second ref → session 100 envelope"
+                )
+            }
+            _ => panic!("expected Tx"),
+        }
     }
 }

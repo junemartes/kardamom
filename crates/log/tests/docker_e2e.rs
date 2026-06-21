@@ -97,6 +97,7 @@ async fn aeron_publish_record_subscribe_e2e() {
                     term_id: 0,
                     term_offset: (i as i32) * 64,
                 },
+                tx_data_session_id: 0,
             })
             .unwrap();
     }

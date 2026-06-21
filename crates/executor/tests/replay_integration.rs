@@ -41,10 +41,13 @@ impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(BPosition, KtTxEnvelope), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
-            sequencer_id: self.sequencer_id,
-        })
+    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+        self.rx
+            .recv()
+            .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
+            .map_err(|_| ExecutorError::TxDataClosed {
+                sequencer_id: self.sequencer_id,
+            })
     }
 }
 
@@ -138,7 +141,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             // canonical id (Receipt.tx_idx).
             b_tx.send((
                 bpos(bpos_off),
-                TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position)),
+                TxOrderingMessage::TxRef(TxRef::new(tx_hash, 0, tx_data_position, 0)),
             ))
             .unwrap();
             nonce += 1;

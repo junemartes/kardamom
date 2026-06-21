@@ -66,7 +66,7 @@ use crate::error::LogError;
 use crate::offer_retry::{OFFER_TIMEOUT, offer_code_str};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
-    Receipt, TxEnvelope, TxError, TxOrderingMessage,
+    Receipt, TxDataLoc, TxEnvelope, TxError, TxOrderingMessage,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -74,10 +74,13 @@ type Pub = rusteron_client::AeronPublication;
 type Sub = rusteron_client::AeronSubscription;
 type Header = rusteron_client::AeronHeader;
 
-/// Closure that decodes one Aeron fragment + position and forwards the
-/// decoded value (or its raw bytes) somewhere Send-friendly. Boxed so
-/// different message types can share the subscription registration path.
-pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition) + Send>;
+/// Closure that decodes one Aeron fragment + position + publisher `session_id`
+/// and forwards the decoded value (or its raw bytes) somewhere Send-friendly.
+/// Boxed so different message types can share the subscription registration
+/// path. Most consumers ignore `session_id`; the tx_data subscription uses it to
+/// build a [`kardamom_types::TxDataLoc`] so concurrent ingress publishers on one
+/// shard stay disambiguated.
+pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition, i32) + Send>;
 
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
@@ -375,18 +378,19 @@ impl AeronRuntime {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
         for uri in uris {
             let msg_tx = msg_tx.clone();
-            let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
-                match codec::materialize::<T>(bytes) {
-                    Ok(v) => {
-                        if msg_tx.send((pos, v)).is_err() {
-                            // Subscriber dropped its receiver.
+            let deliver: DeliverFn =
+                Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+                    match codec::materialize::<T>(bytes) {
+                        Ok(v) => {
+                            if msg_tx.send((pos, v)).is_err() {
+                                // Subscriber dropped its receiver.
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "decode failed on subscription delivery");
                         }
                     }
-                    Err(e) => {
-                        error!(error = %e, "decode failed on subscription delivery");
-                    }
-                }
-            });
+                });
             self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         }
         Ok(msg_rx)
@@ -409,19 +413,44 @@ impl AeronRuntime {
             >,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: DeliverFn =
-            Box::new(
-                move |bytes: &[u8], pos: BPosition| match codec::materialize::<T>(bytes) {
-                    Ok(v) => {
-                        let _ = msg_tx.send((pos, v));
-                    }
-                    Err(e) => {
-                        error!(error = %e, "decode failed on subscription delivery");
-                    }
-                },
-            );
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+            match codec::materialize::<T>(bytes) {
+                Ok(v) => {
+                    let _ = msg_tx.send((pos, v));
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on subscription delivery");
+                }
+            }
+        });
         let sub_id = self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         Ok((sub_id, msg_rx))
+    }
+
+    /// Open a **tx_data** subscription yielding `(TxDataLoc, TxEnvelope)`,
+    /// pairing each envelope with its Aeron publisher `session_id`. The session
+    /// id disambiguates concurrent (active/active) ingress publishers on one
+    /// shard: it is what the sequencer stamps into `TxRef.tx_data_session_id`
+    /// and the executor keys its join buffer on. With a single publisher every
+    /// fragment carries the same session id, so behavior is unchanged.
+    pub fn open_tx_data_subscription(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<UnboundedReceiver<(TxDataLoc, TxEnvelope)>, LogError> {
+        let (msg_tx, msg_rx) = unbounded_channel::<(TxDataLoc, TxEnvelope)>();
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, session: i32| {
+            match codec::materialize::<TxEnvelope>(bytes) {
+                Ok(v) => {
+                    let _ = msg_tx.send((TxDataLoc::new(session, pos), v));
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on tx_data subscription delivery");
+                }
+            }
+        });
+        self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        Ok(msg_rx)
     }
 }
 
@@ -480,8 +509,8 @@ fn run_aeron_thread(
         for entry in subs.iter_mut() {
             let _ = entry.sub.poll_once(
                 |bytes: &[u8], header: Header| {
-                    if let Some(pos) = header_pos(&header) {
-                        (entry.deliver)(bytes, pos);
+                    if let Some((pos, session)) = header_loc(&header) {
+                        (entry.deliver)(bytes, pos, session);
                     }
                 },
                 64,
@@ -748,13 +777,20 @@ fn decode_position(p: i64) -> BPosition {
     }
 }
 
-fn header_pos(h: &Header) -> Option<BPosition> {
+/// Read the fragment-start [`BPosition`] and the Aeron publisher `session_id`
+/// from a SINGLE `get_values()` FFI call — the hottest per-fragment path. They
+/// must come from the same header read: returning them together guarantees the
+/// session belongs to the position's fragment and avoids a divergent
+/// second-read error path (where a transient failure could mint a spurious
+/// session 0 that collides with a genuine session-0 publisher's join key).
+fn header_loc(h: &Header) -> Option<(BPosition, i32)> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
-    Some(BPosition {
+    let pos = BPosition {
         term_id: frame.term_id(),
         term_offset: frame.term_offset(),
-    })
+    };
+    Some((pos, frame.session_id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -842,9 +878,12 @@ impl TxDataPublisherHandle {
     }
 }
 
-/// Per-shard TxData subscriber. Yields `(BPosition, TxEnvelope)`.
+/// Per-shard TxData subscriber. Yields `(TxDataLoc, TxEnvelope)` — the envelope
+/// paired with its publisher `session_id` + `BPosition`, so the sequencer can
+/// stamp `TxRef.tx_data_session_id` and the executor can key its join buffer on
+/// `(shard, session, position)` under concurrent ingress publishers.
 pub struct TxDataSubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, TxEnvelope)>,
+    rx: UnboundedReceiver<(TxDataLoc, TxEnvelope)>,
 }
 
 impl TxDataSubscriberHandle {
@@ -854,18 +893,18 @@ impl TxDataSubscriberHandle {
         sequencer_id: u8,
     ) -> Result<Self, LogError> {
         Ok(Self {
-            rx: rt.open_subscription::<TxEnvelope>(
+            rx: rt.open_tx_data_subscription(
                 &ch.tx_data_channel(sequencer_id),
                 ch.tx_data_stream_id(sequencer_id),
             )?,
         })
     }
 
-    pub async fn recv(&mut self) -> Option<(BPosition, TxEnvelope)> {
+    pub async fn recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         self.rx.recv().await
     }
 
-    pub fn try_recv(&mut self) -> Option<(BPosition, TxEnvelope)> {
+    pub fn try_recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         self.rx.try_recv().ok()
     }
 }

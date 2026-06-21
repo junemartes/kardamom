@@ -154,8 +154,8 @@ async fn proof_of_pipeline_round_trip() {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
         while seen < n && std::time::Instant::now() < deadline {
             match tokio::time::timeout(Duration::from_millis(50), tx_data_sub.recv()).await {
-                Ok(Some((pos, env))) => {
-                    let receipt = synthetic_receipt(&env, pos);
+                Ok(Some((loc, env))) => {
+                    let receipt = synthetic_receipt(&env, loc.position);
                     let publisher = receipts_pub_for_task.clone();
                     let r = receipt.clone();
                     tokio::task::spawn_blocking(move || publisher.publish_receipt(&r))
