@@ -20,8 +20,12 @@ struct Cli {
     rpc_url: String,
 
     /// Canonical owner address (Safe or EOA). Same owner ⇒ same factory address.
-    #[arg(long, global = true, required = true)]
-    owner: Address,
+    ///
+    /// Required, but modelled as an `Option` because clap forbids a `global`
+    /// argument from also being `required`; presence is enforced after parsing
+    /// so `--owner` can be passed either before or after the subcommand.
+    #[arg(long, global = true)]
+    owner: Option<Address>,
 
     #[command(subcommand)]
     command: Command,
@@ -85,9 +89,11 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
+    let owner = resolve_owner(cli.owner)?;
+
     match cli.command {
         Command::EnsureFactory { private_key } => {
-            run_ensure_factory(cli.rpc_url, private_key, cli.owner).await
+            run_ensure_factory(cli.rpc_url, private_key, owner).await
         }
         Command::Deploy {
             private_key,
@@ -106,7 +112,7 @@ async fn main() -> Result<()> {
             run_deploy(
                 cli.rpc_url,
                 private_key,
-                cli.owner,
+                owner,
                 contract_ids,
                 l2_chain_ids,
                 l2_minters,
@@ -119,19 +125,10 @@ async fn main() -> Result<()> {
             l2_chain_ids,
         } => {
             let contract_ids = parse_ids(&ids)?;
-            run_upgrade(
-                cli.rpc_url,
-                private_key,
-                cli.owner,
-                contract_ids,
-                l2_chain_ids,
-            )
-            .await
+            run_upgrade(cli.rpc_url, private_key, owner, contract_ids, l2_chain_ids).await
         }
-        Command::Addresses { l2_chain_id } => {
-            run_addresses(cli.rpc_url, cli.owner, l2_chain_id).await
-        }
-        Command::Verify => run_verify(cli.rpc_url, cli.owner).await,
+        Command::Addresses { l2_chain_id } => run_addresses(cli.rpc_url, owner, l2_chain_id).await,
+        Command::Verify => run_verify(cli.rpc_url, owner).await,
     }
 }
 
@@ -264,6 +261,12 @@ async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
     Ok(())
 }
 
+/// `owner` is global (so it may appear before or after the subcommand), which
+/// clap won't let us also mark `required`; enforce presence here instead.
+fn resolve_owner(owner: Option<Address>) -> Result<Address> {
+    owner.context("the following required arguments were not provided: --owner <OWNER>")
+}
+
 fn parse_key(key: &str) -> Result<PrivateKeySigner> {
     let hex = if let Some(var_name) = key.strip_prefix("env:") {
         std::env::var(var_name).with_context(|| format!("env var `{var_name}` not set"))?
@@ -302,4 +305,90 @@ fn print_mismatch(m: &VerifyMismatch) {
         "MISMATCH id={} proxy={} registry_impl={} erc1967_impl={}",
         m.id, m.proxy, m.registry_impl, m.erc1967_impl
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    const OWNER: &str = "0x70997970C51812dc3A010C7d01b50e0d17dc79C8";
+    const KEY: &str = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
+    const MINTER: &str = "0x0000000000000000000000000000000000000001";
+
+    /// clap's own config linter. Catches structural mistakes like a `global`
+    /// argument that is also `required` (which clap forbids and which silently
+    /// breaks parsing in release builds where the debug-assert is compiled out).
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// deploy.sh passes `--owner` before the subcommand.
+    #[test]
+    fn owner_accepted_before_subcommand() {
+        let parsed = Cli::try_parse_from([
+            "kardamom-deploy",
+            "--owner",
+            OWNER,
+            "deploy",
+            "ETHLockbox",
+            "--private-key",
+            KEY,
+            "--l2-chain-id",
+            "412346",
+            "--l2-minter",
+            MINTER,
+        ]);
+        assert!(parsed.is_ok(), "owner before subcommand: {parsed:?}");
+    }
+
+    /// The README documents `--owner` after the subcommand.
+    #[test]
+    fn owner_accepted_after_subcommand() {
+        let parsed = Cli::try_parse_from([
+            "kardamom-deploy",
+            "deploy",
+            "ETHLockbox",
+            "--owner",
+            OWNER,
+            "--private-key",
+            KEY,
+            "--l2-chain-id",
+            "412346",
+            "--l2-minter",
+            MINTER,
+        ]);
+        assert!(parsed.is_ok(), "owner after subcommand: {parsed:?}");
+    }
+
+    /// Omitting `--owner` parses (owner is global, so clap can't require it) but
+    /// is rejected after parsing.
+    #[test]
+    fn owner_is_required() {
+        let parsed = Cli::try_parse_from([
+            "kardamom-deploy",
+            "deploy",
+            "ETHLockbox",
+            "--private-key",
+            KEY,
+            "--l2-chain-id",
+            "412346",
+            "--l2-minter",
+            MINTER,
+        ])
+        .expect("parsing without --owner should succeed");
+        assert!(parsed.owner.is_none(), "owner should be unset");
+        assert!(
+            resolve_owner(parsed.owner).is_err(),
+            "missing owner should be rejected after parsing"
+        );
+    }
+
+    /// A supplied owner resolves to that address.
+    #[test]
+    fn owner_resolves_when_supplied() {
+        let addr: Address = OWNER.parse().unwrap();
+        assert_eq!(resolve_owner(Some(addr)).unwrap(), addr);
+    }
 }
