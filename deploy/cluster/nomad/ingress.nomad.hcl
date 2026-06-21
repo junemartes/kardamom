@@ -1,4 +1,5 @@
-# kardamom-ingress — eth JSON-RPC proxy. Placed on ingress1 (192.168.56.32).
+# kardamom-ingress — eth JSON-RPC proxy. ACTIVE/ACTIVE: count=2, one per
+# ingress-role node (ingress-0@192.168.56.31, ingress-1@192.168.56.32).
 #
 # Invocation:
 #   kardamom-ingress --config <ingress.toml> --log-config <channels.toml> \
@@ -40,11 +41,20 @@ job "ingress" {
   }
 
   group "ingress" {
-    count = 1
+    # Active/active: 2 replicas, one per ingress-role node (.31, .32). Both join
+    # the tx_receipts multicast group and route to all sequencer shards; the
+    # --ingress-id below namespaces each replica's correlation_ids.
+    count = 2
+
+    constraint {
+      distinct_hosts = true
+    }
 
     # Resilience (chaos tests): restart a crashed task on the same node;
-    # reschedule the alloc onto a healthy node on node loss. Singleton on a
-    # single ingress-role node, so node-failure recovers when the node returns.
+    # reschedule on node loss. With count=2 + distinct_hosts (active/active), a
+    # lost ingress node can't reschedule onto the other ingress node — but it
+    # doesn't need to: the surviving replica serves all traffic (clients fail
+    # over), and this alloc recovers when its node returns.
     restart {
       attempts = 3
       interval = "1m"
@@ -93,6 +103,10 @@ job "ingress" {
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--shards", "2",
           "--jsonrpc-bind", "0.0.0.0:8545",
+          # Stable per-replica id (alloc index 0/1) → namespaces correlation_id
+          # so the two active/active replicas never collide. See
+          # docs/agents/resilient-ingress-spec.md D3.
+          "--ingress-id", "${NOMAD_ALLOC_INDEX}",
           "--ack-policy", "${var.ack_policy}",
           # Record each per-shard tx_data publication to the archive so a
           # restarted executor can replay full transaction envelopes (Phase 2

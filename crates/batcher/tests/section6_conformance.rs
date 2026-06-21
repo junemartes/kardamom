@@ -113,6 +113,7 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
                 alloy_primitives::B256::repeat_byte(hash_seed),
                 0,
                 *a_pos,
+                0,
             )),
         );
         b_off += 16;
@@ -124,6 +125,7 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
                 alloy_primitives::B256::repeat_byte(hash_seed),
                 1,
                 *a_pos,
+                0,
             )),
         );
         b_off += 16;

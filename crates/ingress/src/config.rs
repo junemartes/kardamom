@@ -20,6 +20,11 @@ pub struct IngressConfig {
     pub binary_uds_path: Option<PathBuf>,
     /// Number of sequencer partitions (M); routes `keccak(sender) % M`.
     pub partition_count_m: u32,
+    /// Stable identity of this ingress replica (active/active deployments run N
+    /// of them). Namespaces `correlation_id` so the `(replica, sequence)` pair
+    /// is globally unique: `correlation_id = (ingress_id << 48) | (seq & 2^48-1)`.
+    /// Logged at startup. Single-instance deployments use `0`.
+    pub ingress_id: u16,
     /// Per-IP token-bucket replenishment rate (tokens/sec).
     pub rate_limit_per_ip_per_sec: NonZeroU32,
     /// Per-IP token-bucket burst capacity.
@@ -48,6 +53,7 @@ impl Default for IngressConfig {
             binary_tcp_bind: None,
             binary_uds_path: None,
             partition_count_m: 8,
+            ingress_id: 0,
             rate_limit_per_ip_per_sec: nonzero!(10_000u32),
             rate_limit_burst: nonzero!(1_000u32),
             sig_verify_batch_depth: 64,

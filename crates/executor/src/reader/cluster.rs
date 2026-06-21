@@ -73,7 +73,7 @@ mod tests {
     use kardamom_types::TxRef;
 
     fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {
-        let r = TxRef::new(B256::repeat_byte(off as u8), shard, BPosition { term_id: 0, term_offset: off });
+        let r = TxRef::new(B256::repeat_byte(off as u8), shard, BPosition { term_id: 0, term_offset: off }, 0);
         let ingress = encode_ingress_txref(&r);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
         relayed.to_vec()

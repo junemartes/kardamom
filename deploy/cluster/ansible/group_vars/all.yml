@@ -72,7 +72,11 @@ aeron_tmpfs_size: "1g"
 # Replication semantics:
 #   control     1    singleton: consul+nomad server, registry, anvil L1
 #   sequencer   2    partition_count=2 (partition-index = alloc index)
-#   ingress     1+   scalable RPC front door            (tier: worker)
+#   ingress     2    active/active RPC front door        (tier: worker)
+#                    ingress-0@.31, ingress-1@.32; both join the tx_receipts
+#                    multicast group and route to all sequencer shards. Scale by
+#                    bumping count (no channel edits — receipts are multicast,
+#                    correlation_id is namespaced by --ingress-id).
 #   executor    3    state applier; ONE RECORDER COLLOCATED PER EXECUTOR
 #   sealer      3    3-member Aeron Cluster (Raft) sealer — ordering +
 #                    durability fold into the Raft log + archive; members at
@@ -84,7 +88,7 @@ ip_prefix: "192.168.56"
 node_classes:
   control: { count: 1, ip_start: 10, tier: control }
   sequencer: { count: 2, ip_start: 21, tier: sequencer }
-  ingress: { count: 1, ip_start: 31, tier: worker }
+  ingress: { count: 2, ip_start: 31, tier: worker } # active/active: ingress-0@.31, ingress-1@.32
   executor: { count: 3, ip_start: 41, tier: worker } # 3 exec nodes, each with a recorder
   sealer: { count: 3, ip_start: 51, tier: worker } # 3-member Aeron Cluster (Raft) sealer (.51/.52/.53)
   aux: { count: 1, ip_start: 61, tier: worker } # da_watcher + batcher

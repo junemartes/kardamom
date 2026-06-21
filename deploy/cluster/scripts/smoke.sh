@@ -19,16 +19,16 @@ PK="${PK:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 # Burn / sink address for the transfer.
 TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 VALUE="${VALUE:-1}"   # wei
-# Nonce for the signer. The ingress JSON-RPC surface deliberately does NOT
-# implement eth_getTransactionCount (it errors "deferred to S6 state writer";
-# see crates/ingress/src/json_rpc.rs), exactly like the e2e tests which sign
-# raw txs with explicit nonces. So we MUST pass the nonce ourselves — otherwise
-# `cast send` calls eth_getTransactionCount to fill it and fails. Account #0
-# starts at nonce 0; the caller bumps NONCE per send (the redundancy re-smoke
-# in ci-cluster.sh passes NONCE=1).
-NONCE="${NONCE:-0}"
+# Nonce is ALWAYS 0. Every caller submits from its OWN dedicated funded account
+# (the gate, each load/chaos case, and the churn re-smokes — see the
+# account-budget note in ci-cluster.sh), so each account's first and only tx is
+# nonce 0. The ingress JSON-RPC deliberately does NOT implement
+# eth_getTransactionCount ("deferred to S6 state writer"; crates/ingress/src/
+# json_rpc.rs), so cast can't auto-fill the nonce — but with a fresh account per
+# check we never need a non-zero one, which is why there is no NONCE knob and no
+# cross-call nonce coordination. Pick the account via PK, not the nonce.
 
-echo "==> Smoke test against ingress: ${RPC_URL} (chain-id ${CHAIN_ID}, nonce ${NONCE})"
+echo "==> Smoke test against ingress: ${RPC_URL} (chain-id ${CHAIN_ID}, nonce 0)"
 
 fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
 
@@ -58,7 +58,7 @@ if command -v cast >/dev/null 2>&1; then
       --rpc-url "${RPC_URL}" \
       --chain "${CHAIN_ID}" \
       --legacy \
-      --nonce "${NONCE}" \
+      --nonce 0 \
       --gas-price "${GAS_PRICE:-1000000000}" \
       --gas-limit 21000 \
       --json 2>"${CAST_ERR}")"

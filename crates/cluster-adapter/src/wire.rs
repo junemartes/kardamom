@@ -6,7 +6,7 @@
 //! **Ingress** (Rust sequencer → cluster), one app message per record:
 //! ```text
 //!   [kind:u8 = 0][canonical_id:32][record_type:u8][fields…]
-//!     TxRef       fields = [shard_id:u8][tx_data_position.term_id:i32][.term_offset:i32]
+//!     TxRef       fields = [shard_id:u8][tx_data_position.term_id:i32][.term_offset:i32][tx_data_session_id:i32]
 //!     DepositRef  fields = [deposit_position.term_id:i32][.term_offset:i32]
 //! ```
 //! The Java service parses ONLY `canonical_id` (at the fixed offset) for dedup
@@ -56,13 +56,15 @@ pub enum WireError {
 
 /// Encode a `TxRef` as an ingress app message.
 pub fn encode_ingress_txref(r: &TxRef) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 1 + 1 + 8);
+    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 1 + 1 + 8 + 4);
     b.push(KIND_INGRESS_RECORD);
     b.extend_from_slice(r.tx_hash.as_slice()); // canonical_id (32)
     b.push(RT_TXREF);
     b.push(r.shard_id);
     b.extend_from_slice(&r.tx_data_position.term_id.to_le_bytes());
     b.extend_from_slice(&r.tx_data_position.term_offset.to_le_bytes());
+    // tx_data publisher session (active/active ingress join discriminator).
+    b.extend_from_slice(&r.tx_data_session_id.to_le_bytes());
     b
 }
 
@@ -139,10 +141,12 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
             let shard_id = *fields.first().ok_or(WireError::TooShort { at: 0, need: 1, have: 0 })?;
             let term_id = rd_i32(fields, 1)?;
             let term_offset = rd_i32(fields, 5)?;
+            let tx_data_session_id = rd_i32(fields, 9)?;
             Ok(TxOrderingMessage::TxRef(TxRef::new(
                 id,
                 shard_id,
                 BPosition { term_id, term_offset },
+                tx_data_session_id,
             )))
         }
         RT_DEPOSITREF => {
@@ -235,6 +239,7 @@ mod tests {
             B256::repeat_byte(0xAB),
             3,
             BPosition { term_id: 7, term_offset: 9_999 },
+            5, // tx_data_session_id (exercises the active/active session field roundtrip)
         )
     }
     fn depositref() -> DepositRef {

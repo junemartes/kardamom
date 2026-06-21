@@ -428,12 +428,13 @@ log "smoke test (gate: single-tx must pass before load smoke runs)"
 # so PR runs stay short and a full soak can be dialed up via the cluster-e2e.yml
 # workflow_dispatch / matrix shard knobs.
 #
-# Funded-account budget: genesis prefunds Anvil accounts #0..#15, each its own
+# Funded-account budget: genesis prefunds Anvil accounts #0..#17, each its own
 # contiguous nonce chain on the never-reset chain (a fresh account's first tx
-# MUST be nonce 0, with no gaps). Allocation: #0 = gate smoke above; #1..#6 = the
-# sustained-load harness; #7..#15 = one fresh account per chaos case (see
-# chaos.sh). This disjoint split is why no stage needs nonce-continuation.
-#
+# MUST be nonce 0, with no gaps). Allocation: #0 = gate smoke above; #1..#6 =
+# the sustained-load harness; #7..#15 = one fresh account per chaos case (see
+# chaos.sh); #16 = the ingress-churn failover re-smoke (step 7b); #17 = the
+# fallback executor-churn re-smoke. Every check owns its own account, so every
+# smoke tx is nonce 0 — there's no NONCE knob and no nonce-continuation.
 # RUN_LOAD / RUN_CHAOS (default 1) let a CI shard run just one stage so the full
 # suite can be split across runners (each shard brings up its own cluster). When
 # unset both default to 1 — the local / single-runner path runs smoke + the
@@ -496,9 +497,35 @@ else
     alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
     [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
   sleep 5
-  # Re-smoke after the churn: account #0 nonce 1 is free (the gate used nonce 0;
-  # the load smoke ran on offset 1), so the ingress can't fill the nonce.
-  NONCE=1 ./scripts/smoke.sh
+  # Re-smoke from a dedicated account (#17), disjoint from the gate (#0) and the
+  # ingress-churn re-smoke (#16) — every check owns its own nonce-0 account.
+  PK="0x689af8efa8c651a91ad287602527f3af2fe9f6501a7ac4b061667b5a93e037fd" \
+    ./scripts/smoke.sh
 fi
+
+# --- 7b. Ingress active/active failover + multicast-receipts freeze guard ----
+# Active/active ingress (docs/agents/resilient-ingress-spec.md): kill ingress-0
+# (@.31) and re-smoke against the surviving ingress-1 (@.32). This validates two
+# things at once:
+#   (a) FAILOVER — a client that loses one ingress is served by another replica
+#       (both accept txs, recover the sender, and route to all sequencer shards).
+#   (b) The 2a MULTICAST-RECEIPTS FREEZE GUARD — ingress-0 leaving the shared
+#       tx_receipts multicast group must NOT freeze the image for ingress-1 (the
+#       exact subscriber-churn pathology MDS was introduced to avoid; see the
+#       TxReceipts section of config/channels.toml.tpl). If the group froze,
+#       ingress-1 would never receive the receipt and this re-smoke would time
+#       out — i.e. this IS the freeze reproduction. If it fails here, tighten the
+#       Aeron image-liveness / no_unavailable_image handling until it does not.
+log "ingress-churn: stopping ingress-0 and re-smoking against ingress-1 (.32)"
+docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
+  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.NodeName}} {{.ID}}{{\"\n\"}}{{end}}{{end}}" ingress 2>/dev/null | awk "/ingress-0/{print \$2; exit}"); \
+  [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
+sleep 5
+# Re-smoke against the surviving ingress-1 from a DEDICATED funded account (#16,
+# genesis dev.toml) — disjoint from the gate (#0), load (#1..#6), chaos
+# (#7..#15), and the fallback executor-churn (#17), so there is no cross-stage
+# nonce coordination regardless of which branch above ran.
+PK="0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0" \
+  RPC_URL="http://192.168.56.32:8545" ./scripts/smoke.sh
 
 log "cluster-e2e PASSED"

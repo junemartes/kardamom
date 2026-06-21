@@ -75,7 +75,7 @@ mod tests {
     use kardamom_types::{BPosition, TxOrderingMessage};
 
     fn txref() -> TxRef {
-        TxRef::new(B256::repeat_byte(0x11), 2, BPosition { term_id: 0, term_offset: 100 })
+        TxRef::new(B256::repeat_byte(0x11), 2, BPosition { term_id: 0, term_offset: 100 }, 0)
     }
 
     #[test]

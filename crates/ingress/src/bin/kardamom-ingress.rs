@@ -95,6 +95,11 @@ struct Args {
     /// Host identifier; stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
+    /// Stable identity of this ingress replica (active/active deployments run N
+    /// of them). Namespaces `correlation_id` so `(replica, sequence)` is
+    /// globally unique, and is stamped as a metric label. Default 0.
+    #[arg(long, env = "KARDAMOM_INGRESS_ID", default_value_t = 0)]
+    ingress_id: u16,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -139,6 +144,7 @@ async fn main() -> Result<()> {
     let mut cfg = IngressConfig {
         jsonrpc_bind: args.jsonrpc_bind,
         partition_count_m: args.shards,
+        ingress_id: args.ingress_id,
         ack_policy: args.ack_policy.into(),
         ..IngressConfig::default()
     };
@@ -151,6 +157,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         jsonrpc_bind = %cfg.jsonrpc_bind,
         shards = cfg.partition_count_m,
+        ingress_id = cfg.ingress_id,
         ack_policy = ?cfg.ack_policy,
         "kardamom-ingress starting"
     );

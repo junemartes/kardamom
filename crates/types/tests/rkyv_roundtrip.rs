@@ -232,6 +232,7 @@ fn tx_ref_roundtrip() {
             term_id: 3,
             term_offset: 4096,
         },
+        tx_data_session_id: 0,
     };
     assert_eq!(roundtrip(&r), r);
 }
@@ -245,6 +246,7 @@ fn channel_b_message_tx_ref_roundtrip() {
             term_id: 2,
             term_offset: 1024,
         },
+        tx_data_session_id: 0,
     });
     assert_eq!(roundtrip(&m), m);
 }
@@ -271,6 +273,7 @@ fn channel_b_message_helpers() {
             term_id: 0,
             term_offset: 16,
         },
+        tx_data_session_id: 0,
     };
     let m: TxOrderingMessage = r.into();
     assert!(m.is_tx_ref());

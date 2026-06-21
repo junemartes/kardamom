@@ -27,7 +27,7 @@ use kardamom_log::aeron_live::{
 use kardamom_log::config::LogConfig;
 use kardamom_log::replay;
 use kardamom_state::{Durability, StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
-use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxEnvelope};
+use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxDataLoc, TxEnvelope};
 
 /// CLI mirror of [`kardamom_state::Durability`] (clap renders the variants as
 /// `durable` / `safe-no-sync`).
@@ -260,7 +260,11 @@ async fn main() -> Result<()> {
     // dedicated tokio pump task per shard.
     let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(args.shards as usize);
     for shard_id in 0..args.shards {
-        let (tx, rx) = sync_mpsc::channel::<(BPosition, TxEnvelope)>();
+        // Live on a fresh start; archive replay-merge on crash recovery. Both
+        // paths yield (TxDataLoc, TxEnvelope): the live path reads the publisher
+        // session from the fragment header, and replay recovers the SAME session
+        // (frame-faithful), so the reader's session-keyed join works either way.
+        let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
         if let Some(replay_dst) = recovery_endpoints.as_ref() {
             let mut replay =
                 replay::open_tx_data_replay(&channels, &aeron_cfg, shard_id, replay_dst.clone())
@@ -514,7 +518,7 @@ fn build_genesis_alloc(
 
 struct LiveTxDataSub {
     sequencer_id: u8,
-    rx: sync_mpsc::Receiver<(BPosition, TxEnvelope)>,
+    rx: sync_mpsc::Receiver<(TxDataLoc, TxEnvelope)>,
 }
 
 impl TxDataSubscription for LiveTxDataSub {
@@ -522,7 +526,7 @@ impl TxDataSubscription for LiveTxDataSub {
         self.sequencer_id
     }
 
-    fn next(&mut self) -> Result<(BPosition, TxEnvelope), ExecutorError> {
+    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
         self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })

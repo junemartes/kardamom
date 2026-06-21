@@ -115,7 +115,9 @@ pub fn connect(
     // Egress subscription: the deliver closure ships each raw frame to the
     // session thread.
     let (frame_tx, frame_rx) = unbounded::<Vec<u8>>();
-    let deliver: DeliverFn = Box::new(move |bytes: &[u8], _pos| {
+    // Egress frames are relayed verbatim; the cluster assigns the canonical
+    // index, so the Aeron position/session of the egress image are irrelevant.
+    let deliver: DeliverFn = Box::new(move |bytes: &[u8], _pos, _session| {
         let _ = frame_tx.send(bytes.to_vec());
     });
     rt.open_subscription_with_deliver(&cfg.egress_channel, cfg.egress_stream_id, deliver)
