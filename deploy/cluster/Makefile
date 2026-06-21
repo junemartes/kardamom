@@ -12,25 +12,13 @@ ROOT := $(abspath ../..)
 # image carries the --archive-durability sidecar).
 SERVICES := ingress sequencer executor sealer da-watcher batcher
 
-.PHONY: up vms provision images deploy smoke status down clean validate check-contract
+.PHONY: up images deploy smoke status down clean validate check-contract
 
-## up: full bring-up — VMs, provisioning, images, deploy. Run `make smoke`
-## separately: until the --log-config plumbing lands (issue #36) the services
-## use single-host IPC defaults, so the cross-host pipeline smoke test is
-## EXPECTED TO FAIL (see README "Required service changes").
-up: vms provision images deploy
-	@echo
-	@echo "==> Cluster is up. Run 'make smoke' to exercise the pipeline."
-	@echo "    NOTE: smoke is expected to FAIL until the channels-config plumbing"
-	@echo "    lands (issue #36) — see README 'Required service changes'."
-
-## vms: boot the 5 VMs
-vms:
-	vagrant up
-
-## provision: install docker/nomad/consul/registry via Ansible
-provision:
-	ansible-playbook -i ansible/inventory.ini ansible/site.yml
+## up: bring up the container cluster + run the e2e (scripts/local-cluster.sh).
+## Works on macOS Docker Desktop and Linux Docker — no VMs. `KEEP=1 make up`
+## leaves the cluster running to inspect.
+up:
+	./scripts/local-cluster.sh
 
 ## images: build service + aeron images on the host and push to the registry.
 ## NOTE: pushing needs $(REGISTRY) in the HOST Docker daemon's
@@ -55,10 +43,10 @@ deploy:
 smoke:
 	./scripts/smoke.sh
 
-## status: cluster + job health (Nomad binds the VM IP, not localhost, so the
-## CLI inside the VM needs NOMAD_ADDR pointed at it)
+## status: container + Nomad/Consul health (cluster must be up — e.g. KEEP=1 make up)
 status:
-	vagrant ssh r1 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); nomad node status && echo && nomad job status && echo && consul members'
+	@docker ps --filter name=kardamom- --format 'table {{.Names}}\t{{.Status}}'
+	@docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=$(NOMAD_ADDR); nomad node status && echo && nomad job status && echo && consul members' 2>/dev/null || echo "(control node not up; bring the cluster up first, e.g. KEEP=1 make up)"
 
 ## validate: static checks (run on a host with the toolchain; CI runs these too)
 validate:
@@ -74,10 +62,10 @@ validate:
 check-contract:
 	./scripts/check-contract.py
 
-## down: stop jobs and destroy VMs
+## down: tear down the container cluster (containers + bridge network)
 down:
-	-vagrant ssh r1 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); for j in $$(nomad job status -short 2>/dev/null | awk "NR>1{print \$$1}"); do nomad job stop -purge $$j; done' || true
-	vagrant destroy -f
+	-docker rm -f $$(docker ps -aq --filter name=kardamom-) 2>/dev/null || true
+	-docker network rm kardamom-net 2>/dev/null || true
 
 ## clean: remove local built images
 clean:

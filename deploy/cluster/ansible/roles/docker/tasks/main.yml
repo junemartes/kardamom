@@ -50,12 +50,6 @@
     mode: "0644"
   notify: Restart docker
 
-- name: Add the vagrant user to the docker group
-  ansible.builtin.user:
-    name: vagrant
-    groups: docker
-    append: true
-
 - name: Enable and start Docker
   ansible.builtin.systemd:
     name: docker

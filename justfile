@@ -10,9 +10,9 @@
 #     compile the Solidity contracts.
 # `just bootstrap` installs all of the above for your platform.
 #
-# The multi-node cluster under `deploy/cluster/` needs a different set of HOST
-# tools (Vagrant + a VM provider, Ansible, Docker). `just cluster-bootstrap`
-# installs those; `just cluster-doctor` checks them.
+# The multi-node cluster under `deploy/cluster/` runs as containers and needs a
+# different set of HOST tools (Docker, Ansible, the Nomad CLI). `just
+# cluster-bootstrap` installs those; `just cluster-doctor` checks them.
 
 _default:
     @just --list
@@ -270,12 +270,12 @@ cluster-e2e-local:
 # ---------------------------------------------------------------------------
 # Multi-node cluster (deploy/cluster) — HOST dependencies.
 #
-# These recipes install the tools needed on this machine to run
-# `cd deploy/cluster && make up`: Vagrant + a VM provider, Ansible (+ the
-# ansible.posix / community.docker collections), Docker with BuildKit, and the
-# Nomad CLI (deploy/cluster/scripts/deploy.sh drives the cluster's Nomad API
-# from the host). Nomad *servers/clients* and Consul run inside the VMs and
-# are installed by Ansible, not here. See deploy/cluster/README.md.
+# The cluster runs as CONTAINERS on one Docker host (no VMs). `make up` shells
+# out to scripts/local-cluster.sh, which builds the binaries in a builder image
+# and runs the orchestration (ansible/nomad) inside an orchestrator container —
+# so on macOS the only host dependency is Docker. Ansible + the Nomad CLI are
+# installed here too for the Linux path that runs scripts/ci-cluster.sh directly
+# (and for scripts/deploy.sh from the host). See deploy/cluster/README.md.
 # ---------------------------------------------------------------------------
 
 # Host-side Nomad CLI version. Mirrors nomad_version in
@@ -307,52 +307,32 @@ cluster-bootstrap:
     case "$os" in
     Darwin)
         command -v brew >/dev/null 2>&1 || { echo "Homebrew required — https://brew.sh" >&2; exit 1; }
-        echo ">> installing Vagrant + VirtualBox + Docker + Ansible via brew"
-        # VirtualBox is the practical Vagrant provider on macOS (libvirt is
-        # Linux-only). Casks may prompt for sudo / a kernel-extension approval.
-        brew install --cask vagrant virtualbox docker || true
+        echo ">> installing Docker + Ansible via brew (the cluster runs in containers)"
+        brew install --cask docker || true
         brew install ansible
         install_nomad
-        echo "   NOTE: VirtualBox support on Apple Silicon is limited; a Linux"
-        echo "   host with libvirt/qemu is the best-supported environment."
-        echo "   Start Docker Desktop before running 'make up'."
+        echo "   Start Docker Desktop, then: cd deploy/cluster && make up"
         ;;
     Linux)
         . /etc/os-release 2>/dev/null || true
         echo ">> installing cluster host deps (distro: ${ID:-unknown})"
         if command -v apt-get >/dev/null 2>&1; then
             sudo apt-get update
-            # vagrant + libvirt/qemu provider, build deps for the
-            # vagrant-libvirt plugin (ruby-dev/libvirt-dev/gcc/make),
-            # ansible, and docker + buildx (BuildKit).
-            sudo apt-get install -y \
-                vagrant qemu-kvm libvirt-daemon-system libvirt-clients libvirt-dev \
-                dnsmasq-base ebtables ruby-dev gcc make \
-                ansible docker.io docker-buildx
+            sudo apt-get install -y ansible docker.io docker-buildx
         elif command -v dnf >/dev/null 2>&1; then
-            sudo dnf install -y vagrant @virtualization libvirt libvirt-devel qemu-kvm \
-                ansible docker gcc make ruby-devel
+            sudo dnf install -y ansible docker
         elif command -v pacman >/dev/null 2>&1; then
-            sudo pacman -S --needed --noconfirm vagrant libvirt qemu-full dnsmasq \
-                ansible docker
+            sudo pacman -S --needed --noconfirm ansible docker
         else
-            echo "Unsupported Linux distro. Install manually: vagrant, libvirt+qemu," >&2
-            echo "ansible, docker (see deploy/cluster/README.md)." >&2
+            echo "Unsupported Linux distro. Install manually: ansible, docker" >&2
+            echo "(see deploy/cluster/README.md)." >&2
             exit 1
         fi
-        # vagrant-libvirt provider plugin (idempotent).
-        if ! vagrant plugin list 2>/dev/null | grep -q vagrant-libvirt; then
-            echo ">> installing vagrant-libvirt plugin"
-            vagrant plugin install vagrant-libvirt
-        fi
         install_nomad
-        # Group membership so libvirt + docker work without sudo (needs re-login).
-        for grp in libvirt kvm docker; do
-            getent group "$grp" >/dev/null 2>&1 && sudo usermod -aG "$grp" "$USER" || true
-        done
-        sudo systemctl enable --now libvirtd docker 2>/dev/null || true
-        echo "   NOTE: log out/in (or run 'newgrp docker') so the libvirt/kvm/docker"
-        echo "   group memberships take effect."
+        getent group docker >/dev/null 2>&1 && sudo usermod -aG docker "$USER" || true
+        sudo systemctl enable --now docker 2>/dev/null || true
+        echo "   NOTE: log out/in (or run 'newgrp docker') so the docker group"
+        echo "   membership takes effect."
         ;;
     *)
         echo "Unsupported platform: $os. See deploy/cluster/README.md." >&2
@@ -363,12 +343,7 @@ cluster-bootstrap:
     echo ">> installing ansible collections (ansible.posix, community.docker)"
     ansible-galaxy collection install ansible.posix community.docker
     echo ">> cluster-bootstrap complete. Verify with: just cluster-doctor"
-    echo
-    echo "   MANUAL STEP: 'make images' pushes over plain HTTP to the in-cluster"
-    echo "   registry, so this HOST's Docker daemon must list it as insecure:"
-    echo "       { \"insecure-registries\": [\"192.168.56.10:5000\"] }"
-    echo "   (Linux: /etc/docker/daemon.json + restart docker; Docker Desktop:"
-    echo "   Settings > Docker Engine.) 'just cluster-doctor' checks this."
+    echo "   Then: cd deploy/cluster && make up   (the container cluster + e2e)."
 
 # Check that the HOST has everything deploy/cluster needs.
 cluster-doctor:
@@ -377,17 +352,11 @@ cluster-doctor:
     rc=0
     have() { command -v "$1" >/dev/null 2>&1; }
     chk() { if have "$1"; then echo "  ok    $1 — $("$1" --version 2>&1 | head -1)"; else echo "  MISS  $1 ($2)"; rc=1; fi; }
-    echo ">> deploy/cluster host dependencies:"
-    chk vagrant "run 'just cluster-bootstrap'"
-    chk ansible "run 'just cluster-bootstrap'"
+    echo ">> deploy/cluster host dependencies (container cluster):"
+    chk docker "run 'just cluster-bootstrap' — the cluster nodes are containers"
+    chk ansible "run 'just cluster-bootstrap' (direct Linux ci-cluster.sh path)"
     chk ansible-galaxy "ships with ansible"
-    chk docker "run 'just cluster-bootstrap'"
-    chk nomad "run 'just cluster-bootstrap' — deploy.sh drives the cluster API from the host"
-    if have virsh || have VBoxManage; then
-        echo "  ok    vm provider (libvirt or virtualbox)"
-    else
-        echo "  MISS  vm provider — install libvirt+qemu (Linux) or VirtualBox (macOS)"; rc=1
-    fi
+    chk nomad "run 'just cluster-bootstrap' — deploy.sh / direct ci-cluster.sh need it"
     for col in ansible.posix community.docker; do
         if ansible-galaxy collection list 2>/dev/null | grep -q "^$col "; then
             echo "  ok    ansible collection $col"
@@ -395,19 +364,13 @@ cluster-doctor:
             echo "  MISS  ansible collection $col — run 'just cluster-bootstrap'"; rc=1
         fi
     done
-    # Pushing images needs the in-cluster registry allowed as insecure (HTTP)
-    # in THIS host's Docker daemon. 192.168.56.10:5000 mirrors registry_host/
-    # registry_port in deploy/cluster/ansible/group_vars/all.yml.
-    if docker info >/dev/null 2>&1; then
-        if docker info 2>/dev/null | grep -qE '^\s*192\.168\.56\.11:5000$'; then
-            echo "  ok    docker insecure-registry 192.168.56.10:5000"
-        else
-            echo "  MISS  docker insecure-registry 192.168.56.10:5000 — add to the daemon's"
-            echo "        insecure-registries and restart Docker (see cluster-bootstrap notes)"; rc=1
-        fi
-    else
-        echo "  WARN  docker daemon not running — cannot check insecure-registries"
+    if ! docker info >/dev/null 2>&1; then
+        echo "  WARN  docker daemon not running — start Docker Desktop / dockerd"
     fi
+    # NOTE: the primary container path (scripts/local-cluster.sh) pushes images
+    # engine-to-engine inside the cluster, so this host's Docker daemon needs NO
+    # registry trust. Only the advanced host-driven `make images` push needs the
+    # in-cluster registry 192.168.56.10:5000 listed in daemon insecure-registries.
     # Smoke test (scripts/smoke.sh) prefers foundry's cast; non-fatal.
     if have cast; then
         echo "  ok    cast — $(cast --version 2>&1 | head -1)"
