@@ -1,0 +1,11 @@
+// :service — the thin Aeron Cluster ClusteredService adapter.
+//
+// Depends on :core (the POJO state machine) and io.aeron:aeron-cluster:1.44.0.
+// aeron-cluster pulls in aeron-client (and Agrona) transitively. Isolating the
+// Aeron dependency here keeps :core (and its deterministic tests) buildable on
+// its own.
+
+dependencies {
+    implementation project(':core')
+    implementation 'io.aeron:aeron-cluster:1.44.0'
+}
