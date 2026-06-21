@@ -34,6 +34,33 @@ job "executor" {
       value    = "true"
     }
 
+    # Resilience (chaos tests): restart a crashed task on the same node (resumes
+    # from persistent /opt/kardamom/state); reschedule onto a healthy node on
+    # node loss (a fresh node replays the canonical order from genesis — fine for
+    # a redundant state machine). With 3 executor-role nodes + distinct_hosts, a
+    # lost replica reschedules to a spare node if one exists, else degrades to 2.
+    restart {
+      attempts = 3
+      interval = "1m"
+      delay    = "5s"
+      mode     = "delay"
+    }
+
+    reschedule {
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    update {
+      max_parallel     = 1
+      health_check     = "task_states"
+      min_healthy_time = "10s"
+      healthy_deadline = "2m"
+      auto_revert      = false
+    }
+
     network {
       mode = "host"
     }

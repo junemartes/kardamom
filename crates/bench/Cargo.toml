@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "kardamom-bench-harness"
 path = "src/bin/harness.rs"
 
+[[bin]]
+name = "kardamom-load"
+path = "src/bin/load.rs"
+
 [dependencies]
 kardamom-node = { path = "../node" }
 

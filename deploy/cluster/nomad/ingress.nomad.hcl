@@ -42,6 +42,31 @@ job "ingress" {
   group "ingress" {
     count = 1
 
+    # Resilience (chaos tests): restart a crashed task on the same node;
+    # reschedule the alloc onto a healthy node on node loss. Singleton on a
+    # single ingress-role node, so node-failure recovers when the node returns.
+    restart {
+      attempts = 3
+      interval = "1m"
+      delay    = "5s"
+      mode     = "delay"
+    }
+
+    reschedule {
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    update {
+      max_parallel     = 1
+      health_check     = "checks"
+      min_healthy_time = "10s"
+      healthy_deadline = "2m"
+      auto_revert      = false
+    }
+
     network {
       mode = "host"
       port "jsonrpc" {

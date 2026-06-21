@@ -386,36 +386,59 @@ log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 log "smoke test (gate: single-tx must pass before load smoke runs)"
 ./scripts/smoke.sh
 
-# --- 6b. Exhaustive load smoke (sustained stream; must-deliver + keep-pace) --
-# Runs only after the single-tx smoke above passes (the cheap gate). Sends a
-# sustained tx stream and asserts every tx is receipted and the executors keep
-# pace with the sealer (no freeze / unbounded gap). Knobs via env
-# (SMOKE_DURATION_S / SMOKE_TPS / SMOKE_SENDERS / ...); defaults 60s @ 5 tx/s.
-# Scrapes executor/sealer block metrics via `docker exec kardamom-<node> curl`.
-log "load smoke (sustained stream; must-deliver + keep-pace)"
-# Reserve Anvil account #0 for the single-tx smoke (the gate above + the churn
-# re-smoke below both use scripts/smoke.sh @ account #0, nonces 0 then 1). The
-# load smoke therefore starts its sender set at account #1 (offset 1) so its
-# nonces never collide with account #0's.
-SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
+# --- 7. High sustained-load (Rust harness: ramp -> soak; must-deliver + drop
+# accounting + keep-pace) then 8. chaos/resilience suite. Both use kardamom-load
+# (built alongside the service bins, staged at target/release). Durations/rates
+# are ENV-tunable so PR runs stay short and a full soak can be dialed up via the
+# cluster-e2e.yml workflow_dispatch inputs.
+#
+# Funded-account budget: genesis prefunds Anvil accounts #0..#15, each its own
+# contiguous nonce chain on the never-reset chain (a fresh account's first tx
+# MUST be nonce 0, with no gaps). Allocation: #0 = gate smoke above; #1..#6 =
+# the sustained-load harness; #7..#15 = one fresh account per chaos case (see
+# chaos.sh). This disjoint split is why no stage needs nonce-continuation.
+# RUN_LOAD / RUN_CHAOS (default 1) let a CI shard run just one stage so the full
+# soak can be split across runners (each shard brings up its own cluster). The
+# always-on per-PR run leaves both at 1.
+LOAD_BIN="${ROOT}/target/release/kardamom-load"
+if [[ -x "${LOAD_BIN}" ]]; then
+  if [[ "${RUN_LOAD:-1}" == "1" ]]; then
+    log "load test: kardamom-load ramp+soak (duration=${LOAD_DURATION_S:-60}s target=${LOAD_TARGET_TPS:-200}tps)"
+    # --chain-id is passed explicitly (412346, from group_vars/all.yml) rather
+    # than probed via eth_chainId: ingress.toml sets no chain_id, so its
+    # eth_chainId returns a default that does NOT match the executors' chain, and
+    # txs signed with it would never execute. smoke.sh hardcodes 412346 likewise.
+    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 \
+      --duration "${LOAD_DURATION_S:-60}s" --target-tps "${LOAD_TARGET_TPS:-200}" \
+      --senders "${LOAD_SENDERS:-6}" --sender-offset 1 --assert-all-delivered \
+      --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
+      --scrape executor,sealer,ingress,sequencer --output /tmp/kardamom-load.json
+  else
+    log "RUN_LOAD=0 — skipping sustained-load stage (chaos-only shard)"
+  fi
 
-# --- 7. Subscriber-churn resilience: kill one executor alloc, re-smoke -------
-# The old Q-of-N recorder-redundancy test is GONE: durability is now a single
-# archive at the sealer (no recorder quorum). What the MDC change guarantees is
-# that a tx_ordering *subscriber* dropping no longer freezes the other
-# subscribers' images. Kill one executor alloc (via the control-node Nomad
-# server) and re-smoke: ingress + the sealer durability sidecar must keep
-# advancing (the old shared-multicast group froze every image on a dropped
-# subscriber; under MDC it does not).
-log "subscriber-churn: stopping one executor alloc and re-running smoke"
-docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
-  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
-  [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
-sleep 5
-# Re-smoke after the churn. Nonce coordination across the three smokes: the gate
-# smoke used account #0 nonce 0; the load smoke runs with SMOKE_SENDER_OFFSET=1
-# so it never touches account #0; therefore account #0 nonce 1 is free and the
-# churn re-smoke uses it (the ingress can't fill the nonce; see smoke.sh).
-NONCE=1 ./scripts/smoke.sh
+  if [[ "${RUN_CHAOS:-1}" == "1" ]]; then
+    log "chaos suite (kills components under steady load; asserts auto-recovery)"
+    CHAOS_TPS="${CHAOS_TPS:-50}" CHAOS_CASE_S="${CHAOS_CASE_S:-45}" \
+      CHAOS_CASES="${CHAOS_CASES:-graceful-executor hard-executor sealer-graceful}" \
+      CHAOS_RESTART_SLO_S="${CHAOS_RESTART_SLO_S:-60}" \
+      CHAOS_RESCHEDULE_SLO_S="${CHAOS_RESCHEDULE_SLO_S:-150}" \
+      LOAD_BIN="${LOAD_BIN}" LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}" \
+      ./scripts/chaos.sh
+  else
+    log "RUN_CHAOS=0 — skipping chaos stage (load-only shard)"
+  fi
+else
+  # Fallback (kardamom-load not staged): the legacy bash load smoke (accounts
+  # #1..#4) + single subscriber-churn check.
+  log "WARN: ${LOAD_BIN} not found — running legacy load smoke + subscriber-churn"
+  SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
+  log "subscriber-churn: stopping one executor alloc and re-running smoke"
+  docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
+    alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
+    [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
+  sleep 5
+  NONCE=1 ./scripts/smoke.sh
+fi
 
 log "cluster-e2e PASSED"
