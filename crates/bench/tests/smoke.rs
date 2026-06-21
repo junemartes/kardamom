@@ -1,70 +1,51 @@
-//! Smoke test: run `Benchmark<MixedWorkflow>` against an in-process kardamom
-//! node for a short window, assert per-method histograms are non-empty.
+//! Smoke test: run `Benchmark<TransfersWorkflow>` against an in-process
+//! kardamom **ingress** (real `IngressProxy` over `MockChannels` + a
+//! fake-executor receipt loop) for a short window, and assert the write-path
+//! histogram is non-empty.
+//!
+//! This replaces the former in-process-`Node` smoke test: `kardamom-node` was
+//! removed and the bench now targets the cluster ingress. `transfers` is the
+//! write-path workflow (`eth_sendRawTransaction` + parked-receipt release),
+//! which ingress serves; `eth_call`-based workflows are deferred until ingress
+//! grows read-path RPCs.
 
-use std::net::SocketAddr;
 use std::time::Duration;
 
-use jsonrpsee::http_client::HttpClientBuilder;
-
+use kardamom_bench::harness::spawn_inprocess_ingress;
 use kardamom_bench::workflow::BenchWorkflow;
-use kardamom_bench::{Benchmark, MixedWorkflow};
-use kardamom_node::{Genesis, Node, rpc};
+use kardamom_bench::{Benchmark, MixedWorkflow, TransfersWorkflow};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn bench_records_samples_against_inprocess_node() {
+async fn bench_records_samples_against_inprocess_ingress() {
     let chain_id = 1u64;
     let concurrency = 4u32;
+    let max_in_flight = 4u32;
 
-    let workflow = MixedWorkflow::default();
-    let alloc = workflow.genesis_alloc(concurrency).expect("genesis_alloc");
-    let genesis = Genesis { chain_id, alloc };
-    genesis
-        .validate()
-        .expect("valid genesis from workflow.genesis_alloc");
-    let node = Node::new(&genesis);
-
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-    let server = jsonrpsee::server::Server::builder()
-        .build(addr)
+    let (client, ingress) = spawn_inprocess_ingress(chain_id, 1, max_in_flight as usize)
         .await
-        .unwrap();
-    let bound = server.local_addr().unwrap();
-    let server_handle = server.start({
-        use rpc::EthApiServer;
-        rpc::EthHandlers::new(node).into_rpc()
-    });
-
-    let url = format!("http://{bound}");
-    let client = HttpClientBuilder::default().build(&url).unwrap();
+        .expect("spawn in-process ingress");
 
     let bench = Benchmark {
-        workflow,
+        workflow: TransfersWorkflow::default(),
         timeout: Duration::from_secs(5),
         concurrency,
         txs_per_task: 50,
-        max_in_flight: 4,
+        max_in_flight,
     };
 
     let outputs = bench.run(client).await.expect("bench ran");
     assert!(outputs.counters.sent > 0, "should have sent some requests");
 
-    let call_hist = outputs.histograms.get("eth_call").expect("eth_call hist");
     let send_hist = outputs
         .histograms
         .get("eth_sendRawTransaction")
         .expect("send hist");
-
-    assert!(
-        !call_hist.is_empty(),
-        "eth_call samples should be non-empty"
-    );
     assert!(
         !send_hist.is_empty(),
         "eth_sendRawTransaction samples should be non-empty"
     );
 
-    let _ = server_handle.stop();
-    server_handle.stopped().await;
+    ingress.shutdown().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

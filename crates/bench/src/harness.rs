@@ -2,29 +2,35 @@
 //! and optional `pprof`-based CPU sampling, both scoped to the dispatch
 //! window. Generic over any `BenchWorkflow`.
 //!
-//! Running the standalone node + bench together for a long session
-//! pushes the resulting flamegraph 99%+ into the bare
-//! `ThreadId(N)-tokio-rt-worker` root frame — every nanosecond a worker
-//! is alive but not inside an entered span is attributed there. Embedding
-//! the node in the bench process and only flushing flame samples during
-//! the measurement window keeps the recording tight around the work we
-//! actually care about.
+//! The harness drives an **in-process `IngressProxy`** over in-memory
+//! [`MockChannels`] plus a trivial "fake executor" that reflects every
+//! published `TxEnvelope` straight back as a success `Receipt`. This
+//! exercises the real ingress hot path (batched secp256k1 recovery, sender
+//! routing, jsonrpsee framing, parked-receipt release) in a single process
+//! with no live Aeron media driver — so the profiling recordings stay tight
+//! around the dispatch window.
+//!
+//! This is the decoupled stand-in left in place after `kardamom-node` was
+//! removed. It profiles ingress only; the **full in-process Aeron pipeline
+//! harness** (real sequencer + executor + sealer, so the flame shows revm and
+//! ordering work too) is tracked as a follow-up. Because ingress emits no
+//! `tracing` spans, the `tracing-flame` SVG is sparse for this stand-in; the
+//! `pprof` on-CPU sampler (frame-based, filtered to `kardamom_ingress` frames)
+//! is the useful output here.
 //!
 //! `pprof` samples actual on-CPU time via SIGPROF (everything tokio,
-//! jsonrpsee, revm, k256 actually do — not just our tracing spans). Its
+//! jsonrpsee, secp256k1 actually do — not just our tracing spans). Its
 //! `ProfilerGuard` is built right between warmup and dispatch and dropped
 //! right after dispatch returns, so the SVG is bounded to the same window
 //! as the `tracing-flame` recording.
 
 use std::fs::File;
 use std::io::BufWriter;
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
-use jsonrpsee::server::{Server, ServerHandle};
 use tracing_flame::{FlameLayer, FlushGuard};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::FilterFn;
@@ -32,8 +38,8 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use kardamom_node::rpc::{EthApiServer, EthHandlers};
-use kardamom_node::{Genesis, Node};
+use kardamom_ingress::{InMemoryStateDb, IngressConfig, IngressHandle, IngressProxy, MockChannels};
+use kardamom_types::{AckPolicy, BPosition, Receipt};
 
 use crate::Benchmark;
 use crate::benchmark::Outputs;
@@ -44,7 +50,8 @@ use crate::workflow::BenchWorkflow;
 /// In-process node + RPC server + benchmark dispatcher, with the
 /// flame/pprof recordings scoped to the dispatch window.
 pub struct Harness<W: BenchWorkflow> {
-    /// Chain ID used by the in-process [`kardamom_node::Node`].
+    /// Chain ID the in-process ingress serves via `eth_chainId` (workflows
+    /// presign against it).
     pub chain_id: u64,
     /// The benchmark dispatcher this harness drives.
     pub bench: Benchmark<W>,
@@ -85,7 +92,7 @@ impl<W: BenchWorkflow> Harness<W> {
     /// `Benchmark::dispatch`).
     pub async fn run(self) -> anyhow::Result<()> {
         let (active, flame_guard) = self.init_tracing()?;
-        let (client, server_handle) = self.build_node_and_client().await?;
+        let (client, ingress) = self.build_ingress_and_client().await?;
 
         // All client-side crypto (signer derivation, presigning) happens
         // here, before the dispatcher starts and well before the
@@ -109,8 +116,7 @@ impl<W: BenchWorkflow> Harness<W> {
         self.write_pprof_output(pprof_guard)?;
         self.emit_report(outputs)?;
 
-        let _ = server_handle.stop();
-        server_handle.stopped().await;
+        ingress.shutdown().await;
         Ok(())
     }
 
@@ -157,43 +163,12 @@ impl<W: BenchWorkflow> Harness<W> {
         Ok((active, flame_guard))
     }
 
-    /// Build the in-process node from the workflow's genesis alloc, bind a
-    /// loopback RPC server to an ephemeral port, and build a jsonrpsee
-    /// client pointed at it.
-    async fn build_node_and_client(&self) -> anyhow::Result<(HttpClient, ServerHandle)> {
-        // Build genesis from the workflow's alloc declaration, then
-        // validate it through the node's own validator (catches duplicate
-        // addresses, chain_id == 0, etc.).
-        let alloc = self.bench.workflow.genesis_alloc(self.bench.concurrency)?;
-        let genesis = Genesis {
-            chain_id: self.chain_id,
-            alloc,
-        };
-        genesis.validate().map_err(|e| {
-            anyhow::anyhow!(
-                "invalid Genesis (chain_id={}, allocs from workflow.genesis_alloc): {e}",
-                self.chain_id
-            )
-        })?;
-        let node = Node::new(&genesis);
-
-        // Hard-coded loopback bind: parse cannot fail on this literal.
-        let bind: SocketAddr = "127.0.0.1:0"
-            .parse()
-            .expect("hardcoded loopback `127.0.0.1:0` is a valid SocketAddr");
-        let server = Server::builder().build(bind).await?;
-        let bound = server.local_addr()?;
-
-        let module = EthHandlers::new(node).into_rpc();
-        let server_handle = server.start(module);
-
-        let url = format!("http://{bound}");
-        let client = HttpClientBuilder::default()
-            .request_timeout(REQUEST_TIMEOUT)
-            .max_concurrent_requests(self.bench.max_in_flight as usize + MAX_IN_FLIGHT_SLACK)
-            .build(&url)?;
-
-        Ok((client, server_handle))
+    /// Spin up the in-process ingress stand-in (see [`spawn_inprocess_ingress`])
+    /// and a jsonrpsee client pointed at it. A single shard is plenty for the
+    /// profiling stand-in — the fake executor reflects receipts regardless of
+    /// partitioning, and the bench client drives one URL.
+    async fn build_ingress_and_client(&self) -> anyhow::Result<(HttpClient, InProcessIngress)> {
+        spawn_inprocess_ingress(self.chain_id, 1, self.bench.max_in_flight as usize).await
     }
 
     fn build_pprof_guard(&self) -> anyhow::Result<Option<pprof::ProfilerGuard<'static>>> {
@@ -235,6 +210,22 @@ impl<W: BenchWorkflow> Harness<W> {
             .map_err(|e| anyhow::anyhow!("read {}: {e}", folded_tmp.display()))?;
         let merged_flame = merge_folded_text(&raw_flame);
 
+        // The in-process ingress stand-in emits no `tracing` spans (only the
+        // node did), so the folded text is frequently just bare tokio-worker
+        // roots that `merge_folded_text` drops — leaving nothing to render.
+        // inferno errors on empty input, so skip the SVG and log instead. The
+        // `pprof` on-CPU path (frame-based) is the useful profiling output for
+        // this stand-in; the full pipeline harness restores span-based flames.
+        if merged_flame.trim().is_empty() {
+            let _ = std::fs::remove_file(&folded_tmp);
+            tracing::warn!(
+                flame_out = %self.flame_out.display(),
+                "harness: no tracing spans recorded (ingress emits none); \
+                 skipping tracing-flame SVG — use --pprof-out for on-CPU frames"
+            );
+            return Ok(());
+        }
+
         let svg = File::create(&self.flame_out)
             .map_err(|e| anyhow::anyhow!("create {}: {e}", self.flame_out.display()))?;
         let mut opts = flamegraph_options();
@@ -266,11 +257,11 @@ impl<W: BenchWorkflow> Harness<W> {
             .report()
             .build()
             .map_err(|e| anyhow::anyhow!("pprof report build failed: {e}"))?;
-        // 1. Keep only stacks that contain at least one `kardamom_node::*`
-        //    frame. The harness runs the node and the bench client on the
-        //    same tokio runtime, so the raw report mixes node and client
-        //    work; the user wants the SVG to show node work only.
-        let filtered = filter_to_node(&report);
+        // 1. Keep only stacks that contain at least one `kardamom_ingress::*`
+        //    frame. The harness runs the ingress proxy and the bench client on
+        //    the same tokio runtime, so the raw report mixes ingress and client
+        //    work; the SVG should show ingress work only.
+        let filtered = filter_to_ingress(&report);
         // 2. Convert the filtered Report to folded text, then run the same
         //    `merge_folded_text` we use for tracing-flame above to drop
         //    the thread-name prefix and sum identical stacks across
@@ -286,7 +277,7 @@ impl<W: BenchWorkflow> Harness<W> {
             pprof_out = %path.display(),
             kept_samples = filtered.kept_count,
             dropped_samples = filtered.dropped_count,
-            "harness: wrote pprof flamegraph (filtered to kardamom_node frames, merged across workers)"
+            "harness: wrote pprof flamegraph (filtered to kardamom_ingress frames, merged across workers)"
         );
         Ok(())
     }
@@ -312,6 +303,110 @@ impl<W: BenchWorkflow> Harness<W> {
     }
 }
 
+/// Spin up an in-process [`IngressProxy`] over in-memory [`MockChannels`] plus
+/// a trivial "fake executor" that turns every published `TxEnvelope` straight
+/// into a success `Receipt`. Returns a jsonrpsee client pointed at the proxy's
+/// ephemeral loopback port and a handle that stops everything on
+/// [`InProcessIngress::shutdown`].
+///
+/// This is the decoupled stand-in backing the profiling [`Harness`] and the
+/// crate's smoke tests after `kardamom-node` was removed: it exercises the real
+/// ingress hot path (sig recovery, routing, RPC framing, receipt release)
+/// without a live Aeron media driver or the real sequencer/executor/sealer. The
+/// full in-process Aeron pipeline harness is tracked as a follow-up.
+///
+/// `ack_policy` is forced to [`AckPolicy::OnOffer`] so a submission is released
+/// on receipt arrival alone — there is no recorder/quorum watermark here.
+pub async fn spawn_inprocess_ingress(
+    chain_id: u64,
+    shards: u32,
+    max_in_flight: usize,
+) -> anyhow::Result<(HttpClient, InProcessIngress)> {
+    let (mock, shard_rxs) = MockChannels::new(shards as usize);
+    let receipt_tx = mock.receipt_bus.clone();
+
+    // One fake-executor task per shard: drain published envelopes and reflect a
+    // success receipt back onto the receipt bus so the proxy releases the
+    // parked submission. `from`/`nonce` mirror exactly what the proxy parked on
+    // (it keys pending submissions by `(sender, nonce)`).
+    let mut fake_exec = Vec::with_capacity(shard_rxs.len());
+    for (shard, mut rx) in shard_rxs.into_iter().enumerate() {
+        let receipt_tx = receipt_tx.clone();
+        fake_exec.push(tokio::spawn(async move {
+            let mut idx: i32 = 0;
+            while let Some(env) = rx.recv().await {
+                idx = idx.wrapping_add(1);
+                let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
+                let receipt = Receipt {
+                    tx_idx: BPosition {
+                        term_id: shard as i32,
+                        term_offset: idx,
+                    },
+                    tx_hash: env.tx_hash,
+                    status: true,
+                    gas_used: 21_000,
+                    nonce,
+                    from: env.sender,
+                    ..Default::default()
+                };
+                // A send error means the broadcast bus has no receivers, i.e.
+                // the proxy is gone — nothing left to release.
+                if receipt_tx.send(receipt).is_err() {
+                    break;
+                }
+            }
+        }));
+    }
+
+    let cfg = IngressConfig {
+        chain_id,
+        partition_count_m: shards,
+        ack_policy: AckPolicy::OnOffer,
+        ..IngressConfig::default()
+    };
+    let state_db = Arc::new(InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
+    let handle = proxy.start().await?;
+
+    let url = format!("http://{}", handle.jsonrpc_addr);
+    let client = HttpClientBuilder::default()
+        .request_timeout(REQUEST_TIMEOUT)
+        .max_concurrent_requests(max_in_flight + MAX_IN_FLIGHT_SLACK)
+        .build(&url)?;
+    Ok((client, InProcessIngress { handle, fake_exec }))
+}
+
+/// Owns the in-process ingress server and the fake-executor reflector tasks.
+/// Call [`InProcessIngress::shutdown`] (or drop it) to tear them down.
+pub struct InProcessIngress {
+    handle: IngressHandle,
+    fake_exec: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl InProcessIngress {
+    /// Stop the jsonrpsee server and abort the fake-executor tasks.
+    pub async fn shutdown(self) {
+        let _ = self.handle.jsonrpc_handle.stop();
+        self.handle.jsonrpc_handle.stopped().await;
+        for h in self.fake_exec {
+            h.abort();
+        }
+    }
+}
+
+/// Decode the tx nonce from raw envelope bytes the same way the ingress proxy
+/// does (`alloy_consensus::TxEnvelope::decode`), so the synthesized receipt's
+/// `(from, nonce)` matches the parked-submission key. Returns `None` if the
+/// bytes don't decode (the proxy would already have rejected such a tx).
+fn decode_nonce(raw: &[u8]) -> Option<u64> {
+    use alloy_consensus::transaction::Transaction;
+    use alloy_rlp::Decodable;
+    let mut slice = raw;
+    alloy_consensus::TxEnvelope::decode(&mut slice)
+        .ok()
+        .map(|env| env.nonce())
+}
+
 /// Inferno-flamegraph options shared by the tracing-flame and pprof
 /// renderers. `min_width = 0.0` keeps narrow frames visible (matches
 /// `inferno-flamegraph --minwidth 0`); `image_width = 2000` is enough
@@ -324,9 +419,9 @@ fn flamegraph_options() -> pprof::flamegraph::Options<'static> {
 }
 
 /// Substring matched against demangled symbol names to decide whether a
-/// pprof stack belongs to "the node." Matches `kardamom_node::node::...`,
-/// `kardamom_node::kardamom_executor::...`, etc.
-const NODE_FRAME_NEEDLE: &str = "kardamom_node";
+/// pprof stack belongs to the ingress proxy. Matches
+/// `kardamom_ingress::proxy::...`, `kardamom_ingress::sig_verify::...`, etc.
+const INGRESS_FRAME_NEEDLE: &str = "kardamom_ingress";
 
 struct FilteredReport {
     report: pprof::Report,
@@ -335,15 +430,15 @@ struct FilteredReport {
 }
 
 /// Walk `report.data` and keep only entries whose `Frames` contains at
-/// least one symbol whose demangled name contains `NODE_FRAME_NEEDLE`.
+/// least one symbol whose demangled name contains `INGRESS_FRAME_NEEDLE`.
 /// Samples that land entirely in bench-side / jsonrpsee-client / tokio /
 /// hyper code are dropped.
-fn filter_to_node(report: &pprof::Report) -> FilteredReport {
+fn filter_to_ingress(report: &pprof::Report) -> FilteredReport {
     let mut kept = std::collections::HashMap::new();
     let mut kept_count: isize = 0;
     let mut dropped_count: isize = 0;
     for (frames, count) in &report.data {
-        if frames_contains_node(frames) {
+        if frames_contains_ingress(frames) {
             kept.insert(frames.clone(), *count);
             kept_count += *count;
         } else {
@@ -360,11 +455,11 @@ fn filter_to_node(report: &pprof::Report) -> FilteredReport {
     }
 }
 
-fn frames_contains_node(frames: &pprof::Frames) -> bool {
+fn frames_contains_ingress(frames: &pprof::Frames) -> bool {
     frames.frames.iter().any(|frame| {
         frame
             .iter()
-            .any(|sym| sym.name().contains(NODE_FRAME_NEEDLE))
+            .any(|sym| sym.name().contains(INGRESS_FRAME_NEEDLE))
     })
 }
 

@@ -13,11 +13,6 @@ global:
 # each service with `--metrics-addr 0.0.0.0:<port>` to make these targets
 # reachable.
 scrape_configs:
-  - job_name: kardamom-node
-    metrics_path: /metrics
-    static_configs:
-      - targets: ["host.docker.internal:9000"]
-
   - job_name: kardamom-sequencer
     metrics_path: /metrics
     static_configs:

@@ -6,7 +6,7 @@ use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionRequest};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
-use kardamom_node::AllocEntry;
+use kardamom_types::AllocEntry;
 
 use crate::benchmark::Prepared;
 use crate::workflow::{BenchWorkflow, default_signer_balance};

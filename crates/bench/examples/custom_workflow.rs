@@ -19,7 +19,7 @@ use kardamom_bench::Benchmark;
 use kardamom_bench::benchmark::Prepared;
 use kardamom_bench::harness::Harness;
 use kardamom_bench::workflow::BenchWorkflow;
-use kardamom_node::AllocEntry;
+use kardamom_types::AllocEntry;
 
 const METHOD: &str = "eth_blockNumber";
 
