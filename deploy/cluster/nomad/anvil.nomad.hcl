@@ -37,9 +37,14 @@ job "anvil" {
         # args, bound to 127.0.0.1:8545). Override the entrypoint so the args
         # reach anvil verbatim.
         entrypoint = ["anvil"]
+        # --slots-in-an-epoch 1 makes the `finalized` tag advance after each new
+        # block (anvil's default lags `latest` by ~64 blocks, mirroring mainnet
+        # finality). The da-watcher reads only FINALIZED blocks, so without this
+        # the deposit path's L1 events would never surface on L2.
         args = [
           "--host", "0.0.0.0",
           "--port", "8546",
+          "--slots-in-an-epoch", "1",
         ]
       }
 

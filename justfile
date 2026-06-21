@@ -240,9 +240,11 @@ aeron-driver-down:
     fi
     echo ">> MD stopped"
 
-# Run the e2e tests locally against a host-native Aeron Media Driver. Set
-# the MD up first, run the in-process + multi-process variants, then tear
-# the MD down. Use this on macOS where the Dockerised MD path doesn't work.
+# Run the in-process e2e proof-of-pipeline locally against a host-native Aeron
+# Media Driver. Set the MD up first, run the test, then tear the MD down. Use
+# this on macOS where the Dockerised MD path doesn't work. The full multi-process
+# pipeline (transfer / deposit / contract-deploy) now runs on the nomad cluster —
+# see `just cluster-e2e-local`.
 test-e2e-local: aeron-driver-up
     #!/usr/bin/env bash
     set -euo pipefail
@@ -252,20 +254,18 @@ test-e2e-local: aeron-driver-up
     PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
         cargo test -p e2e --features full-pipeline-e2e \
             --test full_pipeline_e2e --locked -- --ignored --nocapture proof_of_pipeline
-    PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
-        cargo test -p e2e --features full-pipeline-e2e \
-            --test multiprocess_e2e --locked -- --ignored --nocapture --test-threads=1 \
-            multiprocess_e2e_signed_transfer_round_trip \
-            multiprocess_e2e_deposit_round_trip \
-            anvil_pipeline_e2e_l1_deposit_and_l2_round_trip
-    # NOTE: multiprocess_quorum_e2e_recorder_quorum_and_redundancy is run
-    # explicitly (not here): the on-quorum gate keys off the archive's recording
-    # position, whose catch-up latency on a single shared host archive is timing
-    # -sensitive. True 3-archive quorum + recorder-loss redundancy is validated
-    # by the cluster-e2e workflow. Run the single-host variant by name with:
-    #   just aeron-driver-up && KARDAMOM_AERON_DIR=/tmp/kardamom-aeron-local/dir \
-    #     cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e \
-    #     -- --ignored --nocapture multiprocess_quorum
+
+# Run the full multi-host cluster e2e LOCALLY via the container harness
+# (deploy/cluster/scripts/local-cluster.sh) — works on macOS Docker Desktop AND
+# Linux Docker, no Vagrant VMs. It builds the service binaries + the deployer +
+# the cluster-e2e client in a reproducible builder image, then runs the
+# UNMODIFIED ci-cluster.sh inside a privileged orchestrator container (the only
+# place the host sysctls / bridge-multicast tweaks ci-cluster.sh needs actually
+# apply on a laptop). Brings up the container cluster, deploys the ETHLockbox,
+# and asserts transfer + deposit + contract-deploy + executor-failover. Needs
+# only Docker. `KEEP=1 just cluster-e2e-local` leaves the cluster up to inspect.
+cluster-e2e-local:
+    deploy/cluster/scripts/local-cluster.sh
 
 # ---------------------------------------------------------------------------
 # Multi-node cluster (deploy/cluster) — HOST dependencies.

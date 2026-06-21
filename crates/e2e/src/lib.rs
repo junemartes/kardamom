@@ -17,3 +17,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod pipeline;
+
+/// RPC-driven scenarios for the `cluster-e2e` binary: signing helpers + the
+/// transfer / deposit / contract-deploy flows that drive a *deployed* nomad
+/// cluster over its ingress JSON-RPC (and the in-cluster anvil L1). Gated
+/// behind `cluster-e2e` so the heavy alloy/jsonrpsee/da-watcher deps only
+/// compile when the client binary is built.
+#[cfg(feature = "cluster-e2e")]
+pub mod cluster_client;

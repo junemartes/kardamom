@@ -1,9 +1,11 @@
 # kardamom multi-node cluster (Vagrant → Ansible → Nomad/Docker)
 
 A reproducible **5-node** kardamom test/staging cluster on a single host. It is
-the multi-host successor to `crates/e2e/tests/multiprocess_e2e.rs`: Vagrant boots
-the VMs, Ansible installs the Nomad/Consul/Docker substrate, and Nomad runs the
-Aeron media-driver/archive and the kardamom service pipeline as containers.
+the multi-host home of the end-to-end pipeline test — the `cluster-e2e` client
+(`crates/e2e/src/bin/cluster_e2e.rs`) drives it over ingress JSON-RPC + the
+in-cluster anvil L1 — replacing the single-host `multiprocess_e2e.rs`. Vagrant
+boots the VMs, Ansible installs the Nomad/Consul/Docker substrate, and Nomad runs
+the Aeron media-driver/archive and the kardamom service pipeline as containers.
 
 See [`DESIGN.md`](./DESIGN.md) for the full design rationale.
 
@@ -154,8 +156,8 @@ multicast channel layout; only the batcher (#39) remains out of scope.
    (`ingress`/`sequencer`/`executor`/`sealer`/`da-watcher`) and the new
    `kardamom-recorder` now accept `--log-config <toml>` (env
    `KARDAMOM_LOG_CONFIG`) and load a `LogConfig` from it, falling back to the
-   built-in single-host IPC defaults when unset (so `multiprocess_e2e` and local
-   runs are unchanged). The Nomad jobs render `config/channels.toml.tpl` and pass
+   built-in single-host IPC defaults when unset (so single-host local runs like
+   `full_pipeline_e2e` are unchanged). The Nomad jobs render `config/channels.toml.tpl` and pass
    `--log-config /local/channels.toml`.
 2. ⛔ **Batcher is offline (#39).** `kardamom-batcher` still reads Aeron Archive
    segment files in `--dry-run`; its Nomad job remains a periodic/batch job, not

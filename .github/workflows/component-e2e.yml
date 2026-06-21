@@ -1,0 +1,94 @@
+name: component-e2e
+
+# In-process + per-component Aeron smoke tests under real Aeron in Docker. These
+# cover the log/transport codec round trip, the in-process proof-of-pipeline, and
+# the Aeron test harness itself — coverage the cluster-e2e (full orchestration)
+# gate does NOT duplicate.
+#
+# Split out of the retired `docker-e2e` workflow when the single-host
+# `multiprocess_e2e` test moved onto the nomad cluster: those subprocess
+# scenarios are now the `cluster-e2e` workflow's RPC-driven client (see
+# deploy/cluster + crates/e2e/src/bin/cluster_e2e.rs). Only the multiprocess
+# steps were dropped; everything here is what docker-e2e ran besides them.
+#
+# Runs on every PR (and pushes to main); opt out with the `skip-docker-e2e`
+# label for changes that can't affect the pipeline (e.g. docs-only PRs).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Smaller than the default 200 so this CI job stays fast.
+  KARDAMOM_E2E_N: 100
+
+jobs:
+  component-e2e:
+    if: >-
+      !contains(github.event.pull_request.labels.*.name, 'skip-docker-e2e')
+    name: component-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Aeron Media Driver build requires cmake + libuuid headers; the
+      # rusteron-* crates compile the C client from source via the cmake
+      # build-script. Pre-install before we touch cargo.
+      - name: Install system build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: component-e2e
+
+      # Sanity: ensure the Docker daemon is reachable (ubuntu-latest runners
+      # ship with Docker pre-installed) so we fail loudly here rather than
+      # mid-test.
+      - name: docker info
+        run: docker info
+
+      # Build the docker-e2e feature surface so the test binaries are up to date
+      # before we cargo-test the ignored cases.
+      - name: cargo build (docker-e2e feature)
+        run: |
+          cargo build \
+            -p kardamom-log \
+            -p e2e \
+            --features 'kardamom-log/docker-e2e,e2e/full-pipeline-e2e' \
+            --tests
+
+      # The in-process proof-of-pipeline: wires every kardamom subsystem as tokio
+      # tasks against one shared Aeron container, asserts tx_hash propagation +
+      # the libmdbx state-writer round trip.
+      - name: proof-of-pipeline test
+        run: |
+          cargo test \
+            -p e2e \
+            --features 'full-pipeline-e2e' \
+            --test full_pipeline_e2e -- --ignored --nocapture proof_of_pipeline
+
+      # Per-component docker_e2e smoke tests: bring up AeronTestCluster and assert
+      # the harness + live publisher/subscriber adapters come up.
+      - name: per-component docker_e2e smoke
+        run: |
+          cargo test \
+            -p kardamom-log \
+            --features 'docker-e2e' \
+            --test docker_e2e -- --ignored --nocapture
+          cargo test \
+            -p kardamom-log \
+            --features 'docker-e2e' \
+            --test aeron_live_e2e -- --ignored --nocapture

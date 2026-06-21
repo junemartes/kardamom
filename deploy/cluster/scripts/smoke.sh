@@ -24,8 +24,9 @@ VALUE="${VALUE:-1}"   # wei
 # see crates/ingress/src/json_rpc.rs), exactly like the e2e tests which sign
 # raw txs with explicit nonces. So we MUST pass the nonce ourselves — otherwise
 # `cast send` calls eth_getTransactionCount to fill it and fails. Account #0
-# starts at nonce 0; the caller bumps NONCE per send (the redundancy re-smoke
-# in ci-cluster.sh passes NONCE=1).
+# starts at nonce 0; the caller bumps NONCE per send. (ci-cluster.sh drives the
+# pipeline with the cluster-e2e client now, not this script — this stays as a
+# standalone manual gate; `make smoke` still uses it.)
 NONCE="${NONCE:-0}"
 
 echo "==> Smoke test against ingress: ${RPC_URL} (chain-id ${CHAIN_ID}, nonce ${NONCE})"

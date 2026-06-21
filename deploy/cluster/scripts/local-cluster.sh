@@ -53,12 +53,17 @@ build_binaries() {
     -e CARGO_TARGET_DIR=/ltarget -e CARGO_NET_RETRY=10 -e CARGO_HTTP_MULTIPLEXING=false \
     -w /work kardamom-local-build:latest bash -c '
       set -e
+      # Service binaries + the deployer (binary: kardamom-deploy — deploy.sh
+      # deploys the ETHLockbox on the anvil L1 so the deposit path works).
       cargo build --release \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
         -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
+        -p kardamom-deployer \
         --bins
       # The sustained-load + chaos harness ci-cluster.sh runs from target/release.
       cargo build --release -p kardamom-bench --bin kardamom-load
+      # The cluster-e2e client (ci-cluster.sh runs it as the gate + failover check).
+      cargo build --release -p e2e --features cluster-e2e --bin cluster-e2e
       # Stage exactly where ci-cluster.sh looks: the binaries in target/release,
       # and libaeron*.so under a build/*/out/build/lib path it greps for.
       # (kardamom-recorder removed — durability is archive-at-the-sealer.)
@@ -67,6 +72,10 @@ build_binaries() {
         cp -f "/ltarget/release/kardamom-$b" /work/target/release/
       done
       cp -f /ltarget/release/kardamom-load /work/target/release/
+      # The orchestrator-side binaries (run on the runner/orchestrator, not in a
+      # node container): the deployer + the e2e client.
+      cp -f /ltarget/release/kardamom-deploy /work/target/release/
+      cp -f /ltarget/release/cluster-e2e /work/target/release/
       find /ltarget/release/build -path "*/out/build/lib/libaeron*.so" \
         -exec cp -f {} /work/target/release/build/aeronstage/out/build/lib/ \;
       echo "staged: $(ls /work/target/release/build/aeronstage/out/build/lib/ | tr "\n" " ")"

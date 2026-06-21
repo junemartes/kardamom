@@ -8,11 +8,38 @@ publish = false
 default = []
 # Run the full-pipeline cross-component test under real Aeron in Docker.
 # Implies the `docker-e2e` testcontainers harness. Off by default so the
-# standard CI stays fast; the dedicated docker-e2e CI job opts in.
+# standard CI stays fast; the dedicated component-e2e CI job opts in.
 full-pipeline-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
+# Build the `cluster-e2e` client binary that drives the deployed nomad
+# cluster over its ingress JSON-RPC + the in-cluster anvil L1. Off by
+# default so a plain `cargo build` stays lean; the cluster-e2e CI job and
+# the `cluster-e2e-local` target opt in. Enables the alloy/jsonrpsee/
+# da-watcher deps the client needs (a bin can't use dev-dependencies).
+cluster-e2e = [
+    "dep:alloy-consensus",
+    "dep:alloy-network",
+    "dep:alloy-signer-local",
+    "dep:alloy-provider",
+    "dep:alloy-sol-types",
+    "dep:alloy-contract",
+    "dep:alloy-rlp",
+    "dep:jsonrpsee",
+    "dep:kardamom-da-watcher",
+    "dep:anyhow",
+    "dep:clap",
+    "dep:hex",
+    "dep:serde_json",
+]
 
 [lib]
 path = "src/lib.rs"
+
+# RPC-driven cluster e2e client. Gated behind `cluster-e2e` so it only
+# compiles (and pulls its deps) when that feature is enabled.
+[[bin]]
+name = "cluster-e2e"
+path = "src/bin/cluster_e2e.rs"
+required-features = ["cluster-e2e"]
 
 [dependencies]
 kardamom-log.workspace = true
@@ -24,33 +51,30 @@ rkyv.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
+# --- cluster-e2e client deps (optional; enabled by the `cluster-e2e` feature) ---
+# A binary target cannot use [dev-dependencies], so the client's deps live
+# here as optional and are switched on together by the feature above.
+alloy-consensus = { workspace = true, optional = true }
+alloy-network = { workspace = true, optional = true }
+alloy-signer-local = { workspace = true, optional = true }
+alloy-provider = { workspace = true, optional = true }
+alloy-sol-types = { workspace = true, optional = true }
+alloy-contract = { workspace = true, optional = true }
+alloy-rlp = { workspace = true, optional = true }
+jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
+kardamom-da-watcher = { path = "../da_watcher", optional = true }
+anyhow = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
+serde_json = { workspace = true, optional = true }
+
 [dev-dependencies]
-# Note: docker-e2e is activated only when the `full-pipeline-e2e`
-# feature is enabled (see [features] above).
-alloy-consensus.workspace = true
-alloy-contract.workspace = true
-alloy-network.workspace = true
-alloy-node-bindings.workspace = true
-alloy-provider.workspace = true
-alloy-rlp.workspace = true
-alloy-signer-local.workspace = true
-alloy-sol-types.workspace = true
-anyhow.workspace = true
-async-trait = "0.1"
+# Only the in-process `full_pipeline_e2e` test + the throughput bench remain
+# here; both are gated behind `full-pipeline-e2e`. The multiprocess test's
+# heavier deps (alloy signing/provider, jsonrpsee, deployer, service crates)
+# moved onto the cluster-e2e client above.
 criterion.workspace = true
-crossbeam-channel.workspace = true
-hex = "0.4"
-libc.workspace = true
-hdrhistogram.workspace = true
-jsonrpsee = { workspace = true, features = ["http-client"] }
-kardamom-da-watcher = { path = "../da_watcher" }
-kardamom-deployer = { path = "../deployer" }
-kardamom-executor = { path = "../executor" }
-kardamom-ingress = { path = "../ingress" }
-kardamom-sealer = { path = "../sealer" }
-kardamom-sequencer = { path = "../sequencer", features = ["testing"] }
 kardamom-state = { path = "../state" }
-serde_json.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
 

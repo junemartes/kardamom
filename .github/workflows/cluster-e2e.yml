@@ -86,13 +86,21 @@ jobs:
       # wraps each into a thin image (the in-image workspace build is too slow).
       # kardamom-load is the sustained-load + chaos harness ci-cluster.sh runs
       # from target/release (it stays on the runner, not in a service image).
-      - name: cargo build --release (service binaries + load harness)
+      # kardamom-deployer (binary: kardamom-deploy) is built too: deploy.sh uses
+      # it to deploy the ETHLockbox on the anvil L1 so the deposit path works.
+      - name: cargo build --release (service binaries + load harness + deployer)
         run: |
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-deployer \
             --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
+
+      # Build the cluster-e2e client: it drives the deployed cluster over
+      # ingress JSON-RPC + the anvil L1 (transfer / deposit / contract-deploy).
+      - name: cargo build --release (cluster-e2e client)
+        run: cargo build --release -p e2e --features cluster-e2e --bin cluster-e2e
 
       - name: Install Nomad CLI
         run: |
