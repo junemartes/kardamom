@@ -72,6 +72,19 @@ public final class SealerClusteredService implements ClusteredService {
     private Cluster cluster;
     private CanonicalSealerState state;
 
+    /**
+     * Whether the repeating boundary timer is currently armed. Aeron forbids
+     * {@code scheduleTimer} from {@link #onStart} and {@link #doBackgroundWork}
+     * ("sending messages or scheduling timers is not allowed from …"); it is only
+     * permitted while processing the replicated log. The first arming therefore
+     * happens from {@link #onNewLeadershipTermEvent} (a log-driven callback fired
+     * on every member when a leadership term is established, including after a
+     * failover); subsequent re-arms chain from {@link #onTimerEvent}. This flag
+     * keeps exactly one timer live so the leadership-term arming and the
+     * onTimerEvent re-arm never double-schedule.
+     */
+    private boolean boundaryTimerArmed;
+
     // Scratch buffers for ingress id extraction and egress framing. Reused to
     // avoid per-message allocation on the single cluster service thread.
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
@@ -101,7 +114,30 @@ public final class SealerClusteredService implements ClusteredService {
         } else {
             this.state = new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
         }
-        scheduleBoundaryTimer();
+        // Do NOT scheduleTimer here: Aeron rejects it from onStart. The boundary
+        // timer is first armed from onNewLeadershipTermEvent (see field doc).
+        this.boundaryTimerArmed = false;
+    }
+
+    @Override
+    public void onNewLeadershipTermEvent(
+            final long leadershipTermId,
+            final long logPosition,
+            final long timestamp,
+            final long termBaseLogPosition,
+            final int leaderMemberId,
+            final int logSessionId,
+            final java.util.concurrent.TimeUnit timeUnit,
+            final int appVersion) {
+        // First sanctioned point to schedule a timer (this is log-driven, unlike
+        // onStart/doBackgroundWork). Arm the repeating boundary timer once; the
+        // onTimerEvent re-arm keeps it going. Fires on every leadership term,
+        // including the one established after a failover, so a member that becomes
+        // leader without ever having armed the timer (e.g. it started as follower)
+        // still gets a live boundary cadence.
+        if (!boundaryTimerArmed) {
+            scheduleBoundaryTimer();
+        }
     }
 
     @Override
@@ -212,6 +248,7 @@ public final class SealerClusteredService implements ClusteredService {
         while (!cluster.scheduleTimer(BOUNDARY_TIMER_CORRELATION_ID, deadline)) {
             cluster.idleStrategy().idle();
         }
+        boundaryTimerArmed = true;
     }
 
     private void offerRelayed(final ClientSession session, final Relayed relayed) {

@@ -23,6 +23,22 @@ application {
     mainClass = 'io.kardamom.sealer.cluster.ClusterNode'
 }
 
+// The in-JVM Aeron TestCluster failover test (SealerClusterFailoverTest) runs real
+// media drivers + consensus modules in-process. Agrona's TransportPoller and Aeron's
+// unsafe buffers require these JDK module opens on Java 17, and the 3-member cluster
+// plus client needs more heap than the default forked test JVM.
+tasks.named('test') {
+    jvmArgs(
+        '-XX:+EnableDynamicAgentLoading',
+        '--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.util.zip=ALL-UNNAMED',
+        '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED'
+    )
+    maxHeapSize = '1g'
+    // TestCluster spins up many threads; give the forked worker a single test fork.
+    maxParallelForks = 1
+}
+
 tasks.named('shadowJar') {
     archiveBaseName = 'kardamom-cluster-node'
     archiveClassifier = ''
