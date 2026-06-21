@@ -25,6 +25,19 @@ CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="$(cd "${CLUSTER_DIR}/../.." && pwd)"
 cd "${CLUSTER_DIR}"
 
+# The cluster-e2e client binary (built --release by the workflow) drives the
+# pipeline over ingress JSON-RPC + the anvil L1. LOCKBOX_FILE is where deploy.sh
+# writes the resolved ETHLockbox address; export it so the deploy.sh invoked
+# below writes to the same path this script reads back for the client.
+E2E_BIN="${ROOT}/target/release/cluster-e2e"
+export LOCKBOX_FILE="${LOCKBOX_FILE:-/tmp/kardamom-lockbox}"
+
+# cluster-e2e is a pure RPC client, but kardamom-log sits in its dependency tree;
+# point the dynamic loader at the Aeron .so's that Phase 5 stages under
+# target/release, as a safeguard against a libaeron NEEDED entry on Linux. The
+# dir is populated before the gate (Phase 6) runs; absent => harmless.
+run_e2e() { LD_LIBRARY_PATH="${ROOT}/target/release/_aeronlibs:${LD_LIBRARY_PATH:-}" "${E2E_BIN}" "$@"; }
+
 NET=kardamom-net
 SUBNET=192.168.56.0/24
 REGISTRY=192.168.56.10:5000
@@ -383,8 +396,24 @@ export NOMAD_ADDR="http://192.168.56.10:4646"
 log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 ./scripts/deploy.sh
 
-log "smoke test (gate: single-tx must pass before load smoke runs)"
-./scripts/smoke.sh
+# Cluster e2e client (gate): the richer replacement for the single-tx smoke.
+# Drives the deployed cluster over ingress JSON-RPC + the anvil L1 and asserts a
+# signed transfer round-trip, an L1→L2 deposit (anvil depositETH → da-watcher →
+# executor → receipt-by-source_hash), and a contract deploy — all over plain
+# JSON-RPC. deploy.sh wrote the deployed Lockbox address to LOCKBOX_FILE; if it
+# is absent (deploy skipped), fall back to the non-deposit scenarios so the gate
+# still exercises transfers + contract deploy. Account #0 L2 nonces 0-3.
+log "cluster-e2e gate (transfer + deposit + contract-deploy)"
+[[ -x "${E2E_BIN}" ]] || { echo "ERROR: cluster-e2e binary not found at ${E2E_BIN}" >&2; exit 1; }
+LOCKBOX_ADDRESS="$(cat "${LOCKBOX_FILE}" 2>/dev/null || true)"
+if [[ -n "${LOCKBOX_ADDRESS}" ]]; then
+  log "  lockbox ${LOCKBOX_ADDRESS}: running all scenarios"
+  run_e2e all --lockbox "${LOCKBOX_ADDRESS}"
+else
+  log "  no lockbox address; deposit scenario skipped (transfer + contract-deploy only)"
+  run_e2e transfer --count 3 --start-nonce 0
+  run_e2e contract-deploy --nonce 3
+fi
 
 # --- 7. High sustained-load (Rust harness: ramp -> soak; must-deliver + drop
 # accounting + keep-pace) then 8. chaos/resilience suite. Both use kardamom-load
@@ -394,12 +423,12 @@ log "smoke test (gate: single-tx must pass before load smoke runs)"
 #
 # Funded-account budget: genesis prefunds Anvil accounts #0..#15, each its own
 # contiguous nonce chain on the never-reset chain (a fresh account's first tx
-# MUST be nonce 0, with no gaps). Allocation: #0 = gate smoke above; #1..#6 =
-# the sustained-load harness; #7..#15 = one fresh account per chaos case (see
-# chaos.sh). This disjoint split is why no stage needs nonce-continuation.
-# RUN_LOAD / RUN_CHAOS (default 1) let a CI shard run just one stage so the full
-# soak can be split across runners (each shard brings up its own cluster). The
-# always-on per-PR run leaves both at 1.
+# MUST be nonce 0, with no gaps). Allocation: #0 = cluster-e2e gate above (nonces
+# 0-3: transfer x3 + contract deploy); #1..#6 = the sustained-load harness;
+# #7..#15 = one fresh account per chaos case (see chaos.sh). This disjoint split
+# is why no stage needs nonce-continuation. RUN_LOAD / RUN_CHAOS (default 1) let
+# a CI shard run just one stage so the full soak can be split across runners
+# (each shard brings up its own cluster). The always-on per-PR run leaves both at 1.
 LOAD_BIN="${ROOT}/target/release/kardamom-load"
 if [[ -x "${LOAD_BIN}" ]]; then
   if [[ "${RUN_LOAD:-1}" == "1" ]]; then
@@ -430,15 +459,17 @@ if [[ -x "${LOAD_BIN}" ]]; then
   fi
 else
   # Fallback (kardamom-load not staged): the legacy bash load smoke (accounts
-  # #1..#4) + single subscriber-churn check.
+  # #1..#4) + a single subscriber-churn check via the cluster-e2e client.
   log "WARN: ${LOAD_BIN} not found — running legacy load smoke + subscriber-churn"
   SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
-  log "subscriber-churn: stopping one executor alloc and re-running smoke"
+  log "subscriber-churn: stopping one executor alloc and re-running the e2e transfer"
   docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
     alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
     [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
   sleep 5
-  NONCE=1 ./scripts/smoke.sh
+  # Gate ran account #0 nonces 0-3; load smoke used offset 1 (never #0); so #0
+  # nonce 4 is free for this churn re-check (ingress can't fill the nonce).
+  run_e2e transfer --count 1 --start-nonce 4
 fi
 
 log "cluster-e2e PASSED"

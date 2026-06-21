@@ -1,6 +1,6 @@
 # Canonical cluster contract — single source of truth for the whole deploy.
-# Vagrantfile, Ansible roles, Nomad job templates, and config templates all
-# derive their values from here (or mirror it; see deploy/cluster/README.md).
+# Ansible roles, Nomad job templates, and config templates all derive their
+# values from here (or mirror it; see deploy/cluster/README.md).
 ---
 # --- versions -------------------------------------------------------------
 nomad_version: "1.9.5"

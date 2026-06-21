@@ -1,18 +1,20 @@
-# kardamom multi-node cluster (Vagrant → Ansible → Nomad/Docker)
+# kardamom multi-node cluster (Ansible → Nomad/Docker)
 
-A reproducible **5-node** kardamom test/staging cluster on a single host. It is
-the multi-host successor to `crates/e2e/tests/multiprocess_e2e.rs`: Vagrant boots
-the VMs, Ansible installs the Nomad/Consul/Docker substrate, and Nomad runs the
-Aeron media-driver/archive and the kardamom service pipeline as containers.
+A reproducible kardamom test/staging cluster on a single Docker host. It is the
+multi-host home of the end-to-end pipeline test — the `cluster-e2e` client
+(`crates/e2e/src/bin/cluster_e2e.rs`) drives it over ingress JSON-RPC + the
+in-cluster anvil L1 — replacing the single-host `multiprocess_e2e.rs`. Ansible
+installs the Nomad/Consul/Docker substrate, and Nomad runs the Aeron
+media-driver/archive and the kardamom service pipeline. The nodes are containers
+on one Docker host: run it locally with `scripts/local-cluster.sh` (macOS Docker
+Desktop or Linux), or in CI via `scripts/ci-cluster.sh`.
 
 See [`DESIGN.md`](./DESIGN.md) for the full design rationale.
 
-> **Status: scaffold.** All cluster definition lives here and is reviewable, but
-> the full `make up` flow has **not** been executed end-to-end (this was authored
-> in an environment without libvirt/Vagrant/Nomad). It also depends on the
-> service-side changes listed under **[Required service changes](#required-service-changes)**
-> before the pipeline will actually run multi-host over Aeron UDP. Treat job
-> specs / playbooks as needing a real run-through on a virtualization host.
+> **Status: experimental.** All cluster definition lives here and is reviewable.
+> The container bring-up (`scripts/ci-cluster.sh`, the `cluster-e2e` workflow) is
+> wired but still iterating on a real runner; treat the job specs / playbooks as
+> needing a green end-to-end run.
 
 ## Topology (default)
 
@@ -36,11 +38,13 @@ values are defined once in
 **Quickest path:** from the repo root, `just cluster-bootstrap` installs all of
 the host tools below for your platform, and `just cluster-doctor` verifies them.
 
-Install on the **host** machine (the in-VM Nomad/Consul agents are installed
-by Ansible):
+Install on the **host** machine (the in-container Nomad/Consul agents are
+installed by Ansible):
 
-- [Vagrant](https://www.vagrantup.com/) + a provider: **libvirt** (primary) or
-  VirtualBox (fallback).
+- Docker — Docker Desktop on macOS, or Docker Engine on Linux. The cluster nodes
+  run as privileged systemd containers via `scripts/local-cluster.sh` /
+  `scripts/ci-cluster.sh`; on macOS, `local-cluster.sh` runs the harness inside a
+  privileged orchestrator container so the host sysctls / bridge tweaks apply.
 - Ansible (`ansible-playbook`) + collections:
   `ansible-galaxy collection install ansible.posix community.docker`.
 - Docker with **BuildKit** (`DOCKER_BUILDKIT=1`) to build + push the
@@ -48,77 +52,74 @@ by Ansible):
   (including the bundled Aeron C/Java sources via rusteron) — the first build is
   slow and needs the full native toolchain (baked into the builder stage).
 - The **host Docker daemon must allow the in-cluster registry as insecure**
-  (it is plain HTTP): add `{ "insecure-registries": ["192.168.56.11:5000"] }`
+  (it is plain HTTP): add `{ "insecure-registries": ["192.168.56.10:5000"] }`
   to `/etc/docker/daemon.json` (Linux) or Docker Desktop → Settings → Docker
   Engine, then restart Docker. `make images` pushes fail without this.
 - The **Nomad CLI** on the host — `scripts/deploy.sh` drives the cluster's
   Nomad HTTP API from the host (`just cluster-bootstrap` installs a pinned
   version).
-- Foundry's `cast` for the smoke test (the repo-level `just bootstrap`
-  installs Foundry).
-- ~18 GB RAM free (3×3 GB recorder VMs + 2×4 GB worker VMs; recorders run a
-  JVM archive + the executor runs revm).
+- Foundry (`forge`/`cast`) — `forge` builds the deployer (ETHLockbox bytecode),
+  `cast` backs the standalone smoke script (the repo-level `just bootstrap`
+  installs Foundry). `local-cluster.sh` bakes both into its build/orchestrator
+  images, so they're only needed on the host for the `scripts/deploy.sh` path.
+- Enough RAM for ~9 node containers each running a trimmed Aeron media driver
+  (JVM) + its service (the executor runs revm).
 
 ## Quick start
 
 ```sh
 cd deploy/cluster
-make up        # vagrant up → ansible → build+push images → nomad run
-make smoke     # pipeline smoke test against ingress (see note below)
-make status    # nomad/consul/job health
-make down      # stop jobs + vagrant destroy
+make up           # scripts/local-cluster.sh: build + bring up + run the e2e
+KEEP=1 make up    # leave the cluster up to inspect afterwards
+make status       # container + nomad/consul/job health
+make down         # tear down containers + bridge network
 ```
 
-`make up` runs these phases (each is an individual target too):
+`make up` runs `scripts/local-cluster.sh`, which (1) builds the service binaries
++ the deployer + the cluster-e2e client in a reproducible builder image, (2)
+brings up the node containers on a `192.168.56.0/24` bridge, (3) provisions them
+with the UNMODIFIED `site.yml` (Docker, Consul, Nomad, the local registry, the
+tmpfs `aeron.dir`, Nomad node role tags), (4) deploys the Nomad jobs — the Aeron
+**system** job, the anvil L1, the ETHLockbox on that L1, then the service
+pipeline — and (5) runs the cluster-e2e client (transfer + deposit +
+contract-deploy + executor-failover). On Linux you can run
+`scripts/ci-cluster.sh` directly; `local-cluster.sh` wraps it for macOS.
 
-1. `make vms` — `vagrant up` boots the 5 VMs with static IPs + role tags.
-2. `make provision` — `ansible-playbook site.yml` installs Docker, Consul, Nomad,
-   the local registry, the tmpfs `aeron.dir`, and tags Nomad nodes with their role.
-3. `make images` — build the per-service + Aeron images on the host and push them
-   to the registry on `r1`.
-4. `make deploy` — `nomad run` the Aeron **system** job (ArchivingMediaDriver on
-   every node), the anvil L1, then the service jobs.
-
-`make smoke` submits `eth_sendRawTransaction` through ingress and asserts
-receipts (see `scripts/smoke.sh`). It is intentionally **not** chained into
-`make up`: until the channels-config plumbing lands (issue #36, item 1 under
-[Required service changes](#required-service-changes)) the services use
-single-host IPC channel defaults, so the cross-host pipeline — and therefore
-the smoke test — is **expected to fail**.
+`scripts/smoke.sh` remains a standalone single-transfer check against a running
+ingress (`make smoke`); the full e2e is the cluster-e2e client above.
 
 ## Layout
 
 ```
 deploy/cluster/
   DESIGN.md                 design rationale
-  Vagrantfile               5 libvirt/VirtualBox VMs, static IPs, role tags
-  Makefile                  up / vms / provision / images / deploy / smoke /
+  Makefile                  up / images / deploy / smoke / status /
                             validate / check-contract / down
   .yamllint                 lint config (matches ansible-lint's yaml rule)
   ansible/
-    ansible.cfg, inventory.ini
+    ansible.cfg
     group_vars/all.yml      ← canonical contract (IPs, ports, versions, paths)
     site.yml
     roles/{common,docker,consul,nomad,registry}/
   docker/
+    node.Dockerfile         privileged systemd node container (DinD for Nomad)
+    ci-service.Dockerfile   thin runtime wrapping a prebuilt service binary
     service.Dockerfile      multi-stage cargo build → slim runtime (BIN arg)
-                            (the Aeron image builds straight from the canonical
-                            crates/log/docker/aeron/Dockerfile — no copy here)
+    local-build.Dockerfile  reproducible builder image (local-cluster.sh)
+    orchestrator.Dockerfile docker CLI + ansible + nomad (local-cluster.sh)
   nomad/
     aeron.system.nomad.hcl  ArchivingMediaDriver (driver+archive), system job,
                             all nodes
-    recorder.system.nomad.hcl  kardamom-recorder, records tx_ordering +
-                            publishes fsync watermark (role=recorder)
-    quorum.nomad.hcl        kardamom-recorder --aggregate (quorum watermark,
-                            count=1)
-    anvil.nomad.hcl         in-cluster L1 for the smoke test
+    anvil.nomad.hcl         in-cluster L1 (deposit path + smoke)
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
     sealer.nomad.hcl   da-watcher.nomad.hcl  batcher.nomad.hcl
   config/                   *.toml(.tpl) pulled into the job specs via file();
                             channels.toml.tpl is the shared LogConfig
   scripts/
-    deploy.sh               submit jobs in dependency order, wait for allocs
-    smoke.sh                transfers smoke test against the ingress endpoint
+    ci-cluster.sh           bring up the container cluster + deploy + run e2e
+    local-cluster.sh        macOS/Docker-Desktop wrapper around ci-cluster.sh
+    deploy.sh               submit jobs in dependency order, deploy the lockbox
+    smoke.sh / smoke-load.sh  standalone transfer + sustained-load checks
     check-contract.py       fail if any mirror of group_vars/all.yml drifts
 ```
 
@@ -154,8 +155,8 @@ multicast channel layout; only the batcher (#39) remains out of scope.
    (`ingress`/`sequencer`/`executor`/`sealer`/`da-watcher`) and the new
    `kardamom-recorder` now accept `--log-config <toml>` (env
    `KARDAMOM_LOG_CONFIG`) and load a `LogConfig` from it, falling back to the
-   built-in single-host IPC defaults when unset (so `multiprocess_e2e` and local
-   runs are unchanged). The Nomad jobs render `config/channels.toml.tpl` and pass
+   built-in single-host IPC defaults when unset (so single-host local runs like
+   `full_pipeline_e2e` are unchanged). The Nomad jobs render `config/channels.toml.tpl` and pass
    `--log-config /local/channels.toml`.
 2. ⛔ **Batcher is offline (#39).** `kardamom-batcher` still reads Aeron Archive
    segment files in `--dry-run`; its Nomad job remains a periodic/batch job, not

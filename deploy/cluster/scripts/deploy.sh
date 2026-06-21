@@ -18,6 +18,7 @@ set -euo pipefail
 # --- locate the nomad/ job dir relative to this script ----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ROOT="$(cd "${CLUSTER_DIR}/../.." && pwd)"
 NOMAD_DIR="${CLUSTER_DIR}/nomad"
 
 # The job specs pull their template payloads with file("config/...") — those
@@ -26,6 +27,10 @@ cd "${CLUSTER_DIR}"
 
 export NOMAD_ADDR="${NOMAD_ADDR:-http://192.168.56.10:4646}"
 LOCKBOX_ADDRESS="${LOCKBOX_ADDRESS:-}"
+# Anvil L1 endpoint (control node) + a file the deploy step writes the resolved
+# Lockbox address to, so ci-cluster.sh can hand it to the cluster-e2e client.
+ANVIL_L1_RPC="${ANVIL_L1_RPC:-http://192.168.56.10:8546}"
+LOCKBOX_FILE="${LOCKBOX_FILE:-/tmp/kardamom-lockbox}"
 
 echo "==> Nomad endpoint: ${NOMAD_ADDR}"
 echo "==> Job specs:      ${NOMAD_DIR}"
@@ -36,6 +41,20 @@ if ! command -v nomad >/dev/null 2>&1; then
 fi
 
 # --- helpers ----------------------------------------------------------------
+
+# Resolve the kardamom-deploy binary: PATH first, then the workspace target dir
+# (CI builds it under target/release). Prints the path; returns 1 if not found.
+resolve_deploy_bin() {
+  if command -v kardamom-deploy >/dev/null 2>&1; then
+    command -v kardamom-deploy
+    return 0
+  fi
+  local p
+  for p in "${ROOT}/target/release/kardamom-deploy" "${ROOT}/target/debug/kardamom-deploy"; do
+    [[ -x "${p}" ]] && { echo "${p}"; return 0; }
+  done
+  return 1
+}
 
 run_job() {
   local file="$1"
@@ -104,6 +123,57 @@ echo
 echo "### Phase 2: anvil L1"
 run_job "anvil.nomad.hcl"
 wait_running "anvil" 120
+
+# --- 2b. Deploy ETHLockbox on the anvil L1 (enables the deposit path) --------
+# The da-watcher needs a real Lockbox address at job-submit time. If the caller
+# didn't supply LOCKBOX_ADDRESS, deploy it here — AFTER anvil is up and BEFORE
+# the da-watcher job is submitted in Phase 3 — and fan the address out via
+# LOCKBOX_ADDRESS (for the -var below) + LOCKBOX_FILE (for ci-cluster.sh's
+# cluster-e2e client). Best-effort: if kardamom-deploy or a reachable anvil is
+# missing, fall back to the placeholder (transfers still work; only the deposit
+# path is disabled — exactly the prior behaviour).
+echo
+echo "### Phase 2b: ETHLockbox deploy"
+# ERC-7955 permissionless CREATE2 factory (kardamom_deployer::addresses).
+ERC7955_FACTORY="0xC0DEb853af168215879d284cc8B4d0A645fA9b0E"
+ERC7955_RUNTIME="0x60203d3d3582360380843d373d34f5806019573d813d933efd5b3d52f33d52"
+# Anvil dev account #0 — funded on anvil's default mnemonic; serves as the
+# factory owner, the deploy payer, and (later) the depositor.
+DEV_KEY="0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+DEV_OWNER="0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"
+# Opaque L2 minter baked into the lockbox at init (the executor mints
+# unconditionally from a Deposit, so the L2-side mint authority is not exercised).
+L2_MINTER="0x000000000000000000000000000000000000bEEF"
+
+if [[ -n "${LOCKBOX_ADDRESS}" ]]; then
+  echo "    LOCKBOX_ADDRESS preset (${LOCKBOX_ADDRESS}); skipping deploy."
+elif DEPLOY_BIN="$(resolve_deploy_bin)"; then
+  echo "==> injecting ERC-7955 factory bytecode via anvil_setCode (${ANVIL_L1_RPC})"
+  if curl -fsS -X POST "${ANVIL_L1_RPC}" -H 'content-type: application/json' \
+       -d "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"anvil_setCode\",\"params\":[\"${ERC7955_FACTORY}\",\"${ERC7955_RUNTIME}\"]}" \
+       >/dev/null; then
+    echo "==> ${DEPLOY_BIN} deploy ETHLockbox (l2-chain-id 412346)"
+    DEPLOY_OUT="$("${DEPLOY_BIN}" --rpc-url "${ANVIL_L1_RPC}" --owner "${DEV_OWNER}" \
+      deploy ETHLockbox --private-key "${DEV_KEY}" \
+      --l2-chain-id 412346 --l2-minter "${L2_MINTER}")"
+    echo "${DEPLOY_OUT}"
+    # `kardamom-deploy deploy` prints registry entries; the proxy line is the
+    # Lockbox address. Only ETHLockbox is registered on a fresh anvil.
+    LOCKBOX_ADDRESS="$(printf '%s\n' "${DEPLOY_OUT}" | awk '/^[[:space:]]*proxy[[:space:]]/{print $2; exit}')"
+    [[ "${LOCKBOX_ADDRESS}" == 0x* ]] \
+      || { echo "ERROR: could not parse lockbox proxy from deploy output." >&2; exit 1; }
+    echo "    ETHLockbox proxy: ${LOCKBOX_ADDRESS}"
+  else
+    echo "WARNING: anvil_setCode failed; deposit path disabled." >&2
+  fi
+else
+  echo "WARNING: kardamom-deploy not found on PATH or under target/; deposit" >&2
+  echo "         path disabled (da-watcher will use its placeholder address)." >&2
+fi
+
+# Publish the resolved address (if any) for ci-cluster.sh's cluster-e2e client.
+rm -f "${LOCKBOX_FILE}"
+[[ -n "${LOCKBOX_ADDRESS}" ]] && echo "${LOCKBOX_ADDRESS}" > "${LOCKBOX_FILE}"
 
 # --- 3. Service pipeline ----------------------------------------------------
 # The sealer is launched FIRST: besides ordering, it owns the durability
