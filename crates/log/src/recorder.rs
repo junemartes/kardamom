@@ -76,10 +76,20 @@ pub fn connect_client(aeron_dir: Option<&Path>) -> Result<AeronClient, LogError>
 /// against the same Media Driver: this one for archive control, and a
 /// [`connect_client`] one for publishing the fsync watermark.
 pub struct ArchiveSession {
-    /// Held only to keep the archive's client conductor alive; never used
-    /// directly (the `archive` drives all control calls).
+    /// The archive's own Aeron client conductor. Kept to outlive `archive`;
+    /// also exposed via [`ArchiveSession::aeron`] so a replay subscriber can
+    /// open its multi-destination subscription on the same client.
     _aeron: rusteron_archive::Aeron,
     pub archive: Archive,
+}
+
+impl ArchiveSession {
+    /// The archive-side Aeron client. A replay-merge subscriber opens its
+    /// `control-mode=manual` subscription on this client so the subscription
+    /// and the archive control session share one media-driver conductor.
+    pub fn aeron(&self) -> &rusteron_archive::Aeron {
+        &self._aeron
+    }
 }
 
 /// Connect an `AeronArchive` control session over the configured archive
@@ -132,12 +142,21 @@ pub fn connect_archive(
     })
 }
 
-/// Which logical stream a recorder is tailing. TxOrdering (recorded once, at
-/// the sealer) feeds the single durable watermark.
+/// Which logical stream a recorder is tailing.
+///
+/// `TxOrdering` (recorded once, at the sealer) feeds the single durable
+/// watermark. `TxData` / `TxDeposits` are recorded so the executor can replay
+/// the full transaction/deposit envelopes on crash recovery (see
+/// [`crate::replay`]) — without them, only the canonical order survives a
+/// restart, not the bytes needed to re-execute.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecorderKind {
     /// TxOrdering canonical-orderer recorder (carries tiny TxRefs).
     TxOrdering,
+    /// Per-sequencer TxData recorder (carries full `TxEnvelope` bytes).
+    TxData { sequencer_id: u8 },
+    /// TxDeposits recorder (carries full `Deposit` envelopes from the DA watcher).
+    TxDeposits,
 }
 
 pub struct Recorder {
@@ -179,6 +198,23 @@ impl Recorder {
             "B-MDC",
             should_stop,
         )
+    }
+
+    /// Start recording an arbitrary `(channel, stream_id)` — the generic entry
+    /// point used by the per-sequencer `tx_data` recorder (in the sequencer
+    /// process) and the `tx_deposits` recorder (in the DA watcher), so the
+    /// executor can replay full transaction / deposit envelopes on crash
+    /// recovery. `kind` selects the log label; the channel transport (IPC vs
+    /// UDP) chooses the archive source location automatically. Returns
+    /// `Ok(None)` if `should_stop` fires before the recording materialises.
+    pub fn start_stream(
+        archive: Archive,
+        channel: &str,
+        stream_id: i32,
+        kind: RecorderKind,
+        should_stop: &mut dyn FnMut() -> bool,
+    ) -> Result<Option<Self>, LogError> {
+        Self::start_inner(archive, channel, stream_id, kind, "stream", should_stop)
     }
 
     /// Returns `Ok(None)` if `should_stop` fired before a recording appeared

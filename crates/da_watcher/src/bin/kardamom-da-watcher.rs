@@ -23,6 +23,7 @@ use kardamom_da_watcher::{
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
 use kardamom_log::config::LogConfig;
+use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
 use kardamom_types::{BPosition, Deposit};
 
 #[derive(Debug, Parser)]
@@ -52,6 +53,11 @@ struct Args {
     /// default). The local-e2e `just` recipe always passes this explicitly.
     #[arg(long)]
     aeron_dir: Option<PathBuf>,
+    /// Record the tx_deposits publication to the Aeron Archive so the executor
+    /// can replay deposit envelopes on crash recovery (`kardamom_log::replay`).
+    /// Off by default; the cluster sets this where the archive runs.
+    #[arg(long, env = "KARDAMOM_ARCHIVE_DURABILITY", default_value_t = false)]
+    archive_durability: bool,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9005")]
     metrics_addr: SocketAddr,
@@ -90,15 +96,38 @@ fn main() -> anyhow::Result<()> {
         .enable_all()
         .build()?;
 
-    let channels = LogConfig::resolve(args.log_config.as_deref())
-        .context("resolve log config")?
-        .channels;
+    let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let channels = resolved.channels;
+    let aeron_cfg = resolved.aeron;
     let aeron_rt = match args.aeron_dir.as_ref() {
         Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
     let tx_deposits_pub = TxDepositsPublisherHandle::open(&aeron_rt, &channels)
         .context("open TxDepositsPublisherHandle")?;
+
+    // Archive recorder for tx_deposits, co-located with the publisher here, so
+    // the executor can replay deposit envelopes on crash recovery.
+    let recorder_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder_handle = if args.archive_durability {
+        let aeron_dir = args.aeron_dir.clone();
+        let channels = channels.clone();
+        let stop = recorder_stop.clone();
+        Some(
+            std::thread::Builder::new()
+                .name("da-watcher-tx-deposits-recorder".into())
+                .spawn(move || {
+                    if let Err(e) =
+                        run_tx_deposits_recorder(aeron_dir.as_deref(), &channels, &aeron_cfg, stop)
+                    {
+                        tracing::error!(error = %e, "tx_deposits recorder exited with error");
+                    }
+                })
+                .expect("spawn tx_deposits recorder thread"),
+        )
+    } else {
+        None
+    };
 
     rt.block_on(async move {
         let provider = ProviderBuilder::new()
@@ -129,7 +158,45 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })?;
+    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(h) = recorder_handle {
+        let _ = h.join();
+    }
     drop(aeron_rt);
+    Ok(())
+}
+
+/// Connect a thread-confined archive session and record the tx_deposits
+/// publication until `stop` is set. The recording runs in the
+/// ArchivingMediaDriver; this thread keeps the session connected (and re-adopts
+/// an existing recording on restart).
+fn run_tx_deposits_recorder(
+    aeron_dir: Option<&std::path::Path>,
+    channels: &kardamom_log::config::ChannelsConfig,
+    aeron_cfg: &kardamom_log::config::AeronConfig,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
+    let session = connect_archive(aeron_dir, aeron_cfg).context("connect archive")?;
+    let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
+    let recorder = match Recorder::start_stream(
+        session.archive,
+        &channels.tx_deposits_channel,
+        channels.tx_deposits_stream_id,
+        RecorderKind::TxDeposits,
+        &mut should_stop,
+    )
+    .context("start tx_deposits recording")?
+    {
+        Some(r) => r,
+        None => return Ok(()),
+    };
+    tracing::info!(
+        recording_id = recorder.recording_id(),
+        "da-watcher: recording tx_deposits"
+    );
+    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
     Ok(())
 }
 

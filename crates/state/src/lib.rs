@@ -6,6 +6,7 @@
 pub mod compaction;
 pub mod env;
 pub mod error;
+pub mod genesis;
 pub mod geometry;
 pub mod meta;
 pub mod recovery;
@@ -17,6 +18,7 @@ pub mod writer;
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;
+pub use genesis::{genesis_applied, seed_genesis};
 pub use recovery::{RecoveryPoint, read_recovery_point};
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};

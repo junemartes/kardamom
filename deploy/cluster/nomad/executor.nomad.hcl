@@ -12,6 +12,11 @@
 #
 # Mounts both the shared Aeron tmpfs aeron.dir AND the persistent state_dir
 # (/opt/kardamom/state) for the libmdbx StateWriter so state survives restarts.
+# On a restart against a non-empty state_dir the executor runs Phase-2 crash
+# recovery: it replays tx_ordering + tx_data + tx_deposits from the Aeron Archive
+# (replay-merge) and skip-counts past its durable cursor. That needs the archive
+# replay endpoints (--replay/--live-destination-endpoint below) and the ingress /
+# da-watcher recording tx_data / tx_deposits (--archive-durability on those jobs).
 #
 # NOTE: this job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory (scripts/deploy.sh does this).
@@ -91,6 +96,13 @@ job "executor" {
           "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
+          # Crash-recovery archive replay-merge endpoints (used only when the
+          # state DB is non-empty, i.e. on a restart). Bind on this node's
+          # cluster NIC (${meta.node_ip}, same as the sequencer's MDC control)
+          # at ports 40130/40131; one executor per node (distinct_hosts) so no
+          # cross-replica collision.
+          "--replay-destination-endpoint", "${meta.node_ip}:40130",
+          "--live-destination-endpoint", "${meta.node_ip}:40131",
         ]
       }
 

@@ -78,6 +78,27 @@ pub trait StateWriterQueue: Send {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError>;
 }
 
+/// Where a restarted executor resumes from, derived from the persisted state
+/// cursor (`kardamom_state::RecoveryPoint`). When present, the exec thread is
+/// fed the canonical `tx_ordering` stream **from the archive replay** (record 0
+/// onward) and skips everything it already committed:
+///
+/// - `block` — the last durably-committed block (`last_committed_block`). Every
+///   replayed `BoundaryStart` with `block_number <= block` is skipped (not
+///   re-committed); the post-`block` state snapshot is what execution resumes
+///   against.
+/// - `record_count` — the cumulative count of canonical records (TxRef +
+///   DepositRef) applied through `block` (`last_fsynced_b_position.as_index()`).
+///   Every replayed `Tx`/`Deposit` with cumulative index `< record_count` is
+///   skipped (not re-executed). Because `record_count` is exactly the end count
+///   of `block`, the skip boundary falls cleanly between blocks — no partial
+///   block is ever half-replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumePoint {
+    pub block: u64,
+    pub record_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExecutorConfig {
     pub chain_id: u64,
@@ -137,6 +158,7 @@ impl Executor {
         sw_signal: Q,
         sw_queue: P,
         initial_block: u64,
+        resume: Option<ResumePoint>,
     ) -> Result<(), ExecutorError>
     where
         C: TxReceiptsPublication + 'static,
@@ -178,6 +200,7 @@ impl Executor {
             sw_signal,
             sw_queue,
             initial_block,
+            resume,
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
@@ -247,6 +270,10 @@ impl DepositSubscription for BoxedDepSub {
     }
 }
 
+// 8 args mirrors `Executor::run`'s shape (readers/exec/commit wiring); a config
+// struct would just shuffle the same fields behind one name. See the note on
+// `Executor::run`.
+#[allow(clippy::too_many_arguments)]
 fn spawn_exec<S, Q, P>(
     cfg: ExecutorConfig,
     rx: Receiver<ReaderToExec>,
@@ -255,6 +282,7 @@ fn spawn_exec<S, Q, P>(
     mut sw_signal: Q,
     mut sw_queue: P,
     initial_block: u64,
+    resume: Option<ResumePoint>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     S: SnapshotSource + 'static,
@@ -264,17 +292,33 @@ where
     thread::Builder::new()
         .name("executor-exec".into())
         .spawn(move || -> Result<(), ExecutorError> {
+            // Recovery: on a restart the exec thread is fed the canonical
+            // stream re-played from record 0, and skips everything already
+            // committed (see [`ResumePoint`]). `recovering` is cleared once the
+            // replay passes the persisted cursor; on a fresh start it is false.
+            let resume_block = resume.map(|r| r.block).unwrap_or(0);
+            let resume_count = resume.map(|r| r.record_count).unwrap_or(0);
+            // Recovery is only meaningful past genesis (block >= 1); a
+            // `ResumePoint { block: 0 }` would never reach its cursor boundary,
+            // so treat it as a fresh start.
+            let mut recovering = resume_block > 0;
+
             // The snapshot source hands back owned snapshots keyed by block
-            // number. We always open the snapshot for the block *just
-            // committed* (initial_block at startup; whatever the writer
-            // signals after each boundary).
-            let mut snapshot = snapshots.snapshot_after(initial_block);
+            // number. We open the snapshot for the block *just committed*: at a
+            // fresh start that is `initial_block`; on recovery it is the
+            // persisted `resume.block`, so post-cursor execution reads the
+            // correct post-`block` state even while earlier blocks replay.
+            let snapshot_block = resume.map(|r| r.block).unwrap_or(initial_block);
+            let mut snapshot = snapshots.snapshot_after(snapshot_block);
             let mut delta = PendingDelta::new();
             // Block-number bookkeeping. We treat blocks 1-indexed (genesis
             // is block 0). The exec thread assumes every block boundary it
             // sees is for the *current* in-flight block; it doesn't try to
-            // re-derive block numbers without sealer help.
-            let mut current_block = initial_block + 1;
+            // re-derive block numbers without sealer help. On recovery the
+            // replay starts at block 1, so `current_block` starts at 1 too;
+            // each replayed boundary advances it (the snapshot stays anchored
+            // at `resume.block` until the cursor is passed).
+            let mut current_block = if recovering { 1 } else { initial_block + 1 };
             let mut current_l2_ts: u64 = 0;
             // Per-block RPC enrichment counters; reset at each BoundaryStart.
             let mut tx_index_in_block: u64 = 0;
@@ -323,6 +367,13 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        // Recovery skip: this record was already executed and
+                        // committed before the restart. Advance the alignment
+                        // counter (above) but do NOT re-execute, emit a receipt,
+                        // or mutate the delta — its effects are already durable.
+                        if recovering && tx_idx.0 < resume_count {
+                            continue;
+                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
@@ -369,6 +420,11 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        // Recovery skip (see the Tx arm): already-committed
+                        // deposit — advance the counter, do not re-apply.
+                        if recovering && tx_idx.0 < resume_count {
+                            continue;
+                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
@@ -389,6 +445,9 @@ where
                             tx_applied_ok.increment(1);
                         } else {
                             tx_applied_error.increment(1);
+                        }
+                        if let Err(ref e) = result {
+                            tracing::error!(block = current_block, ?position, error = ?e, "exec ERROR: execute_deposit_tx failed");
                         }
                         let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
@@ -428,6 +487,33 @@ where
                                 end: end_tx_idx,
                                 last_seen: BPosition::from_index(have),
                             });
+                        }
+
+                        // Recovery skip: this block was already committed before
+                        // the restart. The alignment check above still ran (we
+                        // never bypass the invariant), but we do NOT re-finalize,
+                        // submit, commit, or emit it — its writes are durable and
+                        // its receipts already reached ingress. Advance the
+                        // per-block bookkeeping; clear recovery once we reach the
+                        // persisted cursor so the next block executes normally.
+                        // The snapshot stays anchored at `resume.block` (opened at
+                        // startup) until then. The delta is provably empty here
+                        // (every replayed tx hit the skip `continue` above).
+                        if recovering && block_number <= resume_block {
+                            block_apply_elapsed = None;
+                            current_block = block_number + 1;
+                            tx_index_in_block = 0;
+                            cumulative_gas_used = 0;
+                            current_l2_ts = l2_timestamp;
+                            if block_number == resume_block {
+                                recovering = false;
+                                tracing::info!(
+                                    resume_block,
+                                    resume_count,
+                                    "recovery replay caught up to the persisted cursor; resuming live execution"
+                                );
+                            }
+                            continue;
                         }
 
                         // Record the block's accumulated execution time.
@@ -650,6 +736,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log.clone()),
             0,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
         drop(rx_e2c);
@@ -722,9 +809,302 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log),
             0,
+            None,
         );
         let res = h.join().expect("no panic");
         assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
+    }
+
+    // ---- Phase 2 recovery: skip-count replay -----------------------------
+    //
+    // On restart the exec thread is fed the canonical stream re-played from
+    // record 0 and must skip everything already committed (see [`ResumePoint`]).
+    // These tests drive the skip path deterministically with synthetic records
+    // — no Aeron, no archive — and assert the executor neither re-commits a
+    // replayed block nor re-emits a replayed receipt, while still executing
+    // everything past the persisted cursor.
+
+    /// Drain a closed `ExecToCommit` receiver, counting emitted receipts and
+    /// returning the block numbers of emitted boundaries (in order).
+    fn drain_commits(rx: Receiver<ExecToCommit>) -> (usize, Vec<u64>) {
+        let mut receipts = 0usize;
+        let mut boundaries = Vec::new();
+        while let Ok(m) = rx.recv() {
+            match m {
+                ExecToCommit::Receipt(_) => receipts += 1,
+                ExecToCommit::Boundary(b) => boundaries.push(b.block_number),
+            }
+        }
+        (receipts, boundaries)
+    }
+
+    #[test]
+    fn recovery_skips_already_applied_txs() {
+        // Pre-restart the executor committed block 1 (2 txs, record_count=2).
+        // The replay re-feeds block 1's 2 txs + boundary, then block 2's new
+        // tx + boundary. With resume={block:1, count:2} the two block-1 txs and
+        // block 1's boundary must be skipped (no receipt, no submit), and only
+        // block 2 must execute + commit.
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000ABCDE");
+        // Snapshot represents post-block-1 state: signer nonce already at 2.
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                2,
+                KECCAK_EMPTY,
+            )
+            .build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
+
+        // --- replayed prefix: block 1 (already committed) ---
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(0),
+                envelope: legacy(&signer, to, 0, 10),
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(1),
+                envelope: legacy(&signer, to, 1, 10),
+                position: pos(1),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(2),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        // --- new work: block 2 (must execute) ---
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(2),
+                envelope: legacy(&signer, to, 2, 10),
+                position: pos(2),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 2,
+                end_tx_idx: pos(3),
+                l2_timestamp: 1_700_000_001,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            Some(ResumePoint {
+                block: 1,
+                record_count: 2,
+            }),
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        let (receipts, boundaries) = drain_commits(rx_e2c);
+        // Only block 2's single tx produced a receipt; block 1's two txs were skipped.
+        assert_eq!(receipts, 1, "only the post-cursor tx should emit a receipt");
+        assert_eq!(boundaries, vec![2], "only block 2 should be emitted");
+        // Only block 2 was submitted to the writer; block 1 was not re-committed.
+        let log = writer_log.lock().unwrap();
+        assert_eq!(
+            log.len(),
+            1,
+            "only block 2 should be submitted to the writer"
+        );
+        assert_eq!(log[0].0.block_number, 2);
+    }
+
+    #[test]
+    fn recovery_skips_empty_block_backlog() {
+        // The sealer kept emitting empty blocks (1,2,3) while the executor was
+        // down; record_count stayed 0. resume={block:3, count:0}. All three
+        // empty boundaries replay and must be skipped; block 4's first real tx
+        // then executes and commits.
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000ABCDE");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                KECCAK_EMPTY,
+            )
+            .build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
+
+        for blk in 1..=3u64 {
+            // Empty blocks: boundary only, cumulative count still 0 (pos(0)).
+            tx_r2e
+                .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                    block_number: blk,
+                    end_tx_idx: pos(0),
+                    l2_timestamp: 1_700_000_000 + blk,
+                }))
+                .unwrap();
+        }
+        // Block 4: first real tx (count 0 -> 1).
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(0),
+                envelope: legacy(&signer, to, 0, 10),
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 4,
+                end_tx_idx: pos(1),
+                l2_timestamp: 1_700_000_004,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            Some(ResumePoint {
+                block: 3,
+                record_count: 0,
+            }),
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        let (receipts, boundaries) = drain_commits(rx_e2c);
+        assert_eq!(receipts, 1, "only block 4's tx should emit a receipt");
+        assert_eq!(
+            boundaries,
+            vec![4],
+            "blocks 1-3 (empty backlog) are skipped"
+        );
+        let log = writer_log.lock().unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log[0].0.block_number, 4);
+    }
+
+    #[test]
+    fn recovery_boundary_alignment_still_checked() {
+        // Recovery must not bypass the boundary-alignment invariant: a replayed
+        // boundary whose claimed record count disagrees with what was seen is
+        // still fatal.
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000ABCDE");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                KECCAK_EMPTY,
+            )
+            .build();
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, _rx_e2c) = bounded::<ExecToCommit>(8);
+
+        // One replayed tx (count 1), but the boundary claims 5 → misaligned.
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(0),
+                envelope: legacy(&signer, to, 0, 10),
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(5),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(Arc::new(Mutex::new(Vec::new()))),
+            0,
+            Some(ResumePoint {
+                block: 1,
+                record_count: 5,
+            }),
+        );
+        let res = h.join().expect("no panic");
+        assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
+    }
+
+    #[test]
+    fn no_resume_executes_and_commits_block_one() {
+        // resume=None is the fresh-start path: block 1 executes and commits.
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000ABCDE");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                KECCAK_EMPTY,
+            )
+            .build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(0),
+                envelope: legacy(&signer, to, 0, 10),
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(1),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        let (receipts, boundaries) = drain_commits(rx_e2c);
+        assert_eq!(receipts, 1);
+        assert_eq!(boundaries, vec![1]);
+        assert_eq!(writer_log.lock().unwrap().len(), 1);
     }
 }
 

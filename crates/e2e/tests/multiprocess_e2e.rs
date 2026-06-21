@@ -133,6 +133,12 @@ async fn multiprocess_e2e_signed_transfer_round_trip() {
             .arg(CHAIN_ID.to_string())
             .arg("--chain")
             .arg(&genesis_path)
+            // libmdbx state dir: a fresh subdir of the cfg tempdir per run,
+            // SafeNoSync (skip fsync) since this env is ephemeral.
+            .arg("--state-dir")
+            .arg(cfg_dir.path().join("executor-state"))
+            .arg("--state-durability")
+            .arg("safe-no-sync")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit()),
     );
@@ -301,6 +307,12 @@ async fn multiprocess_e2e_deposit_round_trip() {
             .arg(CHAIN_ID.to_string())
             .arg("--chain")
             .arg(&genesis_path)
+            // libmdbx state dir: a fresh subdir of the cfg tempdir per run,
+            // SafeNoSync (skip fsync) since this env is ephemeral.
+            .arg("--state-dir")
+            .arg(cfg_dir.path().join("executor-state"))
+            .arg("--state-durability")
+            .arg("safe-no-sync")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit()),
     );
@@ -601,6 +613,12 @@ async fn anvil_pipeline_e2e_l1_deposit_and_l2_round_trip() {
             .arg(CHAIN_ID.to_string())
             .arg("--chain")
             .arg(&genesis_path)
+            // libmdbx state dir: a fresh subdir of the cfg tempdir per run,
+            // SafeNoSync (skip fsync) since this env is ephemeral.
+            .arg("--state-dir")
+            .arg(cfg_dir.path().join("executor-state"))
+            .arg("--state-durability")
+            .arg("safe-no-sync")
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit()),
     );
@@ -920,7 +938,7 @@ fn write_ingress_config(dir: &Path) -> PathBuf {
 }
 
 /// Write a kardamom `Genesis` TOML that funds `alice` with 1000 ETH. The
-/// executor bin loads this via `--chain` and seeds the in-memory state DB.
+/// executor bin loads this via `--chain` and seeds the libmdbx state DB.
 fn write_genesis_toml(dir: &Path, chain_id: u64, alice: Address) -> PathBuf {
     let p = dir.join("genesis.toml");
     let body = format!(

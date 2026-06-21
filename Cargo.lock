@@ -3776,6 +3776,7 @@ dependencies = [
  "dashmap",
  "kardamom-log",
  "kardamom-obs",
+ "kardamom-state",
  "kardamom-types",
  "metrics",
  "rand 0.9.4",

@@ -81,6 +81,9 @@ job "da-watcher" {
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--poll-interval-secs", "1",
+          # Record tx_deposits to the archive so a restarted executor can replay
+          # deposit envelopes (Phase 2 crash recovery).
+          "--archive-durability",
         ]
       }
 

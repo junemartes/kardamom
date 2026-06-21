@@ -254,6 +254,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
                     Imm,
                     writer_q,
                     0,
+                    None,
                 )
             });
 

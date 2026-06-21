@@ -94,6 +94,10 @@ job "ingress" {
           "--shards", "2",
           "--jsonrpc-bind", "0.0.0.0:8545",
           "--ack-policy", "${var.ack_policy}",
+          # Record each per-shard tx_data publication to the archive so a
+          # restarted executor can replay full transaction envelopes (Phase 2
+          # crash recovery).
+          "--archive-durability",
         ]
       }
 

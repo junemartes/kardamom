@@ -42,15 +42,18 @@ pub mod error;
 pub mod exec_types;
 pub mod executor;
 pub mod metrics;
+pub mod persist;
 pub mod reader;
 pub mod state;
 
 pub use actor::{
-    Executor, ExecutorConfig, StateWriterQueue, StateWriterSignal, TxReceiptsPublication,
+    Executor, ExecutorConfig, ResumePoint, StateWriterQueue, StateWriterSignal,
+    TxReceiptsPublication,
 };
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet};
 pub use error::ExecutorError;
+pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
     DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
     TxDataSubscription, TxOrderingSubscription,
