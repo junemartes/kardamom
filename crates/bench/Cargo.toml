@@ -20,10 +20,12 @@ name = "kardamom-load"
 path = "src/bin/load.rs"
 
 [dependencies]
-kardamom-node = { path = "../node" }
+kardamom-types.workspace = true
+kardamom-ingress = { path = "../ingress" }
 
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
+alloy-rlp.workspace = true
 alloy-network.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-eips.workspace = true

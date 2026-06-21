@@ -35,11 +35,10 @@
       "id": 3,
       "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
       "targets": [
-        {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "kardamom_block_number{host_id=~\"$host\"}", "legendFormat": "node", "range": true, "refId": "A"},
         {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "kardamom_sealer_block_number{host_id=~\"$host\"}", "legendFormat": "sealer", "range": true, "refId": "B"},
         {"datasource": {"type": "prometheus", "uid": "prometheus"}, "expr": "kardamom_executor_block_number{host_id=~\"$host\"}", "legendFormat": "executor", "range": true, "refId": "C"}
       ],
-      "title": "Block height (node / sealer / executor)",
+      "title": "Block height (sealer / executor)",
       "type": "timeseries"
     },
     {

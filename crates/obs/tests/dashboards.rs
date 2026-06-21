@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 const EXPECTED_DASHBOARDS: &[&str] = &[
     "kardamom-overview",
-    "kardamom-node",
     "kardamom-sequencer",
     "kardamom-batcher",
     "kardamom-sealer",

@@ -5,7 +5,7 @@ use alloy_primitives::{B256, Bytes, U256};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
-use kardamom_node::AllocEntry;
+use kardamom_types::AllocEntry;
 
 use crate::benchmark::Prepared;
 use crate::mnemonic;

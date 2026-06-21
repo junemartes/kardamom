@@ -1,8 +1,11 @@
 # Kardamom
 
-An Ethereum rollup framework. The workspace is a set of Rust crates
-(`kardamom`, `kardamom-log`, `kardamom-types`, `node`, `deployer`, `bench`)
-plus Solidity contracts under `contracts/`.
+An Ethereum rollup framework. The workspace is a set of Rust crates — the
+cluster services (`kardamom-ingress`, `kardamom-sequencer`, `kardamom-executor`,
+`kardamom-sealer`, `kardamom-batcher`, `kardamom-da-watcher`) wired together over
+Aeron, plus shared libraries (`kardamom-types`, `kardamom-log`, `kardamom-state`,
+`kardamom-obs`) and tooling (`deployer`, `bench`) — plus Solidity contracts under
+`contracts/`.
 
 ## Building
 
@@ -20,8 +23,8 @@ Two parts of the workspace need extra native tooling:
   compiler, `cmake`, `libclang` (for `bindgen`), `pkg-config`, and a **JDK 17+**
   — the Aeron *archive* build runs a Gradle/SBE codegen step that requires JVM
   17 or later.
-- **`forge` (Foundry)** is invoked by the `deployer` and `node` build scripts to
-  compile the Solidity contracts.
+- **`forge` (Foundry)** is invoked by the `deployer` build script to compile the
+  Solidity contracts.
 
 ### Quick start
 

@@ -12,7 +12,7 @@
 //! constructing a `Benchmark` and calling `.run(client)`.
 
 use jsonrpsee::http_client::HttpClient;
-use kardamom_node::AllocEntry;
+use kardamom_types::AllocEntry;
 
 use crate::benchmark::Prepared;
 
