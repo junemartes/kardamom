@@ -1,11 +1,31 @@
-// :service — the thin Aeron Cluster ClusteredService adapter.
+// :service — the Aeron Cluster ClusteredService adapter + the ClusterNode launcher.
 //
-// Depends on :core (the POJO state machine) and io.aeron:aeron-cluster:1.44.0.
-// aeron-cluster pulls in aeron-client (and Agrona) transitively. Isolating the
-// Aeron dependency here keeps :core (and its deterministic tests) buildable on
-// its own.
+// The Java toolchain (17) and `mavenCentral()` are inherited from the root
+// build.gradle `subprojects {}` block; only the Aeron deps, the application
+// main class, and the shadow (fat-jar) packaging are declared here. The
+// `application` plugin re-applies `java` idempotently, so the root's
+// `apply plugin: 'java'` is harmless.
+plugins {
+    id 'application'
+    id 'com.gradleup.shadow' version '8.3.5'
+}
 
 dependencies {
     implementation project(':core')
     implementation 'io.aeron:aeron-cluster:1.44.0'
+    implementation 'io.aeron:aeron-archive:1.44.0'
+    implementation 'io.aeron:aeron-driver:1.44.0'
+    testImplementation 'io.aeron:aeron-test-support:1.44.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+
+application {
+    mainClass = 'io.kardamom.sealer.cluster.ClusterNode'
+}
+
+tasks.named('shadowJar') {
+    archiveBaseName = 'kardamom-cluster-node'
+    archiveClassifier = ''
+    archiveVersion = ''
+    mergeServiceFiles()
 }

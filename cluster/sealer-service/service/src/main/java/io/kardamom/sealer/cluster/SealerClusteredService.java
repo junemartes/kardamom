@@ -66,6 +66,8 @@ public final class SealerClusteredService implements ClusteredService {
     /** Tick cadence for the boundary timer (ms). Matches the 250 ms L2 tick. */
     private final long tickIntervalMs;
     private final int dedupCapacity;
+    /** This cluster member's id, logged on role changes for the chaos suite. */
+    private final int memberId;
 
     private Cluster cluster;
     private CanonicalSealerState state;
@@ -75,9 +77,14 @@ public final class SealerClusteredService implements ClusteredService {
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer();
 
-    public SealerClusteredService(int dedupCapacity, long tickIntervalMs) {
+    public SealerClusteredService(int dedupCapacity, long tickIntervalMs, int memberId) {
         this.dedupCapacity = dedupCapacity;
         this.tickIntervalMs = tickIntervalMs;
+        this.memberId = memberId;
+    }
+
+    public SealerClusteredService(int dedupCapacity, long tickIntervalMs) {
+        this(dedupCapacity, tickIntervalMs, -1);
     }
 
     public SealerClusteredService() {
@@ -159,7 +166,11 @@ public final class SealerClusteredService implements ClusteredService {
     public void onRoleChange(Cluster.Role newRole) {
         // No role-specific behaviour: the cluster log is replicated, so every
         // member runs the same deterministic state machine. Only the leader's
-        // egress offers reach external clients.
+        // egress offers reach external clients. We log the role transition so the
+        // chaos suite (deploy/cluster/scripts/chaos.sh) can grep the alloc log for
+        // leadership changes. Intentionally stdout (NOT a logger) for grep-ability —
+        // do not "clean up" into slf4j without updating the chaos leader detection.
+        System.out.println("cluster role=" + newRole + " memberId=" + memberId);
     }
 
     @Override
