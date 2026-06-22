@@ -425,6 +425,253 @@ async fn multiprocess_e2e_deposit_round_trip() {
     drop(cluster);
 }
 
+/// Validator sync + keep-up smoke test.
+///
+/// Brings up the full pipeline PLUS a `kardamom-validator` that follows the same
+/// canonical channels, re-executes from genesis, advances a canonical MPT state
+/// root, and cross-checks itself against the executor's receipts + per-block
+/// BAL. Drives a stream of transfers, then asserts the validator
+/// 1. syncs from genesis (commits blocks),
+/// 2. keeps up with the executor's committed height within a bounded lag,
+/// 3. verifies blocks against the BAL (`blocks_verified_total > 0`), and
+/// 4. never diverges (`divergence_total == 0`) while its state root advances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker + cargo-built kardamom-* bins; run with `cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e -- --ignored --nocapture multiprocess_e2e_validator_syncs_and_keeps_up`"]
+async fn multiprocess_e2e_validator_syncs_and_keeps_up() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .with_test_writer()
+        .try_init();
+
+    assert!(
+        docker_available().await,
+        "docker not available — e2e tests require a running Docker daemon"
+    );
+
+    build_service_bins_with_validator();
+
+    let cluster = AeronTestCluster::single_node()
+        .await
+        .expect("aeron container up");
+    let aeron_dir = cluster.aeron_dir_host(0).to_path_buf();
+
+    let cfg_dir = TempDir::new().expect("cfg tempdir");
+    let sealer_cfg = write_sealer_config(cfg_dir.path());
+    let sequencer_cfg = write_sequencer_config(cfg_dir.path());
+    let executor_cfg = write_executor_config(cfg_dir.path());
+    let ingress_cfg = write_ingress_config(cfg_dir.path());
+
+    let alice = signer_from_seed(0x11);
+    let alice_addr = alice.address();
+    let bob_addr = Address::repeat_byte(0x22);
+    let genesis_path = write_genesis_toml(cfg_dir.path(), CHAIN_ID, alice_addr);
+
+    let target_bin = workspace_target_bin();
+    // Pin metrics ports so the test can scrape them (the explicit --metrics-addr
+    // CLI arg overrides ChildGuard's KARDAMOM_METRICS_ADDR=127.0.0.1:0 env).
+    const EXEC_METRICS: &str = "127.0.0.1:19604";
+    const VAL_METRICS: &str = "127.0.0.1:19606";
+
+    let sealer = ChildGuard::spawn(
+        "kardamom-sealer",
+        Command::new(target_bin.join("kardamom-sealer"))
+            .arg("--config")
+            .arg(&sealer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let sequencer = ChildGuard::spawn(
+        "kardamom-sequencer",
+        Command::new(target_bin.join("kardamom-sequencer"))
+            .arg("--config")
+            .arg(&sequencer_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let executor = ChildGuard::spawn(
+        "kardamom-executor",
+        Command::new(target_bin.join("kardamom-executor"))
+            .arg("--config")
+            .arg(&executor_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--chain-id")
+            .arg(CHAIN_ID.to_string())
+            .arg("--chain")
+            .arg(&genesis_path)
+            .arg("--state-dir")
+            .arg(cfg_dir.path().join("executor-state"))
+            .arg("--state-durability")
+            .arg("safe-no-sync")
+            .arg("--metrics-addr")
+            .arg(EXEC_METRICS)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let validator = ChildGuard::spawn(
+        "kardamom-validator",
+        Command::new(target_bin.join("kardamom-validator"))
+            // The validator's --config is presence-checked only; reuse the
+            // executor's empty TOML.
+            .arg("--config")
+            .arg(&executor_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--chain-id")
+            .arg(CHAIN_ID.to_string())
+            .arg("--chain")
+            .arg(&genesis_path)
+            .arg("--state-dir")
+            .arg(cfg_dir.path().join("validator-state"))
+            .arg("--state-durability")
+            .arg("safe-no-sync")
+            .arg("--metrics-addr")
+            .arg(VAL_METRICS)
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+    let ingress = ChildGuard::spawn(
+        "kardamom-ingress",
+        Command::new(target_bin.join("kardamom-ingress"))
+            .arg("--config")
+            .arg(&ingress_cfg)
+            .arg("--aeron-dir")
+            .arg(&aeron_dir)
+            .arg("--shards")
+            .arg("1")
+            .arg("--jsonrpc-bind")
+            .arg(format!("127.0.0.1:{JSONRPC_PORT}"))
+            .arg("--ack-policy")
+            .arg("on-offer")
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+    );
+
+    let rpc_url = format!("http://127.0.0.1:{JSONRPC_PORT}");
+    wait_for_jsonrpc(&rpc_url, Duration::from_secs(30))
+        .await
+        .expect("ingress JSON-RPC ready");
+    wait_for_metrics(VAL_METRICS, Duration::from_secs(30))
+        .await
+        .expect("validator metrics ready");
+    wait_for_metrics(EXEC_METRICS, Duration::from_secs(30))
+        .await
+        .expect("executor metrics ready");
+    // Let every Aeron subscription (incl. the validator's) connect before load;
+    // IPC late-joiners do not replay pre-subscription history.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // ----- Sustained load: a stream of transfers spanning many sealer ticks.
+    let client = HttpClientBuilder::default()
+        .request_timeout(Duration::from_secs(60))
+        .build(&rpc_url)
+        .expect("http client");
+    const N: u64 = 12;
+    for nonce in 0..N {
+        let raw = signed_transfer(&alice, bob_addr, U256::from(1u64), nonce);
+        let raw_hex = format!("0x{}", hex::encode(&raw));
+        let _: B256 = client
+            .request("eth_sendRawTransaction", rpc_params![&raw_hex])
+            .await
+            .expect("eth_sendRawTransaction");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tracing::info!("submitted {N} transfers; waiting for validator to catch up");
+
+    // ----- Poll until the validator has caught up to within LAG_BOUND blocks of
+    // the executor, verified at least one block against the BAL, and committed
+    // a few blocks — failing immediately on any divergence.
+    const LAG_BOUND: f64 = 5.0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(40);
+    let mut kept_up = false;
+    loop {
+        let div = scrape(VAL_METRICS, "validator_divergence_total")
+            .await
+            .unwrap_or(0.0);
+        assert_eq!(div, 0.0, "validator reported a divergence mid-run");
+
+        let exec_block = scrape(EXEC_METRICS, "kardamom_executor_block_number")
+            .await
+            .unwrap_or(0.0);
+        let val_block = scrape(VAL_METRICS, "validator_committed_block")
+            .await
+            .unwrap_or(0.0);
+        let verified = scrape(VAL_METRICS, "validator_blocks_verified_total")
+            .await
+            .unwrap_or(0.0);
+        tracing::info!(exec_block, val_block, verified, "validator sync progress");
+
+        if val_block >= 2.0 && verified >= 1.0 && (exec_block - val_block) <= LAG_BOUND {
+            kept_up = true;
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ----- Final assertions.
+    let exec_block = scrape(EXEC_METRICS, "kardamom_executor_block_number")
+        .await
+        .unwrap_or(0.0);
+    let val_block = scrape(VAL_METRICS, "validator_committed_block")
+        .await
+        .unwrap_or(0.0);
+    let verified = scrape(VAL_METRICS, "validator_blocks_verified_total")
+        .await
+        .unwrap_or(0.0);
+    let root_block = scrape(VAL_METRICS, "validator_state_root_block")
+        .await
+        .unwrap_or(0.0);
+    let div = scrape(VAL_METRICS, "validator_divergence_total")
+        .await
+        .unwrap_or(0.0);
+    tracing::info!(
+        exec_block,
+        val_block,
+        verified,
+        root_block,
+        div,
+        "final validator state"
+    );
+
+    assert_eq!(div, 0.0, "validator diverged");
+    assert!(
+        verified >= 1.0,
+        "validator verified no blocks against the BAL"
+    );
+    assert!(
+        val_block >= 2.0,
+        "validator did not sync (committed_block={val_block})"
+    );
+    assert!(
+        root_block >= 2.0,
+        "validator state root did not advance (state_root_block={root_block})"
+    );
+    assert!(
+        kept_up,
+        "validator did not keep up: val_block={val_block}, exec_block={exec_block}, lag bound={LAG_BOUND}"
+    );
+
+    drop(ingress);
+    drop(validator);
+    drop(executor);
+    drop(sequencer);
+    drop(sealer);
+    drop(cluster);
+}
+
 // ============================================================================
 // Phase 2: anvil L1 → da-watcher → L2 round-trip
 // ============================================================================
@@ -876,6 +1123,90 @@ fn build_service_bins_with_da_watcher() {
         st.success(),
         "failed to build kardamom service bins (+ da-watcher)"
     );
+}
+
+/// Same as [`build_service_bins`] but also builds `kardamom-validator`.
+fn build_service_bins_with_validator() {
+    let st = Command::new(env!("CARGO"))
+        .args([
+            "build",
+            "-p",
+            "kardamom-sealer",
+            "-p",
+            "kardamom-sequencer",
+            "-p",
+            "kardamom-executor",
+            "-p",
+            "kardamom-ingress",
+            "-p",
+            "kardamom-validator",
+            "--bins",
+        ])
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .expect("cargo build status");
+    assert!(
+        st.success(),
+        "failed to build kardamom service bins (+ validator)"
+    );
+}
+
+/// Minimal HTTP/1.1 GET of a Prometheus `/metrics` endpoint, returning the
+/// response body (no `reqwest` dep in this crate). `None` if unreachable.
+async fn http_get_metrics(addr: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut s = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let req = format!("GET /metrics HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).await.ok()?;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    text.split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+}
+
+/// Parse a single Prometheus sample value for `name` (ignoring any `{labels}`)
+/// out of a metrics body.
+fn parse_metric(body: &str, name: &str) -> Option<f64> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with('#') {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(name) else {
+            continue;
+        };
+        // Must be the whole metric name: next char is a space or `{labels}`.
+        if !(rest.starts_with(' ') || rest.starts_with('{')) {
+            continue;
+        }
+        if let Some(tok) = line.split_whitespace().last()
+            && let Ok(v) = tok.parse::<f64>()
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Scrape one metric value from a service's `/metrics` endpoint.
+async fn scrape(addr: &str, name: &str) -> Option<f64> {
+    parse_metric(&http_get_metrics(addr).await?, name)
+}
+
+/// Wait until a `/metrics` endpoint answers (the service's obs listener bound).
+async fn wait_for_metrics(addr: &str, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if http_get_metrics(addr).await.is_some() {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    Err(format!(
+        "metrics endpoint {addr} not ready within {timeout:?}"
+    ))
 }
 
 /// Resolve `<workspace>/target/<profile>` where the service bins live.
