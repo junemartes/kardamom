@@ -90,7 +90,11 @@ wait_running() {
 echo
 echo "### Phase 1: Aeron substrate"
 run_job "aeron.system.nomad.hcl"
-wait_running "aeron" 180
+# Generous timeout: every worker node force-pulls the aeron image from the single
+# in-cluster registry at once, slow under CI CPU contention (the dedicated cluster
+# nodes added more concurrent pullers). Comes up well under this cap on a healthy
+# run; the cap only guards against premature failure when bring-up is slow.
+wait_running "aeron" 360
 
 # --- (REMOVED) recorder quorum ----------------------------------------------
 # The custom recorders + Q-of-N quorum aggregator were removed in favour of
@@ -103,7 +107,7 @@ wait_running "aeron" 180
 echo
 echo "### Phase 2: anvil L1"
 run_job "anvil.nomad.hcl"
-wait_running "anvil" 120
+wait_running "anvil" 240
 
 # --- 3. Service pipeline ----------------------------------------------------
 # The 3-member Aeron Cluster (Raft) sealer is launched FIRST: it owns BOTH
@@ -130,7 +134,7 @@ fi
 # subscribes to its egress. Election + archive recovery takes longer than the
 # old single-sealer start, hence the 180s budget.
 run_job "cluster.nomad.hcl"
-wait_running "cluster" 180
+wait_running "cluster" 300
 run_job "sequencer.nomad.hcl"
 # Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
 # SUBSCRIBER and the executor is the must-deliver PUBLISHER; starting the
@@ -139,16 +143,16 @@ run_job "sequencer.nomad.hcl"
 # would back-pressure the exec→commit channel and freeze state). The ingress also
 # subscribes the quorum watermark (from the already-running aggregator) here.
 run_job "ingress.nomad.hcl"
-wait_running "ingress" 120
+wait_running "ingress" 240
 run_job "executor.nomad.hcl"
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 
 # The cluster was already waited-on above (before the sequencer connected).
-wait_running "sequencer" 120
-wait_running "executor" 120
-wait_running "da-watcher" 120
+wait_running "sequencer" 240
+wait_running "executor" 240
+wait_running "da-watcher" 240
 
 # --- 4. Batcher periodic job (offline/dry-run) ------------------------------
 echo

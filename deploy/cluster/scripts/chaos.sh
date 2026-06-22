@@ -350,31 +350,27 @@ run_case() { # <case-name>
     # executor applies them, so executor_progress() advancing == cluster liveness.
 
     cluster-leader-kill)
-      # HARD-kill the inner cluster container on the CURRENT leader's node. A NEW
-      # leader must be elected (different memberId) within the election SLO AND the
-      # executor keeps applying blocks; then the killed member's Nomad task restarts
-      # and the cluster job returns to 3 running. This REPLACES the documented
-      # single-sealer hard-kill SPOF gap (issue #58): the 3-member Raft quorum
-      # survives the loss of any one member, including the leader.
-      local old_leader leader_node new_leader t
+      # HARD-kill the inner cluster container on the CURRENT leader's node. The
+      # 3-member Raft quorum must survive losing the leader and KEEP COMMITTING — the
+      # executor's block gauge resumes advancing once the cluster has a live leader
+      # again. This REPLACES the documented single-sealer hard-kill SPOF gap (#58):
+      # a single sealer crash froze the pipeline; the Raft cluster does not.
+      #
+      # NOTE: we assert the pipeline keeps progressing, NOT that the leader's memberId
+      # changed. A hard-killed leader's Nomad task can restart fast and RE-WIN the
+      # election (it has the most up-to-date log), so requiring a different memberId
+      # is racy and wrong — "the cluster still commits" is the real resilience proof
+      # (it requires a live leader + quorum regardless of which member leads).
+      local old_leader leader_node
       old_leader="$(cluster_leader)"
       leader_node="kardamom-sealer-${old_leader}"
       log "cluster-leader-kill: current leader memberId=${old_leader} on ${leader_node}; hard-killing its cluster container"
       inject_hard "${leader_node}" "${CLUSTER_TASK}"
-      # A NEW leader (different memberId) must emerge within the election SLO. Poll
-      # cluster_leader until the reported leader differs from the killed one (it may
-      # transiently still report the old id from a stale tail until the new leader's
-      # role line ships). cluster_leader itself bounds its own no-leader wait.
-      t=0; new_leader="${old_leader}"
-      while [ "${new_leader}" = "${old_leader}" ]; do
-        new_leader="$(cluster_leader "${CHAOS_LEADER_SLO_S}")"
-        [ "${new_leader}" != "${old_leader}" ] && break
-        sleep 3; t=$((t+3))
-        [ "${t}" -ge "${CHAOS_LEADER_SLO_S}" ] && fail "no NEW leader (still memberId=${old_leader}) within ${CHAOS_LEADER_SLO_S}s after killing leader"
-      done
-      log "cluster-leader-kill: re-elected — new leader memberId=${new_leader} (was ${old_leader})"
-      # Quorum (2/3) intact under the new leader → pipeline keeps making progress.
+      # Quorum re-establishes a leader (a different member, or the restarted one
+      # re-winning) → the pipeline resumes committing. assert_executor_progress polls
+      # up to its timeout, covering the election + client redirect window.
       assert_executor_progress
+      log "cluster-leader-kill: pipeline resumed committing after leader kill (now leader memberId=$(cluster_leader 2>/dev/null || echo '?'))"
       # The killed member's Nomad task restarts (force_pull re-pulls the image) and
       # rejoins, returning the cluster job to 3 running.
       assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
