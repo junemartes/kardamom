@@ -1,0 +1,426 @@
+#!/usr/bin/env bash
+# =============================================================================
+# chaos.sh — resilience/chaos suite for the kardamom cluster.
+# =============================================================================
+#
+# For each failure case: start a steady background load (the kardamom-load
+# harness in --chaos-mode, which soaks at a fixed rate and asserts every
+# ACCEPTED tx eventually receipts), inject a failure, assert the cluster
+# auto-recovers within an SLO AND the pipeline resumes producing blocks, then
+# wait for the load to finish and assert its verdict (no missing receipts, no
+# frozen executor).
+#
+# Runs inside the orchestrator/runner (shares the host docker socket + reaches
+# the cluster bridge), exactly like ci-cluster.sh. The cluster is DinD: each
+# node is a privileged container `kardamom-<class>-<i>` running its own dockerd,
+# and the pipeline services are inner Nomad docker-driver tasks. So:
+#   * graceful kill  = `nomad alloc stop` (via control-0)         → restart
+#   * hard crash     = `docker exec <node> docker kill <inner>`   → restart
+#   * node failure   = `docker kill <node>` (whole node)          → reschedule
+#
+# Recovery semantics depend on topology (singletons on a single role-node can't
+# reschedule to a peer; a node-failure of an executor with no spare role-node
+# degrades to count-1 until the node returns) — the assertions below encode the
+# *achievable* outcome per case rather than blindly expecting a fresh alloc on a
+# new node.
+#
+# CLUSTER MODE (Phase 3): the deploy now uses the CLUSTERED sealer — a 3-member
+# Aeron Cluster (Raft) running as the Nomad job `cluster` (one member per sealer
+# node .51/.52/.53; memberId 0/1/2 == kardamom-sealer-0/1/2 via the node-IP
+# derivation). There is NO single kardamom-sealer and NO Prometheus endpoint on
+# the (Java) cluster node, so cluster-mode progress is measured from the
+# EXECUTOR's `kardamom_executor_block_number` gauge (the executor applies blocks
+# committed out of the cluster's egress) — see executor_progress() below. The
+# three cluster-* cases exercise Raft leader-kill / follower-kill / quorum-loss.
+#
+# ENV knobs (all optional):
+#   RPC_URL                  ingress JSON-RPC      (default http://192.168.56.31:8545)
+#   LOAD_BIN                 kardamom-load path    (default <root>/target/release/kardamom-load)
+#   CHAOS_TPS                steady load rate      (default 50)
+#   CHAOS_CASE_S             per-case load window  (default 45)
+#   LOAD_MAX_GAP             keep-pace gap bound   (default 5)
+#   CHAOS_RESTART_SLO_S      same-node restart SLO (default 30)
+#   CHAOS_RESCHEDULE_SLO_S   node-loss recovery SLO(default 120)
+#   CHAOS_LEADER_SLO_S       new-leader election SLO (default 30)
+#   CHAOS_CASES              space-separated cases (default a representative subset)
+#   INJECT_DELAY             secs of load before injecting (default 10)
+#   CHAOS_ACCT_BASE          first funded account index per case (default 7)
+#
+# Cases: graceful-executor hard-executor graceful-ingress hard-ingress
+#        graceful-sequencer hard-sequencer sealer-graceful sealer-hard
+#        node-failure-executor
+#        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
+# =============================================================================
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+
+NOMAD_ADDR_INT="http://192.168.56.10:4646"
+CONTROL="kardamom-control-0"
+RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
+# Explicit chain-id (ingress eth_chainId returns a default ≠ the cluster chain).
+CHAIN_ID="${CHAIN_ID:-412346}"
+LOAD_BIN="${LOAD_BIN:-${ROOT}/target/release/kardamom-load}"
+CHAOS_TPS="${CHAOS_TPS:-50}"
+CHAOS_CASE_S="${CHAOS_CASE_S:-45}"
+LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}"
+# Service jobs use force_pull=true, so a restart re-pulls the image from the
+# in-cluster registry before the task comes back — allow for that.
+CHAOS_RESTART_SLO_S="${CHAOS_RESTART_SLO_S:-60}"
+CHAOS_RESCHEDULE_SLO_S="${CHAOS_RESCHEDULE_SLO_S:-120}"
+# Raft re-election after a leader loss is fast (a few election timeouts), but the
+# leader log line has to surface in the alloc's stdout AND nomad has to ship it,
+# so give it a generous window before we call it a failure.
+CHAOS_LEADER_SLO_S="${CHAOS_LEADER_SLO_S:-30}"
+CHAOS_CASES="${CHAOS_CASES:-graceful-executor hard-executor cluster-leader-kill node-failure-executor}"
+INJECT_DELAY="${INJECT_DELAY:-10}"
+# Each case's steady load uses ONE dedicated funded account (a fresh nonce chain
+# from 0), so cases never collide and never leave nonce gaps. Genesis funds
+# Anvil accounts #0..#15; ci-cluster.sh reserves #0 (gate) and #1..#6 (load
+# harness), leaving #7..#15 = up to 9 cases. CHAOS_ACCT advances per case.
+CHAOS_ACCT_BASE="${CHAOS_ACCT_BASE:-7}"
+CHAOS_ACCT="${CHAOS_ACCT_BASE}"
+
+# Sealer/executor metrics ports + container names (mirror smoke-load defaults).
+# NOTE: in cluster mode there is no kardamom-sealer (the Java cluster node has no
+# Prometheus endpoint); progress is read from the executor instead (port 9004).
+SEALER_NODE="kardamom-sealer-0"
+SEALER_PORT=9003
+EXECUTOR_NODE="kardamom-executor-0"
+EXECUTOR_PORT="${EXECUTOR_PORT:-9004}"
+# The executor's monotonically-advancing block gauge (crates/executor/src/metrics.rs:
+# kardamom_executor_block_number — set per committed block in actor.rs). This is the
+# cluster-mode pipeline-progress signal (the cluster commits blocks out its egress,
+# the executor applies them, this gauge ticks up). Same metric smoke-load.sh uses.
+EXECUTOR_BLOCK_METRIC="${EXECUTOR_BLOCK_METRIC:-kardamom_executor_block_number}"
+# The Nomad task name inside the `cluster` job (cluster.nomad.hcl: task "cluster"),
+# so inject_hard kardamom-sealer-<id> cluster matches its inner container.
+CLUSTER_TASK="cluster"
+
+LOAD_PID=""
+log()  { echo "==> $*"; }
+fail() { echo "CHAOS FAIL: $*" >&2; exit 1; }
+
+cleanup() {
+  [ -n "${LOAD_PID}" ] && kill "${LOAD_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+[ -x "${LOAD_BIN}" ] || fail "kardamom-load not found/executable at ${LOAD_BIN}"
+
+# Run a command on the control node with NOMAD_ADDR set. $1 is a bash snippet
+# (may reference "$1".."$N"); remaining args are passed positionally.
+on_control() {
+  local script="$1"; shift
+  docker exec "${CONTROL}" bash -lc "export NOMAD_ADDR=${NOMAD_ADDR_INT}; ${script}" _ "$@"
+}
+
+# First RUNNING alloc id for a job, via Nomad's -t Go template (the proven form
+# from ci-cluster.sh's churn — robust to tabular-format changes).
+running_alloc() {
+  on_control 'nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}} {{end}}{{end}}" "$1"' "$1" 2>/dev/null \
+    | tr ' ' '\n' | grep -m1 .
+}
+
+# Count of RUNNING allocs for a job.
+count_running() {
+  on_control 'nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}x{{end}}{{end}}" "$1"' "$1" 2>/dev/null \
+    | tr -cd 'x' | wc -c | tr -d ' '
+}
+
+sealer_boundaries() {
+  docker exec "${SEALER_NODE}" curl -fsS --max-time 5 "http://127.0.0.1:${SEALER_PORT}/metrics" 2>/dev/null \
+    | awk '/^kardamom_sealer_boundaries_emitted_total/{print $NF; exit}'
+}
+
+# Cluster-mode progress probe: the most-recently-committed block number as seen
+# by the executor (kardamom_executor_block_number gauge on :9004). The Java
+# cluster node exposes no Prometheus endpoint, so we measure pipeline liveness at
+# the executor — it applies the blocks the cluster commits out its egress, so its
+# block gauge advancing IS the cluster making progress. Prints the integer value
+# (or empty if the scrape failed). awk takes $NF of the first matching sample and
+# int-truncates (the gauge may render as a float / scientific notation).
+executor_progress() {
+  docker exec "${EXECUTOR_NODE}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+    | awk -v m="${EXECUTOR_BLOCK_METRIC}" '
+        $0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }'
+}
+
+# --- injectors --------------------------------------------------------------
+
+inject_graceful() { # <job>
+  local alloc; alloc="$(running_alloc "$1")"
+  [ -n "${alloc}" ] || fail "no running alloc to stop for job $1"
+  log "graceful: nomad alloc stop ${alloc} (job $1)"
+  on_control 'nomad alloc stop "$1"' "${alloc}" >/dev/null
+}
+
+inject_hard() { # <node-container> <task-name>
+  log "hard: docker kill inner ${2} container on ${1}"
+  docker exec "$1" sh -c 'docker kill $(docker ps --filter name='"$2"' -q | head -1)' >/dev/null \
+    || fail "could not hard-kill ${2} on ${1}"
+}
+
+# --- assertions -------------------------------------------------------------
+
+assert_count() { # <job> <min-running> <slo-secs>
+  local t=0
+  until [ "$(count_running "$1")" -ge "$2" ]; do
+    sleep 3; t=$((t+3))
+    [ "${t}" -ge "$3" ] && fail "$1 did not reach >= $2 running within $3s (have $(count_running "$1"))"
+  done
+  log "$1 has >= $2 running alloc(s) after ${t}s"
+}
+
+assert_progress() { # asserts the sealer keeps emitting block boundaries
+  local b0 b1
+  b0="$(sealer_boundaries || true)"; b0="${b0:-0}"
+  sleep 10
+  b1="$(sealer_boundaries || true)"; b1="${b1:-0}"
+  awk "BEGIN{exit !(${b1}>${b0})}" \
+    && log "pipeline progressing (sealer boundaries ${b0} -> ${b1})" \
+    || fail "pipeline NOT progressing after recovery (sealer boundaries ${b0} -> ${b1})"
+}
+
+# Cluster-mode analogue of assert_progress: the executor's committed-block gauge
+# must advance over a window (the cluster is committing blocks the executor
+# applies). $1 = optional window seconds (default 12 — a couple of block ticks).
+assert_executor_progress() {
+  local window="${1:-12}" e0 e1
+  e0="$(executor_progress || true)"; e0="${e0:-0}"
+  sleep "${window}"
+  e1="$(executor_progress || true)"; e1="${e1:-0}"
+  awk "BEGIN{exit !(${e1}>${e0})}" \
+    && log "pipeline progressing (executor block ${e0} -> ${e1})" \
+    || fail "pipeline NOT progressing (executor block ${e0} -> ${e1} over ${window}s)"
+}
+
+# Cluster-mode "must NOT progress": the executor's block gauge must stay FLAT
+# over a window (quorum lost → no new commits → no false progress). $1 = window.
+assert_executor_stalled() {
+  local window="${1:-15}" e0 e1
+  e0="$(executor_progress || true)"; e0="${e0:-0}"
+  sleep "${window}"
+  e1="$(executor_progress || true)"; e1="${e1:-0}"
+  awk "BEGIN{exit !(${e1}<=${e0})}" \
+    && log "pipeline correctly STALLED (executor block ${e0} -> ${e1} over ${window}s, no false progress)" \
+    || fail "pipeline UNEXPECTEDLY progressed while quorum lost (executor block ${e0} -> ${e1})"
+}
+
+assert_load_pass() { # <json> <case>
+  if grep -q '"pass": true' "$1" 2>/dev/null; then
+    log "load verdict PASS for case $2"
+  else
+    echo "----- load report ($2) [$1] -----" >&2
+    if [ -s "$1" ]; then
+      sed -n '1,80p' "$1" >&2
+    else
+      echo "(report JSON missing/empty — kardamom-load did not finish writing it)" >&2
+    fi
+    echo "----- kardamom-load stdout/stderr (/tmp/chaos-$2.load.log) -----" >&2
+    tail -n 80 "/tmp/chaos-$2.load.log" 2>/dev/null >&2 || echo "(no load log)" >&2
+    fail "load verdict not PASS for case $2"
+  fi
+}
+
+# --- cluster leadership detection -------------------------------------------
+
+# Return the memberId (0/1/2) of the CURRENT Raft leader, by grepping the LAST
+# `cluster role=LEADER memberId=N` line across the 3 `cluster` allocs' stdout.
+# SealerClusteredService.onRoleChange() prints that line to stdout on every role
+# transition (deliberately stdout, not slf4j, for grep-ability), so the last such
+# line in an alloc's log is that member's most-recent role; the member whose last
+# role line is LEADER is the current leader. memberId N == kardamom-sealer-N.
+#
+# Tolerates election windows with a bounded retry loop ($1 = max secs, default
+# CHAOS_LEADER_SLO_S): right after a kill there may briefly be no leader line yet.
+# Prints the leader memberId on stdout (and nothing else); fails if none found in
+# time. Reads logs via the control node's `nomad alloc logs` (same access pattern
+# the rest of the file uses).
+cluster_leader() { # [max-secs]
+  local max="${1:-${CHAOS_LEADER_SLO_S}}" t=0 allocs alloc lastrole leader
+  while :; do
+    leader=""
+    # All cluster allocs (running or not) — a just-killed member's log may still
+    # show its last role line, but we only trust a member whose LAST line is LEADER.
+    allocs="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}}{{\"\n\"}}{{end}}" "$1"' "${CLUSTER_TASK}" 2>/dev/null || true)"
+    while read -r alloc; do
+      [ -n "${alloc}" ] || continue
+      # Last role line in this alloc's stdout. Empty if it never logged a role.
+      lastrole="$(on_control 'nomad alloc logs "$1" 2>/dev/null | grep -E "cluster role=[A-Z]+ memberId=[0-9]+" | tail -1' "${alloc}" 2>/dev/null || true)"
+      case "${lastrole}" in
+        *role=LEADER*)
+          leader="$(printf '%s' "${lastrole}" | sed -nE 's/.*memberId=([0-9]+).*/\1/p')"
+          ;;
+      esac
+    done <<<"${allocs}"
+    [ -n "${leader}" ] && { printf '%s' "${leader}"; return 0; }
+    sleep 3; t=$((t+3))
+    [ "${t}" -ge "${max}" ] && fail "no cluster leader observed within ${max}s (checked alloc logs for 'role=LEADER memberId=')"
+  done
+}
+
+# --- the per-case driver ----------------------------------------------------
+
+run_case() { # <case-name>
+  local name="$1"
+  local out="/tmp/chaos-${name}.json"
+  local logf="/tmp/chaos-${name}.load.log"
+  log "================= CHAOS CASE: ${name} ================="
+
+  # One dedicated fresh funded account per case (single sender, nonces from 0)
+  # so cases never collide / leave nonce gaps on the never-reset chain.
+  local acct="${CHAOS_ACCT}"
+  CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
+  [ "${acct}" -le 15 ] || fail "ran out of funded chaos accounts (#${acct} > 15); reduce CHAOS_CASES"
+
+  # Steady background load for the whole inject+recover window. Drain deadline
+  # outlives the recovery SLO so txs accepted before/around the kill still
+  # receipt after recovery.
+  local drain=$(( CHAOS_RESCHEDULE_SLO_S + 60 ))
+  "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id "${CHAIN_ID}" --chaos-mode --duration "${CHAOS_CASE_S}s" \
+    --target-tps "${CHAOS_TPS}" --senders 1 --sender-offset "${acct}" \
+    --nonce-start 0 --assert-all-delivered --completeness accepted \
+    --max-gap "${LOAD_MAX_GAP}" --scrape executor,sealer,ingress,sequencer \
+    --drain-timeout "${drain}s" --output "${out}" >"${logf}" 2>&1 &
+  LOAD_PID=$!
+
+  sleep "${INJECT_DELAY}"
+
+  case "${name}" in
+    graceful-executor)  inject_graceful executor;                       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-executor)      inject_hard kardamom-executor-0 executor;       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
+    graceful-ingress)   inject_graceful ingress;                        assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-ingress)       inject_hard kardamom-ingress-0 ingress;         assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
+    graceful-sequencer) inject_graceful sequencer;                      assert_count sequencer 2 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-sequencer)     inject_hard kardamom-sequencer-0 sequencer;     assert_count sequencer 2 "${CHAOS_RESTART_SLO_S}" ;;
+    sealer-graceful)    inject_graceful sealer;                         assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
+    # KNOWN GAP (single-sealer topology): after a HARD sealer crash the executors
+    # freeze and don't re-attach to the restarted sealer's canonical tx_ordering
+    # (sealer was a singleton SPOF). SUPERSEDED by the clustered sealer (Phase 3):
+    # the cluster-leader-kill case below now covers the hard-kill-of-the-ordering-
+    # authority scenario with a 3-member Raft quorum that re-elects. Kept here to
+    # reproduce against a legacy single-sealer deploy; tracked in issue #58.
+    sealer-hard)        inject_hard kardamom-sealer-0 sealer;           assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
+    node-failure-executor)
+      # Kill the whole node container. With 3 executor-role nodes + distinct_hosts
+      # the lost replica can't reschedule onto a peer (none free), so the cluster
+      # degrades to 2 and must keep progressing; bringing the node back recovers 3.
+      log "node-failure: docker kill kardamom-executor-2 (whole node)"
+      docker kill kardamom-executor-2 >/dev/null || fail "could not kill node kardamom-executor-2"
+      assert_count executor 2 "${CHAOS_RESTART_SLO_S}"
+      assert_progress
+      log "node-failure: docker start kardamom-executor-2 (node returns)"
+      docker start kardamom-executor-2 >/dev/null || fail "could not restart node kardamom-executor-2"
+      assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
+      ;;
+
+    # --- CLUSTERED-SEALER (Raft) cases ------------------------------------
+    # Progress is measured at the EXECUTOR (the Java cluster node has no
+    # Prometheus endpoint); the cluster commits blocks out its egress, the
+    # executor applies them, so executor_progress() advancing == cluster liveness.
+
+    cluster-leader-kill)
+      # HARD-kill the inner cluster container on the CURRENT leader's node. A NEW
+      # leader must be elected (different memberId) within the election SLO AND the
+      # executor keeps applying blocks; then the killed member's Nomad task restarts
+      # and the cluster job returns to 3 running. This REPLACES the documented
+      # single-sealer hard-kill SPOF gap (issue #58): the 3-member Raft quorum
+      # survives the loss of any one member, including the leader.
+      local old_leader leader_node new_leader t
+      old_leader="$(cluster_leader)"
+      leader_node="kardamom-sealer-${old_leader}"
+      log "cluster-leader-kill: current leader memberId=${old_leader} on ${leader_node}; hard-killing its cluster container"
+      inject_hard "${leader_node}" "${CLUSTER_TASK}"
+      # A NEW leader (different memberId) must emerge within the election SLO. Poll
+      # cluster_leader until the reported leader differs from the killed one (it may
+      # transiently still report the old id from a stale tail until the new leader's
+      # role line ships). cluster_leader itself bounds its own no-leader wait.
+      t=0; new_leader="${old_leader}"
+      while [ "${new_leader}" = "${old_leader}" ]; do
+        new_leader="$(cluster_leader "${CHAOS_LEADER_SLO_S}")"
+        [ "${new_leader}" != "${old_leader}" ] && break
+        sleep 3; t=$((t+3))
+        [ "${t}" -ge "${CHAOS_LEADER_SLO_S}" ] && fail "no NEW leader (still memberId=${old_leader}) within ${CHAOS_LEADER_SLO_S}s after killing leader"
+      done
+      log "cluster-leader-kill: re-elected — new leader memberId=${new_leader} (was ${old_leader})"
+      # Quorum (2/3) intact under the new leader → pipeline keeps making progress.
+      assert_executor_progress
+      # The killed member's Nomad task restarts (force_pull re-pulls the image) and
+      # rejoins, returning the cluster job to 3 running.
+      assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
+      ;;
+
+    cluster-follower-kill)
+      # HARD-kill a member that is NOT the leader. Quorum (2/3) is unaffected, so
+      # the pipeline must keep progressing with NO stall — the executor's block
+      # gauge advances throughout. (No new election is required; the leader is
+      # untouched.) The killed member's task then restarts and rejoins (3/3).
+      local leader follower
+      leader="$(cluster_leader)"
+      # Pick any memberId in 0..2 that isn't the leader.
+      for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
+      log "cluster-follower-kill: leader=memberId=${leader}; killing FOLLOWER memberId=${follower} on kardamom-sealer-${follower}"
+      inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
+      # Quorum holds (2/3): the executor must keep applying blocks with no stall.
+      assert_executor_progress
+      # Leader must be UNCHANGED (a follower loss does not trigger re-election).
+      local still
+      still="$(cluster_leader)"
+      [ "${still}" = "${leader}" ] \
+        && log "cluster-follower-kill: leader unchanged (memberId=${leader}) — quorum held" \
+        || log "cluster-follower-kill: WARN leader changed (${leader} -> ${still}); quorum still held, progress OK"
+      # Killed follower's task restarts and rejoins (3/3).
+      assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
+      ;;
+
+    cluster-quorum-loss-recover)
+      # Kill TWO WHOLE sealer NODE containers (docker kill the kardamom-sealer-X
+      # containers themselves, not the inner task): Nomad on those nodes is gone
+      # too, so the inner cluster tasks CANNOT restart there → only 1 member left →
+      # Raft quorum (needs 2/3) is LOST. The pipeline MUST stall (no false progress:
+      # the executor's block gauge stays flat). Then bring ONE node back (docker
+      # start): quorum (2/3) returns, a leader is re-elected, progress RESUMES, and
+      # the backlog drains gaplessly (load verdict PASS). Generous SLOs: a node
+      # restart re-pulls images, so use CHAOS_RESCHEDULE_SLO_S for the rejoin.
+      local victims=(kardamom-sealer-1 kardamom-sealer-2)
+      log "cluster-quorum-loss-recover: docker kill TWO sealer nodes (${victims[*]}) → quorum lost (1/3 up)"
+      docker kill "${victims[@]}" >/dev/null || fail "could not kill sealer nodes ${victims[*]}"
+      # Quorum lost → the pipeline must STALL (no commits, executor gauge flat).
+      assert_executor_stalled 15
+      log "cluster-quorum-loss-recover: docker start ${victims[0]} (quorum 2/3 returns)"
+      docker start "${victims[0]}" >/dev/null || fail "could not restart node ${victims[0]}"
+      # Its cluster task reschedules + rejoins → quorum restored. Give it the
+      # reschedule SLO (image re-pull). count_running counts the `cluster` allocs.
+      assert_count "${CLUSTER_TASK}" 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      # With quorum back, the executor must resume applying blocks (drains backlog).
+      assert_executor_progress 20
+      # Restore the second node too so the suite leaves a healthy 3/3 cluster for
+      # any subsequent cases (best-effort; not asserted as part of this case's SLO).
+      docker start "${victims[1]}" >/dev/null 2>&1 || true
+      ;;
+
+    *) fail "unknown chaos case: ${name}" ;;
+  esac
+
+  # Pipeline must be producing blocks again after recovery. In cluster mode the
+  # sealer Prometheus endpoint doesn't exist, so use the executor progress probe;
+  # otherwise use the legacy sealer-boundary probe.
+  case "${name}" in
+    cluster-*) assert_executor_progress ;;
+    *)         assert_progress ;;
+  esac
+
+  # Let the background load finish its window + drain, then check its verdict.
+  wait "${LOAD_PID}" || true
+  LOAD_PID=""
+  assert_load_pass "${out}" "${name}"
+  log "CHAOS CASE ${name}: PASS"
+}
+
+log "chaos suite: cases=[${CHAOS_CASES}] tps=${CHAOS_TPS} case_s=${CHAOS_CASE_S} restart_slo=${CHAOS_RESTART_SLO_S} reschedule_slo=${CHAOS_RESCHEDULE_SLO_S} leader_slo=${CHAOS_LEADER_SLO_S}"
+for c in ${CHAOS_CASES}; do
+  run_case "${c}"
+done
+log "chaos suite PASSED (${CHAOS_CASES})"

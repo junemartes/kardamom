@@ -1,15 +1,22 @@
 name: cluster-e2e
 
 # Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
-# 5-"node" cluster as privileged systemd+DinD containers on a 192.168.56.0/24
-# bridge (the VM-less analogue of `make up`), provisions them with the
-# UNMODIFIED site.yml, deploys the Nomad jobs, and runs the pipeline smoke + a
-# recorder-kill redundancy check. See deploy/cluster/scripts/ci-cluster.sh.
+# multi-node cluster as privileged systemd+DinD containers on a 192.168.56.0/24
+# bridge (the VM-less analogue of `make up`), provisions it with the UNMODIFIED
+# site.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
+# + chaos suite. See deploy/cluster/scripts/{ci-cluster,chaos}.sh.
 #
-# Runs on every PR (and pushes to main); opt out with the `skip-cluster-e2e`
-# label for changes that can't affect the cluster. This is the only gate that
-# exercises the full orchestration stack (Ansible/Nomad/Consul) + multi-host
-# Aeron + the recorder/quorum redundancy path end to end.
+# The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
+# replaces the single sealer, so the sequencer + executor binaries are built WITH
+# their `cluster` feature (they fail-fast otherwise) and the Java cluster image is
+# built from the gradle shadowJar.
+#
+# The FULL suite runs on every trigger, SHARDED across runners (each shard brings
+# up its own cluster and runs one slice): one `load` shard (5-min soak), three
+# `chaos-*` component shards (executor/ingress/sequencer), and one `chaos-cluster`
+# shard for the Raft resilience cases. Splitting across runners keeps wall-clock
+# to ~one shard instead of running everything serially. Opt out with the
+# `skip-cluster-e2e` label for changes that can't affect the cluster.
 
 on:
   workflow_dispatch:
@@ -33,12 +40,24 @@ jobs:
   cluster-e2e:
     if: >-
       !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
-    name: container cluster e2e
+    name: container cluster e2e (${{ matrix.shard }})
     # Pinned (not ubuntu-latest): the binaries + libaeron.so built here run in
     # the ubuntu:24.04 ci-service image, so the runner glibc must match that
     # base (see deploy/cluster/docker/ci-service.Dockerfile).
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # Each shard brings up its own cluster (~30 min) + runs its slice.
+    timeout-minutes: 75
+    strategy:
+      # Don't cancel the other shards if one fails — we want every shard's
+      # result on a single run.
+      fail-fast: false
+      matrix:
+        # `load` = the 5-min sustained-load soak. The `chaos-*` shards split the
+        # chaos cases (each brings up its own cluster). chaos-cluster covers the
+        # 3-member Raft sealer (leader-kill / follower-kill / quorum-loss-recover);
+        # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
+        # now the deploy uses the clustered sealer — see "Configure shard").
+        shard: [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster]
     steps:
       - uses: actions/checkout@v4
 
@@ -63,6 +82,14 @@ jobs:
         with:
           shared-key: cluster-e2e
 
+      # JDK for the Java Aeron-Cluster sealer node. The clustered sealer image is
+      # a pure-JVM shadowJar (no native libs); temurin 17 matches cluster.Dockerfile
+      # (eclipse-temurin:17-jre).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       # Trust the in-cluster registry (plain HTTP on the bridge IP).
       - name: Configure host docker for the insecure registry
         run: |
@@ -71,14 +98,29 @@ jobs:
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
 
+      # Build the Java cluster node jar BEFORE the image build: ci-cluster.sh
+      # stages cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
+      # into cluster.Dockerfile's context and builds/pushes kardamom-cluster:dev.
+      - name: Build cluster sealer jar (gradle shadowJar)
+        working-directory: cluster/sealer-service
+        run: ./gradlew :service:shadowJar --no-daemon
+
       # Build the service binaries once on the host; ci-service.Dockerfile then
       # wraps each into a thin image (the in-image workspace build is too slow).
-      - name: cargo build --release (service binaries)
+      # The deploy is CLUSTER mode (cluster.nomad.hcl + [cluster].enabled=true in
+      # the sequencer/executor configs), so kardamom-sequencer + kardamom-executor
+      # MUST be built WITH their `cluster` feature or they fail-fast at startup
+      # ("built without the 'cluster' feature"). The other 4 bins are feature-clean.
+      # kardamom-load is the sustained-load + chaos harness ci-cluster.sh runs from
+      # target/release (it stays on the runner, not in a service image).
+      - name: cargo build --release (service binaries + load harness)
         run: |
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
+            --features 'kardamom-sequencer/cluster kardamom-executor/cluster' \
             --bins
+          cargo build --release -p kardamom-bench --bin kardamom-load
 
       - name: Install Nomad CLI
         run: |
@@ -86,15 +128,38 @@ jobs:
           curl -fsSL "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
           sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
 
-      - name: Bring up the container cluster + smoke + redundancy
+      # Select this shard's stage(s). ci-cluster.sh reads RUN_LOAD / RUN_CHAOS /
+      # CHAOS_CASES from the env. Every shard runs the full (not PR-short)
+      # durations.
+      - name: Configure shard (${{ matrix.shard }})
+        run: |
+          case "${{ matrix.shard }}" in
+            load)            { echo "RUN_LOAD=1"; echo "RUN_CHAOS=0"; echo "LOAD_DURATION_S=300"; echo "LOAD_TARGET_TPS=800"; echo "LOAD_SENDERS=6"; } ;;
+            chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor"; } ;;
+            chaos-ingress)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-ingress hard-ingress"; } ;;
+            chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer"; } ;;
+            # The clustered sealer (Phase 3) is a 3-member Aeron Cluster (Raft).
+            # These cases hard-kill the LEADER (must re-elect within the SLO), a
+            # FOLLOWER (quorum 2/3 holds, no stall), and TWO whole nodes (quorum
+            # lost → pipeline correctly stalls → one node returns → resumes).
+            # This SUPERSEDES the old chaos-sealer shard: the single-sealer hard-
+            # kill SPOF (issue #58, sealer-hard) no longer exists — the Raft quorum
+            # survives the loss of any one member, so chaos-sealer is DROPPED.
+            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover"; } ;;
+            *) echo "unknown shard ${{ matrix.shard }}" >&2; exit 1 ;;
+          esac >> "$GITHUB_ENV"
+          # Chaos knobs shared by all chaos shards (no-op on the load shard).
+          { echo "CHAOS_TPS=200"; echo "CHAOS_CASE_S=120"; echo "CHAOS_RESCHEDULE_SLO_S=200"; echo "CHAOS_LEADER_SLO_S=45"; } >> "$GITHUB_ENV"
+
+      - name: Bring up cluster + run shard (${{ matrix.shard }})
         run: deploy/cluster/scripts/ci-cluster.sh
 
       - name: Dump cluster diagnostics on failure
         if: failure()
         run: |
-          for n in cp1 r1 r2 r3 sq1 sq2 exec1 ingress1 sealer1 dawatcher1 batcher1; do
-            echo "===== kardamom-$n journal ====="
-            docker exec "kardamom-$n" journalctl -u nomad -u consul --no-pager -n 100 2>/dev/null || true
-          done
           export NOMAD_ADDR=http://192.168.56.10:4646
           nomad job status 2>/dev/null || true
+          for c in $(docker ps --format '{{.Names}}' | grep '^kardamom-' || true); do
+            echo "===== $c journal ====="
+            docker exec "$c" journalctl -u nomad -u consul --no-pager -n 80 2>/dev/null || true
+          done

@@ -378,6 +378,28 @@ for svc in "${SERVICES[@]}"; do
   push_image "${REGISTRY}/${bin}:${TAG}"
 done
 
+# --- 5b. Cluster image (Java Aeron-Cluster node) -----------------------------
+# The clustered sealer (cluster.nomad.hcl, Phase 3) runs a PURE-JVM Aeron Cluster
+# member, NOT a Rust SERVICE — so it's built separately from the SERVICES loop
+# above: the workflow runs `./gradlew :service:shadowJar` (before this script) to
+# produce kardamom-cluster-node.jar; here we stage that jar into the Dockerfile's
+# build context and build/push the image deploy.sh's cluster.nomad.hcl pulls
+# (192.168.56.10:5000/kardamom-cluster:dev). cluster.Dockerfile COPYs the jar.
+CLUSTER_JAR="${ROOT}/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
+if [[ -f "${CLUSTER_JAR}" ]]; then
+  log "building + pushing cluster image (Java Aeron-Cluster node) to ${REGISTRY}"
+  cp "${CLUSTER_JAR}" "${ROOT}/deploy/cluster/docker/kardamom-cluster-node.jar"
+  docker build -f "${ROOT}/deploy/cluster/docker/cluster.Dockerfile" \
+    -t "${REGISTRY}/kardamom-cluster:${TAG}" "${ROOT}/deploy/cluster/docker"
+  push_image "${REGISTRY}/kardamom-cluster:${TAG}"
+else
+  # The deploy uses the CLUSTERED sealer (cluster.nomad.hcl), so a missing jar is
+  # fatal: deploy.sh would fail pulling kardamom-cluster:${TAG}. Fail loudly here.
+  echo "ERROR: cluster jar not found at ${CLUSTER_JAR}" >&2
+  echo "       Build it first: (cd cluster/sealer-service && ./gradlew :service:shadowJar)" >&2
+  exit 1
+fi
+
 # --- 6. Deploy the Nomad jobs + smoke ---------------------------------------
 export NOMAD_ADDR="http://192.168.56.10:4646"
 log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
@@ -386,36 +408,73 @@ log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 log "smoke test (gate: single-tx must pass before load smoke runs)"
 ./scripts/smoke.sh
 
-# --- 6b. Exhaustive load smoke (sustained stream; must-deliver + keep-pace) --
-# Runs only after the single-tx smoke above passes (the cheap gate). Sends a
-# sustained tx stream and asserts every tx is receipted and the executors keep
-# pace with the sealer (no freeze / unbounded gap). Knobs via env
-# (SMOKE_DURATION_S / SMOKE_TPS / SMOKE_SENDERS / ...); defaults 60s @ 5 tx/s.
-# Scrapes executor/sealer block metrics via `docker exec kardamom-<node> curl`.
-log "load smoke (sustained stream; must-deliver + keep-pace)"
-# Reserve Anvil account #0 for the single-tx smoke (the gate above + the churn
-# re-smoke below both use scripts/smoke.sh @ account #0, nonces 0 then 1). The
-# load smoke therefore starts its sender set at account #1 (offset 1) so its
-# nonces never collide with account #0's.
-SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
+# --- 7. Sustained-load (8.) chaos/resilience suite — env-gated stages --------
+# Both stages drive the Rust kardamom-load harness (built alongside the service
+# bins by the workflow, staged at target/release). Durations/rates are ENV-tunable
+# so PR runs stay short and a full soak can be dialed up via the cluster-e2e.yml
+# workflow_dispatch / matrix shard knobs.
+#
+# Funded-account budget: genesis prefunds Anvil accounts #0..#15, each its own
+# contiguous nonce chain on the never-reset chain (a fresh account's first tx
+# MUST be nonce 0, with no gaps). Allocation: #0 = gate smoke above; #1..#6 = the
+# sustained-load harness; #7..#15 = one fresh account per chaos case (see
+# chaos.sh). This disjoint split is why no stage needs nonce-continuation.
+#
+# RUN_LOAD / RUN_CHAOS (default 1) let a CI shard run just one stage so the full
+# suite can be split across runners (each shard brings up its own cluster). When
+# unset both default to 1 — the local / single-runner path runs smoke + the
+# default cluster chaos cases. CHAOS_CASES selects which chaos cases to run; in
+# cluster mode the default set is the three Raft cases (see chaos.sh).
+LOAD_BIN="${ROOT}/target/release/kardamom-load"
+if [[ -x "${LOAD_BIN}" ]]; then
+  if [[ "${RUN_LOAD:-1}" == "1" ]]; then
+    log "load test: kardamom-load ramp+soak (duration=${LOAD_DURATION_S:-60}s target=${LOAD_TARGET_TPS:-200}tps)"
+    # --chain-id is passed explicitly (412346, from group_vars/all.yml) rather
+    # than probed via eth_chainId: ingress.toml sets no chain_id, so its
+    # eth_chainId returns a default that does NOT match the executors' chain, and
+    # txs signed with it would never execute. smoke.sh hardcodes 412346 likewise.
+    # Sender offset 1 reserves account #0 for the single-tx smoke gate above.
+    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 \
+      --duration "${LOAD_DURATION_S:-60}s" --target-tps "${LOAD_TARGET_TPS:-200}" \
+      --senders "${LOAD_SENDERS:-6}" --sender-offset 1 --assert-all-delivered \
+      --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
+      --scrape executor,sealer,ingress,sequencer --output /tmp/kardamom-load.json
+  else
+    log "RUN_LOAD=0 — skipping sustained-load stage (chaos-only shard)"
+  fi
 
-# --- 7. Subscriber-churn resilience: kill one executor alloc, re-smoke -------
-# The old Q-of-N recorder-redundancy test is GONE: durability is now a single
-# archive at the sealer (no recorder quorum). What the MDC change guarantees is
-# that a tx_ordering *subscriber* dropping no longer freezes the other
-# subscribers' images. Kill one executor alloc (via the control-node Nomad
-# server) and re-smoke: ingress + the sealer durability sidecar must keep
-# advancing (the old shared-multicast group froze every image on a dropped
-# subscriber; under MDC it does not).
-log "subscriber-churn: stopping one executor alloc and re-running smoke"
-docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
-  alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
-  [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
-sleep 5
-# Re-smoke after the churn. Nonce coordination across the three smokes: the gate
-# smoke used account #0 nonce 0; the load smoke runs with SMOKE_SENDER_OFFSET=1
-# so it never touches account #0; therefore account #0 nonce 1 is free and the
-# churn re-smoke uses it (the ingress can't fill the nonce; see smoke.sh).
-NONCE=1 ./scripts/smoke.sh
+  if [[ "${RUN_CHAOS:-1}" == "1" ]]; then
+    log "chaos suite (kills components under steady load; asserts auto-recovery)"
+    # Default cases are the CLUSTERED-sealer Raft cases (Phase 3): the deploy uses
+    # cluster.nomad.hcl, so the always-on cluster gate exercises leader-kill /
+    # follower-kill / quorum-loss-recover. A shard can override CHAOS_CASES to run
+    # the component (executor/ingress/sequencer) cases instead.
+    CHAOS_TPS="${CHAOS_TPS:-50}" CHAOS_CASE_S="${CHAOS_CASE_S:-45}" \
+      CHAOS_CASES="${CHAOS_CASES:-cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover}" \
+      CHAOS_RESTART_SLO_S="${CHAOS_RESTART_SLO_S:-60}" \
+      CHAOS_RESCHEDULE_SLO_S="${CHAOS_RESCHEDULE_SLO_S:-150}" \
+      CHAOS_LEADER_SLO_S="${CHAOS_LEADER_SLO_S:-30}" \
+      LOAD_BIN="${LOAD_BIN}" LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}" \
+      ./scripts/chaos.sh
+  else
+    log "RUN_CHAOS=0 — skipping chaos stage (load-only shard)"
+  fi
+else
+  # Fallback (kardamom-load not staged): the legacy bash load smoke (accounts
+  # #1..#N) + single subscriber-churn check. Kept so a cluster bring-up without the
+  # harness still exercises a sustained stream + a basic resilience event.
+  log "WARN: ${LOAD_BIN} not found — running legacy load smoke + subscriber-churn"
+  # The load smoke starts its sender set at account #1 (offset 1) so its nonces
+  # never collide with account #0 (reserved for the smoke gate + churn re-smoke).
+  SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
+  log "subscriber-churn: stopping one executor alloc and re-running smoke"
+  docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
+    alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
+    [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
+  sleep 5
+  # Re-smoke after the churn: account #0 nonce 1 is free (the gate used nonce 0;
+  # the load smoke ran on offset 1), so the ingress can't fill the nonce.
+  NONCE=1 ./scripts/smoke.sh
+fi
 
 log "cluster-e2e PASSED"
