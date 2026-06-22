@@ -230,6 +230,14 @@ pub struct ChannelsConfig {
     pub tx_deposits_channel: String,
     pub tx_deposits_stream_id: i32,
 
+    /// TxBal: the per-block BAL (Block Access List — the executor's
+    /// `BlockDelta`: account/storage/code mutations + receipts for a sealed
+    /// block). The sequencer-side executor publishes one `BlockDelta` per block;
+    /// validators subscribe and cross-check their independent re-execution
+    /// against it. RAM only, single publisher (the executor).
+    pub tx_bal_channel: String,
+    pub tx_bal_stream_id: i32,
+
     /// TxOrdering per-recorder fsync watermark publication, parameterized by
     /// recorder_id. e.g. "aeron:ipc?alias=fsync-wm-b-{rid}".
     pub fsync_watermark_channel_template: String,
@@ -463,6 +471,11 @@ impl Default for ChannelsConfig {
             tx_errors_stream_id: 1015,
             tx_deposits_channel: "aeron:ipc?alias=tx-deposits".into(),
             tx_deposits_stream_id: 1016,
+            // 1004 sits in the free range between the receipt block (1002,1003)
+            // and the fsync-watermark block (1010); BAL is another executor
+            // output so it lives near receipts.
+            tx_bal_channel: "aeron:ipc?alias=tx-bal".into(),
+            tx_bal_stream_id: 1004,
             fsync_watermark_channel_template: "aeron:ipc?alias=fsync-wm-{rid}".into(),
             fsync_watermark_stream_id: 1010,
             fsync_watermark_tx_data_channel_template: "aeron:ipc?alias=fsync-wm-a-{sid}".into(),
@@ -582,6 +595,23 @@ mod tests {
         assert!(!ch.tx_ordering_mdc_enabled());
         assert!(ch.tx_ordering_input_subscriber_uris().is_empty());
         assert!(ch.tx_ordering_canonical_subscriber_uri().is_none());
+    }
+
+    #[test]
+    fn tx_bal_defaults_present() {
+        let ch = ChannelsConfig::default();
+        assert_eq!(ch.tx_bal_stream_id, 1004);
+        assert!(ch.tx_bal_channel.contains("tx-bal"));
+        // Must not collide with the receipt block or other channels.
+        for other in [
+            ch.tx_ordering_stream_id,
+            ch.tx_receipts_stream_id,
+            ch.tx_receipts_stream_id + 1,
+            ch.tx_errors_stream_id,
+            ch.tx_deposits_stream_id,
+        ] {
+            assert_ne!(ch.tx_bal_stream_id, other);
+        }
     }
 
     #[test]
