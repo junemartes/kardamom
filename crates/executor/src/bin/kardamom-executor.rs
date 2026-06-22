@@ -13,9 +13,9 @@ use std::sync::mpsc as sync_mpsc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_executor::{
-    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, MockStateDatabase,
-    MutatingSnapshotSource, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
-    WriterApplyingQueue,
+    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig,
+    MockStateDatabase, MutatingSnapshotSource, TxDataSubscription, TxOrderingSubscription,
+    TxReceiptsPublication, WriterApplyingQueue,
 };
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxOrderingSubscriberHandle,
@@ -90,11 +90,19 @@ async fn main() -> Result<()> {
         option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
     )?;
     kardamom_executor::metrics::describe();
-    // Validate the config file exists so misconfigured deployments fail
-    // fast. v0 doesn't yet drive ExecutorConfig from the TOML — operators
-    // tune via the CLI flags above.
-    let _raw =
-        std::fs::read_to_string(&args.config).context("read executor config (presence check)")?;
+    // The TOML supplies the optional `[cluster]` section (default disabled);
+    // all other runtime tuning still comes from the CLI flags above. An empty
+    // / comment-only file (the existing deployment shape) deserializes to a
+    // disabled cluster, so behaviour is unchanged unless `[cluster]` is set.
+    let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
+    let file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
+
+    // Reject `[cluster].enabled = true` when the binary was built without the
+    // `cluster` feature — fail fast rather than silently taking the Aeron path.
+    #[cfg(not(feature = "cluster"))]
+    if file_cfg.cluster.enabled {
+        anyhow::bail!("[cluster].enabled=true but binary built without the 'cluster' feature");
+    }
 
     tracing::info!(
         shards = args.shards,
@@ -148,18 +156,44 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // 1 tx_ordering subscription, same async→sync bridge.
-    let mut tx_ordering_handle = TxOrderingSubscriberHandle::open(&rt, &channels)
-        .context("open TxOrderingSubscriberHandle")?;
-    let (b_tx, b_rx) = sync_mpsc::channel::<(BPosition, TxOrderingMessage)>();
-    tokio::spawn(async move {
-        while let Some(item) = tx_ordering_handle.recv().await {
-            if b_tx.send(item).is_err() {
-                break;
-            }
+    // The cluster-session guard (`LiveCluster`) and its dedicated Aeron runtime
+    // must outlive the executor loop; bind them in the outer scope so they drop
+    // only after the `join` await below. `None` on the Aeron path.
+    #[cfg(feature = "cluster")]
+    let cluster_guard;
+
+    // 1 tx_ordering subscription. In cluster mode it comes from the cluster
+    // egress (the cluster has already deduped + totally ordered the stream) and
+    // exposes a blocking `next()`, so NO async→sync bridge is needed. Otherwise
+    // it's the direct Aeron tx_ordering channel bridged async→sync as before.
+    let b_sub: Box<dyn TxOrderingSubscription> = {
+        #[cfg(feature = "cluster")]
+        if file_cfg.cluster.enabled {
+            // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so
+            // the cluster session never contends with the tx_data / receipts
+            // work on `rt` / `rt_pub`.
+            let cluster_rt = match args.aeron_dir.as_ref() {
+                Some(dir) => AeronRuntime::spawn_with_dir(dir)
+                    .context("spawn cluster AeronRuntime with dir")?,
+                None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
+            };
+            let (guard, cluster_sub) =
+                kardamom_executor::reader::cluster::cluster_tx_ordering_subscription(
+                    cluster_rt,
+                    file_cfg.cluster.to_live(),
+                )
+                .context("connect cluster tx_ordering subscription")?;
+            cluster_guard = Some(guard);
+            tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
+            Box::new(cluster_sub)
+        } else {
+            cluster_guard = None;
+            open_aeron_tx_ordering(&rt, &channels)?
         }
-    });
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(LiveTxOrderingSub { rx: b_rx });
+
+        #[cfg(not(feature = "cluster"))]
+        open_aeron_tx_ordering(&rt, &channels)?
+    };
 
     // 1 tx_deposits subscription. The executor's deposit reader thread
     // joins `(deposit_position, Deposit)` envelopes against the
@@ -259,12 +293,39 @@ async fn main() -> Result<()> {
     // channels, which surfaces TxDataClosed / TxOrderingClosed to the
     // executor — clean shutdown.
     drop(rt);
+    // In cluster mode, the tx_ordering reader blocks on cluster egress
+    // `recv()`, which only returns `None` once the session thread drops its
+    // sender — i.e. when the `LiveCluster` guard is dropped. Drop it here so the
+    // reader sees `TxOrderingClosed` and the executor loop can exit cleanly.
+    #[cfg(feature = "cluster")]
+    drop(cluster_guard);
     match join.await {
         Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
         Ok(Err(e)) => tracing::error!(error = %e, "executor main loop returned an error"),
         Err(e) => tracing::error!(error = %e, "executor task panicked"),
     }
     Ok(())
+}
+
+/// Open the direct Aeron tx_ordering subscription and bridge its async
+/// `recv()` to the synchronous `next()` the executor's reader thread expects,
+/// via a `std::sync::mpsc` channel pumped by a dedicated tokio task. This is
+/// the non-cluster (default) path; must be called inside the tokio runtime.
+fn open_aeron_tx_ordering(
+    rt: &AeronRuntime,
+    channels: &kardamom_log::config::ChannelsConfig,
+) -> Result<Box<dyn TxOrderingSubscription>> {
+    let mut handle =
+        TxOrderingSubscriberHandle::open(rt, channels).context("open TxOrderingSubscriberHandle")?;
+    let (b_tx, b_rx) = sync_mpsc::channel::<(BPosition, TxOrderingMessage)>();
+    tokio::spawn(async move {
+        while let Some(item) = handle.recv().await {
+            if b_tx.send(item).is_err() {
+                break;
+            }
+        }
+    });
+    Ok(Box::new(LiveTxOrderingSub { rx: b_rx }))
 }
 
 /// Load a kardamom genesis TOML and run its semantic validation

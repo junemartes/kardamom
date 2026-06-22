@@ -120,21 +120,41 @@ async fn main() -> anyhow::Result<()> {
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
 
+    // Reject `[cluster].enabled = true` when the binary was built without the
+    // `cluster` feature — fail fast (before opening any Aeron handles) rather
+    // than silently taking the Aeron path.
+    #[cfg(not(feature = "cluster"))]
+    if cfg.cluster.enabled {
+        anyhow::bail!("[cluster].enabled=true but binary built without the 'cluster' feature");
+    }
+
     let shard_id = cfg.sequencer_id;
     let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
         .context("open TxDataSubscriberHandle")?;
+    // Whether tx_ordering is carried by the Aeron Cluster instead of the
+    // direct Aeron tx_ordering channel. Only true when built with the
+    // `cluster` feature AND `[cluster].enabled`.
+    let cluster_enabled = cfg_cluster_enabled(&cfg);
     // tx_ordering publisher: MDC (per-publisher control endpoint) in the
     // cluster, shared IPC channel single-host. When MDC is enabled the
-    // control endpoint is mandatory.
-    let tx_ordering_pub = if channels.tx_ordering_mdc_enabled() {
+    // control endpoint is mandatory. SKIPPED entirely in cluster mode (the
+    // cluster ingress publisher carries tx_ordering instead).
+    let tx_ordering_pub = if cluster_enabled {
+        None
+    } else if channels.tx_ordering_mdc_enabled() {
         let ctl = args.tx_ordering_mdc_control.as_deref().context(
             "tx_ordering MDC is enabled in the log config but --tx-ordering-mdc-control \
              (KARDAMOM_TX_ORDERING_MDC_CONTROL) was not supplied",
         )?;
-        TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
-            .context("open TxOrderingPublisherHandle (MDC)")?
+        Some(
+            TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
+                .context("open TxOrderingPublisherHandle (MDC)")?,
+        )
     } else {
-        TxOrderingPublisherHandle::open(&rt, &channels).context("open TxOrderingPublisherHandle")?
+        Some(
+            TxOrderingPublisherHandle::open(&rt, &channels)
+                .context("open TxOrderingPublisherHandle")?,
+        )
     };
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;
@@ -148,53 +168,73 @@ async fn main() -> anyhow::Result<()> {
     let state_db = Arc::new(EmptyStateDatabase);
     let cfg_clone = cfg.clone();
 
-    // The tx_ordering publisher carries both `TxRef` (this loop) and
-    // `DepositRef` (the deposit pump below). Cloning the handle is sound
-    // — the underlying Aeron publication is a single multi-publisher
-    // stream and the SDK serialises offers internally.
-    let tx_ordering_pub_for_deposits = tx_ordering_pub.clone();
+    // The cluster-session guard (`LiveCluster`) and its dedicated Aeron runtime
+    // must outlive both publish loops; bind them in the outer scope so they drop
+    // only after the `join_*` awaits below. `None` on the Aeron path.
+    #[cfg(feature = "cluster")]
+    let cluster_guard;
 
-    // The sequencer main loop is sync (std::thread + std::thread::sleep
-    // backoff). Hand it to spawn_blocking so the async runtime stays
-    // responsive for shutdown handling.
-    let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
-        let mut sequencer = Sequencer::new(cfg_clone, state_db);
-        let mut tx_data = LiveTxDataSub::new(tx_data_sub);
-        let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub);
-        let mut tx_errors = LiveTxErrorPub::new(tx_errors_pub);
-        sequencer.run(
-            &mut tx_data,
-            &mut tx_ordering,
-            &mut tx_errors,
-            shutdown_for_main,
-        )
-    });
-
-    // Independent pump for tx_deposits → DepositRef on tx_ordering. The
-    // deposit path is not nonce-gated; it's a simple poll → publish loop
-    // that runs alongside the canonical TxData → TxRef path.
-    let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
-        let mut deposit_sub = LiveDepositSub::new(tx_deposits_sub);
-        let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub_for_deposits);
-        let mut backoff_us = 1u64;
-        loop {
-            if shutdown_for_deposits.is_signaled() {
-                return Ok(());
-            }
-            match process_deposit(&mut deposit_sub, &mut tx_ordering) {
-                Ok(true) => backoff_us = 1,
-                Ok(false) => {
-                    std::thread::sleep(Duration::from_micros(backoff_us));
-                    backoff_us = backoff_us.saturating_mul(2).min(100);
-                }
-                Err(SequencerError::Backpressure) => {
-                    std::thread::sleep(Duration::from_micros(10));
-                }
-                Err(SequencerError::IngressDisconnected) => return Ok(()),
-                Err(e) => return Err(e),
-            }
+    // Build the two `spawn_blocking` loops, branching on `cfg.cluster.enabled`
+    // so each branch uses its concrete publisher type — both impl
+    // `TxOrderingRefPublisher`, so the generic `spawn_publish_loops` helper
+    // below works for either. (A `Box<dyn TxOrderingRefPublisher>` would NOT
+    // auto-impl the trait, so we keep concrete types.)
+    let (join_main, join_deposits) = {
+        #[cfg(feature = "cluster")]
+        if cfg.cluster.enabled {
+            // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so
+            // the cluster session never contends with the tx_data subscription
+            // on the main `rt`.
+            let cluster_rt = match args.aeron_dir.as_ref() {
+                Some(dir) => AeronRuntime::spawn_with_dir(dir)
+                    .context("spawn cluster AeronRuntime with dir")?,
+                None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
+            };
+            let (guard, cluster_pub) = kardamom_sequencer::outbound::cluster::cluster_ref_publisher(
+                cluster_rt,
+                cfg.cluster.to_live(),
+            )
+            .context("connect cluster ref publisher")?;
+            cluster_guard = Some(guard);
+            tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
+            // Clone shares the single session thread; offers serialise through it.
+            spawn_publish_loops(
+                cfg_clone,
+                state_db,
+                LiveTxDataSub::new(tx_data_sub),
+                cluster_pub.clone(),
+                cluster_pub,
+                LiveTxErrorPub::new(tx_errors_pub),
+                LiveDepositSub::new(tx_deposits_sub),
+                shutdown_for_main,
+                shutdown_for_deposits,
+            )
+        } else {
+            cluster_guard = None;
+            spawn_aeron_loops(
+                cfg_clone,
+                state_db,
+                tx_data_sub,
+                tx_ordering_pub.expect("tx_ordering_pub opened on the Aeron path"),
+                tx_errors_pub,
+                tx_deposits_sub,
+                shutdown_for_main,
+                shutdown_for_deposits,
+            )
         }
-    });
+
+        #[cfg(not(feature = "cluster"))]
+        spawn_aeron_loops(
+            cfg_clone,
+            state_db,
+            tx_data_sub,
+            tx_ordering_pub.expect("tx_ordering_pub opened on the Aeron path"),
+            tx_errors_pub,
+            tx_deposits_sub,
+            shutdown_for_main,
+            shutdown_for_deposits,
+        )
+    };
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
@@ -209,8 +249,120 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => tracing::error!(error = %e, "sequencer deposit pump returned an error"),
         Err(e) => tracing::error!(error = %e, "sequencer deposit task panicked"),
     }
+    // Drop the cluster session (if any) only after both loops have stopped.
+    #[cfg(feature = "cluster")]
+    drop(cluster_guard);
     drop(rt);
     Ok(())
+}
+
+/// Whether tx_ordering should be carried by the Aeron Cluster. True only when
+/// built with the `cluster` feature AND `[cluster].enabled`. Without the
+/// feature this is always `false` (and `enabled=true` is rejected earlier with
+/// a clear error), so the Aeron path is taken unconditionally.
+fn cfg_cluster_enabled(cfg: &SequencerConfig) -> bool {
+    #[cfg(feature = "cluster")]
+    {
+        cfg.cluster.enabled
+    }
+    #[cfg(not(feature = "cluster"))]
+    {
+        let _ = cfg;
+        false
+    }
+}
+
+type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
+
+/// Spawn the main sequencer loop + the deposit pump over a pair of
+/// `TxOrderingRefPublisher`s (`main_pub` for the canonical `TxRef` loop,
+/// `deposit_pub` for the `DepositRef` pump). Generic over the publisher type so
+/// the Aeron and cluster branches share one implementation; both supply
+/// concrete publishers that impl the trait.
+#[allow(clippy::too_many_arguments)]
+fn spawn_publish_loops<P>(
+    cfg: SequencerConfig,
+    state_db: Arc<EmptyStateDatabase>,
+    mut tx_data: LiveTxDataSub,
+    main_pub: P,
+    deposit_pub: P,
+    mut tx_errors: LiveTxErrorPub,
+    mut deposit_sub: LiveDepositSub,
+    shutdown_for_main: Shutdown,
+    shutdown_for_deposits: Shutdown,
+) -> (LoopHandle, LoopHandle)
+where
+    P: TxOrderingRefPublisher + Send + 'static,
+{
+    // The sequencer main loop is sync (std::thread + std::thread::sleep
+    // backoff). Hand it to spawn_blocking so the async runtime stays
+    // responsive for shutdown handling.
+    let mut main_pub = main_pub;
+    let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut sequencer = Sequencer::new(cfg, state_db);
+        sequencer.run(
+            &mut tx_data,
+            &mut main_pub,
+            &mut tx_errors,
+            shutdown_for_main,
+        )
+    });
+
+    // Independent pump for tx_deposits → DepositRef on tx_ordering. The
+    // deposit path is not nonce-gated; it's a simple poll → publish loop
+    // that runs alongside the canonical TxData → TxRef path.
+    let mut deposit_pub = deposit_pub;
+    let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut backoff_us = 1u64;
+        loop {
+            if shutdown_for_deposits.is_signaled() {
+                return Ok(());
+            }
+            match process_deposit(&mut deposit_sub, &mut deposit_pub) {
+                Ok(true) => backoff_us = 1,
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_micros(backoff_us));
+                    backoff_us = backoff_us.saturating_mul(2).min(100);
+                }
+                Err(SequencerError::Backpressure) => {
+                    std::thread::sleep(Duration::from_micros(10));
+                }
+                Err(SequencerError::IngressDisconnected) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    });
+
+    (join_main, join_deposits)
+}
+
+/// Aeron-backed variant: the tx_ordering publisher carries both `TxRef` (main
+/// loop) and `DepositRef` (deposit pump). Cloning the handle is sound — the
+/// underlying Aeron publication is a single multi-publisher stream and the SDK
+/// serialises offers internally — so both loops share one publication.
+#[allow(clippy::too_many_arguments)]
+fn spawn_aeron_loops(
+    cfg: SequencerConfig,
+    state_db: Arc<EmptyStateDatabase>,
+    tx_data_sub: TxDataSubscriberHandle,
+    tx_ordering_pub: TxOrderingPublisherHandle,
+    tx_errors_pub: TxErrorsPublisherHandle,
+    tx_deposits_sub: TxDepositsSubscriberHandle,
+    shutdown_for_main: Shutdown,
+    shutdown_for_deposits: Shutdown,
+) -> (LoopHandle, LoopHandle) {
+    let tx_ordering_pub_for_deposits = tx_ordering_pub.clone();
+    spawn_publish_loops(
+        cfg,
+        state_db,
+        LiveTxDataSub::new(tx_data_sub),
+        LiveTxOrderingRefPub::new(tx_ordering_pub),
+        LiveTxOrderingRefPub::new(tx_ordering_pub_for_deposits),
+        LiveTxErrorPub::new(tx_errors_pub),
+        LiveDepositSub::new(tx_deposits_sub),
+        shutdown_for_main,
+        shutdown_for_deposits,
+    )
 }
 
 // ---------------------------------------------------------------------------

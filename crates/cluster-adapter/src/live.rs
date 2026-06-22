@@ -71,6 +71,12 @@ impl Drop for LiveCluster {
 }
 
 /// `ClusterIngress` over the live session thread.
+///
+/// `Clone` shares the single session thread: every clone offers through the
+/// same `req_tx`, and the session thread serialises those offers — the correct
+/// single-writer behaviour when two producer threads (e.g. the sequencer's main
+/// loop + deposit pump) publish through one cluster session.
+#[derive(Clone)]
 pub struct LiveIngress {
     req_tx: Sender<OfferReq>,
 }

@@ -17,11 +17,16 @@ use kardamom_cluster_adapter::wire;
 
 use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveError, LiveIngress, live};
 
-pub struct ClusterRefPublisher<I: ClusterIngress> {
+/// Cloning shares the single underlying cluster session: each clone holds a
+/// clone of the ingress (a `Sender<OfferReq>`), so offers from every clone
+/// serialise through the one session thread — correct single-writer behaviour
+/// for the sequencer's main loop + deposit pump publishing concurrently.
+#[derive(Clone)]
+pub struct ClusterRefPublisher<I: ClusterIngress + Clone> {
     ingress: I,
 }
 
-impl<I: ClusterIngress> ClusterRefPublisher<I> {
+impl<I: ClusterIngress + Clone> ClusterRefPublisher<I> {
     pub fn new(ingress: I) -> Self {
         Self { ingress }
     }
@@ -39,7 +44,7 @@ impl<I: ClusterIngress> ClusterRefPublisher<I> {
     }
 }
 
-impl<I: ClusterIngress> TxOrderingRefPublisher for ClusterRefPublisher<I> {
+impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I> {
     fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError> {
         let bytes = wire::encode_ingress_txref(r);
         self.offer(&bytes)
