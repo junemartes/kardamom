@@ -23,9 +23,15 @@ use crate::protocol::{
     wrap_session_message,
 };
 
-/// Client semantic protocol version (major.minor.patch packed into an i32),
-/// matching the schema's `semanticVersion="5.4"`.
-pub const APP_SEMANTIC_VERSION: i32 = (5 << 16) | (4 << 8);
+/// App semantic version sent in `SessionConnectRequest.version`. This is the Aeron
+/// Cluster *appVersion* the ConsensusModule validates — NOT the SBE schema version
+/// (a previous value of 5.4.0 conflated the two). It must be MAJOR 0: Aeron checks
+/// it two ways and both require major 0 here — at session connect the client major
+/// must equal the cluster's appVersion major, and internally a fresh cluster's
+/// leadership-term log version is 0.0.0, so a non-zero major triggers "incompatible
+/// version" and the members self-terminate. Pinned to 0.3.0 to match the Java
+/// cluster (ClusterNode.APP_VERSION).
+pub const APP_SEMANTIC_VERSION: i32 = (0 << 16) | (3 << 8);
 
 /// Session state exposed to the transport.
 #[derive(Debug, Clone, PartialEq, Eq)]

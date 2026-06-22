@@ -418,7 +418,7 @@ mod tests {
         let bytes = encode_session_connect_request(
             42,
             101,
-            (5 << 16) | (4 << 8),
+            (0 << 16) | (3 << 8),
             "aeron:udp?endpoint=10.0.0.9:0",
             &[0xAA, 0xBB],
             "client-1",
@@ -426,7 +426,7 @@ mod tests {
         let got = decode_session_connect_request(&bytes).unwrap();
         assert_eq!(got.correlation_id, 42);
         assert_eq!(got.response_stream_id, 101);
-        assert_eq!(got.app_version, (5 << 16) | (4 << 8));
+        assert_eq!(got.app_version, (0 << 16) | (3 << 8));
         assert_eq!(got.response_channel, "aeron:udp?endpoint=10.0.0.9:0");
         assert_eq!(got.encoded_credentials, vec![0xAA, 0xBB]);
         assert_eq!(got.client_info, "client-1");

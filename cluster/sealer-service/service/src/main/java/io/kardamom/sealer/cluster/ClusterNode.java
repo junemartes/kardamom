@@ -14,13 +14,17 @@ import org.agrona.concurrent.ShutdownSignalBarrier;
 /** Boots an all-in-one Aeron Cluster member (media driver + archive +
  *  consensus module) running {@link SealerClusteredService}. Config via -D sysprops. */
 public final class ClusterNode {
-    // App protocol version shared with the Rust cluster-client. Aeron rejects a
-    // client whose appVersion major differs from the cluster's ("invalid client
-    // version X, cluster is Y"). kardamom-cluster-client's SessionConnectRequest
-    // hard-codes app_version = SemanticVersion.compose(5, 4, 0) (= 5.4.0; see
-    // crates/cluster-client/src/protocol.rs), so the cluster MUST advertise the
-    // same on BOTH the ConsensusModule and the ServiceContainer (they must agree).
-    static final int APP_VERSION = SemanticVersion.compose(5, 4, 0);
+    // App version shared with the Rust cluster-client (kardamom-cluster-client's
+    // SessionConnectRequest sends APP_SEMANTIC_VERSION = 0.3.0). Two Aeron checks
+    // constrain this, and BOTH require MAJOR 0:
+    //   1. session connect: the client's version major must equal the cluster's
+    //      appVersion major;
+    //   2. leadership term: a FRESH cluster's log version is 0.0.0, and Aeron
+    //      rejects a major mismatch ("incompatible version: X log=0.0.0") which
+    //      makes every member self-terminate.
+    // Pinned to 0.3.0 (Aeron 1.44's default appVersion) on BOTH the ConsensusModule
+    // and the ServiceContainer (they must agree).
+    static final int APP_VERSION = SemanticVersion.compose(0, 3, 0);
 
     public static void main(final String[] args) {
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
