@@ -106,9 +106,12 @@ run_job "anvil.nomad.hcl"
 wait_running "anvil" 120
 
 # --- 3. Service pipeline ----------------------------------------------------
-# The sealer is launched FIRST: besides ordering, it owns the durability
-# sidecar, so its durable watermark must be flowing before ingress (on-quorum)
-# needs it.
+# The 3-member Aeron Cluster (Raft) sealer is launched FIRST: it owns BOTH
+# ordering and durability (durability folds into the Raft log + per-member
+# archive), so the cluster must have elected a leader and be accepting ingress
+# before the sequencer cluster-clients connect and the executor subscribes to
+# its egress. (cluster.nomad.hcl supersedes the single sealer.nomad.hcl, which
+# stays on disk but is unused in cluster mode.)
 echo
 echo "### Phase 3: service pipeline"
 
@@ -122,7 +125,12 @@ else
   echo "         default address (deposit path will not function)." >&2
 fi
 
-run_job "sealer.nomad.hcl"
+# Bring the cluster up FIRST and wait until it has converged (leader elected +
+# archive ready) before the sequencer cluster-clients connect and the executor
+# subscribes to its egress. Election + archive recovery takes longer than the
+# old single-sealer start, hence the 180s budget.
+run_job "cluster.nomad.hcl"
+wait_running "cluster" 180
 run_job "sequencer.nomad.hcl"
 # Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
 # SUBSCRIBER and the executor is the must-deliver PUBLISHER; starting the
@@ -137,7 +145,7 @@ run_job "executor.nomad.hcl"
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 
-wait_running "sealer" 120
+# The cluster was already waited-on above (before the sequencer connected).
 wait_running "sequencer" 120
 wait_running "executor" 120
 wait_running "da-watcher" 120

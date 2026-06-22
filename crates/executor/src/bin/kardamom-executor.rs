@@ -55,6 +55,11 @@ struct Args {
     /// the default `partition_count` in the sequencer).
     #[arg(long, default_value_t = 8)]
     shards: u8,
+    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Overrides/sets
+    /// the [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
+    /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     chain_id: u64,
@@ -95,7 +100,18 @@ async fn main() -> Result<()> {
     // / comment-only file (the existing deployment shape) deserializes to a
     // disabled cluster, so behaviour is unchanged unless `[cluster]` is set.
     let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
-    let file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
+    let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
+
+    // Per-node cluster egress endpoint: the cluster client's egress_channel is
+    // this node's reachable address (the node IP differs per replica), so it's
+    // injected by the Nomad job rather than baked into the static config file.
+    // Plain config mutation — `egress_channel` is a non-feature field, so no
+    // `cluster` feature gate is needed (it's a no-op when cluster is off).
+    if file_cfg.cluster.enabled
+        && let Some(ep) = args.cluster_egress_endpoint.as_deref()
+    {
+        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
+    }
 
     // Reject `[cluster].enabled = true` when the binary was built without the
     // `cluster` feature — fail fast rather than silently taking the Aeron path.

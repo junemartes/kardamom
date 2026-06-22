@@ -61,6 +61,11 @@ job "executor" {
           # The job is count-based with distinct_hosts, so ${NOMAD_ALLOC_INDEX}
           # is stable 0..N and matches the co-located recorder's id.
           "--recorder-id", "${NOMAD_ALLOC_INDEX}",
+          # Cluster mode only: this node's cluster-egress (response) endpoint.
+          # The cluster client's egress_channel is per-node (the node IP differs),
+          # so it's injected here rather than baked into config/executor.toml.
+          # Uniform port 40210 (cluster_egress_port); uniqueness comes from node_ip.
+          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
           "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",

@@ -108,7 +108,7 @@ must_contain(CLUSTER / "Makefile", f"TAG := {image_tag}", "image tag")
 
 # --- Nomad job specs ------------------------------------------------------------
 jobs = CLUSTER / "nomad"
-for svc in ("ingress", "sequencer", "executor", "sealer", "da-watcher", "batcher"):
+for svc in ("ingress", "sequencer", "executor", "sealer", "cluster", "da-watcher", "batcher"):
     must_contain(
         jobs / f"{svc}.nomad.hcl",
         f"{registry}/kardamom-{svc}:{image_tag}",
@@ -248,6 +248,106 @@ must_contain(
     registry,
     "insecure-registry address in cluster-bootstrap/doctor",
 )
+
+# --- Aeron Cluster (Raft) sealer ------------------------------------------------
+# The 3-member cluster topology is the canonical contract here, but it is mirrored
+# as literals in three places that cannot read YAML:
+#   - nomad/cluster.nomad.hcl    : the -Dkardamom.cluster.members string + ingressStreamId
+#   - config/sequencer.toml.tpl  : the [cluster] ingress_endpoints + stream ids
+#   - config/executor.toml       : the [cluster] ingress_endpoints + stream ids
+# Derive the expected member endpoints from node_classes.sealer (ip_start lane on
+# ip_prefix) + cluster_member_count + cluster_ports, then assert each mirror agrees.
+ip_prefix = scalar(gv, "ip_prefix")
+cluster_member_count = scalar(gv, "cluster_member_count")
+cluster_ingress_stream_id = scalar(gv, "cluster_ingress_stream_id")
+cluster_egress_stream_id = scalar(gv, "cluster_egress_stream_id")
+cluster_egress_port = scalar(gv, "cluster_egress_port")
+
+# cluster_ports: indented `key: int` entries under the `cluster_ports:` block.
+cp_block = re.search(r"^cluster_ports:\n((?:\s{2}\w+:.*\n?)+)", gv, re.M)
+cluster_ports = (
+    dict(re.findall(r"^\s{2}(\w+):\s*(\d+)", cp_block.group(1), re.M))
+    if cp_block
+    else {}
+)
+for k in ("ingress", "consensus", "log", "catchup", "archive_control"):
+    if k not in cluster_ports:
+        err(f"group_vars/all.yml: missing cluster_ports.{k}")
+
+# sealer node-class ip_start lane (members at <ip_prefix>.<ip_start + i>).
+m_sealer = re.search(r"^\s{2}sealer:\s*\{[^}]*?\bip_start:\s*(\d+)", gv, re.M)
+m_sealer_count = re.search(r"^\s{2}sealer:\s*\{[^}]*?\bcount:\s*(\d+)", gv, re.M)
+if not m_sealer:
+    err("group_vars/all.yml: missing node_classes.sealer.ip_start")
+if m_sealer_count and cluster_member_count and m_sealer_count.group(1) != cluster_member_count:
+    err(
+        "group_vars/all.yml: node_classes.sealer.count "
+        f"({m_sealer_count.group(1)}) != cluster_member_count ({cluster_member_count}) "
+        "— the cluster runs one Raft member per sealer node"
+    )
+
+if (
+    ip_prefix
+    and m_sealer
+    and cluster_member_count.isdigit()
+    and all(k in cluster_ports for k in ("ingress", "consensus", "log", "catchup", "archive_control"))
+):
+    n = int(cluster_member_count)
+    ip_start = int(m_sealer.group(1))
+    member_ips = [f"{ip_prefix}.{ip_start + i}" for i in range(n)]
+    p = cluster_ports
+    # Expected -Dkardamom.cluster.members string (id,ingress,consensus,log,catchup,archive|...).
+    expected_members = "|".join(
+        ",".join(
+            [
+                str(i),
+                f"{ip}:{p['ingress']}",
+                f"{ip}:{p['consensus']}",
+                f"{ip}:{p['log']}",
+                f"{ip}:{p['catchup']}",
+                f"{ip}:{p['archive_control']}",
+            ]
+        )
+        for i, ip in enumerate(member_ips)
+    )
+    must_contain(
+        jobs / "cluster.nomad.hcl",
+        expected_members,
+        "cluster member endpoints (id,ingress,consensus,log,catchup,archive | per member)",
+    )
+    must_contain(
+        jobs / "cluster.nomad.hcl",
+        f"-Dkardamom.cluster.ingressStreamId={cluster_ingress_stream_id}",
+        "cluster ingress stream id",
+    )
+    # Expected [cluster] ingress_endpoints: "id=ip:ingress,..." (client view).
+    expected_endpoints = ",".join(
+        f"{i}={ip}:{p['ingress']}" for i, ip in enumerate(member_ips)
+    )
+    for tpl in ("sequencer.toml.tpl", "executor.toml"):
+        must_contain(
+            CLUSTER / "config" / tpl,
+            f'ingress_endpoints = "{expected_endpoints}"',
+            f"[cluster] ingress_endpoints in {tpl}",
+        )
+        must_contain(
+            CLUSTER / "config" / tpl,
+            f"ingress_stream_id = {cluster_ingress_stream_id}",
+            f"[cluster] ingress_stream_id in {tpl}",
+        )
+        must_contain(
+            CLUSTER / "config" / tpl,
+            f"egress_stream_id = {cluster_egress_stream_id}",
+            f"[cluster] egress_stream_id in {tpl}",
+        )
+# Per-node egress endpoint is injected by the Nomad job (port differs only by
+# node IP), so assert the job carries the flag with the canonical egress port.
+for job in ("sequencer", "executor"):
+    must_contain(
+        jobs / f"{job}.nomad.hcl",
+        f"${{meta.node_ip}}:{cluster_egress_port}",
+        f"per-node cluster egress endpoint (--cluster-egress-endpoint) in {job}",
+    )
 
 if errors:
     print(f"check-contract: {len(errors)} mismatch(es) vs ansible/group_vars/all.yml:")

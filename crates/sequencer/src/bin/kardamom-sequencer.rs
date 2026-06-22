@@ -68,6 +68,11 @@ struct Args {
     /// one of the `tx_ordering_mdc_publishers` entries in the channels config.
     #[arg(long, env = "KARDAMOM_TX_ORDERING_MDC_CONTROL")]
     tx_ordering_mdc_control: Option<String>,
+    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Overrides/sets
+    /// the [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
+    /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9001")]
     metrics_addr: std::net::SocketAddr,
@@ -103,6 +108,16 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(c) = args.core_id {
         cfg.core_id = Some(c);
+    }
+    // Per-node cluster egress endpoint: the cluster client's egress_channel is
+    // this node's reachable address (the node IP differs per replica), so it's
+    // injected by the Nomad job rather than baked into the static config
+    // template. Plain config mutation — `egress_channel` is a non-feature field,
+    // so no `cluster` feature gate is needed (it's a no-op when cluster is off).
+    if cfg.cluster.enabled
+        && let Some(ep) = args.cluster_egress_endpoint.as_deref()
+    {
+        cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
     }
     cfg.validate().context("validate config")?;
 
