@@ -80,6 +80,23 @@ Each runs steady `kardamom-load` across the window (`--assert-all-delivered --co
 - The ingress `ClusterWatermark` factory shape (no factory exists yet; `ClusterWatermark` type is exported).
 - Whether the `sealer` node-class is renamed to `cluster` for clarity or kept as `sealer` (reuse the role/IP lane). Default: keep `sealer` to minimize churn.
 
+## Phase 2 design corrections (discovered during implementation)
+
+Three findings refine the Rust-wiring design from §Architecture C:
+
+1. **Workspace membership is already done.** `Cargo.toml` uses `members = ["crates/*"]`, so `cluster-adapter`/`cluster-client` are already members. Task 2.1 reduces to adding them to the CI build list.
+
+2. **Ingress needs NO cluster wiring or watermark factory.** `AckPolicy::OnOffer` = "no durability gate beyond receipt arrival." Because cluster egress is **post-Raft-commit** (the executor only sees a record after a quorum committed it), a tx that produces a receipt is already quorum-durable. So in cluster mode ingress uses `OnOffer` and is otherwise **unchanged** — drop the `cluster_watermark` factory (the landed `ClusterWatermark` is a plain monotonic counter, not egress-owning) and the ingress code wiring. Setting `--ack-policy on-offer` for the cluster deploy is the only ingress change (Phase 3 config). `ClusterWatermark` stays in `cluster-adapter` unused (a future enhancement could publish a cluster-derived `QuorumWatermark` for `OnQuorum`).
+
+3. **`cluster-adapter` → `sequencer`/`executor` is a hard Cargo cycle** (the binaries live in those crates, and would need to depend on `cluster-adapter`). Resolution, using Cargo's **dev-dependency cycle exemption**:
+   - `cluster-adapter` becomes **transport-only**: keep `gateway`, `live`, `wire`, `watermark`, `fakes`; its normal `[dependencies]` drop `kardamom-sequencer`/`kardamom-executor` (keep `kardamom-types`, `kardamom-log`, `kardamom-cluster-client`).
+   - The trait impls move INTO the consuming crates under a `cluster` feature: `publisher.rs` → `crates/sequencer/src/outbound/cluster.rs` (`ClusterRefPublisher` impl `TxOrderingRefPublisher`); `subscription.rs` → `crates/executor/src/reader/cluster.rs` (`ClusterTxOrderingSubscription` impl `TxOrderingSubscription`). Each uses `cluster-adapter`'s `live::connect` + `gateway` + `wire`.
+   - `sequencer`/`executor` gain a `cluster` feature that enables `dep:kardamom-cluster-adapter`; their binaries construct the cluster impl when `[cluster].enabled`.
+   - The `end_to_end.rs` integration test (spans publisher+subscription) lives in `cluster-adapter/tests/` reaching the moved impls via `cluster-adapter`'s `[dev-dependencies]` on `sequencer`+`executor` (with `cluster` feature) — a **dev-dep cycle, which Cargo permits**. Normal-dep direction (`sequencer`→`cluster-adapter`) stays acyclic.
+   - **Non-cluster paths untouched:** the binaries stay in their crates (docker-e2e/multiprocess unaffected); the `cluster` feature is off by default.
+
+4. **`AeronRuntime` is `#[derive(Clone)]`.** The sequencer/executor already spawn a second runtime to isolate publish from poll. The cluster client gets its **own dedicated `AeronRuntime`** (`spawn_with_dir` on the same `aeron.dir`) to avoid contending with tx_data/tx_receipts on the main runtime.
+
 ## Verification-loop authorization (confirmed)
 
 The user authorized **autonomous push + CI iteration**: create a branch off `claude/sealer-aeron-cluster-failover` (PR #62), push to `junemartes/kardamom`, trigger `cluster-e2e` via `gh workflow run`, watch, read `--log-failed`, fix, and repeat until green — spending Actions minutes as needed, reporting progress each iteration.

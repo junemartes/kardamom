@@ -58,6 +58,9 @@ use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, TxEnvelope, TxOrder
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
+#[cfg(feature = "cluster")]
+pub mod cluster;
+
 /// Subscription to one **tx_data[i]**.
 ///
 /// One impl per sequencer partition. Implementations:

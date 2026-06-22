@@ -7,12 +7,15 @@
 //! not-yet-connected) cluster offer surfaces as `SequencerError::Backpressure`
 //! so the existing rewind/retry path applies.
 
-use kardamom_sequencer::SequencerError;
-use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_types::{DepositRef, TxRef};
 
-use crate::gateway::{ClusterIngress, OfferOutcome};
-use crate::wire;
+use crate::SequencerError;
+use crate::outbound::TxOrderingRefPublisher;
+
+use kardamom_cluster_adapter::gateway::{ClusterIngress, OfferOutcome};
+use kardamom_cluster_adapter::wire;
+
+use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveError, LiveIngress, live};
 
 pub struct ClusterRefPublisher<I: ClusterIngress> {
     ingress: I,
@@ -48,12 +51,22 @@ impl<I: ClusterIngress> TxOrderingRefPublisher for ClusterRefPublisher<I> {
     }
 }
 
-#[cfg(test)]
+/// Connect to the cluster and wrap ingress as a `TxOrderingRefPublisher`.
+/// The returned `LiveCluster` guard MUST be kept alive while the publisher is used.
+pub fn cluster_ref_publisher(
+    rt: kardamom_log::aeron_live::AeronRuntime,
+    cfg: LiveClusterConfig,
+) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>), LiveError> {
+    let (cluster, ingress, _egress) = live::connect(rt, cfg)?;
+    Ok((cluster, ClusterRefPublisher::new(ingress)))
+}
+
+#[cfg(all(test, feature = "cluster"))]
 mod tests {
     use super::*;
-    use crate::gateway::fakes::FakeIngress;
-    use crate::wire::{EgressItem, decode_egress, encode_egress_record, split_ingress};
     use alloy_primitives::B256;
+    use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
+    use kardamom_cluster_adapter::wire::{EgressItem, decode_egress, encode_egress_record, split_ingress};
     use kardamom_types::{BPosition, TxOrderingMessage};
 
     fn txref() -> TxRef {

@@ -25,6 +25,9 @@
 //! (no Aeron media driver required); production wiring binds them to the
 //! real `kardamom_log::publisher` types.
 
+#[cfg(feature = "cluster")]
+pub mod cluster;
+
 use kardamom_types::{DepositRef, TxError, TxRef};
 
 use crate::error::SequencerError;

@@ -18,8 +18,6 @@ testing = []
 
 [dependencies]
 kardamom-types.workspace = true
-kardamom-sequencer = { path = "../sequencer" }
-kardamom-executor = { path = "../executor" }
 kardamom-cluster-client = { path = "../cluster-client" }
 # Live transport reuses kardamom-log's AeronRuntime (already in the tree via the
 # executor → log dependency, so this adds no new native build cost).
@@ -32,3 +30,5 @@ tracing.workspace = true
 
 [dev-dependencies]
 kardamom-cluster-adapter = { path = ".", features = ["testing"] }
+kardamom-sequencer = { path = "../sequencer", features = ["cluster"] }
+kardamom-executor = { path = "../executor", features = ["cluster"] }

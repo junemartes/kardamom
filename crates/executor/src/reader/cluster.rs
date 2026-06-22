@@ -9,12 +9,15 @@
 //! the executor's own `DedupWindow` still provides idempotency across any
 //! reconnect overlap.
 
-use kardamom_executor::ExecutorError;
-use kardamom_executor::reader::TxOrderingSubscription;
 use kardamom_types::{BPosition, TxOrderingMessage};
 
-use crate::gateway::ClusterEgress;
-use crate::wire::{self, EgressItem};
+use crate::ExecutorError;
+use crate::reader::TxOrderingSubscription;
+
+use kardamom_cluster_adapter::gateway::ClusterEgress;
+use kardamom_cluster_adapter::wire::{self, EgressItem};
+
+use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveEgress, LiveError, live};
 
 pub struct ClusterTxOrderingSubscription<E: ClusterEgress> {
     egress: E,
@@ -51,12 +54,22 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
     }
 }
 
-#[cfg(test)]
+/// Connect to the cluster and wrap egress as a `TxOrderingSubscription`.
+/// The returned `LiveCluster` guard MUST be kept alive while the subscription is used.
+pub fn cluster_tx_ordering_subscription(
+    rt: kardamom_log::aeron_live::AeronRuntime,
+    cfg: LiveClusterConfig,
+) -> Result<(LiveCluster, ClusterTxOrderingSubscription<LiveEgress>), LiveError> {
+    let (cluster, _ingress, egress) = live::connect(rt, cfg)?;
+    Ok((cluster, ClusterTxOrderingSubscription::new(egress)))
+}
+
+#[cfg(all(test, feature = "cluster"))]
 mod tests {
     use super::*;
-    use crate::gateway::fakes::FakeEgress;
-    use crate::wire::{encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress};
     use alloy_primitives::B256;
+    use kardamom_cluster_adapter::gateway::fakes::FakeEgress;
+    use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress};
     use kardamom_types::TxRef;
 
     fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {

@@ -4,10 +4,18 @@ version.workspace = true
 edition.workspace = true
 
 
+[features]
+default = []
+# Cluster-mode transport adapter (`reader::cluster`). Pulls in the
+# cluster-adapter transport crate as an optional dep; off by default so the
+# default (Aeron multiprocess) build is unaffected.
+cluster = ["dep:kardamom-cluster-adapter"]
+
 [dependencies]
 # : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
+kardamom-cluster-adapter = { path = "../cluster-adapter", optional = true }
 kardamom-obs = { path = "../obs" }
 revm.workspace = true
 alloy-primitives.workspace = true
@@ -33,6 +41,7 @@ path = "src/bin/kardamom-executor.rs"
 # : hermetic unit tests use kardamom-log's in-memory fakes.
 # Real-Aeron e2e tests pull `docker-e2e` to bring in the testcontainers harness.
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
 alloy-network.workspace = true
 alloy-eips.workspace = true

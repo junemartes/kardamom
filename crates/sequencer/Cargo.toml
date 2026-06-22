@@ -15,6 +15,10 @@ path = "src/bin/kardamom-sequencer.rs"
 testing = []
 # Real-Aeron Docker e2e test gate. Implies `testing` for the harness import.
 docker-e2e = ["testing", "kardamom-log/docker-e2e"]
+# Cluster-mode transport adapter (`outbound::cluster`). Pulls in the
+# cluster-adapter transport crate as an optional dep; off by default so the
+# default (Aeron multiprocess) build is unaffected.
+cluster = ["dep:kardamom-cluster-adapter"]
 
 [dependencies]
 alloy-primitives.workspace = true
@@ -24,6 +28,7 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 core_affinity = "0.8"
+kardamom-cluster-adapter = { path = "../cluster-adapter", optional = true }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
@@ -46,6 +51,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # `cargo test --features testing` (matches the convention CI uses).
 kardamom-sequencer = { path = ".", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 proptest = "1"
 rand = "0.9"
 

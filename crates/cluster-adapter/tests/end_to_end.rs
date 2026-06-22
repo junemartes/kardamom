@@ -14,9 +14,10 @@ use std::collections::{HashSet, VecDeque};
 use alloy_primitives::B256;
 use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record, split_ingress};
-use kardamom_cluster_adapter::{ClusterRefPublisher, ClusterTxOrderingSubscription};
 use kardamom_executor::reader::TxOrderingSubscription;
+use kardamom_executor::reader::cluster::ClusterTxOrderingSubscription;
 use kardamom_sequencer::outbound::TxOrderingRefPublisher;
+use kardamom_sequencer::outbound::cluster::ClusterRefPublisher;
 use kardamom_types::{BPosition, TxOrderingMessage, TxRef};
 
 /// Mirrors the Java `CanonicalSealerState`: FIFO first-seen dedup, 0-based
