@@ -8,11 +8,20 @@ import io.aeron.cluster.service.ClusteredServiceContainer;
 import io.aeron.driver.MediaDriver;
 import io.aeron.driver.ThreadingMode;
 import java.io.File;
+import org.agrona.SemanticVersion;
 import org.agrona.concurrent.ShutdownSignalBarrier;
 
 /** Boots an all-in-one Aeron Cluster member (media driver + archive +
  *  consensus module) running {@link SealerClusteredService}. Config via -D sysprops. */
 public final class ClusterNode {
+    // App protocol version shared with the Rust cluster-client. Aeron rejects a
+    // client whose appVersion major differs from the cluster's ("invalid client
+    // version X, cluster is Y"). kardamom-cluster-client's SessionConnectRequest
+    // hard-codes app_version = SemanticVersion.compose(5, 4, 0) (= 5.4.0; see
+    // crates/cluster-client/src/protocol.rs), so the cluster MUST advertise the
+    // same on BOTH the ConsensusModule and the ServiceContainer (they must agree).
+    static final int APP_VERSION = SemanticVersion.compose(5, 4, 0);
+
     public static void main(final String[] args) {
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
@@ -60,11 +69,13 @@ public final class ClusterNode {
             .clusterDir(new File(clusterDir))
             .ingressChannel("aeron:udp")
             .ingressStreamId(ingressStreamId)
+            .appVersion(APP_VERSION)
             .replicationChannel("aeron:udp?endpoint=" + me[3]);
 
         final ClusteredServiceContainer.Context serviceCtx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
+            .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId));
 
         try (ClusteredMediaDriver ignored = ClusteredMediaDriver.launch(driverCtx, archiveCtx, consensusCtx);
