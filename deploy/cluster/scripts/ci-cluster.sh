@@ -348,45 +348,6 @@ log "ansible-playbook site.yml (generated container inventory: ${CONTAINER_INVEN
 ANSIBLE_HOST_KEY_CHECKING=False \
   ansible-playbook -i "${CONTAINER_INVENTORY}" ansible/site.yml
 
-# --- 4b. Build prerequisites the (workflow-scope-limited) workflow no longer does
-# The cluster-e2e.yml workflow deliberately does NOT touch the build steps below
-# (changing the workflow file needs a `workflow`-scoped token we don't have), so
-# everything the CLUSTERED deploy needs that the base workflow's generic build
-# step doesn't produce is built HERE, on the runner host (sudo/apt/cargo/gradle
-# are all available — the workflow runs this script directly on the host). These
-# run BEFORE the image builds below, which consume their outputs:
-#   - the gradle shadowJar  -> staged into cluster.Dockerfile in §5b
-#   - the cluster-feature sequencer/executor bins -> wrapped in the §5 image loop
-#   - kardamom-load         -> run from target/release in §7 (chaos/load harness)
-#
-# 1) JDK 17 — gradle needs a JVM to build the Aeron-Cluster sealer fat jar. The
-#    base workflow's earlier `apt-get update` already refreshed the index; re-run
-#    it (quietly) for safety, then install idempotently.
-log "installing JDK 17 (gradle toolchain for the cluster sealer jar)"
-sudo apt-get update -qq
-sudo apt-get install -y --no-install-recommends openjdk-17-jdk
-java -version
-
-# 2) Cluster sealer fat jar (gradle shadowJar) — must exist before §5b cp/build.
-#    Produces cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar.
-log "building cluster sealer jar (gradle :service:shadowJar)"
-(cd "${ROOT}/cluster/sealer-service" && ./gradlew :service:shadowJar --no-daemon)
-
-# 3) Rebuild sequencer + executor WITH the `cluster` feature. The base workflow
-#    built them feature-LESS, but this deploy sets [cluster].enabled=true, so a
-#    feature-less binary fail-fasts at startup ("built without the 'cluster'
-#    feature"). Incremental over the warm cache, so this only recompiles the
-#    cluster-gated code paths. Overwrites target/release/kardamom-{sequencer,executor}
-#    BEFORE the §5 service-image loop wraps those binaries.
-log "rebuilding sequencer + executor WITH the cluster feature"
-cargo build --release -p kardamom-sequencer -p kardamom-executor \
-  --features 'kardamom-sequencer/cluster kardamom-executor/cluster' --bins
-
-# 4) kardamom-load — the load/chaos harness §7 runs from target/release. Built
-#    here so this script is self-contained regardless of what the workflow built.
-log "building kardamom-load (load + chaos harness)"
-cargo build --release -p kardamom-bench --bin kardamom-load
-
 # --- 5. Build thin service images from prebuilt binaries, push to r1 ---------
 # The workflow ran `cargo build --release` for each BIN; wrap each into a thin
 # image and push to the in-cluster registry (reachable on the bridge IP).
@@ -459,20 +420,14 @@ log "smoke test (gate: single-tx must pass before load smoke runs)"
 # sustained-load harness; #7..#15 = one fresh account per chaos case (see
 # chaos.sh). This disjoint split is why no stage needs nonce-continuation.
 #
-# RUN_LOAD / RUN_CHAOS let a CI shard run just one stage so the full suite can be
-# split across runners (each shard brings up its own cluster). The base workflow
-# sets NO shard env, so the defaults below define the single-runner path that has
-# to fit the workflow's 60-min budget:
-#   RUN_CHAOS=1  — run the chaos suite (the resilience signal we want)
-#   RUN_LOAD=0   — SKIP the standalone 5-min sustained-load soak. Each chaos case
-#                  already runs its own load window (CHAOS_CASE_S), which is the
-#                  resilience signal; the extra soak would just burn budget. Set
-#                  RUN_LOAD=1 to dial the soak back on (e.g. a `load` shard).
-#   CHAOS_CASES  — the three CLUSTERED-sealer Raft cases (~12 min total), which
-#                  on top of ~30 min bring-up comfortably fits 60 min.
+# RUN_LOAD / RUN_CHAOS (default 1) let a CI shard run just one stage so the full
+# suite can be split across runners (each shard brings up its own cluster). When
+# unset both default to 1 — the local / single-runner path runs smoke + the
+# default cluster chaos cases. CHAOS_CASES selects which chaos cases to run; in
+# cluster mode the default set is the three Raft cases (see chaos.sh).
 LOAD_BIN="${ROOT}/target/release/kardamom-load"
 if [[ -x "${LOAD_BIN}" ]]; then
-  if [[ "${RUN_LOAD:-0}" == "1" ]]; then
+  if [[ "${RUN_LOAD:-1}" == "1" ]]; then
     log "load test: kardamom-load ramp+soak (duration=${LOAD_DURATION_S:-60}s target=${LOAD_TARGET_TPS:-200}tps)"
     # --chain-id is passed explicitly (412346, from group_vars/all.yml) rather
     # than probed via eth_chainId: ingress.toml sets no chain_id, so its
