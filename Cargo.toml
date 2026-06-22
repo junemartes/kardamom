@@ -41,6 +41,7 @@ alloy-node-bindings = "2.0"
 
 kardamom-types = { path = "crates/types" }
 kardamom-log = { path = "crates/log" }
+kardamom-engine = { path = "crates/engine" }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
 io-uring = "0.7"
 # NOTE: rusteron's `static` feature links Aeron statically but is broken on

@@ -1,0 +1,31 @@
+[package]
+name = "kardamom-engine"
+version.workspace = true
+edition.workspace = true
+
+# Role-agnostic execution engine: the reader/join topology, per-tx revm
+# execution, delta/write-set accumulation, and the reader→exec→commit
+# orchestration behind a `BlockSink` seam. Shared by the sequencer-side
+# `kardamom-executor` and the `kardamom-validator`.
+
+[dependencies]
+kardamom-types = { workspace = true }
+kardamom-log = { workspace = true }
+kardamom-state = { path = "../state" }
+revm.workspace = true
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+bytes.workspace = true
+metrics = { workspace = true }
+tracing.workspace = true
+thiserror.workspace = true
+crossbeam-channel = "0.5"
+dashmap = { workspace = true }
+
+[dev-dependencies]
+kardamom-log = { workspace = true, features = ["testing"] }
+alloy-signer-local.workspace = true
+alloy-network.workspace = true
+alloy-eips.workspace = true
+tempfile = { workspace = true }

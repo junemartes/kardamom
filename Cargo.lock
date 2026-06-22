@@ -3760,6 +3760,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-engine"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "bytes",
+ "crossbeam-channel",
+ "dashmap",
+ "kardamom-log",
+ "kardamom-state",
+ "kardamom-types",
+ "metrics",
+ "revm",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-executor"
 version = "0.1.0"
 dependencies = [
@@ -3774,6 +3796,7 @@ dependencies = [
  "criterion 0.5.1",
  "crossbeam-channel",
  "dashmap",
+ "kardamom-engine",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-state",

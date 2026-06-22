@@ -1,4 +1,4 @@
-//! Errors raised by the executor actor and its helpers.
+//! Errors raised by the engine actor and its helpers.
 
 use alloy_primitives::B256;
 
@@ -65,3 +65,8 @@ pub enum ExecutorError {
         timeout_ms: u64,
     },
 }
+
+/// Role-agnostic alias for the engine error. New engine/validator code should
+/// prefer `EngineError`; `ExecutorError` is retained for the existing executor
+/// call sites and is the same type.
+pub type EngineError = ExecutorError;

@@ -1,71 +1,25 @@
-//! Kardamom S4 v0 sequential executor.
+//! Kardamom S4 v0 sequential executor — the **sequencer-side role**.
 //!
-//! Single-threaded revm executor that subscribes to M per-sequencer
-//! **tx_data**'s + the canonical **tx_ordering** orderer and joins them by
-//! reference. Publishes receipts + sealed BlockBoundaries to tx_receipts.
-//! Block-STM is explicitly out of scope for v0; S4 v1 will replace the
-//! single execution thread with parallel workers behind the same
-//! `TxDataSubscription` / `TxOrderingSubscription` / `TxReceiptsPublication`
-//! interface.
-//!
-//! ## Wire topology ()
-//!
-//! - **TxData[i]** (per-sequencer, M of them) carries full `TxEnvelope`
-//!   bytes. Executors run M subscriptions, one per sequencer partition.
-//! - **TxOrdering** carries tiny `TxOrderingMessage` records (`TxRef |
-//!   BoundaryStart`) — ~16-32 B each. This is the canonical orderer.
-//! - **TxReceipts** carries `Receipt` and slim `BlockBoundary` records (the
-//!   executor's output).
-//!
-//! See `` §2.3
-//! (transport split) and §2.4 (executor). Shared types come from
-//! `kardamom-types` (S0).
+//! The execution core now lives in [`kardamom_engine`]; this crate is the
+//! sequencer role (the `kardamom-executor` binary) plus a thin re-export of the
+//! engine API so existing `kardamom_executor::...` paths keep resolving.
 //!
 //! ## Divergence detection
 //!
-//! Spec §4.4 mandates that two replicas publishing a `Receipt` with the same
-//! `tx_idx` but different `write_set_hash` halt the chain. The executor
-//! cannot detect this from its own output — it has no visibility into peer
-//! replicas. The detection point is the **tx_receipts consumer** that dedupes
-//! by `tx_idx`; that consumer panics on hash mismatch.
-//!
-//! That consumer lives in the `kardamom-log` crate (S3). The chaos test
-//! `cargo test -p kardamom-log --test divergence_halt` (to be added in a
-//! follow-up to the S3 plan) injects a "buggy replica" by hand-crafting a
-//! `Receipt` with a tweaked `write_set_hash` and asserts the consumer
-//! panics. Cross-reference when that lands.
+//! Two replicas publishing a `Receipt` with the same `tx_idx` but different
+//! `write_set_hash` must halt the chain. The executor cannot detect this from
+//! its own output; the detection point is the **tx_receipts consumer** that
+//! dedupes by `tx_idx` and panics on hash mismatch (lives in `kardamom-log`).
+//! Independently, a `kardamom-validator` re-executes the canonical order and
+//! cross-checks against the executor's receipts + BAL.
 
-pub mod actor;
-pub mod block_env;
-pub mod delta;
-pub mod error;
-pub mod exec_types;
-pub mod executor;
-pub mod metrics;
-pub mod persist;
-pub mod reader;
-pub mod state;
+// Flat API (types, traits, structs) — same names the crate exposed before the
+// engine extraction.
+pub use kardamom_engine::*;
 
-pub use actor::{
-    Executor, ExecutorConfig, ResumePoint, StateWriterQueue, StateWriterSignal,
-    TxReceiptsPublication,
+// Re-export the engine's modules so path-qualified references keep working
+// (`kardamom_executor::metrics::describe()`, tests' `kardamom_executor::executor::*`,
+// the throughput bench's `block_env` / `delta`, etc.).
+pub use kardamom_engine::{
+    actor, block_env, delta, error, exec_types, executor, metrics, persist, reader, state,
 };
-pub use block_env::ExecEnv;
-pub use delta::{PendingDelta, WriteSet};
-pub use error::ExecutorError;
-pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
-pub use reader::{
-    DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
-    TxDataSubscription, TxOrderingSubscription,
-};
-pub use state::{
-    MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
-    WriterApplyingQueue,
-};
-// Shared types re-exported from the `types` crate so external callers can
-// pull them via `kardamom_executor::*` without a separate dependency line.
-pub use ::kardamom_types::{
-    AccountChange, BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt,
-    SnapshotSource, StateDatabase, StorageChange, TxEnvelope, TxOrderingMessage, TxRef, WireLog,
-};
-pub use exec_types::{CMessage, ReceiptStatus, TxIndex};

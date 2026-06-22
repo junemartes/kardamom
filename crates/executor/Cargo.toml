@@ -5,6 +5,9 @@ edition.workspace = true
 
 
 [dependencies]
+# Execution core (reader/join topology, revm execution, delta accumulation,
+# reader→exec→commit orchestration) lives in the shared engine crate.
+kardamom-engine = { workspace = true }
 # : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
