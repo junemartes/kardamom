@@ -18,7 +18,9 @@ use signet_libmdbx::{Database, Environment};
 
 use crate::env::StateEnv;
 use crate::error::StateError;
-use crate::meta::{KEY_LAST_COMMITTED_BLOCK, decode_u64, encode_b_position};
+use crate::meta::{
+    KEY_LAST_COMMITTED_BLOCK, KEY_STATE_ROOT, decode_b256, decode_u64, encode_b_position,
+};
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
     decode_account_value, decode_receipt_value, decode_storage_value, decode_tx_hash_value,
@@ -81,6 +83,18 @@ impl StateSnapshot {
     /// Returns the block number this snapshot is anchored at.
     pub fn block_number(&self) -> u64 {
         self.inner.block_number
+    }
+
+    /// The canonical Ethereum MPT world-state root committed at this snapshot's
+    /// block, or `None` on databases written by the plain (non-trie) executor
+    /// writer (which does not maintain a state root). Written by the trie-aware
+    /// writer (`StateWriter::spawn_with_trie`); see [`crate::trie`].
+    pub fn state_root(&self) -> Result<Option<B256>, StateError> {
+        let meta = self.inner.txn.open_db(Some(TABLE_META))?;
+        match self.inner.txn.get::<Vec<u8>>(meta.dbi(), KEY_STATE_ROOT)? {
+            None => Ok(None),
+            Some(bytes) => decode_b256(&bytes).map(Some),
+        }
     }
 }
 

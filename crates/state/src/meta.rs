@@ -24,6 +24,11 @@ pub const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 /// idempotent across restarts independently of the block cursor (genesis is
 /// "block 0", so `last_committed_block` stays 0 until the first real block).
 pub const KEY_GENESIS_APPLIED: &[u8] = b"genesis_applied";
+/// Latest computed Ethereum MPT world-state root (32 B). Written by the
+/// trie-aware writer (`StateWriter::spawn_with_trie`) in the same RW txn as the
+/// block it commits; absent on databases written by the plain (non-trie)
+/// executor writer. See `crate::trie`.
+pub const KEY_STATE_ROOT: &[u8] = b"state_root";
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -84,6 +89,21 @@ pub fn decode_b_position(bytes: &[u8]) -> Result<BPosition, StateError> {
         term_id: i32::from_be_bytes(term_id_bytes),
         term_offset: i32::from_be_bytes(term_offset_bytes),
     })
+}
+
+pub fn encode_b256(v: alloy_primitives::B256) -> [u8; 32] {
+    v.into()
+}
+
+pub fn decode_b256(bytes: &[u8]) -> Result<alloy_primitives::B256, StateError> {
+    if bytes.len() != 32 {
+        return Err(StateError::BadEncoding {
+            table: "meta",
+            expected: 32,
+            got: bytes.len(),
+        });
+    }
+    Ok(alloy_primitives::B256::from_slice(bytes))
 }
 
 #[cfg(test)]

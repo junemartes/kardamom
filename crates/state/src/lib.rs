@@ -13,6 +13,7 @@ pub mod recovery;
 pub mod schema;
 pub mod snapshot;
 pub mod swap;
+pub mod trie;
 pub mod writer;
 
 pub use compaction::compact_to;
@@ -22,4 +23,5 @@ pub use genesis::{genesis_applied, seed_genesis};
 pub use recovery::{RecoveryPoint, read_recovery_point};
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};
+pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
 pub use writer::{StateWriter, WriteBatch, WriterHandle};

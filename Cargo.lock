@@ -3941,6 +3941,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-trie",
  "bytes",
  "criterion 0.7.0",
  "crossbeam-channel",
