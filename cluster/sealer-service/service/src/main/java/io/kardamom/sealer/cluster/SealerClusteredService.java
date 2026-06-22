@@ -174,7 +174,7 @@ public final class SealerClusteredService implements ClusteredService {
         }
 
         final Optional<Relayed> relayed = state.onRecord(canonicalIdScratch, payload);
-        relayed.ifPresent(r -> offerRelayed(session, r));
+        relayed.ifPresent(this::offerRelayed);
     }
 
     @Override
@@ -251,9 +251,17 @@ public final class SealerClusteredService implements ClusteredService {
         boundaryTimerArmed = true;
     }
 
-    private void offerRelayed(final ClientSession session, final Relayed relayed) {
+    private void offerRelayed(final Relayed relayed) {
         final int len = frameRelayed(relayed);
-        offerToSession(session, len);
+        // Broadcast the relayed canonical record to EVERY client session, not just
+        // the sender. The executor replicas consume the canonical tx_ordering stream
+        // from egress on their OWN sessions (they never publish ingress), so offering
+        // only to the sending session (the sequencer) starved them: they received the
+        // broadcast boundaries but no records, tripping the executor's
+        // BoundaryMisaligned check (want_count>have_count). Mirrors offerBoundary.
+        for (final ClientSession session : cluster.clientSessions()) {
+            offerToSession(session, len);
+        }
     }
 
     /**
