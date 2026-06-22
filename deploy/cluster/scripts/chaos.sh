@@ -88,6 +88,11 @@ CHAOS_ACCT="${CHAOS_ACCT_BASE}"
 SEALER_NODE="kardamom-sealer-0"
 SEALER_PORT=9003
 EXECUTOR_NODE="kardamom-executor-0"
+# Progress is scraped from whichever executor responds (a chaos case may kill one
+# of them — hard-executor kills executor-0, node-failure-executor kills executor-2),
+# so executor_progress() tries each in turn. The 3 executors are state-machine
+# replicas at ~the same block height, so any one is a valid liveness signal.
+EXECUTOR_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
 EXECUTOR_PORT="${EXECUTOR_PORT:-9004}"
 # The executor's monotonically-advancing block gauge (crates/executor/src/metrics.rs:
 # kardamom_executor_block_number — set per committed block in actor.rs). This is the
@@ -142,9 +147,12 @@ sealer_boundaries() {
 # (or empty if the scrape failed). awk takes $NF of the first matching sample and
 # int-truncates (the gauge may render as a float / scientific notation).
 executor_progress() {
-  docker exec "${EXECUTOR_NODE}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
-    | awk -v m="${EXECUTOR_BLOCK_METRIC}" '
-        $0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }'
+  local n v
+  for n in "${EXECUTOR_NODES[@]}"; do
+    v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+      | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+  done
 }
 
 # --- injectors --------------------------------------------------------------
@@ -173,14 +181,12 @@ assert_count() { # <job> <min-running> <slo-secs>
   log "$1 has >= $2 running alloc(s) after ${t}s"
 }
 
-assert_progress() { # asserts the sealer keeps emitting block boundaries
-  local b0 b1
-  b0="$(sealer_boundaries || true)"; b0="${b0:-0}"
-  sleep 10
-  b1="$(sealer_boundaries || true)"; b1="${b1:-0}"
-  awk "BEGIN{exit !(${b1}>${b0})}" \
-    && log "pipeline progressing (sealer boundaries ${b0} -> ${b1})" \
-    || fail "pipeline NOT progressing after recovery (sealer boundaries ${b0} -> ${b1})"
+assert_progress() {
+  # In cluster mode there is no kardamom-sealer Prometheus endpoint, so pipeline
+  # progress for ALL cases (cluster and component) is read from the executor's
+  # committed-block gauge. Delegates to the executor probe (kept as a name so the
+  # ported component-chaos cases below need no edits).
+  assert_executor_progress "$@"
 }
 
 # Cluster-mode analogue of assert_progress: the executor's committed-block gauge
@@ -221,6 +227,22 @@ assert_load_pass() { # <json> <case>
     echo "----- kardamom-load stdout/stderr (/tmp/chaos-$2.load.log) -----" >&2
     tail -n 80 "/tmp/chaos-$2.load.log" 2>/dev/null >&2 || echo "(no load log)" >&2
     fail "load verdict not PASS for case $2"
+  fi
+}
+
+# Relaxed load verdict for the TOTAL-OUTAGE case (cluster-quorum-loss-recover). A
+# full quorum loss legitimately stops the sequencer from ACCEPTING some txs offered
+# during the outage — they surface as seq_dropped / past-nonce and were never
+# accepted, so they are not a delivery gap. The guarantee that must still hold is
+# GAPLESS delivery of every ACCEPTED tx (missing == 0) — which the cluster meets on
+# recovery. So assert missing==0 here instead of the strict all-delivered verdict.
+assert_accepted_delivered() { # <json> <case>
+  if grep -qE '"missing":[[:space:]]*0[[:space:]]*,' "$1" 2>/dev/null; then
+    log "load OK for case $2: every ACCEPTED tx receipted (missing=0); seq_dropped tolerated during total outage"
+  else
+    echo "----- load report ($2) [$1] -----" >&2
+    [ -s "$1" ] && sed -n '1,80p' "$1" >&2 || echo "(report JSON missing/empty)" >&2
+    fail "accepted txs NOT all delivered (missing>0) for case $2"
   fi
 }
 
@@ -415,7 +437,12 @@ run_case() { # <case-name>
   # Let the background load finish its window + drain, then check its verdict.
   wait "${LOAD_PID}" || true
   LOAD_PID=""
-  assert_load_pass "${out}" "${name}"
+  case "${name}" in
+    # Total-outage case: assert gapless delivery of ACCEPTED txs (missing==0),
+    # tolerating seq_dropped (txs the sequencer couldn't accept during the outage).
+    cluster-quorum-loss-recover) assert_accepted_delivered "${out}" "${name}" ;;
+    *)                           assert_load_pass "${out}" "${name}" ;;
+  esac
   log "CHAOS CASE ${name}: PASS"
 }
 
