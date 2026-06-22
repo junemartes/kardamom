@@ -1,0 +1,33 @@
+[package]
+name = "kardamom-validator"
+version.workspace = true
+edition.workspace = true
+
+# Monolithic validator node: follows the sequencer by subscribing to the live
+# channels, re-executes every block through the shared kardamom-engine core,
+# produces a canonical Ethereum MPT state root (trie-aware state writer), and
+# cross-checks itself against the executor's receipts (tx_receipts) and per-block
+# BAL (tx_bal). Fail-stop on divergence. Off the hot path; no HA.
+
+[dependencies]
+kardamom-engine = { workspace = true }
+kardamom-types = { workspace = true }
+kardamom-log = { workspace = true }
+kardamom-state = { path = "../state" }
+kardamom-obs = { path = "../obs" }
+alloy-primitives.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+metrics = { workspace = true }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+toml.workspace = true
+
+[[bin]]
+name = "kardamom-validator"
+path = "src/bin/kardamom-validator.rs"
+
+[dev-dependencies]
+alloy-primitives.workspace = true

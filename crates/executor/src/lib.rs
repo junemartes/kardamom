@@ -23,3 +23,8 @@ pub use kardamom_engine::*;
 pub use kardamom_engine::{
     actor, block_env, delta, error, exec_types, executor, metrics, persist, reader, state,
 };
+
+/// Executor-side BAL publication (the sequencer-role behaviour layered on the
+/// shared engine: publish each block's `BlockDelta` on `tx_bal`).
+pub mod bal;
+pub use bal::BalPublishingWriterQueue;
