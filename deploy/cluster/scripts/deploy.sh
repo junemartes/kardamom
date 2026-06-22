@@ -94,7 +94,7 @@ run_job "aeron.system.nomad.hcl"
 # in-cluster registry at once, slow under CI CPU contention (the dedicated cluster
 # nodes added more concurrent pullers). Comes up well under this cap on a healthy
 # run; the cap only guards against premature failure when bring-up is slow.
-wait_running "aeron" 360
+wait_running "aeron" 600
 
 # --- (REMOVED) recorder quorum ----------------------------------------------
 # The custom recorders + Q-of-N quorum aggregator were removed in favour of
