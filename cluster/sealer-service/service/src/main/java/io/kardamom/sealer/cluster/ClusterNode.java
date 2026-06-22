@@ -38,11 +38,18 @@ public final class ClusterNode {
             .dirDeleteOnStart(true)
             .dirDeleteOnShutdown(false);
 
+        // Aeron 1.44 requires Archive.Context.replicationChannel to be set (no
+        // default). It's the channel this archive receives replication on during
+        // cluster catch-up (snapshot/log transfer between members). The standard
+        // ClusteredMediaDriver pattern uses this node's IP with an OS-assigned
+        // (ephemeral) port. me[*] all share this node's IP (host of the ingress ep).
+        final String nodeHost = me[0].split(":")[0];
         final Archive.Context archiveCtx = new Archive.Context()
             .aeronDirectoryName(aeronDir)
             .archiveDir(new File(archiveDir))
             .controlChannel("aeron:udp?endpoint=" + me[4])
             .localControlChannel("aeron:ipc?term-length=64k")
+            .replicationChannel("aeron:udp?endpoint=" + nodeHost + ":0")
             .recordingEventsEnabled(false)
             .threadingMode(ArchiveThreadingMode.SHARED);
 
