@@ -232,6 +232,19 @@ dump_diagnostics() {
       nomad alloc logs "${alloc}" 2>/dev/null | tail -40 || true
     done <<<"${allocs}"
   done
+
+  # Aeron Cluster members log fatal errors to *-error.log files in the cluster +
+  # aeron dirs (NOT to the alloc stderr — the JVM exits 0 via the termination
+  # hook after a ConsensusModule/ServiceContainer error). Dump them from each
+  # sealer node (the dirs are bind-mounted from the node into the inner task).
+  for n in "${NODES[@]}"; do
+    [[ "${NODE_ROLE[$n]}" == "sealer" ]] || continue
+    echo "===== ${n}: Aeron cluster error logs ====="
+    docker exec "kardamom-${n}" sh -c '
+      for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do
+        [ -f "$f" ] && { echo "--- $f ---"; cat "$f"; }
+      done' 2>/dev/null || true
+  done
 }
 
 cleanup() {
