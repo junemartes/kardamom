@@ -320,6 +320,13 @@ if (
         f"-Dkardamom.cluster.ingressStreamId={cluster_ingress_stream_id}",
         "cluster ingress stream id",
     )
+    # memberId is derived from the node's own IP (alloc index != node), so the job
+    # passes the per-node ${meta.node_ip} rather than a static index→IP mapping.
+    must_contain(
+        jobs / "cluster.nomad.hcl",
+        "-Dkardamom.cluster.nodeIp=${meta.node_ip}",
+        "per-node cluster memberId derivation (node IP, not alloc index)",
+    )
     # Expected [cluster] ingress_endpoints: "id=ip:ingress,..." (client view).
     expected_endpoints = ",".join(
         f"{i}={ip}:{p['ingress']}" for i, ip in enumerate(member_ips)

@@ -14,10 +14,15 @@ import org.agrona.concurrent.ShutdownSignalBarrier;
  *  consensus module) running {@link SealerClusteredService}. Config via -D sysprops. */
 public final class ClusterNode {
     public static void main(final String[] args) {
-        final int memberId = Integer.getInteger("kardamom.cluster.memberId", 0);
         // "0,ingressHost:port,consensusHost:port,logHost:port,catchupHost:port,archiveHost:port|1,...|2,..."
         final String clusterMembers = System.getProperty("kardamom.cluster.members");
         if (clusterMembers == null) throw new IllegalStateException("kardamom.cluster.members not set");
+        // memberId: use an explicit -Dkardamom.cluster.memberId when given (>=0, e.g.
+        // TestCluster), else derive it from this node's IP. The Nomad deploy passes the
+        // node IP (not an explicit id) because the alloc index != the node it lands on.
+        final int memberIdProp = Integer.getInteger("kardamom.cluster.memberId", -1);
+        final String nodeIp = System.getProperty("kardamom.cluster.nodeIp");
+        final int memberId = (memberIdProp >= 0) ? memberIdProp : memberIdForNodeIp(clusterMembers, nodeIp);
         final String aeronDir = System.getProperty("aeron.dir", "/opt/kardamom/aeron-mount/dir");
         final String clusterDir = System.getProperty("kardamom.cluster.dir", "/opt/kardamom/cluster");
         final String archiveDir = System.getProperty("kardamom.archive.dir", "/opt/kardamom/archive");
@@ -89,5 +94,26 @@ public final class ClusterNode {
             }
         }
         throw new IllegalArgumentException("memberId " + memberId + " not in " + clusterMembers);
+    }
+
+    /** Resolve this member's id by matching nodeIp against each member's ingress host
+     *  in the clusterMembers string. Used when memberId isn't given explicitly (the
+     *  Nomad deploy passes the node IP, since alloc index != node). */
+    static int memberIdForNodeIp(final String clusterMembers, final String nodeIp) {
+        if (nodeIp == null || nodeIp.isEmpty()) {
+            throw new IllegalStateException(
+                "neither kardamom.cluster.memberId nor kardamom.cluster.nodeIp was set");
+        }
+        for (final String member : clusterMembers.split("\\|")) {
+            final String[] f = member.split(",");
+            if (f.length < 6) {
+                throw new IllegalArgumentException("malformed cluster member entry: '" + member + "'");
+            }
+            final String ingressHost = f[1].trim().split(":")[0];
+            if (ingressHost.equals(nodeIp.trim())) {
+                return Integer.parseInt(f[0].trim());
+            }
+        }
+        throw new IllegalArgumentException("nodeIp " + nodeIp + " matches no member ingress host in " + clusterMembers);
     }
 }
