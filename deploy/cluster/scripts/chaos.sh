@@ -190,16 +190,22 @@ assert_progress() {
 }
 
 # Cluster-mode analogue of assert_progress: the executor's committed-block gauge
-# must advance over a window (the cluster is committing blocks the executor
-# applies). $1 = optional window seconds (default 12 — a couple of block ticks).
+# must advance. POLLS until it advances or a timeout — recovery is not instant
+# after a leader kill (the cluster client must redirect to the newly-elected leader
+# and resume egress before the executor applies the next block), so a single fixed
+# window is flaky. Succeeds as soon as progress is observed. $1 = timeout secs
+# (default 60).
 assert_executor_progress() {
-  local window="${1:-12}" e0 e1
+  local timeout="${1:-60}" e0 e1 t=0
   e0="$(executor_progress || true)"; e0="${e0:-0}"
-  sleep "${window}"
-  e1="$(executor_progress || true)"; e1="${e1:-0}"
-  awk "BEGIN{exit !(${e1}>${e0})}" \
-    && log "pipeline progressing (executor block ${e0} -> ${e1})" \
-    || fail "pipeline NOT progressing (executor block ${e0} -> ${e1} over ${window}s)"
+  while :; do
+    sleep 5; t=$((t + 5))
+    e1="$(executor_progress || true)"; e1="${e1:-0}"
+    awk "BEGIN{exit !(${e1}>${e0})}" \
+      && { log "pipeline progressing (executor block ${e0} -> ${e1} after ${t}s)"; return 0; }
+    [ "${t}" -ge "${timeout}" ] \
+      && fail "pipeline NOT progressing (executor block ${e0} -> ${e1} over ${timeout}s)"
+  done
 }
 
 # Cluster-mode "must NOT progress": the executor's block gauge must stay FLAT
@@ -417,7 +423,9 @@ run_case() { # <case-name>
       # reschedule SLO (image re-pull). count_running counts the `cluster` allocs.
       assert_count "${CLUSTER_TASK}" 2 "${CHAOS_RESCHEDULE_SLO_S}"
       # With quorum back, the executor must resume applying blocks (drains backlog).
-      assert_executor_progress 20
+      # Generous timeout: the rejoined member must catch up its Raft log + the new
+      # quorum must re-elect before commits resume.
+      assert_executor_progress 60
       # Restore the second node too so the suite leaves a healthy 3/3 cluster for
       # any subsequent cases (best-effort; not asserted as part of this case's SLO).
       docker start "${victims[1]}" >/dev/null 2>&1 || true
