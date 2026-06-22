@@ -115,11 +115,18 @@ jobs:
       # target/release (it stays on the runner, not in a service image).
       - name: cargo build --release (service binaries + load harness)
         run: |
+          # The 4 feature-clean service bins.
           cargo build --release \
-            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-            -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
-            --features 'kardamom-sequencer/cluster kardamom-executor/cluster' \
+            -p kardamom-ingress -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
             --bins
+          # Build sequencer + executor WITH their cluster feature, as SEPARATE
+          # per-package invocations using the bare `--features cluster` form. The
+          # multi-package `--features 'kardamom-sequencer/cluster ...'` form does NOT
+          # actually enable the feature on the bins under this workspace's resolver
+          # (verified via `cargo build -v`: no `--cfg feature="cluster"`), so the
+          # bins would fail-fast at startup ("built without the 'cluster' feature").
+          cargo build --release -p kardamom-sequencer --features cluster --bins
+          cargo build --release -p kardamom-executor --features cluster --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
 
       - name: Install Nomad CLI
