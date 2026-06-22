@@ -41,6 +41,18 @@ job "cluster" {
     task "cluster" {
       driver = "docker"
 
+      # JVM options for the image ENTRYPOINT (java -Xmx384m -cp ... ClusterNode).
+      # These MUST go through env, NOT docker `args`: docker `args` are appended
+      # AFTER the main class, so they would become program arguments (args[]) rather
+      # than -D system properties — ClusterNode reads System.getProperty(...), so the
+      # members/nodeIp props would be null and EVERY member crash-loops on startup
+      # ("kardamom.cluster.members not set"). JAVA_TOOL_OPTIONS is read by the JVM as
+      # VM options (same mechanism as the aeron job's _JAVA_OPTIONS). ${meta.node_ip}
+      # interpolates in env exactly as it would in args.
+      env {
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000"
+      }
+
       config {
         image = "192.168.56.10:5000/kardamom-cluster:dev"
         # Always pull the freshly-built image: the mutable :dev tag would otherwise
@@ -53,24 +65,9 @@ job "cluster" {
           "/opt/kardamom/cluster:/opt/kardamom/cluster",
           "/opt/kardamom/archive:/opt/kardamom/archive",
         ]
-        # These are -D sysprops appended to the image ENTRYPOINT java command.
-        args = [
-          # memberId is resolved by matching this node's IP against the ingress host
-          # of each member below (alloc index != node, so ${NOMAD_ALLOC_INDEX} can't
-          # be used). ${meta.node_ip} is the proven per-node interpolation (same as
-          # the sequencer's --tx-ordering-mdc-control ${meta.node_ip}:40110).
-          "-Dkardamom.cluster.nodeIp=${meta.node_ip}",
-          "-Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204",
-          # aeron.dir is a DISTINCT subdir (.../cluster-dir) from the node's shared
-          # Aeron substrate (.../dir): the cluster runs its OWN embedded
-          # ClusteredMediaDriver, which must not clash with the node substrate's
-          # media driver sharing /opt/kardamom/aeron-mount/dir.
-          "-Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir",
-          "-Dkardamom.cluster.dir=/opt/kardamom/cluster",
-          "-Dkardamom.archive.dir=/opt/kardamom/archive",
-          "-Dkardamom.cluster.ingressStreamId=101",
-          "-Dkardamom.cluster.tickMs=2000",
-        ]
+        # NOTE: the JVM -D system properties are passed via the JAVA_TOOL_OPTIONS env
+        # stanza above, NOT here as docker `args` (args land after the main class and
+        # would be parsed as program arguments, leaving System.getProperty null).
       }
 
       resources {
