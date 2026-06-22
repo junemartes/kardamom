@@ -6,6 +6,7 @@
 pub mod benchmark;
 pub mod config;
 pub mod harness;
+pub mod load;
 pub mod mnemonic;
 pub mod report;
 pub mod signers;
