@@ -6,12 +6,17 @@ name: cluster-e2e
 # site.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
 # + chaos suite. See deploy/cluster/scripts/{ci-cluster,chaos}.sh.
 #
-# The FULL suite runs on every trigger, SHARDED across runners (each shard
-# brings up its own cluster and runs one slice): one `load` shard (5-min soak)
-# and four `chaos-*` shards covering all 9 failure cases. Splitting across
-# runners keeps wall-clock to ~one shard instead of running everything serially.
-# Opt out with the `skip-cluster-e2e` label for changes that can't affect the
-# cluster.
+# The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
+# replaces the single sealer, so the sequencer + executor binaries are built WITH
+# their `cluster` feature (they fail-fast otherwise) and the Java cluster image is
+# built from the gradle shadowJar.
+#
+# The FULL suite runs on every trigger, SHARDED across runners (each shard brings
+# up its own cluster and runs one slice): one `load` shard (5-min soak), three
+# `chaos-*` component shards (executor/ingress/sequencer), and one `chaos-cluster`
+# shard for the Raft resilience cases. Splitting across runners keeps wall-clock
+# to ~one shard instead of running everything serially. Opt out with the
+# `skip-cluster-e2e` label for changes that can't affect the cluster.
 
 on:
   workflow_dispatch:
@@ -47,9 +52,12 @@ jobs:
       # result on a single run.
       fail-fast: false
       matrix:
-        # `load` = the 5-min sustained-load soak. The four `chaos-*` shards
-        # split the 9 chaos cases (each brings up its own cluster).
-        shard: [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-sealer]
+        # `load` = the 5-min sustained-load soak. The `chaos-*` shards split the
+        # chaos cases (each brings up its own cluster). chaos-cluster covers the
+        # 3-member Raft sealer (leader-kill / follower-kill / quorum-loss-recover);
+        # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
+        # now the deploy uses the clustered sealer — see "Configure shard").
+        shard: [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster]
     steps:
       - uses: actions/checkout@v4
 
@@ -74,6 +82,14 @@ jobs:
         with:
           shared-key: cluster-e2e
 
+      # JDK for the Java Aeron-Cluster sealer node. The clustered sealer image is
+      # a pure-JVM shadowJar (no native libs); temurin 17 matches cluster.Dockerfile
+      # (eclipse-temurin:17-jre).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
       # Trust the in-cluster registry (plain HTTP on the bridge IP).
       - name: Configure host docker for the insecure registry
         run: |
@@ -82,16 +98,35 @@ jobs:
           # cgroup v2 + systemd-in-container needs this on some runners.
           sudo modprobe ip_tables || true
 
+      # Build the Java cluster node jar BEFORE the image build: ci-cluster.sh
+      # stages cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
+      # into cluster.Dockerfile's context and builds/pushes kardamom-cluster:dev.
+      - name: Build cluster sealer jar (gradle shadowJar)
+        working-directory: cluster/sealer-service
+        run: ./gradlew :service:shadowJar --no-daemon
+
       # Build the service binaries once on the host; ci-service.Dockerfile then
       # wraps each into a thin image (the in-image workspace build is too slow).
-      # kardamom-load is the sustained-load + chaos harness ci-cluster.sh runs
-      # from target/release (it stays on the runner, not in a service image).
+      # The deploy is CLUSTER mode (cluster.nomad.hcl + [cluster].enabled=true in
+      # the sequencer/executor configs), so kardamom-sequencer + kardamom-executor
+      # MUST be built WITH their `cluster` feature or they fail-fast at startup
+      # ("built without the 'cluster' feature"). The other 3 bins are feature-clean.
+      # kardamom-load is the sustained-load + chaos harness ci-cluster.sh runs from
+      # target/release (it stays on the runner, not in a service image).
       - name: cargo build --release (service binaries + load harness)
         run: |
+          # The 3 feature-clean service bins.
           cargo build --release \
-            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-            -p kardamom-sealer -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-ingress -p kardamom-da-watcher -p kardamom-batcher \
             --bins
+          # Build sequencer + executor WITH their cluster feature, as SEPARATE
+          # per-package invocations using the bare `--features cluster` form. The
+          # multi-package `--features 'kardamom-sequencer/cluster ...'` form does NOT
+          # actually enable the feature on the bins under this workspace's resolver
+          # (verified via `cargo build -v`: no `--cfg feature="cluster"`), so the
+          # bins would fail-fast at startup ("built without the 'cluster' feature").
+          cargo build --release -p kardamom-sequencer --features cluster --bins
+          cargo build --release -p kardamom-executor --features cluster --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
 
       - name: Install Nomad CLI
@@ -110,17 +145,18 @@ jobs:
             chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor"; } ;;
             chaos-ingress)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-ingress hard-ingress"; } ;;
             chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer"; } ;;
-            # NOTE: sealer-hard (SIGKILL) is intentionally NOT in the always-on
-            # suite. The chaos suite found that after a HARD sealer crash the
-            # executors freeze and don't re-attach to the restarted sealer's
-            # canonical tx_ordering (the sealer is a documented singleton SPOF;
-            # HA is future work). sealer-graceful (SIGTERM) DOES recover.
-            # Tracked in issue #58; reproduce with CHAOS_CASES=sealer-hard.
-            chaos-sealer)    { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=sealer-graceful"; } ;;
+            # The clustered sealer (Phase 3) is a 3-member Aeron Cluster (Raft).
+            # These cases hard-kill the LEADER (must re-elect within the SLO), a
+            # FOLLOWER (quorum 2/3 holds, no stall), and TWO whole nodes (quorum
+            # lost → pipeline correctly stalls → one node returns → resumes).
+            # This SUPERSEDES the old chaos-sealer shard: the single-sealer hard-
+            # kill SPOF (issue #58, sealer-hard) no longer exists — the Raft quorum
+            # survives the loss of any one member, so chaos-sealer is DROPPED.
+            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover"; } ;;
             *) echo "unknown shard ${{ matrix.shard }}" >&2; exit 1 ;;
           esac >> "$GITHUB_ENV"
           # Chaos knobs shared by all chaos shards (no-op on the load shard).
-          { echo "CHAOS_TPS=200"; echo "CHAOS_CASE_S=120"; echo "CHAOS_RESCHEDULE_SLO_S=200"; } >> "$GITHUB_ENV"
+          { echo "CHAOS_TPS=200"; echo "CHAOS_CASE_S=120"; echo "CHAOS_RESCHEDULE_SLO_S=200"; echo "CHAOS_LEADER_SLO_S=45"; } >> "$GITHUB_ENV"
 
       - name: Bring up cluster + run shard (${{ matrix.shard }})
         run: deploy/cluster/scripts/ci-cluster.sh

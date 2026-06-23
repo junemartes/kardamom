@@ -4,21 +4,22 @@
 //! the same shape as the live [`crate::aeron_live::AeronRuntime::open_subscription`].
 //!
 //! This is the executor's crash-recovery input: on restart it must re-consume
-//! the canonical `tx_ordering` stream it already saw (to skip-count past its
-//! durable cursor — see `kardamom_executor`'s `ResumePoint`) and then continue
-//! live. Aeron does **not** replay history to a late live subscriber, so the
-//! durable copy lives in the Aeron Archive (recorded by [`crate::recorder`]),
-//! and [`rusteron_archive::AeronArchiveReplayMerge`] stitches "replay from the
+//! the multicast `tx_data` / `tx_deposits` streams it already saw (to skip-count
+//! past its durable cursor — see `kardamom_executor`'s `ResumePoint`) and then
+//! continue live. (In CLUSTER-ONLY mode the canonical `tx_ordering` stream is
+//! replayed by the Aeron Cluster, not this replay-merge path.) Aeron does
+//! **not** replay history to a late live subscriber, so the durable copy lives
+//! in the Aeron Archive (recorded by [`crate::recorder`]), and
+//! [`rusteron_archive::AeronArchiveReplayMerge`] stitches "replay from the
 //! recording" onto "follow the live publication" in a single multi-destination
 //! subscription.
 //!
 //! ## Transport requirement
 //!
-//! Replay-merge is **UDP-MDC only**: it needs the live publication to be a
-//! dynamic-MDC UDP channel and a `control-mode=manual` subscription so the merge
-//! can add the replay and live destinations itself. It does not work over the
-//! single-host IPC default (Aeron never replays history to an IPC subscriber).
-//! Callers gate on [`crate::config::ChannelsConfig::tx_ordering_mdc_enabled`].
+//! Replay-merge is **UDP only**: it needs the live publication to be a UDP
+//! channel and a `control-mode=manual` subscription so the merge can add the
+//! replay and live destinations itself. It does not work over the single-host
+//! IPC default (Aeron never replays history to an IPC subscriber).
 //!
 //! ## Position stability
 //!
@@ -78,13 +79,10 @@ pub struct ReplayMergeSubscriber<T> {
 /// live publication. `replay_destination_endpoint` is the local UDP endpoint the
 /// archive replays TO (may be shared across streams — the media driver demuxes by
 /// stream id). `live_destination` is the full Aeron channel the merge follows
-/// once replay catches up — its shape depends on the publication transport:
-/// - MDC dynamic-control (tx_ordering): `aeron:udp?endpoint=<local>|control=<ctl>`
-///   (the executor receives the MDC stream on its own endpoint), built via
-///   [`build_mdc_live_destination`].
-/// - Multicast (tx_data / tx_deposits): the publication's own multicast channel,
-///   e.g. `aeron:udp?endpoint=239.x:port|interface=...` (the executor joins the
-///   group directly).
+/// once replay catches up — for the surviving multicast streams (tx_data /
+/// tx_deposits) this is the publication's own multicast channel, e.g.
+/// `aeron:udp?endpoint=239.x:port|interface=...` (the executor joins the group
+/// directly).
 #[derive(Clone, Debug)]
 pub struct ReplayMergeParams {
     /// Aeron media-driver dir (the node-local tmpfs); `None` uses the C client
@@ -404,55 +402,6 @@ fn header_bposition(h: &rusteron_archive::AeronHeader) -> Option<BPosition> {
     })
 }
 
-/// Build the replay-merge live destination for the MDC `tx_ordering` stream:
-/// the executor receives the MDC stream on its own `live_destination_endpoint`,
-/// attached to the publisher's dynamic-control endpoint (extracted from the
-/// canonical subscriber URI, e.g.
-/// `aeron:udp?control=10.0.0.1:40010|control-mode=dynamic`).
-fn build_mdc_live_destination(
-    live_channel: &str,
-    live_destination_endpoint: &str,
-) -> Result<String, LogError> {
-    for tok in live_channel.trim_start_matches("aeron:udp?").split('|') {
-        if let Some(ctl) = tok.strip_prefix("control=") {
-            return Ok(format!(
-                "aeron:udp?endpoint={live_destination_endpoint}|control={ctl}"
-            ));
-        }
-    }
-    Err(LogError::Config(format!(
-        "live channel {live_channel:?} has no control= endpoint (tx_ordering replay-merge needs \
-         an MDC dynamic-control publication)"
-    )))
-}
-
-/// Open a replay-merge subscriber for the canonical `tx_ordering` stream
-/// (MDC dynamic-control), decoding [`kardamom_types::TxOrderingMessage`]. The
-/// executor uses this on crash recovery instead of the live tx_ordering
-/// subscriber.
-pub fn open_tx_ordering_replay(
-    ch: &crate::config::ChannelsConfig,
-    aeron: &AeronConfig,
-    replay_destination_endpoint: String,
-    live_destination_endpoint: String,
-) -> Result<ReplayMergeSubscriber<kardamom_types::TxOrderingMessage>, LogError> {
-    let live_channel = ch.tx_ordering_canonical_subscriber_uri().ok_or_else(|| {
-        LogError::Config(
-            "tx_ordering replay requires MDC (tx_ordering_canonical_publisher is unset)".into(),
-        )
-    })?;
-    let live_destination = build_mdc_live_destination(&live_channel, &live_destination_endpoint)?;
-    ReplayMergeSubscriber::open(
-        ReplayMergeParams {
-            aeron_dir: Some(aeron.aeron_dir.clone()),
-            stream_id: ch.tx_ordering_stream_id,
-            replay_destination_endpoint,
-            live_destination,
-        },
-        aeron.clone(),
-    )
-}
-
 /// Open a replay-merge subscriber for one per-sequencer `tx_data` shard,
 /// decoding [`kardamom_types::TxEnvelope`]. tx_data is a **multicast**
 /// publication, so the merge follows the publication's own multicast channel
@@ -495,24 +444,3 @@ pub fn open_tx_deposits_replay(
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mdc_live_destination_built_from_control_uri() {
-        assert_eq!(
-            build_mdc_live_destination(
-                "aeron:udp?control=10.0.0.1:40010|control-mode=dynamic",
-                "10.0.0.2:40120"
-            )
-            .unwrap(),
-            "aeron:udp?endpoint=10.0.0.2:40120|control=10.0.0.1:40010"
-        );
-        // A non-MDC (endpoint-only) live channel errors — tx_ordering replay needs MDC.
-        assert!(
-            build_mdc_live_destination("aeron:udp?endpoint=10.0.0.1:40010", "10.0.0.2:40120")
-                .is_err()
-        );
-    }
-}

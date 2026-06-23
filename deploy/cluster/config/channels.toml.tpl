@@ -65,28 +65,9 @@ tx_data_channel_template = "aeron:udp?endpoint=239.192.56.11:40000|interface=192
 tx_data_stream_id_base = 2000
 
 # --- TxOrdering: canonical orderer, via MDC (see header). --------------------
-# `tx_ordering_channel` is the single-host IPC fallback ONLY — UNUSED in the
-# cluster because tx_ordering_mdc_control_template below is set.
+# `tx_ordering_channel` is the single-host IPC fallback ONLY.
 tx_ordering_channel = "aeron:ipc?alias=tx-ordering"
 tx_ordering_stream_id = 1001
-# MDC control template: `{ctl}` ← each publisher's ip:port control endpoint.
-tx_ordering_mdc_control_template = "aeron:udp?control={ctl}|control-mode=dynamic|interface=192.168.56.0/24"
-# tx_ordering INPUT publishers: the SEQUENCERS only. The sealer subscribes to
-# every one of these (open_input), merges them, defines the ONE canonical
-# interleaving, dedups, and republishes onto its own canonical publication.
-# Each sequencer selects its own endpoint via --tx-ordering-mdc-control
-# (sequencer.nomad.hcl). seq0@.21, seq1@.22 (node-class IPs).
-tx_ordering_mdc_publishers = [
-  "192.168.56.21:40110",
-  "192.168.56.22:40110",
-]
-# tx_ordering CANONICAL publisher: the SEALER (@.51). It is the SOLE publisher
-# of the canonical TxRef/DepositRef + boundary stream. Executors, the
-# durability sidecar, and the sealer's own bootstrap subscribe HERE (a single
-# image → one total order → well-defined positions → boundary alignment holds).
-# The sealer opens this via channel_b_mdc_control in sealer.toml (must equal
-# this value). MUST be distinct from the sequencer inputs above.
-tx_ordering_canonical_publisher = "192.168.56.51:40110"
 
 # --- TxReceipts: receipts + block boundaries. MDS fan-in (see header). --------
 # Each executor replica publishes BOTH the receipt stream (1002) and the

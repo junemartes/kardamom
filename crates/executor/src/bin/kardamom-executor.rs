@@ -17,18 +17,17 @@ use std::sync::mpsc as sync_mpsc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_executor::{
-    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, MdbxSnapshotSource,
-    MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription, TxOrderingSubscription,
-    TxReceiptsPublication,
+    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig,
+    MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription,
+    TxOrderingSubscription, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxOrderingSubscriberHandle,
-    TxReceiptsPublisherHandle,
+    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsPublisherHandle,
 };
 use kardamom_log::config::LogConfig;
 use kardamom_log::replay;
 use kardamom_state::{Durability, StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
-use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxEnvelope, TxOrderingMessage};
+use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxEnvelope};
 
 /// CLI mirror of [`kardamom_state::Durability`] (clap renders the variants as
 /// `durable` / `safe-no-sync`).
@@ -78,6 +77,11 @@ struct Args {
     /// the default `partition_count` in the sequencer).
     #[arg(long, default_value_t = 8)]
     shards: u8,
+    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Overrides/sets
+    /// the [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
+    /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
     /// L2 chain id (used for revm).
     #[arg(long, default_value_t = 1)]
     chain_id: u64,
@@ -107,15 +111,12 @@ struct Args {
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     state_durability: StateDurabilityArg,
     /// UDP endpoint (`host:port`) the archive replay-merge binds to receive
-    /// **replayed** tx_ordering fragments on crash recovery. Required only when
-    /// resuming a non-empty state DB over MDC; ignored on a fresh start.
+    /// **replayed** tx_data / tx_deposits fragments on crash recovery. Required
+    /// only when resuming a non-empty state DB; ignored on a fresh start.
+    /// (tx_ordering crash recovery is handled by the Aeron Cluster client, not
+    /// by an archive replay-merge — see the tx_ordering subscription below.)
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
     replay_destination_endpoint: Option<String>,
-    /// UDP endpoint (`host:port`) the archive replay-merge binds to receive the
-    /// **live** tx_ordering stream once replay catches up. Required only when
-    /// resuming a non-empty state DB over MDC; ignored on a fresh start.
-    #[arg(long, env = "KARDAMOM_LIVE_DESTINATION")]
-    live_destination_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9004")]
     metrics_addr: std::net::SocketAddr,
@@ -136,11 +137,19 @@ async fn main() -> Result<()> {
         option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
     )?;
     kardamom_executor::metrics::describe();
-    // Validate the config file exists so misconfigured deployments fail
-    // fast. v0 doesn't yet drive ExecutorConfig from the TOML — operators
-    // tune via the CLI flags above.
-    let _raw =
-        std::fs::read_to_string(&args.config).context("read executor config (presence check)")?;
+    // The TOML supplies the optional `[cluster]` section (default disabled);
+    // all other runtime tuning still comes from the CLI flags above. An empty
+    // / comment-only file (the existing deployment shape) deserializes to a
+    // disabled cluster, so behaviour is unchanged unless `[cluster]` is set.
+    let raw = std::fs::read_to_string(&args.config).context("read executor config")?;
+    let mut file_cfg: ExecutorFileConfig = toml::from_str(&raw).context("parse executor config")?;
+
+    // Per-node cluster egress endpoint: the cluster client's egress_channel is
+    // this node's reachable address (the node IP differs per replica), so it's
+    // injected by the Nomad job rather than baked into the static config file.
+    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
+        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
+    }
 
     tracing::info!(
         shards = args.shards,
@@ -211,15 +220,6 @@ async fn main() -> Result<()> {
     // requires the UDP-MDC transport (archive replay-merge does not work over the
     // single-host IPC default), so over IPC a non-empty DB is still refused.
     let resume = if recovery.last_committed_block > 0 {
-        if !channels.tx_ordering_mdc_enabled() {
-            anyhow::bail!(
-                "state DB at {} is at block {}, but tx_ordering MDC is disabled — archive \
-                 replay-merge recovery needs the UDP-MDC transport. Start against a fresh \
-                 --state-dir, or run with an MDC log-config.",
-                args.state_dir.display(),
-                recovery.last_committed_block,
-            );
-        }
         let rp = ResumePoint {
             block: recovery.last_committed_block,
             record_count: recovery.last_fsynced_b_position.as_index(),
@@ -234,26 +234,22 @@ async fn main() -> Result<()> {
         None
     };
 
-    // On crash recovery (`resume.is_some()`) every inbound stream is read from
-    // the archive replay-merge instead of live, so the executor re-sees the full
-    // history (tx_ordering refs + tx_data/tx_deposits envelopes) and can
-    // skip-count past its durable cursor AND re-execute any txs sealed while it
-    // was down. The replay endpoints are shared across streams (the media driver
-    // demuxes by stream id); only tx_ordering (MDC) also needs a live endpoint.
+    // On crash recovery (`resume.is_some()`) the tx_data / tx_deposits streams
+    // are read from the archive replay-merge instead of live, so the executor
+    // re-sees the full envelope history and can skip-count past its durable
+    // cursor AND re-execute any txs ordered while it was down. (tx_ordering is
+    // re-seen from the Aeron Cluster egress, not this archive endpoint — the
+    // cluster client replays the canonical stream on reconnect.) The replay
+    // endpoint is shared across the tx_data/tx_deposits streams (the media
+    // driver demuxes by stream id).
     let recovery_endpoints = if resume.is_some() {
         let replay_dst = args.replay_destination_endpoint.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "crash recovery needs --replay-destination-endpoint (host:port) for archive \
-                 replay-merge"
+                "crash recovery needs --replay-destination-endpoint (host:port) for tx_data / \
+                 tx_deposits archive replay-merge"
             )
         })?;
-        let live_dst = args.live_destination_endpoint.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "crash recovery needs --live-destination-endpoint (host:port) for archive \
-                 replay-merge"
-            )
-        })?;
-        Some((replay_dst, live_dst))
+        Some(replay_dst)
     } else {
         None
     };
@@ -265,7 +261,7 @@ async fn main() -> Result<()> {
     let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(args.shards as usize);
     for shard_id in 0..args.shards {
         let (tx, rx) = sync_mpsc::channel::<(BPosition, TxEnvelope)>();
-        if let Some((replay_dst, _)) = recovery_endpoints.as_ref() {
+        if let Some(replay_dst) = recovery_endpoints.as_ref() {
             let mut replay =
                 replay::open_tx_data_replay(&channels, &aeron_cfg, shard_id, replay_dst.clone())
                     .with_context(|| format!("open tx_data replay-merge shard={shard_id}"))?;
@@ -293,45 +289,41 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // 1 tx_ordering subscription, async→sync bridged. On a fresh start this is
-    // the live MDC/IPC subscriber; on crash recovery it is the archive
-    // replay-merge subscriber (replays the recorded stream from the start, then
-    // follows live) so the exec thread can skip-count past its durable cursor.
-    let (b_tx, b_rx) = sync_mpsc::channel::<(BPosition, TxOrderingMessage)>();
-    if let Some((replay_dst, live_dst)) = recovery_endpoints.as_ref() {
-        let mut replay = replay::open_tx_ordering_replay(
-            &channels,
-            &aeron_cfg,
-            replay_dst.clone(),
-            live_dst.clone(),
+    // 1 tx_ordering subscription — ALWAYS the Aeron Cluster (Raft) egress. The
+    // cluster has already deduped + totally ordered the stream and exposes a
+    // blocking `next()`, so NO async→sync bridge is needed. Leader failover /
+    // reconnect — including crash-recovery replay of the canonical stream — is
+    // handled inside the cluster client, so the reader never sees an image
+    // rotation; the executor's skip-count + `DedupWindow` provide idempotency
+    // across any reconnect overlap. (The single-sealer restart BoundaryMisaligned
+    // can't occur: the cluster continues the committed count/block across leader
+    // failover.) The cluster-session guard (`LiveCluster`) + its dedicated Aeron
+    // runtime must outlive the executor loop, so bind the guard in the outer
+    // scope; it is dropped only after the `join` await below.
+    //
+    // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the cluster
+    // session never contends with the tx_data / receipts work on `rt` / `rt_pub`.
+    let cluster_rt = match args.aeron_dir.as_ref() {
+        Some(dir) => {
+            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
+        }
+        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
+    };
+    let (cluster_guard, cluster_sub) =
+        kardamom_executor::reader::cluster::cluster_tx_ordering_subscription(
+            cluster_rt,
+            file_cfg.cluster.to_live(),
         )
-        .context("open tx_ordering archive replay-merge subscriber")?;
-        tokio::spawn(async move {
-            while let Some(item) = replay.recv().await {
-                if b_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    } else {
-        let mut tx_ordering_handle = TxOrderingSubscriberHandle::open(&rt, &channels)
-            .context("open TxOrderingSubscriberHandle")?;
-        tokio::spawn(async move {
-            while let Some(item) = tx_ordering_handle.recv().await {
-                if b_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(LiveTxOrderingSub { rx: b_rx });
+        .context("connect cluster tx_ordering subscription")?;
+    tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
 
     // 1 tx_deposits subscription. The executor's deposit reader thread
     // joins `(deposit_position, Deposit)` envelopes against the
     // `DepositRef`s observed on tx_ordering; `source_hash` is the dedup
     // key. Live on a fresh start; archive replay-merge on recovery.
     let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
-    if let Some((replay_dst, _)) = recovery_endpoints.as_ref() {
+    if let Some(replay_dst) = recovery_endpoints.as_ref() {
         let mut replay = replay::open_tx_deposits_replay(&channels, &aeron_cfg, replay_dst.clone())
             .context("open tx_deposits archive replay-merge subscriber")?;
         tokio::spawn(async move {
@@ -442,6 +434,11 @@ async fn main() -> Result<()> {
     // channels, which surfaces TxDataClosed / TxOrderingClosed to the
     // executor — clean shutdown.
     drop(rt);
+    // In cluster mode, the tx_ordering reader blocks on cluster egress
+    // `recv()`, which only returns `None` once the session thread drops its
+    // sender — i.e. when the `LiveCluster` guard is dropped. Drop it here so the
+    // reader sees `TxOrderingClosed` and the executor loop can exit cleanly.
+    drop(cluster_guard);
     match join.await {
         Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
         Ok(Err(e)) => tracing::error!(error = %e, "executor main loop returned an error"),
@@ -529,16 +526,6 @@ impl TxDataSubscription for LiveTxDataSub {
         self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
-    }
-}
-
-struct LiveTxOrderingSub {
-    rx: sync_mpsc::Receiver<(BPosition, TxOrderingMessage)>,
-}
-
-impl TxOrderingSubscription for LiveTxOrderingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::TxOrderingClosed)
     }
 }
 
