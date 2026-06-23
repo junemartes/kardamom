@@ -29,6 +29,15 @@ pub const TABLE_RECEIPTS: &str = "receipts";
 pub const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
 pub const TABLE_META: &str = "meta";
 
+// --- Incremental state-trie tables (schema v2; see crate::trie) ---
+// Stored intermediate branch nodes, keyed by trie PATH (len-prefixed packed
+// nibbles); the hashed-state mirror holds the leaves keyed by keccak. See
+// docs/specs/2026-06-23-incremental-trie-design.md.
+pub const TABLE_ACCOUNT_TRIE: &str = "account_trie";
+pub const TABLE_STORAGE_TRIE: &str = "storage_trie";
+pub const TABLE_HASHED_ACCOUNTS: &str = "hashed_accounts";
+pub const TABLE_HASHED_STORAGE: &str = "hashed_storage";
+
 pub const ALL_TABLES: &[&str] = &[
     TABLE_ACCOUNTS,
     TABLE_STORAGE,
@@ -37,6 +46,10 @@ pub const ALL_TABLES: &[&str] = &[
     TABLE_RECEIPTS,
     TABLE_TX_HASH_INDEX,
     TABLE_META,
+    TABLE_ACCOUNT_TRIE,
+    TABLE_STORAGE_TRIE,
+    TABLE_HASHED_ACCOUNTS,
+    TABLE_HASHED_STORAGE,
 ];
 
 // ---------- accounts ----------

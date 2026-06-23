@@ -12,9 +12,13 @@
 //! already the canonical Ethereum root regardless of how it is computed — proven
 //! by the `incremental_equals_full_rebuild` test against an independent rebuild.
 //!
-//! These functions are pure (iterator in, root out); [`crate::writer`] drives
-//! them with mdbx cursors inside the block-commit transaction so the root
-//! advances atomically with the state.
+//! The pure `state_root` / `storage_root` rebuild functions below are retained
+//! as the **shadow-check oracle** for the node-incremental path (see
+//! [`node`] / `cursor` / `prefix_set` / `walker`, and `StateRoot::*_incremental`).
+//! `crate::writer` drives them with mdbx cursors inside the block-commit
+//! transaction so the root advances atomically with the state.
+
+pub mod node;
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY, TrieAccount, root};

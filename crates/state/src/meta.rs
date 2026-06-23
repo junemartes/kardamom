@@ -30,7 +30,10 @@ pub const KEY_GENESIS_APPLIED: &[u8] = b"genesis_applied";
 /// executor writer. See `crate::trie`.
 pub const KEY_STATE_ROOT: &[u8] = b"state_root";
 
-pub const SCHEMA_VERSION: u32 = 1;
+// v2 adds the incremental state-trie tables (account_trie, storage_trie,
+// hashed_accounts, hashed_storage). A v1 DB is refused (fresh-from-genesis
+// only; see docs/specs/2026-06-23-incremental-trie-design.md §8).
+pub const SCHEMA_VERSION: u32 = 2;
 
 pub fn encode_u64(v: u64) -> [u8; 8] {
     v.to_be_bytes()
