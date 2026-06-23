@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="io.kardamom.sealer.cluster.SealerClusterFailoverTest" tests="1" skipped="0" failures="0" errors="0" timestamp="2026-06-22T06:22:40" hostname="Ubuntu-2404-noble-amd64-base" time="12.182">
+  <properties/>
+  <testcase name="egressContinuesGaplesslyAcrossLeaderKill()" classname="io.kardamom.sealer.cluster.SealerClusterFailoverTest" time="12.182"/>
+  <system-out><![CDATA[cluster role=LEADER memberId=0
+cluster role=FOLLOWER memberId=0
+cluster role=LEADER memberId=1
+cluster role=FOLLOWER memberId=1
+]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

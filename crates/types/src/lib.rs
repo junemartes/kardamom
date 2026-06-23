@@ -29,6 +29,7 @@ pub mod tx_error;
 pub mod tx_ordering;
 pub mod txref;
 pub mod watermark;
+pub mod withdrawals;
 pub mod wire;
 
 pub use ack_policy::AckPolicy;

@@ -73,6 +73,24 @@ pub fn app_impl_address(factory: Address, impl_salt: B256, impl_initcode: &Bytes
     factory.create2(impl_salt, keccak256(impl_initcode))
 }
 
+/// App proxy address: the factory CREATE2's `ERC1967Proxy(impl, initData)` with
+/// `proxy_salt`. Mirrors `KardamomFactoryV1._deployUUPS`, so callers can predict
+/// a contract's address before it is deployed (e.g. to wire one contract's
+/// address into another's init data within the same atomic batch).
+///
+/// NOTE: the proxy address depends on `init_data` (it is part of the proxy
+/// constructor args), so predict with the *exact* init data the deploy will use.
+pub fn app_proxy_address(
+    factory: Address,
+    proxy_creation_code: &Bytes,
+    impl_addr: Address,
+    init_data: &Bytes,
+    proxy_salt: B256,
+) -> Address {
+    let full = proxy_full_initcode(proxy_creation_code, impl_addr, init_data);
+    factory.create2_from_code(proxy_salt, &full)
+}
+
 /// ERC1967 implementation storage slot.
 pub const ERC1967_IMPL_SLOT: B256 =
     b256!("360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc");

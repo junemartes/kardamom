@@ -8,10 +8,11 @@ use alloy_rpc_types_eth::TransactionRequest;
 use alloy_sol_types::{SolCall, sol};
 
 use crate::addresses::{
-    ERC1967_IMPL_SLOT, ERC7955_FACTORY, factory_impl_address, factory_init_data,
-    factory_proxy_address, proxy_full_initcode,
+    ERC1967_IMPL_SLOT, ERC7955_FACTORY, app_impl_address, app_proxy_address, factory_impl_address,
+    factory_init_data, factory_proxy_address, proxy_full_initcode,
 };
 use crate::embedded;
+use crate::ids::ContractId;
 use crate::spec::{DeploymentSpec, Op, build_spec};
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,30 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let proxy_creation_code = embedded::erc1967_proxy_creation();
         let impl_addr = factory_impl_address(&impl_initcode);
         factory_proxy_address(&proxy_creation_code, impl_addr, self.owner)
+    }
+
+    /// Predict the proxy address a fresh `Op::Deploy { l2_chain_id, id, .. }`
+    /// (version 1) will produce, given the exact `init_args` that deploy will
+    /// use. Pure (no I/O). Used to wire one contract's address into another's
+    /// init data within the same atomic `apply` batch (e.g. the output oracle
+    /// address into `ETHLockbox.initialize`).
+    pub fn predict_proxy_address(
+        &self,
+        l2_chain_id: u64,
+        id: ContractId,
+        init_args: &Bytes,
+    ) -> Address {
+        let factory = self.factory_address();
+        let impl_initcode = id.creation_bytecode();
+        let impl_addr = app_impl_address(factory, id.impl_salt(1), &impl_initcode);
+        let init_data = crate::spec::encode_init_calldata(id, init_args);
+        app_proxy_address(
+            factory,
+            &embedded::erc1967_proxy_creation(),
+            impl_addr,
+            &init_data,
+            id.proxy_salt(l2_chain_id),
+        )
     }
 
     // -----------------------------------------------------------------------
