@@ -18,10 +18,99 @@
 //! `crate::writer` drives them with mdbx cursors inside the block-commit
 //! transaction so the root advances atomically with the state.
 
+pub mod cursor;
 pub mod node;
+pub mod prefix_set;
+pub mod walker;
+
+#[cfg(test)]
+mod incremental_tests;
+
+pub use prefix_set::PrefixSet;
+pub use walker::TrieUpdates;
 
 use alloy_primitives::{Address, B256, U256};
+use alloy_rlp::Encodable;
 use alloy_trie::{EMPTY_ROOT_HASH, KECCAK_EMPTY, TrieAccount, root};
+use signet_libmdbx::Database;
+use signet_libmdbx::tx::aliases::RwTxSync;
+
+use crate::error::StateError;
+
+/// Node-incremental state-root computation over the stored trie tables. The
+/// pure `state_root`/`storage_root` rebuild fns below remain the shadow-check
+/// oracle.
+pub struct StateRoot;
+
+impl StateRoot {
+    /// One account's storage-trie root, incrementally. `prefix_set` holds
+    /// `keccak(slot)` of the account's changed slots.
+    pub fn storage_root_incremental(
+        tx: &RwTxSync,
+        storage_trie: Database,
+        hashed_storage: Database,
+        account_hash: B256,
+        prefix_set: &PrefixSet,
+    ) -> Result<(B256, TrieUpdates), StateError> {
+        walker::storage_root(tx, storage_trie, hashed_storage, &account_hash, prefix_set)
+    }
+
+    /// The world-state account-trie root, incrementally. `prefix_set` holds
+    /// `keccak(addr)` of every changed account (incl. storage-root changes).
+    pub fn state_root_incremental(
+        tx: &RwTxSync,
+        account_trie: Database,
+        hashed_accounts: Database,
+        prefix_set: &PrefixSet,
+    ) -> Result<(B256, TrieUpdates), StateError> {
+        let leaf = |p: &AccountTrieParts| {
+            let mut buf = Vec::new();
+            p.to_trie_account().encode(&mut buf);
+            buf
+        };
+        walker::account_root(tx, account_trie, hashed_accounts, prefix_set, &leaf)
+    }
+}
+
+/// Persist a walk's [`TrieUpdates`] to a node table: upsert each produced branch
+/// node and delete each collapsed path. `account_hash` namespaces storage-trie
+/// keys (`None` for the account trie). Used by the writer and the test harness.
+pub fn apply_trie_updates(
+    txn: &RwTxSync,
+    db: Database,
+    account_hash: Option<&B256>,
+    updates: &TrieUpdates,
+) -> Result<(), StateError> {
+    use signet_libmdbx::WriteFlags;
+    let key = |path: &alloy_trie::Nibbles| -> Vec<u8> {
+        let nibs = path.to_vec();
+        match account_hash {
+            Some(a) => {
+                let mut k = Vec::with_capacity(32 + nibs.len());
+                k.extend_from_slice(a.as_slice());
+                k.extend_from_slice(&nibs);
+                k
+            }
+            None => nibs,
+        }
+    };
+    for (path, node) in &updates.upserts {
+        txn.put(
+            db,
+            key(path),
+            node::encode_branch_node(node),
+            WriteFlags::UPSERT,
+        )?;
+    }
+    for path in &updates.removals {
+        match txn.del(db, key(path), None) {
+            Ok(_) => {}
+            Err(signet_libmdbx::MdbxError::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
 
 /// The basic account fields needed to form an account-trie leaf. (`AccountValue`
 /// in [`crate::schema`] stores these plus the persisted `storage_root`.)
@@ -60,8 +149,18 @@ impl AccountTrieParts {
     /// EIP-161 emptiness: an account with zero nonce, zero balance, and no code
     /// is not present in the world-state trie. (Storage-bearing accounts have
     /// code in practice, so `storage_root` is not part of the emptiness test.)
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.nonce == 0 && self.balance.is_zero() && self.canonical_code_hash() == KECCAK_EMPTY
+    }
+
+    /// The canonical Ethereum account-trie leaf value for this account.
+    pub(crate) fn to_trie_account(self) -> TrieAccount {
+        TrieAccount {
+            nonce: self.nonce,
+            balance: self.balance,
+            storage_root: self.canonical_storage_root(),
+            code_hash: self.canonical_code_hash(),
+        }
     }
 }
 
