@@ -115,18 +115,13 @@ jobs:
       # target/release (it stays on the runner, not in a service image).
       - name: cargo build --release (service binaries + load harness)
         run: |
-          # The 3 feature-clean service bins.
+          # Cluster-only: the Aeron Cluster (Raft) transport is unconditional now
+          # (no `cluster` cargo feature), so every service bin builds in one pass —
+          # sequencer/executor talk to the cluster by default.
           cargo build --release \
-            -p kardamom-ingress -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
+            -p kardamom-da-watcher -p kardamom-batcher \
             --bins
-          # Build sequencer + executor WITH their cluster feature, as SEPARATE
-          # per-package invocations using the bare `--features cluster` form. The
-          # multi-package `--features 'kardamom-sequencer/cluster ...'` form does NOT
-          # actually enable the feature on the bins under this workspace's resolver
-          # (verified via `cargo build -v`: no `--cfg feature="cluster"`), so the
-          # bins would fail-fast at startup ("built without the 'cluster' feature").
-          cargo build --release -p kardamom-sequencer --features cluster --bins
-          cargo build --release -p kardamom-executor --features cluster --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
 
       - name: Install Nomad CLI

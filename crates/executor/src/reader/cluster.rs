@@ -69,11 +69,21 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeEgress;
-    use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress};
+    use kardamom_cluster_adapter::wire::{
+        encode_egress_boundary, encode_egress_record, encode_ingress_txref, split_ingress,
+    };
     use kardamom_types::TxRef;
 
     fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {
-        let r = TxRef::new(B256::repeat_byte(off as u8), shard, BPosition { term_id: 0, term_offset: off }, 0);
+        let r = TxRef::new(
+            B256::repeat_byte(off as u8),
+            shard,
+            BPosition {
+                term_id: 0,
+                term_offset: off,
+            },
+            0,
+        );
         let ingress = encode_ingress_txref(&r);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
         relayed.to_vec()

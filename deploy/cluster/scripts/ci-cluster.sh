@@ -453,7 +453,7 @@ if [[ -x "${LOAD_BIN}" ]]; then
       --duration "${LOAD_DURATION_S:-60}s" --target-tps "${LOAD_TARGET_TPS:-200}" \
       --senders "${LOAD_SENDERS:-6}" --sender-offset 1 --assert-all-delivered \
       --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
-      --scrape executor,sealer,ingress,sequencer --output /tmp/kardamom-load.json
+      --scrape executor,ingress,sequencer --output /tmp/kardamom-load.json
   else
     log "RUN_LOAD=0 — skipping sustained-load stage (chaos-only shard)"
   fi

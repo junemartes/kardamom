@@ -87,7 +87,11 @@ pub struct SessionDriver {
 impl SessionDriver {
     /// `keep_alive_interval_ms` should be < the cluster's session timeout
     /// (typically a few seconds); a connect is queued immediately.
-    pub fn new(response_channel: impl Into<String>, response_stream_id: i32, keep_alive_interval_ms: u64) -> Self {
+    pub fn new(
+        response_channel: impl Into<String>,
+        response_stream_id: i32,
+        keep_alive_interval_ms: u64,
+    ) -> Self {
         Self {
             state: SessionState::Connecting,
             response_channel: response_channel.into(),
@@ -134,7 +138,10 @@ impl SessionDriver {
         } = self.state
             && now_ms.saturating_sub(self.last_emit_ms) >= self.keep_alive_interval_ms
         {
-            out.push(encode_session_keep_alive(leadership_term_id, cluster_session_id));
+            out.push(encode_session_keep_alive(
+                leadership_term_id,
+                cluster_session_id,
+            ));
             self.last_emit_ms = now_ms;
         }
         out
@@ -164,9 +171,9 @@ impl SessionDriver {
             Ok(Egress::SessionMessage(m)) => {
                 // Only surface messages for our session.
                 match self.state {
-                    SessionState::Connected { cluster_session_id, .. }
-                        if cluster_session_id == m.cluster_session_id =>
-                    {
+                    SessionState::Connected {
+                        cluster_session_id, ..
+                    } if cluster_session_id == m.cluster_session_id => {
                         vec![DriverEvent::AppMessage(m.payload.to_vec())]
                     }
                     _ => Vec::new(),
@@ -271,9 +278,16 @@ mod tests {
     #[test]
     fn ok_session_event_connects() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         let evs = d.on_egress(&ok_event(corr, 77, 3, 1));
-        assert_eq!(evs, vec![DriverEvent::Connected { cluster_session_id: 77 }]);
+        assert_eq!(
+            evs,
+            vec![DriverEvent::Connected {
+                cluster_session_id: 77
+            }]
+        );
         assert!(d.is_connected());
     }
 
@@ -281,7 +295,9 @@ mod tests {
     fn wrap_app_only_after_connected() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
         assert!(d.wrap_app(b"x", 0).is_none());
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         d.on_egress(&ok_event(corr, 5, 9, 0));
         let framed = d.wrap_app(b"payload", 42).expect("connected");
         match decode_egress(&framed).unwrap() {
@@ -297,7 +313,9 @@ mod tests {
     #[test]
     fn redirect_repoints_and_reconnects() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         let redirect = encode_session_event(&SessionEvent {
             cluster_session_id: -1,
             correlation_id: corr,
@@ -317,14 +335,18 @@ mod tests {
         // A fresh connect (new correlation id) is queued for the leader.
         let out = d.poll_outbound(1);
         assert_eq!(out.len(), 1);
-        let corr2 = decode_session_connect_request(&out[0]).unwrap().correlation_id;
+        let corr2 = decode_session_connect_request(&out[0])
+            .unwrap()
+            .correlation_id;
         assert_ne!(corr2, corr);
     }
 
     #[test]
     fn new_leader_event_updates_term_keeps_session() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         d.on_egress(&ok_event(corr, 5, 9, 0));
         let nl = encode_new_leader_event(&NewLeaderEvent {
             leadership_term_id: 10,
@@ -354,7 +376,9 @@ mod tests {
     #[test]
     fn keep_alive_emitted_after_interval() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         d.on_egress(&ok_event(corr, 5, 9, 0));
         // Before the interval: nothing.
         assert!(d.poll_outbound(500).is_empty());
@@ -374,18 +398,25 @@ mod tests {
     #[test]
     fn session_message_for_other_session_ignored() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         d.on_egress(&ok_event(corr, 5, 9, 0));
         let other = wrap_session_message(9, 999, 0, b"not-ours");
         assert!(d.on_egress(&other).is_empty());
         let ours = wrap_session_message(9, 5, 0, b"ours");
-        assert_eq!(d.on_egress(&ours), vec![DriverEvent::AppMessage(b"ours".to_vec())]);
+        assert_eq!(
+            d.on_egress(&ours),
+            vec![DriverEvent::AppMessage(b"ours".to_vec())]
+        );
     }
 
     #[test]
     fn auth_rejected_fails_session() {
         let mut d = SessionDriver::new("ch", 1, 1_000);
-        let corr = decode_session_connect_request(&d.poll_outbound(0)[0]).unwrap().correlation_id;
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
         let rej = encode_session_event(&SessionEvent {
             cluster_session_id: -1,
             correlation_id: corr,
@@ -394,7 +425,10 @@ mod tests {
             code: EventCode::AuthenticationRejected,
             detail: "bad creds".into(),
         });
-        assert_eq!(d.on_egress(&rej), vec![DriverEvent::Failed("bad creds".into())]);
+        assert_eq!(
+            d.on_egress(&rej),
+            vec![DriverEvent::Failed("bad creds".into())]
+        );
         assert!(matches!(d.state(), SessionState::Failed(_)));
     }
 }

@@ -86,7 +86,10 @@ impl ClusterIngress for LiveIngress {
         let (reply_tx, reply_rx) = bounded(1);
         if self
             .req_tx
-            .send(OfferReq { payload: payload.to_vec(), reply: reply_tx })
+            .send(OfferReq {
+                payload: payload.to_vec(),
+                reply: reply_tx,
+            })
             .is_err()
         {
             return OfferOutcome::NotConnected; // session thread gone
@@ -134,7 +137,10 @@ pub fn connect(
         .map_err(|e| LiveError(format!("spawn session thread: {e}")))?;
 
     Ok((
-        LiveCluster { stop, join: Some(join) },
+        LiveCluster {
+            stop,
+            join: Some(join),
+        },
         LiveIngress { req_tx },
         LiveEgress { out_rx },
     ))
@@ -188,7 +194,10 @@ fn run_session(
                                     egress_alive = false; // consumer dropped
                                 }
                             }
-                            DriverEvent::Reconnect { leader_member_id, ingress_endpoints } => {
+                            DriverEvent::Reconnect {
+                                leader_member_id,
+                                ingress_endpoints,
+                            } => {
                                 if let Some(p) = open_leader_pub(
                                     &rt,
                                     &ingress_endpoints,

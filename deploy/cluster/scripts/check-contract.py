@@ -144,12 +144,8 @@ for job in ("ingress", "sequencer", "executor", "da-watcher"):
         "--log-config",
         "channels config passed via --log-config (issue #36)",
     )
-# The sequencer publisher control endpoint is injected from Nomad node meta.
-must_contain(
-    jobs / "sequencer.nomad.hcl",
-    "--tx-ordering-mdc-control",
-    "sequencer tx_ordering MDC control endpoint flag",
-)
+# Cluster-only: the sequencer publishes tx_ordering to the Aeron Cluster, not via
+# an Aeron MDC control endpoint, so there is no --tx-ordering-mdc-control flag.
 must_contain(
     CLUSTER / "config" / "genesis" / "dev.toml",
     f"chain_id = {chain_id}",

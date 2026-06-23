@@ -151,11 +151,12 @@ async fn main() -> anyhow::Result<()> {
         }
         None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
     };
-    let (cluster_guard, cluster_pub) = kardamom_sequencer::outbound::cluster::cluster_ref_publisher(
-        cluster_rt,
-        cfg.cluster.to_live(),
-    )
-    .context("connect cluster ref publisher")?;
+    let (cluster_guard, cluster_pub) =
+        kardamom_sequencer::outbound::cluster::cluster_ref_publisher(
+            cluster_rt,
+            cfg.cluster.to_live(),
+        )
+        .context("connect cluster ref publisher")?;
     tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
     // Clone shares the single session thread; offers serialise through it. Both
     // loops use `cluster_pub` (impl `TxOrderingRefPublisher`) — the canonical

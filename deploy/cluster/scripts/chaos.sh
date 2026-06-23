@@ -331,7 +331,7 @@ run_case() { # <case-name>
   "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id "${CHAIN_ID}" --chaos-mode --duration "${CHAOS_CASE_S}s" \
     --target-tps "${CHAOS_TPS}" --senders 1 --sender-offset "${acct}" \
     --nonce-start 0 --assert-all-delivered --completeness accepted \
-    --max-gap "${LOAD_MAX_GAP}" --scrape executor,sealer,ingress,sequencer \
+    --max-gap "${LOAD_MAX_GAP}" --scrape executor,ingress,sequencer \
     --drain-timeout "${drain}s" --output "${out}" >"${logf}" 2>&1 &
   LOAD_PID=$!
 

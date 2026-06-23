@@ -487,4 +487,3 @@ pub fn open_tx_deposits_replay(
         aeron.clone(),
     )
 }
-

@@ -66,6 +66,62 @@ impl Default for IngressConfig {
     }
 }
 
+/// TOML file the `kardamom-ingress` binary parses from `--config` for the
+/// Aeron Cluster (Raft) client connection. The rest of the ingress runtime
+/// tuning still comes from CLI flags + [`IngressConfig::default`].
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct IngressFileConfig {
+    /// Aeron Cluster (Raft) sealer client config. The on-quorum ack gate
+    /// derives its durable watermark from this cluster's egress progress.
+    pub cluster: ClusterConfig,
+}
+
+/// Aeron Cluster (Raft) client config (mirrors the executor/sequencer shape).
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// Retained for config-file backward compatibility; IGNORED — cluster mode
+    /// is the only mode.
+    pub enabled: bool,
+    /// "memberId=host:port,…" cluster ingress endpoints.
+    pub ingress_endpoints: String,
+    pub initial_leader_member_id: i32,
+    pub ingress_stream_id: i32,
+    /// This client's egress (response) channel URI, e.g. "aeron:udp?endpoint=<ip>:<port>".
+    pub egress_channel: String,
+    pub egress_stream_id: i32,
+    pub keep_alive_interval_ms: u64,
+}
+
+impl ClusterConfig {
+    /// Sane stream-id / keepalive defaults when the TOML omits them.
+    fn defaults_applied(mut self) -> Self {
+        if self.ingress_stream_id == 0 {
+            self.ingress_stream_id = 101;
+        }
+        if self.egress_stream_id == 0 {
+            self.egress_stream_id = 102;
+        }
+        if self.keep_alive_interval_ms == 0 {
+            self.keep_alive_interval_ms = 1000;
+        }
+        self
+    }
+
+    pub fn to_live(&self) -> kardamom_cluster_adapter::LiveClusterConfig {
+        let c = self.clone().defaults_applied();
+        kardamom_cluster_adapter::LiveClusterConfig {
+            ingress_endpoints: c.ingress_endpoints,
+            initial_leader_member_id: c.initial_leader_member_id,
+            ingress_stream_id: c.ingress_stream_id,
+            egress_channel: c.egress_channel,
+            egress_stream_id: c.egress_stream_id,
+            keep_alive_interval_ms: c.keep_alive_interval_ms,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

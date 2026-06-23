@@ -32,7 +32,13 @@ struct MockService {
 
 impl MockService {
     fn new(capacity: usize) -> Self {
-        Self { seen: HashSet::new(), fifo: VecDeque::new(), capacity, count: 0, block: 1 }
+        Self {
+            seen: HashSet::new(),
+            fifo: VecDeque::new(),
+            capacity,
+            count: 0,
+            block: 1,
+        }
     }
 
     fn first_seen(&mut self, id: [u8; 32]) -> bool {
@@ -68,7 +74,15 @@ impl MockService {
 }
 
 fn txref(tag: u8) -> TxRef {
-    TxRef::new(B256::repeat_byte(tag), 1, BPosition { term_id: 0, term_offset: tag as i32 }, 0)
+    TxRef::new(
+        B256::repeat_byte(tag),
+        1,
+        BPosition {
+            term_id: 0,
+            term_offset: tag as i32,
+        },
+        0,
+    )
 }
 
 #[test]

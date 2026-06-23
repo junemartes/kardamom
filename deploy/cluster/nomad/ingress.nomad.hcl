@@ -6,10 +6,12 @@
 #       --aeron-dir <dir> --shards 2 --jsonrpc-bind 0.0.0.0:8545 \
 #       --ack-policy on-quorum
 #
-# ingress.toml is presence-checked only; runtime tuning is via flags.
-# channels.toml (issue #36) supplies the UDP multicast channels — including the
-# quorum_watermark stream ingress subscribes to for the on-quorum ack gate,
-# published by the quorum job (issue #38).
+# ingress.toml supplies the [cluster] Aeron Cluster (Raft) client connection
+# (for the on-quorum watermark observer); other runtime tuning is via flags.
+# channels.toml (issue #36) supplies the UDP multicast channels. The on-quorum
+# ack gate's durable watermark is NOT an Aeron quorum_watermark stream anymore —
+# in the cluster-only topology ingress derives it from Aeron Cluster egress
+# progress (see crates/ingress/src/cluster.rs).
 #
 # tx_receipts MDS fan-in: channels.toml's tx_receipts_control_channel +
 # tx_receipts_executor_count drive ingress to open one control-mode=manual
@@ -27,7 +29,7 @@
 
 variable "ack_policy" {
   type        = string
-  description = "Ingress ack durability gate. Defaults to on-offer: a tx is acked once it is sequenced (offered), with no durable-watermark gate on the critical path. The strong durability boundary is L1 DA (via the batcher); a stronger pre-confirmation gate returns when the sealer becomes a raft-consensus turn-based system. Override with: nomad job run -var ack_policy=on-quorum ingress.nomad.hcl (requires the sealer's archive-at-sealer durable watermark)."
+  description = "Ingress ack durability gate. Defaults to on-offer: a tx is acked once it is sequenced (offered), with no durable-watermark gate on the critical path. The strong durability boundary is L1 DA (via the batcher). on-quorum is now available: the Aeron Cluster (Raft) is the orderer, and ingress derives the durable watermark from cluster egress progress (a record/boundary on egress is a Raft-quorum-durability signal). Override with: nomad job run -var ack_policy=on-quorum ingress.nomad.hcl (needs the [cluster] section in ingress.toml + --cluster-egress-endpoint, both wired in this job)."
   default     = "on-offer"
 }
 
@@ -108,6 +110,11 @@ job "ingress" {
           # docs/agents/resilient-ingress-spec.md D3.
           "--ingress-id", "${NOMAD_ALLOC_INDEX}",
           "--ack-policy", "${var.ack_policy}",
+          # Cluster mode: this node's cluster-egress (response) endpoint for the
+          # on-quorum watermark observer's Aeron Cluster client. Uniform port
+          # 40210 (cluster_egress_port); uniqueness comes from the ingress
+          # node_ip. Only consulted when --ack-policy gates on quorum.
+          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
           # Record each per-shard tx_data publication to the archive so a
           # restarted executor can replay full transaction envelopes (Phase 2
           # crash recovery).

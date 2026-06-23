@@ -167,7 +167,11 @@ pub fn encode_session_connect_request(
     client_info: &str,
 ) -> Vec<u8> {
     let mut b = Vec::new();
-    put_header(&mut b, BLOCK_SESSION_CONNECT_REQUEST, TEMPLATE_SESSION_CONNECT_REQUEST);
+    put_header(
+        &mut b,
+        BLOCK_SESSION_CONNECT_REQUEST,
+        TEMPLATE_SESSION_CONNECT_REQUEST,
+    );
     b.extend_from_slice(&correlation_id.to_le_bytes());
     b.extend_from_slice(&response_stream_id.to_le_bytes());
     b.extend_from_slice(&app_version.to_le_bytes());
@@ -212,7 +216,11 @@ pub fn decode_session_connect_request(buf: &[u8]) -> Result<SessionConnectReques
 
 pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
     let mut b = Vec::new();
-    put_header(&mut b, BLOCK_SESSION_KEEP_ALIVE, TEMPLATE_SESSION_KEEP_ALIVE);
+    put_header(
+        &mut b,
+        BLOCK_SESSION_KEEP_ALIVE,
+        TEMPLATE_SESSION_KEEP_ALIVE,
+    );
     b.extend_from_slice(&leadership_term_id.to_le_bytes());
     b.extend_from_slice(&cluster_session_id.to_le_bytes());
     b
@@ -220,7 +228,11 @@ pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i6
 
 pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
     let mut b = Vec::new();
-    put_header(&mut b, BLOCK_SESSION_CLOSE_REQUEST, TEMPLATE_SESSION_CLOSE_REQUEST);
+    put_header(
+        &mut b,
+        BLOCK_SESSION_CLOSE_REQUEST,
+        TEMPLATE_SESSION_CLOSE_REQUEST,
+    );
     b.extend_from_slice(&leadership_term_id.to_le_bytes());
     b.extend_from_slice(&cluster_session_id.to_le_bytes());
     b
@@ -244,8 +256,13 @@ pub fn wrap_session_message(
     timestamp: i64,
     payload: &[u8],
 ) -> Vec<u8> {
-    let mut b = Vec::with_capacity(HEADER_LEN + BLOCK_SESSION_MESSAGE_HEADER as usize + payload.len());
-    put_header(&mut b, BLOCK_SESSION_MESSAGE_HEADER, TEMPLATE_SESSION_MESSAGE_HEADER);
+    let mut b =
+        Vec::with_capacity(HEADER_LEN + BLOCK_SESSION_MESSAGE_HEADER as usize + payload.len());
+    put_header(
+        &mut b,
+        BLOCK_SESSION_MESSAGE_HEADER,
+        TEMPLATE_SESSION_MESSAGE_HEADER,
+    );
     b.extend_from_slice(&leadership_term_id.to_le_bytes());
     b.extend_from_slice(&cluster_session_id.to_le_bytes());
     b.extend_from_slice(&timestamp.to_le_bytes());
@@ -368,11 +385,13 @@ pub fn decode_egress(buf: &[u8]) -> Result<Egress<'_>, DecodeError> {
             let leadership_term_id = rd_i64(body, 0)?;
             let cluster_session_id = rd_i64(body, 8)?;
             let timestamp = rd_i64(body, 16)?;
-            let payload = body.get(h.block_length as usize..).ok_or(DecodeError::TooShort {
-                at: h.block_length as usize,
-                need: 0,
-                have: body.len(),
-            })?;
+            let payload = body
+                .get(h.block_length as usize..)
+                .ok_or(DecodeError::TooShort {
+                    at: h.block_length as usize,
+                    need: 0,
+                    have: body.len(),
+                })?;
             Ok(Egress::SessionMessage(SessionMessage {
                 leadership_term_id,
                 cluster_session_id,
@@ -537,7 +556,10 @@ mod tests {
     #[test]
     fn truncated_buffer_errors_cleanly() {
         let b = [0u8; 4]; // shorter than an 8-byte header
-        assert!(matches!(MessageHeader::decode(&b), Err(DecodeError::TooShort { .. })));
+        assert!(matches!(
+            MessageHeader::decode(&b),
+            Err(DecodeError::TooShort { .. })
+        ));
     }
 
     #[test]

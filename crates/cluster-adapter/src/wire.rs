@@ -91,16 +91,22 @@ pub enum EgressItem {
 }
 
 pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
-    let kind = *buf.first().ok_or(WireError::TooShort { at: 0, need: 1, have: 0 })?;
+    let kind = *buf.first().ok_or(WireError::TooShort {
+        at: 0,
+        need: 1,
+        have: 0,
+    })?;
     match kind {
         EGRESS_KIND_RELAYED => {
             let index = rd_u64(buf, 1)?;
             let payload_len = rd_u32(buf, 9)? as usize;
             let start = 13;
-            let payload = buf.get(start..start + payload_len).ok_or(WireError::BadPayloadLen {
-                declared: payload_len,
-                remaining: buf.len().saturating_sub(start),
-            })?;
+            let payload = buf
+                .get(start..start + payload_len)
+                .ok_or(WireError::BadPayloadLen {
+                    declared: payload_len,
+                    remaining: buf.len().saturating_sub(start),
+                })?;
             Ok(EgressItem::Record {
                 index,
                 msg: decode_relayed_payload(payload)?,
@@ -138,14 +144,21 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
     let fields = &p[CANONICAL_ID_LEN + 1..];
     match rt {
         RT_TXREF => {
-            let shard_id = *fields.first().ok_or(WireError::TooShort { at: 0, need: 1, have: 0 })?;
+            let shard_id = *fields.first().ok_or(WireError::TooShort {
+                at: 0,
+                need: 1,
+                have: 0,
+            })?;
             let term_id = rd_i32(fields, 1)?;
             let term_offset = rd_i32(fields, 5)?;
             let tx_data_session_id = rd_i32(fields, 9)?;
             Ok(TxOrderingMessage::TxRef(TxRef::new(
                 id,
                 shard_id,
-                BPosition { term_id, term_offset },
+                BPosition {
+                    term_id,
+                    term_offset,
+                },
                 tx_data_session_id,
             )))
         }
@@ -154,7 +167,10 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
             let term_offset = rd_i32(fields, 4)?;
             Ok(TxOrderingMessage::DepositRef(DepositRef::new(
                 id,
-                BPosition { term_id, term_offset },
+                BPosition {
+                    term_id,
+                    term_offset,
+                },
             )))
         }
         other => Err(WireError::BadRecordType(other)),
@@ -189,7 +205,11 @@ pub fn encode_egress_boundary(block_number: u64, end_tx_idx: u64, l2_timestamp: 
 /// onward (what the Java service forwards to egress). Used by the in-Rust
 /// service mock in tests.
 pub fn split_ingress(buf: &[u8]) -> Result<([u8; 32], &[u8]), WireError> {
-    let payload = buf.get(1..).ok_or(WireError::TooShort { at: 1, need: 0, have: 0 })?;
+    let payload = buf.get(1..).ok_or(WireError::TooShort {
+        at: 1,
+        need: 0,
+        have: 0,
+    })?;
     let cid: [u8; 32] = payload
         .get(0..CANONICAL_ID_LEN)
         .ok_or(WireError::TooShort {
@@ -219,8 +239,7 @@ fn rd_u64(b: &[u8], at: usize) -> Result<u64, WireError> {
     Ok(u64::from_le_bytes(s.try_into().unwrap()))
 }
 fn slice4(b: &[u8], at: usize) -> Result<[u8; 4], WireError> {
-    Ok(b
-        .get(at..at + 4)
+    Ok(b.get(at..at + 4)
         .ok_or(WireError::TooShort {
             at,
             need: 4,
@@ -238,12 +257,21 @@ mod tests {
         TxRef::new(
             B256::repeat_byte(0xAB),
             3,
-            BPosition { term_id: 7, term_offset: 9_999 },
+            BPosition {
+                term_id: 7,
+                term_offset: 9_999,
+            },
             5, // tx_data_session_id (exercises the active/active session field roundtrip)
         )
     }
     fn depositref() -> DepositRef {
-        DepositRef::new(B256::repeat_byte(0xCD), BPosition { term_id: 1, term_offset: 42 })
+        DepositRef::new(
+            B256::repeat_byte(0xCD),
+            BPosition {
+                term_id: 1,
+                term_offset: 42,
+            },
+        )
     }
 
     /// Ingress → (service relays from offset 1) → egress → decode reproduces the TxRef.
@@ -318,7 +346,10 @@ mod tests {
 
     #[test]
     fn truncated_egress_errors_cleanly() {
-        assert!(matches!(decode_egress(&[EGRESS_KIND_RELAYED, 0, 0]), Err(WireError::TooShort { .. })));
+        assert!(matches!(
+            decode_egress(&[EGRESS_KIND_RELAYED, 0, 0]),
+            Err(WireError::TooShort { .. })
+        ));
         assert!(decode_egress(&[]).is_err());
     }
 }

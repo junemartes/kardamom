@@ -71,11 +71,21 @@ mod tests {
     use super::*;
     use alloy_primitives::B256;
     use kardamom_cluster_adapter::gateway::fakes::FakeIngress;
-    use kardamom_cluster_adapter::wire::{EgressItem, decode_egress, encode_egress_record, split_ingress};
+    use kardamom_cluster_adapter::wire::{
+        EgressItem, decode_egress, encode_egress_record, split_ingress,
+    };
     use kardamom_types::{BPosition, TxOrderingMessage};
 
     fn txref() -> TxRef {
-        TxRef::new(B256::repeat_byte(0x11), 2, BPosition { term_id: 0, term_offset: 100 }, 0)
+        TxRef::new(
+            B256::repeat_byte(0x11),
+            2,
+            BPosition {
+                term_id: 0,
+                term_offset: 100,
+            },
+            0,
+        )
     }
 
     #[test]
@@ -99,7 +109,13 @@ mod tests {
     fn publishes_depositref_as_ingress_envelope() {
         let ingress = FakeIngress::new();
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
-        let r = DepositRef::new(B256::repeat_byte(0x22), BPosition { term_id: 1, term_offset: 7 });
+        let r = DepositRef::new(
+            B256::repeat_byte(0x22),
+            BPosition {
+                term_id: 1,
+                term_offset: 7,
+            },
+        );
         pubr.try_publish_deposit_ref(&r).unwrap();
         assert_eq!(ingress.accepted().len(), 1);
     }
@@ -109,7 +125,10 @@ mod tests {
         let ingress = FakeIngress::new();
         ingress.set_outcome(OfferOutcome::BackPressured);
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
-        assert!(matches!(pubr.try_publish_ref(&txref()), Err(SequencerError::Backpressure)));
+        assert!(matches!(
+            pubr.try_publish_ref(&txref()),
+            Err(SequencerError::Backpressure)
+        ));
         // Nothing was accepted by the gateway.
         assert!(ingress.accepted().is_empty());
     }
@@ -119,6 +138,9 @@ mod tests {
         let ingress = FakeIngress::new();
         ingress.set_outcome(OfferOutcome::NotConnected);
         let mut pubr = ClusterRefPublisher::new(ingress);
-        assert!(matches!(pubr.try_publish_ref(&txref()), Err(SequencerError::Backpressure)));
+        assert!(matches!(
+            pubr.try_publish_ref(&txref()),
+            Err(SequencerError::Backpressure)
+        ));
     }
 }
