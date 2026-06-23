@@ -14,7 +14,6 @@
 //!
 //! `BlockDelta` lives in `kardamom-types` — we never redefine it.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -31,15 +30,14 @@ use crate::meta::{
 };
 use crate::schema::{
     AccountValue, HeaderValue, TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_META,
-    TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX, decode_account_value, decode_storage_value,
-    encode_account_key, encode_account_value, encode_block_key, encode_code_key,
-    encode_header_value, encode_receipt_value, encode_storage_key, encode_storage_value,
-    encode_tx_hash_key, encode_tx_hash_value,
+    TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX, encode_account_key, encode_account_value,
+    encode_block_key, encode_code_key, encode_header_value, encode_receipt_value,
+    encode_storage_key, encode_storage_value, encode_tx_hash_key, encode_tx_hash_value,
 };
 use crate::snapshot::StateSnapshot;
 use crate::swap::{SnapshotHandle, SnapshotReceiver, channel as swap_channel};
-use crate::trie::{self, AccountTrieParts};
-use alloy_primitives::{Address, B256, U256};
+use crate::trie;
+use alloy_primitives::B256;
 
 /// One block's worth of state changes submitted to the writer.
 ///
@@ -90,34 +88,44 @@ impl WriterHandle {
     }
 }
 
+/// How the writer maintains the state-root trie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrieMode {
+    /// No trie (the sequencer-side executor; v0 emits no state-root commitment).
+    Off,
+    /// Node-incremental trie, persisting the canonical MPT root per block.
+    Incremental,
+    /// Incremental, plus a full-rebuild shadow-check every `every_n` blocks that
+    /// fail-stops the writer on mismatch (a canary against walker bugs).
+    ShadowCheck { every_n: u64 },
+}
+
 /// Single-writer state thread. Owns the only RW mdbx txn at a time.
 pub struct StateWriter {
     env: StateEnv,
     delta_rx: Receiver<WriteBatch>,
     snapshot_handle: SnapshotHandle,
-    /// When true, every block commit also maintains per-account `storage_root`s
-    /// and computes the canonical Ethereum MPT world-state root, persisting it
-    /// to `meta[KEY_STATE_ROOT]` in the same txn. Used by the validator; the
-    /// sequencer-side executor leaves this off (v0: no state-root commitment).
-    compute_trie: bool,
+    /// Trie maintenance mode. `Off` for the executor; `Incremental`/`ShadowCheck`
+    /// for the validator — each block commit advances the canonical Ethereum MPT
+    /// world-state root (see [`crate::trie`]) inside the same atomic txn.
+    trie_mode: TrieMode,
 }
 
 impl StateWriter {
     /// Spawn the plain writer (no state-root trie) on a dedicated OS thread.
-    /// This is the sequencer-side executor's backend — behaviour is unchanged
-    /// from before the trie support landed.
+    /// This is the sequencer-side executor's backend.
     pub fn spawn(env: StateEnv) -> Result<WriterHandle, StateError> {
-        Self::spawn_inner(env, false)
+        Self::spawn_inner(env, TrieMode::Off)
     }
 
-    /// Spawn the trie-aware writer: in addition to persisting state, each block
-    /// commit advances the Ethereum MPT state root (see [`crate::trie`]) inside
-    /// the same atomic txn. Used by the validator.
-    pub fn spawn_with_trie(env: StateEnv) -> Result<WriterHandle, StateError> {
-        Self::spawn_inner(env, true)
+    /// Spawn the trie-aware writer with the given [`TrieMode`]: each block commit
+    /// advances the Ethereum MPT state root inside the same atomic txn. Used by
+    /// the validator.
+    pub fn spawn_with_trie(env: StateEnv, mode: TrieMode) -> Result<WriterHandle, StateError> {
+        Self::spawn_inner(env, mode)
     }
 
-    fn spawn_inner(env: StateEnv, compute_trie: bool) -> Result<WriterHandle, StateError> {
+    fn spawn_inner(env: StateEnv, trie_mode: TrieMode) -> Result<WriterHandle, StateError> {
         // Bounded channel: HORIZON_BLOCKS deep. If the writer falls behind by
         // more than the version horizon, the executor will block here — at
         // which point the snapshot it holds is about to be invalidated anyway,
@@ -138,7 +146,7 @@ impl StateWriter {
             env: env.clone(),
             delta_rx,
             snapshot_handle: snapshot_handle.clone(),
-            compute_trie,
+            trie_mode,
         };
 
         let join = thread::Builder::new()
@@ -219,73 +227,19 @@ impl StateWriter {
         }
 
         // --- accounts ---
-        if self.compute_trie {
-            // Trie-aware: every account touched this block (a basic-field change
-            // OR a storage change) gets its storage_root recomputed from its
-            // current slots and persisted, so the world-state root is canonical.
-            let mut basics: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
-            for c in &batch.delta.accounts {
-                basics.insert(c.address, (c.nonce, c.balance, c.code_hash));
-            }
-            let mut touched: BTreeSet<Address> = basics.keys().copied().collect();
-            for s in &batch.delta.storage {
-                touched.insert(s.address);
-            }
-            for addr in touched {
-                let prefix = addr.into_array();
-                // Recompute this account's storage_root from all its slots.
-                let storage_root = {
-                    let mut cur = txn.cursor(storage)?;
-                    let mut slots: Vec<(B256, U256)> = Vec::new();
-                    let mut item = cur.set_range::<Vec<u8>, Vec<u8>>(&prefix)?;
-                    while let Some((k, v)) = item {
-                        if k.len() < 52 || k[..20] != prefix[..] {
-                            break;
-                        }
-                        slots.push((B256::from_slice(&k[20..52]), decode_storage_value(&v)?));
-                        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-                    }
-                    trie::storage_root(slots)
-                };
-                // Basic fields: from the delta if the account changed this block,
-                // otherwise carry forward the existing record (storage-only change).
-                let (nonce, balance, code_hash) = match basics.get(&addr) {
-                    Some(&b) => b,
-                    None => match txn.get::<Vec<u8>>(accounts.dbi(), &prefix)? {
-                        Some(bytes) => {
-                            let v = decode_account_value(&bytes)?;
-                            (v.nonce, v.balance, v.code_hash)
-                        }
-                        None => (0, U256::ZERO, B256::ZERO),
-                    },
-                };
-                let v = AccountValue {
-                    nonce,
-                    balance,
-                    code_hash,
-                    storage_root,
-                };
-                txn.put(
-                    accounts,
-                    encode_account_key(addr),
-                    encode_account_value(&v),
-                    WriteFlags::UPSERT,
-                )?;
-            }
-        } else {
-            // Plain path (executor): AccountChange carries no storage_root; the
-            // v0 executor does not maintain per-account MPT roots, so persist
-            // storage_root = B256::ZERO.
-            for change in &batch.delta.accounts {
-                let key = encode_account_key(change.address);
-                let v = AccountValue {
-                    nonce: change.nonce,
-                    balance: change.balance,
-                    code_hash: change.code_hash,
-                    storage_root: B256::ZERO,
-                };
-                txn.put(accounts, key, encode_account_value(&v), WriteFlags::UPSERT)?;
-            }
+        // The `accounts` table feeds revm reads (nonce/balance/code_hash) and
+        // does not carry a meaningful storage_root — the state trie keeps the
+        // canonical per-account storage_root in `hashed_accounts` (see
+        // crate::trie). Persist storage_root = ZERO here regardless of trie mode.
+        for change in &batch.delta.accounts {
+            let key = encode_account_key(change.address);
+            let v = AccountValue {
+                nonce: change.nonce,
+                balance: change.balance,
+                code_hash: change.code_hash,
+                storage_root: B256::ZERO,
+            };
+            txn.put(accounts, key, encode_account_value(&v), WriteFlags::UPSERT)?;
         }
 
         // --- code ---
@@ -353,28 +307,30 @@ impl StateWriter {
         )?;
 
         // --- state root (trie-aware only) ---
-        // Canonical Ethereum MPT world-state root over the full account set,
-        // persisted in the same txn so the root advances atomically with state.
-        if self.compute_trie {
-            let root = {
-                let mut cur = txn.cursor(accounts)?;
-                let mut all: Vec<(Address, AccountTrieParts)> = Vec::new();
-                let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-                while let Some((k, v)) = item {
-                    let av = decode_account_value(&v)?;
-                    all.push((
-                        Address::from_slice(&k),
-                        AccountTrieParts {
-                            nonce: av.nonce,
-                            balance: av.balance,
-                            code_hash: av.code_hash,
-                            storage_root: av.storage_root,
-                        },
-                    ));
-                    item = cur.next::<Vec<u8>, Vec<u8>>()?;
+        // Node-incrementally advance the canonical Ethereum MPT world-state root
+        // and persist it in the same txn so the root advances atomically with
+        // state. ShadowCheck additionally rebuilds the root from scratch on a
+        // sampling interval and fail-stops on mismatch (canary for walker bugs).
+        if self.trie_mode != TrieMode::Off {
+            let tables = trie::TrieTables::open(&txn)?;
+            let root = trie::update_for_block(&txn, &tables, &batch.delta)?;
+            if let TrieMode::ShadowCheck { every_n } = self.trie_mode
+                && every_n != 0
+                && batch.boundary.block_number.is_multiple_of(every_n)
+            {
+                let rebuilt = trie::rebuild_root(&txn, &tables)?;
+                if rebuilt != root {
+                    error!(
+                        block = batch.boundary.block_number,
+                        %root, %rebuilt, "trie shadow-check MISMATCH — halting writer"
+                    );
+                    return Err(StateError::ShadowMismatch {
+                        block: batch.boundary.block_number,
+                        incremental: root,
+                        rebuilt,
+                    });
                 }
-                trie::state_root(all)
-            };
+            }
             txn.put(meta, KEY_STATE_ROOT, encode_b256(root), WriteFlags::UPSERT)?;
         }
 
@@ -481,9 +437,11 @@ mod trie_writer_tests {
             },
             BlockDelta {
                 block_number: 2,
-                // 0x11 changes a slot (storage-only: NOT in accounts), 0x22 gets funds.
-                accounts: vec![acct(0x22, 1, 800)],
-                storage: vec![slot(0x11, 1, 0), slot(0x33, 5, 42)], // zero-out one slot, add account 0x33's slot
+                // 0x11 changes a slot (storage-only: NOT in accounts), 0x22 gets
+                // funds, 0x33 is created (a real, non-empty account) so its slot
+                // below is reachable (an empty account's storage is pruned).
+                accounts: vec![acct(0x22, 1, 800), acct(0x33, 1, 1)],
+                storage: vec![slot(0x11, 1, 0), slot(0x33, 5, 42)], // zero-out one slot, add 0x33's slot
                 code: vec![],
                 receipts: vec![],
             },
@@ -506,7 +464,7 @@ mod trie_writer_tests {
                 .durability(Durability::SafeNoSync)
                 .open()
                 .unwrap();
-            let handle = StateWriter::spawn_with_trie(env).unwrap();
+            let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
             for delta in &blocks {
                 for s in &delta.storage {
                     model_stor
@@ -536,5 +494,50 @@ mod trie_writer_tests {
         let persisted = snap.state_root().unwrap().expect("trie writer set a root");
         assert_eq!(persisted, model_root(&model_accts, &model_stor));
         assert_ne!(persisted, trie::empty_root());
+    }
+
+    #[test]
+    fn shadow_check_agrees_every_block() {
+        // In ShadowCheck mode the writer rebuilds the root from scratch each block
+        // and fail-stops on mismatch. The independent rebuild must agree with the
+        // incremental walker every block, so the writer shuts down cleanly.
+        let dir = tempfile::tempdir().unwrap();
+        let env = StateEnvBuilder::new(dir.path())
+            .durability(Durability::SafeNoSync)
+            .open()
+            .unwrap();
+        let handle =
+            StateWriter::spawn_with_trie(env, TrieMode::ShadowCheck { every_n: 1 }).unwrap();
+        let blocks = vec![
+            BlockDelta {
+                block_number: 1,
+                accounts: vec![acct(0x11, 1, 1000), acct(0x22, 1, 500)],
+                storage: vec![slot(0x11, 1, 7)],
+                code: vec![],
+                receipts: vec![],
+            },
+            BlockDelta {
+                block_number: 2,
+                accounts: vec![acct(0x33, 1, 9)],
+                storage: vec![slot(0x11, 2, 8), slot(0x33, 1, 1)],
+                code: vec![],
+                receipts: vec![],
+            },
+            BlockDelta {
+                block_number: 3,
+                accounts: vec![acct(0x11, 2, 1001)],
+                storage: vec![slot(0x11, 1, 0)],
+                code: vec![],
+                receipts: vec![],
+            },
+        ];
+        for d in &blocks {
+            handle
+                .delta_tx
+                .send(WriteBatch::new(boundary(d.block_number), d.clone()))
+                .unwrap();
+        }
+        // A shadow-check mismatch would surface here as the writer's Err result.
+        handle.shutdown().expect("shadow-check agreed every block");
     }
 }

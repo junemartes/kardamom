@@ -24,4 +24,4 @@ pub use recovery::{RecoveryPoint, read_recovery_point};
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};
 pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
-pub use writer::{StateWriter, WriteBatch, WriterHandle};
+pub use writer::{StateWriter, TrieMode, WriteBatch, WriterHandle};

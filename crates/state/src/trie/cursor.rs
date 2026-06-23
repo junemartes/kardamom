@@ -47,7 +47,7 @@ pub(crate) fn get_branch_node(
 }
 
 /// Decode a `hashed_accounts` value (`nonce ++ balance ++ code_hash ++ storage_root`).
-fn decode_account_leaf(b: &[u8]) -> Result<AccountTrieParts, StateError> {
+pub(crate) fn decode_account_leaf(b: &[u8]) -> Result<AccountTrieParts, StateError> {
     if b.len() != 104 {
         return Err(StateError::BadEncoding {
             table: HASHED_ACCT,
