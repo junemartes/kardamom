@@ -29,7 +29,9 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_log::replay;
-use kardamom_state::{Durability, StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
+use kardamom_state::{
+    Durability, StateEnvBuilder, StateWriter, TrieMode, read_recovery_point, seed_genesis,
+};
 use kardamom_types::{
     AccountChange, BPosition, BlockDelta, CodeEntry, Deposit, TxEnvelope, TxOrderingMessage,
 };
@@ -91,6 +93,12 @@ struct Args {
     /// State durability mode.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     state_durability: StateDurabilityArg,
+    /// Enable the state-trie shadow-check: every N blocks, recompute the world
+    /// state root by full rebuild and fail-stop on mismatch with the incremental
+    /// walker (a canary against trie bugs). Absent ⇒ incremental only; `1` ⇒
+    /// every block. Costs a full rebuild on the sampled blocks.
+    #[arg(long, env = "KARDAMOM_TRIE_SHADOW_CHECK")]
+    trie_shadow_check: Option<u64>,
     /// UDP endpoint the archive replay-merge binds to receive replayed
     /// tx_ordering fragments on crash recovery (resume only).
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
@@ -331,7 +339,12 @@ async fn main() -> Result<()> {
     );
 
     // Trie-aware writer: each block commit advances the MPT state root.
-    let writer = StateWriter::spawn_with_trie(env).context("spawn trie-aware state writer")?;
+    let trie_mode = match args.trie_shadow_check {
+        Some(every_n) => TrieMode::ShadowCheck { every_n },
+        None => TrieMode::Incremental,
+    };
+    let writer =
+        StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let sw_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
     let sw_queue = ValidatorWriterQueue::new(

@@ -319,7 +319,9 @@ impl StateWriter {
                 && batch.boundary.block_number.is_multiple_of(every_n)
             {
                 let rebuilt = trie::rebuild_root(&txn, &tables)?;
+                metrics::counter!("kardamom_state_trie_shadow_checks_total").increment(1);
                 if rebuilt != root {
+                    metrics::counter!("kardamom_state_trie_shadow_mismatch_total").increment(1);
                     error!(
                         block = batch.boundary.block_number,
                         %root, %rebuilt, "trie shadow-check MISMATCH — halting writer"

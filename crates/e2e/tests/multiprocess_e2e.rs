@@ -535,6 +535,11 @@ async fn multiprocess_e2e_validator_syncs_and_keeps_up() {
             .arg(cfg_dir.path().join("validator-state"))
             .arg("--state-durability")
             .arg("safe-no-sync")
+            // Shadow-check the node-incremental state trie EVERY block against a
+            // full rebuild; a walker bug fail-stops the validator (process exits,
+            // failing the test) and bumps kardamom_state_trie_shadow_mismatch_total.
+            .arg("--trie-shadow-check")
+            .arg("1")
             .arg("--metrics-addr")
             .arg(VAL_METRICS)
             .stdout(Stdio::inherit())
@@ -662,6 +667,26 @@ async fn multiprocess_e2e_validator_syncs_and_keeps_up() {
     assert!(
         kept_up,
         "validator did not keep up: val_block={val_block}, exec_block={exec_block}, lag bound={LAG_BOUND}"
+    );
+
+    // ----- Incremental-trie shadow-check: every block recomputed the root by
+    // full rebuild and it matched the node-incremental walker. A mismatch would
+    // have fail-stopped the validator (caught above by sync/keep-up failing);
+    // additionally assert the counters directly.
+    let shadow_checks = scrape(VAL_METRICS, "kardamom_state_trie_shadow_checks_total")
+        .await
+        .unwrap_or(0.0);
+    let shadow_mismatch = scrape(VAL_METRICS, "kardamom_state_trie_shadow_mismatch_total")
+        .await
+        .unwrap_or(0.0);
+    tracing::info!(shadow_checks, shadow_mismatch, "trie shadow-check");
+    assert!(
+        shadow_checks >= 1.0,
+        "trie shadow-check never ran (checks={shadow_checks})"
+    );
+    assert_eq!(
+        shadow_mismatch, 0.0,
+        "incremental state trie diverged from full rebuild ({shadow_mismatch} mismatches)"
     );
 
     drop(ingress);
