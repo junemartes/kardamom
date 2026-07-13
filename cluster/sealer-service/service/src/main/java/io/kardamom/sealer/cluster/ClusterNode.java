@@ -74,12 +74,19 @@ public final class ClusterNode {
             .ingressChannel("aeron:udp")
             .ingressStreamId(ingressStreamId)
             .appVersion(APP_VERSION)
-            // Client sessions survive a full quorum outage of the chaos suite's
-            // shape (kill 2/3, ~15s stall window, restart) instead of expiring
-            // at Aeron's 10s default and forcing every client through a
-            // reconnect. Clients still keep-alive every 1s; a genuinely dead
-            // client holds a session slot for at most 30s.
-            .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(30))
+            // Client sessions must survive a full quorum outage END TO END
+            // (kill 2/3 -> 15s stall window -> node restart -> member recovery
+            // -> re-election: ~40-60s observed on CI) instead of expiring and
+            // forcing clients through a reconnect. Without canonical-stream
+            // replay on reconnect (a tracked follow-up), a session that dies
+            // while commits continue re-attaches with an unrecoverable GAP —
+            // the client then fail-stops (observed: the validator halting after
+            // the quorum case at 30s). No commits happen during the outage
+            // itself, so a SURVIVING session resumes gap-free. Clients
+            // keep-alive every 1s; a genuinely dead client holds a session
+            // slot for at most 90s, acceptable for this deployment's small,
+            // long-lived client set.
+            .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(90))
             // leaderHeartbeatTimeoutNs stays at Aeron's 10s default: raising it
             // to 20s was tried and made real failovers ~20s slower (leader-kill
             // recovery blew the 60s pipeline-progress SLO), while the "leader
