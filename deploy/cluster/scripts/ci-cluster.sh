@@ -296,9 +296,17 @@ log "creating bridge ${NET} (${SUBNET})"
 # Name the underlying Linux bridge so its /sys path is deterministic (otherwise
 # docker derives br-<network-id[:12]>). We disable IGMP snooping on it next.
 BRIDGE_NAME=kardamom-br0
-docker network create --driver bridge \
-  -o "com.docker.network.bridge.name=${BRIDGE_NAME}" \
-  --subnet "${SUBNET}" "${NET}"
+# Idempotent: reuse an existing ${NET} (e.g. a KEEP=1 run or local iteration) —
+# recreating it would also recreate the underlying bridge and silently reset
+# multicast_snooping to the kernel default (1), undoing the fix below on hosts
+# where this script cannot sudo.
+if ! docker network inspect "${NET}" >/dev/null 2>&1; then
+  docker network create --driver bridge \
+    -o "com.docker.network.bridge.name=${BRIDGE_NAME}" \
+    --subnet "${SUBNET}" "${NET}"
+else
+  log "network ${NET} already exists; reusing"
+fi
 
 # Aeron's cross-node data plane is UDP MULTICAST (tx_ordering: sealer ->
 # recorders + executor; the per-recorder fsync watermarks and the aggregated

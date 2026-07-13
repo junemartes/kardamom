@@ -159,16 +159,17 @@ fn run_session(
         cfg.egress_stream_id,
         cfg.keep_alive_interval_ms,
     );
-    let mut ingress = match open_leader_pub(
-        &rt,
-        &cfg.ingress_endpoints,
-        cfg.initial_leader_member_id,
-        cfg.ingress_stream_id,
-    ) {
+    // Current ingress target + the member list to rotate through when connect
+    // attempts go unanswered (the target may be a dead node; any LIVE member
+    // answers a connect — the leader with OK, a follower with a REDIRECT to
+    // the leader — so round-robin always converges on the leader).
+    let mut endpoints = cfg.ingress_endpoints.clone();
+    let mut target_member = cfg.initial_leader_member_id;
+    let mut ingress = match open_leader_pub(&rt, &endpoints, target_member, cfg.ingress_stream_id) {
         Some(p) => p,
         None => {
             tracing::error!(
-                endpoints = %cfg.ingress_endpoints,
+                endpoints = %endpoints,
                 "cluster session: no usable initial ingress endpoint"
             );
             return;
@@ -205,6 +206,8 @@ fn run_session(
                                     cfg.ingress_stream_id,
                                 ) {
                                     ingress = p;
+                                    endpoints = ingress_endpoints;
+                                    target_member = leader_member_id;
                                 }
                             }
                             DriverEvent::Connected { cluster_session_id } => {
@@ -223,9 +226,25 @@ fn run_session(
             }
         }
 
-        // 2. Connect / keep-alive frames.
+        // 2. Connect / keep-alive frames. The driver self-heals (re-emits a
+        // connect on connect-timeout and after a session-failure backoff); when
+        // it emits a RETRY attempt, rotate the ingress target to the next
+        // member id BEFORE publishing it — the member we were pointed at may be
+        // gone, and any live member redirects us to the leader.
         let now = now_ms();
-        for frame in driver.poll_outbound(now) {
+        let frames = driver.poll_outbound(now);
+        if driver.take_rotate_hint()
+            && let Some((next_member, p)) =
+                open_next_member_pub(&rt, &endpoints, target_member, cfg.ingress_stream_id)
+        {
+            target_member = next_member;
+            ingress = p;
+            tracing::info!(
+                member = target_member,
+                "cluster session: rotating ingress target for reconnect"
+            );
+        }
+        for frame in frames {
             ingress.publish_best_effort(to_aligned(&frame));
         }
 
@@ -273,6 +292,40 @@ fn endpoint_for_member(endpoints: &str, member_id: i32) -> Option<String> {
         let (id, ep) = entry.split_once('=')?;
         (id.trim() == want).then(|| ep.trim().to_string())
     })
+}
+
+/// All member ids present in a `memberId=host:port,…` list, sorted.
+fn member_ids(endpoints: &str) -> Vec<i32> {
+    let mut ids: Vec<i32> = endpoints
+        .split(',')
+        .filter_map(|entry| entry.split_once('=')?.0.trim().parse().ok())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// Open a publication to the member AFTER `current` in the list (wrapping) —
+/// the round-robin step for self-heal reconnects. Falls through dead ids by
+/// returning the first member whose publication opens.
+fn open_next_member_pub(
+    rt: &AeronRuntime,
+    endpoints: &str,
+    current: i32,
+    stream_id: i32,
+) -> Option<(i32, PubHandle)> {
+    let ids = member_ids(endpoints);
+    if ids.is_empty() {
+        return None;
+    }
+    let start = ids.iter().position(|&id| id == current).unwrap_or(0);
+    // Try every member once, starting from the one after `current`.
+    for step in 1..=ids.len() {
+        let id = ids[(start + step) % ids.len()];
+        if let Some(p) = open_leader_pub(rt, endpoints, id, stream_id) {
+            return Some((id, p));
+        }
+    }
+    None
 }
 
 fn to_aligned(bytes: &[u8]) -> AlignedVec {

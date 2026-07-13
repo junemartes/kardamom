@@ -74,6 +74,12 @@ public final class ClusterNode {
             .ingressChannel("aeron:udp")
             .ingressStreamId(ingressStreamId)
             .appVersion(APP_VERSION)
+            // Client sessions survive a full quorum outage of the chaos suite's
+            // shape (kill 2/3, ~15s stall window, restart) instead of expiring
+            // at Aeron's 10s default and forcing every client through a
+            // reconnect. Clients still keep-alive every 1s; a genuinely dead
+            // client holds a session slot for at most 30s.
+            .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(30))
             .replicationChannel("aeron:udp?endpoint=" + me[3]);
 
         final ClusteredServiceContainer.Context serviceCtx = new ClusteredServiceContainer.Context()

@@ -68,6 +68,19 @@ pub enum DriverEvent {
     Failed(String),
 }
 
+/// How long a connect request may stay unanswered before it is re-emitted
+/// (the transport is told to rotate to the next member first — the target may
+/// be a dead node).
+pub const CONNECT_TIMEOUT_MS: u64 = 3_000;
+
+/// Backoff before a FAILED session (closed/rejected by the cluster, e.g. a
+/// session timeout during a quorum outage) queues a fresh connect. A failed
+/// session is NOT terminal: the cluster closing our session is an event to
+/// recover from, not a reason to go dark (a client that never reconnects
+/// silently starves its consumer forever — the executor/validator block on an
+/// egress that will never speak again).
+pub const RECONNECT_BACKOFF_MS: u64 = 1_000;
+
 /// Sans-IO cluster session driver.
 pub struct SessionDriver {
     state: SessionState,
@@ -82,6 +95,19 @@ pub struct SessionDriver {
     pending_connect: bool,
     /// Wall-clock (ms) of the last ingress frame we emitted; gates keep-alives.
     last_emit_ms: u64,
+    /// Wall-clock (ms) of the last connect request emission; gates the
+    /// connect-timeout re-emit and the failed-state reconnect backoff.
+    last_connect_ms: u64,
+    /// Total connect requests emitted. The transport watches this to rotate
+    /// its ingress target (round-robin over the member list) whenever a NEW
+    /// attempt is emitted after the first — the member we were pointed at may
+    /// be gone, and any live member will REDIRECT us to the leader.
+    connect_attempts: u64,
+    /// Set when the next queued connect is a SELF-HEAL retry (connect timeout
+    /// or failed-session backoff) — the transport should rotate its ingress
+    /// target before publishing it. NOT set for redirect-driven connects (those
+    /// must go to the member the cluster just named).
+    rotate_hint: bool,
 }
 
 impl SessionDriver {
@@ -101,7 +127,22 @@ impl SessionDriver {
             next_correlation_id: 1,
             pending_connect: true,
             last_emit_ms: 0,
+            last_connect_ms: 0,
+            connect_attempts: 0,
+            rotate_hint: false,
         }
+    }
+
+    /// Total connect requests emitted so far.
+    pub fn connect_attempts(&self) -> u64 {
+        self.connect_attempts
+    }
+
+    /// True (once) when the connect just emitted was a self-heal retry — the
+    /// transport should rotate its ingress target round-robin. Redirect-driven
+    /// connects never set this.
+    pub fn take_rotate_hint(&mut self) -> bool {
+        std::mem::take(&mut self.rotate_hint)
     }
 
     pub fn state(&self) -> &SessionState {
@@ -114,8 +155,28 @@ impl SessionDriver {
 
     /// Frames the transport should offer on the ingress publication now. Emits
     /// a queued connect request, and a keep-alive when the interval has elapsed
-    /// while connected.
+    /// while connected. Self-healing: a FAILED session queues a fresh connect
+    /// after [`RECONNECT_BACKOFF_MS`], and an unanswered connect re-emits after
+    /// [`CONNECT_TIMEOUT_MS`] (the transport rotates the target member).
     pub fn poll_outbound(&mut self, now_ms: u64) -> Vec<Vec<u8>> {
+        match &self.state {
+            SessionState::Failed(_)
+                if now_ms.saturating_sub(self.last_connect_ms) >= RECONNECT_BACKOFF_MS =>
+            {
+                self.state = SessionState::Connecting;
+                self.pending_connect = true;
+                self.rotate_hint = true;
+            }
+            SessionState::Connecting
+                if !self.pending_connect
+                    && self.connect_attempts > 0
+                    && now_ms.saturating_sub(self.last_connect_ms) >= CONNECT_TIMEOUT_MS =>
+            {
+                self.pending_connect = true;
+                self.rotate_hint = true;
+            }
+            _ => {}
+        }
         let mut out = Vec::new();
         if self.pending_connect {
             self.in_flight_correlation_id = self.next_correlation_id;
@@ -130,6 +191,8 @@ impl SessionDriver {
             ));
             self.pending_connect = false;
             self.last_emit_ms = now_ms;
+            self.last_connect_ms = now_ms;
+            self.connect_attempts += 1;
         }
         if let SessionState::Connected {
             cluster_session_id,
@@ -409,6 +472,80 @@ mod tests {
             d.on_egress(&ours),
             vec![DriverEvent::AppMessage(b"ours".to_vec())]
         );
+    }
+
+    #[test]
+    fn failed_session_reconnects_after_backoff() {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
+        d.on_egress(&ok_event(corr, 5, 9, 0));
+        // Cluster closes the session (e.g. timeout during a quorum outage).
+        let closed = encode_session_event(&SessionEvent {
+            cluster_session_id: 5,
+            correlation_id: 0,
+            leadership_term_id: 9,
+            leader_member_id: 0,
+            code: EventCode::Closed,
+            detail: "TIMEOUT".into(),
+        });
+        assert_eq!(
+            d.on_egress(&closed),
+            vec![DriverEvent::Failed("TIMEOUT".into())]
+        );
+        // Before the backoff elapses (relative to the last connect at t=0…
+        // long past already at t=10_000): a fresh connect is queued.
+        let out = d.poll_outbound(10_000);
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            MessageHeader::decode(&out[0]).unwrap().template_id,
+            TEMPLATE_SESSION_CONNECT_REQUEST
+        );
+        assert!(d.take_rotate_hint(), "self-heal retry must hint a rotation");
+        assert!(matches!(d.state(), SessionState::Connecting));
+        // And the new connect can complete with a fresh correlation id.
+        let corr2 = decode_session_connect_request(&out[0])
+            .unwrap()
+            .correlation_id;
+        assert_ne!(corr2, corr);
+        d.on_egress(&ok_event(corr2, 6, 10, 1));
+        assert!(d.is_connected());
+    }
+
+    #[test]
+    fn unanswered_connect_reemits_after_timeout_with_rotate_hint() {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        assert_eq!(d.poll_outbound(0).len(), 1);
+        assert!(!d.take_rotate_hint(), "first connect is not a retry");
+        // Before the connect timeout: nothing.
+        assert!(d.poll_outbound(CONNECT_TIMEOUT_MS - 1).is_empty());
+        // After: the connect is re-emitted and the transport is told to rotate.
+        let out = d.poll_outbound(CONNECT_TIMEOUT_MS);
+        assert_eq!(out.len(), 1);
+        assert!(d.take_rotate_hint());
+        assert_eq!(d.connect_attempts(), 2);
+    }
+
+    #[test]
+    fn redirect_connect_does_not_hint_rotation() {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
+        let redirect = encode_session_event(&SessionEvent {
+            cluster_session_id: -1,
+            correlation_id: corr,
+            leadership_term_id: 0,
+            leader_member_id: 2,
+            code: EventCode::Redirect,
+            detail: "0=h0:9,1=h1:9,2=h2:9".into(),
+        });
+        d.on_egress(&redirect);
+        // The redirect-driven connect must go to the member the cluster named,
+        // NOT be rotated away from it.
+        assert_eq!(d.poll_outbound(1).len(), 1);
+        assert!(!d.take_rotate_hint());
     }
 
     #[test]
