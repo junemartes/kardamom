@@ -155,12 +155,20 @@ sealer_boundaries() {
 # (or empty if the scrape failed). awk takes $NF of the first matching sample and
 # int-truncates (the gauge may render as a float / scientific notation).
 executor_progress() {
-  local n v
+  # MAX across all responding executors, NOT the first responder: a replica
+  # restarted by a chaos case legitimately reports gauge 0 (or a low block)
+  # while it replays/recovers, even though its peers — and the pipeline — are
+  # fine. Pinning the probe to that replica reads as "pipeline NOT progressing
+  # (block 0 -> 0)" when nothing is wrong (observed on node-failure-executor
+  # right after hard-executor restarted executor-0).
+  local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
     v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
-    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
+  [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
+  return 1
 }
 
 # --- injectors --------------------------------------------------------------

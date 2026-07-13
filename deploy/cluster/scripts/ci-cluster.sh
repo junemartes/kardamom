@@ -262,7 +262,7 @@ dump_diagnostics() {
       [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
       docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster describe 2>&1
       echo "--- recovery-plan ---"
-      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster recovery-plan 2>&1 | tail -20' 2>/dev/null || true
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster recovery-plan 1 2>&1 | tail -20' 2>/dev/null || true
   done
 }
 
