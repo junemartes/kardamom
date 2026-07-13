@@ -558,6 +558,9 @@ PK="0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0" \
 # single-sealer full-pipeline e2e in the cluster-only migration).
 log "validator verdict: sync + keep-up + BAL cross-check (no divergence)"
 EXEC_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
+# The validator lives on the aux node (see validator.nomad.hcl — kept out of
+# the executor-chaos blast radius).
+VALIDATOR_NODES=(kardamom-aux-0)
 VALIDATOR_PORT=9006
 EXECUTOR_PORT=9004
 VALIDATOR_LAG_MAX="${VALIDATOR_LAG_MAX:-10}"
@@ -569,14 +572,13 @@ scrape_metric() { # <node> <port> <metric-name> -> value or ""
     | awk -v m="$3" '$0 ~ "^"m"([{ ])" {v=$NF} END {if (v != "") print v}'
 }
 
-# The validator lands on ONE executor-class node — find it by probing :9006.
 VALIDATOR_NODE=""
-for n in "${EXEC_NODES[@]}"; do
+for n in "${VALIDATOR_NODES[@]}"; do
   if docker exec "$n" curl -fsS --max-time 5 "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
     VALIDATOR_NODE="$n"; break
   fi
 done
-[[ -n "${VALIDATOR_NODE}" ]] || { echo "FAIL: no validator /metrics on :${VALIDATOR_PORT} on any executor node (fail-stopped or never placed?)" >&2; exit 1; }
+[[ -n "${VALIDATOR_NODE}" ]] || { echo "FAIL: no validator /metrics on :${VALIDATOR_PORT} (fail-stopped — divergence or session death?)" >&2; exit 1; }
 log "validator found on ${VALIDATOR_NODE}"
 
 # Executor progress reference: any responding executor (state-machine replicas).

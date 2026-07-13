@@ -6,10 +6,13 @@
 # proven divergence — a dead validator alloc IS the divergence signal, so the
 # job deliberately does NOT restart on failure.
 #
-# Placement: one validator, co-located on an executor-class node (it needs the
-# node-local Aeron media driver + the cluster NIC). Its ports are distinct from
-# the co-resident executor's: cluster egress 40230 (executor: 40210 =
-# cluster_egress_port), metrics 9006 (executor: 9004).
+# Placement: one validator on the AUX node (da-watcher/batcher tier). It only
+# needs the node-local Aeron media driver + the cluster NIC — any worker-tier
+# node works — and the aux node is deliberately OUTSIDE the chaos suite's blast
+# radius: the executor chaos cases kill executor tasks/nodes (node-failure kills
+# the executor-2 node outright), and a validator co-located there dies as
+# collateral, indistinguishable from a fail-stop. Ports on the aux node:
+# cluster egress 40230, metrics 9006 (no conflicts; no executor co-resident).
 #
 # NOTE: this job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory (scripts/deploy.sh does this).
@@ -20,7 +23,7 @@ job "validator" {
 
   constraint {
     attribute = "${meta.role}"
-    value     = "executor"
+    value     = "aux"
   }
 
   group "validator" {
