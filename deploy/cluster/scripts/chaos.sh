@@ -441,9 +441,15 @@ run_case() { # <case-name>
       # reschedule SLO (image re-pull). count_running counts the `cluster` allocs.
       assert_count "${CLUSTER_TASK}" 2 "${CHAOS_RESCHEDULE_SLO_S}"
       # With quorum back, the executor must resume applying blocks (drains backlog).
-      # Generous timeout: the rejoined member must catch up its Raft log + the new
-      # quorum must re-elect before commits resume.
-      assert_executor_progress 60
+      # WIDE timeout — this is the one case where the clients' cluster SESSIONS
+      # die (a >15s total outage exceeds the session timeout; leader-kill keeps
+      # sessions alive via NewLeaderEvent redirect). Observed on CI: re-election
+      # + client session re-establishment alone takes ~50s after the node
+      # restart, and the reopened sessions then replay the canonical stream from
+      # the log before NEW commits surface on the executor's block gauge. 60s
+      # timed out reproducibly (3/3 runs, sessions reopening ~40s in); 180s
+      # covers re-election + reconnect + replay with margin.
+      assert_executor_progress 180
       # Restore the second node too so the suite leaves a healthy 3/3 cluster for
       # any subsequent cases (best-effort; not asserted as part of this case's SLO).
       docker start "${victims[1]}" >/dev/null 2>&1 || true
