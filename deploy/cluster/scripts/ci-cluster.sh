@@ -341,6 +341,12 @@ for n in "${NODES[@]}"; do
   # volumes live on the host's real fs, where overlay works.
   docker volume create "kardamom-${n}-docker" >/dev/null
   docker volume create "kardamom-${n}-containerd" >/dev/null
+  # Idempotent: a node left up by a previous KEEP=1 run is reused as-is.
+  if docker inspect "kardamom-${n}" >/dev/null 2>&1; then
+    log "node kardamom-${n} already exists; reusing"
+    docker start "kardamom-${n}" >/dev/null 2>&1 || true
+    continue
+  fi
   docker run -d --name "kardamom-${n}" --hostname "${n}" \
     --privileged --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
