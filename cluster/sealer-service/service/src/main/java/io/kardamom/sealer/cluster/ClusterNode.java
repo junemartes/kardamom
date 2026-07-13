@@ -80,12 +80,10 @@ public final class ClusterNode {
             // reconnect. Clients still keep-alive every 1s; a genuinely dead
             // client holds a session slot for at most 30s.
             .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(30))
-            // Aeron's 10s default trips SPURIOUSLY on CPU-starved CI runners
-            // ("leader heartbeat timeout" warnings during normal bring-up),
-            // causing needless step-downs/elections under load — the entry
-            // point to the fragile recovery path. 20s still detects a truly
-            // dead leader well inside the chaos suite's 45s election SLO.
-            .leaderHeartbeatTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(20))
+            // leaderHeartbeatTimeoutNs stays at Aeron's 10s default: raising it
+            // to 20s was tried and made real failovers ~20s slower (leader-kill
+            // recovery blew the 60s pipeline-progress SLO), while the "leader
+            // heartbeat timeout" warnings it was meant to silence were benign.
             .replicationChannel("aeron:udp?endpoint=" + me[3]);
 
         final ClusteredServiceContainer.Context serviceCtx = new ClusteredServiceContainer.Context()
