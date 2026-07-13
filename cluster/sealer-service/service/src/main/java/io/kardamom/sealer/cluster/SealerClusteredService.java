@@ -311,11 +311,24 @@ public final class SealerClusteredService implements ClusteredService {
         return pos;
     }
 
+    /**
+     * Bounded egress-offer retries per session per frame. The offers run on the
+     * SINGLE clustered-service thread: an UNBOUNDED retry against one wedged or
+     * slow client session (its egress image full because the subscriber
+     * stopped draining) blocks record relaying and the boundary tick for the
+     * WHOLE cluster — one sick client must never stall the pipeline. After the
+     * bound, the frame is dropped for THAT session only; the client sees a gap
+     * on its egress, which its consumer detects (the executor's boundary
+     * alignment) — the correct failure locality.
+     */
+    private static final int MAX_OFFER_RETRIES = 8;
+
     private void offerToSession(final ClientSession session, final int length) {
         long result;
+        int retries = 0;
         do {
             result = session.offer(egressBuffer, 0, length);
-        } while (result < 0 && retryable(result));
+        } while (result < 0 && retryable(result) && ++retries < MAX_OFFER_RETRIES);
     }
 
     /** Whether a negative offer result is a retryable back-pressure condition. */
