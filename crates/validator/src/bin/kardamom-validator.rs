@@ -389,7 +389,7 @@ async fn main() -> Result<()> {
     }
     let initial_block = recovery.last_committed_block;
 
-    let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
+    let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run(
             cfg,
             a_subs,
@@ -404,12 +404,26 @@ async fn main() -> Result<()> {
         )
     });
 
-    wait_for_shutdown().await;
-    tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
+    // Exit on WHICHEVER comes first: an operator shutdown signal, or the
+    // engine loop finishing on its own (a divergence fail-stop or a stream
+    // error). Waiting only for SIGTERM would leave a halted validator lingering
+    // "alive" — metrics up, chain frozen — hiding the very fail-stop signal
+    // the divergence machinery exists to surface.
+    let engine_result = tokio::select! {
+        _ = wait_for_shutdown() => {
+            tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
+            None
+        }
+        res = &mut join => Some(res),
+    };
     drop(rt);
     drop(cluster_guard);
     let mut diverged = divergence.is_halted();
-    match join.await {
+    let joined = match engine_result {
+        Some(r) => r,
+        None => join.await,
+    };
+    match joined {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "validator main loop returned an error");
