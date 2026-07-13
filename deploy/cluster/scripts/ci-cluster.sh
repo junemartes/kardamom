@@ -228,8 +228,11 @@ dump_diagnostics() {
       printf '%s\n' "${err}" | head -30 || true
       echo "----- ${job} alloc ${alloc}: stderr (tail 40) -----"
       printf '%s\n' "${err}" | tail -40 || true
-      echo "----- ${job} alloc ${alloc}: stdout (tail 40) -----"
-      nomad alloc logs "${alloc}" 2>/dev/null | tail -40 || true
+      # Full role/election history matters for the cluster job; more tail there.
+      local stdout_tail=40
+      [[ "${job}" == "cluster" ]] && stdout_tail=200
+      echo "----- ${job} alloc ${alloc}: stdout (tail ${stdout_tail}) -----"
+      nomad alloc logs "${alloc}" 2>/dev/null | tail -"${stdout_tail}" || true
     done <<<"${allocs}"
   done
 
@@ -244,6 +247,22 @@ dump_diagnostics() {
       for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do
         [ -f "$f" ] && { echo "--- $f ---"; cat "$f"; }
       done' 2>/dev/null || true
+  done
+
+  # Consensus-module state per member (election phase, log/commit/append
+  # positions, recovery plan) — the ground truth for "leader elected but
+  # nothing commits" stalls. ClusterTool ships in the cluster-node jar; run it
+  # inside each sealer node's INNER cluster task container (nomad docker task,
+  # named by its alloc; find it via the inner docker ps).
+  for n in "${NODES[@]}"; do
+    [[ "${NODE_ROLE[$n]}" == "sealer" ]] || continue
+    echo "===== ${n}: ClusterTool describe ====="
+    docker exec "kardamom-${n}" sh -c '
+      inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
+      [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster describe 2>&1
+      echo "--- recovery-plan ---"
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster recovery-plan 2>&1 | tail -20' 2>/dev/null || true
   done
 }
 
