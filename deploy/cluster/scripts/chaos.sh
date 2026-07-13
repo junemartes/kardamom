@@ -86,12 +86,11 @@ CHAOS_ACCT_BASE="${CHAOS_ACCT_BASE:-7}"
 CHAOS_ACCT="${CHAOS_ACCT_BASE}"
 
 # Sealer/executor metrics ports + container names (mirror smoke-load defaults).
-# NOTE: in cluster mode there is no kardamom-sealer (the Java cluster node has no
-# Prometheus endpoint); progress is read from the executor instead (port 9004).
-# The legacy single-sealer boundary probe is kept (sealer_boundaries) as a
-# fallback for a non-clustered deploy — see assert_progress().
+# NOTE: the Java cluster node has no Prometheus endpoint; the executors
+# re-export the sealer's boundary stream from cluster egress on port 9004, so
+# both progress probes (sealer_boundaries, executor_progress) read from the
+# executor nodes — see assert_progress().
 SEALER_NODE="kardamom-sealer-0"
-SEALER_PORT=9003
 EXECUTOR_NODE="kardamom-executor-0"
 # Progress is scraped from whichever executor responds (a chaos case may kill one
 # of them — hard-executor kills executor-0, node-failure-executor kills executor-2),
@@ -139,12 +138,17 @@ count_running() {
     | tr -cd 'x' | wc -c | tr -d ' '
 }
 
-# Legacy single-sealer progress probe: the sealer's emitted-block-boundary
-# counter. Only available on a non-clustered deploy (the Java cluster node has no
-# Prometheus endpoint); assert_progress uses this as a fallback when present.
+# Sealer boundary-counter probe: the sealer's boundary stream as re-exported
+# by the executors from cluster egress (the Java cluster node itself has no
+# Prometheus endpoint). Ticks ~4/s while the sealer is alive — a finer liveness
+# signal than the block gauge. Tries each executor node like executor_progress.
 sealer_boundaries() {
-  docker exec "${SEALER_NODE}" curl -fsS --max-time 5 "http://127.0.0.1:${SEALER_PORT}/metrics" 2>/dev/null \
-    | awk '/^kardamom_sealer_boundaries_emitted_total/{print $NF; exit}'
+  local n v
+  for n in "${EXECUTOR_NODES[@]}"; do
+    v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+      | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
+    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+  done
 }
 
 # Cluster-mode progress probe: the most-recently-committed block number as seen
@@ -198,12 +202,12 @@ assert_count() { # <job> <min-running> <slo-secs>
 }
 
 assert_progress() {
-  # Pipeline-progress probe for the component-chaos cases. On a legacy single-
-  # sealer deploy the sealer exposes a block-boundary counter, so prefer it when
-  # reachable. In cluster mode there is no kardamom-sealer Prometheus endpoint, so
-  # fall back to the executor's committed-block gauge (the same signal the cluster
-  # cases use). Kept as a name so the ported component-chaos cases below need no
-  # edits.
+  # Pipeline-progress probe for the component-chaos cases. Prefer the sealer's
+  # boundary counter (re-exported by the executors) when reachable — it ticks
+  # every boundary, ~4/s, even with no load. If no executor exporter answers,
+  # fall back to the executor's committed-block gauge (the same signal the
+  # cluster cases use). Kept as a name so the ported component-chaos cases
+  # below need no edits.
   local b0 b1
   b0="$(sealer_boundaries || true)"
   if [ -n "${b0}" ]; then
@@ -214,7 +218,7 @@ assert_progress() {
       || fail "pipeline NOT progressing after recovery (sealer boundaries ${b0} -> ${b1})"
     return 0
   fi
-  # No sealer endpoint (clustered deploy): use the executor block gauge.
+  # No executor exporter answered: poll the executor block gauge instead.
   assert_executor_progress "$@"
 }
 

@@ -45,7 +45,10 @@
 #    ci-cluster.sh reach nodes: `docker exec kardamom-<node> curl 127.0.0.1:<port>`.
 #    Defaults (from the binaries' --metrics-addr defaults):
 #       executor  kardamom-executor-0  127.0.0.1:9004  kardamom_executor_block_number
-#       sealer    kardamom-sealer-0    127.0.0.1:9003  kardamom_sealer_block_number
+#       sealer    kardamom-executor-0  127.0.0.1:9004  kardamom_sealer_block_number
+#    The clustered sealer (Java Aeron Cluster) has no Prometheus endpoint;
+#    executors re-export its boundary stream from cluster egress, so the
+#    sealer block metric is read from an executor node.
 #
 # ---------------------------------------------------------------------------
 # ENV KNOBS (all optional; sane defaults)
@@ -70,9 +73,10 @@
 #   Node/metrics overrides (verify against a live cluster — see RETURN notes):
 #   EXECUTOR_NODES     space-separated node-container names that run an executor
 #                                  (default "kardamom-executor-0 ...-1 ...-2")
-#   SEALER_NODE        node-container running the sealer (default kardamom-sealer-0)
+#   SEALER_NODE        node-container to read the re-exported sealer metric
+#                                  from (default kardamom-executor-0)
 #   EXECUTOR_METRICS_PORT  (default 9004)
-#   SEALER_METRICS_PORT    (default 9003)
+#   SEALER_METRICS_PORT    (default 9004 — the executor exporter)
 #   EXECUTOR_BLOCK_METRIC  (default kardamom_executor_block_number)
 #   SEALER_BLOCK_METRIC    (default kardamom_sealer_block_number)
 #   METRICS_VIA_DOCKER 1 => scrape via `docker exec <node> curl 127.0.0.1:port`
@@ -116,9 +120,9 @@ VALUE="${VALUE:-1}"
 TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 
 EXECUTOR_NODES="${EXECUTOR_NODES:-kardamom-executor-0 kardamom-executor-1 kardamom-executor-2}"
-SEALER_NODE="${SEALER_NODE:-kardamom-sealer-0}"
+SEALER_NODE="${SEALER_NODE:-kardamom-executor-0}"
 EXECUTOR_METRICS_PORT="${EXECUTOR_METRICS_PORT:-9004}"
-SEALER_METRICS_PORT="${SEALER_METRICS_PORT:-9003}"
+SEALER_METRICS_PORT="${SEALER_METRICS_PORT:-9004}"
 EXECUTOR_BLOCK_METRIC="${EXECUTOR_BLOCK_METRIC:-kardamom_executor_block_number}"
 SEALER_BLOCK_METRIC="${SEALER_BLOCK_METRIC:-kardamom_sealer_block_number}"
 METRICS_VIA_DOCKER="${METRICS_VIA_DOCKER:-1}"

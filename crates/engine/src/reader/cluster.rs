@@ -40,6 +40,10 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
                     return Ok((BPosition::from_index(index), msg));
                 }
                 Ok(EgressItem::Boundary(b)) => {
+                    // The clustered sealer has no Prometheus endpoint; re-export
+                    // its boundary stream here (see `crate::metrics`).
+                    metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
+                    metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(b.block_number as f64);
                     let pos = b.end_tx_idx;
                     return Ok((pos, TxOrderingMessage::BoundaryStart(b)));
                 }
