@@ -1,7 +1,8 @@
 //! `kardamom-validator`: monolithic validator node.
 //!
 //! Follows the sequencer by subscribing to the same canonical streams the
-//! executor reads (`tx_data` × M, `tx_ordering`, `tx_deposits`), re-executes
+//! executor reads (`tx_data` × M, `tx_ordering` from the Aeron Cluster (Raft)
+//! egress, `tx_deposits`), re-executes
 //! every block through the shared `kardamom-engine` pipeline, and commits to its
 //! own libmdbx state via the **trie-aware** writer — advancing a canonical
 //! Ethereum MPT state root per block. It additionally subscribes to the
@@ -19,23 +20,33 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_engine::reader::cluster::ClusterConfig;
 use kardamom_engine::{
     DepositSubscription, Executor, ExecutorConfig, ExecutorError, MdbxSnapshotSource,
     MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription, TxOrderingSubscription,
 };
 use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxOrderingSubscriberHandle,
-    TxReceiptsSubscriberHandle,
+    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_log::replay;
 use kardamom_state::{Durability, StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
 use kardamom_types::{
-    AccountChange, BPosition, BlockDelta, CodeEntry, Deposit, TxEnvelope, TxOrderingMessage,
+    AccountChange, BPosition, BlockDelta, CodeEntry, Deposit, TxDataLoc, TxEnvelope,
 };
 use kardamom_validator::{
     BalBuffer, Divergence, ReceiptBuffer, ValidatorReceiptSink, ValidatorWriterQueue, metrics,
 };
+
+/// Top-level config the `kardamom-validator` binary deserializes from
+/// `--config`. Same `[cluster]` section shape as the executor's.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(default)]
+struct ValidatorFileConfig {
+    /// Aeron Cluster (Raft) sealer client config. tx_ordering ALWAYS comes from
+    /// the cluster egress — there is no non-cluster path.
+    cluster: ClusterConfig,
+}
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 enum StateDurabilityArg {
@@ -92,13 +103,15 @@ struct Args {
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     state_durability: StateDurabilityArg,
     /// UDP endpoint the archive replay-merge binds to receive replayed
-    /// tx_ordering fragments on crash recovery (resume only).
+    /// tx_data / tx_deposits fragments on crash recovery (resume only —
+    /// tx_ordering recovery is the cluster client's replay, not the archive).
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
     replay_destination_endpoint: Option<String>,
-    /// UDP endpoint the archive replay-merge binds for the live tx_ordering
-    /// stream once replay catches up (resume only).
-    #[arg(long, env = "KARDAMOM_LIVE_DESTINATION")]
-    live_destination_endpoint: Option<String>,
+    /// This node's cluster-egress endpoint `ip:port`. Overrides/sets the
+    /// [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
+    /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9006")]
     metrics_addr: std::net::SocketAddr,
@@ -120,8 +133,19 @@ async fn main() -> Result<()> {
     )?;
     kardamom_engine::metrics::describe();
     metrics::describe();
-    let _raw =
-        std::fs::read_to_string(&args.config).context("read validator config (presence check)")?;
+    // The TOML supplies the `[cluster]` section (the canonical tx_ordering
+    // stream is ALWAYS the Aeron Cluster egress); all other runtime tuning
+    // still comes from the CLI flags above.
+    let raw = std::fs::read_to_string(&args.config).context("read validator config")?;
+    let mut file_cfg: ValidatorFileConfig =
+        toml::from_str(&raw).context("parse validator config")?;
+
+    // Per-node cluster egress endpoint: the cluster client's egress_channel is
+    // this node's reachable address, so it's injected by the deploy rather than
+    // baked into the static config file.
+    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
+        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
+    }
 
     tracing::info!(
         shards = args.shards,
@@ -166,14 +190,6 @@ async fn main() -> Result<()> {
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
     let resume = if recovery.last_committed_block > 0 {
-        if !channels.tx_ordering_mdc_enabled() {
-            anyhow::bail!(
-                "validator state DB at {} is at block {}, but tx_ordering MDC is disabled — \
-                 archive replay-merge recovery needs the UDP-MDC transport.",
-                args.state_dir.display(),
-                recovery.last_committed_block,
-            );
-        }
         let rp = ResumePoint {
             block: recovery.last_committed_block,
             record_count: recovery.last_fsynced_b_position.as_index(),
@@ -191,11 +207,7 @@ async fn main() -> Result<()> {
             .replay_destination_endpoint
             .clone()
             .context("crash recovery needs --replay-destination-endpoint")?;
-        let live_dst = args
-            .live_destination_endpoint
-            .clone()
-            .context("crash recovery needs --live-destination-endpoint")?;
-        Some((replay_dst, live_dst))
+        Some(replay_dst)
     } else {
         None
     };
@@ -203,8 +215,8 @@ async fn main() -> Result<()> {
     // M tx_data subscriptions (async→sync bridged), identical to the executor.
     let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(args.shards as usize);
     for shard_id in 0..args.shards {
-        let (tx, rx) = sync_mpsc::channel::<(BPosition, TxEnvelope)>();
-        if let Some((replay_dst, _)) = recovery_endpoints.as_ref() {
+        let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
+        if let Some(replay_dst) = recovery_endpoints.as_ref() {
             let mut replay =
                 replay::open_tx_data_replay(&channels, &aeron_cfg, shard_id, replay_dst.clone())
                     .with_context(|| format!("open tx_data replay-merge shard={shard_id}"))?;
@@ -232,39 +244,32 @@ async fn main() -> Result<()> {
         }));
     }
 
-    // tx_ordering subscription.
-    let (b_tx, b_rx) = sync_mpsc::channel::<(BPosition, TxOrderingMessage)>();
-    if let Some((replay_dst, live_dst)) = recovery_endpoints.as_ref() {
-        let mut replay = replay::open_tx_ordering_replay(
-            &channels,
-            &aeron_cfg,
-            replay_dst.clone(),
-            live_dst.clone(),
+    // 1 tx_ordering subscription — ALWAYS the Aeron Cluster (Raft) egress,
+    // exactly as in the executor. The cluster has already deduped + totally
+    // ordered the stream and exposes a blocking `next()`, so no async→sync
+    // bridge is needed. Leader failover / reconnect — including crash-recovery
+    // replay of the canonical stream — is handled inside the cluster client.
+    // The cluster-session guard (`LiveCluster`) + its dedicated Aeron runtime
+    // must outlive the validator loop, so bind the guard in the outer scope;
+    // it is dropped only after the `join` await below.
+    let cluster_rt = match args.aeron_dir.as_ref() {
+        Some(dir) => {
+            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
+        }
+        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
+    };
+    let (cluster_guard, cluster_sub) =
+        kardamom_engine::reader::cluster::cluster_tx_ordering_subscription(
+            cluster_rt,
+            file_cfg.cluster.to_live(),
         )
-        .context("open tx_ordering archive replay-merge subscriber")?;
-        tokio::spawn(async move {
-            while let Some(item) = replay.recv().await {
-                if b_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    } else {
-        let mut handle = TxOrderingSubscriberHandle::open(&rt, &channels)
-            .context("open TxOrderingSubscriberHandle")?;
-        tokio::spawn(async move {
-            while let Some(item) = handle.recv().await {
-                if b_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(LiveTxOrderingSub { rx: b_rx });
+        .context("connect cluster tx_ordering subscription")?;
+    tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");
+    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
 
     // tx_deposits subscription.
     let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
-    if let Some((replay_dst, _)) = recovery_endpoints.as_ref() {
+    if let Some(replay_dst) = recovery_endpoints.as_ref() {
         let mut replay = replay::open_tx_deposits_replay(&channels, &aeron_cfg, replay_dst.clone())
             .context("open tx_deposits archive replay-merge subscriber")?;
         tokio::spawn(async move {
@@ -389,6 +394,7 @@ async fn main() -> Result<()> {
     wait_for_shutdown().await;
     tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
     drop(rt);
+    drop(cluster_guard);
     let mut diverged = divergence.is_halted();
     match join.await {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
@@ -475,25 +481,16 @@ fn build_genesis_alloc(
 
 struct LiveTxDataSub {
     sequencer_id: u8,
-    rx: sync_mpsc::Receiver<(BPosition, TxEnvelope)>,
+    rx: sync_mpsc::Receiver<(TxDataLoc, TxEnvelope)>,
 }
 impl TxDataSubscription for LiveTxDataSub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(BPosition, TxEnvelope), ExecutorError> {
+    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
         self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
-    }
-}
-
-struct LiveTxOrderingSub {
-    rx: sync_mpsc::Receiver<(BPosition, TxOrderingMessage)>,
-}
-impl TxOrderingSubscription for LiveTxOrderingSub {
-    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::TxOrderingClosed)
     }
 }
 

@@ -11,7 +11,11 @@ edition.workspace = true
 [dependencies]
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
+# Cluster (Raft) transport adapter (`reader::cluster`). tx_ordering ALWAYS comes
+# from the cluster egress — non-optional, there is no non-cluster path.
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-state = { path = "../state" }
+serde = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
@@ -25,6 +29,7 @@ dashmap = { workspace = true }
 
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
 alloy-network.workspace = true
 alloy-eips.workspace = true

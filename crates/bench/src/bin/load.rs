@@ -105,8 +105,9 @@ struct Args {
     #[arg(long = "chaos-mode", default_value_t = false)]
     chaos_mode: bool,
 
-    /// Comma-separated services to scrape.
-    #[arg(long, default_value = "executor,sealer,ingress")]
+    /// Comma-separated services to scrape. (No `sealer`: cluster-only — ordering
+    /// is the Aeron Cluster (Raft), which has no `kardamom_service_up` endpoint.)
+    #[arg(long, default_value = "executor,ingress")]
     scrape: String,
 
     /// docker-exec scrape (true) vs direct curl (false).

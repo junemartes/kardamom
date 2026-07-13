@@ -1,0 +1,9 @@
+rootProject.name = 'kardamom-sealer-service'
+
+// Two-concern split so the deterministic POJO tests need NO Aeron jars:
+//   :core    — pure CanonicalSealerState POJO + JUnit 5 tests (junit-jupiter only)
+//   :service — thin Aeron ClusteredService delegating to the POJO (depends on
+//              io.aeron:aeron-cluster). Isolating it here keeps `./gradlew :core:test`
+//              runnable even when the Aeron jars cannot be fetched.
+include 'core'
+include 'service'

@@ -4,21 +4,22 @@
 //! the same shape as the live [`crate::aeron_live::AeronRuntime::open_subscription`].
 //!
 //! This is the executor's crash-recovery input: on restart it must re-consume
-//! the canonical `tx_ordering` stream it already saw (to skip-count past its
-//! durable cursor — see `kardamom_executor`'s `ResumePoint`) and then continue
-//! live. Aeron does **not** replay history to a late live subscriber, so the
-//! durable copy lives in the Aeron Archive (recorded by [`crate::recorder`]),
-//! and [`rusteron_archive::AeronArchiveReplayMerge`] stitches "replay from the
+//! the multicast `tx_data` / `tx_deposits` streams it already saw (to skip-count
+//! past its durable cursor — see `kardamom_executor`'s `ResumePoint`) and then
+//! continue live. (In CLUSTER-ONLY mode the canonical `tx_ordering` stream is
+//! replayed by the Aeron Cluster, not this replay-merge path.) Aeron does
+//! **not** replay history to a late live subscriber, so the durable copy lives
+//! in the Aeron Archive (recorded by [`crate::recorder`]), and
+//! [`rusteron_archive::AeronArchiveReplayMerge`] stitches "replay from the
 //! recording" onto "follow the live publication" in a single multi-destination
 //! subscription.
 //!
 //! ## Transport requirement
 //!
-//! Replay-merge is **UDP-MDC only**: it needs the live publication to be a
-//! dynamic-MDC UDP channel and a `control-mode=manual` subscription so the merge
-//! can add the replay and live destinations itself. It does not work over the
-//! single-host IPC default (Aeron never replays history to an IPC subscriber).
-//! Callers gate on [`crate::config::ChannelsConfig::tx_ordering_mdc_enabled`].
+//! Replay-merge is **UDP only**: it needs the live publication to be a UDP
+//! channel and a `control-mode=manual` subscription so the merge can add the
+//! replay and live destinations itself. It does not work over the single-host
+//! IPC default (Aeron never replays history to an IPC subscriber).
 //!
 //! ## Position stability
 //!
@@ -57,7 +58,7 @@ use crate::codec;
 use crate::config::AeronConfig;
 use crate::error::LogError;
 use crate::recorder::connect_archive;
-use kardamom_types::BPosition;
+use kardamom_types::{BPosition, TxDataLoc};
 
 /// How long the merge may make no progress before it is considered stuck.
 const MERGE_PROGRESS_TIMEOUT_MS: i64 = 60_000;
@@ -67,8 +68,8 @@ const POLL_FRAGMENT_LIMIT: i32 = 100;
 /// A live replay-merge subscriber. Owns a dedicated OS thread that replays the
 /// recorded stream then follows it live, delivering decoded `(BPosition, T)`
 /// records. Drop (or [`shutdown`](Self::shutdown)) to stop the thread.
-pub struct ReplayMergeSubscriber<T> {
-    rx: UnboundedReceiver<(BPosition, T)>,
+pub struct ReplayMergeSubscriber<T, L = BPosition> {
+    rx: UnboundedReceiver<(L, T)>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
 }
@@ -78,13 +79,10 @@ pub struct ReplayMergeSubscriber<T> {
 /// live publication. `replay_destination_endpoint` is the local UDP endpoint the
 /// archive replays TO (may be shared across streams — the media driver demuxes by
 /// stream id). `live_destination` is the full Aeron channel the merge follows
-/// once replay catches up — its shape depends on the publication transport:
-/// - MDC dynamic-control (tx_ordering): `aeron:udp?endpoint=<local>|control=<ctl>`
-///   (the executor receives the MDC stream on its own endpoint), built via
-///   [`build_mdc_live_destination`].
-/// - Multicast (tx_data / tx_deposits): the publication's own multicast channel,
-///   e.g. `aeron:udp?endpoint=239.x:port|interface=...` (the executor joins the
-///   group directly).
+/// once replay catches up — for the surviving multicast streams (tx_data /
+/// tx_deposits) this is the publication's own multicast channel, e.g.
+/// `aeron:udp?endpoint=239.x:port|interface=...` (the executor joins the group
+/// directly).
 #[derive(Clone, Debug)]
 pub struct ReplayMergeParams {
     /// Aeron media-driver dir (the node-local tmpfs); `None` uses the C client
@@ -98,31 +96,49 @@ pub struct ReplayMergeParams {
     pub live_destination: String,
 }
 
-impl<T> ReplayMergeSubscriber<T>
+impl<T, L> ReplayMergeSubscriber<T, L>
 where
     T: rkyv::Archive + Send + 'static,
     T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
         + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    L: Send + 'static,
 {
-    /// Open a replay-merge subscriber. Resolves the recording for
+    /// Open a replay-merge subscriber, deriving each record's location `L` from
+    /// its `(BPosition, session_id)` via `loc`. Resolves the recording for
     /// `params.stream_id`, replays it from the start, and follows live —
     /// delivering decoded records on the returned channel. The archive client
     /// is connected on the subscriber's own thread (it is `!Send`), so this
     /// returns as soon as the thread is spawned; connection/resolution happen
     /// on that thread and surface as a closed channel on fatal error.
-    pub fn open(params: ReplayMergeParams, cfg: AeronConfig) -> Result<Self, LogError> {
-        let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
+    ///
+    /// Archive replay is frame-faithful (see the module-level "Position
+    /// stability" note): the replayed fragment header carries the SAME
+    /// `(term_id, term_offset)` AND `session_id` it had when first recorded. So
+    /// the `session_id` `loc` sees on replay equals the one the live path sees —
+    /// which is what lets the executor's session-keyed join (`TxDataLoc`) match
+    /// recorded `TxRef.tx_data_session_id` on crash-recovery.
+    pub fn open_with_loc<F>(
+        params: ReplayMergeParams,
+        cfg: AeronConfig,
+        loc: F,
+    ) -> Result<Self, LogError>
+    where
+        F: Fn(BPosition, i32) -> L + Send + 'static,
+    {
+        let (msg_tx, msg_rx) = unbounded_channel::<(L, T)>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
 
         let join = thread::Builder::new()
             .name("kardamom-replay-merge".into())
             .spawn(move || {
-                if let Err(e) = run_replay_merge::<T>(&params, &cfg, &stop_thread, move |rec| {
-                    // Returns Err only when the consumer has dropped its
-                    // receiver — treat as a stop request.
-                    msg_tx.send(rec).map_err(|_| ())
-                }) {
+                if let Err(e) =
+                    run_replay_merge::<T, L, F>(&params, &cfg, &stop_thread, loc, move |rec| {
+                        // Returns Err only when the consumer has dropped its
+                        // receiver — treat as a stop request.
+                        msg_tx.send(rec).map_err(|_| ())
+                    })
+                {
                     warn!(error = %e, "replay-merge subscriber stopped with error");
                 }
             })
@@ -137,12 +153,12 @@ where
 
     /// Receive the next decoded record, or `None` once the stream ends / the
     /// subscriber is stopped.
-    pub async fn recv(&mut self) -> Option<(BPosition, T)> {
+    pub async fn recv(&mut self) -> Option<(L, T)> {
         self.rx.recv().await
     }
 
     /// Borrow the receiver (e.g. to bridge into a sync channel).
-    pub fn receiver_mut(&mut self) -> &mut UnboundedReceiver<(BPosition, T)> {
+    pub fn receiver_mut(&mut self) -> &mut UnboundedReceiver<(L, T)> {
         &mut self.rx
     }
 
@@ -155,7 +171,21 @@ where
     }
 }
 
-impl<T> Drop for ReplayMergeSubscriber<T> {
+impl<T> ReplayMergeSubscriber<T, BPosition>
+where
+    T: rkyv::Archive + Send + 'static,
+    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    /// Open a replay-merge subscriber delivering `(BPosition, T)` — the location
+    /// is the fragment position alone (session id ignored). Used by the
+    /// single-publisher streams (tx_ordering, tx_deposits).
+    pub fn open(params: ReplayMergeParams, cfg: AeronConfig) -> Result<Self, LogError> {
+        Self::open_with_loc(params, cfg, |pos, _session| pos)
+    }
+}
+
+impl<T, L> Drop for ReplayMergeSubscriber<T, L> {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
         if let Some(j) = self.join.take() {
@@ -168,16 +198,18 @@ impl<T> Drop for ReplayMergeSubscriber<T> {
 /// replay-merge, and poll it (replay then live) until stopped, delivering each
 /// decoded fragment via `deliver`. `deliver` returning `Err(())` (consumer gone)
 /// ends the loop.
-fn run_replay_merge<T>(
+fn run_replay_merge<T, L, F>(
     params: &ReplayMergeParams,
     cfg: &AeronConfig,
     stop: &AtomicBool,
-    mut deliver: impl FnMut((BPosition, T)) -> Result<(), ()>,
+    loc: F,
+    mut deliver: impl FnMut((L, T)) -> Result<(), ()>,
 ) -> Result<(), LogError>
 where
     T: rkyv::Archive,
     T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
         + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+    F: Fn(BPosition, i32) -> L,
 {
     let session = connect_archive(params.aeron_dir.as_deref(), cfg)?;
     let archive = &session.archive;
@@ -264,7 +296,7 @@ where
         let n = merge
             .poll_once(
                 |bytes: &[u8], header| {
-                    let pos = match header_bposition(&header) {
+                    let (pos, session) = match header_loc(&header) {
                         Some(p) => p,
                         None => {
                             handler_err.set(Some(LogError::Aeron(
@@ -275,7 +307,7 @@ where
                     };
                     match codec::materialize::<T>(bytes) {
                         Ok(v) => {
-                            if deliver((pos, v)).is_err() {
+                            if deliver((loc(pos, session), v)).is_err() {
                                 consumer_gone.set(true);
                             }
                         }
@@ -395,62 +427,18 @@ fn resolve_recording(
 /// Derive the canonical `BPosition` (`term_id`, `term_offset`) from a replay /
 /// live fragment header — identical to the live subscriber's `header_pos`, so a
 /// record's id is the same whether it arrives via replay or live.
-fn header_bposition(h: &rusteron_archive::AeronHeader) -> Option<BPosition> {
+/// Read the fragment-start [`BPosition`] and the original publisher `session_id`
+/// from a replayed (or live) fragment header. Archive replay is frame-faithful,
+/// so during replay these are the values the fragment had when first recorded —
+/// not the replay transport's own session. Mirrors `aeron_live::header_loc`.
+fn header_loc(h: &rusteron_archive::AeronHeader) -> Option<(BPosition, i32)> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
-    Some(BPosition {
+    let pos = BPosition {
         term_id: frame.term_id(),
         term_offset: frame.term_offset(),
-    })
-}
-
-/// Build the replay-merge live destination for the MDC `tx_ordering` stream:
-/// the executor receives the MDC stream on its own `live_destination_endpoint`,
-/// attached to the publisher's dynamic-control endpoint (extracted from the
-/// canonical subscriber URI, e.g.
-/// `aeron:udp?control=10.0.0.1:40010|control-mode=dynamic`).
-fn build_mdc_live_destination(
-    live_channel: &str,
-    live_destination_endpoint: &str,
-) -> Result<String, LogError> {
-    for tok in live_channel.trim_start_matches("aeron:udp?").split('|') {
-        if let Some(ctl) = tok.strip_prefix("control=") {
-            return Ok(format!(
-                "aeron:udp?endpoint={live_destination_endpoint}|control={ctl}"
-            ));
-        }
-    }
-    Err(LogError::Config(format!(
-        "live channel {live_channel:?} has no control= endpoint (tx_ordering replay-merge needs \
-         an MDC dynamic-control publication)"
-    )))
-}
-
-/// Open a replay-merge subscriber for the canonical `tx_ordering` stream
-/// (MDC dynamic-control), decoding [`kardamom_types::TxOrderingMessage`]. The
-/// executor uses this on crash recovery instead of the live tx_ordering
-/// subscriber.
-pub fn open_tx_ordering_replay(
-    ch: &crate::config::ChannelsConfig,
-    aeron: &AeronConfig,
-    replay_destination_endpoint: String,
-    live_destination_endpoint: String,
-) -> Result<ReplayMergeSubscriber<kardamom_types::TxOrderingMessage>, LogError> {
-    let live_channel = ch.tx_ordering_canonical_subscriber_uri().ok_or_else(|| {
-        LogError::Config(
-            "tx_ordering replay requires MDC (tx_ordering_canonical_publisher is unset)".into(),
-        )
-    })?;
-    let live_destination = build_mdc_live_destination(&live_channel, &live_destination_endpoint)?;
-    ReplayMergeSubscriber::open(
-        ReplayMergeParams {
-            aeron_dir: Some(aeron.aeron_dir.clone()),
-            stream_id: ch.tx_ordering_stream_id,
-            replay_destination_endpoint,
-            live_destination,
-        },
-        aeron.clone(),
-    )
+    };
+    Some((pos, frame.session_id()))
 }
 
 /// Open a replay-merge subscriber for one per-sequencer `tx_data` shard,
@@ -464,8 +452,12 @@ pub fn open_tx_data_replay(
     aeron: &AeronConfig,
     shard_id: u8,
     replay_destination_endpoint: String,
-) -> Result<ReplayMergeSubscriber<kardamom_types::TxEnvelope>, LogError> {
-    ReplayMergeSubscriber::open(
+) -> Result<ReplayMergeSubscriber<kardamom_types::TxEnvelope, TxDataLoc>, LogError> {
+    // tx_data carries the publisher (ingress) session id, which the executor's
+    // join keys on (`TxDataLoc`). Replay is frame-faithful, so we recover the
+    // original session from each replayed fragment header — identical to the
+    // live path — and the session-keyed join matches recorded TxRefs on resume.
+    ReplayMergeSubscriber::open_with_loc(
         ReplayMergeParams {
             aeron_dir: Some(aeron.aeron_dir.clone()),
             stream_id: ch.tx_data_stream_id(shard_id),
@@ -473,6 +465,7 @@ pub fn open_tx_data_replay(
             live_destination: ch.tx_data_channel(shard_id),
         },
         aeron.clone(),
+        |pos, session| TxDataLoc::new(session, pos),
     )
 }
 
@@ -493,26 +486,4 @@ pub fn open_tx_deposits_replay(
         },
         aeron.clone(),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mdc_live_destination_built_from_control_uri() {
-        assert_eq!(
-            build_mdc_live_destination(
-                "aeron:udp?control=10.0.0.1:40010|control-mode=dynamic",
-                "10.0.0.2:40120"
-            )
-            .unwrap(),
-            "aeron:udp?endpoint=10.0.0.2:40120|control=10.0.0.1:40010"
-        );
-        // A non-MDC (endpoint-only) live channel errors — tx_ordering replay needs MDC.
-        assert!(
-            build_mdc_live_destination("aeron:udp?endpoint=10.0.0.1:40010", "10.0.0.2:40120")
-                .is_err()
-        );
-    }
 }

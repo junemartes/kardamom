@@ -48,14 +48,27 @@ pub struct TxRef {
     pub shard_id: u8,
     /// Aeron position on channel_A[shard_id] where the envelope starts.
     pub tx_data_position: BPosition,
+    /// Aeron publisher `session_id` of the tx_data fragment. Discriminates
+    /// concurrent ingress publishers on one shard: with active/active ingress
+    /// two publishers have independent term spaces, so `tx_data_position`
+    /// `(term_id, term_offset)` can collide across sessions. The executor join
+    /// key is `(shard_id, tx_data_session_id, tx_data_position)`, unique again.
+    /// Single-publisher deployments just carry one session id throughout.
+    pub tx_data_session_id: i32,
 }
 
 impl TxRef {
-    pub const fn new(tx_hash: B256, shard_id: u8, tx_data_position: BPosition) -> Self {
+    pub const fn new(
+        tx_hash: B256,
+        shard_id: u8,
+        tx_data_position: BPosition,
+        tx_data_session_id: i32,
+    ) -> Self {
         Self {
             tx_hash,
             shard_id,
             tx_data_position,
+            tx_data_session_id,
         }
     }
 }

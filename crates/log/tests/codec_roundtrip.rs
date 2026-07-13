@@ -34,6 +34,7 @@ fn log_codec_tx_ref_roundtrip() {
             term_id: 4,
             term_offset: 8192,
         },
+        tx_data_session_id: 0,
     };
     let bytes = encode(&r).unwrap();
     // ~16 B on the wire (TxRef is sequencer_id: u8 + BPosition: i32+i32 + padding).
@@ -63,6 +64,7 @@ fn log_codetx_receipts_channel_b_message_roundtrip() {
             term_id: 1,
             term_offset: 4096,
         },
+        tx_data_session_id: 0,
     });
     let bytes = encode(&m).unwrap();
     let back: TxOrderingMessage = materialize(&bytes).unwrap();

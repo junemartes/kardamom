@@ -1,0 +1,34 @@
+[package]
+name = "kardamom-cluster-adapter"
+version.workspace = true
+edition.workspace = true
+
+# In-process adapters that plug an Aeron Cluster in BEHIND the existing kardamom
+# transport trait seams — `TxOrderingRefPublisher` (sequencer → cluster ingress)
+# and `TxOrderingSubscription` (executor ← cluster egress) — so the actors are
+# unchanged and only the binary wiring picks the impl. Pure-Rust (the live
+# cluster transport is layered behind `kardamom-cluster-client`'s `aeron-live`
+# feature); this crate's logic is deterministically testable with in-memory
+# gateway fakes.
+
+[features]
+default = []
+# Expose the in-memory gateway fakes for downstream-crate tests.
+testing = []
+
+[dependencies]
+kardamom-types.workspace = true
+kardamom-cluster-client = { path = "../cluster-client" }
+# Live transport reuses kardamom-log's AeronRuntime (already in the tree via the
+# executor → log dependency, so this adds no new native build cost).
+kardamom-log.workspace = true
+alloy-primitives.workspace = true
+crossbeam-channel.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+kardamom-cluster-adapter = { path = ".", features = ["testing"] }
+kardamom-sequencer = { path = "../sequencer" }
+kardamom-executor = { path = "../executor" }

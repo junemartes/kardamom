@@ -1,0 +1,47 @@
+// :service — the Aeron Cluster ClusteredService adapter + the ClusterNode launcher.
+//
+// The Java toolchain (17) and `mavenCentral()` are inherited from the root
+// build.gradle `subprojects {}` block; only the Aeron deps, the application
+// main class, and the shadow (fat-jar) packaging are declared here. The
+// `application` plugin re-applies `java` idempotently, so the root's
+// `apply plugin: 'java'` is harmless.
+plugins {
+    id 'application'
+    id 'com.gradleup.shadow' version '8.3.5'
+}
+
+dependencies {
+    implementation project(':core')
+    implementation 'io.aeron:aeron-cluster:1.44.0'
+    implementation 'io.aeron:aeron-archive:1.44.0'
+    implementation 'io.aeron:aeron-driver:1.44.0'
+    testImplementation 'io.aeron:aeron-test-support:1.44.0'
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+
+application {
+    mainClass = 'io.kardamom.sealer.cluster.ClusterNode'
+}
+
+// The in-JVM Aeron TestCluster failover test (SealerClusterFailoverTest) runs real
+// media drivers + consensus modules in-process. Agrona's TransportPoller and Aeron's
+// unsafe buffers require these JDK module opens on Java 17, and the 3-member cluster
+// plus client needs more heap than the default forked test JVM.
+tasks.named('test') {
+    jvmArgs(
+        '-XX:+EnableDynamicAgentLoading',
+        '--add-opens', 'java.base/sun.nio.ch=ALL-UNNAMED',
+        '--add-opens', 'java.base/java.util.zip=ALL-UNNAMED',
+        '--add-opens', 'java.base/jdk.internal.misc=ALL-UNNAMED'
+    )
+    maxHeapSize = '1g'
+    // TestCluster spins up many threads; give the forked worker a single test fork.
+    maxParallelForks = 1
+}
+
+tasks.named('shadowJar') {
+    archiveBaseName = 'kardamom-cluster-node'
+    archiveClassifier = ''
+    archiveVersion = ''
+    mergeServiceFiles()
+}

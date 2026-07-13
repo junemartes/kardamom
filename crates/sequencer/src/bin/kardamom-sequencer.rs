@@ -1,8 +1,8 @@
 //! `kardamom-sequencer`: per-partition sequencer process.
 //!
 //! Parses a TOML [`SequencerConfig`], opens its shard's tx_data subscriber +
-//! the canonical tx_ordering publisher + a tx_errors publisher for
-//! rejection signals, and runs the sequencer main loop on a dedicated
+//! the Aeron Cluster (Raft) ref publisher (tx_ordering) + a tx_errors publisher
+//! for rejection signals, and runs the sequencer main loop on a dedicated
 //! blocking thread until SIGTERM / Ctrl-C.
 
 use std::path::PathBuf;
@@ -15,7 +15,6 @@ use bytes::Bytes;
 use clap::Parser;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxOrderingPublisherHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_sequencer::config::SequencerConfig;
@@ -25,8 +24,7 @@ use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
 use kardamom_types::{
-    BPosition, Deposit, DepositRef, Receipt, StateDatabase, StateError, TxEnvelope, TxError,
-    TxOrderingMessage, TxRef,
+    BPosition, Deposit, Receipt, StateDatabase, StateError, TxDataLoc, TxEnvelope, TxError,
 };
 
 #[derive(Debug, Parser)]
@@ -62,12 +60,11 @@ struct Args {
     /// Override the CPU core to pin to.
     #[arg(long)]
     core_id: Option<usize>,
-    /// This sequencer's tx_ordering MDC control endpoint (`ip:port`). Required
-    /// when the resolved `LogConfig` enables tx_ordering MDC
-    /// (`tx_ordering_mdc_control_template` set); ignored otherwise. Must match
-    /// one of the `tx_ordering_mdc_publishers` entries in the channels config.
-    #[arg(long, env = "KARDAMOM_TX_ORDERING_MDC_CONTROL")]
-    tx_ordering_mdc_control: Option<String>,
+    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Overrides/sets
+    /// the [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
+    /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9001")]
     metrics_addr: std::net::SocketAddr,
@@ -104,6 +101,12 @@ async fn main() -> anyhow::Result<()> {
     if let Some(c) = args.core_id {
         cfg.core_id = Some(c);
     }
+    // Per-node cluster egress endpoint: the cluster client's egress_channel is
+    // this node's reachable address (the node IP differs per replica), so it's
+    // injected by the Nomad job rather than baked into the static config template.
+    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
+        cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
+    }
     cfg.validate().context("validate config")?;
 
     tracing::info!(
@@ -123,19 +126,6 @@ async fn main() -> anyhow::Result<()> {
     let shard_id = cfg.sequencer_id;
     let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
         .context("open TxDataSubscriberHandle")?;
-    // tx_ordering publisher: MDC (per-publisher control endpoint) in the
-    // cluster, shared IPC channel single-host. When MDC is enabled the
-    // control endpoint is mandatory.
-    let tx_ordering_pub = if channels.tx_ordering_mdc_enabled() {
-        let ctl = args.tx_ordering_mdc_control.as_deref().context(
-            "tx_ordering MDC is enabled in the log config but --tx-ordering-mdc-control \
-             (KARDAMOM_TX_ORDERING_MDC_CONTROL) was not supplied",
-        )?;
-        TxOrderingPublisherHandle::open_mdc(&rt, &channels, ctl)
-            .context("open TxOrderingPublisherHandle (MDC)")?
-    } else {
-        TxOrderingPublisherHandle::open(&rt, &channels).context("open TxOrderingPublisherHandle")?
-    };
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;
     let tx_errors_pub =
@@ -148,53 +138,40 @@ async fn main() -> anyhow::Result<()> {
     let state_db = Arc::new(EmptyStateDatabase);
     let cfg_clone = cfg.clone();
 
-    // The tx_ordering publisher carries both `TxRef` (this loop) and
-    // `DepositRef` (the deposit pump below). Cloning the handle is sound
-    // — the underlying Aeron publication is a single multi-publisher
-    // stream and the SDK serialises offers internally.
-    let tx_ordering_pub_for_deposits = tx_ordering_pub.clone();
-
-    // The sequencer main loop is sync (std::thread + std::thread::sleep
-    // backoff). Hand it to spawn_blocking so the async runtime stays
-    // responsive for shutdown handling.
-    let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
-        let mut sequencer = Sequencer::new(cfg_clone, state_db);
-        let mut tx_data = LiveTxDataSub::new(tx_data_sub);
-        let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub);
-        let mut tx_errors = LiveTxErrorPub::new(tx_errors_pub);
-        sequencer.run(
-            &mut tx_data,
-            &mut tx_ordering,
-            &mut tx_errors,
-            shutdown_for_main,
-        )
-    });
-
-    // Independent pump for tx_deposits → DepositRef on tx_ordering. The
-    // deposit path is not nonce-gated; it's a simple poll → publish loop
-    // that runs alongside the canonical TxData → TxRef path.
-    let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
-        let mut deposit_sub = LiveDepositSub::new(tx_deposits_sub);
-        let mut tx_ordering = LiveTxOrderingRefPub::new(tx_ordering_pub_for_deposits);
-        let mut backoff_us = 1u64;
-        loop {
-            if shutdown_for_deposits.is_signaled() {
-                return Ok(());
-            }
-            match process_deposit(&mut deposit_sub, &mut tx_ordering) {
-                Ok(true) => backoff_us = 1,
-                Ok(false) => {
-                    std::thread::sleep(Duration::from_micros(backoff_us));
-                    backoff_us = backoff_us.saturating_mul(2).min(100);
-                }
-                Err(SequencerError::Backpressure) => {
-                    std::thread::sleep(Duration::from_micros(10));
-                }
-                Err(SequencerError::IngressDisconnected) => return Ok(()),
-                Err(e) => return Err(e),
-            }
+    // tx_ordering is ALWAYS published to the Aeron Cluster (Raft) ingress. The
+    // cluster-session guard (`LiveCluster`) + its dedicated Aeron runtime must
+    // outlive both publish loops, so bind the guard in the outer scope; it is
+    // dropped only after the `join_*` awaits below.
+    //
+    // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the cluster
+    // session never contends with the tx_data subscription on the main `rt`.
+    let cluster_rt = match args.aeron_dir.as_ref() {
+        Some(dir) => {
+            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
         }
-    });
+        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
+    };
+    let (cluster_guard, cluster_pub) =
+        kardamom_sequencer::outbound::cluster::cluster_ref_publisher(
+            cluster_rt,
+            cfg.cluster.to_live(),
+        )
+        .context("connect cluster ref publisher")?;
+    tracing::info!("kardamom-sequencer: tx_ordering via Aeron Cluster");
+    // Clone shares the single session thread; offers serialise through it. Both
+    // loops use `cluster_pub` (impl `TxOrderingRefPublisher`) — the canonical
+    // `TxRef` loop and the `DepositRef` pump.
+    let (join_main, join_deposits) = spawn_publish_loops(
+        cfg_clone,
+        state_db,
+        LiveTxDataSub::new(tx_data_sub),
+        cluster_pub.clone(),
+        cluster_pub,
+        LiveTxErrorPub::new(tx_errors_pub),
+        LiveDepositSub::new(tx_deposits_sub),
+        shutdown_for_main,
+        shutdown_for_deposits,
+    );
 
     wait_for_shutdown().await;
     tracing::info!("kardamom-sequencer: shutdown signal received");
@@ -209,8 +186,74 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => tracing::error!(error = %e, "sequencer deposit pump returned an error"),
         Err(e) => tracing::error!(error = %e, "sequencer deposit task panicked"),
     }
+    // Drop the cluster session only after both loops have stopped.
+    drop(cluster_guard);
     drop(rt);
     Ok(())
+}
+
+type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
+
+/// Spawn the main sequencer loop + the deposit pump over a pair of
+/// `TxOrderingRefPublisher`s (`main_pub` for the canonical `TxRef` loop,
+/// `deposit_pub` for the `DepositRef` pump). Generic over the publisher type so
+/// the Aeron and cluster branches share one implementation; both supply
+/// concrete publishers that impl the trait.
+#[allow(clippy::too_many_arguments)]
+fn spawn_publish_loops<P>(
+    cfg: SequencerConfig,
+    state_db: Arc<EmptyStateDatabase>,
+    mut tx_data: LiveTxDataSub,
+    main_pub: P,
+    deposit_pub: P,
+    mut tx_errors: LiveTxErrorPub,
+    mut deposit_sub: LiveDepositSub,
+    shutdown_for_main: Shutdown,
+    shutdown_for_deposits: Shutdown,
+) -> (LoopHandle, LoopHandle)
+where
+    P: TxOrderingRefPublisher + Send + 'static,
+{
+    // The sequencer main loop is sync (std::thread + std::thread::sleep
+    // backoff). Hand it to spawn_blocking so the async runtime stays
+    // responsive for shutdown handling.
+    let mut main_pub = main_pub;
+    let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut sequencer = Sequencer::new(cfg, state_db);
+        sequencer.run(
+            &mut tx_data,
+            &mut main_pub,
+            &mut tx_errors,
+            shutdown_for_main,
+        )
+    });
+
+    // Independent pump for tx_deposits → DepositRef on tx_ordering. The
+    // deposit path is not nonce-gated; it's a simple poll → publish loop
+    // that runs alongside the canonical TxData → TxRef path.
+    let mut deposit_pub = deposit_pub;
+    let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut backoff_us = 1u64;
+        loop {
+            if shutdown_for_deposits.is_signaled() {
+                return Ok(());
+            }
+            match process_deposit(&mut deposit_sub, &mut deposit_pub) {
+                Ok(true) => backoff_us = 1,
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_micros(backoff_us));
+                    backoff_us = backoff_us.saturating_mul(2).min(100);
+                }
+                Err(SequencerError::Backpressure) => {
+                    std::thread::sleep(Duration::from_micros(10));
+                }
+                Err(SequencerError::IngressDisconnected) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    });
+
+    (join_main, join_deposits)
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +271,7 @@ impl LiveTxDataSub {
 }
 
 impl TxDataSubscriber for LiveTxDataSub {
-    fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
         // try_recv is non-blocking. The Sequencer's run loop handles
         // backoff when poll returns None.
         Ok(self.handle.try_recv())
@@ -248,48 +291,6 @@ impl LiveDepositSub {
 impl DepositSubscriber for LiveDepositSub {
     fn poll(&mut self) -> Result<Option<(BPosition, Deposit)>, SequencerError> {
         Ok(self.handle.try_recv())
-    }
-}
-
-struct LiveTxOrderingRefPub {
-    handle: TxOrderingPublisherHandle,
-}
-
-impl LiveTxOrderingRefPub {
-    fn new(handle: TxOrderingPublisherHandle) -> Self {
-        Self { handle }
-    }
-}
-
-impl TxOrderingRefPublisher for LiveTxOrderingRefPub {
-    fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError> {
-        publish_ordering(&self.handle, TxOrderingMessage::TxRef(*r))
-    }
-
-    fn try_publish_deposit_ref(&mut self, r: &DepositRef) -> Result<(), SequencerError> {
-        publish_ordering(&self.handle, TxOrderingMessage::DepositRef(*r))
-    }
-}
-
-fn publish_ordering(
-    handle: &TxOrderingPublisherHandle,
-    msg: TxOrderingMessage,
-) -> Result<(), SequencerError> {
-    match handle.publish(&msg) {
-        Ok(_pos) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string();
-            // The AeronRuntime publish loop retries on back-pressure
-            // internally (up to 1024 attempts); a returned error means
-            // we hit the cap. Surface as Backpressure so the sequencer
-            // state machine rewinds and retries on the next pass.
-            if msg.contains("back-pressure") {
-                Err(SequencerError::Backpressure)
-            } else {
-                tracing::error!(error = %msg, "tx_ordering publish failed");
-                Err(SequencerError::Backpressure)
-            }
-        }
     }
 }
 

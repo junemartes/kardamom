@@ -17,9 +17,15 @@
 // engine extraction.
 pub use kardamom_engine::*;
 
+/// Executor **binary** file config (`executor.toml`): role-specific deploy
+/// surface (cluster egress endpoint, mdbx path, …) — stays in this crate, the
+/// engine is config-agnostic.
+pub mod config;
+
 // Re-export the engine's modules so path-qualified references keep working
 // (`kardamom_executor::metrics::describe()`, tests' `kardamom_executor::executor::*`,
 // the throughput bench's `block_env` / `delta`, etc.).
+pub use config::ExecutorFileConfig;
 pub use kardamom_engine::{
     actor, block_env, delta, error, exec_types, executor, metrics, persist, reader, state,
 };
