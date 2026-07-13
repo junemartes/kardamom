@@ -1,5 +1,5 @@
 # Default kardamom dev chain.
-# Run with: kardamom --chain chains/dev.toml
+# Seeds the executor's genesis: kardamom-executor --chain chains/dev.toml
 #
 # The single prefunded account is the well-known Anvil/Hardhat account #0.
 # Private key: 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80
