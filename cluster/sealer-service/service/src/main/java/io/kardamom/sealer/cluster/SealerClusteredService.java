@@ -314,9 +314,14 @@ public final class SealerClusteredService implements ClusteredService {
      * explicit signal the client can act on (reconnect; the executor's
      * boundary-alignment fail-stop + archive crash recovery self-heal), never
      * a silent gap. Wall-clock is safe here: egress offers are member-local IO
-     * (only the leader's reach clients), not replicated state.
+     * (only the leader's reach clients), not replicated state. 1s of grace: a
+     * DEAD session still costs only one deadline before it is closed, while a
+     * live client riding out a CI CPU spike (e.g. during a chaos node kill +
+     * reschedule) is not spuriously executed — a close forces that client
+     * through reconnect + fail-stop + crash recovery, so false positives
+     * cascade (observed: all three executors restarting at once).
      */
-    private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(250);
+    private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
 
     private void offerToSession(final ClientSession session, final int length) {
         final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
