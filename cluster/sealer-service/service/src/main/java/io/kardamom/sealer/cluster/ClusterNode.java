@@ -99,10 +99,23 @@ public final class ClusterNode {
             .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId));
 
+        // Announce self-termination on stdout. Aeron's DEFAULT termination hook
+        // signals the shutdown barrier and the JVM exits 0 with NOTHING in the
+        // error log or stderr — operationally invisible (a member restarted into
+        // the survivors' election window dies this way ~1s after launch). The
+        // supervisor (Nomad) restarts us either way; the line makes the WHEN
+        // grep-able next to the role lines the chaos suite already reads.
+        final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
+        consensusCtx.terminationHook(() -> {
+            System.out.println("cluster TERMINATION memberId=" + memberId
+                + " (consensus module requested shutdown — e.g. election/state conflict on rejoin)");
+            barrier.signal();
+        });
+
         try (ClusteredMediaDriver ignored = ClusteredMediaDriver.launch(driverCtx, archiveCtx, consensusCtx);
              ClusteredServiceContainer ignored2 = ClusteredServiceContainer.launch(serviceCtx)) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
-            new ShutdownSignalBarrier().await();
+            barrier.await();
         }
     }
 

@@ -34,6 +34,25 @@ job "cluster" {
       value    = "true"
     }
 
+    # NEVER give up restarting a Raft member (mode=delay retries past exhausted
+    # attempts instead of leaving the task dead). Nomad's service defaults
+    # (attempts=2/30m, mode=fail) silently strand members: a member restarted
+    # into the survivors' election window (~10s leader-heartbeat timeout + the
+    # election itself) SELF-TERMINATES via Aeron's termination hook — cleanly,
+    # exit 0, nothing in the error log (reproduced locally: a kill -9'd leader
+    # relaunched at +2s dies ~1s in; relaunched after the election it rejoins
+    # fine every time). Each such death burned a default attempt; once
+    # exhausted the member stayed down and the cluster wedged at 2/3 (or 1/3
+    # after the quorum-loss case) — the chaos suite's dominant flake. The 15s
+    # delay also spaces retries PAST the election window, so the second attempt
+    # lands in the always-works rejoin path.
+    restart {
+      attempts = 5
+      interval = "5m"
+      delay    = "15s"
+      mode     = "delay"
+    }
+
     network {
       mode = "host"
     }
