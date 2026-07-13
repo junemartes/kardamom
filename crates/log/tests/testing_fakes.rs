@@ -88,7 +88,7 @@ fn channel_a_publish_returns_tx_data_positionnd_subscription_yields_same_positio
     assert!(p1 < p2);
 
     let mut got: Vec<(BPosition, u64)> = Vec::new();
-    sub.poll(|pos, e| got.push((pos, e.correlation_id)), 16);
+    sub.poll(|loc, e| got.push((loc.position, e.correlation_id)), 16);
     assert_eq!(got.len(), 3);
     assert_eq!(got[0].0, p0);
     assert_eq!(got[1].0, p1);
@@ -109,6 +109,7 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
             term_id: 0,
             term_offset: 0,
         },
+        tx_data_session_id: 0,
     };
     let r2 = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
@@ -117,6 +118,7 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
             term_id: 0,
             term_offset: 64,
         },
+        tx_data_session_id: 0,
     };
     let b = BlockBoundaryStart {
         block_number: 1,
@@ -165,6 +167,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
             tx_hash: alloy_primitives::B256::ZERO,
             shard_id: 0,
             tx_data_position: p_0a,
+            tx_data_session_id: 0,
         })
         .unwrap();
     let _ = b_pub
@@ -172,6 +175,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
             tx_hash: alloy_primitives::B256::ZERO,
             shard_id: 1,
             tx_data_position: p_1a,
+            tx_data_session_id: 0,
         })
         .unwrap();
     let _ = b_pub
@@ -179,6 +183,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
             tx_hash: alloy_primitives::B256::ZERO,
             shard_id: 1,
             tx_data_position: p_1b,
+            tx_data_session_id: 0,
         })
         .unwrap();
     let _ = b_pub
@@ -186,6 +191,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
             tx_hash: alloy_primitives::B256::ZERO,
             shard_id: 0,
             tx_data_position: p_0b,
+            tx_data_session_id: 0,
         })
         .unwrap();
 
@@ -194,14 +200,14 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
     let mut a0_sub = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-0", 2001);
     let mut a1_sub = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-1", 2002);
     a0_sub.poll(
-        |pos, env| {
-            a_buffer.insert((0, pos), env);
+        |loc, env| {
+            a_buffer.insert((0, loc.position), env);
         },
         16,
     );
     a1_sub.poll(
-        |pos, env| {
-            a_buffer.insert((1, pos), env);
+        |loc, env| {
+            a_buffer.insert((1, loc.position), env);
         },
         16,
     );

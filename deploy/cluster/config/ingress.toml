@@ -1,6 +1,19 @@
-# kardamom-ingress config — intentionally empty of settings.
+# kardamom-ingress config.
 #
-# The binary presence-checks --config but takes all runtime tuning via CLI
-# flags (see nomad/ingress.nomad.hcl, which renders this file into the alloc
-# via file()). This comment also keeps the rendered Nomad template non-empty,
-# which job validation requires.
+# Runtime tuning is via CLI flags (see nomad/ingress.nomad.hcl, which renders
+# this file into the alloc via file()), EXCEPT the [cluster] section below, which
+# the binary parses for its Aeron Cluster (Raft) client connection.
+
+# Aeron Cluster (Raft) client — the on-quorum ack gate derives its durable
+# watermark from this cluster's egress progress (cluster-only topology: there is
+# no standalone sealer publishing a quorum watermark anymore). Mirrors the
+# sequencer/executor [cluster] connection; only consulted when --ack-policy
+# requires the quorum gate. egress_channel is set per-node by
+# --cluster-egress-endpoint (the ingress node IP differs from the cluster nodes).
+[cluster]
+enabled = true
+ingress_endpoints = "0=192.168.56.51:40200,1=192.168.56.52:40200,2=192.168.56.53:40200"
+initial_leader_member_id = 0
+ingress_stream_id = 101
+egress_stream_id = 102
+keep_alive_interval_ms = 1000

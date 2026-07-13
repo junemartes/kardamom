@@ -13,7 +13,7 @@ use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::error::SequencerError;
@@ -23,9 +23,9 @@ use kardamom_sequencer::outbound::fakes::{
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
-struct DequeTxData(VecDeque<(BPosition, TxEnvelope)>);
+struct DequeTxData(VecDeque<(TxDataLoc, TxEnvelope)>);
 impl TxDataSubscriber for DequeTxData {
-    fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
         Ok(self.0.pop_front())
     }
 }
@@ -60,7 +60,7 @@ fn signed_envelope(s: &PrivateKeySigner, n: u64, correlation_id: u64) -> TxEnvel
 
 fn bench_in_order(c: &mut Criterion) {
     let signers: Vec<_> = (1..=64u64).map(signer).collect();
-    let mut batch: Vec<(BPosition, TxEnvelope)> = Vec::with_capacity(64 * 16);
+    let mut batch: Vec<(TxDataLoc, TxEnvelope)> = Vec::with_capacity(64 * 16);
     for (i, s) in signers.iter().enumerate() {
         for n in 0u64..16 {
             let correlation = (i * 16 + n as usize) as u64;
@@ -68,7 +68,10 @@ fn bench_in_order(c: &mut Criterion) {
                 term_id: 0,
                 term_offset: (correlation as i32) * 64,
             };
-            batch.push((position, signed_envelope(s, n, correlation)));
+            batch.push((
+                TxDataLoc::new(0, position),
+                signed_envelope(s, n, correlation),
+            ));
         }
     }
     c.bench_function("sequencer_run_once_1024_proxy_sender", |b| {

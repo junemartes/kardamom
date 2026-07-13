@@ -15,12 +15,13 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
 use kardamom_ingress::channels::{InMemoryStateDb, IngressPublication, IngressSubscription};
-use kardamom_ingress::config::IngressConfig;
+use kardamom_ingress::cluster::cluster_watermark_observer;
+use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::error::IngressError;
 use kardamom_ingress::proxy::IngressProxy;
 use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, QuorumSubscriberHandle, TxDataPublisherHandle,
-    TxErrorsSubscriberHandle, TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
+    AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
+    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
@@ -95,6 +96,17 @@ struct Args {
     /// Host identifier; stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
+    /// Stable identity of this ingress replica (active/active deployments run N
+    /// of them). Namespaces `correlation_id` so `(replica, sequence)` is
+    /// globally unique, and is stamped as a metric label. Default 0.
+    #[arg(long, env = "KARDAMOM_INGRESS_ID", default_value_t = 0)]
+    ingress_id: u16,
+    /// This node's cluster-egress endpoint `ip:port` (cluster mode). Overrides
+    /// the `[cluster] egress_channel` as `aeron:udp?endpoint=<ip:port>` — the
+    /// cluster client's per-node response channel. Injected per node by the
+    /// Nomad job. Only consulted when the ack policy requires the quorum gate.
+    #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
+    cluster_egress_endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -129,16 +141,17 @@ async fn main() -> Result<()> {
         option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
     )?;
     kardamom_ingress::metrics::describe();
-    // v0 config loading: validate the path exists; runtime tunables come
-    // from defaults + CLI flags. A future revision will derive Deserialize
-    // for IngressConfig (Duration via humantime_serde) so the TOML drives
-    // every knob.
-    let _raw =
-        std::fs::read_to_string(&args.config).context("read ingress config (presence check)")?;
+    // v0 config loading: runtime tunables come from defaults + CLI flags; the
+    // TOML supplies the optional `[cluster]` section (the Aeron Cluster client
+    // connection used by the on-quorum watermark observer below). A future
+    // revision will derive Deserialize for the full IngressConfig.
+    let raw = std::fs::read_to_string(&args.config).context("read ingress config")?;
+    let file_cfg: IngressFileConfig = toml::from_str(&raw).context("parse ingress config")?;
 
     let mut cfg = IngressConfig {
         jsonrpc_bind: args.jsonrpc_bind,
         partition_count_m: args.shards,
+        ingress_id: args.ingress_id,
         ack_policy: args.ack_policy.into(),
         ..IngressConfig::default()
     };
@@ -151,6 +164,7 @@ async fn main() -> Result<()> {
     tracing::info!(
         jsonrpc_bind = %cfg.jsonrpc_bind,
         shards = cfg.partition_count_m,
+        ingress_id = cfg.ingress_id,
         ack_policy = ?cfg.ack_policy,
         "kardamom-ingress starting"
     );
@@ -192,6 +206,44 @@ async fn main() -> Result<()> {
         LiveIngressSubscription::open(&rt, &channels, args.recorder_id, executor_count)
             .context("open IngressSubscription")?;
     let state_db = Arc::new(InMemoryStateDb::new());
+
+    // Cluster watermark → on-quorum ack gate. In the cluster-only topology there
+    // is no standalone sealer publishing the durable watermark; the ingress
+    // instead connects to the Aeron Cluster (Raft) as a client and folds its
+    // egress progress into a monotonic durable count (a record/boundary on
+    // egress is a Raft-quorum-durability signal), feeding the proxy's watermark
+    // bus. Only needed when the ack policy actually gates on quorum. The
+    // `LiveCluster` guard is held in scope so the session outlives the loop.
+    let _cluster_guard = if cfg.ack_policy.requires_quorum() {
+        let mut live = file_cfg.cluster.to_live();
+        if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
+            live.egress_channel = format!("aeron:udp?endpoint={ep}");
+        }
+        // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the
+        // cluster session never contends with the tx_data publish / receipts work.
+        let cluster_rt = match args.aeron_dir.as_ref() {
+            Some(dir) => {
+                AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
+            }
+            None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
+        };
+        let (guard, mut observer) =
+            cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
+        // Blocking egress poll on a dedicated thread → durable count → bus.
+        let wm_tx = subscription.watermarks.clone();
+        std::thread::Builder::new()
+            .name("cluster-watermark".into())
+            .spawn(move || {
+                while let Some(position) = observer.next_position() {
+                    let _ = wm_tx.send(QuorumWatermark { position });
+                }
+            })
+            .context("spawn cluster watermark thread")?;
+        tracing::info!("kardamom-ingress: on-quorum watermark via Aeron Cluster egress");
+        Some(guard)
+    } else {
+        None
+    };
 
     let proxy = IngressProxy::new(cfg, publication, subscription, state_db);
     let handle = proxy.start().await.context("IngressProxy::start")?;
@@ -386,15 +438,11 @@ impl LiveIngressSubscription {
             }
         });
 
-        // Quorum watermark
-        let mut q_sub = QuorumSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open quorum watermark: {e}")))?;
-        let tx = watermarks_tx.clone();
-        tokio::spawn(async move {
-            while let Some((_pos, w)) = q_sub.recv().await {
-                let _ = tx.send(w);
-            }
-        });
+        // Quorum/durable watermark: in the cluster-only topology this bus is fed
+        // by the Aeron Cluster egress observer spawned in `main` (cluster mode
+        // replaced the standalone sealer that used to publish it on Aeron), not
+        // by an Aeron `quorum_watermark` subscription here. The bus + its
+        // `subscribe_watermark()` surface are unchanged; only the producer moved.
 
         // Per-recorder fsync watermark
         let mut fsync_sub = FsyncWatermarkSubscriberHandle::open(rt, channels, recorder_id)

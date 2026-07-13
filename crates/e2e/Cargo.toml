@@ -47,7 +47,6 @@ kardamom-da-watcher = { path = "../da_watcher" }
 kardamom-deployer = { path = "../deployer" }
 kardamom-executor = { path = "../executor" }
 kardamom-ingress = { path = "../ingress" }
-kardamom-sealer = { path = "../sealer" }
 kardamom-sequencer = { path = "../sequencer", features = ["testing"] }
 kardamom-state = { path = "../state" }
 serde_json.workspace = true

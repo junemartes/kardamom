@@ -16,7 +16,7 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
@@ -100,7 +100,9 @@ fn integration_1000_txs_100_senders_with_chaos() {
         let position = pos_n(correlation as u64);
         sender_at_pos.insert(position, (signers[*i].address(), *n));
         let env = signed_envelope(&signers[*i], *n, correlation as u64);
-        channel_a.queue.push_back((position, env));
+        channel_a
+            .queue
+            .push_back((TxDataLoc::new(0, position), env));
     }
     let total_input = channel_a.queue.len();
 
@@ -170,20 +172,20 @@ fn integration_duplicates_are_reported() {
     let mut channel_a = ScriptedTxData::default();
     channel_a
         .queue
-        .push_back((pos_n(0), signed_envelope(&s, 0, 100)));
+        .push_back((TxDataLoc::new(0, pos_n(0)), signed_envelope(&s, 0, 100)));
     channel_a
         .queue
-        .push_back((pos_n(1), signed_envelope(&s, 1, 101)));
+        .push_back((TxDataLoc::new(0, pos_n(1)), signed_envelope(&s, 1, 101)));
     // Three duplicates of nonce 0 arriving AFTER nonce 1 has been processed.
     channel_a
         .queue
-        .push_back((pos_n(2), signed_envelope(&s, 0, 200)));
+        .push_back((TxDataLoc::new(0, pos_n(2)), signed_envelope(&s, 0, 200)));
     channel_a
         .queue
-        .push_back((pos_n(3), signed_envelope(&s, 0, 201)));
+        .push_back((TxDataLoc::new(0, pos_n(3)), signed_envelope(&s, 0, 201)));
     channel_a
         .queue
-        .push_back((pos_n(4), signed_envelope(&s, 0, 202)));
+        .push_back((TxDataLoc::new(0, pos_n(4)), signed_envelope(&s, 0, 202)));
 
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
@@ -228,7 +230,7 @@ fn integration_bounded_buffer_evicts_oldest() {
     for n in 100..110u64 {
         channel_a
             .queue
-            .push_back((pos_n(n), signed_envelope(&s, n, n)));
+            .push_back((TxDataLoc::new(0, pos_n(n)), signed_envelope(&s, n, n)));
     }
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();

@@ -1,0 +1,16 @@
+[package]
+name = "kardamom-cluster-client"
+version.workspace = true
+edition.workspace = true
+
+# A minimal, Rust-native Aeron Cluster *client* built on rusteron's Aeron
+# pub/sub. This first layer is the pure cluster session-protocol codec
+# (SBE schema id=111, the `io.aeron.cluster.codecs` package vendored with
+# rusteron). It has NO native deps so it builds + tests on any platform; the
+# live client (publications/subscriptions, connect handshake, leader redirect)
+# is layered on top behind the `aeron-live` feature in later Phase-0 work.
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]

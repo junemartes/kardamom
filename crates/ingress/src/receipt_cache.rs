@@ -50,12 +50,22 @@ impl ReceiptCache {
     }
 
     fn evict_if_full<K: Eq + std::hash::Hash + Copy>(&self, map: &DashMap<K, Receipt>) {
-        if map.len() >= self.capacity
-            && let Some(entry) = map.iter().next()
-        {
-            let key = *entry.key();
-            drop(entry);
-            map.remove(&key);
+        if map.len() >= self.capacity {
+            // Copy a victim key out and DROP the iterator BEFORE `remove()`.
+            // DashMap's `Iter` holds a read-guard on the shard it is positioned
+            // on, and `remove()` needs that shard's write-guard — so removing
+            // while the iterator is still alive self-deadlocks on that shard
+            // (read held + write requested, same thread). The previous
+            // `if .. && let Some(entry) = map.iter().next() { .. map.remove(..) }`
+            // form kept the `map.iter()` temporary alive to the end of the
+            // block (let-chain temporary lifetime), so it deadlocked the
+            // tx_receipts watcher the moment the cache first reached capacity —
+            // freezing receipt delivery on that replica until restart. Binding
+            // the key in its own statement drops the iterator at the `;`.
+            let victim = map.iter().next().map(|e| *e.key());
+            if let Some(key) = victim {
+                map.remove(&key);
+            }
         }
     }
 
@@ -109,5 +119,39 @@ mod tests {
         // Same entry also indexed by tx_hash.
         assert_eq!(c.lookup_by_tx_hash(h).unwrap().tx_hash, h);
         assert!(c.lookup_by_tx_hash(B256::repeat_byte(0x22)).is_none());
+    }
+
+    // Regression: inserting past capacity must EVICT, not deadlock. The old
+    // `evict_if_full` held a DashMap iterator (shard read-guard) across
+    // `remove()` (shard write-guard) and self-deadlocked the moment the cache
+    // first filled — which froze the ingress tx_receipts watcher under sustained
+    // load (cluster-e2e ingress-churn freeze). This test would hang on the old
+    // code; the harness timeout turns that hang into a visible failure.
+    #[tokio::test(flavor = "current_thread")]
+    async fn insert_past_capacity_evicts_without_deadlock() {
+        let cap = 64usize;
+        let c = ReceiptCache::new(cap);
+        // Insert well past capacity. Distinct (sender, nonce, tx_hash) each time.
+        for i in 0..(cap as u64 * 4) {
+            let b = (i % 251) as u8;
+            c.insert(make_receipt(
+                Address::repeat_byte(b ^ 0x5a),
+                i,
+                B256::repeat_byte(b ^ 0xa5),
+                i as i32,
+            ));
+        }
+        // Bounded: never exceeds capacity (FIFO/arbitrary eviction kept it in check).
+        assert!(
+            c.len() <= cap,
+            "cache must stay bounded: {} > {cap}",
+            c.len()
+        );
+        // Still usable: the most recent insert is retrievable.
+        let last = (cap as u64 * 4) - 1;
+        assert!(
+            c.lookup(Address::repeat_byte(((last % 251) as u8) ^ 0x5a), last)
+                .is_some()
+        );
     }
 }

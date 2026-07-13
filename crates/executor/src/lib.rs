@@ -37,6 +37,7 @@
 
 pub mod actor;
 pub mod block_env;
+pub mod config;
 pub mod delta;
 pub mod error;
 pub mod exec_types;
@@ -51,6 +52,7 @@ pub use actor::{
     TxReceiptsPublication,
 };
 pub use block_env::ExecEnv;
+pub use config::ExecutorFileConfig;
 pub use delta::{PendingDelta, WriteSet};
 pub use error::ExecutorError;
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};

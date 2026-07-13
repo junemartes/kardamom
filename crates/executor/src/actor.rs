@@ -251,7 +251,9 @@ impl TxDataSubscription for BoxedASub {
     fn sequencer_id(&self) -> u8 {
         self.0.sequencer_id()
     }
-    fn next(&mut self) -> Result<(BPosition, kardamom_types::TxEnvelope), ExecutorError> {
+    fn next(
+        &mut self,
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_types::TxEnvelope), ExecutorError> {
         self.0.next()
     }
 }
