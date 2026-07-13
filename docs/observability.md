@@ -13,10 +13,17 @@ Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
 | --- | --- | --- |
 | `kardamom-sequencer` | `127.0.0.1:9001` | `kardamom-sequencer` |
 | `kardamom-batcher` | `127.0.0.1:9002` | `kardamom-batcher` |
-| `kardamom-sealer` | `127.0.0.1:9003` | `kardamom-sealer` |
 | `kardamom-executor` | `127.0.0.1:9004` | `kardamom-executor` |
 | `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
 | `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
+
+The sealer no longer appears here: canonical ordering now runs as a Java
+clustered service inside an Aeron Cluster (`cluster/sealer-service/`), which
+exports **no Prometheus metrics** — there is no `kardamom-sealer` binary, no
+`:9003` listener, and no sealer scrape job in `deploy/prometheus.yml`. (The
+`kardamom_sealer_*` metric names and port 9003 remain reserved; the
+`kardamom-load` harness still probes them opportunistically and tolerates
+their absence.)
 
 All binaries read the same `KARDAMOM_METRICS_ADDR` env var, so a value
 shared across colocated services makes them race for one socket — prefer the
@@ -29,7 +36,7 @@ service must be started with `--metrics-addr 0.0.0.0:<port>` (or another
 non-loopback bind) to be reachable.
 
 Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
-`local`; the sealer defaults to its config file's `host_id` instead). It's
+`local`). It's
 stamped on every emitted metric as the `host_id` label, alongside an automatic
 `service` label set by `kardamom_obs::init`. The top-level `Kardamom Overview`
 dashboard exposes a `host` template variable; per-service dashboards inherit it.
@@ -37,8 +44,8 @@ dashboard exposes a `host` template variable; per-service dashboards inherit it.
 ### Naming convention
 
 `kardamom_<service>_<subsystem>_<name>_<unit>` (e.g. `kardamom_sequencer_tx_ingested_total`,
-`kardamom_executor_block_apply_duration_seconds`). The sealer and executor each
-expose a `kardamom_<service>_block_number` gauge for the chain head.
+`kardamom_executor_block_apply_duration_seconds`). The executor exposes a
+`kardamom_executor_block_number` gauge for the chain head.
 
 ### Scaling to multiple hosts
 
@@ -47,7 +54,7 @@ second host running every service, append `host-2:<port>` to each of the
 target lists. Every metric is already labelled with `host_id`, so dashboards
 group by host without relabel rules.
 
-### Rename map (from before this PR)
+### Rename map (historical — the metrics-namespace migration)
 
 | Old | New |
 | --- | --- |
@@ -58,9 +65,10 @@ group by host without relabel rules.
 | `sealer_block_number` | `kardamom_sealer_block_number` |
 | `sealer_tick_skipped_total` | `kardamom_sealer_tick_skipped_total` |
 
-The sealer's per-emission `host_id` label is gone — `host_id` is now a
-recorder-level global, sourced from `--host-id`/`KARDAMOM_HOST_ID` and falling
-back to the sealer config's `host_id`.
+Per-emission `host_id` labels are gone — `host_id` is a recorder-level global,
+sourced from `--host-id`/`KARDAMOM_HOST_ID`. (The `kardamom_sealer_*` rows
+above are from the era of the standalone Rust sealer, since replaced by the
+Aeron Cluster service, which emits no metrics.)
 
 ## What is instrumented
 
@@ -69,7 +77,7 @@ whatever its provisioned Grafana dashboard
 (`deploy/grafana/provisioning/dashboards-json/kardamom-<service>.json`) queries.
 Names follow the `kardamom_<service>_*` convention above, and the `Kardamom
 Overview` dashboard (`kardamom-overview`) stitches the cross-service signals
-(liveness, block height from the sealer/executor) into one view.
+(liveness, block height from the executor) into one view.
 
 Every service also emits `kardamom_build_info` (gauge, always 1, labeled with
 `version` and `sha`) via `kardamom_obs::init` — set `KARDAMOM_GIT_SHA` at build
@@ -83,8 +91,10 @@ Bring up the observability stack:
 cd deploy && docker compose up
 ```
 
-Start the cluster (see `deploy/cluster/` for the multi-host path, or run the
-services locally against a native Aeron media driver — `just aeron-driver-up`).
+Start the cluster (see `deploy/cluster/` — canonical ordering lives in the
+Aeron Cluster sealer, which only runs there, so that is the full-pipeline
+path; individual Rust services can still be run locally against a native
+Aeron media driver — `just aeron-driver-up`).
 Then drive load at the ingress JSON-RPC endpoint with the bench. `transfers` is
 the write-path workload (`eth_sendRawTransaction`); the chain it targets must
 already prefund the signer EOAs the workflow uses (see "Workflows + signer
@@ -139,8 +149,9 @@ ingress stand-in emits **no** `tracing` spans, so that SVG is skipped when
 empty (the harness logs a warning). The `pprof` output is the useful one for
 this stand-in. Restoring span-based flames that show real ordering + revm
 execution is the job of the **full in-process Aeron pipeline harness**, tracked
-as a follow-up: it will run the real sequencer/executor/sealer/ingress in one
-process over Aeron IPC.
+as a follow-up: it will run the real sequencer/executor/ingress in one process
+over Aeron IPC (the sealer is now a JVM Aeron Cluster service, so it stays
+external).
 
 Symbolication is handled in-process by `pprof-rs`, so no `dsymutil` / `.dSYM`
 dance is needed. Both outputs are restricted to the dispatch window: neither
@@ -223,9 +234,12 @@ per-signer presign for main starting at nonce `WARMUP`.
 
 Each service has a provisioned dashboard under
 `deploy/grafana/provisioning/dashboards-json/` (`kardamom-ingress`,
-`kardamom-sequencer`, `kardamom-executor`, `kardamom-sealer`,
+`kardamom-sequencer`, `kardamom-executor`,
 `kardamom-batcher`, `kardamom-da-watcher`), plus the cross-service
-`kardamom-overview`. `crates/obs/tests/dashboards.rs` statically validates that
+`kardamom-overview`. A `kardamom-sealer` dashboard also still ships, but its
+panels query `kardamom_sealer_*` metrics that nothing emits since the sealer
+moved into the Aeron Cluster — expect it to stay empty until the clustered
+sealer grows an exporter. `crates/obs/tests/dashboards.rs` statically validates that
 every shipped dashboard parses, is schema-38, and only queries `kardamom`-scoped
 metrics — keep the `EXPECTED_DASHBOARDS` list in that test in sync when adding
 or removing a dashboard.

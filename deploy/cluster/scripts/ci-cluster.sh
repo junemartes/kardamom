@@ -653,6 +653,8 @@ diverged="$(printf '%.0f' "${diverged:-0}")"
 # every committed block recomputed the state root by FULL rebuild and compared
 # it to the node-incremental walker's. A mismatch fail-stops the validator
 # (caught by the liveness probe above); assert the counters directly too.
+# Runs on every shard: the validator commits blocks (v_blk > 0 asserted above
+# on both the load and chaos paths), so checks_total must be > 0 everywhere.
 shadow_checks="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" kardamom_state_trie_shadow_checks_total)"
 shadow_checks="$(printf '%.0f' "${shadow_checks:-0}")"
 (( shadow_checks > 0 )) || { echo "FAIL: trie shadow-check never ran (checks=${shadow_checks})" >&2; exit 1; }
