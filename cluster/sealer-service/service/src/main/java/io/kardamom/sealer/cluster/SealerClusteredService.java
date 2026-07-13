@@ -302,23 +302,35 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Bounded egress-offer retries per session per frame. The offers run on the
-     * SINGLE clustered-service thread: an UNBOUNDED retry against one wedged or
-     * slow client session (its egress image full because the subscriber
-     * stopped draining) blocks record relaying and the boundary tick for the
-     * WHOLE cluster — one sick client must never stall the pipeline. After the
-     * bound, the frame is dropped for THAT session only; the client sees a gap
-     * on its egress, which its consumer detects (the executor's boundary
-     * alignment) — the correct failure locality.
+     * Per-frame egress-offer deadline per session. The offers run on the SINGLE
+     * clustered-service thread: an UNBOUNDED retry against one wedged client
+     * session (its egress image full because the subscriber stopped draining)
+     * blocks record relaying and the boundary tick for the WHOLE cluster. But
+     * silently DROPPING the frame is worse: a client that misses a boundary
+     * seals two blocks as one and provably diverges (observed as a validator
+     * BAL divergence under chaos load — a count-bounded retry of a few idle
+     * cycles expired in sub-millisecond bursts of ordinary back-pressure). So:
+     * retry up to a real deadline, and on exhaustion CLOSE the session — an
+     * explicit signal the client can act on (reconnect; the executor's
+     * boundary-alignment fail-stop + archive crash recovery self-heal), never
+     * a silent gap. Wall-clock is safe here: egress offers are member-local IO
+     * (only the leader's reach clients), not replicated state.
      */
-    private static final int MAX_OFFER_RETRIES = 8;
+    private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(250);
 
     private void offerToSession(final ClientSession session, final int length) {
+        final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
         long result;
-        int retries = 0;
         do {
             result = session.offer(egressBuffer, 0, length);
-        } while (result < 0 && retryable(result) && ++retries < MAX_OFFER_RETRIES);
+            if (result >= 0 || !retryable(result)) {
+                return;
+            }
+        } while (System.nanoTime() < deadline);
+        // Deadline exhausted on persistent back-pressure: this session's
+        // subscriber has stopped draining. Close it rather than drop frames —
+        // a closed session is a fact the client sees; a gap is silent corruption.
+        session.close();
     }
 
     /** Whether a negative offer result is a retryable back-pressure condition. */
