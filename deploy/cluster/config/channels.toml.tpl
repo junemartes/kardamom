@@ -125,6 +125,13 @@ tx_errors_stream_id = 1015
 tx_deposits_channel = "aeron:udp?endpoint=239.192.56.19:40040|interface=192.168.56.0/24|ttl=1"
 tx_deposits_stream_id = 1016
 
+# --- TxBal: per-block BAL (the executor's BlockDelta). The executor publishes
+# one BlockDelta per sealed block; validators subscribe and cross-check their
+# independent re-execution against it. Multicast (many validator subscribers).
+# Own group .21:40050. Stream 1004 (free range between receipts and fsync).
+tx_bal_channel = "aeron:udp?endpoint=239.192.56.21:40050|interface=192.168.56.0/24|ttl=1"
+tx_bal_stream_id = 1004
+
 # --- fsync watermark (tx_data), per-sequencer. RAM only; single-host fsync. ---
 # (The per-RECORDER tx_ordering fsync watermark + the Q-of-N aggregated quorum
 # watermark channels were REMOVED with the custom recorders; the tx_data fsync

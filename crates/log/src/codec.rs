@@ -47,3 +47,48 @@ where
 {
     rkyv::from_bytes::<T, rancor::Error>(bytes).map_err(|e| LogError::Codec(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::{Address, B256, U256};
+    use kardamom_types::{AccountChange, BlockDelta, CodeEntry, StorageChange};
+
+    /// The BAL payload (`BlockDelta`) must survive an encode → materialize
+    /// round-trip unchanged — this is what the executor publishes on tx_bal and
+    /// the validator decodes to cross-check its re-execution.
+    #[test]
+    fn block_delta_bal_roundtrips() {
+        let delta = BlockDelta {
+            block_number: 42,
+            accounts: vec![
+                AccountChange {
+                    address: Address::from([0x11; 20]),
+                    nonce: 7,
+                    balance: U256::from(1_000_000u64),
+                    code_hash: B256::from([0xaa; 32]),
+                },
+                AccountChange {
+                    address: Address::from([0x22; 20]),
+                    nonce: 0,
+                    balance: U256::ZERO,
+                    code_hash: B256::ZERO,
+                },
+            ],
+            storage: vec![StorageChange {
+                address: Address::from([0x11; 20]),
+                key: B256::from([0x01; 32]),
+                value: U256::from(99u64),
+            }],
+            code: vec![CodeEntry {
+                code_hash: B256::from([0xaa; 32]),
+                code: vec![0x60, 0x00, 0x60, 0x00].into(),
+            }],
+            receipts: Vec::new(),
+        };
+
+        let bytes = encode(&delta).expect("encode BlockDelta");
+        let decoded: BlockDelta = materialize(&bytes).expect("materialize BlockDelta");
+        assert_eq!(decoded, delta);
+    }
+}

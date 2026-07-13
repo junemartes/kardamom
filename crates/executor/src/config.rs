@@ -13,6 +13,11 @@
 
 use serde::Deserialize;
 
+// The `[cluster]` section type lives beside the cluster reader in the engine
+// (the validator parses the same section); re-exported here so existing
+// `kardamom_executor::config::ClusterConfig` paths keep resolving.
+pub use kardamom_engine::reader::cluster::ClusterConfig;
+
 /// Top-level config the `kardamom-executor` binary deserializes from `--config`.
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
@@ -20,51 +25,6 @@ pub struct ExecutorFileConfig {
     /// Aeron Cluster (Raft) sealer client config. tx_ordering ALWAYS comes from
     /// the cluster egress — there is no longer a non-cluster path.
     pub cluster: ClusterConfig,
-}
-
-/// Aeron Cluster (Raft) sealer client config.
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-#[serde(default)]
-pub struct ClusterConfig {
-    /// Retained for config-file backward compatibility; IGNORED — cluster mode
-    /// is the only mode, so the executor always connects to the cluster.
-    pub enabled: bool,
-    /// "memberId=host:port,…" cluster ingress endpoints.
-    pub ingress_endpoints: String,
-    pub initial_leader_member_id: i32,
-    pub ingress_stream_id: i32,
-    /// This client's egress (response) channel URI, e.g. "aeron:udp?endpoint=<ip>:<port>".
-    pub egress_channel: String,
-    pub egress_stream_id: i32,
-    pub keep_alive_interval_ms: u64,
-}
-
-impl ClusterConfig {
-    /// Sane stream-id / keepalive defaults when the TOML omits them.
-    pub fn defaults_applied(mut self) -> Self {
-        if self.ingress_stream_id == 0 {
-            self.ingress_stream_id = 101;
-        }
-        if self.egress_stream_id == 0 {
-            self.egress_stream_id = 102;
-        }
-        if self.keep_alive_interval_ms == 0 {
-            self.keep_alive_interval_ms = 1000;
-        }
-        self
-    }
-
-    pub fn to_live(&self) -> kardamom_cluster_adapter::LiveClusterConfig {
-        let c = self.clone().defaults_applied();
-        kardamom_cluster_adapter::LiveClusterConfig {
-            ingress_endpoints: c.ingress_endpoints,
-            initial_leader_member_id: c.initial_leader_member_id,
-            ingress_stream_id: c.ingress_stream_id,
-            egress_channel: c.egress_channel,
-            egress_stream_id: c.egress_stream_id,
-            keep_alive_interval_ms: c.keep_alive_interval_ms,
-        }
-    }
 }
 
 #[cfg(test)]

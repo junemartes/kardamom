@@ -155,12 +155,20 @@ sealer_boundaries() {
 # (or empty if the scrape failed). awk takes $NF of the first matching sample and
 # int-truncates (the gauge may render as a float / scientific notation).
 executor_progress() {
-  local n v
+  # MAX across all responding executors, NOT the first responder: a replica
+  # restarted by a chaos case legitimately reports gauge 0 (or a low block)
+  # while it replays/recovers, even though its peers — and the pipeline — are
+  # fine. Pinning the probe to that replica reads as "pipeline NOT progressing
+  # (block 0 -> 0)" when nothing is wrong (observed on node-failure-executor
+  # right after hard-executor restarted executor-0).
+  local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
     v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
-    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
+  [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
+  return 1
 }
 
 # --- injectors --------------------------------------------------------------
@@ -441,9 +449,15 @@ run_case() { # <case-name>
       # reschedule SLO (image re-pull). count_running counts the `cluster` allocs.
       assert_count "${CLUSTER_TASK}" 2 "${CHAOS_RESCHEDULE_SLO_S}"
       # With quorum back, the executor must resume applying blocks (drains backlog).
-      # Generous timeout: the rejoined member must catch up its Raft log + the new
-      # quorum must re-elect before commits resume.
-      assert_executor_progress 60
+      # WIDE timeout — this is the one case where the clients' cluster SESSIONS
+      # die (a >15s total outage exceeds the session timeout; leader-kill keeps
+      # sessions alive via NewLeaderEvent redirect). Observed on CI: re-election
+      # + client session re-establishment alone takes ~50s after the node
+      # restart, and the reopened sessions then replay the canonical stream from
+      # the log before NEW commits surface on the executor's block gauge. 60s
+      # timed out reproducibly (3/3 runs, sessions reopening ~40s in); 180s
+      # covers re-election + reconnect + replay with margin.
+      assert_executor_progress 180
       # Restore the second node too so the suite leaves a healthy 3/3 cluster for
       # any subsequent cases (best-effort; not asserted as part of this case's SLO).
       docker start "${victims[1]}" >/dev/null 2>&1 || true

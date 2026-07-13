@@ -72,19 +72,6 @@ public final class SealerClusteredService implements ClusteredService {
     private Cluster cluster;
     private CanonicalSealerState state;
 
-    /**
-     * Whether the repeating boundary timer is currently armed. Aeron forbids
-     * {@code scheduleTimer} from {@link #onStart} and {@link #doBackgroundWork}
-     * ("sending messages or scheduling timers is not allowed from …"); it is only
-     * permitted while processing the replicated log. The first arming therefore
-     * happens from {@link #onNewLeadershipTermEvent} (a log-driven callback fired
-     * on every member when a leadership term is established, including after a
-     * failover); subsequent re-arms chain from {@link #onTimerEvent}. This flag
-     * keeps exactly one timer live so the leadership-term arming and the
-     * onTimerEvent re-arm never double-schedule.
-     */
-    private boolean boundaryTimerArmed;
-
     // Scratch buffers for ingress id extraction and egress framing. Reused to
     // avoid per-message allocation on the single cluster service thread.
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
@@ -114,9 +101,9 @@ public final class SealerClusteredService implements ClusteredService {
         } else {
             this.state = new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
         }
-        // Do NOT scheduleTimer here: Aeron rejects it from onStart. The boundary
-        // timer is first armed from onNewLeadershipTermEvent (see field doc).
-        this.boundaryTimerArmed = false;
+        // Do NOT scheduleTimer here: Aeron rejects it from onStart ("sending
+        // messages or scheduling timers is not allowed from onStart"); the
+        // boundary timer is armed from onNewLeadershipTermEvent (log-driven).
     }
 
     @Override
@@ -130,14 +117,18 @@ public final class SealerClusteredService implements ClusteredService {
             final java.util.concurrent.TimeUnit timeUnit,
             final int appVersion) {
         // First sanctioned point to schedule a timer (this is log-driven, unlike
-        // onStart/doBackgroundWork). Arm the repeating boundary timer once; the
-        // onTimerEvent re-arm keeps it going. Fires on every leadership term,
-        // including the one established after a failover, so a member that becomes
-        // leader without ever having armed the timer (e.g. it started as follower)
-        // still gets a live boundary cadence.
-        if (!boundaryTimerArmed) {
-            scheduleBoundaryTimer();
-        }
+        // onStart/doBackgroundWork). Re-arm the repeating boundary timer on EVERY
+        // new leadership term — unconditionally. Pending cluster timers live in
+        // the LEADER's timer wheel only (scheduleTimer from a follower is not
+        // actioned; only the expiry is replicated through the log), so any
+        // election can lose the pending tick: if the old leader died — or stepped
+        // down during a quorum outage — before appending the expiry, NO member
+        // holds a live timer afterwards and the boundary clock stops forever
+        // (records still relay, but blocks never seal — the executor gauge
+        // freezes; observed as the chaos suite's post-quorum-recovery stall).
+        // Re-arming with the SAME correlation id is idempotent: Aeron replaces
+        // the pending timer rather than double-scheduling.
+        scheduleBoundaryTimer();
     }
 
     @Override
@@ -248,7 +239,6 @@ public final class SealerClusteredService implements ClusteredService {
         while (!cluster.scheduleTimer(BOUNDARY_TIMER_CORRELATION_ID, deadline)) {
             cluster.idleStrategy().idle();
         }
-        boundaryTimerArmed = true;
     }
 
     private void offerRelayed(final Relayed relayed) {
@@ -311,11 +301,24 @@ public final class SealerClusteredService implements ClusteredService {
         return pos;
     }
 
+    /**
+     * Bounded egress-offer retries per session per frame. The offers run on the
+     * SINGLE clustered-service thread: an UNBOUNDED retry against one wedged or
+     * slow client session (its egress image full because the subscriber
+     * stopped draining) blocks record relaying and the boundary tick for the
+     * WHOLE cluster — one sick client must never stall the pipeline. After the
+     * bound, the frame is dropped for THAT session only; the client sees a gap
+     * on its egress, which its consumer detects (the executor's boundary
+     * alignment) — the correct failure locality.
+     */
+    private static final int MAX_OFFER_RETRIES = 8;
+
     private void offerToSession(final ClientSession session, final int length) {
         long result;
+        int retries = 0;
         do {
             result = session.offer(egressBuffer, 0, length);
-        } while (result < 0 && retryable(result));
+        } while (result < 0 && retryable(result) && ++retries < MAX_OFFER_RETRIES);
     }
 
     /** Whether a negative offer result is a retryable back-pressure condition. */

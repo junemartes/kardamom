@@ -3783,6 +3783,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-engine"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "bytes",
+ "crossbeam-channel",
+ "dashmap",
+ "kardamom-cluster-adapter",
+ "kardamom-log",
+ "kardamom-state",
+ "kardamom-types",
+ "metrics",
+ "revm",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-executor"
 version = "0.1.0"
 dependencies = [
@@ -3798,6 +3822,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "kardamom-cluster-adapter",
+ "kardamom-engine",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-state",
@@ -3925,6 +3950,7 @@ version = "0.1.0"
 dependencies = [
  "alloy-primitives",
  "alloy-rlp",
+ "alloy-trie",
  "bytes",
  "criterion 0.7.0",
  "crossbeam-channel",
@@ -3947,6 +3973,27 @@ dependencies = [
  "rkyv",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "kardamom-validator"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "anyhow",
+ "clap",
+ "kardamom-engine",
+ "kardamom-log",
+ "kardamom-obs",
+ "kardamom-state",
+ "kardamom-types",
+ "metrics",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

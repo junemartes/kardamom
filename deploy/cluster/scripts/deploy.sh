@@ -145,6 +145,10 @@ run_job "sequencer.nomad.hcl"
 run_job "ingress.nomad.hcl"
 wait_running "ingress" 240
 run_job "executor.nomad.hcl"
+# The validator is a passive follower (subscribes to the same multicast
+# channels + its own cluster egress session); it can come up alongside the
+# executors — it re-executes from genesis regardless of join order.
+run_job "validator.nomad.hcl"
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
@@ -152,6 +156,7 @@ run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 # The cluster was already waited-on above (before the sequencer connected).
 wait_running "sequencer" 240
 wait_running "executor" 240
+wait_running "validator" 240
 wait_running "da-watcher" 240
 
 # --- 4. Batcher periodic job (offline/dry-run) ------------------------------

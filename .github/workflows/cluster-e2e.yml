@@ -120,7 +120,7 @@ jobs:
           # sequencer/executor talk to the cluster by default.
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-            -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
 

@@ -15,6 +15,10 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 # `rlp` feature enables RlpEncodable/RlpDecodable on Address, B256, U256.
 alloy-primitives = { workspace = true, features = ["rlp"] }
 alloy-rlp = { workspace = true, features = ["derive"] }
+# Ethereum MPT primitives + the `ethereum` feature's secure-trie root helpers
+# (state_root_unhashed / storage_root_unhashed, TrieAccount, EMPTY_ROOT_HASH)
+# for the validator's incremental state-root trie.
+alloy-trie = { version = "0.9", features = ["ethereum"] }
 bytes.workspace = true
 crossbeam-channel = "0.5"
 kardamom-log.workspace = true

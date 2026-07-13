@@ -17,9 +17,9 @@ use std::sync::mpsc as sync_mpsc;
 use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_executor::{
-    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig,
-    MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription,
-    TxOrderingSubscription, TxReceiptsPublication,
+    BalPublishingWriterQueue, CMessage, DepositSubscription, Executor, ExecutorConfig,
+    ExecutorError, ExecutorFileConfig, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
+    ResumePoint, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsPublisherHandle,
@@ -392,7 +392,14 @@ async fn main() -> Result<()> {
     let writer = StateWriter::spawn(env).context("spawn state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let sw_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
-    let sw_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
+    // BAL publication: tee each block's BlockDelta onto tx_bal so validators can
+    // cross-check their re-execution. Published on the isolated publication
+    // runtime (rt_pub), like receipts, so it never stalls the subscription poll.
+    let bal_pub = rt_pub
+        .open_publication(&channels.tx_bal_channel, channels.tx_bal_stream_id)
+        .context("open tx_bal publication")?;
+    let sw_queue =
+        BalPublishingWriterQueue::new(MdbxWriterQueue::new(writer.delta_tx.clone()), bal_pub);
 
     let mut cfg = ExecutorConfig {
         chain_id,

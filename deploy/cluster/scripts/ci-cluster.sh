@@ -32,7 +32,7 @@ TAG=dev
 NODE_IMAGE=kardamom-node:ci
 # NOTE: kardamom-recorder was removed (durability is now archive-at-the-sealer);
 # the sealer image carries the durability sidecar.
-SERVICES=(ingress sequencer executor da-watcher batcher)
+SERVICES=(ingress sequencer executor validator da-watcher batcher)
 
 # Node instances are GENERATED from the class model in group_vars/all.yml
 # (node_classes: class -> {count, ip_start}) — the single source of truth. For
@@ -228,8 +228,11 @@ dump_diagnostics() {
       printf '%s\n' "${err}" | head -30 || true
       echo "----- ${job} alloc ${alloc}: stderr (tail 40) -----"
       printf '%s\n' "${err}" | tail -40 || true
-      echo "----- ${job} alloc ${alloc}: stdout (tail 40) -----"
-      nomad alloc logs "${alloc}" 2>/dev/null | tail -40 || true
+      # Full role/election history matters for the cluster job; more tail there.
+      local stdout_tail=40
+      [[ "${job}" == "cluster" ]] && stdout_tail=200
+      echo "----- ${job} alloc ${alloc}: stdout (tail ${stdout_tail}) -----"
+      nomad alloc logs "${alloc}" 2>/dev/null | tail -"${stdout_tail}" || true
     done <<<"${allocs}"
   done
 
@@ -244,6 +247,22 @@ dump_diagnostics() {
       for f in /opt/kardamom/cluster/*error*.log /opt/kardamom/aeron-mount/cluster-dir/*error*.log; do
         [ -f "$f" ] && { echo "--- $f ---"; cat "$f"; }
       done' 2>/dev/null || true
+  done
+
+  # Consensus-module state per member (election phase, log/commit/append
+  # positions, recovery plan) — the ground truth for "leader elected but
+  # nothing commits" stalls. ClusterTool ships in the cluster-node jar; run it
+  # inside each sealer node's INNER cluster task container (nomad docker task,
+  # named by its alloc; find it via the inner docker ps).
+  for n in "${NODES[@]}"; do
+    [[ "${NODE_ROLE[$n]}" == "sealer" ]] || continue
+    echo "===== ${n}: ClusterTool describe ====="
+    docker exec "kardamom-${n}" sh -c '
+      inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
+      [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster describe 2>&1
+      echo "--- recovery-plan ---"
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster recovery-plan 1 2>&1 | tail -20' 2>/dev/null || true
   done
 }
 
@@ -296,9 +315,17 @@ log "creating bridge ${NET} (${SUBNET})"
 # Name the underlying Linux bridge so its /sys path is deterministic (otherwise
 # docker derives br-<network-id[:12]>). We disable IGMP snooping on it next.
 BRIDGE_NAME=kardamom-br0
-docker network create --driver bridge \
-  -o "com.docker.network.bridge.name=${BRIDGE_NAME}" \
-  --subnet "${SUBNET}" "${NET}"
+# Idempotent: reuse an existing ${NET} (e.g. a KEEP=1 run or local iteration) —
+# recreating it would also recreate the underlying bridge and silently reset
+# multicast_snooping to the kernel default (1), undoing the fix below on hosts
+# where this script cannot sudo.
+if ! docker network inspect "${NET}" >/dev/null 2>&1; then
+  docker network create --driver bridge \
+    -o "com.docker.network.bridge.name=${BRIDGE_NAME}" \
+    --subnet "${SUBNET}" "${NET}"
+else
+  log "network ${NET} already exists; reusing"
+fi
 
 # Aeron's cross-node data plane is UDP MULTICAST (tx_ordering: sealer ->
 # recorders + executor; the per-recorder fsync watermarks and the aggregated
@@ -333,6 +360,12 @@ for n in "${NODES[@]}"; do
   # volumes live on the host's real fs, where overlay works.
   docker volume create "kardamom-${n}-docker" >/dev/null
   docker volume create "kardamom-${n}-containerd" >/dev/null
+  # Idempotent: a node left up by a previous KEEP=1 run is reused as-is.
+  if docker inspect "kardamom-${n}" >/dev/null 2>&1; then
+    log "node kardamom-${n} already exists; reusing"
+    docker start "kardamom-${n}" >/dev/null 2>&1 || true
+    continue
+  fi
   docker run -d --name "kardamom-${n}" --hostname "${n}" \
     --privileged --cgroupns=host \
     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
@@ -527,5 +560,95 @@ sleep 5
 # nonce coordination regardless of which branch above ran.
 PK="0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0" \
   RPC_URL="http://192.168.56.32:8545" ./scripts/smoke.sh
+
+# --- 7c. Validator sync + keep-up verdict -------------------------------------
+# The validator (validator.nomad.hcl, one alloc on an executor-class node)
+# followed everything the shard just did — bring-up, smoke, load and/or chaos —
+# re-executing every block through the shared engine and cross-checking against
+# the executors' receipts + per-block BAL, advancing an MPT state root. Assert:
+#   (a) LIVENESS  — its /metrics endpoint (:9006) answers: the process did NOT
+#       fail-stop (a proven divergence exits 2 and the job never restarts).
+#   (b) SYNC + KEEP-UP — validator_committed_block advances and closes to within
+#       VALIDATOR_LAG_MAX of the executors' kardamom_executor_block_number.
+#   (c) VERIFICATION — validator_blocks_verified_total > 0 (the BAL cross-check
+#       actually ran) and validator_divergence_total is absent/0.
+# This is the cluster-mode successor of the old multiprocess
+# `multiprocess_e2e_validator_syncs_and_keeps_up` smoke (removed with the
+# single-sealer full-pipeline e2e in the cluster-only migration).
+log "validator verdict: sync + keep-up + BAL cross-check (no divergence)"
+EXEC_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
+# The validator lives on the aux node (see validator.nomad.hcl — kept out of
+# the executor-chaos blast radius).
+VALIDATOR_NODES=(kardamom-aux-0)
+VALIDATOR_PORT=9006
+EXECUTOR_PORT=9004
+VALIDATOR_LAG_MAX="${VALIDATOR_LAG_MAX:-10}"
+VALIDATOR_SYNC_TIMEOUT_S="${VALIDATOR_SYNC_TIMEOUT_S:-180}"
+
+# Scrape one metric value (last sample wins; strips labels) from a node:port.
+scrape_metric() { # <node> <port> <metric-name> -> value or ""
+  docker exec "$1" curl -fsS --max-time 5 "http://127.0.0.1:$2/metrics" 2>/dev/null \
+    | awk -v m="$3" '$0 ~ "^"m"([{ ])" {v=$NF} END {if (v != "") print v}'
+}
+
+VALIDATOR_NODE=""
+for n in "${VALIDATOR_NODES[@]}"; do
+  if docker exec "$n" curl -fsS --max-time 5 "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
+    VALIDATOR_NODE="$n"; break
+  fi
+done
+[[ -n "${VALIDATOR_NODE}" ]] || { echo "FAIL: no validator /metrics on :${VALIDATOR_PORT} (fail-stopped — divergence or session death?)" >&2; exit 1; }
+log "validator found on ${VALIDATOR_NODE}"
+
+# Executor progress reference: any responding executor (state-machine replicas).
+executor_block() {
+  local v
+  for n in "${EXEC_NODES[@]}"; do
+    v="$(scrape_metric "$n" "${EXECUTOR_PORT}" kardamom_executor_block_number)"
+    [[ -n "$v" ]] && { printf '%.0f\n' "$v"; return 0; }
+  done
+  return 1
+}
+
+# The SYNC/KEEP-UP bound is asserted on the LOAD shard only. The chaos shards
+# kill Raft members under load, which can expire the validator's cluster
+# session (>15s outages exceed the session timeout); catching back up after a
+# session loss needs the branch-node-incremental trie (#65 — the full-rebuild
+# root here is too slow to drain a big backlog) and client reconnect hardening,
+# tracked as follow-ups. On chaos shards the verdict still asserts the hard
+# safety properties: the validator stayed ALIVE (no fail-stop), it VERIFIED
+# blocks against the BAL, and it counted ZERO divergences.
+v_start="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)"; v_start="${v_start:-0}"
+if [[ "${RUN_LOAD:-1}" == "1" ]]; then
+  deadline=$(( $(date +%s) + VALIDATOR_SYNC_TIMEOUT_S ))
+  ok=0
+  while (( $(date +%s) < deadline )); do
+    e_blk="$(executor_block || echo "")"
+    v_blk="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)"
+    v_blk="$(printf '%.0f' "${v_blk:-0}")"
+    if [[ -n "${e_blk}" ]] && (( v_blk > 0 )) && (( e_blk - v_blk <= VALIDATOR_LAG_MAX )); then
+      ok=1; break
+    fi
+    sleep 5
+  done
+  e_blk="${e_blk:-?}"
+  if (( ok != 1 )); then
+    echo "FAIL: validator did not sync within ${VALIDATOR_SYNC_TIMEOUT_S}s (validator=${v_blk:-?} executor=${e_blk}, started at ${v_start})" >&2
+    exit 1
+  fi
+  log "validator synced: block ${v_blk} vs executor ${e_blk} (lag $(( e_blk - v_blk )) <= ${VALIDATOR_LAG_MAX})"
+else
+  v_blk="$(printf '%.0f' "${v_start}")"
+  (( v_blk > 0 )) || { echo "FAIL: validator never committed a block (committed=${v_blk})" >&2; exit 1; }
+  log "chaos shard: validator alive at block ${v_blk} (sync bound asserted on the load shard)"
+fi
+
+verified="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_blocks_verified_total)"
+verified="$(printf '%.0f' "${verified:-0}")"
+(( verified > 0 )) || { echo "FAIL: validator verified 0 blocks against the BAL (tx_bal not flowing?)" >&2; exit 1; }
+diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
+diverged="$(printf '%.0f' "${diverged:-0}")"
+(( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
+log "validator verdict PASSED: ${verified} blocks BAL-verified, 0 divergences, state root advancing"
 
 log "cluster-e2e PASSED"

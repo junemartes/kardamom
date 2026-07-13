@@ -54,6 +54,52 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
     }
 }
 
+/// Aeron Cluster (Raft) sealer client config — the `[cluster]` TOML section
+/// shared by every role that reads the canonical stream (executor, validator).
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct ClusterConfig {
+    /// Retained for config-file backward compatibility; IGNORED — cluster mode
+    /// is the only mode, so clients always connect to the cluster.
+    pub enabled: bool,
+    /// "memberId=host:port,…" cluster ingress endpoints.
+    pub ingress_endpoints: String,
+    pub initial_leader_member_id: i32,
+    pub ingress_stream_id: i32,
+    /// This client's egress (response) channel URI, e.g. "aeron:udp?endpoint=<ip>:<port>".
+    pub egress_channel: String,
+    pub egress_stream_id: i32,
+    pub keep_alive_interval_ms: u64,
+}
+
+impl ClusterConfig {
+    /// Sane stream-id / keepalive defaults when the TOML omits them.
+    pub fn defaults_applied(mut self) -> Self {
+        if self.ingress_stream_id == 0 {
+            self.ingress_stream_id = 101;
+        }
+        if self.egress_stream_id == 0 {
+            self.egress_stream_id = 102;
+        }
+        if self.keep_alive_interval_ms == 0 {
+            self.keep_alive_interval_ms = 1000;
+        }
+        self
+    }
+
+    pub fn to_live(&self) -> LiveClusterConfig {
+        let c = self.clone().defaults_applied();
+        LiveClusterConfig {
+            ingress_endpoints: c.ingress_endpoints,
+            initial_leader_member_id: c.initial_leader_member_id,
+            ingress_stream_id: c.ingress_stream_id,
+            egress_channel: c.egress_channel,
+            egress_stream_id: c.egress_stream_id,
+            keep_alive_interval_ms: c.keep_alive_interval_ms,
+        }
+    }
+}
+
 /// Connect to the cluster and wrap egress as a `TxOrderingSubscription`.
 /// The returned `LiveCluster` guard MUST be kept alive while the subscription is used.
 pub fn cluster_tx_ordering_subscription(

@@ -74,6 +74,16 @@ public final class ClusterNode {
             .ingressChannel("aeron:udp")
             .ingressStreamId(ingressStreamId)
             .appVersion(APP_VERSION)
+            // Client sessions survive a full quorum outage of the chaos suite's
+            // shape (kill 2/3, ~15s stall window, restart) instead of expiring
+            // at Aeron's 10s default and forcing every client through a
+            // reconnect. Clients still keep-alive every 1s; a genuinely dead
+            // client holds a session slot for at most 30s.
+            .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(30))
+            // leaderHeartbeatTimeoutNs stays at Aeron's 10s default: raising it
+            // to 20s was tried and made real failovers ~20s slower (leader-kill
+            // recovery blew the 60s pipeline-progress SLO), while the "leader
+            // heartbeat timeout" warnings it was meant to silence were benign.
             .replicationChannel("aeron:udp?endpoint=" + me[3]);
 
         final ClusteredServiceContainer.Context serviceCtx = new ClusteredServiceContainer.Context()
