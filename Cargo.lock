@@ -3956,6 +3956,7 @@ dependencies = [
  "crossbeam-channel",
  "kardamom-log",
  "kardamom-types",
+ "metrics",
  "rkyv",
  "signet-libmdbx",
  "tempfile",

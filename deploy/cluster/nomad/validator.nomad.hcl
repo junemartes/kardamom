@@ -73,6 +73,16 @@ job "validator" {
           # Own state dir UNDER the shared persistent mount — never the
           # executor's /opt/kardamom/state root (separate mdbx env).
           "--state-dir", "/opt/kardamom/state/validator",
+          # Shadow-check the node-incremental state trie against a full rebuild
+          # every 8th block; a walker bug fail-stops the validator (dead alloc =
+          # verdict failure) and bumps kardamom_state_trie_shadow_mismatch_total.
+          # Every-block checking is exhaustive but a full rebuild per 250ms block
+          # saturates a CI core continuously — on the 4-core DinD runner that
+          # starves the Aeron cluster's timing-sensitive recovery paths (the
+          # walker's per-block equivalence is separately unit-tested with 50
+          # randomized blocks; cadence 8 still shadow-checks hundreds of blocks
+          # per e2e run under real load).
+          "--trie-shadow-check", "8",
         ]
       }
 

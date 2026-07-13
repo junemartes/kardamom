@@ -649,6 +649,18 @@ verified="$(printf '%.0f' "${verified:-0}")"
 diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
 diverged="$(printf '%.0f' "${diverged:-0}")"
 (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
-log "validator verdict PASSED: ${verified} blocks BAL-verified, 0 divergences, state root advancing"
+# Incremental-trie shadow-check (--trie-shadow-check 1 in validator.nomad.hcl):
+# every committed block recomputed the state root by FULL rebuild and compared
+# it to the node-incremental walker's. A mismatch fail-stops the validator
+# (caught by the liveness probe above); assert the counters directly too.
+# Runs on every shard: the validator commits blocks (v_blk > 0 asserted above
+# on both the load and chaos paths), so checks_total must be > 0 everywhere.
+shadow_checks="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" kardamom_state_trie_shadow_checks_total)"
+shadow_checks="$(printf '%.0f' "${shadow_checks:-0}")"
+(( shadow_checks > 0 )) || { echo "FAIL: trie shadow-check never ran (checks=${shadow_checks})" >&2; exit 1; }
+shadow_mismatch="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" kardamom_state_trie_shadow_mismatch_total)"
+shadow_mismatch="$(printf '%.0f' "${shadow_mismatch:-0}")"
+(( shadow_mismatch == 0 )) || { echo "FAIL: incremental state trie diverged from full rebuild (${shadow_mismatch} mismatches)" >&2; exit 1; }
+log "validator verdict PASSED: ${verified} blocks BAL-verified, 0 divergences, ${shadow_checks} shadow-checks / 0 mismatches"
 
 log "cluster-e2e PASSED"

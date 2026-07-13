@@ -30,7 +30,9 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_log::replay;
-use kardamom_state::{Durability, StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
+use kardamom_state::{
+    Durability, StateEnvBuilder, StateWriter, TrieMode, read_recovery_point, seed_genesis,
+};
 use kardamom_types::{
     AccountChange, BPosition, BlockDelta, CodeEntry, Deposit, TxDataLoc, TxEnvelope,
 };
@@ -102,6 +104,12 @@ struct Args {
     /// State durability mode.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     state_durability: StateDurabilityArg,
+    /// Enable the state-trie shadow-check: every N blocks, recompute the world
+    /// state root by full rebuild and fail-stop on mismatch with the incremental
+    /// walker (a canary against trie bugs). Absent ⇒ incremental only; `1` ⇒
+    /// every block. Costs a full rebuild on the sampled blocks.
+    #[arg(long, env = "KARDAMOM_TRIE_SHADOW_CHECK")]
+    trie_shadow_check: Option<u64>,
     /// UDP endpoint the archive replay-merge binds to receive replayed
     /// tx_data / tx_deposits fragments on crash recovery (resume only —
     /// tx_ordering recovery is the cluster client's replay, not the archive).
@@ -336,7 +344,12 @@ async fn main() -> Result<()> {
     );
 
     // Trie-aware writer: each block commit advances the MPT state root.
-    let writer = StateWriter::spawn_with_trie(env).context("spawn trie-aware state writer")?;
+    let trie_mode = match args.trie_shadow_check {
+        Some(every_n) => TrieMode::ShadowCheck { every_n },
+        None => TrieMode::Incremental,
+    };
+    let writer =
+        StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
     let sw_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
     let sw_queue = ValidatorWriterQueue::new(
@@ -376,7 +389,7 @@ async fn main() -> Result<()> {
     }
     let initial_block = recovery.last_committed_block;
 
-    let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
+    let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run(
             cfg,
             a_subs,
@@ -391,12 +404,26 @@ async fn main() -> Result<()> {
         )
     });
 
-    wait_for_shutdown().await;
-    tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
+    // Exit on WHICHEVER comes first: an operator shutdown signal, or the
+    // engine loop finishing on its own (a divergence fail-stop or a stream
+    // error). Waiting only for SIGTERM would leave a halted validator lingering
+    // "alive" — metrics up, chain frozen — hiding the very fail-stop signal
+    // the divergence machinery exists to surface.
+    let engine_result = tokio::select! {
+        _ = wait_for_shutdown() => {
+            tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
+            None
+        }
+        res = &mut join => Some(res),
+    };
     drop(rt);
     drop(cluster_guard);
     let mut diverged = divergence.is_halted();
-    match join.await {
+    let joined = match engine_result {
+        Some(r) => r,
+        None => join.await,
+    };
+    match joined {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "validator main loop returned an error");

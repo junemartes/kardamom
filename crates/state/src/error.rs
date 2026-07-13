@@ -27,6 +27,14 @@ pub enum StateError {
     RkyvDecode { table: &'static str, detail: String },
     #[error("recovery failed: {0}")]
     Recovery(String),
+    #[error(
+        "trie shadow-check mismatch at block {block}: incremental {incremental} != rebuilt {rebuilt}"
+    )]
+    ShadowMismatch {
+        block: u64,
+        incremental: alloy_primitives::B256,
+        rebuilt: alloy_primitives::B256,
+    },
 }
 
 impl From<signet_libmdbx::ReadError> for StateError {
