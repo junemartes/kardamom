@@ -65,8 +65,8 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::offer_retry::{OFFER_TIMEOUT, offer_code_str};
 use kardamom_types::{
-    BPosition, BlockBoundary, BlockBoundaryStart, Deposit, FsyncWatermark, QuorumWatermark,
-    Receipt, TxEnvelope, TxError, TxOrderingMessage,
+    BPosition, BlockBoundary, Deposit, FsyncWatermark, QuorumWatermark, Receipt, TxDataLoc,
+    TxEnvelope, TxError,
 };
 
 type AeronClient = rusteron_client::Aeron;
@@ -74,10 +74,13 @@ type Pub = rusteron_client::AeronPublication;
 type Sub = rusteron_client::AeronSubscription;
 type Header = rusteron_client::AeronHeader;
 
-/// Closure that decodes one Aeron fragment + position and forwards the
-/// decoded value (or its raw bytes) somewhere Send-friendly. Boxed so
-/// different message types can share the subscription registration path.
-pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition) + Send>;
+/// Closure that decodes one Aeron fragment + position + publisher `session_id`
+/// and forwards the decoded value (or its raw bytes) somewhere Send-friendly.
+/// Boxed so different message types can share the subscription registration
+/// path. Most consumers ignore `session_id`; the tx_data subscription uses it to
+/// build a [`kardamom_types::TxDataLoc`] so concurrent ingress publishers on one
+/// shard stay disambiguated.
+pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition, i32) + Send>;
 
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
@@ -375,18 +378,19 @@ impl AeronRuntime {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
         for uri in uris {
             let msg_tx = msg_tx.clone();
-            let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition| {
-                match codec::materialize::<T>(bytes) {
-                    Ok(v) => {
-                        if msg_tx.send((pos, v)).is_err() {
-                            // Subscriber dropped its receiver.
+            let deliver: DeliverFn =
+                Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+                    match codec::materialize::<T>(bytes) {
+                        Ok(v) => {
+                            if msg_tx.send((pos, v)).is_err() {
+                                // Subscriber dropped its receiver.
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "decode failed on subscription delivery");
                         }
                     }
-                    Err(e) => {
-                        error!(error = %e, "decode failed on subscription delivery");
-                    }
-                }
-            });
+                });
             self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         }
         Ok(msg_rx)
@@ -409,19 +413,44 @@ impl AeronRuntime {
             >,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: DeliverFn =
-            Box::new(
-                move |bytes: &[u8], pos: BPosition| match codec::materialize::<T>(bytes) {
-                    Ok(v) => {
-                        let _ = msg_tx.send((pos, v));
-                    }
-                    Err(e) => {
-                        error!(error = %e, "decode failed on subscription delivery");
-                    }
-                },
-            );
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+            match codec::materialize::<T>(bytes) {
+                Ok(v) => {
+                    let _ = msg_tx.send((pos, v));
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on subscription delivery");
+                }
+            }
+        });
         let sub_id = self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         Ok((sub_id, msg_rx))
+    }
+
+    /// Open a **tx_data** subscription yielding `(TxDataLoc, TxEnvelope)`,
+    /// pairing each envelope with its Aeron publisher `session_id`. The session
+    /// id disambiguates concurrent (active/active) ingress publishers on one
+    /// shard: it is what the sequencer stamps into `TxRef.tx_data_session_id`
+    /// and the executor keys its join buffer on. With a single publisher every
+    /// fragment carries the same session id, so behavior is unchanged.
+    pub fn open_tx_data_subscription(
+        &self,
+        uri: &str,
+        stream_id: i32,
+    ) -> Result<UnboundedReceiver<(TxDataLoc, TxEnvelope)>, LogError> {
+        let (msg_tx, msg_rx) = unbounded_channel::<(TxDataLoc, TxEnvelope)>();
+        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, session: i32| {
+            match codec::materialize::<TxEnvelope>(bytes) {
+                Ok(v) => {
+                    let _ = msg_tx.send((TxDataLoc::new(session, pos), v));
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on tx_data subscription delivery");
+                }
+            }
+        });
+        self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        Ok(msg_rx)
     }
 }
 
@@ -480,8 +509,8 @@ fn run_aeron_thread(
         for entry in subs.iter_mut() {
             let _ = entry.sub.poll_once(
                 |bytes: &[u8], header: Header| {
-                    if let Some(pos) = header_pos(&header) {
-                        (entry.deliver)(bytes, pos);
+                    if let Some((pos, session)) = header_loc(&header) {
+                        (entry.deliver)(bytes, pos, session);
                     }
                 },
                 64,
@@ -748,13 +777,20 @@ fn decode_position(p: i64) -> BPosition {
     }
 }
 
-fn header_pos(h: &Header) -> Option<BPosition> {
+/// Read the fragment-start [`BPosition`] and the Aeron publisher `session_id`
+/// from a SINGLE `get_values()` FFI call — the hottest per-fragment path. They
+/// must come from the same header read: returning them together guarantees the
+/// session belongs to the position's fragment and avoids a divergent
+/// second-read error path (where a transient failure could mint a spurious
+/// session 0 that collides with a genuine session-0 publisher's join key).
+fn header_loc(h: &Header) -> Option<(BPosition, i32)> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
-    Some(BPosition {
+    let pos = BPosition {
         term_id: frame.term_id(),
         term_offset: frame.term_offset(),
-    })
+    };
+    Some((pos, frame.session_id()))
 }
 
 // ---------------------------------------------------------------------------
@@ -842,9 +878,12 @@ impl TxDataPublisherHandle {
     }
 }
 
-/// Per-shard TxData subscriber. Yields `(BPosition, TxEnvelope)`.
+/// Per-shard TxData subscriber. Yields `(TxDataLoc, TxEnvelope)` — the envelope
+/// paired with its publisher `session_id` + `BPosition`, so the sequencer can
+/// stamp `TxRef.tx_data_session_id` and the executor can key its join buffer on
+/// `(shard, session, position)` under concurrent ingress publishers.
 pub struct TxDataSubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, TxEnvelope)>,
+    rx: UnboundedReceiver<(TxDataLoc, TxEnvelope)>,
 }
 
 impl TxDataSubscriberHandle {
@@ -854,158 +893,18 @@ impl TxDataSubscriberHandle {
         sequencer_id: u8,
     ) -> Result<Self, LogError> {
         Ok(Self {
-            rx: rt.open_subscription::<TxEnvelope>(
+            rx: rt.open_tx_data_subscription(
                 &ch.tx_data_channel(sequencer_id),
                 ch.tx_data_stream_id(sequencer_id),
             )?,
         })
     }
 
-    pub async fn recv(&mut self) -> Option<(BPosition, TxEnvelope)> {
+    pub async fn recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         self.rx.recv().await
     }
 
-    pub fn try_recv(&mut self) -> Option<(BPosition, TxEnvelope)> {
-        self.rx.try_recv().ok()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// TxOrdering: canonical orderer of TxOrderingMessage (TxRef | BoundaryStart).
-// ---------------------------------------------------------------------------
-
-/// TxOrdering publisher. Both sequencers (publishing `TxRef`) and the sealer
-/// (publishing `BoundaryStart`) write here; they share the same Aeron stream.
-#[derive(Clone)]
-pub struct TxOrderingPublisherHandle {
-    inner: PubHandle,
-}
-
-impl TxOrderingPublisherHandle {
-    /// Open the tx_ordering publication on the shared `tx_ordering_channel`
-    /// (single-host IPC / legacy multicast). Use [`Self::open_mdc`] for the
-    /// multi-host MDC path.
-    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        Ok(Self {
-            inner: rt.open_publication(&ch.tx_ordering_channel, ch.tx_ordering_stream_id)?,
-        })
-    }
-
-    /// Open the tx_ordering publication as an Aeron MDC
-    /// `control-mode=dynamic` publisher bound to **this publisher's** control
-    /// endpoint (`ip:port`). Subscribers attach themselves to this endpoint;
-    /// no per-subscriber config is needed and a dropped subscriber can no
-    /// longer freeze the other subscribers' images.
-    ///
-    /// `control_endpoint` must be registered in
-    /// `ch.tx_ordering_mdc_publishers` (enforced by
-    /// [`ChannelsConfig::tx_ordering_mdc_control_for`]).
-    pub fn open_mdc(
-        rt: &AeronRuntime,
-        ch: &ChannelsConfig,
-        control_endpoint: &str,
-    ) -> Result<Self, LogError> {
-        let uri = ch.tx_ordering_mdc_control_for(control_endpoint)?;
-        Ok(Self {
-            inner: rt.open_publication(&uri, ch.tx_ordering_stream_id)?,
-        })
-    }
-
-    /// Open the publisher honouring the config: MDC when enabled (binding to
-    /// `control_endpoint`), the shared channel otherwise. This is the single
-    /// entry point the service binaries call so the IPC fallback is uniform.
-    pub fn open_for(
-        rt: &AeronRuntime,
-        ch: &ChannelsConfig,
-        control_endpoint: &str,
-    ) -> Result<Self, LogError> {
-        if ch.tx_ordering_mdc_enabled() {
-            Self::open_mdc(rt, ch, control_endpoint)
-        } else {
-            Self::open(rt, ch)
-        }
-    }
-
-    pub fn publish(&self, msg: &TxOrderingMessage) -> Result<BPosition, LogError> {
-        self.inner.publish(msg)
-    }
-
-    /// Publish a boundary marker (convenience over `publish` with the variant
-    /// constructor).
-    pub fn publish_boundary(&self, b: &BlockBoundaryStart) -> Result<BPosition, LogError> {
-        self.inner
-            .publish(&TxOrderingMessage::BoundaryStart(b.clone()))
-    }
-
-    pub fn raw(&self) -> &PubHandle {
-        &self.inner
-    }
-}
-
-/// TxOrdering subscriber. Yields `(BPosition, TxOrderingMessage)`.
-pub struct TxOrderingSubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, TxOrderingMessage)>,
-}
-
-impl TxOrderingSubscriberHandle {
-    /// Open the **canonical** tx_ordering subscriber (executor, durability
-    /// sidecar, sealer bootstrap). When MDC is enabled it attaches to the
-    /// **single** `tx_ordering_canonical_publisher` (the sealer) — one image,
-    /// one total order, so positions are well-defined and the executor's
-    /// boundary alignment holds. When MDC is disabled it opens the single
-    /// shared `tx_ordering_channel` (IPC / legacy multicast).
-    pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let rx = if ch.tx_ordering_mdc_enabled() {
-            let uri = ch.tx_ordering_canonical_subscriber_uri().ok_or_else(|| {
-                LogError::Config(
-                    "tx_ordering MDC enabled but tx_ordering_canonical_publisher is empty".into(),
-                )
-            })?;
-            rt.open_subscription_merged::<TxOrderingMessage>(&[&uri], ch.tx_ordering_stream_id)?
-        } else {
-            rt.open_subscription::<TxOrderingMessage>(
-                &ch.tx_ordering_channel,
-                ch.tx_ordering_stream_id,
-            )?
-        };
-        Ok(Self { rx })
-    }
-
-    /// Open the sealer's **input** tx_ordering subscriber: the merge of every
-    /// sequencer's MDC publication (`tx_ordering_mdc_publishers`) on
-    /// `tx_ordering_stream_id`. Only the sealer calls this — it reads the raw
-    /// per-sequencer TxRef/DepositRef stream, defines the canonical
-    /// interleaving, and republishes it onto its own canonical publication.
-    /// The merge order here is the sealer's private business: because the
-    /// sealer is the *single* canonical publisher, whatever order it observes
-    /// becomes THE order for every downstream reader. When MDC is disabled it
-    /// falls back to the shared `tx_ordering_channel` (single-host path).
-    pub fn open_input(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let rx = if ch.tx_ordering_mdc_enabled() {
-            let uris = ch.tx_ordering_input_subscriber_uris();
-            if uris.is_empty() {
-                return Err(LogError::Config(
-                    "tx_ordering MDC enabled but tx_ordering_mdc_publishers (sequencer \
-                     inputs) is empty"
-                        .into(),
-                ));
-            }
-            let uri_refs: Vec<&str> = uris.iter().map(String::as_str).collect();
-            rt.open_subscription_merged::<TxOrderingMessage>(&uri_refs, ch.tx_ordering_stream_id)?
-        } else {
-            rt.open_subscription::<TxOrderingMessage>(
-                &ch.tx_ordering_channel,
-                ch.tx_ordering_stream_id,
-            )?
-        };
-        Ok(Self { rx })
-    }
-
-    pub async fn recv(&mut self) -> Option<(BPosition, TxOrderingMessage)> {
-        self.rx.recv().await
-    }
-
-    pub fn try_recv(&mut self) -> Option<(BPosition, TxOrderingMessage)> {
+    pub fn try_recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
         self.rx.try_recv().ok()
     }
 }
@@ -1442,8 +1341,6 @@ const _: fn() = || {
     assert_send_sync::<PubHandle>();
     assert_send_sync::<TxDataPublisherHandle>();
     assert_send::<TxDataSubscriberHandle>();
-    assert_send_sync::<TxOrderingPublisherHandle>();
-    assert_send::<TxOrderingSubscriberHandle>();
     assert_send_sync::<TxReceiptsPublisherHandle>();
     assert_send::<TxReceiptsSubscriberHandle>();
     assert_send::<TxReceiptsBoundarySubscriberHandle>();

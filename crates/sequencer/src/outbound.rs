@@ -25,6 +25,8 @@
 //! (no Aeron media driver required); production wiring binds them to the
 //! real `kardamom_log::publisher` types.
 
+pub mod cluster;
+
 use kardamom_types::{DepositRef, TxError, TxRef};
 
 use crate::error::SequencerError;
@@ -117,9 +119,9 @@ mod tests {
     #[test]
     fn fake_b_records_refs() {
         let mut p = InMemoryTxOrderingRefPublisher::default();
-        p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default()))
+        p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default(), 0))
             .unwrap();
-        p.try_publish_ref(&TxRef::new(B256::ZERO, 1, BPosition::default()))
+        p.try_publish_ref(&TxRef::new(B256::ZERO, 1, BPosition::default(), 0))
             .unwrap();
         assert_eq!(p.refs.lock().unwrap().len(), 2);
     }
@@ -129,7 +131,7 @@ mod tests {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default())),
+            p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default(), 0)),
             Err(SequencerError::Backpressure)
         ));
     }

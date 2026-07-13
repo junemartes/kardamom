@@ -2,7 +2,7 @@
 # Deploy the kardamom Nomad job pipeline to the cluster.
 #
 # Order: Aeron substrate (system) + anvil L1, wait until their allocations are
-# running, then the service jobs (sealer, sequencer, executor, ingress,
+# running, then the service jobs (cluster, sequencer, executor, ingress,
 # da-watcher), then register the batcher periodic job.
 #
 # Talks to the Nomad server on r1. By default uses the HTTP API over the
@@ -90,7 +90,11 @@ wait_running() {
 echo
 echo "### Phase 1: Aeron substrate"
 run_job "aeron.system.nomad.hcl"
-wait_running "aeron" 180
+# Generous timeout: every worker node force-pulls the aeron image from the single
+# in-cluster registry at once, slow under CI CPU contention (the dedicated cluster
+# nodes added more concurrent pullers). Comes up well under this cap on a healthy
+# run; the cap only guards against premature failure when bring-up is slow.
+wait_running "aeron" 600
 
 # --- (REMOVED) recorder quorum ----------------------------------------------
 # The custom recorders + Q-of-N quorum aggregator were removed in favour of
@@ -103,12 +107,15 @@ wait_running "aeron" 180
 echo
 echo "### Phase 2: anvil L1"
 run_job "anvil.nomad.hcl"
-wait_running "anvil" 120
+wait_running "anvil" 240
 
 # --- 3. Service pipeline ----------------------------------------------------
-# The sealer is launched FIRST: besides ordering, it owns the durability
-# sidecar, so its durable watermark must be flowing before ingress (on-quorum)
-# needs it.
+# The 3-member Aeron Cluster (Raft) sealer is launched FIRST: it owns BOTH
+# ordering and durability (durability folds into the Raft log + per-member
+# archive), so the cluster must have elected a leader and be accepting ingress
+# before the sequencer cluster-clients connect and the executor subscribes to
+# its egress. (The standalone single-sealer job has been removed; the Aeron
+# Cluster — cluster.nomad.hcl — is the sole orderer/durability.)
 echo
 echo "### Phase 3: service pipeline"
 
@@ -122,7 +129,12 @@ else
   echo "         default address (deposit path will not function)." >&2
 fi
 
-run_job "sealer.nomad.hcl"
+# Bring the cluster up FIRST and wait until it has converged (leader elected +
+# archive ready) before the sequencer cluster-clients connect and the executor
+# subscribes to its egress. Election + archive recovery takes longer than the
+# old single-sealer start, hence the 180s budget.
+run_job "cluster.nomad.hcl"
+wait_running "cluster" 300
 run_job "sequencer.nomad.hcl"
 # Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
 # SUBSCRIBER and the executor is the must-deliver PUBLISHER; starting the
@@ -131,16 +143,21 @@ run_job "sequencer.nomad.hcl"
 # would back-pressure the exec→commit channel and freeze state). The ingress also
 # subscribes the quorum watermark (from the already-running aggregator) here.
 run_job "ingress.nomad.hcl"
-wait_running "ingress" 120
+wait_running "ingress" 240
 run_job "executor.nomad.hcl"
+# The validator is a passive follower (subscribes to the same multicast
+# channels + its own cluster egress session); it can come up alongside the
+# executors — it re-executes from genesis regardless of join order.
+run_job "validator.nomad.hcl"
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 
-wait_running "sealer" 120
-wait_running "sequencer" 120
-wait_running "executor" 120
-wait_running "da-watcher" 120
+# The cluster was already waited-on above (before the sequencer connected).
+wait_running "sequencer" 240
+wait_running "executor" 240
+wait_running "validator" 240
+wait_running "da-watcher" 240
 
 # --- 4. Batcher periodic job (offline/dry-run) ------------------------------
 echo

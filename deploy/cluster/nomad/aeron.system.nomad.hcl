@@ -40,6 +40,20 @@ job "aeron" {
     value     = "control"
   }
 
+  # Keep the shared media driver OFF the sealer nodes too: in cluster mode they run
+  # ONLY the Aeron Cluster (cluster.nomad.hcl), which boots its OWN embedded
+  # ClusteredMediaDriver on a private aeron.dir (.../aeron-mount/cluster-dir) and
+  # never touches the shared substrate (.../aeron-mount/dir). Running an unused
+  # ArchivingMediaDriver on all 3 sealer nodes just added 3 more concurrent image
+  # pulls from the single in-cluster registry at deploy time (the dominant bring-up
+  # bottleneck under CI contention). The on-node tmpfs is mounted by Ansible
+  # independently, so the cluster's cluster-dir is unaffected.
+  constraint {
+    attribute = "${meta.role}"
+    operator  = "!="
+    value     = "sealer"
+  }
+
   group "aeron" {
     network {
       mode = "host"

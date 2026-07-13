@@ -37,7 +37,7 @@ pub use delta::{AccountChange, BlockDelta, CodeEntry, StorageChange};
 pub use deposit::{Deposit, DepositRef};
 pub use envelope::TxEnvelope;
 pub use genesis::{AllocEntry, Genesis, GenesisError};
-pub use position::BPosition;
+pub use position::{BPosition, TxDataLoc};
 pub use receipt::{Receipt, WireLog};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};

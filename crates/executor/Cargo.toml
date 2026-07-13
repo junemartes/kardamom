@@ -11,6 +11,9 @@ kardamom-engine = { workspace = true }
 # : shared types live in kardamom-types.
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
+# Cluster (Raft) transport adapter (`reader::cluster`). tx_ordering ALWAYS comes
+# from the cluster egress — non-optional, there is no non-cluster path.
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-obs = { path = "../obs" }
 # libmdbx-backed production state backend (StateWriter + snapshot-swap channel).
 kardamom-state = { path = "../state" }
@@ -22,6 +25,7 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 metrics = { workspace = true }
+serde.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
@@ -38,6 +42,7 @@ path = "src/bin/kardamom-executor.rs"
 # : hermetic unit tests use kardamom-log's in-memory fakes.
 # Real-Aeron e2e tests pull `docker-e2e` to bring in the testcontainers harness.
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 alloy-signer-local.workspace = true
 alloy-network.workspace = true
 alloy-eips.workspace = true

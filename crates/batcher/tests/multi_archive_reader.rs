@@ -80,19 +80,19 @@ fn happy_path_in_order_resolution() {
         &[
             (
                 pos(0),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0), 0)),
             ),
             (
                 pos(16),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(0), 0)),
             ),
             (
                 pos(32),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128), 0)),
             ),
             (
                 pos(48),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(128))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 1, pos(128), 0)),
             ),
             (
                 pos(64),
@@ -172,15 +172,15 @@ fn out_of_order_b_refs_a_positions_still_resolve() {
         &[
             (
                 pos(0),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(256))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(256), 0)),
             ),
             (
                 pos(16),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(128), 0)),
             ),
             (
                 pos(32),
-                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0))),
+                TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(0), 0)),
             ),
             (
                 pos(48),
@@ -229,7 +229,7 @@ fn missing_a_archive_surfaces_as_config_error() {
         "b.rec",
         &[(
             pos(0),
-            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 99, pos(0))),
+            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 99, pos(0), 0)),
         )],
     );
 
@@ -258,7 +258,7 @@ fn missing_a_position_surfaces_as_frame_error() {
         "b.rec",
         &[(
             pos(0),
-            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(9999))),
+            TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 0, pos(9999), 0)),
         )],
     );
 
