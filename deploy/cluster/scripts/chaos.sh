@@ -143,12 +143,19 @@ count_running() {
 # Prometheus endpoint). Ticks ~4/s while the sealer is alive — a finer liveness
 # signal than the block gauge. Tries each executor node like executor_progress.
 sealer_boundaries() {
-  local n v
+  # MAX across all responding executors, NOT the first responder — same
+  # rationale as executor_progress below: a replica that restarted (or is
+  # replaying/catching up) legitimately reports a low/frozen counter while its
+  # peers — and the pipeline — are fine; pinning the probe to it reads as a
+  # pipeline stall when nothing is wrong.
+  local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
-    v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
-    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
+  [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
+  return 1
 }
 
 # Cluster-mode progress probe: the most-recently-committed block number as seen
@@ -167,7 +174,7 @@ executor_progress() {
   # right after hard-executor restarted executor-0).
   local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
-    v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
@@ -372,7 +379,10 @@ run_case() { # <case-name>
       log "node-failure: docker kill kardamom-executor-2 (whole node)"
       docker kill kardamom-executor-2 >/dev/null || fail "could not kill node kardamom-executor-2"
       assert_count executor 2 "${CHAOS_RESTART_SLO_S}"
-      assert_progress
+      # Wide window here too: killing a whole NODE thrashes the runner (docker
+      # teardown + nomad node-down churn) enough that on 4-core CI hosts even
+      # the survivors' metric scrapes black out well past 60s.
+      assert_executor_progress 180
       log "node-failure: docker start kardamom-executor-2 (node returns)"
       docker start kardamom-executor-2 >/dev/null || fail "could not restart node kardamom-executor-2"
       assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
@@ -473,9 +483,17 @@ run_case() { # <case-name>
   # Pipeline must be producing blocks again after recovery. In cluster mode the
   # sealer Prometheus endpoint doesn't exist, so use the executor progress probe;
   # otherwise assert_progress prefers the legacy sealer-boundary probe.
+  # node-failure gets the WIDE window: right after `docker start` of the killed
+  # node, the runner is saturated by nomad rescheduling + the returning node
+  # force-pulling every image through the in-cluster registry — on 4-core CI
+  # runners even the metric scrapes time out through that thrash ("block 0 ->
+  # 0" with the max-across-replicas probe = nobody answered), while the same
+  # case passes cleanly on a 12-core host. Same evidence-based widening as the
+  # quorum-loss case's 180s.
   case "${name}" in
-    cluster-*) assert_executor_progress ;;
-    *)         assert_progress ;;
+    cluster-*)              assert_executor_progress ;;
+    node-failure-*)         assert_executor_progress 180 ;;
+    *)                      assert_progress ;;
   esac
 
   # Let the background load finish its window + drain, then check its verdict.
