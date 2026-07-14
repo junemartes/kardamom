@@ -670,6 +670,14 @@ verified="$(printf '%.0f' "${verified:-0}")"
 diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
 diverged="$(printf '%.0f' "${diverged:-0}")"
 (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
+# The metric resets if the alloc restarted (recovery loop); a PRE-restart
+# divergence still shows in the alloc log — catch it there too.
+if docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
+    alloc=$(nomad job allocs -t "{{range .}}{{.ID}} {{end}}" validator 2>/dev/null | awk "{print \$1}"); \
+    nomad alloc logs "$alloc" 2>/dev/null' 2>/dev/null | grep -q "halted on divergence"; then
+  echo "FAIL: validator halted on divergence (found in alloc log)" >&2
+  exit 1
+fi
 # Incremental-trie shadow-check (--trie-shadow-check 1 in validator.nomad.hcl):
 # every committed block recomputed the state root by FULL rebuild and compared
 # it to the node-incremental walker's. A mismatch fail-stops the validator

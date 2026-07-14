@@ -396,6 +396,15 @@ async fn main() -> Result<()> {
         chain_id,
         ..ExecutorConfig::default()
     };
+    // ALWAYS bound the tx_data join wait. A verifier that loses an envelope
+    // (its multicast image lapsed while it fell behind a load burst — the
+    // side-streams have no retention/refetch yet) must fail LOUDLY, not hang
+    // forever mid-join: exiting lets the supervisor restart it into the
+    // crash-recovery path, which replays the missing tx_data range from the
+    // archive recorders and resumes from the persisted cursor — the designed
+    // recovery loop. (Divergence fail-stops stay distinguishable by their
+    // 'halted on divergence' log line.)
+    cfg.reader.join_timeout = Duration::from_secs(60);
     if resume.is_some() {
         cfg.reader.join_timeout = Duration::from_secs(30);
     }

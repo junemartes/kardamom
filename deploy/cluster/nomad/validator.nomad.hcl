@@ -29,12 +29,19 @@ job "validator" {
   group "validator" {
     count = 1
 
-    # NO restart/reschedule on failure: the validator fail-stops (exit 2) on a
-    # proven divergence, and auto-restarting would erase that signal (a fresh
-    # validator re-syncs from genesis and may not re-hit the divergence). The
-    # cluster-e2e verdict asserts the alloc is still running.
+    # Restarts are the validator's RECOVERY loop, not a signal-eraser: a lost
+    # tx_data envelope (multicast image lapse while lagging a load burst)
+    # fail-stops via the bounded join timeout, and the restart resumes from
+    # the persisted cursor through crash recovery — tx_ordering rides the
+    # cluster replay, the envelope gap replays from the archive recorders.
+    # Divergence fail-stops remain detectable across restarts by their
+    # 'halted on divergence' line in the alloc log (the e2e verdict greps it);
+    # they will crash-loop here, which is correct — a diverged validator must
+    # not be quietly absorbed.
     restart {
-      attempts = 0
+      attempts = 5
+      interval = "10m"
+      delay    = "15s"
       mode     = "fail"
     }
 
