@@ -123,12 +123,22 @@ impl BalBuffer {
     /// Returns `None` if it never showed (the caller treats that as "could not
     /// verify", not as divergence).
     pub fn take(&self, block: u64, timeout: Duration) -> Option<BlockDelta> {
+        // DEADLINE semantics, not per-wakeup timeout: inserts for OTHER keys
+        // notify_all every block (~250ms-2s under a live chain), and a full
+        // fresh timeout per wakeup means a wait for a key that never arrives
+        // NEVER times out — the writer queue then hangs forever on one lost
+        // BAL while the buffer keeps filling (observed as a total validator
+        // freeze with a healthy chain).
+        let deadline = std::time::Instant::now() + timeout;
         let mut guard = self.inner.lock().unwrap();
         loop {
             if let Some(d) = guard.remove(&block) {
                 return Some(d);
             }
-            let (g, wait) = self.cv.wait_timeout(guard, timeout).unwrap();
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return guard.remove(&block);
+            };
+            let (g, wait) = self.cv.wait_timeout(guard, remaining).unwrap();
             guard = g;
             if wait.timed_out() {
                 return guard.remove(&block);
@@ -161,12 +171,18 @@ impl ReceiptBuffer {
     }
 
     pub fn take(&self, idx: BPosition, timeout: Duration) -> Option<Receipt> {
+        // Deadline semantics — see BalBuffer::take (same lost-key-never-times-
+        // out hazard under a continuous receipt stream).
+        let deadline = std::time::Instant::now() + timeout;
         let mut guard = self.inner.lock().unwrap();
         loop {
             if let Some(r) = guard.remove(&idx) {
                 return Some(r);
             }
-            let (g, wait) = self.cv.wait_timeout(guard, timeout).unwrap();
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return guard.remove(&idx);
+            };
+            let (g, wait) = self.cv.wait_timeout(guard, remaining).unwrap();
             guard = g;
             if wait.timed_out() {
                 return guard.remove(&idx);
