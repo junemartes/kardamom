@@ -143,12 +143,19 @@ count_running() {
 # Prometheus endpoint). Ticks ~4/s while the sealer is alive — a finer liveness
 # signal than the block gauge. Tries each executor node like executor_progress.
 sealer_boundaries() {
-  local n v
+  # MAX across all responding executors, NOT the first responder — same
+  # rationale as executor_progress below: a replica that restarted (or is
+  # replaying/catching up) legitimately reports a low/frozen counter while its
+  # peers — and the pipeline — are fine; pinning the probe to it reads as a
+  # pipeline stall when nothing is wrong.
+  local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
     v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
-    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
+  [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
+  return 1
 }
 
 # Cluster-mode progress probe: the most-recently-committed block number as seen
