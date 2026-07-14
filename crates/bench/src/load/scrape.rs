@@ -13,12 +13,14 @@ use tokio::process::Command;
 
 // Default metrics ports (the services' --metrics-addr defaults).
 const PORT_EXECUTOR: u16 = 9004;
-const PORT_SEALER: u16 = 9003;
 const PORT_INGRESS: u16 = 9006;
 const PORT_SEQUENCER: u16 = 9001;
 
 // Exact Prometheus metric names exposed by each service.
 const M_EXECUTOR_BLOCK: &str = "kardamom_executor_block_number";
+// The clustered sealer has no Prometheus endpoint; each executor re-exports
+// the sealer's boundary stream as it decodes cluster egress, so the
+// kardamom_sealer_* series are read off the executor endpoints.
 const M_SEALER_BLOCK: &str = "kardamom_sealer_block_number";
 const M_SEALER_BOUNDARIES: &str = "kardamom_sealer_boundaries_emitted_total";
 const M_INGRESS_RECEIVED: &str = "kardamom_ingress_tx_received_total";
@@ -35,9 +37,11 @@ const M_SERVICE_UP: &str = "kardamom_service_up";
 pub struct MetricsSnapshot {
     /// `(node, executor_block_number)` per scraped executor node.
     pub executor_blocks: Vec<(String, Option<u64>)>,
-    /// Sealer's last sealed block number.
+    /// Sealer's last sealed block number (most-advanced executor observation
+    /// of the cluster's boundary stream).
     pub sealer_block: Option<u64>,
-    /// Sealer block-boundaries-emitted counter (liveness during chaos).
+    /// Sealer block-boundaries counter (liveness during chaos), observed the
+    /// same way.
     pub sealer_boundaries: Option<u64>,
     /// Ingress: total submissions received.
     pub ingress_received: Option<u64>,
@@ -63,12 +67,12 @@ pub struct Scraper {
     /// `docker exec <node> curl 127.0.0.1:<port>` when true; direct
     /// `curl http://<node>:<port>` when false.
     pub via_docker: bool,
-    /// Lowercased service names to scrape: any of executor/sealer/ingress/sequencer.
+    /// Lowercased service names to scrape: any of executor/ingress/sequencer.
+    /// (The sealer values ride the executor scrape — the clustered sealer has
+    /// no endpoint of its own.)
     pub scrape: BTreeSet<String>,
     /// Executor node-container names.
     pub executor_nodes: Vec<String>,
-    /// Sealer node-container name.
-    pub sealer_node: String,
     /// Ingress node-container name.
     pub ingress_node: String,
     /// Sequencer node-container names.
@@ -101,43 +105,29 @@ impl Scraper {
         }
     }
 
-    async fn block_at(&self, node: &str, port: u16, metric: &str) -> Option<u64> {
-        let body = self.fetch(node, port).await?;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        sum_metric(&body, metric).map(|v| v as u64)
-    }
-
     /// Take a full snapshot of the configured services.
     pub async fn snapshot(&self) -> MetricsSnapshot {
         let mut snap = MetricsSnapshot::default();
 
         if self.wants("executor") {
             for node in &self.executor_nodes {
-                let blk = self.block_at(node, PORT_EXECUTOR, M_EXECUTOR_BLOCK).await;
-                snap.executor_blocks.push((node.clone(), blk));
-                let up = self.service_up_at(node, PORT_EXECUTOR).await;
-                snap.service_up.push((format!("executor@{node}"), up));
+                let body = self.fetch(node, PORT_EXECUTOR).await;
+                let g = |m: &str| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    body.as_deref()
+                        .and_then(|b| sum_metric(b, m))
+                        .map(|v| v as u64)
+                };
+                snap.executor_blocks
+                    .push((node.clone(), g(M_EXECUTOR_BLOCK)));
+                // Sealer output as re-exported by this executor from cluster
+                // egress; keep the most-advanced observation across nodes so a
+                // single stalled executor doesn't mask sealer progress.
+                snap.sealer_block = snap.sealer_block.max(g(M_SEALER_BLOCK));
+                snap.sealer_boundaries = snap.sealer_boundaries.max(g(M_SEALER_BOUNDARIES));
+                snap.service_up
+                    .push((format!("executor@{node}"), g(M_SERVICE_UP)));
             }
-        }
-        if self.wants("sealer") {
-            let body = self.fetch(&self.sealer_node, PORT_SEALER).await;
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            {
-                snap.sealer_block = body
-                    .as_deref()
-                    .and_then(|b| sum_metric(b, M_SEALER_BLOCK))
-                    .map(|v| v as u64);
-                snap.sealer_boundaries = body
-                    .as_deref()
-                    .and_then(|b| sum_metric(b, M_SEALER_BOUNDARIES))
-                    .map(|v| v as u64);
-            }
-            let up = body
-                .as_deref()
-                .and_then(|b| sum_metric(b, M_SERVICE_UP))
-                .map(|v| v as u64);
-            snap.service_up
-                .push((format!("sealer@{}", self.sealer_node), up));
         }
         if self.wants("ingress") {
             let body = self.fetch(&self.ingress_node, PORT_INGRESS).await;
@@ -189,12 +179,6 @@ impl Scraper {
             snap.seq_backpressure = any_b.then_some(b);
         }
         snap
-    }
-
-    async fn service_up_at(&self, node: &str, port: u16) -> Option<u64> {
-        let body = self.fetch(node, port).await?;
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        sum_metric(&body, M_SERVICE_UP).map(|v| v as u64)
     }
 }
 

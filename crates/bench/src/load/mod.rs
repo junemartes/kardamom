@@ -97,8 +97,6 @@ pub struct LoadConfig {
     pub metrics_via_docker: bool,
     /// Executor node-container names.
     pub executor_nodes: Vec<String>,
-    /// Sealer node-container name.
-    pub sealer_node: String,
     /// Ingress node-container name.
     pub ingress_node: String,
     /// Sequencer node-container names.
@@ -167,7 +165,6 @@ fn build_scraper(cfg: &LoadConfig) -> Scraper {
             .map(|s| s.to_lowercase())
             .collect::<BTreeSet<_>>(),
         executor_nodes: cfg.executor_nodes.clone(),
-        sealer_node: cfg.sealer_node.clone(),
         ingress_node: cfg.ingress_node.clone(),
         sequencer_nodes: cfg.sequencer_nodes.clone(),
     }
