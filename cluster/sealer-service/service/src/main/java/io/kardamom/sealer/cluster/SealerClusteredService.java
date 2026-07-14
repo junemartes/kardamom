@@ -301,15 +301,25 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private void handleReplayRequest(final ClientSession session, final long fromIndex, final long fromBlock) {
         if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
+            // stdout, like the role lines: grep-able next to the chaos suite's
+            // other signals (the service has no other logger).
+            System.out.println("cluster REPLAY memberId=" + memberId
+                + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
+                + ") UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")");
             offerControl(session, EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
             return;
         }
+        long served = 0;
         for (final RetainedFrame f : retained) {
             final boolean wanted = f.boundary ? f.key >= fromBlock : f.key >= fromIndex;
             if (wanted) {
                 offerBytesToSession(session, f.frame);
+                served++;
             }
         }
+        System.out.println("cluster REPLAY memberId=" + memberId
+            + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
+            + ") served=" + served + " retained=" + retained.size());
         offerControl(session, EGRESS_KIND_REPLAY_DONE, state.canonicalCount(), state.blockNumber());
     }
 

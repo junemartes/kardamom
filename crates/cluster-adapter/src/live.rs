@@ -309,7 +309,12 @@ fn run_session(
             {
                 let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
                 if let Some(framed) = driver.wrap_app(&req, now as i64) {
-                    ingress.publish_best_effort(to_aligned(&framed));
+                    // RETRYING publish, not best-effort: this rare, critical
+                    // message is sent exactly when the ingress publication is
+                    // at its busiest (mass reconnects under churn) — the
+                    // best-effort deadline dropped it every 3s in lockstep
+                    // with the backpressure that caused the stall.
+                    let _ = ingress.publish_bytes(to_aligned(&framed));
                     tracing::info!(
                         next_index = cursor.0,
                         next_block = cursor.1,
