@@ -114,10 +114,7 @@ contract ETHLockboxTest is Test {
     {
         vm.deal(address(lockbox), 10 ether);
         wtx = ETHLockbox.WithdrawalTransaction({
-            nonce: 0,
-            sender: L2_SENDER,
-            target: L1_TARGET,
-            value: value
+            nonce: 0, sender: L2_SENDER, target: L1_TARGET, value: value
         });
         bytes32 leaf0 = _leaf(0, L1_TARGET, value);
         bytes32 sibling = _leaf(1, address(0xdead), 3 ether); // some other withdrawal
@@ -181,7 +178,8 @@ contract ETHLockboxTest is Test {
             uint256 leafIndex,
             bytes32[] memory proof
         ) = _setupWithdrawal(1 ether);
-        oracle.set(0, _outputRoot(stateRoot, withdrawalsRoot), false); // window not elapsed / deleted
+        // window not elapsed / deleted
+        oracle.set(0, _outputRoot(stateRoot, withdrawalsRoot), false);
 
         vm.expectRevert(ETHLockbox.NotFinalizable.selector);
         lockbox.finalizeWithdrawal(wtx, 0, stateRoot, withdrawalsRoot, leafIndex, proof);
@@ -221,10 +219,7 @@ contract ETHLockboxTest is Test {
         // A range with exactly one withdrawal: root == leaf, empty proof.
         vm.deal(address(lockbox), 10 ether);
         ETHLockbox.WithdrawalTransaction memory wtx = ETHLockbox.WithdrawalTransaction({
-            nonce: 0,
-            sender: L2_SENDER,
-            target: L1_TARGET,
-            value: 2 ether
+            nonce: 0, sender: L2_SENDER, target: L1_TARGET, value: 2 ether
         });
         bytes32 withdrawalsRoot = _leaf(0, L1_TARGET, 2 ether);
         bytes32 stateRoot = keccak256("sr");
@@ -237,9 +232,8 @@ contract ETHLockboxTest is Test {
 
     function test_unauthorized_upgrade_reverts() public {
         ETHLockbox newImpl = new ETHLockbox();
-        (bool ok,) = address(lockbox).call(
-            abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), "")
-        );
+        (bool ok,) = address(lockbox)
+            .call(abi.encodeWithSignature("upgradeToAndCall(address,bytes)", address(newImpl), ""));
         assertFalse(ok, "non-factory upgrade must revert");
     }
 }

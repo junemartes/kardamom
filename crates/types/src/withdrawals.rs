@@ -95,7 +95,11 @@ pub fn withdrawal_proof(leaves: &[B256], index: usize) -> Vec<B256> {
     let mut idx = index;
     let mut proof = Vec::new();
     while level.len() > 1 {
-        let sibling = if idx % 2 == 0 { level[idx + 1] } else { level[idx - 1] };
+        let sibling = if idx.is_multiple_of(2) {
+            level[idx + 1]
+        } else {
+            level[idx - 1]
+        };
         proof.push(sibling);
         level = level.chunks(2).map(|p| hash_pair(p[0], p[1])).collect();
         idx /= 2;
@@ -109,7 +113,11 @@ pub fn recompute_root(leaf: B256, index: usize, proof: &[B256]) -> B256 {
     let mut node = leaf;
     let mut idx = index;
     for sibling in proof {
-        node = if idx & 1 == 0 { hash_pair(node, *sibling) } else { hash_pair(*sibling, node) };
+        node = if idx & 1 == 0 {
+            hash_pair(node, *sibling)
+        } else {
+            hash_pair(*sibling, node)
+        };
         idx >>= 1;
     }
     node

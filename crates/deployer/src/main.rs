@@ -221,7 +221,8 @@ async fn run_deploy(
                     let oracle = match output_oracle {
                         Some(a) => a,
                         None if deploying_oracle => {
-                            let oargs = oracle_init_args(attester, challenger, finalization_window)?;
+                            let oargs =
+                                oracle_init_args(attester, challenger, finalization_window)?;
                             deployer.predict_proxy_address(
                                 *chain_id,
                                 ContractId::WithdrawalOutputOracle,

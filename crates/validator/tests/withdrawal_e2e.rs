@@ -74,7 +74,8 @@ fn wallet_provider(anvil: &alloy_node_bindings::AnvilInstance, key: &str) -> imp
         .connect_http(anvil.endpoint_url());
     // alloy's default HTTP poll interval is slow; tighten it so `get_receipt`
     // returns promptly against the local node.
-    p.client().set_poll_interval(std::time::Duration::from_millis(50));
+    p.client()
+        .set_poll_interval(std::time::Duration::from_millis(50));
     p
 }
 
@@ -83,7 +84,10 @@ fn wallet_provider(anvil: &alloy_node_bindings::AnvilInstance, key: &str) -> imp
 /// (kept alive by the caller) plus the deployed oracle/lockbox addresses.
 /// Returns `None` if anvil is unavailable.
 async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address)> {
-    let anvil = alloy_node_bindings::Anvil::new().block_time(1).try_spawn().ok()?;
+    let anvil = alloy_node_bindings::Anvil::new()
+        .block_time(1)
+        .try_spawn()
+        .ok()?;
 
     let deploy_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
@@ -115,8 +119,11 @@ async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address
     // Predict the oracle proxy address, wire it into the lockbox init, deploy
     // both atomically.
     let oracle_init = encode_oracle_init_args(ATTESTER_ADDR, CHALLENGER_ADDR, WINDOW);
-    let predicted_oracle =
-        deployer.predict_proxy_address(L2_CHAIN_ID, ContractId::WithdrawalOutputOracle, &oracle_init);
+    let predicted_oracle = deployer.predict_proxy_address(
+        L2_CHAIN_ID,
+        ContractId::WithdrawalOutputOracle,
+        &oracle_init,
+    );
     let lockbox_init = encode_address_pair(L2_MINTER, predicted_oracle);
 
     deployer
@@ -151,7 +158,10 @@ async fn setup() -> Option<(alloy_node_bindings::AnvilInstance, Address, Address
         .proxy;
     // The factory's CREATE2 address must match the Rust prediction used to wire
     // the lockbox — otherwise the lockbox would point at the wrong oracle.
-    assert_eq!(oracle_addr, predicted_oracle, "predicted oracle address must match deployed");
+    assert_eq!(
+        oracle_addr, predicted_oracle,
+        "predicted oracle address must match deployed"
+    );
     Some((anvil, oracle_addr, lockbox_addr))
 }
 
@@ -159,7 +169,8 @@ fn deposit_provider(anvil: &alloy_node_bindings::AnvilInstance) -> impl Provider
     let p = ProviderBuilder::new()
         .disable_recommended_fillers()
         .connect_http(anvil.endpoint_url());
-    p.client().set_poll_interval(std::time::Duration::from_millis(50));
+    p.client()
+        .set_poll_interval(std::time::Duration::from_millis(50));
     p
 }
 
@@ -178,7 +189,11 @@ async fn attester_posts_output_matching_rust_root() {
 
     // Fund the lockbox via a deposit (the on-ramp).
     lockbox
-        .depositETH(address!("0000000000000000000000000000000000001234"), 0, Bytes::new())
+        .depositETH(
+            address!("0000000000000000000000000000000000001234"),
+            0,
+            Bytes::new(),
+        )
         .value(U256::from(5_000_000_000_000_000_000u128))
         .send()
         .await
@@ -203,13 +218,19 @@ async fn attester_posts_output_matching_rust_root() {
     let output_root = withdrawals::output_root(state_root, wroot);
 
     let poster = OutputPoster::new(attester_provider.clone(), oracle_addr);
-    poster.propose_output(output_root, 100).await.expect("attester posts output");
+    poster
+        .propose_output(output_root, 100)
+        .await
+        .expect("attester posts output");
 
     // Cross-language assertion: the on-chain output root equals the Rust-computed
     // one, and the attester recorded exactly one output.
     let oracle = WithdrawalOutputOracle::new(oracle_addr, read_provider);
     assert_eq!(oracle.outputCount().call().await.unwrap(), U256::from(1u64));
-    assert_eq!(oracle.outputRootAt(U256::ZERO).call().await.unwrap(), output_root);
+    assert_eq!(
+        oracle.outputRootAt(U256::ZERO).call().await.unwrap(),
+        output_root
+    );
 }
 
 #[tokio::test]
@@ -226,7 +247,11 @@ async fn full_withdrawal_finalize_and_challenge() {
 
     // Fund the lockbox.
     lockbox
-        .depositETH(address!("0000000000000000000000000000000000001234"), 0, Bytes::new())
+        .depositETH(
+            address!("0000000000000000000000000000000000001234"),
+            0,
+            Bytes::new(),
+        )
         .value(U256::from(5_000_000_000_000_000_000u128))
         .send()
         .await
@@ -239,7 +264,12 @@ async fn full_withdrawal_finalize_and_challenge() {
     let l2_sender = address!("00000000000000000000000000000000000000AA");
     let recipient = address!("00000000000000000000000000000000000000CC");
     let value = U256::from(1_000_000_000_000_000_000u128);
-    let leaves = vec![withdrawals::withdrawal_leaf(U256::ZERO, l2_sender, recipient, value)];
+    let leaves = vec![withdrawals::withdrawal_leaf(
+        U256::ZERO,
+        l2_sender,
+        recipient,
+        value,
+    )];
     let wroot = withdrawals::withdrawals_root(&leaves);
     let state_root = B256::from([0x99; 32]);
     let output_root = withdrawals::output_root(state_root, wroot);
@@ -257,7 +287,14 @@ async fn full_withdrawal_finalize_and_challenge() {
 
     // Before the window: finalize must revert.
     let early = lockbox
-        .finalizeWithdrawal(wtx.clone(), U256::ZERO, state_root, wroot, U256::ZERO, proof.clone())
+        .finalizeWithdrawal(
+            wtx.clone(),
+            U256::ZERO,
+            state_root,
+            wroot,
+            U256::ZERO,
+            proof.clone(),
+        )
         .send()
         .await;
     assert!(early.is_err(), "finalize before window must revert");
@@ -279,7 +316,12 @@ async fn full_withdrawal_finalize_and_challenge() {
     assert_eq!(read_provider.get_balance(recipient).await.unwrap(), value);
 
     // Challenge path: a second (bad) output is deleted and can never finalize.
-    let bad_leaves = vec![withdrawals::withdrawal_leaf(U256::from(2u64), l2_sender, recipient, value)];
+    let bad_leaves = vec![withdrawals::withdrawal_leaf(
+        U256::from(2u64),
+        l2_sender,
+        recipient,
+        value,
+    )];
     let bad_wroot = withdrawals::withdrawals_root(&bad_leaves);
     let bad_state = B256::from([0xBA; 32]);
     poster

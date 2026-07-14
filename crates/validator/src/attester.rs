@@ -56,7 +56,8 @@ pub fn collect_withdrawal_leaves(delta: &BlockDelta) -> Vec<B256> {
             if log.address != withdrawals::MESSAGE_PASSER {
                 continue;
             }
-            if let Some((nonce, leaf)) = withdrawals::decode_message_passed(&log.topics, &log.data) {
+            if let Some((nonce, leaf)) = withdrawals::decode_message_passed(&log.topics, &log.data)
+            {
                 found.push((nonce, leaf));
             }
         }
@@ -174,7 +175,10 @@ mod tests {
         ]);
         let leaves = collect_withdrawal_leaves(&delta);
         assert_eq!(leaves.len(), 2);
-        assert_eq!(leaves[0], withdrawals::withdrawal_leaf(U256::ZERO, s, t, U256::from(100u64)));
+        assert_eq!(
+            leaves[0],
+            withdrawals::withdrawal_leaf(U256::ZERO, s, t, U256::from(100u64))
+        );
         assert_eq!(
             leaves[1],
             withdrawals::withdrawal_leaf(U256::from(1u64), s, t, U256::from(200u64))
@@ -194,10 +198,17 @@ mod tests {
         let sr = B256::from([0xab; 32]);
         let s = Address::from([0x11; 20]);
         let t = Address::from([0x22; 20]);
-        let leaves =
-            vec![withdrawals::withdrawal_leaf(U256::ZERO, s, t, U256::from(5u64))];
+        let leaves = vec![withdrawals::withdrawal_leaf(
+            U256::ZERO,
+            s,
+            t,
+            U256::from(5u64),
+        )];
         let out = build_output(sr, &leaves);
         assert_eq!(out.withdrawals_root, withdrawals::withdrawals_root(&leaves));
-        assert_eq!(out.output_root, withdrawals::output_root(sr, out.withdrawals_root));
+        assert_eq!(
+            out.output_root,
+            withdrawals::output_root(sr, out.withdrawals_root)
+        );
     }
 }

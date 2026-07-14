@@ -16,6 +16,11 @@ pragma solidity ^0.8.26;
 ///         This is a genesis predeploy (its **runtime** bytecode is seeded at a
 ///         fixed address), so it is intentionally not upgradeable and has no
 ///         constructor-time state.
+// Locking ETH is the DESIGN: this L2 predeploy escrows the withdrawn value
+// permanently on L2 (the burn side of the off-ramp); the corresponding release
+// happens on L1 from the ETHLockbox after the output finalizes. There must be
+// no L2-side withdrawal function.
+// slither-disable-next-line locked-ether
 contract L2ToL1MessagePasser {
     /// @notice Monotonic withdrawal counter. Also the withdrawal's global index
     ///         (its position in the validator's leaf ordering).

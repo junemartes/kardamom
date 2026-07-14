@@ -64,8 +64,7 @@ impl ContractId {
     /// `abi_encode` of the tuple would prepend a leading offset because the tuple
     /// contains a dynamic member (the string), diverging from Solidity.
     pub fn proxy_salt(self, l2_chain_id: u64) -> B256 {
-        let encoded =
-            (U256::from(l2_chain_id), self.id(), "proxy".to_string()).abi_encode_params();
+        let encoded = (U256::from(l2_chain_id), self.id(), "proxy".to_string()).abi_encode_params();
         keccak256(encoded)
     }
 
@@ -117,7 +116,10 @@ mod tests {
         let id = ContractId::WithdrawalOutputOracle.id();
         assert_eq!(id, keccak256(b"kardamom.l1.WithdrawalOutputOracle"));
         let sel = ContractId::WithdrawalOutputOracle.init_selector();
-        assert_eq!(&sel[..], &keccak256(b"initialize(address,address,uint64)")[..4]);
+        assert_eq!(
+            &sel[..],
+            &keccak256(b"initialize(address,address,uint64)")[..4]
+        );
         // Distinct from the other ids.
         assert_ne!(id, ContractId::EthLockbox.id());
         assert_ne!(id, ContractId::KardamomL2Settlement.id());

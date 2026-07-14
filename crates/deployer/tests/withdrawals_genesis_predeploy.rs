@@ -17,8 +17,8 @@ fn dev_withdrawals_genesis_predeploys_message_passer_with_artifact_bytecode() {
 
     // Genesis side.
     let toml = workspace.join("chains/dev-withdrawals.toml");
-    let raw = std::fs::read_to_string(&toml)
-        .unwrap_or_else(|e| panic!("read {}: {e}", toml.display()));
+    let raw =
+        std::fs::read_to_string(&toml).unwrap_or_else(|e| panic!("read {}: {e}", toml.display()));
     let genesis: Genesis = toml::from_str(&raw).expect("dev-withdrawals.toml parses");
     genesis.validate().expect("dev-withdrawals.toml validates");
     let entry = genesis

@@ -41,16 +41,14 @@ contract WithdrawalFlowTest is Test {
         // Lockbox proxy, pointed at the oracle.
         ETHLockbox lImpl = new ETHLockbox();
         lockbox = ETHLockbox(
-            payable(
-                address(
+            payable(address(
                     new ERC1967Proxy(
                         address(lImpl),
                         abi.encodeWithSelector(
                             ETHLockbox.initialize.selector, L2_MINTER, address(oracle)
                         )
                     )
-                )
-            )
+                ))
         );
         vm.warp(1_700_000_000);
     }

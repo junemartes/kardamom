@@ -107,8 +107,8 @@ contract ETHLockbox is KardamomUUPSBase {
 
         if (_merkleRoot(wh, leafIndex, proof) != withdrawalsRoot) revert BadInclusionProof();
 
-        bytes32 outputRoot =
-            keccak256(abi.encodePacked(OUTPUT_VERSION, stateRoot, withdrawalsRoot));
+        bytes memory packed = abi.encodePacked(OUTPUT_VERSION, stateRoot, withdrawalsRoot);
+        bytes32 outputRoot = keccak256(packed);
         if (IWithdrawalOutputOracle(outputOracle).outputRootAt(outputIndex) != outputRoot) {
             revert OutputRootMismatch();
         }
@@ -117,6 +117,11 @@ contract ETHLockbox is KardamomUUPSBase {
         }
 
         finalizedWithdrawals[wh] = true;
+        // Paying an arbitrary target is the CONTRACT'S PURPOSE: the recipient +
+        // amount are authorized by the Merkle inclusion proof against an
+        // attested, challenge-window-finalized output root (checked above), and
+        // the replay guard is set before the transfer (CEI).
+        // slither-disable-next-line arbitrary-send-eth
         (bool ok,) = wtx.target.call{value: wtx.value}("");
         if (!ok) revert TransferFailed();
         emit WithdrawalFinalized(wh, wtx.target, wtx.value);
