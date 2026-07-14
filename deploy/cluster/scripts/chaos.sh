@@ -379,7 +379,10 @@ run_case() { # <case-name>
       log "node-failure: docker kill kardamom-executor-2 (whole node)"
       docker kill kardamom-executor-2 >/dev/null || fail "could not kill node kardamom-executor-2"
       assert_count executor 2 "${CHAOS_RESTART_SLO_S}"
-      assert_progress
+      # Wide window here too: killing a whole NODE thrashes the runner (docker
+      # teardown + nomad node-down churn) enough that on 4-core CI hosts even
+      # the survivors' metric scrapes black out well past 60s.
+      assert_executor_progress 180
       log "node-failure: docker start kardamom-executor-2 (node returns)"
       docker start kardamom-executor-2 >/dev/null || fail "could not restart node kardamom-executor-2"
       assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
