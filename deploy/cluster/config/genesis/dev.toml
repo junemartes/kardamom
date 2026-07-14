@@ -1,10 +1,11 @@
 # kardamom cluster dev chain genesis.
 #
-# Copied from chains/dev.toml and extended to prefund the first 16
+# Copied from chains/dev.toml and extended to prefund the first 18
 # Anvil/Hardhat-derived accounts (the well-known test mnemonic
 # "test test test test test test test test test test test junk") so the
 # transfers smoke test (scripts/smoke.sh) has funded signers. Account #0 is the
-# canonical kardamom dev account; #0..#15 each get 1000 ETH.
+# canonical kardamom dev account; #0..#17 each get 1000 ETH (#16/#17 are
+# dedicated to the ci-cluster.sh ingress-/executor-churn re-smokes).
 #
 # Shipped to the executor alloc via the Nomad `template` stanza in
 # nomad/executor.nomad.hcl and passed with `--chain`.
@@ -107,6 +108,23 @@ balance = "1000000000000000000000"
 # pk: 0x8166f546bab6da521a8369cab06c5d2b9e46670292d85c875ee9ec20e84ffb61
 [[alloc]]
 address = "0xcd3B766CCDd6AE721141F452C550Ca635964ce71"
+balance = "1000000000000000000000"
+
+# --- Anvil account #16 (dedicated to the ingress-churn failover re-smoke) -----
+# pk: 0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0
+# Used by scripts/ci-cluster.sh's ingress-churn step so it owns its own nonce
+# chain (first tx at nonce 0) and never collides with the gate (#0), load
+# harness (#1..#6), or chaos cases (#7..#15) — no cross-stage nonce coordination.
+[[alloc]]
+address = "0x2546BcD3c84621e976D8185a91A922aE77ECEc30"
+balance = "1000000000000000000000"
+
+# --- Anvil account #17 (dedicated to the fallback executor-churn re-smoke) -----
+# pk: 0x689af8efa8c651a91ad287602527f3af2fe9f6501a7ac4b061667b5a93e037fd
+# Used by ci-cluster.sh's legacy/fallback executor-churn re-smoke so it too sends
+# nonce 0 from its own account, letting smoke.sh drop the NONCE knob entirely.
+[[alloc]]
+address = "0xbDA5747bFD65F08deb54cb465eB87D40e51B197E"
 balance = "1000000000000000000000"
 
 # --- ERC-7955 permissionless CREATE2 factory predeploy (from chains/dev.toml).

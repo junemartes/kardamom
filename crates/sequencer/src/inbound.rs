@@ -10,23 +10,26 @@
 //! `tx_hash` populated by the proxy — no recovery or hashing happens here.
 
 use crate::error::SequencerError;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{TxDataLoc, TxEnvelope};
 
-/// Subscription to one tx_data stream. Yields `(tx_data_position, envelope)`
-/// per Aeron fragment. Production implementations wrap a
-/// `log` tx_data subscriber; tests use [`fakes::ScriptedTxData`].
+/// Subscription to one tx_data stream. Yields `(TxDataLoc, envelope)` per Aeron
+/// fragment — the envelope paired with its publisher `session_id` and
+/// `BPosition`. Production implementations wrap a `log` tx_data subscriber;
+/// tests use [`fakes::ScriptedTxData`].
 ///
-/// Same shape as the executor's `TxDataSubscription` trait; the
-/// difference is the sequencer is one of P concurrent subscribers per
-/// shard, while the executor is the sole consumer per shard for the
-/// envelope→ref join.
+/// Same shape as the executor's `TxDataSubscription` trait; the difference is
+/// the sequencer is one of P concurrent subscribers per shard, while the
+/// executor is the sole consumer per shard for the envelope→ref join. The
+/// session id in `TxDataLoc` discriminates concurrent (active/active) ingress
+/// publishers so the stamped `TxRef.tx_data_session_id` makes the executor join
+/// key unique.
 pub trait TxDataSubscriber: Send {
     /// Poll for at most one message. Returns:
-    ///  - `Ok(Some((tx_data_position, env)))` on the next available fragment.
+    ///  - `Ok(Some((loc, env)))` on the next available fragment.
     ///  - `Ok(None)` when no message is ready (caller backs off).
     ///  - `Err(IngressDisconnected)` when the subscription is permanently
     ///    closed.
-    fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError>;
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError>;
 }
 
 // ===========================================================================
@@ -39,18 +42,18 @@ pub mod fakes {
 
     use super::*;
 
-    /// In-memory tx_data subscription scripted with `(position, envelope)`
-    /// pairs in arrival order. Tests typically prepare a vector of envelopes
-    /// and synthesize monotonically increasing positions before driving
-    /// `Sequencer::run_once`.
+    /// In-memory tx_data subscription scripted with `(loc, envelope)` pairs in
+    /// arrival order. Tests typically prepare a vector of envelopes and
+    /// synthesize monotonically increasing [`TxDataLoc`]s (session + position)
+    /// before driving `Sequencer::run_once`.
     #[derive(Default)]
     pub struct ScriptedTxData {
-        pub queue: VecDeque<(BPosition, TxEnvelope)>,
+        pub queue: VecDeque<(TxDataLoc, TxEnvelope)>,
         pub disconnected: bool,
     }
 
     impl TxDataSubscriber for ScriptedTxData {
-        fn poll(&mut self) -> Result<Option<(BPosition, TxEnvelope)>, SequencerError> {
+        fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
             if self.disconnected {
                 return Err(SequencerError::IngressDisconnected);
             }

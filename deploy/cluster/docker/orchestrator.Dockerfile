@@ -43,9 +43,10 @@ RUN arch="$(dpkg --print-architecture)" && \
 # foundry `cast` for smoke.sh's preferred Path A (signed eth_sendRawTransaction +
 # receipt poll). The cluster-e2e workflow installs this via foundry-toolchain on
 # the runner; bundle it here so the LOCAL smoke matches CI instead of falling back
-# to smoke.sh's curl path, which needs a nonce-specific pre-signed RAW_TX and so
-# can't do the NONCE=1 redundancy re-smoke. foundryup downloads a prebuilt binary
-# for the image arch (amd64/arm64).
+# to smoke.sh's curl path, whose hardcoded pre-signed RAW_TX only covers account
+# #0 — it can't sign from the per-check dedicated accounts (#16/#17, via PK) the
+# churn re-smokes use. foundryup downloads a prebuilt binary for the image arch
+# (amd64/arm64).
 RUN curl -L https://foundry.paradigm.xyz | bash && \
     /root/.foundry/bin/foundryup && \
     install -m0755 /root/.foundry/bin/cast /usr/local/bin/cast

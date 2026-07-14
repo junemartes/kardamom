@@ -365,7 +365,7 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     let (status_success, logs) = match &result {
         ExecutionResult::Success { logs, .. } => (true, logs.clone()),
         ExecutionResult::Revert { .. } => (false, Vec::<Log>::new()),
-        ExecutionResult::Halt { reason: _, .. } => (false, Vec::<Log>::new()),
+        ExecutionResult::Halt { .. } => (false, Vec::<Log>::new()),
     };
 
     // Build the write set from revm's final-state cache. Both the mint

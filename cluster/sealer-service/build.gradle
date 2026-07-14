@@ -1,0 +1,33 @@
+// Root build for the Kardamom sealer cluster service.
+//
+// Common Java 17 toolchain + JUnit 5 test platform for every subproject. The
+// :core project carries the deterministic state machine and its Aeron-free
+// tests; :service carries the Aeron ClusteredService adapter.
+
+subprojects {
+    apply plugin: 'java'
+
+    group = 'io.kardamom'
+    version = '0.1.0'
+
+    repositories {
+        mavenCentral()
+    }
+
+    java {
+        toolchain {
+            languageVersion = JavaLanguageVersion.of(17)
+        }
+    }
+
+    tasks.withType(JavaCompile).configureEach {
+        options.encoding = 'UTF-8'
+    }
+
+    tasks.withType(Test).configureEach {
+        useJUnitPlatform()
+        testLogging {
+            events 'passed', 'skipped', 'failed'
+        }
+    }
+}

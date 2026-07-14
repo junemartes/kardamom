@@ -27,13 +27,18 @@ governor = "0.10"
 hyper = { version = "1", features = ["http1", "server"] }
 jsonrpsee.workspace = true
 kardamom-log = { workspace = true, features = ["testing"] }
+# Cluster (Raft) transport adapter: the ingress on-quorum ack gate derives its
+# durable watermark from cluster egress progress (ClusterWatermark).
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
 metrics.workspace = true
 nonzero_ext = "0.3"
 secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
+serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tower = { version = "0.5", features = ["util"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -48,6 +53,9 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 futures.workspace = true
 jsonrpsee = { version = "0.26", features = ["server", "macros", "client", "http-client"] }
 k256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+# `testing` exposes cluster-adapter's in-memory gateway fakes (FakeEgress) used
+# by the cluster watermark observer unit tests.
+kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
 metrics = { workspace = true }
 rand = "0.9"

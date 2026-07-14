@@ -108,7 +108,7 @@ must_contain(CLUSTER / "Makefile", f"TAG := {image_tag}", "image tag")
 
 # --- Nomad job specs ------------------------------------------------------------
 jobs = CLUSTER / "nomad"
-for svc in ("ingress", "sequencer", "executor", "sealer", "da-watcher", "batcher"):
+for svc in ("ingress", "sequencer", "executor", "cluster", "da-watcher", "batcher"):
     must_contain(
         jobs / f"{svc}.nomad.hcl",
         f"{registry}/kardamom-{svc}:{image_tag}",
@@ -119,15 +119,10 @@ must_contain(
     f"{registry}/kardamom-aeron:{image_tag}",
     "aeron image ref",
 )
-# NOTE: the recorder + quorum jobs were removed (durability is now
-# archive-at-the-sealer via the sealer's --archive-durability sidecar). The
-# sealer job must carry that flag, else nothing publishes the durable watermark
-# ingress --ack-policy on-quorum gates on.
-must_contain(
-    jobs / "sealer.nomad.hcl",
-    "--archive-durability",
-    "sealer archive-at-the-sealer durability sidecar flag",
-)
+# NOTE: cluster-only. Ordering + durability are provided by the Aeron Cluster
+# (Raft) job (cluster.nomad.hcl); the standalone sealer + its --archive-durability
+# sidecar are gone, so the durable watermark ingress --ack-policy on-quorum gates
+# on now comes from cluster egress progress (ClusterWatermark).
 must_contain(jobs / "anvil.nomad.hcl", f'"{anvil_l1}"', "anvil L1 port")
 must_contain(
     jobs / "da-watcher.nomad.hcl",
@@ -138,75 +133,19 @@ must_contain(jobs / "ingress.nomad.hcl", f"static = {ingress_rpc}", "ingress RPC
 must_contain(jobs / "executor.nomad.hcl", f'"{chain_id}"', "L2 chain id")
 
 # --- config templates -----------------------------------------------------------
-# tx_ordering now uses MDC: each publisher binds its own control endpoint, and
-# subscribers attach to every endpoint in tx_ordering_mdc_publishers. The
-# contract: the sealer's channel_b_mdc_control MUST be one of those endpoints
-# (else the sealer publishes to a control endpoint no subscriber attaches to,
-# silently dropping every boundary), and channel_b_boundary_stream_id MUST equal
-# channels tx_ordering_stream_id (the boundary stream all subscribers read).
-import re as _re
-
-
-def _extract(path, pattern, label):
-    rel = path.relative_to(REPO)
-    if not path.exists():
-        err(f"{rel}: file missing ({label})")
-        return None
-    m = _re.search(pattern, path.read_text(), _re.M)
-    if not m:
-        err(f"{rel}: could not find {label}")
-        return None
-    return m.group(1).strip()
-
-
-sealer_mdc = _extract(
-    CLUSTER / "config" / "sealer.toml.tpl",
-    r'^channel_b_mdc_control\s*=\s*"([^"]+)"',
-    "sealer channel_b_mdc_control",
-)
-channels_text = (CLUSTER / "config" / "channels.toml.tpl").read_text()
-mdc_publishers = _re.findall(r'"(\d+\.\d+\.\d+\.\d+:\d+)"', channels_text)
-if sealer_mdc is not None and sealer_mdc not in mdc_publishers:
-    err(
-        f"sealer channel_b_mdc_control {sealer_mdc!r} is not in "
-        f"tx_ordering_mdc_publishers {mdc_publishers!r} — the sealer would "
-        "publish to a control endpoint no subscriber attaches to"
-    )
-
-sealer_bnd = _extract(
-    CLUSTER / "config" / "sealer.toml.tpl",
-    r"^channel_b_boundary_stream_id\s*=\s*(\d+)",
-    "sealer channel_b_boundary_stream_id",
-)
-channels_ordering_sid = _extract(
-    CLUSTER / "config" / "channels.toml.tpl",
-    r"^tx_ordering_stream_id\s*=\s*(\d+)",
-    "channels tx_ordering_stream_id",
-)
-if (
-    sealer_bnd is not None
-    and channels_ordering_sid is not None
-    and sealer_bnd != channels_ordering_sid
-):
-    err(
-        "sealer channel_b_boundary_stream_id != channels tx_ordering_stream_id "
-        f"({sealer_bnd!r} vs {channels_ordering_sid!r}) — publishers and "
-        "subscribers would disagree on the boundary stream"
-    )
+# Cluster-only: tx_ordering is carried by the Aeron Cluster (Raft), not the
+# legacy MDC pub/sub, so the old sealer channel_b_mdc_control ⊆ tx_ordering_mdc_
+# publishers contract (and the standalone sealer.toml.tpl it read) are gone.
 # channels.toml.tpl is consumed via --log-config by every pipeline service;
 # spot-check the flag is actually wired.
-for job in ("ingress", "sequencer", "executor", "sealer", "da-watcher"):
+for job in ("ingress", "sequencer", "executor", "da-watcher"):
     must_contain(
         jobs / f"{job}.nomad.hcl",
         "--log-config",
         "channels config passed via --log-config (issue #36)",
     )
-# The sequencer publisher control endpoint is injected from Nomad node meta.
-must_contain(
-    jobs / "sequencer.nomad.hcl",
-    "--tx-ordering-mdc-control",
-    "sequencer tx_ordering MDC control endpoint flag",
-)
+# Cluster-only: the sequencer publishes tx_ordering to the Aeron Cluster, not via
+# an Aeron MDC control endpoint, so there is no --tx-ordering-mdc-control flag.
 must_contain(
     CLUSTER / "config" / "genesis" / "dev.toml",
     f"chain_id = {chain_id}",
@@ -248,6 +187,113 @@ must_contain(
     registry,
     "insecure-registry address in cluster-bootstrap/doctor",
 )
+
+# --- Aeron Cluster (Raft) sealer ------------------------------------------------
+# The 3-member cluster topology is the canonical contract here, but it is mirrored
+# as literals in three places that cannot read YAML:
+#   - nomad/cluster.nomad.hcl    : the -Dkardamom.cluster.members string + ingressStreamId
+#   - config/sequencer.toml.tpl  : the [cluster] ingress_endpoints + stream ids
+#   - config/executor.toml       : the [cluster] ingress_endpoints + stream ids
+# Derive the expected member endpoints from node_classes.sealer (ip_start lane on
+# ip_prefix) + cluster_member_count + cluster_ports, then assert each mirror agrees.
+ip_prefix = scalar(gv, "ip_prefix")
+cluster_member_count = scalar(gv, "cluster_member_count")
+cluster_ingress_stream_id = scalar(gv, "cluster_ingress_stream_id")
+cluster_egress_stream_id = scalar(gv, "cluster_egress_stream_id")
+cluster_egress_port = scalar(gv, "cluster_egress_port")
+
+# cluster_ports: indented `key: int` entries under the `cluster_ports:` block.
+cp_block = re.search(r"^cluster_ports:\n((?:\s{2}\w+:.*\n?)+)", gv, re.M)
+cluster_ports = (
+    dict(re.findall(r"^\s{2}(\w+):\s*(\d+)", cp_block.group(1), re.M))
+    if cp_block
+    else {}
+)
+for k in ("ingress", "consensus", "log", "catchup", "archive_control"):
+    if k not in cluster_ports:
+        err(f"group_vars/all.yml: missing cluster_ports.{k}")
+
+# sealer node-class ip_start lane (members at <ip_prefix>.<ip_start + i>).
+m_sealer = re.search(r"^\s{2}sealer:\s*\{[^}]*?\bip_start:\s*(\d+)", gv, re.M)
+m_sealer_count = re.search(r"^\s{2}sealer:\s*\{[^}]*?\bcount:\s*(\d+)", gv, re.M)
+if not m_sealer:
+    err("group_vars/all.yml: missing node_classes.sealer.ip_start")
+if m_sealer_count and cluster_member_count and m_sealer_count.group(1) != cluster_member_count:
+    err(
+        "group_vars/all.yml: node_classes.sealer.count "
+        f"({m_sealer_count.group(1)}) != cluster_member_count ({cluster_member_count}) "
+        "— the cluster runs one Raft member per sealer node"
+    )
+
+if (
+    ip_prefix
+    and m_sealer
+    and cluster_member_count.isdigit()
+    and all(k in cluster_ports for k in ("ingress", "consensus", "log", "catchup", "archive_control"))
+):
+    n = int(cluster_member_count)
+    ip_start = int(m_sealer.group(1))
+    member_ips = [f"{ip_prefix}.{ip_start + i}" for i in range(n)]
+    p = cluster_ports
+    # Expected -Dkardamom.cluster.members string (id,ingress,consensus,log,catchup,archive|...).
+    expected_members = "|".join(
+        ",".join(
+            [
+                str(i),
+                f"{ip}:{p['ingress']}",
+                f"{ip}:{p['consensus']}",
+                f"{ip}:{p['log']}",
+                f"{ip}:{p['catchup']}",
+                f"{ip}:{p['archive_control']}",
+            ]
+        )
+        for i, ip in enumerate(member_ips)
+    )
+    must_contain(
+        jobs / "cluster.nomad.hcl",
+        expected_members,
+        "cluster member endpoints (id,ingress,consensus,log,catchup,archive | per member)",
+    )
+    must_contain(
+        jobs / "cluster.nomad.hcl",
+        f"-Dkardamom.cluster.ingressStreamId={cluster_ingress_stream_id}",
+        "cluster ingress stream id",
+    )
+    # memberId is derived from the node's own IP (alloc index != node), so the job
+    # passes the per-node ${meta.node_ip} rather than a static index→IP mapping.
+    must_contain(
+        jobs / "cluster.nomad.hcl",
+        "-Dkardamom.cluster.nodeIp=${meta.node_ip}",
+        "per-node cluster memberId derivation (node IP, not alloc index)",
+    )
+    # Expected [cluster] ingress_endpoints: "id=ip:ingress,..." (client view).
+    expected_endpoints = ",".join(
+        f"{i}={ip}:{p['ingress']}" for i, ip in enumerate(member_ips)
+    )
+    for tpl in ("sequencer.toml.tpl", "executor.toml"):
+        must_contain(
+            CLUSTER / "config" / tpl,
+            f'ingress_endpoints = "{expected_endpoints}"',
+            f"[cluster] ingress_endpoints in {tpl}",
+        )
+        must_contain(
+            CLUSTER / "config" / tpl,
+            f"ingress_stream_id = {cluster_ingress_stream_id}",
+            f"[cluster] ingress_stream_id in {tpl}",
+        )
+        must_contain(
+            CLUSTER / "config" / tpl,
+            f"egress_stream_id = {cluster_egress_stream_id}",
+            f"[cluster] egress_stream_id in {tpl}",
+        )
+# Per-node egress endpoint is injected by the Nomad job (port differs only by
+# node IP), so assert the job carries the flag with the canonical egress port.
+for job in ("sequencer", "executor"):
+    must_contain(
+        jobs / f"{job}.nomad.hcl",
+        f"${{meta.node_ip}}:{cluster_egress_port}",
+        f"per-node cluster egress endpoint (--cluster-egress-endpoint) in {job}",
+    )
 
 if errors:
     print(f"check-contract: {len(errors)} mismatch(es) vs ansible/group_vars/all.yml:")

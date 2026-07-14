@@ -9,7 +9,7 @@
 #
 # ── Transport model ──────────────────────────────────────────────────────────
 # Most fan-out/fan-in channels use UDP **multicast** (one shared URI valid on
-# every node, no per-node rendering). Two channels are point-to-point multi-
+# every node, no per-node rendering). tx_ordering is point-to-point multi-
 # destination instead, because a shared multicast group's subscriber-churn froze
 # images (killing one recorder froze every executor):
 #
@@ -21,10 +21,14 @@
 #    boundary alignment is unchanged (per-image subscriber positions match the
 #    old shared-multicast case).
 #
-#  • **tx_receipts** → Aeron **MDS** (multi-destination-subscription) fan-in.
-#    Each executor replica publishes receipts (+the boundary side-stream) to its
-#    own unicast endpoint; ingress attaches them all to ONE control-mode=manual
-#    subscription and dedups the N identical replica copies by tx hash.
+#  • **tx_receipts** → Aeron **multicast** (active/active 2a — see the TxReceipts
+#    section below and docs/agents/resilient-ingress-spec.md D2). Receipts moved
+#    OFF the per-ingress unicast MDS (which pinned all executors to ONE ingress
+#    IP, so a second ingress replica got nothing) ONTO a shared multicast group:
+#    every ingress replica joins and receives every receipt, each executor
+#    publishes its copy to the group, and each ingress dedups the N copies by tx
+#    hash locally. The freeze the MDS avoided is now guarded by the cluster-e2e
+#    ingress-kill check rather than the topology.
 #
 # ⚠ HIGHEST-RISK AREA TO VALIDATE: that Aeron preserves the canonical
 # tx_ordering order across the merged MDC images. The cluster e2e
@@ -35,8 +39,9 @@
 # derives the even control address as data-1), spaced by 2 so derived control
 # addresses never collide; `interface` pins egress, ttl=1 keeps traffic on-
 # segment. tx_ordering MDC control ports (unicast on the publisher nodes):
-# 40110 (seq0@.21), 40111 (seq1@.22), 40112 (sealer@.51). tx_receipts MDS
-# unicast endpoints: 192.168.56.31:40020+replica (on the ingress node).
+# 40110 (seq0@.21), 40111 (seq1@.22), 40112 (sealer@.51). tx_receipts now rides
+# the multicast group 239.192.56.15:40020 (data 1002 + boundary 1003), joined by
+# every ingress replica — no per-ingress unicast endpoints.
 
 [aeron]
 # Archive control rides aeron:ipc (the LogConfig default — restated here for
@@ -65,49 +70,47 @@ tx_data_channel_template = "aeron:udp?endpoint=239.192.56.11:40000|interface=192
 tx_data_stream_id_base = 2000
 
 # --- TxOrdering: canonical orderer, via MDC (see header). --------------------
-# `tx_ordering_channel` is the single-host IPC fallback ONLY — UNUSED in the
-# cluster because tx_ordering_mdc_control_template below is set.
+# `tx_ordering_channel` is the single-host IPC fallback ONLY.
 tx_ordering_channel = "aeron:ipc?alias=tx-ordering"
 tx_ordering_stream_id = 1001
-# MDC control template: `{ctl}` ← each publisher's ip:port control endpoint.
-tx_ordering_mdc_control_template = "aeron:udp?control={ctl}|control-mode=dynamic|interface=192.168.56.0/24"
-# tx_ordering INPUT publishers: the SEQUENCERS only. The sealer subscribes to
-# every one of these (open_input), merges them, defines the ONE canonical
-# interleaving, dedups, and republishes onto its own canonical publication.
-# Each sequencer selects its own endpoint via --tx-ordering-mdc-control
-# (sequencer.nomad.hcl). seq0@.21, seq1@.22 (node-class IPs).
-tx_ordering_mdc_publishers = [
-  "192.168.56.21:40110",
-  "192.168.56.22:40110",
-]
-# tx_ordering CANONICAL publisher: the SEALER (@.51). It is the SOLE publisher
-# of the canonical TxRef/DepositRef + boundary stream. Executors, the
-# durability sidecar, and the sealer's own bootstrap subscribe HERE (a single
-# image → one total order → well-defined positions → boundary alignment holds).
-# The sealer opens this via channel_b_mdc_control in sealer.toml (must equal
-# this value). MUST be distinct from the sequencer inputs above.
-tx_ordering_canonical_publisher = "192.168.56.51:40110"
 
-# --- TxReceipts: receipts + block boundaries. MDS fan-in (see header). --------
-# Each executor replica publishes BOTH the receipt stream (1002) and the
-# boundary side-stream (1003) to its OWN unicast endpoint
-# `tx_receipts_endpoint_host:tx_receipts_endpoint_base_port + replica_idx`
-# (replica_idx = the executor's --recorder-id = ${NOMAD_ALLOC_INDEX}). Ingress
-# opens ONE control-mode=manual subscription on `tx_receipts_control_channel`
-# and attaches each executor endpoint (0..tx_receipts_executor_count) as a
-# destination, deduping the N identical receipt copies by tx hash (first-wins).
-# host = ingress_ip (192.168.56.31, group_vars/all.yml); base_port 40020;
-# executor_count must match the executor job `count` (nomad/executor.nomad.hcl).
-# TODO(consul-watch): replace the static `tx_receipts_executor_count` with a
-# Consul watch on an `executor-receipts` service so ingress add/removes
-# destinations on membership change. `tx_receipts_channel` is the IPC fallback.
-tx_receipts_control_channel = "aeron:udp?control-mode=manual|interface=192.168.56.0/24"
-tx_receipts_endpoint_host = "192.168.56.31"
-tx_receipts_endpoint_base_port = 40020
-# Pin the per-replica endpoints to the cluster NIC (like every other UDP channel);
-# without this the executor's unicast publish picks the wrong source NIC and the
-# boundary/receipt connection to ingress never forms.
-tx_receipts_endpoint_interface = "192.168.56.0/24"
+# --- TxReceipts: receipts + block boundaries. MULTICAST (active/active 2a). ----
+# CHANGED for active/active ingress (docs/agents/resilient-ingress-spec.md, D2):
+# receipts ride a shared **multicast** group, NOT the per-ingress unicast MDS
+# fan-in. The MDS endpoints were pinned to ONE ingress IP — a second ingress
+# replica received nothing. With multicast, every ingress replica simply joins
+# `tx_receipts_channel` (data stream 1002 + boundary side-stream 1003) and
+# receives every receipt; each executor replica publishes its copy to the same
+# group, and each ingress dedups the N identical copies locally by tx hash
+# (first-wins, `kardamom_ingress::seen_receipts`). Replica-count-agnostic on both
+# sides — add ingress/executor replicas with no channel edits.
+#
+# MDS is DISABLED: `tx_receipts_control_channel` is empty, so ingress takes the
+# single-channel path (`TxReceiptsSubscriberHandle::open` + the boundary sub) and
+# executors publish via the non-MDS publisher. `tx_receipts_executor_count` is
+# retained only as a hint for local dedup-window sizing; it no longer drives any
+# endpoints.
+#
+# ⚠ FREEZE RISK (the reason MDS existed): a shared multicast group's
+# subscriber-churn once froze images (killing one recorder froze every executor).
+# Ingress churn (a replica crash/restart leaving+rejoining the group) could
+# reintroduce that image-freeze for the surviving subscribers. The cluster-e2e
+# (.github/workflows/cluster-e2e.yml → scripts/ci-cluster.sh ingress-churn check)
+# exercises exactly this: kill one ingress while traffic flows and assert the
+# survivor keeps receiving receipts.
+#
+# NOTE: the freeze that check first caught was NOT an Aeron image/transport
+# issue — the multicast group preserves delivery across subscriber churn
+# (verified on a real cluster: 0 loss, subscriber positions advancing). It was a
+# deadlock in ingress's receipt cache: `ReceiptCache::evict_if_full` held a
+# DashMap shard read-guard across `remove()`, wedging the tx_receipts watcher the
+# moment the cache filled under the sustained receipt firehose — so an idle
+# replica (serving no traffic but still receiving every receipt) froze. Fixed in
+# crates/ingress/src/receipt_cache.rs; no channel/flow-control change needed.
+tx_receipts_control_channel = ""
+tx_receipts_endpoint_host = ""
+tx_receipts_endpoint_base_port = 0
+tx_receipts_endpoint_interface = ""
 tx_receipts_executor_count = 3
 tx_receipts_channel = "aeron:udp?endpoint=239.192.56.15:40020|interface=192.168.56.0/24|ttl=1"
 tx_receipts_stream_id = 1002

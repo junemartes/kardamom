@@ -18,6 +18,7 @@
 
 pub mod binary;
 pub mod channels;
+pub mod cluster;
 pub mod config;
 pub mod error;
 pub mod json_rpc;

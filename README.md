@@ -1,11 +1,17 @@
 # Kardamom
 
 An Ethereum rollup framework. The workspace is a set of Rust crates — the
-cluster services (`kardamom-ingress`, `kardamom-sequencer`, `kardamom-executor`,
-`kardamom-sealer`, `kardamom-batcher`, `kardamom-da-watcher`) wired together over
-Aeron, plus shared libraries (`kardamom-types`, `kardamom-log`, `kardamom-state`,
-`kardamom-obs`) and tooling (`deployer`, `bench`) — plus Solidity contracts under
-`contracts/`.
+pipeline services (`kardamom-ingress`, `kardamom-sequencer`, `kardamom-executor`,
+`kardamom-batcher`, `kardamom-da-watcher`) wired together over Aeron, shared
+libraries (`kardamom-types`, `kardamom-log`, `kardamom-state`, `kardamom-obs`,
+`kardamom-cluster-adapter`, `kardamom-cluster-client`), and tooling
+(`deployer`, `bench`, the `e2e` test crate). The sealer is not a Rust crate:
+canonical ordering runs as a **Java Aeron Cluster (Raft) clustered service**
+under `cluster/sealer-service/` (Aeron's Consensus Module is JVM-only); the
+Rust pipeline talks to it through `kardamom-cluster-adapter` /
+`kardamom-cluster-client`. Solidity contracts live under `contracts/`, chain
+genesis configs under `chains/`, and the observability + multi-node deploy
+stack under `deploy/`.
 
 ## Building
 
@@ -25,6 +31,10 @@ Two parts of the workspace need extra native tooling:
   17 or later.
 - **`forge` (Foundry)** is invoked by the `deployer` build script to compile the
   Solidity contracts.
+
+The Java sealer under `cluster/sealer-service/` is built separately with its
+Gradle wrapper (`./gradlew build`) and also needs a JDK 17 — the same one the
+`aeron-live` build uses.
 
 ### Quick start
 
@@ -77,13 +87,17 @@ features; launch your editor from a shell where `JAVA_HOME` is set so the
 
 ## `just` recipes
 
-| Recipe            | What it does |
-| ----------------- | ------------ |
-| `just bootstrap`  | Install the Aeron native toolchain + Foundry for this platform. |
-| `just check`      | `cargo check` the whole workspace with all features. |
-| `just clippy`     | Clippy across all features with `-D warnings` (mirrors CI). |
-| `just test`       | Run the test suite across all features. |
-| `just check-aeron`| Targeted check that just the Aeron bindings compile. |
+| Recipe                   | What it does |
+| ------------------------ | ------------ |
+| `just bootstrap`         | Install the Aeron native toolchain + Foundry for this platform. |
+| `just check`             | `cargo check` the whole workspace with all features. |
+| `just clippy`            | Clippy across all features with `-D warnings` (mirrors CI). |
+| `just test`              | Run the test suite across all features. |
+| `just check-aeron`       | Targeted check that just the Aeron bindings compile. |
+| `just aeron-driver-up`   | Start a host-native Aeron Media Driver (jar cached locally). |
+| `just aeron-driver-down` | Stop the Media Driver started by `aeron-driver-up`. |
+| `just cluster-bootstrap` | Install the HOST tools for the `deploy/cluster/` workflow (Vagrant, Ansible, Docker…). |
+| `just cluster-doctor`    | Check the host has everything `deploy/cluster/` needs. |
 
 All build/test recipes set `JAVA_HOME` to a detected JDK 17+ automatically.
 

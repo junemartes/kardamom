@@ -10,7 +10,7 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::inbound::fakes::ScriptedTxData;
@@ -70,7 +70,7 @@ fn hydrates_committed_nonce_for_established_sender() {
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
     let mut channel_a = ScriptedTxData {
-        queue: [(pos(0), signed_envelope(&signer, 5, 100))].into(),
+        queue: [(TxDataLoc::new(0, pos(0)), signed_envelope(&signer, 5, 100))].into(),
         disconnected: false,
     };
     let mut b = InMemoryTxOrderingRefPublisher::default();
@@ -93,7 +93,7 @@ fn hydrates_zero_for_brand_new_sender() {
 
     let mut seq = Sequencer::new(one_partition_cfg(), db);
     let mut channel_a = ScriptedTxData {
-        queue: [(pos(0), signed_envelope(&signer, 0, 100))].into(),
+        queue: [(TxDataLoc::new(0, pos(0)), signed_envelope(&signer, 0, 100))].into(),
         disconnected: false,
     };
     let mut b = InMemoryTxOrderingRefPublisher::default();
@@ -114,8 +114,8 @@ fn hydration_runs_once_per_sender() {
     let mut seq = Sequencer::new(one_partition_cfg(), db);
     let mut channel_a = ScriptedTxData {
         queue: [
-            (pos(0), signed_envelope(&signer, 0, 100)),
-            (pos(64), signed_envelope(&signer, 1, 101)),
+            (TxDataLoc::new(0, pos(0)), signed_envelope(&signer, 0, 100)),
+            (TxDataLoc::new(0, pos(64)), signed_envelope(&signer, 1, 101)),
         ]
         .into(),
         disconnected: false,

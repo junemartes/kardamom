@@ -85,10 +85,11 @@ job "sequencer" {
           "--partition-count", "2",
           "--partition-index", "${NOMAD_ALLOC_INDEX}",
           "--sequencer-id", "${NOMAD_ALLOC_INDEX}",
-          # This node's tx_ordering MDC publisher control endpoint. Uniform port
-          # 40110 on this node's IP; uniqueness comes from node_ip. Must match an
-          # entry in tx_ordering_mdc_publishers in channels.toml.tpl.
-          "--tx-ordering-mdc-control", "${meta.node_ip}:40110",
+          # Cluster mode only: this node's cluster-egress (response) endpoint.
+          # The cluster client's egress_channel is per-node (the node IP differs),
+          # so it's injected here rather than baked into sequencer.toml.tpl.
+          # Uniform port 40210 (cluster_egress_port); uniqueness comes from node_ip.
+          "--cluster-egress-endpoint", "${meta.node_ip}:40210",
         ]
       }
 

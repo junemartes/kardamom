@@ -23,7 +23,7 @@ use alloy_primitives::{Address, U256};
 use alloy_rlp::Encodable;
 use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
-use kardamom_types::{BPosition, TxEnvelope};
+use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 
@@ -141,7 +141,9 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
                 (i as u8, position),
                 (all_signers_per_part[i as usize][si].address(), n),
             );
-            channels_a[i as usize].queue.push_back((position, env));
+            channels_a[i as usize]
+                .queue
+                .push_back((TxDataLoc::new(0, position), env));
             correlation += 1;
         }
     }

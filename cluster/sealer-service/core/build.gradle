@@ -1,0 +1,9 @@
+// :core — the pure, deterministic CanonicalSealerState state machine.
+//
+// Deliberately has NO Aeron dependency. Its only test dependency is JUnit 5, so
+// `./gradlew :core:test` runs even if the Aeron jars cannot be fetched.
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}

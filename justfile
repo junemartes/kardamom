@@ -6,7 +6,7 @@
 #     bundled Aeron C sources via the rusteron crates — needs cmake, a C/C++
 #     compiler, libclang (for bindgen), pkg-config, and a JDK 17+ (the Aeron
 #     archive build runs a Gradle/SBE codegen step that requires JVM 17+);
-#   * the `deployer`/`node` build scripts shell out to Foundry's `forge` to
+#   * the `deployer` build script shells out to Foundry's `forge` to
 #     compile the Solidity contracts.
 # `just bootstrap` installs all of the above for your platform.
 #

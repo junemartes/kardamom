@@ -23,6 +23,8 @@ bytes.workspace = true
 crossbeam-channel = "0.5"
 kardamom-log.workspace = true
 kardamom-types.workspace = true
+# Shadow-check counters surface in the host process's Prometheus exporter.
+metrics = { workspace = true }
 # libmdbx binding. We use the signet-libmdbx fork (MIT/Apache, idiomatic 0.8
 # API) rather than vorot93/libmdbx (MPL-2.0) : the MIT/Apache fork
 # is preferred when the licensing matters. The on-disk format is identical

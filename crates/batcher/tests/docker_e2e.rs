@@ -117,6 +117,7 @@ fn write_synthetic_archives(
             alloy_primitives::B256::repeat_byte(0x01),
             0,
             pos(0),
+            0,
         )),
     );
     append_frame(
@@ -126,6 +127,7 @@ fn write_synthetic_archives(
             alloy_primitives::B256::repeat_byte(0x02),
             1,
             pos(0),
+            0,
         )),
     );
     append_frame(
@@ -135,6 +137,7 @@ fn write_synthetic_archives(
             alloy_primitives::B256::repeat_byte(0x03),
             0,
             pos(128),
+            0,
         )),
     );
     append_frame(
@@ -144,6 +147,7 @@ fn write_synthetic_archives(
             alloy_primitives::B256::repeat_byte(0x04),
             1,
             pos(128),
+            0,
         )),
     );
     append_frame(

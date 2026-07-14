@@ -24,6 +24,9 @@ anyhow.workspace = true
 bytes.workspace = true
 clap.workspace = true
 core_affinity = "0.8"
+# Cluster (Raft) transport adapter (`outbound::cluster`). tx_ordering ALWAYS goes
+# to the cluster ingress — non-optional, there is no non-cluster path.
+kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-log = { workspace = true, features = ["testing"] }
 kardamom-obs = { path = "../obs" }
 kardamom-types.workspace = true
@@ -46,6 +49,7 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 # `cargo test --features testing` (matches the convention CI uses).
 kardamom-sequencer = { path = ".", features = ["testing"] }
 kardamom-log = { workspace = true, features = ["testing"] }
+kardamom-cluster-adapter = { path = "../cluster-adapter", features = ["testing"] }
 proptest = "1"
 rand = "0.9"
 

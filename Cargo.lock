@@ -2207,7 +2207,6 @@ dependencies = [
  "kardamom-executor",
  "kardamom-ingress",
  "kardamom-log",
- "kardamom-sealer",
  "kardamom-sequencer",
  "kardamom-state",
  "kardamom-types",
@@ -3712,6 +3711,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-cluster-adapter"
+version = "0.1.0"
+dependencies = [
+ "alloy-primitives",
+ "crossbeam-channel",
+ "kardamom-cluster-adapter",
+ "kardamom-cluster-client",
+ "kardamom-executor",
+ "kardamom-log",
+ "kardamom-sequencer",
+ "kardamom-types",
+ "rkyv",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "kardamom-cluster-client"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kardamom-da-watcher"
 version = "0.1.0"
 dependencies = [
@@ -3771,11 +3794,13 @@ dependencies = [
  "bytes",
  "crossbeam-channel",
  "dashmap",
+ "kardamom-cluster-adapter",
  "kardamom-log",
  "kardamom-state",
  "kardamom-types",
  "metrics",
  "revm",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
@@ -3796,6 +3821,7 @@ dependencies = [
  "criterion 0.5.1",
  "crossbeam-channel",
  "dashmap",
+ "kardamom-cluster-adapter",
  "kardamom-engine",
  "kardamom-log",
  "kardamom-obs",
@@ -3806,6 +3832,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "reqwest 0.13.4",
  "revm",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -3834,6 +3861,7 @@ dependencies = [
  "hyper",
  "jsonrpsee",
  "k256",
+ "kardamom-cluster-adapter",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-types",
@@ -3842,8 +3870,10 @@ dependencies = [
  "rand 0.9.4",
  "reqwest 0.13.4",
  "secp256k1 0.31.1",
+ "serde",
  "thiserror 2.0.18",
  "tokio",
+ "toml",
  "tower",
  "tracing",
  "tracing-subscriber 0.3.23",
@@ -3884,28 +3914,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kardamom-sealer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "criterion 0.7.0",
- "kardamom-log",
- "kardamom-obs",
- "kardamom-sealer",
- "kardamom-types",
- "metrics",
- "proptest",
- "reqwest 0.13.4",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber 0.3.23",
-]
-
-[[package]]
 name = "kardamom-sequencer"
 version = "0.1.0"
 dependencies = [
@@ -3919,6 +3927,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "criterion 0.5.1",
+ "kardamom-cluster-adapter",
  "kardamom-log",
  "kardamom-obs",
  "kardamom-sequencer",
@@ -3947,6 +3956,7 @@ dependencies = [
  "crossbeam-channel",
  "kardamom-log",
  "kardamom-types",
+ "metrics",
  "rkyv",
  "signet-libmdbx",
  "tempfile",
@@ -3987,6 +3997,7 @@ dependencies = [
  "kardamom-state",
  "kardamom-types",
  "metrics",
+ "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

@@ -29,8 +29,10 @@ use std::time::Duration;
 use kardamom_engine::{CMessage, ExecutorError, StateWriterQueue, TxReceiptsPublication};
 use kardamom_types::{BPosition, BlockBoundary, BlockDelta, Receipt};
 
-pub mod attester;
 pub mod metrics;
+/// L1 output attester: collects `MessagePassed` leaves from re-executed
+/// blocks, builds the per-output withdrawals root, posts to the L1 oracle.
+pub mod attester;
 
 /// Shared divergence flag. Once tripped, the validator has observed a proven
 /// discrepancy between its independent re-execution and the sequencer's output;

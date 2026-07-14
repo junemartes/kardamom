@@ -1,4 +1,0 @@
-	cluster role=LEADER memberId=0
-	!cluster role=FOLLOWER memberId=0
-	cluster role=LEADER memberId=1
-	!cluster role=FOLLOWER memberId=1

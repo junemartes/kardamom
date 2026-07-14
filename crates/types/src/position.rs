@@ -59,6 +59,31 @@ impl BPosition {
     }
 }
 
+/// Location of a `TxEnvelope` fragment on a tx_data stream: the Aeron publisher
+/// `session_id` plus the fragment-start [`BPosition`].
+///
+/// The session id discriminates **concurrent ingress publishers** on one shard.
+/// Aeron positions are per-session, so two active/active ingresses publishing to
+/// the same tx_data stream can produce the same `(term_id, term_offset)`; pairing
+/// it with `session_id` makes the executor's join key
+/// `(shard_id, session_id, position)` unique. This is an in-process locator (log →
+/// sequencer / executor); only `session_id` crosses the wire, carried by
+/// [`crate::TxRef::tx_data_session_id`]. `BPosition` itself is unchanged.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TxDataLoc {
+    pub session_id: i32,
+    pub position: BPosition,
+}
+
+impl TxDataLoc {
+    pub const fn new(session_id: i32, position: BPosition) -> Self {
+        Self {
+            session_id,
+            position,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::BPosition;

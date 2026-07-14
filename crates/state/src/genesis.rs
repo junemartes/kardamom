@@ -86,6 +86,25 @@ pub fn seed_genesis(
         }
     }
 
+    // Build the initial hashed-state mirror + account trie so a from-genesis
+    // validator starts at the correct world-state root before block 1. (Harmless
+    // for the executor, whose writer runs with TrieMode::Off and ignores them.)
+    let trie_tables = crate::trie::TrieTables::open(&txn)?;
+    let genesis_delta = kardamom_types::BlockDelta {
+        block_number: 0,
+        accounts: accounts.to_vec(),
+        storage: Vec::new(),
+        code: code.to_vec(),
+        receipts: Vec::new(),
+    };
+    let root = crate::trie::update_for_block(&txn, &trie_tables, &genesis_delta)?;
+    txn.put(
+        meta,
+        crate::meta::KEY_STATE_ROOT,
+        crate::meta::encode_b256(root),
+        WriteFlags::UPSERT,
+    )?;
+
     // Flag last so a crash mid-seed leaves the env un-flagged and the next start
     // re-seeds cleanly.
     txn.put(meta, KEY_GENESIS_APPLIED, encode_u32(1), WriteFlags::UPSERT)?;
@@ -136,6 +155,45 @@ mod tests {
         assert_eq!(balance, U256::from(1_000u64));
         assert_eq!(ch, code_hash);
         assert_eq!(snap.code_by_hash(code_hash).unwrap(), code);
+    }
+
+    #[test]
+    fn seed_genesis_sets_canonical_state_root() {
+        // A from-genesis validator must start at the correct world-state root
+        // before block 1.
+        let (_dir, env) = temp_env();
+        let a1 = Address::repeat_byte(0x11);
+        let a2 = Address::repeat_byte(0x22);
+        let accounts = vec![
+            AccountChange {
+                address: a1,
+                nonce: 1,
+                balance: U256::from(100u64),
+                code_hash: B256::ZERO,
+            },
+            AccountChange {
+                address: a2,
+                nonce: 0,
+                balance: U256::from(50u64),
+                code_hash: B256::ZERO,
+            },
+        ];
+        assert!(seed_genesis(&env, &accounts, &[]).unwrap());
+
+        let want = crate::trie::state_root(accounts.iter().map(|a| {
+            (
+                a.address,
+                crate::trie::AccountTrieParts {
+                    nonce: a.nonce,
+                    balance: a.balance,
+                    code_hash: a.code_hash,
+                    storage_root: B256::ZERO,
+                },
+            )
+        }));
+        let snap = StateSnapshot::open(&env).unwrap();
+        assert_eq!(snap.state_root().unwrap(), Some(want));
+        assert_ne!(want, crate::trie::empty_root());
     }
 
     #[test]

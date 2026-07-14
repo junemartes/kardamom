@@ -34,7 +34,7 @@ fn reads_two_interleaved_b_records() {
     append_frame(
         &mut buf,
         pos(0),
-        &TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 3, pos(128))),
+        &TxOrderingMessage::TxRef(TxRef::new(alloy_primitives::B256::ZERO, 3, pos(128), 0)),
     );
     append_frame(
         &mut buf,
