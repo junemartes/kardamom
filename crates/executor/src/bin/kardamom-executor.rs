@@ -7,9 +7,10 @@
 //! opened at `--state-dir`: chain state is committed durably per block and
 //! persists across restarts. Genesis is seeded once into a fresh env.
 //!
-//! Crash-recovery resume (replaying the canonical stream from the persisted
-//! cursor) is Phase 2; until then a non-empty state DB is refused at startup so
-//! we never double-apply already-committed blocks.
+//! Crash-recovery resume: startup reads the persisted state cursor
+//! (`last_committed_block` / `last_committed_end_tx_position`) and replays the
+//! canonical stream from the Aeron archives via a replay-merge, skip-counting
+//! past the cursor so already-committed blocks are never double-applied.
 
 use std::path::PathBuf;
 use std::sync::mpsc as sync_mpsc;

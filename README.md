@@ -2,16 +2,23 @@
 
 An Ethereum rollup framework. The workspace is a set of Rust crates — the
 pipeline services (`kardamom-ingress`, `kardamom-sequencer`, `kardamom-executor`,
-`kardamom-batcher`, `kardamom-da-watcher`) wired together over Aeron, shared
-libraries (`kardamom-types`, `kardamom-log`, `kardamom-state`, `kardamom-obs`,
-`kardamom-cluster-adapter`, `kardamom-cluster-client`), and tooling
-(`deployer`, `bench`, the `e2e` test crate). The sealer is not a Rust crate:
+`kardamom-batcher`, `kardamom-da-watcher`) wired together over Aeron, the
+off-hot-path `kardamom-validator` (re-executes every block and fail-stops on
+divergence), shared libraries (`kardamom-types`, `kardamom-log`,
+`kardamom-state`, `kardamom-obs`, `kardamom-engine` — the execution core shared
+by executor and validator — `kardamom-cluster-adapter`,
+`kardamom-cluster-client`), and tooling (`deployer`, `bench`, the `e2e` test
+crate). The sealer is not a Rust crate:
 canonical ordering runs as a **Java Aeron Cluster (Raft) clustered service**
 under `cluster/sealer-service/` (Aeron's Consensus Module is JVM-only); the
 Rust pipeline talks to it through `kardamom-cluster-adapter` /
 `kardamom-cluster-client`. Solidity contracts live under `contracts/`, chain
 genesis configs under `chains/`, and the observability + multi-node deploy
 stack under `deploy/`.
+
+See [`docs/img/architecture.jpg`](docs/img/architecture.jpg) for the service
+architecture diagram, and [`docs/failure-modes.md`](docs/failure-modes.md) for
+how each actor fails and recovers (with the chaos cases that verify it).
 
 ## Building
 

@@ -51,7 +51,7 @@
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
 #        graceful-sequencer hard-sequencer sealer-graceful sealer-hard
-#        node-failure-executor
+#        node-failure-executor archive-driver-loss
 #        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
 # =============================================================================
 set -euo pipefail
@@ -386,6 +386,29 @@ run_case() { # <case-name>
       log "node-failure: docker start kardamom-executor-2 (node returns)"
       docker start kardamom-executor-2 >/dev/null || fail "could not restart node kardamom-executor-2"
       assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
+      ;;
+
+    archive-driver-loss)
+      # HARD-kill the Aeron SUBSTRATE (the `aeron` system job's combined
+      # ArchivingMediaDriver task) on the ingress-0 node — not the ingress task
+      # itself. This is the untested failure surface the component cases skip:
+      # every service on the node shares that driver's aeron.dir, so the local
+      # ingress loses its transport AND its tx_data durability recorder in one
+      # blow. Expected outcome, in order:
+      #   1. the pipeline keeps progressing — ingress is active/active, so
+      #      clients retry against ingress-1 (the load runs in --chaos-mode);
+      #   2. Nomad restarts the aeron system task within the restart SLO
+      #      (archive segments persist on the node volume across the restart);
+      #   3. the collocated ingress task recovers against the fresh driver and
+      #      the ingress job returns to full strength within the reschedule SLO
+      #      (driver + dependent-task restart chain, hence the wider SLO).
+      local aeron_base
+      aeron_base="$(count_running aeron)"
+      log "archive-driver-loss: killing archiving-media-driver on kardamom-ingress-0 (aeron allocs baseline=${aeron_base})"
+      inject_hard kardamom-ingress-0 archiving-media-driver
+      assert_progress
+      assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
+      assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
       ;;
 
     # --- CLUSTERED-SEALER (Raft) cases ------------------------------------
