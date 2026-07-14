@@ -421,6 +421,14 @@ async fn main() -> Result<()> {
     // tight live join timeout (100 ms) would fire spuriously when a TxRef
     // arrives before its replayed envelope. Relax it generously while resuming;
     // a genuine missing-envelope still aborts, just after a longer grace.
+    // ALWAYS bounded, fresh starts included: a replica whose multicast tx_data
+    // image races a sequencer restart (new publisher session) can lose an
+    // envelope, and an unbounded join wait then FREEZES that replica silently
+    // while its peers advance (observed under the hard-sequencer chaos case:
+    // one executor frozen at +0 blocks while the chain advanced 195). Failing
+    // loudly hands recovery to the designed loop: nomad restarts the task and
+    // crash recovery replays the tx_data gap from the archive.
+    cfg.reader.join_timeout = std::time::Duration::from_secs(60);
     if resume.is_some() {
         cfg.reader.join_timeout = std::time::Duration::from_secs(30);
     }
