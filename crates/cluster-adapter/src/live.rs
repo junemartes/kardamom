@@ -139,11 +139,28 @@ pub fn connect_with_replay(
     connect_inner(rt, cfg, Some(replay))
 }
 
+/// Append a small term-length to a cluster control channel unless the URI
+/// already pins one. Cluster ingress/egress carry KB/s of control + canonical
+/// frames, but Aeron's default 16MB terms allocate a ~50MB log PER publication
+/// image — on both the client's AND every member's aeron tmpfs. Session churn
+/// (chaos failovers, zombie-close reconnects) at 50MB a pop exhausts the 1GB
+/// tmpfs, and the clustered SERVICE then dies with "insufficient usable
+/// storage" while Raft itself stays healthy — observed live as the
+/// post-failover pipeline freeze. 1MB terms cut every such log 16x.
+fn with_control_term_length(uri: &str) -> String {
+    if uri.contains("term-length") {
+        uri.to_string()
+    } else {
+        format!("{uri}|term-length=1m")
+    }
+}
+
 fn connect_inner(
     rt: AeronRuntime,
-    cfg: LiveClusterConfig,
+    mut cfg: LiveClusterConfig,
     replay: Option<ReplayOnConnect>,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
     // Egress subscription: the deliver closure ships each raw frame to the
     // session thread.
     let (frame_tx, frame_rx) = unbounded::<Vec<u8>>();
@@ -359,7 +376,9 @@ fn open_leader_pub(
     stream_id: i32,
 ) -> Option<PubHandle> {
     let endpoint = endpoint_for_member(endpoints, member_id)?;
-    let uri = format!("aeron:udp?endpoint={endpoint}");
+    // Small terms: this publication's log allocates at ITS term length on the
+    // client AND as the matching image on EVERY cluster member's tmpfs.
+    let uri = format!("aeron:udp?endpoint={endpoint}|term-length=1m");
     rt.open_publication(&uri, stream_id).ok()
 }
 

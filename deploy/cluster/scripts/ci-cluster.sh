@@ -256,13 +256,16 @@ dump_diagnostics() {
   # named by its alloc; find it via the inner docker ps).
   for n in "${NODES[@]}"; do
     [[ "${NODE_ROLE[$n]}" == "sealer" ]] || continue
-    echo "===== ${n}: ClusterTool describe ====="
+    echo "===== ${n}: ClusterTool errors + members ====="
     docker exec "kardamom-${n}" sh -c '
       inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
       [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
-      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster describe 2>&1
-      echo "--- recovery-plan ---"
-      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster recovery-plan 1 2>&1 | tail -20' 2>/dev/null || true
+      # errors reads the CONSENSUS_MODULE and CONTAINER mark-file error buffers;
+      # the CONTAINER one is where a dying clustered SERVICE logs (e.g. aeron
+      # tmpfs exhaustion) and is NOT covered by the *.log file glob above.
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster errors 2>&1 | tail -40
+      echo "--- list-members ---"
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster list-members 2>&1 | tail -3' 2>/dev/null || true
   done
 }
 
