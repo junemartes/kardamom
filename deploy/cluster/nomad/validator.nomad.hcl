@@ -29,12 +29,19 @@ job "validator" {
   group "validator" {
     count = 1
 
-    # NO restart/reschedule on failure: the validator fail-stops (exit 2) on a
-    # proven divergence, and auto-restarting would erase that signal (a fresh
-    # validator re-syncs from genesis and may not re-hit the divergence). The
-    # cluster-e2e verdict asserts the alloc is still running.
+    # Restarts are the validator's RECOVERY loop, not a signal-eraser: a lost
+    # tx_data envelope (multicast image lapse while lagging a load burst)
+    # fail-stops via the bounded join timeout, and the restart resumes from
+    # the persisted cursor through crash recovery — tx_ordering rides the
+    # cluster replay, the envelope gap replays from the archive recorders.
+    # Divergence fail-stops remain detectable across restarts by their
+    # 'halted on divergence' line in the alloc log (the e2e verdict greps it);
+    # they will crash-loop here, which is correct — a diverged validator must
+    # not be quietly absorbed.
     restart {
-      attempts = 0
+      attempts = 5
+      interval = "10m"
+      delay    = "15s"
       mode     = "fail"
     }
 
@@ -73,6 +80,13 @@ job "validator" {
           # Own state dir UNDER the shared persistent mount — never the
           # executor's /opt/kardamom/state root (separate mdbx env).
           "--state-dir", "/opt/kardamom/state/validator",
+          # Crash-recovery archive replay-merge endpoint for tx_data /
+          # tx_deposits (used only when the state DB is non-empty, i.e. on a
+          # restart mid-chain). tx_ordering recovery rides the cluster replay
+          # instead. Port 40131 on this node's IP (the executor's replay
+          # endpoint uses 40130 on ITS nodes; no co-residence, but keep them
+          # distinct anyway).
+          "--replay-destination-endpoint", "${meta.node_ip}:40131",
           # Shadow-check the node-incremental state trie against a full rebuild
           # every 8th block; a walker bug fail-stops the validator (dead alloc =
           # verdict failure) and bumps kardamom_state_trie_shadow_mismatch_total.

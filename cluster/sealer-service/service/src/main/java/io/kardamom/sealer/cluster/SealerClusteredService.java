@@ -56,9 +56,21 @@ public final class SealerClusteredService implements ClusteredService {
     /** Minimum valid ingress length: kind + canonical id (payload may be empty). */
     private static final int MIN_INGRESS_LEN = CANONICAL_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
 
+    /** Ingress message kinds (first byte of every ingress app message). */
+    public static final byte KIND_INGRESS_RECORD = 0;
+    /** Replay request: {@code [kind:1][from_index:u64 LE][from_block:u64 LE]}. */
+    public static final byte KIND_REPLAY_REQUEST = 1;
+
     /** Egress message kinds (first byte of every egress frame). */
     public static final byte EGRESS_KIND_RELAYED = 1;
     public static final byte EGRESS_KIND_BOUNDARY = 2;
+    /** Replay refused: {@code [kind:3][oldest_index:u64][oldest_block:u64]}. */
+    public static final byte EGRESS_KIND_REPLAY_UNAVAILABLE = 3;
+    /** Replay complete: {@code [kind:4][up_to_index:u64][up_to_block:u64]}. */
+    public static final byte EGRESS_KIND_REPLAY_DONE = 4;
+
+    /** Bounded in-memory retention of framed egress bytes for client replay. */
+    private static final int DEFAULT_RETENTION = 65536;
 
     /** Correlation id used when scheduling the repeating boundary timer. */
     public static final long BOUNDARY_TIMER_CORRELATION_ID = 1L;
@@ -71,6 +83,34 @@ public final class SealerClusteredService implements ClusteredService {
 
     private Cluster cluster;
     private CanonicalSealerState state;
+
+    /** One retained, already-framed egress frame (record or boundary). */
+    private static final class RetainedFrame {
+        final byte[] frame;
+        final boolean boundary;
+        final long key; // record index, or boundary block number
+
+        RetainedFrame(final byte[] frame, final boolean boundary, final long key) {
+            this.frame = frame;
+            this.boundary = boundary;
+            this.key = key;
+        }
+    }
+
+    /**
+     * Retained egress frames, in EMISSION ORDER, for `REPLAY_FROM` requests
+     * from (re)connecting clients — without replay, frames committed while a
+     * client had no session are missed forever and its canonical stream has an
+     * unrecoverable gap. Deterministic across members (derived from the
+     * replicated log); NOT snapshotted (v1): a member restarted from snapshot
+     * serves REPLAY_UNAVAILABLE for pre-restart ranges, an honest degradation.
+     */
+    private final java.util.ArrayDeque<RetainedFrame> retained = new java.util.ArrayDeque<>();
+    private final int retentionCap =
+        Integer.getInteger("kardamom.cluster.retention", DEFAULT_RETENTION);
+    /** First record index / boundary block still guaranteed retained. */
+    private long firstRetainedIndex = 0L;
+    private long firstRetainedBlock = CanonicalSealerState.GENESIS_BLOCK_NUMBER;
 
     // Scratch buffers for ingress id extraction and egress framing. Reused to
     // avoid per-message allocation on the single cluster service thread.
@@ -149,6 +189,17 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_REPLAY_REQUEST) {
+            if (length < 1 + Long.BYTES + Long.BYTES) {
+                return; // malformed replay request
+            }
+            final long fromIndex =
+                buffer.getLong(offset + 1, ByteOrder.LITTLE_ENDIAN);
+            final long fromBlock =
+                buffer.getLong(offset + 1 + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
+            handleReplayRequest(session, fromIndex, fromBlock);
+            return;
+        }
         if (length < MIN_INGRESS_LEN) {
             // Malformed / too-short envelope: cannot contain kind + 32-byte id.
             return;
@@ -241,8 +292,57 @@ public final class SealerClusteredService implements ClusteredService {
         }
     }
 
+    /**
+     * Serve a client replay request: re-offer every retained frame at/after the
+     * requested cursor to the REQUESTING session only, then a REPLAY_DONE
+     * marker (or REPLAY_UNAVAILABLE when eviction has outrun the request).
+     * Runs identically on every member from the replicated log; only the
+     * leader's session offers reach the client.
+     */
+    private void handleReplayRequest(final ClientSession session, final long fromIndex, final long fromBlock) {
+        if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
+            offerControl(session, EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
+            return;
+        }
+        for (final RetainedFrame f : retained) {
+            final boolean wanted = f.boundary ? f.key >= fromBlock : f.key >= fromIndex;
+            if (wanted) {
+                offerBytesToSession(session, f.frame);
+            }
+        }
+        offerControl(session, EGRESS_KIND_REPLAY_DONE, state.canonicalCount(), state.blockNumber());
+    }
+
+    private void offerControl(final ClientSession session, final byte kind, final long a, final long b) {
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, kind);
+        pos += Byte.BYTES;
+        buf.putLong(pos, a, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, b, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        offerToSession(session, pos);
+    }
+
+    /** Retain an already-framed egress frame for future replays (bounded). */
+    private void retain(final int length, final boolean boundary, final long key) {
+        final byte[] copy = new byte[length];
+        egressBuffer.getBytes(0, copy);
+        retained.addLast(new RetainedFrame(copy, boundary, key));
+        while (retained.size() > retentionCap) {
+            final RetainedFrame evicted = retained.removeFirst();
+            if (evicted.boundary) {
+                firstRetainedBlock = evicted.key + 1;
+            } else {
+                firstRetainedIndex = evicted.key + 1;
+            }
+        }
+    }
+
     private void offerRelayed(final Relayed relayed) {
         final int len = frameRelayed(relayed);
+        retain(len, false, relayed.index);
         // Broadcast the relayed canonical record to EVERY client session, not just
         // the sender. The executor replicas consume the canonical tx_ordering stream
         // from egress on their OWN sessions (they never publish ingress), so offering
@@ -277,6 +377,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     private void offerBoundary(final Boundary boundary) {
         final int len = frameBoundary(boundary);
+        retain(len, true, boundary.blockNumber);
         // Boundaries are broadcast to every open client session.
         for (final ClientSession session : cluster.clientSessions()) {
             offerToSession(session, len);
@@ -323,6 +424,20 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
 
+    /** Offer arbitrary raw bytes (a retained frame) to one session. */
+    private void offerBytesToSession(final ClientSession session, final byte[] frame) {
+        final UnsafeBuffer buf = new UnsafeBuffer(frame);
+        final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
+        long result;
+        do {
+            result = session.offer(buf, 0, frame.length);
+            if (result >= 0 || !retryable(result)) {
+                return;
+            }
+        } while (System.nanoTime() < deadline);
+        session.close();
+    }
+
     private void offerToSession(final ClientSession session, final int length) {
         final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
         long result;
@@ -338,13 +453,21 @@ public final class SealerClusteredService implements ClusteredService {
         session.close();
     }
 
-    /** Whether a negative offer result is a retryable back-pressure condition. */
+    /** Whether a negative offer result is retryable within the deadline. */
     private boolean retryable(final long offerResult) {
-        // ADMIN_ACTION / BACK_PRESSURED are retryable; CLOSED / MAX_POSITION_EXCEEDED
-        // / NOT_CONNECTED are not. Treat the back-pressure cases as retryable and
-        // idle, anything else as terminal for this offer.
+        // BACK_PRESSURED / ADMIN_ACTION: transient flow control. NOT_CONNECTED:
+        // ALSO retryable-within-deadline — an egress publication is legitimately
+        // unconnected for a moment at session open AND after a leader failover
+        // (the new leader re-creates it); but a session whose egress NEVER
+        // (re)connects within the deadline must be CLOSED by the caller, not
+        // skipped: its keep-alives still flow via ingress, so the consensus
+        // module keeps it alive while the service silently drops every frame —
+        // a ZOMBIE the client cannot detect (observed: a validator starved for
+        // 30+ minutes on an intact session after a leader kill). CLOSED /
+        // MAX_POSITION_EXCEEDED stay terminal.
         if (offerResult == io.aeron.Publication.BACK_PRESSURED
-                || offerResult == io.aeron.Publication.ADMIN_ACTION) {
+                || offerResult == io.aeron.Publication.ADMIN_ACTION
+                || offerResult == io.aeron.Publication.NOT_CONNECTED) {
             cluster.idleStrategy().idle();
             return true;
         }

@@ -105,8 +105,10 @@ struct Args {
     #[arg(long = "chaos-mode", default_value_t = false)]
     chaos_mode: bool,
 
-    /// Comma-separated services to scrape. (No `sealer`: cluster-only — ordering
-    /// is the Aeron Cluster (Raft), which has no `kardamom_service_up` endpoint.)
+    /// Comma-separated services to scrape: executor/ingress/sequencer. The
+    /// `kardamom_sealer_*` values ride the executor scrape — the clustered
+    /// sealer (Aeron Cluster, Raft) has no endpoint of its own; executors
+    /// re-export its boundary stream from cluster egress.
     #[arg(long, default_value = "executor,ingress")]
     scrape: String,
 
@@ -120,10 +122,6 @@ struct Args {
         default_value = "kardamom-executor-0,kardamom-executor-1,kardamom-executor-2"
     )]
     executor_nodes: String,
-
-    /// Sealer node-container name.
-    #[arg(long = "sealer-node", default_value = "kardamom-sealer-0")]
-    sealer_node: String,
 
     /// Ingress node-container name.
     #[arg(long = "ingress-node", default_value = "kardamom-ingress-0")]
@@ -197,7 +195,6 @@ async fn main() -> anyhow::Result<()> {
         scrape: csv(&args.scrape),
         metrics_via_docker: args.metrics_via_docker,
         executor_nodes: csv(&args.executor_nodes),
-        sealer_node: args.sealer_node,
         ingress_node: args.ingress_node,
         sequencer_nodes: csv(&args.sequencer_nodes),
         output: args.output,

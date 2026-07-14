@@ -313,10 +313,21 @@ async fn main() -> Result<()> {
         }
         None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
     };
+    // Replay cursor: on crash recovery, resume the canonical stream from the
+    // persisted state cursor — the cluster re-offers retained frames from
+    // there on every session establishment, so tx_ordering is gapless across
+    // restarts AND session loss (no separate archive path needed).
+    let cluster_cursor = match &resume {
+        Some(rp) => {
+            kardamom_executor::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1)
+        }
+        None => kardamom_executor::reader::cluster::ReplayCursor::genesis(),
+    };
     let (cluster_guard, cluster_sub) =
         kardamom_executor::reader::cluster::cluster_tx_ordering_subscription(
             cluster_rt,
             file_cfg.cluster.to_live(),
+            cluster_cursor,
         )
         .context("connect cluster tx_ordering subscription")?;
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");

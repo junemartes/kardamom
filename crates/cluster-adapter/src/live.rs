@@ -109,12 +109,58 @@ impl ClusterEgress for LiveEgress {
     }
 }
 
+/// What the session thread sends on every session establishment when the
+/// client is a canonical-stream CONSUMER: a `REPLAY_FROM(next_index,
+/// next_block)` request composed from the consumer's live delivery cursor
+/// (shared atomics, written by the subscription on every delivery). This is
+/// what makes the canonical stream gapless across session loss — without it,
+/// frames committed between session death and re-connect are missed forever.
+#[derive(Clone)]
+pub struct ReplayOnConnect {
+    pub next_index: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub next_block: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// Connect to the cluster, spawning the session thread. Returns the lifetime
 /// guard plus the ingress/egress seams for the trait adapters.
 pub fn connect(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    connect_inner(rt, cfg, None)
+}
+
+/// [`connect`], plus a replay request on every session establishment.
+pub fn connect_with_replay(
+    rt: AeronRuntime,
+    cfg: LiveClusterConfig,
+    replay: ReplayOnConnect,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    connect_inner(rt, cfg, Some(replay))
+}
+
+/// Append a small term-length to a cluster control channel unless the URI
+/// already pins one. Cluster ingress/egress carry KB/s of control + canonical
+/// frames, but Aeron's default 16MB terms allocate a ~50MB log PER publication
+/// image — on both the client's AND every member's aeron tmpfs. Session churn
+/// (chaos failovers, zombie-close reconnects) at 50MB a pop exhausts the 1GB
+/// tmpfs, and the clustered SERVICE then dies with "insufficient usable
+/// storage" while Raft itself stays healthy — observed live as the
+/// post-failover pipeline freeze. 1MB terms cut every such log 16x.
+fn with_control_term_length(uri: &str) -> String {
+    if uri.contains("term-length") {
+        uri.to_string()
+    } else {
+        format!("{uri}|term-length=1m")
+    }
+}
+
+fn connect_inner(
+    rt: AeronRuntime,
+    mut cfg: LiveClusterConfig,
+    replay: Option<ReplayOnConnect>,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
     // Egress subscription: the deliver closure ships each raw frame to the
     // session thread.
     let (frame_tx, frame_rx) = unbounded::<Vec<u8>>();
@@ -133,7 +179,7 @@ pub fn connect(
 
     let join = thread::Builder::new()
         .name("cluster-session".into())
-        .spawn(move || run_session(rt, cfg, frame_rx, req_rx, out_tx, stop_thread))
+        .spawn(move || run_session(rt, cfg, replay, frame_rx, req_rx, out_tx, stop_thread))
         .map_err(|e| LiveError(format!("spawn session thread: {e}")))?;
 
     Ok((
@@ -149,6 +195,7 @@ pub fn connect(
 fn run_session(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
+    replay: Option<ReplayOnConnect>,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
     out_tx: Sender<Vec<u8>>,
@@ -175,6 +222,15 @@ fn run_session(
             return;
         }
     };
+
+    // Replay-request resend state: the request is publish()ed on the cluster
+    // ingress, which right after a (re)connect is often still NOT_CONNECTED —
+    // a single best-effort send is silently lost and the consumer then waits
+    // forever for a replay nobody asked for. Resend every REPLAY_RESEND_MS
+    // until the consumer's cursor ADVANCES (progress = frames flowing again).
+    const REPLAY_RESEND_MS: u64 = 3_000;
+    let mut replay_last_sent_ms: u64 = 0;
+    let mut replay_cursor_at_send: (u64, u64) = (u64::MAX, u64::MAX);
 
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
     // publisher-only client (the sequencer) drops its `LiveEgress`, after which
@@ -212,6 +268,10 @@ fn run_session(
                             }
                             DriverEvent::Connected { cluster_session_id } => {
                                 tracing::info!(cluster_session_id, "cluster session opened");
+                                // Canonical-stream consumers request replay from
+                                // their delivery cursor on EVERY establishment;
+                                // force an immediate (re)send below.
+                                replay_last_sent_ms = 0;
                             }
                             DriverEvent::Failed(reason) => {
                                 tracing::error!(%reason, "cluster session failed");
@@ -223,6 +283,41 @@ fn run_session(
                 // A dropped LiveIngress/LiveEgress must NOT kill the session
                 // (the other half may still be in use); only `stop` terminates.
                 Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // 1b. Replay request (canonical-stream consumers): send on session
+        // establishment and RE-SEND periodically until the consumer's cursor
+        // advances — the ingress publication is often not yet connected right
+        // after a (re)connect, so any single send can be silently lost.
+        if let Some(r) = &replay
+            && driver.is_connected()
+        {
+            let cursor = (
+                r.next_index.load(std::sync::atomic::Ordering::Relaxed),
+                r.next_block.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let now = now_ms();
+            let progressed = cursor != replay_cursor_at_send;
+            if progressed && replay_last_sent_ms != 0 {
+                // Frames are flowing — move the checkpoint so a FUTURE stall is
+                // measured from the most recent progress, not the last send.
+                replay_cursor_at_send = cursor;
+                replay_last_sent_ms = now;
+            } else if replay_last_sent_ms == 0
+                || now.saturating_sub(replay_last_sent_ms) >= REPLAY_RESEND_MS
+            {
+                let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
+                if let Some(framed) = driver.wrap_app(&req, now as i64) {
+                    ingress.publish_best_effort(to_aligned(&framed));
+                    tracing::info!(
+                        next_index = cursor.0,
+                        next_block = cursor.1,
+                        "cluster replay requested"
+                    );
+                    replay_last_sent_ms = now;
+                    replay_cursor_at_send = cursor;
+                }
             }
         }
 
@@ -281,7 +376,9 @@ fn open_leader_pub(
     stream_id: i32,
 ) -> Option<PubHandle> {
     let endpoint = endpoint_for_member(endpoints, member_id)?;
-    let uri = format!("aeron:udp?endpoint={endpoint}");
+    // Small terms: this publication's log allocates at ITS term length on the
+    // client AND as the matching image on EVERY cluster member's tmpfs.
+    let uri = format!("aeron:udp?endpoint={endpoint}|term-length=1m");
     rt.open_publication(&uri, stream_id).ok()
 }
 

@@ -256,13 +256,16 @@ dump_diagnostics() {
   # named by its alloc; find it via the inner docker ps).
   for n in "${NODES[@]}"; do
     [[ "${NODE_ROLE[$n]}" == "sealer" ]] || continue
-    echo "===== ${n}: ClusterTool describe ====="
+    echo "===== ${n}: ClusterTool errors + members ====="
     docker exec "kardamom-${n}" sh -c '
       inner="$(docker ps --format "{{.Names}}" | grep -m1 "^cluster-")"
       [ -n "$inner" ] || { echo "(no inner cluster container running)"; exit 0; }
-      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster describe 2>&1
-      echo "--- recovery-plan ---"
-      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar         io.aeron.cluster.ClusterTool /opt/kardamom/cluster recovery-plan 1 2>&1 | tail -20' 2>/dev/null || true
+      # errors reads the CONSENSUS_MODULE and CONTAINER mark-file error buffers;
+      # the CONTAINER one is where a dying clustered SERVICE logs (e.g. aeron
+      # tmpfs exhaustion) and is NOT covered by the *.log file glob above.
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster errors 2>&1 | tail -40
+      echo "--- list-members ---"
+      docker exec "$inner" java -cp /opt/kardamom/cluster-node.jar io.aeron.cluster.ClusterTool /opt/kardamom/cluster list-members 2>&1 | tail -3' 2>/dev/null || true
   done
 }
 
@@ -610,15 +613,22 @@ executor_block() {
   return 1
 }
 
-# The SYNC/KEEP-UP bound is asserted on the LOAD shard only. The chaos shards
-# kill Raft members under load, which can expire the validator's cluster
-# session (>15s outages exceed the session timeout); catching back up after a
-# session loss needs the branch-node-incremental trie (#65 — the full-rebuild
-# root here is too slow to drain a big backlog) and client reconnect hardening,
-# tracked as follow-ups. On chaos shards the verdict still asserts the hard
-# safety properties: the validator stayed ALIVE (no fail-stop), it VERIFIED
-# blocks against the BAL, and it counted ZERO divergences.
+# What the verdict asserts per shard tracks what the DESIGN guarantees:
+#
+# LOAD shard — full sync + bounded lag. The canonical stream is loss-proof
+# (cluster sessions + retention + REPLAY_FROM on every establishment), and
+# under plain load the validator demonstrably keeps up.
+#
+# CHAOS shards — fail-stop safety + forward progress, NOT bounded lag. The
+# canonical stream survives chaos (verified: the subscription cursor advances
+# through leader kills and quorum loss via replay + catch-up ordering), but
+# the MULTICAST side-streams (tx_bal, tx_receipts, tx_data envelopes) have no
+# retention/refetch yet: a deliberately-slower-than-hot-path verifier that
+# falls behind a 200tps chaos barrage lapses those images and then pays the
+# BAL wait per block — bounded-lag-after-chaos requires the archive-backed
+# side-stream refetch (tracked follow-up), not test tuning.
 v_start="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)"; v_start="${v_start:-0}"
+v_start="$(printf '%.0f' "${v_start}")"
 if [[ "${RUN_LOAD:-1}" == "1" ]]; then
   deadline=$(( $(date +%s) + VALIDATOR_SYNC_TIMEOUT_S ))
   ok=0
@@ -638,9 +648,20 @@ if [[ "${RUN_LOAD:-1}" == "1" ]]; then
   fi
   log "validator synced: block ${v_blk} vs executor ${e_blk} (lag $(( e_blk - v_blk )) <= ${VALIDATOR_LAG_MAX})"
 else
-  v_blk="$(printf '%.0f' "${v_start}")"
-  (( v_blk > 0 )) || { echo "FAIL: validator never committed a block (committed=${v_blk})" >&2; exit 1; }
-  log "chaos shard: validator alive at block ${v_blk} (sync bound asserted on the load shard)"
+  # Forward progress: the validator must still be verifying and committing.
+  deadline=$(( $(date +%s) + 60 ))
+  ok=0
+  while (( $(date +%s) < deadline )); do
+    v_blk="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)"
+    v_blk="$(printf '%.0f' "${v_blk:-0}")"
+    if (( v_blk > v_start )); then ok=1; break; fi
+    sleep 5
+  done
+  if (( ok != 1 )); then
+    echo "FAIL: validator made no progress after chaos (stuck at ${v_blk:-?})" >&2
+    exit 1
+  fi
+  log "chaos shard: validator progressing (${v_start} -> ${v_blk}); bounded lag asserted on the load shard"
 fi
 
 verified="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_blocks_verified_total)"
@@ -649,6 +670,14 @@ verified="$(printf '%.0f' "${verified:-0}")"
 diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
 diverged="$(printf '%.0f' "${diverged:-0}")"
 (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
+# The metric resets if the alloc restarted (recovery loop); a PRE-restart
+# divergence still shows in the alloc log — catch it there too.
+if docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
+    alloc=$(nomad job allocs -t "{{range .}}{{.ID}} {{end}}" validator 2>/dev/null | awk "{print \$1}"); \
+    nomad alloc logs "$alloc" 2>/dev/null' 2>/dev/null | grep -q "halted on divergence"; then
+  echo "FAIL: validator halted on divergence (found in alloc log)" >&2
+  exit 1
+fi
 # Incremental-trie shadow-check (--trie-shadow-check 1 in validator.nomad.hcl):
 # every committed block recomputed the state root by FULL rebuild and compared
 # it to the node-incremental walker's. A mismatch fail-stops the validator
