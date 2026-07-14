@@ -73,6 +73,13 @@ job "validator" {
           # Own state dir UNDER the shared persistent mount — never the
           # executor's /opt/kardamom/state root (separate mdbx env).
           "--state-dir", "/opt/kardamom/state/validator",
+          # Crash-recovery archive replay-merge endpoint for tx_data /
+          # tx_deposits (used only when the state DB is non-empty, i.e. on a
+          # restart mid-chain). tx_ordering recovery rides the cluster replay
+          # instead. Port 40131 on this node's IP (the executor's replay
+          # endpoint uses 40130 on ITS nodes; no co-residence, but keep them
+          # distinct anyway).
+          "--replay-destination-endpoint", "${meta.node_ip}:40131",
           # Shadow-check the node-incremental state trie against a full rebuild
           # every 8th block; a walker bug fail-stops the validator (dead alloc =
           # verdict failure) and bumps kardamom_state_trie_shadow_mismatch_total.
