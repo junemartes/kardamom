@@ -29,6 +29,9 @@ use std::time::Duration;
 use kardamom_engine::{CMessage, ExecutorError, StateWriterQueue, TxReceiptsPublication};
 use kardamom_types::{BPosition, BlockBoundary, BlockDelta, Receipt};
 
+/// L1 output attester: collects `MessagePassed` leaves from re-executed
+/// blocks, builds the per-output withdrawals root, posts to the L1 oracle.
+pub mod attester;
 pub mod metrics;
 
 /// Shared divergence flag. Once tripped, the validator has observed a proven

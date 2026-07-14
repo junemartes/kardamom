@@ -33,6 +33,12 @@ pub fn kardamom_l2_settlement_creation() -> Bytes {
     Bytes::from_static(KARDAMOM_L2_SETTLEMENT_CREATION)
 }
 
+/// Creation bytecode of `WithdrawalOutputOracle` — the withdrawal output root
+/// registry. The factory CREATE2's this on demand.
+pub fn withdrawal_output_oracle_creation() -> Bytes {
+    Bytes::from_static(WITHDRAWAL_OUTPUT_ORACLE_CREATION)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +61,10 @@ mod tests {
     #[test]
     fn kardamom_l2_settlement_creation_is_nonempty() {
         assert!(!kardamom_l2_settlement_creation().is_empty());
+    }
+
+    #[test]
+    fn withdrawal_output_oracle_creation_is_nonempty() {
+        assert!(!withdrawal_output_oracle_creation().is_empty());
     }
 }

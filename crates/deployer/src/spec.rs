@@ -116,6 +116,16 @@ pub fn encode_address_arg(addr: Address) -> Bytes {
     Bytes::from(v)
 }
 
+/// abi-encode two address arguments, e.g. `ETHLockbox.initialize(l2Minter, outputOracle)`.
+pub fn encode_address_pair(a: Address, b: Address) -> Bytes {
+    Bytes::from((a, b).abi_encode_params())
+}
+
+/// abi-encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`.
+pub fn encode_oracle_init_args(attester: Address, challenger: Address, window: u64) -> Bytes {
+    Bytes::from((attester, challenger, window).abi_encode_params())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

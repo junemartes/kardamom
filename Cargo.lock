@@ -3980,9 +3980,17 @@ dependencies = [
 name = "kardamom-validator"
 version = "0.1.0"
 dependencies = [
+ "alloy-contract",
+ "alloy-network",
+ "alloy-node-bindings",
  "alloy-primitives",
+ "alloy-provider",
+ "alloy-rpc-types-eth",
+ "alloy-signer-local",
+ "alloy-sol-types",
  "anyhow",
  "clap",
+ "kardamom-deployer",
  "kardamom-engine",
  "kardamom-log",
  "kardamom-obs",
@@ -3990,6 +3998,7 @@ dependencies = [
  "kardamom-types",
  "metrics",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "toml",

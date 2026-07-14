@@ -4,7 +4,7 @@
 //! canonical label), and an `initialize` signature used to encode init calldata.
 //! Adding a new L1 contract is one new variant + four match-arms — no factory edit.
 
-use alloy_primitives::{B256, Bytes, keccak256};
+use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue;
 
 use crate::embedded;
@@ -16,27 +16,39 @@ pub enum ContractId {
     /// `(prevBatchIndex, blobHashes, l2BlockStart, l2BlockEnd)` and emits
     /// `BatchPosted` — no state-root storage (S0).
     KardamomL2Settlement,
+    /// L1 registry of attested L2 output roots for the withdrawal off-ramp.
+    /// Permissioned attester proposes outputs; permissioned challenger deletes
+    /// within the finalization window.
+    WithdrawalOutputOracle,
 }
 
 impl ContractId {
     /// Every variant. The exhaustive match in `creation_bytecode` makes this
     /// list mandatory-to-update when a new variant is added.
-    pub const ALL: &'static [Self] = &[Self::EthLockbox, Self::KardamomL2Settlement];
+    pub const ALL: &'static [Self] = &[
+        Self::EthLockbox,
+        Self::KardamomL2Settlement,
+        Self::WithdrawalOutputOracle,
+    ];
 
     /// Canonical label hashed into the registry key.
     pub fn label(self) -> &'static str {
         match self {
             ContractId::EthLockbox => "kardamom.l1.ETHLockbox",
             ContractId::KardamomL2Settlement => "kardamom.l2.KardamomL2Settlement",
+            ContractId::WithdrawalOutputOracle => "kardamom.l1.WithdrawalOutputOracle",
         }
     }
 
     /// Solidity signature of the impl's `initialize` method.
     pub fn init_signature(self) -> &'static str {
         match self {
-            ContractId::EthLockbox => "initialize(address)",
+            // ETHLockbox.initialize(address _l2Minter, address _outputOracle)
+            ContractId::EthLockbox => "initialize(address,address)",
             // KardamomL2Settlement.initialize(address _l1Batcher)
             ContractId::KardamomL2Settlement => "initialize(address)",
+            // WithdrawalOutputOracle.initialize(address attester, address challenger, uint64 window)
+            ContractId::WithdrawalOutputOracle => "initialize(address,address,uint64)",
         }
     }
 
@@ -46,9 +58,13 @@ impl ContractId {
     }
 
     /// Proxy salt — includes l2_chain_id so each L2 gets a distinct proxy address.
-    /// `keccak256(abi.encode(l2ChainId, id, "proxy"))`.
+    /// Must byte-match `KardamomFactoryV1._deployUUPS`, which computes the salt
+    /// itself as `keccak256(abi.encode(uint256 l2ChainId, bytes32 id, "proxy"))`.
+    /// Use `abi_encode_params` (Solidity `abi.encode(args…)` semantics): a plain
+    /// `abi_encode` of the tuple would prepend a leading offset because the tuple
+    /// contains a dynamic member (the string), diverging from Solidity.
     pub fn proxy_salt(self, l2_chain_id: u64) -> B256 {
-        let encoded = (l2_chain_id, self.id(), "proxy".to_string()).abi_encode();
+        let encoded = (U256::from(l2_chain_id), self.id(), "proxy".to_string()).abi_encode_params();
         keccak256(encoded)
     }
 
@@ -72,6 +88,7 @@ impl ContractId {
         match self {
             ContractId::EthLockbox => embedded::eth_lockbox_creation(),
             ContractId::KardamomL2Settlement => embedded::kardamom_l2_settlement_creation(),
+            ContractId::WithdrawalOutputOracle => embedded::withdrawal_output_oracle_creation(),
         }
     }
 }
@@ -90,8 +107,22 @@ mod tests {
     #[test]
     fn init_selector_for_eth_lockbox() {
         let sel = ContractId::EthLockbox.init_selector();
-        let expected = &keccak256(b"initialize(address)")[..4];
+        let expected = &keccak256(b"initialize(address,address)")[..4];
         assert_eq!(&sel[..], expected);
+    }
+
+    #[test]
+    fn withdrawal_output_oracle_id_and_selector() {
+        let id = ContractId::WithdrawalOutputOracle.id();
+        assert_eq!(id, keccak256(b"kardamom.l1.WithdrawalOutputOracle"));
+        let sel = ContractId::WithdrawalOutputOracle.init_selector();
+        assert_eq!(
+            &sel[..],
+            &keccak256(b"initialize(address,address,uint64)")[..4]
+        );
+        // Distinct from the other ids.
+        assert_ne!(id, ContractId::EthLockbox.id());
+        assert_ne!(id, ContractId::KardamomL2Settlement.id());
     }
 
     #[test]

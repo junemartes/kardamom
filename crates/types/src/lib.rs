@@ -30,6 +30,7 @@ pub mod tx_ordering;
 pub mod txref;
 pub mod watermark;
 pub mod wire;
+pub mod withdrawals;
 
 pub use ack_policy::AckPolicy;
 pub use boundary::{BlockBoundary, BlockBoundaryStart};

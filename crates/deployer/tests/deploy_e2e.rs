@@ -7,7 +7,7 @@ use alloy_provider::{Provider, ProviderBuilder};
 use alloy_sol_types::sol;
 
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
-use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_arg};
+use kardamom_deployer::{ContractId, Deployer, FactoryStatus, Op, encode_address_pair};
 
 sol! {
     #[sol(rpc)]
@@ -121,12 +121,12 @@ async fn multi_l2_deploy_and_atomic_upgrade() {
                 Op::Deploy {
                     l2_chain_id: 42,
                     id: ContractId::EthLockbox,
-                    init_args: encode_address_arg(l2_minter_a),
+                    init_args: encode_address_pair(l2_minter_a, Address::ZERO),
                 },
                 Op::Deploy {
                     l2_chain_id: 43,
                     id: ContractId::EthLockbox,
-                    init_args: encode_address_arg(l2_minter_b),
+                    init_args: encode_address_pair(l2_minter_b, Address::ZERO),
                 },
             ],
             DEV_OWNER,

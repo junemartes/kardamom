@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand};
 
 use kardamom_deployer::{
     ContractId, Deployer, FactoryStatus, Op, RegistryEntry, VerifyMismatch, encode_address_arg,
+    encode_address_pair, encode_oracle_init_args,
 };
 
 #[derive(Debug, Parser)]
@@ -44,7 +45,8 @@ enum Command {
         #[arg(long)]
         private_key: String,
 
-        /// Contract IDs to deploy (e.g. ETHLockbox). Same id repeats per L2.
+        /// Contract IDs to deploy (e.g. ETHLockbox, WithdrawalOutputOracle).
+        /// Same id repeats per L2.
         #[arg(required = true)]
         ids: Vec<String>,
 
@@ -52,9 +54,28 @@ enum Command {
         #[arg(long = "l2-chain-id", required = true)]
         l2_chain_ids: Vec<u64>,
 
-        /// L2 minter addresses for ETHLockbox initialize. Must match `--l2-chain-id` count.
+        /// L2 minter addresses for ETHLockbox initialize. Must match `--l2-chain-id`
+        /// count when ETHLockbox is among the deployed ids.
         #[arg(long = "l2-minter")]
         l2_minters: Vec<Address>,
+
+        /// Output oracle address wired into ETHLockbox.initialize. If omitted, the
+        /// oracle being deployed in this same invocation is used (its address is
+        /// predicted); otherwise defaults to the zero address (deposit-only).
+        #[arg(long = "output-oracle")]
+        output_oracle: Option<Address>,
+
+        /// Attester address for WithdrawalOutputOracle.initialize.
+        #[arg(long)]
+        attester: Option<Address>,
+
+        /// Challenger address for WithdrawalOutputOracle.initialize.
+        #[arg(long)]
+        challenger: Option<Address>,
+
+        /// Finalization window (seconds) for WithdrawalOutputOracle.initialize.
+        #[arg(long, default_value_t = 86_400)]
+        finalization_window: u64,
     },
 
     /// Upgrade contracts to the next version across one or more L2s in one tx.
@@ -94,15 +115,21 @@ async fn main() -> Result<()> {
             ids,
             l2_chain_ids,
             l2_minters,
+            output_oracle,
+            attester,
+            challenger,
+            finalization_window,
         } => {
-            if l2_chain_ids.len() != l2_minters.len() {
+            let contract_ids = parse_ids(&ids)?;
+            if contract_ids.contains(&ContractId::EthLockbox)
+                && l2_chain_ids.len() != l2_minters.len()
+            {
                 bail!(
-                    "--l2-chain-id ({}) and --l2-minter ({}) counts must match",
+                    "--l2-chain-id ({}) and --l2-minter ({}) counts must match when deploying ETHLockbox",
                     l2_chain_ids.len(),
                     l2_minters.len()
                 );
             }
-            let contract_ids = parse_ids(&ids)?;
             run_deploy(
                 cli.rpc_url,
                 private_key,
@@ -110,6 +137,10 @@ async fn main() -> Result<()> {
                 contract_ids,
                 l2_chain_ids,
                 l2_minters,
+                output_oracle,
+                attester,
+                challenger,
+                finalization_window,
             )
             .await
         }
@@ -154,6 +185,7 @@ async fn run_ensure_factory(rpc_url: String, private_key: String, owner: Address
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_deploy(
     rpc_url: String,
     private_key: String,
@@ -161,6 +193,10 @@ async fn run_deploy(
     ids: Vec<ContractId>,
     l2_chain_ids: Vec<u64>,
     l2_minters: Vec<Address>,
+    output_oracle: Option<Address>,
+    attester: Option<Address>,
+    challenger: Option<Address>,
+    finalization_window: u64,
 ) -> Result<()> {
     let signer = parse_key(&private_key)?;
     let operator = signer.address();
@@ -171,14 +207,41 @@ async fn run_deploy(
 
     deployer.ensure_factory(operator).await?;
 
-    // For each id × each (l2_chain_id, l2_minter) pair, emit one Op::Deploy.
+    // Per-contract init args. For each id × L2, emit one Op::Deploy with the
+    // contract-specific initialize calldata.
+    let deploying_oracle = ids.contains(&ContractId::WithdrawalOutputOracle);
     let mut ops: Vec<Op> = Vec::new();
     for id in &ids {
-        for (chain_id, minter) in l2_chain_ids.iter().zip(l2_minters.iter()) {
+        for (i, chain_id) in l2_chain_ids.iter().enumerate() {
+            let init_args = match id {
+                ContractId::EthLockbox => {
+                    let minter = l2_minters[i];
+                    // Wire the oracle: explicit flag, else the oracle deployed in
+                    // this same batch (predicted), else zero (deposit-only).
+                    let oracle = match output_oracle {
+                        Some(a) => a,
+                        None if deploying_oracle => {
+                            let oargs =
+                                oracle_init_args(attester, challenger, finalization_window)?;
+                            deployer.predict_proxy_address(
+                                *chain_id,
+                                ContractId::WithdrawalOutputOracle,
+                                &oargs,
+                            )
+                        }
+                        None => Address::ZERO,
+                    };
+                    encode_address_pair(minter, oracle)
+                }
+                ContractId::WithdrawalOutputOracle => {
+                    oracle_init_args(attester, challenger, finalization_window)?
+                }
+                ContractId::KardamomL2Settlement => encode_address_arg(l2_minters[i]),
+            };
             ops.push(Op::Deploy {
                 l2_chain_id: *chain_id,
                 id: *id,
-                init_args: encode_address_arg(*minter),
+                init_args,
             });
         }
     }
@@ -279,12 +342,28 @@ fn parse_ids(ids: &[String]) -> Result<Vec<ContractId>> {
 }
 
 fn parse_contract_id(s: &str) -> Result<ContractId> {
-    match s.to_lowercase().replace('-', "").as_str() {
+    match s.to_lowercase().replace(['-', '_'], "").as_str() {
         "ethlockbox" => Ok(ContractId::EthLockbox),
+        "kardamoml2settlement" => Ok(ContractId::KardamomL2Settlement),
+        "withdrawaloutputoracle" => Ok(ContractId::WithdrawalOutputOracle),
         other => bail!(
-            "unknown contract id `{other}`; valid values: ETHLockbox, eth-lockbox, ethLockbox"
+            "unknown contract id `{other}`; valid values: ETHLockbox, \
+             WithdrawalOutputOracle, KardamomL2Settlement"
         ),
     }
+}
+
+/// Encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`,
+/// requiring the attester/challenger flags.
+fn oracle_init_args(
+    attester: Option<Address>,
+    challenger: Option<Address>,
+    window: u64,
+) -> Result<Bytes> {
+    let attester = attester.context("--attester required to deploy WithdrawalOutputOracle")?;
+    let challenger =
+        challenger.context("--challenger required to deploy WithdrawalOutputOracle")?;
+    Ok(encode_oracle_init_args(attester, challenger, window))
 }
 
 fn print_entry(e: &RegistryEntry) {
