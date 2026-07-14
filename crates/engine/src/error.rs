@@ -27,6 +27,11 @@ pub enum ExecutorError {
     #[error("tx_ordering subscription closed")]
     TxOrderingClosed,
 
+    #[error(
+        "cluster replay unavailable: need from index {from_index}, oldest retained {oldest_index} — full resync required"
+    )]
+    ClusterReplayUnavailable { from_index: u64, oldest_index: u64 },
+
     #[error("tx_data[{sequencer_id}] subscription closed")]
     TxDataClosed { sequencer_id: u8 },
 

@@ -50,6 +50,13 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 Ok(EgressItem::Boundary(b)) => {
                     self.watermark.observe_boundary(b.end_tx_idx.as_index())
                 }
+                // Replay control frames are per-session responses to a
+                // REPLAY_FROM request; the ingress never sends one (it derives
+                // a watermark from live progress only), so these cannot arrive
+                // on its session — ignore defensively.
+                Ok(EgressItem::ReplayDone { .. } | EgressItem::ReplayUnavailable { .. }) => {
+                    continue;
+                }
                 Err(e) => {
                     // The cluster stream is authoritative, so this should never
                     // happen in practice; drop the frame and keep observing.

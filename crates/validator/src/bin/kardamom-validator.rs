@@ -266,10 +266,22 @@ async fn main() -> Result<()> {
         }
         None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
     };
+    // Replay cursor: resume from the persisted state cursor (fresh validators
+    // start at genesis and receive the full retained canonical stream). The
+    // replay request is re-sent on every session establishment, so a validator
+    // whose session dies mid-chaos catches back up instead of fail-stopping on
+    // an unrecoverable gap.
+    let cluster_cursor = match &resume {
+        Some(rp) => {
+            kardamom_engine::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1)
+        }
+        None => kardamom_engine::reader::cluster::ReplayCursor::genesis(),
+    };
     let (cluster_guard, cluster_sub) =
         kardamom_engine::reader::cluster::cluster_tx_ordering_subscription(
             cluster_rt,
             file_cfg.cluster.to_live(),
+            cluster_cursor,
         )
         .context("connect cluster tx_ordering subscription")?;
     tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");

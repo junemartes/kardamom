@@ -109,11 +109,40 @@ impl ClusterEgress for LiveEgress {
     }
 }
 
+/// What the session thread sends on every session establishment when the
+/// client is a canonical-stream CONSUMER: a `REPLAY_FROM(next_index,
+/// next_block)` request composed from the consumer's live delivery cursor
+/// (shared atomics, written by the subscription on every delivery). This is
+/// what makes the canonical stream gapless across session loss — without it,
+/// frames committed between session death and re-connect are missed forever.
+#[derive(Clone)]
+pub struct ReplayOnConnect {
+    pub next_index: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    pub next_block: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
 /// Connect to the cluster, spawning the session thread. Returns the lifetime
 /// guard plus the ingress/egress seams for the trait adapters.
 pub fn connect(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    connect_inner(rt, cfg, None)
+}
+
+/// [`connect`], plus a replay request on every session establishment.
+pub fn connect_with_replay(
+    rt: AeronRuntime,
+    cfg: LiveClusterConfig,
+    replay: ReplayOnConnect,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    connect_inner(rt, cfg, Some(replay))
+}
+
+fn connect_inner(
+    rt: AeronRuntime,
+    cfg: LiveClusterConfig,
+    replay: Option<ReplayOnConnect>,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
     // Egress subscription: the deliver closure ships each raw frame to the
     // session thread.
@@ -133,7 +162,7 @@ pub fn connect(
 
     let join = thread::Builder::new()
         .name("cluster-session".into())
-        .spawn(move || run_session(rt, cfg, frame_rx, req_rx, out_tx, stop_thread))
+        .spawn(move || run_session(rt, cfg, replay, frame_rx, req_rx, out_tx, stop_thread))
         .map_err(|e| LiveError(format!("spawn session thread: {e}")))?;
 
     Ok((
@@ -149,6 +178,7 @@ pub fn connect(
 fn run_session(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
+    replay: Option<ReplayOnConnect>,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
     out_tx: Sender<Vec<u8>>,
@@ -212,6 +242,22 @@ fn run_session(
                             }
                             DriverEvent::Connected { cluster_session_id } => {
                                 tracing::info!(cluster_session_id, "cluster session opened");
+                                // Canonical-stream consumers request replay from
+                                // their delivery cursor on EVERY establishment —
+                                // a fresh session receives only frames committed
+                                // from now on; the replay fills what a prior
+                                // session (or a fresh start behind the stream)
+                                // missed.
+                                if let Some(r) = &replay {
+                                    let req = crate::wire::encode_replay_request(
+                                        r.next_index.load(std::sync::atomic::Ordering::Relaxed),
+                                        r.next_block.load(std::sync::atomic::Ordering::Relaxed),
+                                    );
+                                    if let Some(framed) = driver.wrap_app(&req, now_ms() as i64) {
+                                        ingress.publish_best_effort(to_aligned(&framed));
+                                        tracing::info!("cluster replay requested at session open");
+                                    }
+                                }
                             }
                             DriverEvent::Failed(reason) => {
                                 tracing::error!(%reason, "cluster session failed");
