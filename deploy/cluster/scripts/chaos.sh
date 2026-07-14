@@ -480,9 +480,17 @@ run_case() { # <case-name>
   # Pipeline must be producing blocks again after recovery. In cluster mode the
   # sealer Prometheus endpoint doesn't exist, so use the executor progress probe;
   # otherwise assert_progress prefers the legacy sealer-boundary probe.
+  # node-failure gets the WIDE window: right after `docker start` of the killed
+  # node, the runner is saturated by nomad rescheduling + the returning node
+  # force-pulling every image through the in-cluster registry — on 4-core CI
+  # runners even the metric scrapes time out through that thrash ("block 0 ->
+  # 0" with the max-across-replicas probe = nobody answered), while the same
+  # case passes cleanly on a 12-core host. Same evidence-based widening as the
+  # quorum-loss case's 180s.
   case "${name}" in
-    cluster-*) assert_executor_progress ;;
-    *)         assert_progress ;;
+    cluster-*)              assert_executor_progress ;;
+    node-failure-*)         assert_executor_progress 180 ;;
+    *)                      assert_progress ;;
   esac
 
   # Let the background load finish its window + drain, then check its verdict.
