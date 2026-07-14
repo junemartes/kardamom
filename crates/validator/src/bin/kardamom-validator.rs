@@ -266,10 +266,22 @@ async fn main() -> Result<()> {
         }
         None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
     };
+    // Replay cursor: resume from the persisted state cursor (fresh validators
+    // start at genesis and receive the full retained canonical stream). The
+    // replay request is re-sent on every session establishment, so a validator
+    // whose session dies mid-chaos catches back up instead of fail-stopping on
+    // an unrecoverable gap.
+    let cluster_cursor = match &resume {
+        Some(rp) => {
+            kardamom_engine::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1)
+        }
+        None => kardamom_engine::reader::cluster::ReplayCursor::genesis(),
+    };
     let (cluster_guard, cluster_sub) =
         kardamom_engine::reader::cluster::cluster_tx_ordering_subscription(
             cluster_rt,
             file_cfg.cluster.to_live(),
+            cluster_cursor,
         )
         .context("connect cluster tx_ordering subscription")?;
     tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");
@@ -384,6 +396,15 @@ async fn main() -> Result<()> {
         chain_id,
         ..ExecutorConfig::default()
     };
+    // ALWAYS bound the tx_data join wait. A verifier that loses an envelope
+    // (its multicast image lapsed while it fell behind a load burst — the
+    // side-streams have no retention/refetch yet) must fail LOUDLY, not hang
+    // forever mid-join: exiting lets the supervisor restart it into the
+    // crash-recovery path, which replays the missing tx_data range from the
+    // archive recorders and resumes from the persisted cursor — the designed
+    // recovery loop. (Divergence fail-stops stay distinguishable by their
+    // 'halted on divergence' log line.)
+    cfg.reader.join_timeout = Duration::from_secs(60);
     if resume.is_some() {
         cfg.reader.join_timeout = Duration::from_secs(30);
     }

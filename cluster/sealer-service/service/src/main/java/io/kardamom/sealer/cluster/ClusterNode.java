@@ -45,19 +45,87 @@ public final class ClusterNode {
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 
-        final MediaDriver.Context driverCtx = new MediaDriver.Context()
+        // Launch with a retry past the mark-file liveness window. A member that
+        // was HARD-KILLED (kill -9 / docker kill) cannot clear its archive and
+        // cluster mark files; agrona's guard then sees a fresh-enough activity
+        // timestamp and ClusteredMediaDriver.launch throws
+        // "IllegalStateException: active Mark file detected" until the stale
+        // heartbeat ages out (~10s) — the chaos suite's "poison window": a
+        // supervisor restarting the task within it burned restart attempts
+        // until the member was stranded below quorum. Retrying IN-PROCESS
+        // (fresh contexts each attempt — Aeron contexts are single-use) makes a
+        // supervised restart deterministic while PRESERVING the double-run
+        // guard: a genuinely live sibling on the same dirs keeps heartbeating,
+        // so every retry still fails and we exit with the original error.
+        final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
+        ClusteredMediaDriver driver = null;
+        ClusteredServiceContainer container = null;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                driver = ClusteredMediaDriver.launch(
+                    driverContext(aeronDir),
+                    archiveContext(aeronDir, archiveDir, me),
+                    consensusContext(aeronDir, clusterDir, clusterMembers, memberId, ingressStreamId, me, barrier));
+                container = ClusteredServiceContainer.launch(
+                    serviceContext(aeronDir, clusterDir, dedupCapacity, tickMs, memberId, barrier));
+                break;
+            } catch (final RuntimeException e) {
+                org.agrona.CloseHelper.quietClose(driver);
+                driver = null;
+                if (!isActiveMarkFile(e) || attempt >= MAX_LAUNCH_ATTEMPTS) {
+                    throw e;
+                }
+                System.out.println("cluster LAUNCH RETRY memberId=" + memberId + " attempt=" + attempt
+                    + " — stale mark file from a hard-killed predecessor; waiting out the liveness window");
+                try {
+                    Thread.sleep(LAUNCH_RETRY_DELAY_MS);
+                } catch (final InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+
+        try (ClusteredMediaDriver ignored = driver;
+             ClusteredServiceContainer ignored2 = container) {
+            System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
+            barrier.await();
+        }
+    }
+
+    /** Launch retries past the ~10s mark-file liveness window with margin. */
+    static final int MAX_LAUNCH_ATTEMPTS = 6;
+    static final long LAUNCH_RETRY_DELAY_MS = 5_000;
+
+    /** Whether the launch failure is agrona's "active Mark file detected" guard. */
+    static boolean isActiveMarkFile(final Throwable t) {
+        for (Throwable c = t; c != null; c = c.getCause()) {
+            if (c instanceof IllegalStateException
+                && c.getMessage() != null
+                && c.getMessage().contains("active Mark file detected")) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static MediaDriver.Context driverContext(final String aeronDir) {
+        return new MediaDriver.Context()
             .aeronDirectoryName(aeronDir)
             .threadingMode(ThreadingMode.SHARED)
             .dirDeleteOnStart(true)
             .dirDeleteOnShutdown(false);
+    }
 
         // Aeron 1.44 requires Archive.Context.replicationChannel to be set (no
         // default). It's the channel this archive receives replication on during
         // cluster catch-up (snapshot/log transfer between members). The standard
         // ClusteredMediaDriver pattern uses this node's IP with an OS-assigned
         // (ephemeral) port. me[*] all share this node's IP (host of the ingress ep).
+    private static Archive.Context archiveContext(
+            final String aeronDir, final String archiveDir, final String[] me) {
         final String nodeHost = me[0].split(":")[0];
-        final Archive.Context archiveCtx = new Archive.Context()
+        return new Archive.Context()
             .aeronDirectoryName(aeronDir)
             .archiveDir(new File(archiveDir))
             .controlChannel("aeron:udp?endpoint=" + me[4])
@@ -65,13 +133,27 @@ public final class ClusterNode {
             .replicationChannel("aeron:udp?endpoint=" + nodeHost + ":0")
             .recordingEventsEnabled(false)
             .threadingMode(ArchiveThreadingMode.SHARED);
+    }
 
-        final ConsensusModule.Context consensusCtx = new ConsensusModule.Context()
+    private static ConsensusModule.Context consensusContext(
+            final String aeronDir, final String clusterDir, final String clusterMembers,
+            final int memberId, final int ingressStreamId, final String[] me,
+            final ShutdownSignalBarrier barrier) {
+        final ConsensusModule.Context ctx = new ConsensusModule.Context()
             .clusterMemberId(memberId)
             .clusterMembers(clusterMembers)
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .ingressChannel("aeron:udp")
+            // The cluster LOG rides Aeron's 64MB default terms -> a 192MB log
+            // buffer for the log publication, PLUS 192MB per member image,
+            // PLUS 192MB per election LogReplay — on the aeron tmpfs. At this
+            // deployment's KB/s rates that's ~all of a 1GB tmpfs gone at
+            // election time: members then die with 'insufficient usable
+            // storage' (log replay / session response pubs) while Raft looks
+            // healthy from outside. 8MB terms (24MB logs) leave an order of
+            // magnitude of headroom without approaching flow-control limits.
+            .logChannel("aeron:udp?term-length=8m")
             .ingressStreamId(ingressStreamId)
             .appVersion(APP_VERSION)
             // Client sessions must survive a full quorum outage END TO END
@@ -93,30 +175,35 @@ public final class ClusterNode {
             // heartbeat timeout" warnings it was meant to silence were benign.
             .replicationChannel("aeron:udp?endpoint=" + me[3]);
 
-        final ClusteredServiceContainer.Context serviceCtx = new ClusteredServiceContainer.Context()
+        // Announce self-termination on stdout — Aeron's DEFAULT termination
+        // hook signals the shutdown barrier and the JVM exits 0 with NOTHING on
+        // stderr or in the error log; the line makes the WHEN and the WHICH
+        // grep-able next to the role lines the chaos suite already reads.
+        ctx.terminationHook(() -> {
+            System.out.println("cluster TERMINATION memberId=" + memberId
+                + " component=CONSENSUS_MODULE (requested shutdown — e.g. election/state conflict on rejoin)");
+            barrier.signal();
+        });
+        return ctx;
+    }
+
+    private static ClusteredServiceContainer.Context serviceContext(
+            final String aeronDir, final String clusterDir, final int dedupCapacity,
+            final long tickMs, final int memberId, final ShutdownSignalBarrier barrier) {
+        final ClusteredServiceContainer.Context ctx = new ClusteredServiceContainer.Context()
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .appVersion(APP_VERSION)
             .clusteredService(new SealerClusteredService(dedupCapacity, tickMs, memberId));
-
-        // Announce self-termination on stdout. Aeron's DEFAULT termination hook
-        // signals the shutdown barrier and the JVM exits 0 with NOTHING in the
-        // error log or stderr — operationally invisible (a member restarted into
-        // the survivors' election window dies this way ~1s after launch). The
-        // supervisor (Nomad) restarts us either way; the line makes the WHEN
-        // grep-able next to the role lines the chaos suite already reads.
-        final ShutdownSignalBarrier barrier = new ShutdownSignalBarrier();
-        consensusCtx.terminationHook(() -> {
+        // The clustered-service CONTAINER has its OWN termination hook;
+        // instrumenting only the consensus module still exits silently when the
+        // container is the one that terminates.
+        ctx.terminationHook(() -> {
             System.out.println("cluster TERMINATION memberId=" + memberId
-                + " (consensus module requested shutdown — e.g. election/state conflict on rejoin)");
+                + " component=SERVICE_CONTAINER (requested shutdown)");
             barrier.signal();
         });
-
-        try (ClusteredMediaDriver ignored = ClusteredMediaDriver.launch(driverCtx, archiveCtx, consensusCtx);
-             ClusteredServiceContainer ignored2 = ClusteredServiceContainer.launch(serviceCtx)) {
-            System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
-            barrier.await();
-        }
+        return ctx;
     }
 
     /**
