@@ -51,7 +51,7 @@ paths:
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
 
 # tmpfs size for the Aeron media-driver shared-memory dir.
-aeron_tmpfs_size: "1g"
+aeron_tmpfs_size: "2g"
 
 # --- cluster topology (node classes) --------------------------------------
 # The cluster is defined as a small set of node CLASSES, each with a replica

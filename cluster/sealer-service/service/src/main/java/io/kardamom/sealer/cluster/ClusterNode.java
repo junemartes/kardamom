@@ -145,6 +145,15 @@ public final class ClusterNode {
             .aeronDirectoryName(aeronDir)
             .clusterDir(new File(clusterDir))
             .ingressChannel("aeron:udp")
+            // The cluster LOG rides Aeron's 64MB default terms -> a 192MB log
+            // buffer for the log publication, PLUS 192MB per member image,
+            // PLUS 192MB per election LogReplay — on the aeron tmpfs. At this
+            // deployment's KB/s rates that's ~all of a 1GB tmpfs gone at
+            // election time: members then die with 'insufficient usable
+            // storage' (log replay / session response pubs) while Raft looks
+            // healthy from outside. 8MB terms (24MB logs) leave an order of
+            // magnitude of headroom without approaching flow-control limits.
+            .logChannel("aeron:udp?term-length=8m")
             .ingressStreamId(ingressStreamId)
             .appVersion(APP_VERSION)
             // Client sessions must survive a full quorum outage END TO END
