@@ -206,6 +206,15 @@ fn run_session(
         }
     };
 
+    // Replay-request resend state: the request is publish()ed on the cluster
+    // ingress, which right after a (re)connect is often still NOT_CONNECTED —
+    // a single best-effort send is silently lost and the consumer then waits
+    // forever for a replay nobody asked for. Resend every REPLAY_RESEND_MS
+    // until the consumer's cursor ADVANCES (progress = frames flowing again).
+    const REPLAY_RESEND_MS: u64 = 3_000;
+    let mut replay_last_sent_ms: u64 = 0;
+    let mut replay_cursor_at_send: (u64, u64) = (u64::MAX, u64::MAX);
+
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
     // publisher-only client (the sequencer) drops its `LiveEgress`, after which
     // we stop routing application payloads (and never accumulate them) but keep
@@ -243,21 +252,9 @@ fn run_session(
                             DriverEvent::Connected { cluster_session_id } => {
                                 tracing::info!(cluster_session_id, "cluster session opened");
                                 // Canonical-stream consumers request replay from
-                                // their delivery cursor on EVERY establishment —
-                                // a fresh session receives only frames committed
-                                // from now on; the replay fills what a prior
-                                // session (or a fresh start behind the stream)
-                                // missed.
-                                if let Some(r) = &replay {
-                                    let req = crate::wire::encode_replay_request(
-                                        r.next_index.load(std::sync::atomic::Ordering::Relaxed),
-                                        r.next_block.load(std::sync::atomic::Ordering::Relaxed),
-                                    );
-                                    if let Some(framed) = driver.wrap_app(&req, now_ms() as i64) {
-                                        ingress.publish_best_effort(to_aligned(&framed));
-                                        tracing::info!("cluster replay requested at session open");
-                                    }
-                                }
+                                // their delivery cursor on EVERY establishment;
+                                // force an immediate (re)send below.
+                                replay_last_sent_ms = 0;
                             }
                             DriverEvent::Failed(reason) => {
                                 tracing::error!(%reason, "cluster session failed");
@@ -269,6 +266,41 @@ fn run_session(
                 // A dropped LiveIngress/LiveEgress must NOT kill the session
                 // (the other half may still be in use); only `stop` terminates.
                 Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // 1b. Replay request (canonical-stream consumers): send on session
+        // establishment and RE-SEND periodically until the consumer's cursor
+        // advances — the ingress publication is often not yet connected right
+        // after a (re)connect, so any single send can be silently lost.
+        if let Some(r) = &replay
+            && driver.is_connected()
+        {
+            let cursor = (
+                r.next_index.load(std::sync::atomic::Ordering::Relaxed),
+                r.next_block.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            let now = now_ms();
+            let progressed = cursor != replay_cursor_at_send;
+            if progressed && replay_last_sent_ms != 0 {
+                // Frames are flowing — move the checkpoint so a FUTURE stall is
+                // measured from the most recent progress, not the last send.
+                replay_cursor_at_send = cursor;
+                replay_last_sent_ms = now;
+            } else if replay_last_sent_ms == 0
+                || now.saturating_sub(replay_last_sent_ms) >= REPLAY_RESEND_MS
+            {
+                let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
+                if let Some(framed) = driver.wrap_app(&req, now as i64) {
+                    ingress.publish_best_effort(to_aligned(&framed));
+                    tracing::info!(
+                        next_index = cursor.0,
+                        next_block = cursor.1,
+                        "cluster replay requested"
+                    );
+                    replay_last_sent_ms = now;
+                    replay_cursor_at_send = cursor;
+                }
             }
         }
 

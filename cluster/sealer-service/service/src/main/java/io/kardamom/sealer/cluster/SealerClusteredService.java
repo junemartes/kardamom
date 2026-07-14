@@ -453,13 +453,21 @@ public final class SealerClusteredService implements ClusteredService {
         session.close();
     }
 
-    /** Whether a negative offer result is a retryable back-pressure condition. */
+    /** Whether a negative offer result is retryable within the deadline. */
     private boolean retryable(final long offerResult) {
-        // ADMIN_ACTION / BACK_PRESSURED are retryable; CLOSED / MAX_POSITION_EXCEEDED
-        // / NOT_CONNECTED are not. Treat the back-pressure cases as retryable and
-        // idle, anything else as terminal for this offer.
+        // BACK_PRESSURED / ADMIN_ACTION: transient flow control. NOT_CONNECTED:
+        // ALSO retryable-within-deadline — an egress publication is legitimately
+        // unconnected for a moment at session open AND after a leader failover
+        // (the new leader re-creates it); but a session whose egress NEVER
+        // (re)connects within the deadline must be CLOSED by the caller, not
+        // skipped: its keep-alives still flow via ingress, so the consensus
+        // module keeps it alive while the service silently drops every frame —
+        // a ZOMBIE the client cannot detect (observed: a validator starved for
+        // 30+ minutes on an intact session after a leader kill). CLOSED /
+        // MAX_POSITION_EXCEEDED stay terminal.
         if (offerResult == io.aeron.Publication.BACK_PRESSURED
-                || offerResult == io.aeron.Publication.ADMIN_ACTION) {
+                || offerResult == io.aeron.Publication.ADMIN_ACTION
+                || offerResult == io.aeron.Publication.NOT_CONNECTED) {
             cluster.idleStrategy().idle();
             return true;
         }
