@@ -150,7 +150,7 @@ sealer_boundaries() {
   # pipeline stall when nothing is wrong.
   local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
-    v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
@@ -174,7 +174,7 @@ executor_progress() {
   # right after hard-executor restarted executor-0).
   local n v best=""
   for n in "${EXECUTOR_NODES[@]}"; do
-    v="$(docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
       | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done

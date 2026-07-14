@@ -590,13 +590,13 @@ VALIDATOR_SYNC_TIMEOUT_S="${VALIDATOR_SYNC_TIMEOUT_S:-180}"
 
 # Scrape one metric value (last sample wins; strips labels) from a node:port.
 scrape_metric() { # <node> <port> <metric-name> -> value or ""
-  docker exec "$1" curl -fsS --max-time 5 "http://127.0.0.1:$2/metrics" 2>/dev/null \
+  timeout 8 docker exec "$1" curl -fsS --max-time 5 "http://127.0.0.1:$2/metrics" 2>/dev/null \
     | awk -v m="$3" '$0 ~ "^"m"([{ ])" {v=$NF} END {if (v != "") print v}'
 }
 
 VALIDATOR_NODE=""
 for n in "${VALIDATOR_NODES[@]}"; do
-  if docker exec "$n" curl -fsS --max-time 5 "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
+  if timeout 8 docker exec "$n" curl -fsS --max-time 5 "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
     VALIDATOR_NODE="$n"; break
   fi
 done
