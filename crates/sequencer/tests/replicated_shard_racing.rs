@@ -121,8 +121,7 @@ fn run_replica(stream: &[(TxDataLoc, TxEnvelope)], db: Arc<FakeStateDatabase>) -
     let mut rc = InMemoryTxErrorPublisher::default();
     let mut seq = Sequencer::new(shard0_cfg(), db);
     while seq.run_once(&mut inbound, &mut b, &mut rc).unwrap() {}
-    let refs = b.refs.lock().unwrap().clone();
-    refs
+    b.refs.lock().unwrap().clone()
 }
 
 /// The cluster's first-seen dedup (Java `CanonicalSealerState.firstSeen`,
@@ -166,18 +165,17 @@ fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         let mut ia = a.iter();
         let mut ib = b.iter();
-        let mut order: Vec<bool> = std::iter::repeat(true)
-            .take(a.len())
-            .chain(std::iter::repeat(false).take(b.len()))
+        let mut order: Vec<bool> = std::iter::repeat_n(true, a.len())
+            .chain(std::iter::repeat_n(false, b.len()))
             .collect();
         order.shuffle(&mut rng);
         let interleaved: Vec<TxRef> = order
             .into_iter()
             .map(|from_a| {
                 if from_a {
-                    ia.next().unwrap().clone()
+                    *ia.next().unwrap()
                 } else {
-                    ib.next().unwrap().clone()
+                    *ib.next().unwrap()
                 }
             })
             .collect();
