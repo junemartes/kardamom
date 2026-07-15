@@ -81,7 +81,9 @@ gen_container_inventory() {
     for n in "${NODES[@]}"; do
       [[ "${NODE_ROLE[$n]}" == "${r}" ]] || continue
       extra=""; [[ "${r}" == "control" ]] && extra=" control_plane=true"
-      echo "${n} ansible_host=kardamom-${n} kardamom_node=${n} node_ip=${NODE_IP[$n]} role=${r} tier=${NODE_TIER[$n]}${extra}" >>"${CONTAINER_INVENTORY}"
+      # node_index = the <i> of <class>-<i>: the node's 0-based index within
+      # its class, stamped as Nomad node meta (see nomad.hcl.j2).
+      echo "${n} ansible_host=kardamom-${n} kardamom_node=${n} node_ip=${NODE_IP[$n]} role=${r} tier=${NODE_TIER[$n]} node_index=${n##*-}${extra}" >>"${CONTAINER_INVENTORY}"
     done
     echo "" >>"${CONTAINER_INVENTORY}"
   done

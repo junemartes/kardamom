@@ -71,7 +71,12 @@ aeron_tmpfs_size: "2g"
 #
 # Replication semantics:
 #   control     1    singleton: consul+nomad server, registry, anvil L1
-#   sequencer   2    partition_count=2 (partition-index = alloc index)
+#   sequencer   2    partition_count=2, P=2 racing replicas per shard: two job
+#                    groups (seq-a offset 0, seq-b offset 1), partition-index =
+#                    ${meta.node_index} -> node-0 {a:shard0, b:shard1}, node-1
+#                    the reverse; replicas of a shard never share a node. The
+#                    Aeron Cluster dedups the racing refs (canonical_id
+#                    first-seen), so a replica kill costs no shard downtime.
 #   ingress     2    active/active RPC front door        (tier: worker)
 #                    ingress-0@.31, ingress-1@.32; both join the tx_receipts
 #                    multicast group and route to all sequencer shards. Scale by

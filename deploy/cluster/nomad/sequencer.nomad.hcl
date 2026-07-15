@@ -1,18 +1,22 @@
-# kardamom-sequencer — partitions and orders L2 txs. Runs as a Nomad *system*
-# job constrained to worker nodes (${meta.role} == sequencer), so exactly one
-# instance lands on each of sq1 (sequencer_id 0) and sq2 (sequencer_id 1).
+# kardamom-sequencer — partitions and orders L2 txs, P=2 racing replicas per
+# shard. Two identical service groups ("seq-a", "seq-b") of count = 2 each run
+# on the 2 sequencer-role nodes; both replicas of a shard subscribe to the same
+# per-shard tx_data multicast stream and both offer refs to the Aeron Cluster,
+# which dedups by canonical_id first-seen (the same mechanism that already
+# absorbs the M duplicate DepositRefs). A replica crash therefore costs
+# NOTHING: its twin never stopped. See
+# docs/agents/replicated-sequencer-shards-spec.md.
 #
-# Invocation (from crates/e2e/tests/multiprocess_e2e.rs + the cluster contract):
-#   kardamom-sequencer --config <sequencer.toml> --aeron-dir <dir>
-# with per-node identity injected from Nomad node meta:
-#   --partition-count 2
-#   --partition-index ${meta.sequencer_id}
-#   --sequencer-id    ${meta.sequencer_id}
-# (CLI flags override config; see crates/sequencer/src/bin/kardamom-sequencer.rs.)
+# Placement is DETERMINISTIC, derived from node meta (not alloc index):
+#   group seq-a: partition = ${meta.node_index}            → node-0: shard 0, node-1: shard 1
+#   group seq-b: partition = ${meta.node_index} + offset 1 → node-0: shard 1, node-1: shard 0
+# so the two replicas of any shard always land on DIFFERENT nodes and a node
+# loss leaves every shard with one live replica.
 #
-# Each worker reads its own ${meta.sequencer_id} (set by Ansible Nomad node
-# meta), so the single job spec yields distinct sequencer identities per node.
-# partition_count = 2 from group_vars/all.yml.
+# Colocated-replica port separation (host networking, two sequencer processes
+# per node): seq-b moves its Prometheus listener to :9011 and its per-node
+# cluster-egress (response) endpoint to :40211 (seq-a keeps the standard
+# :9001 / :40210).
 #
 # Shares the node Aeron media driver via the bind-mounted tmpfs aeron.dir.
 
@@ -20,25 +24,24 @@ job "sequencer" {
   datacenters = ["dc1"]
   type        = "service"
 
-  # One sequencer per dedicated sequencer node.
+  # Sequencer-role nodes only.
   constraint {
     attribute = "${meta.role}"
     value     = "sequencer"
   }
 
-  group "sequencer" {
-    # partition_count (group_vars/all.yml). distinct_hosts → one sequencer per
-    # distinct sequencer node; partition-index = ${NOMAD_ALLOC_INDEX} (0,1).
+  group "seq-a" {
+    # One replica-a per distinct sequencer node; partition = node_index.
     count = 2
     constraint {
       operator = "distinct_hosts"
       value    = "true"
     }
 
-    # Resilience (chaos tests): restart a crashed task on the same node
-    # (preserving its --partition-index ${NOMAD_ALLOC_INDEX}); reschedule onto a
-    # healthy node on node loss. With 2 sequencer-role nodes + distinct_hosts, a
-    # lost partition reschedules only when its node returns (degrades to 1 until).
+    # Resilience (chaos tests): restart a crashed task on the same node;
+    # reschedule onto a healthy node on node loss. With 2 sequencer-role nodes
+    # + distinct_hosts, a lost replica reschedules only when its node returns —
+    # but its shard stays live throughout via the seq-b twin on the other node.
     restart {
       attempts = 3
       interval = "1m"
@@ -65,7 +68,7 @@ job "sequencer" {
       mode = "host"
     }
 
-    task "sequencer" {
+    task "sequencer-a" {
       driver = "docker"
 
       config {
@@ -73,7 +76,7 @@ job "sequencer" {
         # Always pull the freshly-built image: the mutable :dev tag would otherwise
         # let Nomad reuse a stale node-cached layer across rebuilds (caused a
         # crash-retry storm that stalled the deploy).
-        force_pull    = true
+        force_pull   = true
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
@@ -83,8 +86,7 @@ job "sequencer" {
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           "--partition-count", "2",
-          "--partition-index", "${NOMAD_ALLOC_INDEX}",
-          "--sequencer-id", "${NOMAD_ALLOC_INDEX}",
+          "--partition-index", "${meta.node_index}",
           # Cluster mode only: this node's cluster-egress (response) endpoint.
           # The cluster client's egress_channel is per-node (the node IP differs),
           # so it's injected here rather than baked into sequencer.toml.tpl.
@@ -103,6 +105,88 @@ job "sequencer" {
       # deploy/cluster/ — scripts/deploy.sh does this). partition_index /
       # sequencer_id in that file are placeholders overridden per-node by the
       # CLI flags above.
+      template {
+        destination = "local/sequencer.toml"
+        data        = file("config/sequencer.toml.tpl")
+      }
+
+      resources {
+        cpu    = 750
+        memory = 512
+      }
+    }
+  }
+
+  group "seq-b" {
+    # The racing twin: same node set, rotated shard (partition-offset 1), so
+    # node N serves the shard its seq-a neighbour does NOT.
+    count = 2
+    constraint {
+      operator = "distinct_hosts"
+      value    = "true"
+    }
+
+    restart {
+      attempts = 3
+      interval = "1m"
+      delay    = "5s"
+      mode     = "delay"
+    }
+
+    reschedule {
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    update {
+      max_parallel     = 1
+      health_check     = "task_states"
+      min_healthy_time = "10s"
+      healthy_deadline = "2m"
+      auto_revert      = false
+    }
+
+    network {
+      mode = "host"
+    }
+
+    task "sequencer-b" {
+      driver = "docker"
+
+      config {
+        image        = "192.168.56.10:5000/kardamom-sequencer:dev"
+        force_pull   = true
+        network_mode = "host"
+        volumes = [
+          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+        ]
+        args = [
+          "--config", "/local/sequencer.toml",
+          "--log-config", "/local/channels.toml",
+          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          "--partition-count", "2",
+          "--partition-index", "${meta.node_index}",
+          # Rotate onto the other shard (see header): replicas of a shard
+          # never share a node.
+          "--partition-offset", "1",
+          # Distinct per-node cluster-egress endpoint: the seq-a process on
+          # this node already binds :40210.
+          "--cluster-egress-endpoint", "${meta.node_ip}:40211",
+        ]
+      }
+
+      env {
+        # The seq-a process on this node owns the default :9001.
+        KARDAMOM_METRICS_ADDR = "127.0.0.1:9011"
+      }
+
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
+      }
+
       template {
         destination = "local/sequencer.toml"
         data        = file("config/sequencer.toml.tpl")
