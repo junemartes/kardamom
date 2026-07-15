@@ -97,6 +97,8 @@ EXECUTOR_NODE="kardamom-executor-0"
 # so executor_progress() tries each in turn. The 3 executors are state-machine
 # replicas at ~the same block height, so any one is a valid liveness signal.
 EXECUTOR_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
+# Executor node bridge IPs (group_vars node_classes: executor ip_start=41).
+EXECUTOR_IPS=(192.168.56.41 192.168.56.42 192.168.56.43)
 EXECUTOR_PORT="${EXECUTOR_PORT:-9004}"
 # The executor's monotonically-advancing block gauge (crates/executor/src/metrics.rs:
 # kardamom_executor_block_number — set per committed block in actor.rs). This is the
