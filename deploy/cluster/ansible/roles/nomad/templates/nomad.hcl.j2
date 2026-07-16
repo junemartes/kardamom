@@ -30,8 +30,9 @@ client {
   # role  = node class (unique placement: ${meta.role} == ingress, …)
   # tier  = coarse group (collocation/exclusion: recorders + aeron target
   #         ${meta.tier} == worker; aeron excludes ${meta.tier} == control).
-  # Per-replica identity (recorder_id, partition-index) comes from
-  # ${NOMAD_ALLOC_INDEX} in the count-based jobs, not node meta.
+  # Per-replica identity (recorder_id) comes from ${NOMAD_ALLOC_INDEX} in the
+  # count-based jobs; the sequencer job instead derives its partition from
+  # ${meta.node_index} (deterministic replica-group cross-placement).
   meta {
     kardamom_node = "{{ kardamom_node }}"
     role          = "{{ role }}"
@@ -39,6 +40,12 @@ client {
     # node_ip: this node's cluster IP. Used by sequencer.nomad.hcl / sealer to
     # form the tx_ordering MDC control endpoint <node_ip>:{{ tx_ordering_mdc_port }}.
     node_ip       = "{{ node_ip }}"
+    # node_index: this node's 0-based index within its class (the <i> of
+    # kardamom-<class>-<i>, or the inventory's explicit node_index/sequencer_id
+    # var). Gives jobs a DETERMINISTIC node-derived identity —
+    # sequencer.nomad.hcl uses it as the partition index so its two replica
+    # groups cross-place shards without depending on alloc-index luck.
+    node_index    = "{{ node_index | default(sequencer_id | default('0')) }}"
   }
 }
 

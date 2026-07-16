@@ -79,16 +79,31 @@ with three distinct, tested modes:
   publication is durable can lose that tx. The `on-quorum` gate (ack only
   after the Raft cluster commits) exists for when that window matters.
 
-## Sequencer (×2, sharded by sender)
+## Sequencer (2 shards × 2 racing replicas)
 
-- **Crash** (`graceful-` / `hard-sequencer`) — its sender-shard stalls until
-  the restart (nonce state rebuilds from the stream); the other shard is
-  unaffected.
+Each shard is served by two active/active replicas on different nodes (Nomad
+groups `seq-a`/`seq-b`, cross-placed via `meta.node_index` — see
+`docs/agents/replicated-sequencer-shards-spec.md`). Both consume the shard's
+`tx_data` multicast stream and both offer byte-identical refs; the cluster's
+first-seen dedup keeps one.
+
+- **Replica crash / hard kill** (`sequencer-replica-kill`,
+  `graceful-`/`hard-sequencer`) — **no stall**: the twin never stopped. Chaos
+  asserts live pipeline progress during the outage and 4/4 allocs back within
+  the restart SLO. The restarted replica joins live (no archive replay — its
+  twin covered the gap, and replay could overshoot the sealer's dedup window)
+  and hydrates nonce floors from committed state.
+- **Sequencer node loss** — cross-placement guarantees every shard keeps one
+  replica; redundancy (not availability) degrades until the node returns.
+- **Both replicas of one shard down** — that shard stalls; this is now the
+  double-failure case.
 - **Backpressure, not loss** — a refused cluster offer maps to
   `SequencerError::Backpressure` and the rewind/retry path; the failure mode
   is latency, never a dropped record.
-- **Racing duplicates are expected** — replicas publishing concurrently are
-  deduped by the cluster's first-seen window on the 32-byte `canonical_id`.
+- **Racing duplicates are the design** — deduped by the cluster's first-seen
+  window on the 32-byte `canonical_id`, with per-sender nonce order preserved
+  (per-session order + identical per-replica streams); pinned by
+  `crates/sequencer/tests/replicated_shard_racing.rs`.
 
 ![Edge and off-hot-path failure states](img/states-edge-offpath.jpg)
 
