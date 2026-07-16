@@ -112,6 +112,23 @@ impl SequencerConfig {
         }
         Ok(())
     }
+
+    /// Rotate the shard assignment for a racing-replica group:
+    /// `partition_index ← (partition_index + offset) % partition_count`,
+    /// with `sequencer_id` following the rotated partition (the
+    /// `sequencer_id == partition_index` invariant) unless
+    /// `keep_sequencer_id` is set (an explicit operator override).
+    ///
+    /// A second replica group passes `offset = 1` so each node serves a
+    /// different shard per group, guaranteeing the two replicas of any
+    /// shard land on distinct nodes.
+    pub fn rotate_partition(&mut self, offset: u32, keep_sequencer_id: bool) {
+        let m = self.partition_count.max(1);
+        self.partition_index = (self.partition_index + offset) % m;
+        if !keep_sequencer_id {
+            self.sequencer_id = self.partition_index as u8;
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -150,6 +167,45 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(cfg.validate(), Err(ConfigError::ZeroPartitions)));
+    }
+
+    #[test]
+    fn rotate_partition_wraps_and_updates_sequencer_id() {
+        let mut cfg = SequencerConfig {
+            partition_count: 2,
+            partition_index: 1,
+            sequencer_id: 1,
+            ..Default::default()
+        };
+        cfg.rotate_partition(1, false);
+        assert_eq!(cfg.partition_index, 0);
+        assert_eq!(cfg.sequencer_id, 0);
+        cfg.validate().unwrap();
+
+        // Rotating the peer node's raw index 0 lands on the other shard, so
+        // node-0 serves {a: shard 0, b: shard 1} and node-1 the reverse.
+        let mut peer = SequencerConfig {
+            partition_count: 2,
+            partition_index: 0,
+            sequencer_id: 0,
+            ..Default::default()
+        };
+        peer.rotate_partition(1, false);
+        assert_eq!(peer.partition_index, 1);
+        assert_eq!(peer.sequencer_id, 1);
+    }
+
+    #[test]
+    fn rotate_partition_keeps_explicit_sequencer_id() {
+        let mut cfg = SequencerConfig {
+            partition_count: 2,
+            partition_index: 0,
+            sequencer_id: 7,
+            ..Default::default()
+        };
+        cfg.rotate_partition(1, true);
+        assert_eq!(cfg.partition_index, 1);
+        assert_eq!(cfg.sequencer_id, 7);
     }
 
     #[test]

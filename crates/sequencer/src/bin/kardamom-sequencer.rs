@@ -52,6 +52,18 @@ struct Args {
     /// Override the partition count (M).
     #[arg(long)]
     partition_count: Option<u32>,
+    /// Replica-group shard rotation: the effective partition becomes
+    /// `(partition_index + partition_offset) % partition_count`, and
+    /// `sequencer_id` follows it (unless explicitly overridden). Lets a
+    /// second Nomad group of racing replicas reuse the same node-derived
+    /// `--partition-index` while serving a rotated shard, so the two
+    /// replicas of any shard land on different nodes deterministically.
+    /// Racing replicas are safe by construction: refs encode
+    /// deterministically from the shared per-shard tx_data stream and the
+    /// Aeron Cluster dedups records by canonical_id first-seen — the same
+    /// mechanism that already absorbs the M duplicate DepositRefs.
+    #[arg(long, default_value_t = 0)]
+    partition_offset: u32,
     /// Override the sequencer id embedded in every tx_ordering `TxRef`.
     /// If omitted and the TOML did not set it, falls back to
     /// `partition_index as u8`.
@@ -92,6 +104,16 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(m) = args.partition_count {
         cfg.partition_count = m;
+    }
+    if args.partition_offset != 0 {
+        let raw_index = cfg.partition_index;
+        cfg.rotate_partition(args.partition_offset, args.sequencer_id.is_some());
+        tracing::info!(
+            raw_index,
+            offset = args.partition_offset,
+            rotated = cfg.partition_index,
+            "partition-offset: rotated shard assignment (racing replica group)"
+        );
     }
     if let Some(id) = args.sequencer_id {
         cfg.sequencer_id = id;

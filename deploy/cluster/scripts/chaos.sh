@@ -50,7 +50,8 @@
 #   CHAOS_ACCT_BASE          first funded account index per case (default 7)
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
-#        graceful-sequencer hard-sequencer sealer-graceful sealer-hard
+#        graceful-sequencer hard-sequencer sequencer-replica-kill
+#        sealer-graceful sealer-hard
 #        node-failure-executor archive-driver-loss
 #        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
 # =============================================================================
@@ -97,6 +98,8 @@ EXECUTOR_NODE="kardamom-executor-0"
 # so executor_progress() tries each in turn. The 3 executors are state-machine
 # replicas at ~the same block height, so any one is a valid liveness signal.
 EXECUTOR_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
+# Executor node bridge IPs (group_vars node_classes: executor ip_start=41).
+EXECUTOR_IPS=(192.168.56.41 192.168.56.42 192.168.56.43)
 EXECUTOR_PORT="${EXECUTOR_PORT:-9004}"
 # The executor's monotonically-advancing block gauge (crates/executor/src/metrics.rs:
 # kardamom_executor_block_number — set per committed block in actor.rs). This is the
@@ -437,8 +440,21 @@ run_case() { # <case-name>
     hard-executor)      inject_hard kardamom-executor-0 executor;       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
     graceful-ingress)   inject_graceful ingress;                        assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
     hard-ingress)       inject_hard kardamom-ingress-0 ingress;         assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
-    graceful-sequencer) inject_graceful sequencer;                      assert_count sequencer 2 "${CHAOS_RESTART_SLO_S}" ;;
-    hard-sequencer)     inject_hard kardamom-sequencer-0 sequencer;     assert_count sequencer 2 "${CHAOS_RESTART_SLO_S}" ;;
+    # Sequencers run P=2 racing replicas per shard (job groups seq-a/seq-b,
+    # 4 allocs total): a kill no longer stalls its shard — the twin on the
+    # other node keeps ordering, so these also assert live pipeline progress.
+    graceful-sequencer) inject_graceful sequencer;                      assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-sequencer)     inject_hard kardamom-sequencer-0 sequencer;     assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
+
+    sequencer-replica-kill)
+      # HARD-kill a SPECIFIC replica (seq-a on node-0 = shard 0's replica A;
+      # its twin is seq-b on node-1). The shard must stay live with NO stall —
+      # the racing twin never stopped and the cluster dedups its refs — and
+      # the killed replica restarts to full strength (4/4).
+      inject_hard kardamom-sequencer-0 sequencer-a
+      assert_progress
+      assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
+      ;;
     sealer-graceful)    inject_graceful sealer;                         assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
     # KNOWN GAP (single-sealer topology): after a HARD sealer crash the executors
     # freeze and don't re-attach to the restarted sealer's canonical tx_ordering

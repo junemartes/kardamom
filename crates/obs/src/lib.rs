@@ -34,14 +34,71 @@ pub fn init(
         return Err(anyhow!("host_id must be non-empty"));
     }
 
-    PrometheusBuilder::new()
-        .with_http_listener(metrics_addr)
-        .set_buckets(DURATION_BUCKETS)
-        .context("set_buckets")?
-        .add_global_label("service", service)
-        .add_global_label("host_id", host_id)
-        .install()
-        .context("PrometheusBuilder::install")?;
+    // Build AND run the exporter on a DEDICATED thread with its own
+    // single-threaded runtime, never on the service's tokio runtime.
+    // `PrometheusBuilder::install()` spawns onto the ambient runtime when one
+    // exists, which couples scrape liveness to service-runtime health: a
+    // wedged or starved service runtime silently takes /metrics down with it,
+    // and every probe reads "service gone" when the truth is "service wedged"
+    // (see issue #76 — the node-failure-executor blackout). A dedicated
+    // thread keeps /metrics answering regardless, so wedged-but-alive is
+    // observable as `kardamom_service_up == 1` with stale gauges.
+    //
+    // The whole build runs INSIDE the dedicated runtime's context because
+    // `PrometheusBuilder::build()` requires an ambient Tokio reactor ("there
+    // is no reactor running" otherwise) — and some callers (da-watcher) call
+    // `init` from a plain non-async main. The channel hand-off makes init
+    // fail-fast and guarantees the recorder is globally installed before
+    // init returns (so `describe_*!`/`gauge!` below always hit it).
+    let host_id_owned = host_id.to_string();
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
+    std::thread::Builder::new()
+        .name("obs-exporter".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("obs-exporter: build runtime")
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            let _guard = rt.enter();
+            let built = PrometheusBuilder::new()
+                .with_http_listener(metrics_addr)
+                .set_buckets(DURATION_BUCKETS)
+                .context("set_buckets")
+                .and_then(|b| {
+                    b.add_global_label("service", service)
+                        .add_global_label("host_id", &host_id_owned)
+                        .build()
+                        .context("PrometheusBuilder::build")
+                });
+            let exporter = match built {
+                Ok((recorder, exporter)) => {
+                    if let Err(e) = metrics::set_global_recorder(recorder) {
+                        let _ = ready_tx.send(Err(anyhow!("set_global_recorder: {e}")));
+                        return;
+                    }
+                    let _ = ready_tx.send(Ok(()));
+                    exporter
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            if let Err(e) = rt.block_on(exporter) {
+                tracing::error!(error = ?e, "obs-exporter: exporter terminated");
+            }
+        })
+        .context("spawn obs-exporter thread")?;
+    ready_rx
+        .recv()
+        .context("obs-exporter thread exited before signalling readiness")??;
 
     metrics::describe_gauge!(BUILD_INFO, "Build info; value is always 1.");
     metrics::gauge!(

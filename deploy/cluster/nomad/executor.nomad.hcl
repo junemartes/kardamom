@@ -109,6 +109,15 @@ job "executor" {
           # recovery is handled by the Aeron Cluster client, so there is no
           # separate live-destination endpoint anymore.)
           "--replay-destination-endpoint", "${meta.node_ip}:40130",
+          # Bind the Prometheus exporter on ALL interfaces (default is
+          # loopback): the chaos suite probes it DIRECTLY over the cluster
+          # bridge (http://<node_ip>:9004/metrics), keeping dockerd out of
+          # the observation path — a docker kill of a privileged sibling node
+          # can stall docker exec runner-wide for minutes, which read as
+          # "block 0 -> 0" while executors were healthy (issue #76). The
+          # bridge is the isolated 192.168.56.0/24 test segment; loopback
+          # scrapes (docker exec curl 127.0.0.1:9004) keep working too.
+          "--metrics-addr", "0.0.0.0:9004",
         ]
       }
 
