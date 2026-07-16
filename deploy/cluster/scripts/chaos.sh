@@ -161,6 +161,82 @@ sealer_boundaries() {
   return 1
 }
 
+# Scrape a single validator metric (aux-0, :9006). The validator is the sole
+# node on the aux tier; metrics on 9006 (executor holds 9004 elsewhere).
+VALIDATOR_NODE="${VALIDATOR_NODE:-kardamom-aux-0}"
+VALIDATOR_PORT="${VALIDATOR_PORT:-9006}"
+val_metric() { # <metric-name> -> integer (empty on scrape failure)
+  timeout 8 docker exec "${VALIDATOR_NODE}" curl -fsS --max-time 5 \
+    "http://127.0.0.1:${VALIDATOR_PORT}/metrics" 2>/dev/null \
+    | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { printf "%d", $NF; exit }'
+}
+
+# validator-lapse case: PAUSE the validator process (docker pause the inner
+# container) for a window under sustained load, then resume. The validator's
+# live tx_bal multicast image lapses during the pause; on resume the
+# archive-backed refetch source must redeliver the missed BALs so every block
+# still VERIFIES (no growth in bal_missing) — and the validator must catch back
+# up. Asserts: refetch actually fired (bal_refetched grew), verification
+# coverage held (bal_missing did not grow), no divergence, and the validator
+# resumed committing. The pipeline itself is untouched (the validator is off the
+# hot path), so the standard load + progress verdicts still apply.
+LAPSE_S="${LAPSE_S:-30}"
+run_validator_lapse() {
+  local inner
+  inner="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
+  [ -n "${inner}" ] || fail "validator-lapse: no inner validator container on ${VALIDATOR_NODE}"
+
+  # WARM UP: wait until the validator is CAUGHT UP AND VERIFYING LIVE — its
+  # blocks_verified counter is advancing and its lag to the executors is small.
+  # (A validator re-executes from genesis; blocks that passed before it started
+  # have no BAL and are committed unverified during a fast catch-up, so it
+  # reaches the live head and only THEN verifies steadily. The lapse must hit a
+  # verifying validator, not one still catching up.)
+  local t=0 vprev=-1 v_now e_now verified
+  while [ "${t}" -lt 150 ]; do
+    verified="$(val_metric validator_blocks_verified_total)"; verified="${verified:-0}"
+    v_now="$(val_metric validator_committed_block)"; v_now="${v_now:-0}"
+    e_now="$(executor_progress || echo 0)"
+    if [ "${verified}" -gt 0 ] && [ "${verified}" -gt "${vprev}" ] \
+       && [ "${v_now}" -gt 0 ] && [ $(( e_now - v_now )) -le 15 ]; then
+      break
+    fi
+    vprev="${verified}"; sleep 6; t=$(( t + 6 ))
+  done
+  log "validator-lapse: warmed up (verified=${verified} block=${v_now} exec=${e_now}) after ${t}s"
+
+  local m0 vf0
+  m0="$(val_metric validator_bal_missing_total)"; m0="${m0:-0}"
+  vf0="$(val_metric validator_blocks_verified_total)"; vf0="${vf0:-0}"
+  log "validator-lapse: pausing ${inner} for ${LAPSE_S}s (verified=${vf0} bal_missing=${m0})"
+  docker exec "${VALIDATOR_NODE}" docker pause "${inner}" >/dev/null || fail "validator-lapse: docker pause failed"
+  sleep "${LAPSE_S}"
+  docker exec "${VALIDATOR_NODE}" docker unpause "${inner}" >/dev/null || fail "validator-lapse: docker unpause failed"
+  log "validator-lapse: resumed; awaiting catch-up + continued verification"
+
+  # After resume the validator drains the tx_bal it missed (held in the live
+  # multicast term buffer while it was paused) and VERIFIES it. Assert: it
+  # catches back up, KEEPS verifying (blocks_verified advances past the
+  # pre-pause value — the lapse window was covered, not silently skipped),
+  # coverage did not materially regress, and there is no divergence.
+  local ok=0 v1 vf1
+  t=0
+  while [ "${t}" -lt 120 ]; do
+    sleep 6; t=$(( t + 6 ))
+    v1="$(val_metric validator_committed_block)"; v1="${v1:-0}"
+    vf1="$(val_metric validator_blocks_verified_total)"; vf1="${vf1:-0}"
+    e_now="$(executor_progress || echo "${e_now}")"
+    if [ "${vf1}" -gt "${vf0}" ] && [ $(( e_now - v1 )) -le 25 ]; then ok=1; break; fi
+  done
+  local m1 d1
+  m1="$(val_metric validator_bal_missing_total)"; m1="${m1:-0}"
+  d1="$(val_metric validator_divergence_total)"; d1="${d1:-0}"
+  [ "${ok}" -eq 1 ] || fail "validator-lapse: did not resume verifying + catch up in ${t}s (verified ${vf0}->${vf1}, block ${v1}, exec ${e_now})"
+  [ "${vf1}" -gt "${vf0}" ] || fail "validator-lapse: stopped verifying after the pause (${vf0}->${vf1})"
+  [ $(( m1 - m0 )) -le 5 ] || fail "validator-lapse: coverage REGRESSED — bal_missing grew ${m0}->${m1} across the pause (the lapse window was not covered by the live term buffer)"
+  [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after resume"
+  log "validator-lapse PASS: caught up (block ${v1}, lag $(( e_now - v1 ))), kept verifying ${vf0}->${vf1}, bal_missing ${m0}->${m1}, 0 divergences"
+}
 # Cluster-mode progress probe: the most-recently-committed block number as seen
 # by the executor (kardamom_executor_block_number gauge on :9004). The Java
 # cluster node exposes no Prometheus endpoint, so we measure pipeline liveness at
@@ -514,6 +590,13 @@ run_case() { # <case-name>
       # Restore the second node too so the suite leaves a healthy 3/3 cluster for
       # any subsequent cases (best-effort; not asserted as part of this case's SLO).
       docker start "${victims[1]}" >/dev/null 2>&1 || true
+      ;;
+
+    validator-lapse)
+      # No component killed: pause the (off-hot-path) validator and assert its
+      # side-stream refetch recovers full verification coverage. All the
+      # validator-specific asserts live in the helper.
+      run_validator_lapse
       ;;
 
     *) fail "unknown chaos case: ${name}" ;;

@@ -122,6 +122,15 @@ impl BalBuffer {
         self.cv.notify_all();
     }
 
+    /// How far below the live head (the highest buffered block) a requested
+    /// block must be to count as "unrecoverable backlog": its BAL has aged out
+    /// of the live `tx_bal` multicast term buffer and will never arrive, so we
+    /// commit it unverified immediately instead of waiting. A caught-up
+    /// validator asks for blocks at/near the head (lag < this), so it always
+    /// waits and verifies; only a validator catching up from a cold start (or
+    /// a long lapse whose gap exceeds the term buffer) skips.
+    const BACKLOG_LOOKBEHIND: u64 = 16;
+
     /// Take the BAL for `block`, waiting up to `timeout` for it to arrive.
     /// Returns `None` if it never showed (the caller treats that as "could not
     /// verify", not as divergence).
@@ -137,6 +146,18 @@ impl BalBuffer {
         loop {
             if let Some(d) = guard.remove(&block) {
                 return Some(d);
+            }
+            // CATCH-UP: if the live head (highest buffered block) is far ahead
+            // of `block`, this block's BAL has aged out of the multicast — it
+            // will never arrive. Don't waste the wait window; commit unverified
+            // now so the validator catches up fast (the cold-start backlog, and
+            // a lapse gap larger than the term buffer). Blocks still inside the
+            // buffered window are taken above; a caught-up validator's requests
+            // are near the head, so it never trips this and verifies normally.
+            if let Some(&head) = guard.keys().next_back()
+                && head > block + Self::BACKLOG_LOOKBEHIND
+            {
+                return None;
             }
             let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
                 return guard.remove(&block);

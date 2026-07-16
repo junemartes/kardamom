@@ -145,8 +145,9 @@ jobs:
             # sequencer-replica-kill targets one racing replica of a shard
             # (seq-a on node-0) and asserts the twin keeps the shard live
             # with NO stall (P=2 replicas per shard as of the replicated-
-            # sequencer-shards change).
-            chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer sequencer-replica-kill"; } ;;
+            # sequencer-shards change). validator-lapse pauses the validator
+            # under load and asserts it resumes verifying with coverage held.
+            chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer sequencer-replica-kill validator-lapse"; } ;;
             # The clustered sealer (Phase 3) is a 3-member Aeron Cluster (Raft).
             # These cases hard-kill the LEADER (must re-elect within the SLO), a
             # FOLLOWER (quorum 2/3 holds, no stall), and TWO whole nodes (quorum
