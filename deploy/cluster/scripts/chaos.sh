@@ -194,7 +194,8 @@ val_metric() { # <metric-name> -> integer (empty on scrape failure)
 # drains them and keeps verifying, and the catch-up skip (#78) bounds the cost
 # of anything that aged out of the term buffer (those blocks commit unverified
 # instead of blocking 5s each). There is NO side-stream refetch mechanism —
-# that prototype was discarded. Asserts: verification coverage held
+# that prototype was discarded (a co-located recorder + follow-live replay
+# starves the live poll path). Asserts: verification coverage held
 # (bal_missing did not materially grow), the validator kept verifying past the
 # pre-pause count, caught back up, and saw no divergence. The pipeline itself
 # is untouched (the validator is off the hot path), so the standard load +

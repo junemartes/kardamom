@@ -120,6 +120,27 @@ an MPT state-root mismatch — it stops rather than continuing on bad state,
 and stays stopped until an operator intervenes. A crashed validator costs
 verification coverage, never L2 liveness; nothing on the hot path consumes it.
 
+Catch-up semantics (#78) make that coverage cost explicit:
+
+- **Behind the head** (fresh start against a running chain, or restart): the
+  per-block BALs ride a lossy `tx_bal` multicast whose term buffer only holds
+  the recent window, so backlog blocks more than `BACKLOG_LOOKBEHIND` (16)
+  behind the live head have unrecoverable BALs — the validator **commits them
+  unverified immediately** instead of burning the full BAL wait per block
+  (which made catch-up slower than the chain grows). Continuous verification
+  is a property of a *caught-up* validator, at the head.
+- **Brief lapse** (pause/stall shorter than the live term buffer): fully
+  covered — the missed BALs are still buffered on resume, verification
+  continues without a coverage gap. The `validator-lapse` chaos case pauses
+  the validator for 30 s under load and asserts it catches back up, keeps
+  verifying, `validator_bal_missing_total` doesn't materially grow (a small
+  tolerance absorbs edge-of-window blocks), and there are zero divergences.
+- **Lapse longer than the term buffer**: those blocks age out and are
+  committed unverified (counted in `validator_bal_missing_total`) — recovering
+  them would need archive-backed refetch, which was prototyped and
+  deliberately discarded because a co-located recorder + follow-live replay
+  starves the validator's live poll path (see PR #78's discussion).
+
 ## Batcher (offline, archive-driven)
 
 A crash costs **DA freshness only** — L2 keeps sequencing and executing.
@@ -190,6 +211,16 @@ by construction.
   not expose Aeron's network `replicate()`), and the restored archive passes
   Aeron's own `ArchiveTool verify`. Without it, losing one copy leaves the *next*
   loss fatal, and a volume wipe hangs the executor's `resolve_recording`.
+- **The observation path itself** (issue #76, fixed) — `docker kill` of a
+  privileged DinD node stalls host-dockerd `docker exec` runner-wide for
+  minutes, blacking out every exec-based probe at once; for three days this
+  masqueraded as "all executors dead" while the pipeline was healthy. Lesson
+  encoded in the harness: chaos probes now hit the executors' exporters
+  **directly over the cluster bridge** (`0.0.0.0:9004` bind), with exec as
+  fallback, and every service's exporter runs on a dedicated thread so a
+  wedged service runtime can't take `/metrics` down with it. When reading
+  chaos failures, distinguish "the pipeline stalled" from "the probes went
+  dark" before diagnosing.
 
 ## Known gaps (untested failure surface)
 
@@ -206,4 +237,9 @@ by construction.
 - **L1 outage** — the batcher's behavior under sustained L1 RPC failure /
   gas spikes is designed (lag + catch-up) but not chaos-tested.
 - **Validator divergence injection** — fail-stop is unit-tested, but no e2e
-  case feeds the validator a corrupted receipt/BAL stream.
+  case feeds the validator a corrupted receipt/BAL stream. (Lapse recovery
+  *is* now covered by `validator-lapse`.)
+- **Load-harness scrapes still ride `docker exec`** — the chaos *probes*
+  moved to direct HTTP (issue #76), but `kardamom-load --metrics-via-docker`
+  remains the default; a runner-wide exec stall can still degrade its
+  keep-pace verdicts (chaos-mode leniency masks it today).
