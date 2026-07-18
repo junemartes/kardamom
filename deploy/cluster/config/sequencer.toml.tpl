@@ -24,7 +24,16 @@ partition_index = 0
 sequencer_id = 0
 
 # Per-sender pending bound and backpressure behaviour.
-max_pending_per_sender = 16
+#
+# The pending buffer is the per-sender reorder window: concurrent submissions
+# from one sender arrive with nonces out of order, and a burst deeper than this
+# bound EVICTS the oldest buffered tx — leaving a permanent nonce gap that
+# wedges the sender (every later nonce stays "future" forever; there is no
+# recovery path yet). At 16 a ~50-tx same-sender burst wedged senders at
+# ~600 tx/s aggregate; at 512 the same workload rode through cleanly to the
+# pipeline's CPU ceiling (2026-07-18 saturation campaign). Cost is bounded:
+# worst case 512 buffered envelopes per active sender.
+max_pending_per_sender = 512
 backpressure_policy = "return_immediately"
 
 [cluster]

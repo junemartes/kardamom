@@ -55,7 +55,7 @@ build_binaries() {
       set -e
       cargo build --release \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-        -p kardamom-da-watcher -p kardamom-batcher \
+        -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
         --bins
       # The sustained-load + chaos harness ci-cluster.sh runs from target/release.
       cargo build --release -p kardamom-bench --bin kardamom-load
@@ -63,7 +63,7 @@ build_binaries() {
       # and libaeron*.so under a build/*/out/build/lib path it greps for.
       # (kardamom-recorder removed — durability is archive-at-the-sealer.)
       mkdir -p /work/target/release/build/aeronstage/out/build/lib
-      for b in ingress sequencer executor da-watcher batcher; do
+      for b in ingress sequencer executor validator da-watcher batcher; do
         cp -f "/ltarget/release/kardamom-$b" /work/target/release/
       done
       cp -f /ltarget/release/kardamom-load /work/target/release/
