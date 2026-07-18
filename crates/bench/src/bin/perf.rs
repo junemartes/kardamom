@@ -29,7 +29,10 @@ use kardamom_bench::load::{self, ANVIL_MNEMONIC, Completeness, LoadConfig};
 use kardamom_bench::perf::{OutDir, cluster, profile, report};
 
 #[derive(Parser, Debug)]
-#[command(name = "kardamom-perf", about = "Cluster perf pipeline: up → ramp to the edge → profile the sealer leader → report.")]
+#[command(
+    name = "kardamom-perf",
+    about = "Cluster perf pipeline: up → ramp to the edge → profile the sealer leader → report."
+)]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -105,7 +108,10 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     match Args::parse().cmd {
-        Cmd::Up { skip_build, repo_root } => cluster::up(&repo_root, skip_build),
+        Cmd::Up {
+            skip_build,
+            repo_root,
+        } => cluster::up(&repo_root, skip_build),
         Cmd::Run(a) => run(a).await,
         Cmd::Report { dir } => rerender(dir),
     }
@@ -123,7 +129,9 @@ fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
         sender_offset: 0,
         nonce_start: 0,
         mnemonic: ANVIL_MNEMONIC.to_string(),
-        to: "0x000000000000000000000000000000000000dEaD".parse::<Address>().unwrap(),
+        to: "0x000000000000000000000000000000000000dEaD"
+            .parse::<Address>()
+            .unwrap(),
         value: U256::from(1),
         gas_price: 1_000_000_000,
         max_in_flight: 1024,
@@ -202,7 +210,9 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
             let cpu = cluster::cpu_sample(cluster::NODES)?;
             std::fs::write(
                 out_dir.join("cpu-snapshot.txt"),
-                cpu.iter().map(|(n, p)| format!("{n} {p:.1}%\n")).collect::<String>(),
+                cpu.iter()
+                    .map(|(n, p)| format!("{n} {p:.1}%\n"))
+                    .collect::<String>(),
             )?;
             Ok((leader, collapsed, cpu))
         })
@@ -215,17 +225,29 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     let summary = report::analyze_collapsed(&collapsed);
     let svg = profile::render_svg(
         &out.0,
-        &format!("kardamom sealer leader @ {soak_rate} tx/s — itimer {}s", a.profile_secs),
+        &format!(
+            "kardamom sealer leader @ {soak_rate} tx/s — itimer {}s",
+            a.profile_secs
+        ),
     )?;
-    let md =
-        report::write_summary(&out, &discovery, &soak_report, &leader, &cpu_snapshot, &summary)?;
+    let md = report::write_summary(
+        &out,
+        &discovery,
+        &soak_report,
+        &leader,
+        &cpu_snapshot,
+        &summary,
+    )?;
 
     println!("==> report: {}", md.display());
     if let Some(svg) = svg {
         println!("==> flamegraph: {}", svg.display());
     }
     println!("==> raw: {}", out.0.display());
-    anyhow::ensure!(load_pass, "profiled soak verdict FAILED — see load-report.json");
+    anyhow::ensure!(
+        load_pass,
+        "profiled soak verdict FAILED — see load-report.json"
+    );
     Ok(())
 }
 
@@ -246,8 +268,14 @@ fn rerender(dir: PathBuf) -> anyhow::Result<()> {
         })
         .collect();
     let summary = report::analyze_collapsed(&collapsed);
-    let md =
-        report::write_summary(&out, &discovery, &soak_report, "(from artifacts)", &cpu, &summary)?;
+    let md = report::write_summary(
+        &out,
+        &discovery,
+        &soak_report,
+        "(from artifacts)",
+        &cpu,
+        &summary,
+    )?;
     println!("==> report: {}", md.display());
     Ok(())
 }

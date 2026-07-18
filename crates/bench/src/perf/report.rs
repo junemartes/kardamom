@@ -30,8 +30,14 @@ pub struct ProfileSummary {
 /// ordered from most to least specific).
 const BUCKETS: &[(&str, &str)] = &[
     ("idle-strategy spin/yield", "BackoffIdleStrategy.idle"),
-    ("UDP receive (media driver poll)", "DataTransportPoller.poll"),
-    ("UDP send (replication + egress)", "DatagramChannelImpl.write"),
+    (
+        "UDP receive (media driver poll)",
+        "DataTransportPoller.poll",
+    ),
+    (
+        "UDP send (replication + egress)",
+        "DatagramChannelImpl.write",
+    ),
     ("thread park/unpark", "LockSupport.park"),
     ("archive recording", "io/aeron/archive/"),
     ("sealer service logic", "io/kardamom/sealer/"),
@@ -43,7 +49,9 @@ pub fn analyze_collapsed(collapsed: &str) -> ProfileSummary {
     let mut buckets: HashMap<&str, u64> = HashMap::new();
 
     for line in collapsed.lines() {
-        let Some((stack, n)) = line.rsplit_once(' ') else { continue };
+        let Some((stack, n)) = line.rsplit_once(' ') else {
+            continue;
+        };
         let Ok(n) = n.parse::<u64>() else { continue };
         total += n;
         if let Some(leaf) = stack.rsplit(';').next() {
@@ -57,10 +65,19 @@ pub fn analyze_collapsed(collapsed: &str) -> ProfileSummary {
         }
     }
 
-    let pct = |n: u64| if total == 0 { 0.0 } else { n as f64 / total as f64 * 100.0 };
+    let pct = |n: u64| {
+        if total == 0 {
+            0.0
+        } else {
+            n as f64 / total as f64 * 100.0
+        }
+    };
     let mut top_leaves: Vec<FrameShare> = leaves
         .into_iter()
-        .map(|(frame, n)| FrameShare { frame: frame.to_string(), pct: pct(n) })
+        .map(|(frame, n)| FrameShare {
+            frame: frame.to_string(),
+            pct: pct(n),
+        })
         .collect();
     top_leaves.sort_by(|a, b| b.pct.total_cmp(&a.pct));
     top_leaves.truncate(15);
@@ -73,7 +90,11 @@ pub fn analyze_collapsed(collapsed: &str) -> ProfileSummary {
         })
         .collect();
 
-    ProfileSummary { total_samples: total, top_leaves, buckets }
+    ProfileSummary {
+        total_samples: total,
+        top_leaves,
+        buckets,
+    }
 }
 
 /// Write `summary.md`. The ramp/edge numbers come from the discovery run;
@@ -100,25 +121,43 @@ pub fn write_summary(
     writeln!(
         md,
         "- delivery (soak): offered {} · receipted {} · missing {} · unlanded {} → **{}**",
-        v.offered, v.receipted, v.missing, v.unlanded,
+        v.offered,
+        v.receipted,
+        v.missing,
+        v.unlanded,
         if v.pass { "PASS" } else { "FAIL" }
     )?;
     writeln!(
         md,
         "- receipt latency (soak): p50 {} ms · p99 {} ms · max {} ms",
-        soak.lat_p50_us / 1000, soak.lat_p99_us / 1000, soak.lat_max_us / 1000
+        soak.lat_p50_us / 1000,
+        soak.lat_p99_us / 1000,
+        soak.lat_max_us / 1000
     )?;
-    writeln!(md, "- profiled node: **{leader}** (busiest sealer under load = Raft leader)\n")?;
+    writeln!(
+        md,
+        "- profiled node: **{leader}** (busiest sealer under load = Raft leader)\n"
+    )?;
 
     writeln!(md, "## Ramp (discovery run)\n")?;
-    writeln!(md, "| rate (tx/s) | accept | keep-pace | seq clean | verdict |")?;
+    writeln!(
+        md,
+        "| rate (tx/s) | accept | keep-pace | seq clean | verdict |"
+    )?;
     writeln!(md, "|---:|---:|:--|:--|:--|")?;
     for s in &discovery.ramp {
         writeln!(
             md,
             "| {} | {:.3} | {} | {} | {} |",
-            s.rate, s.accept_ratio, s.gap_ok, s.seq_clean,
-            if s.sustainable { "sustainable" } else { "UNSUSTAINABLE" }
+            s.rate,
+            s.accept_ratio,
+            s.gap_ok,
+            s.seq_clean,
+            if s.sustainable {
+                "sustainable"
+            } else {
+                "UNSUSTAINABLE"
+            }
         )?;
     }
 
@@ -129,7 +168,11 @@ pub fn write_summary(
         writeln!(md, "| {name} | {pct:.1} |")?;
     }
 
-    writeln!(md, "\n## Sealer-leader profile ({} samples)\n", profile.total_samples)?;
+    writeln!(
+        md,
+        "\n## Sealer-leader profile ({} samples)\n",
+        profile.total_samples
+    )?;
     writeln!(md, "Inclusive attribution by bucket:\n")?;
     writeln!(md, "| bucket | share |")?;
     writeln!(md, "|:--|---:|")?;

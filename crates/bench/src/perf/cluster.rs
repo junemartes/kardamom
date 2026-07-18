@@ -24,8 +24,11 @@ pub const NODES: &[&str] = &[
     "kardamom-aux-0",
 ];
 
-pub const SEALER_NODES: &[&str] =
-    &["kardamom-sealer-0", "kardamom-sealer-1", "kardamom-sealer-2"];
+pub const SEALER_NODES: &[&str] = &[
+    "kardamom-sealer-0",
+    "kardamom-sealer-1",
+    "kardamom-sealer-2",
+];
 
 const NOMAD_ADDR: &str = "http://192.168.56.10:4646";
 
@@ -92,7 +95,10 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
         println!("==> building service binaries + orchestrator image");
         sh(
             "bash",
-            &[&format!("{root}/deploy/cluster/scripts/local-cluster.sh"), "build"],
+            &[
+                &format!("{root}/deploy/cluster/scripts/local-cluster.sh"),
+                "build",
+            ],
         )?;
     }
     purge()?;
@@ -102,10 +108,17 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     sh(
         "docker",
         &[
-            "run", "-d", "--name", "kardamom-orch",
-            "--privileged", "--network=host", "--pid=host",
-            "-v", "/var/run/docker.sock:/var/run/docker.sock",
-            "-v", &format!("{root}:/work"),
+            "run",
+            "-d",
+            "--name",
+            "kardamom-orch",
+            "--privileged",
+            "--network=host",
+            "--pid=host",
+            "-v",
+            "/var/run/docker.sock:/var/run/docker.sock",
+            "-v",
+            &format!("{root}:/work"),
             "kardamom-orchestrator:latest",
         ],
     )?;
@@ -113,12 +126,18 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
         "docker",
         &[
             "exec",
-            "-e", "KEEP=1",
-            "-e", "RUN_LOAD=0",
-            "-e", "RUN_CHAOS=0",
-            "-e", "REGISTRY_PUSH_NODE=control-0",
+            "-e",
+            "KEEP=1",
+            "-e",
+            "RUN_LOAD=0",
+            "-e",
+            "RUN_CHAOS=0",
+            "-e",
+            "REGISTRY_PUSH_NODE=control-0",
             "kardamom-orch",
-            "bash", "-lc", "cd /work && deploy/cluster/scripts/ci-cluster.sh",
+            "bash",
+            "-lc",
+            "cd /work && deploy/cluster/scripts/ci-cluster.sh",
         ],
     )?;
     let passes = out.matches("RESULT: PASS").count();

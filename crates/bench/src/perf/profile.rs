@@ -46,7 +46,11 @@ pub fn stage(node: &str, cache_dir: &Path) -> anyhow::Result<()> {
     let tgz = fetch_tarball(cache_dir)?;
     sh(
         "docker",
-        &["cp", tgz.to_str().context("path utf-8")?, &format!("{node}:/tmp/ap.tgz")],
+        &[
+            "cp",
+            tgz.to_str().context("path utf-8")?,
+            &format!("{node}:/tmp/ap.tgz"),
+        ],
     )?;
     docker_exec(
         node,
@@ -84,7 +88,10 @@ docker cp "$cid":/tmp/perf.collapsed /tmp/perf.collapsed"#
         &[
             "cp",
             &format!("{node}:/tmp/perf.collapsed"),
-            out_dir.join("stacks.collapsed").to_str().context("path utf-8")?,
+            out_dir
+                .join("stacks.collapsed")
+                .to_str()
+                .context("path utf-8")?,
         ],
     )?;
 
