@@ -141,7 +141,7 @@ jobs:
             # archive-driver-loss kills the Aeron SUBSTRATE (ArchivingMediaDriver
             # system task) under ingress-0 — active/active must ride through a
             # node losing its driver + durability recorder, not just its task.
-            chaos-ingress)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-ingress hard-ingress archive-driver-loss"; } ;;
+            chaos-ingress)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-ingress hard-ingress archive-driver-loss archive-tx-data-wipe"; } ;;
             # sequencer-replica-kill targets one racing replica of a shard
             # (seq-a on node-0) and asserts the twin keeps the shard live
             # with NO stall (P=2 replicas per shard as of the replicated-

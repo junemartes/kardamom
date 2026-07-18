@@ -76,6 +76,10 @@ path = "src/bin/kardamom-batcher.rs"
 name = "kardamom-reconstruct"
 path = "src/bin/kardamom-reconstruct.rs"
 
+[[bin]]
+name = "kardamom-archive-rereplicate"
+path = "src/bin/kardamom-archive-rereplicate.rs"
+
 [[bench]]
 name = "pack_throughput"
 harness = false

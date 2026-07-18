@@ -35,6 +35,7 @@ pub mod l1;
 pub mod multi_archive_reader;
 pub mod recon;
 pub mod reexec;
+pub mod rereplicate;
 pub mod settlement;
 
 pub use batch::{BatchAccumulator, ClosedBlock, RecordedTx};
@@ -45,3 +46,4 @@ pub use frame::{BlockFrame, Kar1Payload, TxFrame};
 pub use l1::{BatchDescriptor, post_batch, read_posted_batches, recover_blocks};
 pub use multi_archive_reader::{MultiArchiveConfig, MultiArchiveReader, ResolvedRecord};
 pub use reexec::{block_frame_to_replay, reconstruct_state};
+pub use rereplicate::{MirrorReport, mirror_archive, verify_mirror};
