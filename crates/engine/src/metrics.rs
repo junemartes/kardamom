@@ -9,11 +9,15 @@ pub const STATE_COMMIT_DURATION_SECONDS: &str = "kardamom_executor_state_commit_
 pub const BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 
 // The clustered sealer (the Java Aeron Cluster service) exposes no Prometheus
-// endpoint of its own, so the executor re-exports the sealer's output as it
-// decodes cluster egress (`reader/cluster.rs`): each Boundary frame bumps the
-// counter and sets the gauge to the sealer's declared block number. They
-// measure the boundary stream as observed at this executor's subscription,
-// not JVM-internal state.
+// endpoint of its own, so the EXECUTOR re-exports the sealer's output as it
+// decodes cluster egress (`reader/cluster.rs`): each in-order delivered
+// Boundary bumps the counter and sets the gauge to the sealer's declared block
+// number. They measure the boundary stream as observed at that executor's
+// subscription, not JVM-internal state. The validator consumes the same
+// shared subscription but constructs it with the emission SUPPRESSED
+// (`suppress_sealer_metrics`), so only executor exporters publish these
+// series; probes may still `max()` across the executor replicas (each replica
+// re-exports its own view).
 pub const SEALER_BLOCK_NUMBER: &str = "kardamom_sealer_block_number";
 pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_total";
 

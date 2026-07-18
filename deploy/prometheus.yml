@@ -13,10 +13,19 @@ global:
 # each service with `--metrics-addr 0.0.0.0:<port>` to make these targets
 # reachable.
 scrape_configs:
+  # P=2 racing replicas per shard: replica group "a" exports on :9001, group
+  # "b" (the colocated twin, rotated shard) on :9011. Both replicas of a
+  # shard process the same tx stream, so stream-derived counters must be
+  # aggregated `max by (partition)` — summing double-counts. The `replica`
+  # target label separates the groups; single-replica dev stacks simply show
+  # the :9011 target as down.
   - job_name: kardamom-sequencer
     metrics_path: /metrics
     static_configs:
       - targets: ["host.docker.internal:9001"]
+        labels: {replica: "a"}
+      - targets: ["host.docker.internal:9011"]
+        labels: {replica: "b"}
 
   - job_name: kardamom-batcher
     metrics_path: /metrics

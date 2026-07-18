@@ -1,124 +1,131 @@
-# kardamom multi-node cluster (Vagrant → Ansible → Nomad/Docker)
+# kardamom multi-node cluster (Ansible → Nomad/Consul → Docker)
 
-A reproducible **5-node** kardamom test/staging cluster on a single host. It is
-the multi-host successor to `crates/e2e/tests/multiprocess_e2e.rs`: Vagrant boots
-the VMs, Ansible installs the Nomad/Consul/Docker substrate, and Nomad runs the
-Aeron media-driver/archive and the kardamom service pipeline as containers.
+A reproducible multi-node kardamom test/staging cluster. Two ways to
+materialise the nodes, sharing the same Ansible playbook and Nomad jobs:
 
-See [`DESIGN.md`](./DESIGN.md) for the full design rationale.
+- **Containers (the path CI runs):** `scripts/ci-cluster.sh` boots one
+  privileged systemd + Docker-in-Docker container per node on a
+  `192.168.56.0/24` bridge and drives the full bring-up + smoke + load +
+  chaos suite (`.github/workflows/cluster-e2e.yml`).
+- **VMs (Vagrant):** `make up` boots one VM per node (libvirt primary,
+  VirtualBox fallback) and provisions them with the same `site.yml`.
 
-> **Status: scaffold.** All cluster definition lives here and is reviewable, but
-> the full `make up` flow has **not** been executed end-to-end (this was authored
-> in an environment without libvirt/Vagrant/Nomad). It also depends on the
-> service-side changes listed under **[Required service changes](#required-service-changes)**
-> before the pipeline will actually run multi-host over Aeron UDP. Treat job
-> specs / playbooks as needing a real run-through on a virtualization host.
+See [`DESIGN.md`](./DESIGN.md) for the original design rationale and
+[`../../docs/failure-modes.md`](../../docs/failure-modes.md) for per-actor
+failure/recovery behavior and the chaos cases that verify it.
 
-## Topology (default)
+> **Status.** The container path runs green in CI (`cluster-e2e`, sharded
+> across runners). The Vagrant path shares all of its Ansible/Nomad surface
+> with it but has not been exercised end-to-end on a real virtualization host.
 
-| Node | IP | Role | Workloads |
-|------|----|------|-----------|
-| `r1` | 192.168.56.11 | recorder + control | Nomad/Consul **server**, Docker registry, anvil (L1), media driver, archive, `kardamom-recorder` (id 0), quorum aggregator |
-| `r2` | 192.168.56.12 | recorder | media driver, archive, `kardamom-recorder` (id 1) |
-| `r3` | 192.168.56.13 | recorder | media driver, archive, `kardamom-recorder` (id 2) |
-| `w1` | 192.168.56.21 | worker | media driver, sequencer #0, executor (+state), ingress (JSON-RPC :8545) |
-| `w2` | 192.168.56.22 | worker | media driver, sequencer #1, sealer, da_watcher, batcher |
+## Topology
 
-The 3 `kardamom-recorder` processes record `tx_ordering` and publish their
-fsync watermarks; the quorum aggregator (a single `kardamom-recorder
---aggregate` on r1) combines them into the quorum watermark that ingress
-gates on with `--ack-policy on-quorum` (tolerates 1 recorder failure). All
-values are defined once in
-[`ansible/group_vars/all.yml`](./ansible/group_vars/all.yml).
+Nodes are defined as **classes** in
+[`ansible/group_vars/all.yml`](./ansible/group_vars/all.yml)
+(`node_classes`: class → `{count, ip_start, tier}` — the single source of
+truth). Instance `<class>-<i>` gets IP `ip_prefix.<ip_start+i>`:
+
+| Class | Count | IPs | Runs |
+|-------|-------|-----|------|
+| `control` | 1 | .10 | Nomad/Consul **server**, Docker registry, anvil (L1) |
+| `sequencer` | 2 | .21–.22 | 2 shards × 2 racing replicas (job groups `seq-a`/`seq-b`, cross-placed via `meta.node_index`) |
+| `ingress` | 2 | .31–.32 | active/active JSON-RPC front door (:8545) |
+| `executor` | 3 | .41–.43 | state-machine replica appliers (libmdbx state) |
+| `sealer` | 3 | .51–.53 | **3-member Aeron Cluster (Raft)** — the Java `cluster` job: canonical ordering + archive-at-the-sealer durability folded into the Raft log |
+| `aux` | 1 | .61 | validator, da_watcher, batcher (off the chaos blast radius) |
+
+Every non-control node also runs the Aeron `ArchivingMediaDriver` (the `aeron`
+Nomad system job). There is **no standalone sealer binary and no
+recorder/quorum tier** anymore: ordering is the Java Aeron Cluster
+(`cluster/sealer-service/`), and durability is the sealer archive (the old
+Q-of-N recorder design is preserved, marked superseded, in
+`docs/agents/log-config-and-recorder-spec.md`).
 
 ## Host prerequisites
 
-**Quickest path:** from the repo root, `just cluster-bootstrap` installs all of
-the host tools below for your platform, and `just cluster-doctor` verifies them.
+**Quickest path:** from the repo root, `just cluster-bootstrap` installs the
+host tools below for your platform, and `just cluster-doctor` verifies them.
 
-Install on the **host** machine (the in-VM Nomad/Consul agents are installed
-by Ansible):
-
-- [Vagrant](https://www.vagrantup.com/) + a provider: **libvirt** (primary) or
-  VirtualBox (fallback).
+- For the **VM path**: [Vagrant](https://www.vagrantup.com/) + libvirt
+  (primary) or VirtualBox (fallback).
 - Ansible (`ansible-playbook`) + collections:
   `ansible-galaxy collection install ansible.posix community.docker`.
-- Docker with **BuildKit** (`DOCKER_BUILDKIT=1`) to build + push the
-  service/Aeron images. Note: each service image compiles the workspace
-  (including the bundled Aeron C/Java sources via rusteron) — the first build is
-  slow and needs the full native toolchain (baked into the builder stage).
+- Docker (with BuildKit) to build + push the service/Aeron images.
 - The **host Docker daemon must allow the in-cluster registry as insecure**
-  (it is plain HTTP): add `{ "insecure-registries": ["192.168.56.11:5000"] }`
-  to `/etc/docker/daemon.json` (Linux) or Docker Desktop → Settings → Docker
-  Engine, then restart Docker. `make images` pushes fail without this.
+  (plain HTTP): add `{ "insecure-registries": ["192.168.56.10:5000"] }` to
+  `/etc/docker/daemon.json` (Linux) or Docker Desktop → Settings → Docker
+  Engine, then restart Docker. Pushes fail without this.
 - The **Nomad CLI** on the host — `scripts/deploy.sh` drives the cluster's
-  Nomad HTTP API from the host (`just cluster-bootstrap` installs a pinned
-  version).
-- Foundry's `cast` for the smoke test (the repo-level `just bootstrap`
-  installs Foundry).
-- ~18 GB RAM free (3×3 GB recorder VMs + 2×4 GB worker VMs; recorders run a
-  JVM archive + the executor runs revm).
+  Nomad HTTP API from the host.
+- **JDK 17 + Gradle wrapper** for the Java Aeron Cluster node jar:
+  `(cd cluster/sealer-service && ./gradlew :service:shadowJar)` — `make
+  images` / `ci-cluster.sh` stage it into the `kardamom-cluster` image and
+  fail loudly if it is missing.
+- Foundry's `cast` for the smoke tests (repo-level `just bootstrap`).
 
-## Quick start
+## Quick start (VM path)
 
 ```sh
 cd deploy/cluster
 make up        # vagrant up → ansible → build+push images → nomad run
-make smoke     # pipeline smoke test against ingress (see note below)
+make smoke     # single-tx pipeline smoke against ingress
 make status    # nomad/consul/job health
 make down      # stop jobs + vagrant destroy
 ```
 
-`make up` runs these phases (each is an individual target too):
+`make up` phases (each is an individual target too):
 
-1. `make vms` — `vagrant up` boots the 5 VMs with static IPs + role tags.
-2. `make provision` — `ansible-playbook site.yml` installs Docker, Consul, Nomad,
-   the local registry, the tmpfs `aeron.dir`, and tags Nomad nodes with their role.
-3. `make images` — build the per-service + Aeron images on the host and push them
-   to the registry on `r1`.
-4. `make deploy` — `nomad run` the Aeron **system** job (ArchivingMediaDriver on
-   every node), the anvil L1, then the service jobs.
+1. `make vms` — `vagrant up` boots one VM per `node_classes` instance.
+2. `make provision` — `ansible-playbook site.yml` (inventory:
+   `ansible/inventory.ini`, kept in sync with `node_classes`) installs
+   Docker, Consul, Nomad, the registry, the tmpfs `aeron.dir`, and stamps
+   each Nomad node's meta (`role`, `tier`, `node_ip`, `node_index`).
+3. `make images` — build the service + Aeron + cluster images on the host and
+   push them to the in-cluster registry.
+4. `make deploy` — `scripts/deploy.sh` submits the jobs in dependency order:
+   `aeron` (system) + `anvil`, then `cluster` (the Raft sealer), then
+   `sequencer` / `ingress` / `executor` / `validator` / `da-watcher`, then
+   the periodic `batcher`.
 
-`make smoke` submits `eth_sendRawTransaction` through ingress and asserts
-receipts (see `scripts/smoke.sh`). It is intentionally **not** chained into
-`make up`: until the channels-config plumbing lands (issue #36, item 1 under
-[Required service changes](#required-service-changes)) the services use
-single-host IPC channel defaults, so the cross-host pipeline — and therefore
-the smoke test — is **expected to fail**.
+The container path is one command: `deploy/cluster/scripts/ci-cluster.sh`
+(`KEEP=1` leaves the node containers up; `scripts/local-cluster.sh` wraps it
+for Docker Desktop hosts).
 
 ## Layout
 
 ```
 deploy/cluster/
-  DESIGN.md                 design rationale
-  Vagrantfile               5 libvirt/VirtualBox VMs, static IPs, role tags
+  DESIGN.md                 design rationale (original; recorder tier since removed)
+  Vagrantfile               one VM per node_classes instance (VM path)
   Makefile                  up / vms / provision / images / deploy / smoke /
                             validate / check-contract / down
-  .yamllint                 lint config (matches ansible-lint's yaml rule)
   ansible/
-    ansible.cfg, inventory.ini
-    group_vars/all.yml      ← canonical contract (IPs, ports, versions, paths)
+    ansible.cfg, inventory.ini   (static VM inventory — mirrors node_classes;
+                                  the container path generates its own)
+    group_vars/all.yml      ← canonical contract (classes, IPs, ports, versions)
     site.yml
     roles/{common,docker,consul,nomad,registry}/
   docker/
-    service.Dockerfile      multi-stage cargo build → slim runtime (BIN arg)
-                            (the Aeron image builds straight from the canonical
-                            crates/log/docker/aeron/Dockerfile — no copy here)
+    service.Dockerfile      multi-stage cargo build → slim runtime (VM path)
+    ci-service.Dockerfile   thin wrapper over prebuilt binaries (CI path)
+    cluster.Dockerfile      Java Aeron Cluster node (shadowJar + JRE 17)
+    node.Dockerfile         systemd+DinD "node" container (CI path)
   nomad/
-    aeron.system.nomad.hcl  ArchivingMediaDriver (driver+archive), system job,
-                            all nodes
-    recorder.system.nomad.hcl  kardamom-recorder, records tx_ordering +
-                            publishes fsync watermark (role=recorder)
-    quorum.nomad.hcl        kardamom-recorder --aggregate (quorum watermark,
-                            count=1)
-    anvil.nomad.hcl         in-cluster L1 for the smoke test
+    aeron.system.nomad.hcl  ArchivingMediaDriver (driver+archive), all nodes
+    cluster.nomad.hcl       3-member Aeron Cluster (Raft) sealer, .51/.52/.53
+    anvil.nomad.hcl         in-cluster L1 for the smoke test + da-watcher
     ingress.nomad.hcl  sequencer.nomad.hcl  executor.nomad.hcl
-    sealer.nomad.hcl   da-watcher.nomad.hcl  batcher.nomad.hcl
+    validator.nomad.hcl  da-watcher.nomad.hcl  batcher.nomad.hcl
   config/                   *.toml(.tpl) pulled into the job specs via file();
                             channels.toml.tpl is the shared LogConfig
   scripts/
+    lib.sh                  shared control-node helpers (nomad via docker exec)
     deploy.sh               submit jobs in dependency order, wait for allocs
-    smoke.sh                transfers smoke test against the ingress endpoint
+    smoke.sh                single-tx smoke test against ingress
+    smoke-load.sh           bash sustained-load smoke (legacy fallback)
+    ci-cluster.sh           container-node bring-up + full CI suite
+    local-cluster.sh        ci-cluster.sh wrapper for Docker Desktop
+    chaos.sh                chaos suite (kill components under load)
     check-contract.py       fail if any mirror of group_vars/all.yml drifts
 ```
 
@@ -128,100 +135,37 @@ The Nomad job specs pull their config payloads from `config/` with HCL2
 
 ## Aeron-in-Docker
 
-- **Shared `aeron.dir`:** Ansible mounts a host tmpfs at `/opt/kardamom/aeron-mount`;
-  the media-driver container and every co-located service container bind-mount the
-  same path so they share the CnC file + mmap'd ring buffers.
-- **Host networking:** all Aeron + service containers run `network_mode = "host"`,
-  so Aeron UDP channel endpoints are just the VM IP — no Docker port mapping.
-- **Channels:** `aeron:ipc?…` (single-host default) → `aeron:udp?endpoint=<mcast-group>:<port>|interface=192.168.56.0/24`.
-  The whole `LogConfig` (channels + quorum + archive control) is rendered once
-  in `config/channels.toml.tpl` and consumed by every service + the recorder
-  via `--log-config` (issue #36). One shared file works on every node because
-  channels are **UDP multicast**: per-stream identity is the stream id, so the
-  `{sid}`/`{rid}` template substitutions only label the `alias` — no per-node
-  rendering needed (this is what closes #37).
-- **Archive** runs on all nodes; `kardamom-recorder` records `tx_ordering` only
-  on the recorders, sharing `aeron.dir` + a persistent `archive_dir` volume.
-
-## Required service changes
-
-The deployment originally depended on four service-side changes. **#36 and #38
-are now implemented in this PR** (so the multi-host UDP pipeline and the
-on-quorum durability path are wired end-to-end); #37 is dissolved by the
-multicast channel layout; only the batcher (#39) remains out of scope.
-
-1. ✅ **Channels config plumbing (#36).** Every pipeline binary
-   (`ingress`/`sequencer`/`executor`/`sealer`/`da-watcher`) and the new
-   `kardamom-recorder` now accept `--log-config <toml>` (env
-   `KARDAMOM_LOG_CONFIG`) and load a `LogConfig` from it, falling back to the
-   built-in single-host IPC defaults when unset (so `multiprocess_e2e` and local
-   runs are unchanged). The Nomad jobs render `config/channels.toml.tpl` and pass
-   `--log-config /local/channels.toml`.
-2. ⛔ **Batcher is offline (#39).** `kardamom-batcher` still reads Aeron Archive
-   segment files in `--dry-run`; its Nomad job remains a periodic/batch job, not
-   an always-on service. Wiring the live L1 broadcast path is a follow-up.
-3. ✅ **Deployable recorder/quorum process (#38).** `kardamom-recorder` records
-   `tx_ordering` on each recorder (`recorder.system.nomad.hcl`, one per
-   `role=recorder` node, reading `${meta.recorder_id}`) and publishes its fsync
-   watermark; a single `--aggregate --no-record` instance (`quorum.nomad.hcl`)
-   publishes the Q-of-N quorum watermark. The ingress job therefore defaults
-   `--ack-policy` to **`on-quorum`** (override to `on-offer` for an
-   Aeron-substrate-only bring-up).
-4. ✅ **Per-node channel rendering (#37) — not needed.** The multicast layout
-   uses one shared `channels.toml` for all nodes (stream-id, not per-host IP,
-   distinguishes publishers), so there is nothing to render per node.
-
-> Note: there is **no `aeron-live` feature** to toggle — `rusteron` is an
-> unconditional dependency of `kardamom-log`, so a plain `cargo build` already
-> produces real-Aeron binaries. The service Dockerfile builds with no extra
-> feature flag (an `AERON_FEATURE` build-arg placeholder is provided in case
-> Aeron is later made optional).
-
-## Verification status
-
-| Check | Status |
-|-------|--------|
-| Design reviewed & approved | ✅ (`DESIGN.md`, `docs/agents/log-config-and-recorder-spec.md`) |
-| `--log-config` (#36) + `kardamom-recorder` (#38) | ✅ implemented; unit + config tests pass |
-| `nomad job validate` (all 10 specs, Nomad 1.9.5) | ✅ pass; also in CI (`cluster-validate`) |
-| `yamllint` / `ansible-lint` (production profile) | ✅ pass; also in CI (`cluster-validate`) |
-| Contract drift (`scripts/check-contract.py`) | ✅ pass; also in CI (`cluster-validate`) |
-| Pipeline + on-quorum + redundancy in containers | ⚙️ `cluster-e2e` workflow (gated; see below) |
-| `make up` on a real virtualization host | ⛔ not run (no libvirt in authoring env) |
-
-The **single biggest thing to validate** is whether Aeron preserves the
-canonical `tx_ordering` order across multiple cross-host publishers (2
-sequencers + the sealer) over UDP multicast — this is the property the
-container `cluster-e2e` job exercises. The single-host IPC defaults (no
-`--log-config`) remain the known-good path. Also exercise the
-UDP-over-host-networking tuning (MTU, `SO_RCVBUF`, archive fsync on VM disk).
+- **Shared `aeron.dir`:** Ansible mounts a host tmpfs at
+  `/opt/kardamom/aeron-mount`; the media-driver container and every co-located
+  service container bind-mount the same path so they share the CnC file +
+  mmap'd ring buffers.
+- **Host networking:** all Aeron + service containers run
+  `network_mode = "host"`, so Aeron UDP channel endpoints are just the node
+  IP — no Docker port mapping.
+- **Channels:** one shared `config/channels.toml.tpl` (UDP multicast; stream
+  ids distinguish publishers) consumed by every service via `--log-config`.
+- **Durability:** the sealer's Aeron Cluster members archive the canonical
+  log (`archive-at-the-sealer`); executors persist state in libmdbx under
+  `/opt/kardamom/state` and crash-recover by archive replay-merge.
 
 ## Sustained-load + chaos suite
 
 The `cluster-e2e` workflow runs the full suite on every trigger, **sharded
-across runners** (each shard brings up its own cluster):
+across runners** (each shard brings up its own container cluster):
 
 | Shard | Exercises |
 |-------|-----------|
 | `load` | 5-min sustained soak (`kardamom-load` ramp→soak; must-deliver + drop accounting + keep-pace) |
-| `chaos-executor` | graceful + hard kill + **node-failure** (Nomad reschedule) |
-| `chaos-ingress` | graceful + hard kill (singleton restart) |
-| `chaos-sequencer` | graceful + hard kill (partition restart) |
-| `chaos-sealer` | graceful restart (SPOF recovery) |
+| `chaos-executor` | graceful + hard kill + **node-failure** (degrade to 2/3, node returns) |
+| `chaos-ingress` | graceful + hard kill + **archive-driver-loss** (Aeron substrate kill under ingress-0) |
+| `chaos-sequencer` | graceful + hard kill + **sequencer-replica-kill** (racing-twin failover, restarted replica must regain coverage) + **validator-lapse** |
+| `chaos-cluster` | Raft sealer: **leader-kill** / **follower-kill** / **quorum-loss-recover** |
 
-`kardamom-load` is the harness (`crates/bench`, `bin/load.rs`); `chaos.sh`
-injects the failures under steady load and asserts Nomad auto-recovery + that
-the pipeline keeps producing blocks.
-
-### Known resilience gaps
-
-- **Hard sealer crash → executors freeze** ([#58]). After a `docker kill`
-  (SIGKILL) of the singleton sealer under load, the sealer process restarts and
-  resumes sealing, but the executors do **not** re-attach to its restarted
-  canonical `tx_ordering` MDC publication — they freeze and the pipeline stops
-  processing. A **graceful** sealer restart (SIGTERM) recovers cleanly. The
-  sealer is a singleton SPOF (HA is future work), so the `sealer-hard` chaos
-  case is **excluded from the always-on suite** and tracked in [#58]; reproduce
-  it on demand with `CHAOS_CASES=sealer-hard deploy/cluster/scripts/chaos.sh`.
+`kardamom-load` is the harness (`crates/bench/src/load/`); `chaos.sh` injects
+the failures under steady load and asserts Nomad auto-recovery + pipeline
+progress + the load verdict. The old single-sealer `sealer-hard` SPOF case
+([#58]) is superseded by the Raft cluster cases (a `sealer-hard` arm is kept
+in `chaos.sh` only for legacy single-sealer deploys). Remaining untested
+surface is tracked in `docs/failure-modes.md` ("Known gaps").
 
 [#58]: https://github.com/junemartes/kardamom/issues/58

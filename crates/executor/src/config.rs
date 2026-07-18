@@ -4,8 +4,9 @@
 //! presence-checked `--config`. This module adds the top-level config the
 //! binary deserializes from that TOML; every field has a default so an empty
 //! config file (the existing deployment shape) still parses. The first real
-//! field is the optional `[cluster]` section — default disabled, leaving the
-//! Aeron IPC/MDC tx_ordering path unchanged.
+//! field is the `[cluster]` section — cluster mode is the only mode, so the
+//! section must be populated for the binary to connect (an empty section
+//! fails at cluster connect time with a config error).
 //!
 //! Note: this is distinct from [`crate::ExecutorConfig`] (in `actor.rs`), which
 //! is the in-process runtime tuning passed to [`crate::Executor::run`]. This
@@ -32,20 +33,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_toml_parses_to_disabled_cluster() {
+    fn empty_toml_parses_to_default_cluster() {
         let cfg: ExecutorFileConfig = toml::from_str("").unwrap();
-        assert!(!cfg.cluster.enabled);
+        assert!(cfg.cluster.ingress_endpoints.is_empty());
     }
 
     #[test]
     fn comment_only_toml_parses() {
         // Matches the deployed executor.toml shape (comment-only file).
         let cfg: ExecutorFileConfig = toml::from_str("# just a comment\n").unwrap();
-        assert!(!cfg.cluster.enabled);
+        assert!(cfg.cluster.ingress_endpoints.is_empty());
     }
 
     #[test]
     fn cluster_section_parses() {
+        // `enabled` is a legacy key (removed knob) — must still be tolerated.
         let toml = r#"
             [cluster]
             enabled = true
@@ -54,7 +56,6 @@ mod tests {
             egress_channel = "aeron:udp?endpoint=127.0.0.1:9050"
         "#;
         let cfg: ExecutorFileConfig = toml::from_str(toml).unwrap();
-        assert!(cfg.cluster.enabled);
         assert_eq!(cfg.cluster.ingress_endpoints, "0=h0:9000,1=h1:9001");
         // Stream-id / keepalive defaults fill in when omitted.
         let c = cfg.cluster.defaults_applied();

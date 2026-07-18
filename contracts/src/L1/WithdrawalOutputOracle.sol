@@ -43,6 +43,9 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
         uint64 timestamp
     );
     event OutputDeleted(uint256 indexed index, bytes32 outputRoot);
+    event AttesterUpdated(address indexed previous, address indexed current);
+    event ChallengerUpdated(address indexed previous, address indexed current);
+    event FinalizationWindowUpdated(uint64 previous, uint64 current);
 
     error NotAttester();
     error NotChallenger();
@@ -50,6 +53,8 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
     error UnknownOutput();
     error AlreadyDeleted();
     error WindowElapsed();
+    error ZeroAddress();
+    error ZeroWindow();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -60,8 +65,45 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
         external
         initializer
     {
+        // A zero attester bricks proposals, a zero challenger removes the only
+        // milestone-1 fraud backstop, and a zero window makes every output
+        // instantly finalizable (challenge impossible). None is ever valid.
+        if (_attester == address(0) || _challenger == address(0)) revert ZeroAddress();
+        if (_finalizationWindow == 0) revert ZeroWindow();
         attester = _attester;
         challenger = _challenger;
+        finalizationWindow = _finalizationWindow;
+    }
+
+    // -------------------------------------------------------------------------
+    // Key rotation (factory-gated: the same authority that can upgrade the
+    // implementation — recovery path for a leaked attester/challenger key
+    // without a full UUPS upgrade).
+    // -------------------------------------------------------------------------
+
+    /// @notice Rotate the attester key. Only the kardamom factory.
+    function setAttester(address _attester) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        if (_attester == address(0)) revert ZeroAddress();
+        emit AttesterUpdated(attester, _attester);
+        attester = _attester;
+    }
+
+    /// @notice Rotate the challenger key. Only the kardamom factory.
+    function setChallenger(address _challenger) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        if (_challenger == address(0)) revert ZeroAddress();
+        emit ChallengerUpdated(challenger, _challenger);
+        challenger = _challenger;
+    }
+
+    /// @notice Adjust the finalization window. Only the kardamom factory.
+    ///         Applies to outputs proposed after the change AND retroactively to
+    ///         pending ones (`isFinalizable`/`deleteOutput` read the live value).
+    function setFinalizationWindow(uint64 _finalizationWindow) external {
+        if (msg.sender != FACTORY) revert NotFactory();
+        if (_finalizationWindow == 0) revert ZeroWindow();
+        emit FinalizationWindowUpdated(finalizationWindow, _finalizationWindow);
         finalizationWindow = _finalizationWindow;
     }
 
@@ -84,15 +126,25 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
     }
 
     /// @notice Append an attested output. Only the attester; the covered L2 block
-    ///         must strictly advance.
+    ///         must strictly advance past the latest **non-deleted** output.
+    ///         Deleted (successfully challenged) outputs are excluded from the
+    ///         monotonicity floor so a corrected output for the challenged range
+    ///         (same `l2BlockNumber`) can be re-proposed — otherwise every honest
+    ///         withdrawal in that range would be permanently stranded.
     function proposeOutput(bytes32 outputRoot, uint64 l2BlockNumber)
         external
         returns (uint256 index)
     {
         if (msg.sender != attester) revert NotAttester();
         uint256 n = _outputs.length;
-        if (n > 0 && l2BlockNumber <= _outputs[n - 1].l2BlockNumber) {
-            revert NonMonotonicBlock();
+        // Compare against the latest non-deleted output. The backward scan is
+        // bounded by the trailing run of deleted outputs — deletions are
+        // permissioned, rare, and window-limited.
+        for (uint256 i = n; i > 0; i--) {
+            Output storage prev = _outputs[i - 1];
+            if (prev.deleted) continue;
+            if (l2BlockNumber <= prev.l2BlockNumber) revert NonMonotonicBlock();
+            break;
         }
         index = n;
         _outputs.push(
@@ -112,7 +164,10 @@ contract WithdrawalOutputOracle is KardamomUUPSBase {
     ///         never finalize a withdrawal.
     /// @dev    Milestone 1 deletes a single output. A production challenge rolls
     ///         back this output and every later one (they build on rejected
-    ///         state); that is a follow-up once outputs chain explicitly.
+    ///         state); that is a follow-up once outputs chain explicitly. The
+    ///         attester can re-propose a corrected output for the deleted range
+    ///         (deleted outputs don't count toward the monotonicity floor in
+    ///         `proposeOutput`).
     function deleteOutput(uint256 index) external {
         if (msg.sender != challenger) revert NotChallenger();
         if (index >= _outputs.length) revert UnknownOutput();

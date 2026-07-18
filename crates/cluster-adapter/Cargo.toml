@@ -25,10 +25,14 @@ kardamom-log.workspace = true
 alloy-primitives.workspace = true
 crossbeam-channel.workspace = true
 rkyv.workspace = true
+# The shared `[cluster]` TOML section (config::ClusterConfig) lives here so the
+# sequencer/engine/ingress service configs re-export one definition.
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 kardamom-cluster-adapter = { path = ".", features = ["testing"] }
+toml.workspace = true
 kardamom-sequencer = { path = "../sequencer" }
 kardamom-executor = { path = "../executor" }

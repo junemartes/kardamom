@@ -31,8 +31,7 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::offer_retry::{OFFER_TIMEOUT, offer_with_deadline};
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, BlockDelta, QuorumWatermark, TxEnvelope, TxOrderingMessage,
-    TxRef,
+    BPosition, BlockBoundaryStart, QuorumWatermark, TxEnvelope, TxOrderingMessage, TxRef,
 };
 
 // rusteron re-exports we depend on. `AeronPublication` is the shared
@@ -186,27 +185,6 @@ impl QuorumPublisher {
 
     pub fn publish(&self, q: &QuorumWatermark) -> Result<(), LogError> {
         offer(&self.pub_handle, q).map(|_| ())
-    }
-}
-
-/// BAL publisher: the sequencer-side executor publishes one [`BlockDelta`] per
-/// sealed block — the per-block Block Access List (account/storage/code
-/// mutations + receipts). Single publisher; validators subscribe and
-/// cross-check their independent re-execution against it.
-pub struct BalPublisher {
-    pub_handle: Pub,
-}
-
-impl BalPublisher {
-    pub fn open(aeron: &AeronClient, ch: &ChannelsConfig) -> Result<Self, LogError> {
-        let pub_handle = add_pub(aeron, &ch.tx_bal_channel, ch.tx_bal_stream_id, "bal")?;
-        Ok(Self { pub_handle })
-    }
-
-    /// Publish a per-block [`BlockDelta`] (BAL). Returns the fragment's start
-    /// position on the tx_bal stream.
-    pub fn publish(&self, delta: &BlockDelta) -> Result<BPosition, LogError> {
-        offer(&self.pub_handle, delta)
     }
 }
 

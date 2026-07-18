@@ -78,6 +78,15 @@ pub trait StateWriterQueue: Send {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError>;
 }
 
+// Lets a binary pick between role-specific queue wrappers at runtime (e.g. the
+// validator's optional attester tee) without monomorphising `Executor::run`
+// twice.
+impl StateWriterQueue for Box<dyn StateWriterQueue> {
+    fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+        (**self).submit(block, delta)
+    }
+}
+
 /// Where a restarted executor resumes from, derived from the persisted state
 /// cursor (`kardamom_state::RecoveryPoint`). When present, the exec thread is
 /// fed the canonical `tx_ordering` stream **from the archive replay** (record 0
@@ -548,12 +557,23 @@ where
                         let commit_start = Instant::now();
                         sw_queue.submit(boundary.clone(), bd)?;
 
+                        // Wait for the writer to durably commit BEFORE
+                        // forwarding the sealed Boundary to the tx_receipts
+                        // publisher: downstream must never observe a boundary
+                        // for state a crash could still un-commit. The per-tx
+                        // receipts DO stream out at execute time (above),
+                        // ahead of durability — a crash in that window
+                        // re-executes the block on recovery and re-publishes
+                        // byte-identical receipts, so tx_receipts is
+                        // AT-LEAST-ONCE and every consumer must dedup on
+                        // `tx_idx` (ingress does). Holding whole receipt
+                        // batches until the fsync would stall client acks a
+                        // full commit cycle for no correctness gain.
+                        let committed = sw_signal.wait_committed(block_number)?;
+
                         if tx.send(ExecToCommit::Boundary(boundary)).is_err() {
                             return Ok(());
                         }
-
-                        // Wait for the writer to durably commit.
-                        let committed = sw_signal.wait_committed(block_number)?;
                         metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
                             .record(commit_start.elapsed().as_secs_f64());
                         metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(block_number as f64);
@@ -618,6 +638,17 @@ where
                 // normally succeeds on the first attempt.)
                 let mut attempts: u32 = 0;
                 while let Err(e) = c_pub.publish(c_msg.clone()) {
+                    // A PROVEN divergence from the sink (the validator's
+                    // receipt cross-check) is fatal, not transient. Retrying
+                    // would silently defeat the fail-stop: the first failing
+                    // publish already consumed the buffered receipt, so a
+                    // retry finds nothing, waits out the receipt window, lands
+                    // in the "unverified" arm and the pipeline keeps
+                    // committing past a proven mismatch. Propagate instead so
+                    // `Executor::run` returns the error and the process halts.
+                    if matches!(e, ExecutorError::Divergence(_)) {
+                        return Err(e);
+                    }
                     attempts += 1;
                     if attempts == 1 || attempts.is_multiple_of(20) {
                         warn!(error = %e, attempts, "tx_receipts publish failed; retrying (must-deliver)");
@@ -1217,5 +1248,39 @@ mod commit_tests {
         let l = log.lock().unwrap();
         assert_eq!(l.len(), 1, "the receipt must be delivered, not dropped");
         assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
+    }
+
+    /// A sink that reports a PROVEN divergence (the validator's receipt
+    /// cross-check) on every publish.
+    struct DivergingPub;
+    impl TxReceiptsPublication for DivergingPub {
+        fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
+            Err(ExecutorError::Divergence("receipt mismatch at tx 0".into()))
+        }
+    }
+
+    // F10.1 regression: the must-deliver retry must NOT spin on a proven
+    // divergence — that would consume the fail-stop (retry → empty buffer →
+    // "unverified" → pipeline keeps committing). A Divergence error has to
+    // propagate out of the commit thread immediately.
+    #[test]
+    fn commit_thread_fail_stops_on_divergence() {
+        let (tx, rx) = bounded::<ExecToCommit>(8);
+        tx.send(ExecToCommit::Receipt(Receipt {
+            tx_idx: BPosition {
+                term_id: 0,
+                term_offset: 0,
+            },
+            ..Default::default()
+        }))
+        .unwrap();
+        drop(tx);
+
+        let h = spawn_commit(DivergingPub, rx);
+        let res = h.join().expect("no panic");
+        assert!(
+            matches!(res, Err(ExecutorError::Divergence(_))),
+            "divergence must propagate, not be retried: {res:?}"
+        );
     }
 }

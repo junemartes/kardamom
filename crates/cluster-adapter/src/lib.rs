@@ -16,11 +16,13 @@
 //! Aeron pub/sub (behind that crate's `aeron-live` feature); the in-memory fakes
 //! make the trait adapters deterministically testable.
 
+pub mod config;
 pub mod gateway;
 pub mod live;
 pub mod watermark;
 pub mod wire;
 
+pub use config::ClusterConfig;
 pub use gateway::{ClusterEgress, ClusterIngress, OfferOutcome};
 pub use watermark::ClusterWatermark;
 

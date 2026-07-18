@@ -10,6 +10,14 @@ pub enum ExecutorError {
     #[error("state backend error: {0}")]
     State(String),
 
+    /// A PROVEN divergence between a validator's re-execution and the
+    /// sequencer's published output (write-set != BAL, receipt mismatch).
+    /// FATAL and non-retryable: unlike a transient transport error, the
+    /// commit thread's must-deliver retry must NOT spin on this — it has to
+    /// propagate so the pipeline halts and the process fail-stops.
+    #[error("proven divergence: {0}")]
+    Divergence(String),
+
     #[error("revm execution failure at tx {idx:?}: {detail}")]
     Execution { idx: TxIndex, detail: String },
 

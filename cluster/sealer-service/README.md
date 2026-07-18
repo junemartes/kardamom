@@ -33,6 +33,20 @@ egress   relayed:  [kind:u8=1][index:u64-LE][payload_len:u32-LE][relayed payload
          boundary: [kind:u8=2][block_number:u64-LE][end_tx_idx:u64-LE][l2_timestamp:u64-LE]
 ```
 
+## Dedup window sizing (`-Dkardamom.cluster.dedupCapacity`)
+
+The first-seen window is the ONLY thing preventing a lagging racing replica's
+re-offers from being ordered twice: a replica that stalls (GC pause, SIGSTOP,
+cgroup throttle, receive backlog) and resumes after its twin pushed more than
+`dedupCapacity` *unique* ids through the sealer re-offers records whose ids
+were FIFO-evicted — and they are accepted as fresh. The invariant is
+quantitative: **`dedupCapacity` > worst-case replica stall × peak unique-record
+throughput**. The default (`1 << 17` = 131072, see
+`SealerClusteredService.DEFAULT_DEDUP_CAPACITY`) tolerates a ~13 s stall at
+10k tx/s (~20 MB heap, ~4 MB snapshot). Every member must use the SAME value —
+the window is part of the deterministic state machine, and a snapshot never
+loads into a smaller window than it was taken with.
+
 ## Build & test
 
 Requires a JDK 17 (`JAVA_HOME`). The Gradle wrapper downloads Gradle 8.7 on

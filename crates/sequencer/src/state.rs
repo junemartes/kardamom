@@ -6,6 +6,7 @@
 //! exercises it directly.
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use alloy_primitives::Address;
 
@@ -33,11 +34,26 @@ pub struct ProcessResult<T> {
     pub outcome: NonceOutcome,
 }
 
+/// A sender whose pending buffer holds only nonces strictly above its floor:
+/// the gap `expected..lowest` is not in flight locally. Recorded the first
+/// time [`PartitionState::fast_forward_stalled`] observes the configuration;
+/// if the same `(expected, lowest)` pair is still stalled after the lag
+/// bound, the floor fast-forwards to `lowest`. Any progress (a match
+/// advancing `expected`, or a lower nonce arriving and shrinking the gap)
+/// invalidates the mark and restarts the clock.
+#[derive(Debug)]
+struct StallMark {
+    expected: u64,
+    lowest: u64,
+    since: Instant,
+}
+
 #[derive(Debug)]
 pub struct PartitionState<T> {
     max_pending_per_sender: usize,
     next: HashMap<Address, u64>,
     pending: HashMap<Address, PendingBuffer<T>>,
+    stalls: HashMap<Address, StallMark>,
 }
 
 impl<T> PartitionState<T> {
@@ -46,6 +62,7 @@ impl<T> PartitionState<T> {
             max_pending_per_sender,
             next: HashMap::new(),
             pending: HashMap::new(),
+            stalls: HashMap::new(),
         }
     }
 
@@ -172,6 +189,80 @@ impl<T> PartitionState<T> {
         }
         out
     }
+
+    /// Stream-adaptive nonce-floor fast-forward.
+    ///
+    /// A replica that live-joins its shard's tx_data mid-stream (restart —
+    /// there is no archive replay) hydrates established senders at a floor
+    /// that lags the live stream: the state DB is empty or the committed
+    /// nonce trails what the twin already ordered. Every subsequent tx from
+    /// such a sender buffers as "future" against a gap that can never fill,
+    /// so the replica silently stops covering the sender.
+    ///
+    /// This method detects that condition: a sender whose pending buffer
+    /// holds nonces strictly above the floor, unchanged (same `expected`,
+    /// same lowest buffered nonce) for at least `max_lag`, has its floor
+    /// fast-forwarded to the lowest buffered nonce; the now-contiguous run is
+    /// drained and returned for publishing, in the same shape as
+    /// [`Self::drain_pending`]. A `max_lag` of zero fires immediately.
+    ///
+    /// Safety: the floor only ever skips forward, so per-publisher nonce
+    /// order is preserved, and any ref the twin already offered is absorbed
+    /// by the cluster's first-seen dedup. If the missing nonces were never
+    /// ordered by anyone (both replicas of the shard down simultaneously —
+    /// outside the P=2 design's failure envelope), the skipped prefix is
+    /// lost either way; fast-forwarding surfaces the gap at the executor
+    /// instead of freezing the sender here forever.
+    pub fn fast_forward_stalled(
+        &mut self,
+        now: Instant,
+        max_lag: Duration,
+    ) -> Vec<(Address, u64, T)> {
+        let mut out = Vec::new();
+        // `pending` / `next` / `stalls` are borrowed as disjoint fields (same
+        // pattern as `drain_pending`).
+        for (&sender, buf) in self.pending.iter_mut() {
+            let Some(lowest) = buf.lowest_nonce() else {
+                self.stalls.remove(&sender);
+                continue;
+            };
+            let expected = self.next.get(&sender).copied().unwrap_or(0);
+            if lowest <= expected {
+                // Drainable by the normal paths — not a stall.
+                self.stalls.remove(&sender);
+                continue;
+            }
+            let due = max_lag.is_zero()
+                || match self.stalls.get(&sender) {
+                    Some(m) if m.expected == expected && m.lowest == lowest => {
+                        now.duration_since(m.since) >= max_lag
+                    }
+                    _ => {
+                        // New stall configuration (or the gap moved): (re)arm.
+                        self.stalls.insert(
+                            sender,
+                            StallMark {
+                                expected,
+                                lowest,
+                                since: now,
+                            },
+                        );
+                        false
+                    }
+                };
+            if !due {
+                continue;
+            }
+            let mut advanced = lowest;
+            for (n, p) in buf.drain_consecutive_from(lowest) {
+                out.push((sender, n, p));
+                advanced = n.saturating_add(1);
+            }
+            self.next.insert(sender, advanced);
+            self.stalls.remove(&sender);
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -265,6 +356,69 @@ mod tests {
             out.outcome,
             NonceOutcome::BufferedEvicting { evicted_nonce: 5 }
         );
+    }
+
+    #[test]
+    fn fast_forward_waits_for_the_lag_bound_then_adopts_the_gap() {
+        let mut st: PartitionState<u32> = PartitionState::new(8);
+        let lag = Duration::from_millis(50);
+        let t0 = Instant::now();
+        // Rejoin scenario: floor 0, live stream starts at nonce 10.
+        st.process(s(1), 10, 110);
+        st.process(s(1), 11, 111);
+        // First observation arms the stall mark — nothing published yet.
+        assert!(st.fast_forward_stalled(t0, lag).is_empty());
+        // Still inside the lag bound.
+        assert!(
+            st.fast_forward_stalled(t0 + Duration::from_millis(10), lag)
+                .is_empty()
+        );
+        // Past the bound: floor jumps to 10, contiguous run drains.
+        let out = st.fast_forward_stalled(t0 + lag, lag);
+        assert_eq!(out, vec![(s(1), 10, 110), (s(1), 11, 111)]);
+        assert_eq!(st.next_nonce(s(1)), 12);
+        // The live stream continues seamlessly from the adopted floor.
+        let next = st.process(s(1), 12, 112);
+        assert_eq!(next.outcome, NonceOutcome::Matched);
+    }
+
+    #[test]
+    fn fast_forward_rearms_when_the_gap_shrinks() {
+        let mut st: PartitionState<u32> = PartitionState::new(8);
+        let lag = Duration::from_millis(50);
+        let t0 = Instant::now();
+        st.process(s(1), 10, 110);
+        assert!(st.fast_forward_stalled(t0, lag).is_empty());
+        // A lower (but still future) nonce arrives: the gap is filling in —
+        // the mark must re-arm on the new configuration, not fire early.
+        st.process(s(1), 8, 108);
+        assert!(st.fast_forward_stalled(t0 + lag, lag).is_empty());
+        // Only a full lag after the new configuration does it adopt nonce 8
+        // (and stop at the 9→10 gap... which no longer exists: 8 then 10).
+        let out = st.fast_forward_stalled(t0 + lag + lag, lag);
+        assert_eq!(out, vec![(s(1), 8, 108)]);
+        assert_eq!(st.next_nonce(s(1)), 9);
+    }
+
+    #[test]
+    fn fast_forward_ignores_senders_without_a_gap() {
+        let mut st: PartitionState<u32> = PartitionState::new(8);
+        let t0 = Instant::now();
+        st.process(s(1), 0, 100); // matched; no pending
+        assert!(
+            st.fast_forward_stalled(t0, Duration::ZERO).is_empty(),
+            "matched sender must not be touched"
+        );
+        assert_eq!(st.next_nonce(s(1)), 1);
+    }
+
+    #[test]
+    fn fast_forward_zero_lag_fires_immediately() {
+        let mut st: PartitionState<u32> = PartitionState::new(8);
+        st.process(s(1), 5, 55);
+        let out = st.fast_forward_stalled(Instant::now(), Duration::ZERO);
+        assert_eq!(out, vec![(s(1), 5, 55)]);
+        assert_eq!(st.next_nonce(s(1)), 6);
     }
 
     #[test]

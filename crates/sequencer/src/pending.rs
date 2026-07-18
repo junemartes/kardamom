@@ -41,6 +41,11 @@ impl<T> PendingBuffer<T> {
         self.inner.contains_key(&nonce)
     }
 
+    /// Lowest buffered nonce, if any.
+    pub fn lowest_nonce(&self) -> Option<u64> {
+        self.inner.keys().next().copied()
+    }
+
     pub fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
         if self.capacity == 0 {
             return InsertOutcome::DroppedBufferDisabled;

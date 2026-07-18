@@ -37,10 +37,13 @@ async fn docker_available() -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p log --features docker-e2e --test aeron_live_e2e -- --ignored`"]
 async fn aeron_live_send_friendly_round_trip() {
-    if !docker_available().await {
-        eprintln!("skipping: docker not available");
-        return;
-    }
+    // This test only runs when explicitly opted in (`--features docker-e2e --
+    // --ignored`), an environment where Docker is required — its absence is an
+    // error, not a skip condition (a silent return would count as a green pass).
+    assert!(
+        docker_available().await,
+        "docker not available — required for this --ignored docker-e2e test"
+    );
 
     let cluster = AeronTestCluster::single_node()
         .await

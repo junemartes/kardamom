@@ -5,8 +5,8 @@ edition.workspace = true
 
 # Role-agnostic execution engine: the reader/join topology, per-tx revm
 # execution, delta/write-set accumulation, and the reader→exec→commit
-# orchestration behind a `BlockSink` seam. Shared by the sequencer-side
-# `kardamom-executor` and the `kardamom-validator`.
+# orchestration behind the `StateWriterQueue` / `TxReceiptsPublication` seams.
+# Shared by the sequencer-side `kardamom-executor` and the `kardamom-validator`.
 
 [dependencies]
 kardamom-types = { workspace = true }
@@ -26,6 +26,14 @@ tracing.workspace = true
 thiserror.workspace = true
 crossbeam-channel = "0.5"
 dashmap = { workspace = true }
+# bin_support: shared wiring for the two engine-driven binaries (executor +
+# validator) — CLI arg mirror, genesis loading, async→sync stream bridging,
+# tracing/shutdown helpers. Both engine consumers are those binaries.
+anyhow = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }

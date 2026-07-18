@@ -99,29 +99,147 @@ fn write_set_diff_summary(local: &BlockDelta, bal: &BlockDelta) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// BAL buffer: block_number -> executor BlockDelta, filled by the tx_bal task.
+// Verification buffers: a shared bounded, cursor-pruned core + the two typed
+// wrappers (BAL by block number, receipts by canonical tx_idx).
 // ---------------------------------------------------------------------------
+
+/// Key of a verification buffer, mappable to the monotone index (block number
+/// / canonical record index) the catch-up + pruning arithmetic runs on.
+trait BufKey: Ord + Copy {
+    fn index(self) -> u64;
+}
+impl BufKey for u64 {
+    fn index(self) -> u64 {
+        self
+    }
+}
+impl BufKey for BPosition {
+    fn index(self) -> u64 {
+        self.as_index()
+    }
+}
+
+/// Shared core of [`BalBuffer`] / [`ReceiptBuffer`]: producer task inserts,
+/// the (sync) consumer thread `take`s in MONOTONE key order, blocking briefly
+/// for the matching artifact. Bounded and cursor-pruned so late/stale
+/// artifacts can never leak: an entry the consumer's cursor has already
+/// passed is dead weight (no future take will request it).
+struct KeyedBuffer<K: BufKey, V> {
+    inner: Mutex<KeyedInner<K, V>>,
+    cv: Condvar,
+    /// Max retained entries. On overflow the OLDEST entry is evicted: the
+    /// consumer treats a missing artifact as "could not verify" (never a
+    /// false divergence), so eviction can only cost an unverified block/tx.
+    cap: usize,
+    /// Catch-up skip horizon in index units — see [`take`](Self::take).
+    lookbehind: u64,
+}
+
+struct KeyedInner<K: BufKey, V> {
+    map: BTreeMap<K, V>,
+    /// Index of the latest key requested by `take`. Requests are monotone, so
+    /// inserts strictly below it are late arrivals for keys the consumer has
+    /// already passed (taken, skipped or timed out) and are dropped — the
+    /// leak fix for artifacts that land just after their take gave up.
+    cursor: Option<u64>,
+}
+
+impl<K: BufKey, V> KeyedBuffer<K, V> {
+    fn new(cap: usize, lookbehind: u64) -> Self {
+        Self {
+            inner: Mutex::new(KeyedInner {
+                map: BTreeMap::new(),
+                cursor: None,
+            }),
+            cv: Condvar::new(),
+            cap,
+            lookbehind,
+        }
+    }
+
+    fn insert(&self, key: K, value: V) {
+        let mut g = self.inner.lock().unwrap();
+        // Late arrival below the consumer's cursor: no future take will ever
+        // request it — dropping it here (plus the prune in `take`) keeps the
+        // buffer from accreting dead entries for the process lifetime.
+        if g.cursor.is_some_and(|c| key.index() < c) {
+            return;
+        }
+        g.map.insert(key, value);
+        while g.map.len() > self.cap {
+            g.map.pop_first();
+        }
+        drop(g);
+        self.cv.notify_all();
+    }
+
+    /// Take the value for `key`, waiting up to `timeout` for it to arrive.
+    /// Returns `None` if it never showed (the caller treats that as "could
+    /// not verify", never as divergence).
+    fn take(&self, key: K, timeout: Duration) -> Option<V> {
+        // DEADLINE semantics, not per-wakeup timeout: inserts for OTHER keys
+        // notify_all every block (~250ms-2s under a live chain), and a full
+        // fresh timeout per wakeup means a wait for a key that never arrives
+        // NEVER times out — the consumer then hangs forever on one lost
+        // artifact while the buffer keeps filling (observed as a total
+        // validator freeze with a healthy chain).
+        let deadline = std::time::Instant::now() + timeout;
+        let mut g = self.inner.lock().unwrap();
+        // Requests are monotone: everything below `key` has already been
+        // resolved (taken / skipped / timed out) and can be pruned; remember
+        // the cursor so late re-arrivals are dropped at insert.
+        g.cursor = Some(g.cursor.map_or(key.index(), |c| c.max(key.index())));
+        g.map = std::mem::take(&mut g.map).split_off(&key);
+        loop {
+            if let Some(v) = g.map.remove(&key) {
+                return Some(v);
+            }
+            // CATCH-UP: if the live head (highest buffered key) is far ahead
+            // of `key`, this artifact has aged out of the live stream's term
+            // buffer — it will never arrive. Don't waste the wait window;
+            // return None now ("commit unverified") so the validator catches
+            // up fast (the cold-start backlog, and a lapse gap larger than
+            // the term buffer). Keys still inside the buffered window are
+            // taken above; a caught-up validator's requests are near the
+            // head, so it never trips this and verifies normally.
+            if let Some((&head, _)) = g.map.last_key_value()
+                && head.index() > key.index() + self.lookbehind
+            {
+                return None;
+            }
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return g.map.remove(&key);
+            };
+            let (g2, wait) = self.cv.wait_timeout(g, remaining).unwrap();
+            g = g2;
+            if wait.timed_out() {
+                return g.map.remove(&key);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().unwrap().map.len()
+    }
+}
 
 /// Buffer of executor-published BALs keyed by block number. The Aeron `tx_bal`
 /// subscriber task calls [`insert`](Self::insert); the (sync) exec thread calls
 /// [`take`](Self::take), blocking briefly for the matching block to arrive.
-#[derive(Default)]
 pub struct BalBuffer {
-    inner: Mutex<BTreeMap<u64, BlockDelta>>,
-    cv: Condvar,
+    core: KeyedBuffer<u64, BlockDelta>,
+}
+
+impl Default for BalBuffer {
+    fn default() -> Self {
+        Self {
+            core: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
+        }
+    }
 }
 
 impl BalBuffer {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn insert(&self, delta: BlockDelta) {
-        let block = delta.block_number;
-        self.inner.lock().unwrap().insert(block, delta);
-        self.cv.notify_all();
-    }
-
     /// How far below the live head (the highest buffered block) a requested
     /// block must be to count as "unrecoverable backlog": its BAL has aged out
     /// of the live `tx_bal` multicast term buffer and will never arrive, so we
@@ -130,99 +248,102 @@ impl BalBuffer {
     /// waits and verifies; only a validator catching up from a cold start (or
     /// a long lapse whose gap exceeds the term buffer) skips.
     const BACKLOG_LOOKBEHIND: u64 = 16;
+    /// Bound on buffered BALs (whole `BlockDelta`s — the heavyweight buffer).
+    /// ~17-35 min of chain at the 250ms-2s block cadence; far beyond the
+    /// verify window, so eviction only fires if the consumer stalls outright.
+    const MAX_BUFFERED: usize = 1024;
+
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    #[cfg(test)]
+    fn with_cap(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            core: KeyedBuffer::new(cap, Self::BACKLOG_LOOKBEHIND),
+        })
+    }
+
+    pub fn insert(&self, delta: BlockDelta) {
+        self.core.insert(delta.block_number, delta);
+    }
 
     /// Take the BAL for `block`, waiting up to `timeout` for it to arrive.
     /// Returns `None` if it never showed (the caller treats that as "could not
-    /// verify", not as divergence).
+    /// verify", not as divergence). See [`KeyedBuffer::take`] for the deadline
+    /// + catch-up semantics.
     pub fn take(&self, block: u64, timeout: Duration) -> Option<BlockDelta> {
-        // DEADLINE semantics, not per-wakeup timeout: inserts for OTHER keys
-        // notify_all every block (~250ms-2s under a live chain), and a full
-        // fresh timeout per wakeup means a wait for a key that never arrives
-        // NEVER times out — the writer queue then hangs forever on one lost
-        // BAL while the buffer keeps filling (observed as a total validator
-        // freeze with a healthy chain).
-        let deadline = std::time::Instant::now() + timeout;
-        let mut guard = self.inner.lock().unwrap();
-        loop {
-            if let Some(d) = guard.remove(&block) {
-                return Some(d);
-            }
-            // CATCH-UP: if the live head (highest buffered block) is far ahead
-            // of `block`, this block's BAL has aged out of the multicast — it
-            // will never arrive. Don't waste the wait window; commit unverified
-            // now so the validator catches up fast (the cold-start backlog, and
-            // a lapse gap larger than the term buffer). Blocks still inside the
-            // buffered window are taken above; a caught-up validator's requests
-            // are near the head, so it never trips this and verifies normally.
-            if let Some(&head) = guard.keys().next_back()
-                && head > block + Self::BACKLOG_LOOKBEHIND
-            {
-                return None;
-            }
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return guard.remove(&block);
-            };
-            let (g, wait) = self.cv.wait_timeout(guard, remaining).unwrap();
-            guard = g;
-            if wait.timed_out() {
-                return guard.remove(&block);
-            }
+        self.core.take(block, timeout)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.core.len()
+    }
+}
+
+/// Buffer of executor-published receipts keyed by canonical `tx_idx`. Filled by
+/// the `tx_receipts` subscriber task; drained by the commit thread.
+pub struct ReceiptBuffer {
+    core: KeyedBuffer<BPosition, Receipt>,
+}
+
+impl Default for ReceiptBuffer {
+    fn default() -> Self {
+        Self {
+            core: KeyedBuffer::new(Self::MAX_BUFFERED, Self::BACKLOG_LOOKBEHIND),
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Receipt buffer: tx_idx -> executor Receipt, filled by the tx_receipts task.
-// ---------------------------------------------------------------------------
-
-/// Buffer of executor-published receipts keyed by canonical `tx_idx`. Filled by
-/// the `tx_receipts` subscriber task; drained by the commit thread.
-#[derive(Default)]
-pub struct ReceiptBuffer {
-    inner: Mutex<BTreeMap<BPosition, Receipt>>,
-    cv: Condvar,
-}
-
 impl ReceiptBuffer {
+    /// Receipt-path mirror of [`BalBuffer::BACKLOG_LOOKBEHIND`], in canonical
+    /// RECORDS rather than blocks: when the highest buffered `tx_idx` is this
+    /// far ahead of the requested one, the executor's receipt for the
+    /// requested tx has aged out of the live `tx_receipts` stream and will
+    /// never arrive — skip immediately ("unverified") instead of blocking the
+    /// commit thread for the full receipt window per historical tx (which
+    /// capped cold-start catch-up behind a loaded chain at ~0.2 tx/s).
+    /// 4096 records ≈ the BAL heuristic's 16 blocks at a few hundred tx/block;
+    /// a caught-up validator's requests trail the head by less, so it always
+    /// waits and verifies.
+    const BACKLOG_LOOKBEHIND: u64 = 4096;
+    /// Bound on buffered receipts (small structs; the cap is a leak guard).
+    const MAX_BUFFERED: usize = 1 << 16;
+
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
     }
 
     pub fn insert(&self, receipt: Receipt) {
-        let idx = receipt.tx_idx;
-        self.inner.lock().unwrap().insert(idx, receipt);
-        self.cv.notify_all();
+        self.core.insert(receipt.tx_idx, receipt);
     }
 
+    /// See [`KeyedBuffer::take`] — deadline semantics plus the aged-out
+    /// catch-up skip.
     pub fn take(&self, idx: BPosition, timeout: Duration) -> Option<Receipt> {
-        // Deadline semantics — see BalBuffer::take (same lost-key-never-times-
-        // out hazard under a continuous receipt stream).
-        let deadline = std::time::Instant::now() + timeout;
-        let mut guard = self.inner.lock().unwrap();
-        loop {
-            if let Some(r) = guard.remove(&idx) {
-                return Some(r);
-            }
-            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
-                return guard.remove(&idx);
-            };
-            let (g, wait) = self.cv.wait_timeout(guard, remaining).unwrap();
-            guard = g;
-            if wait.timed_out() {
-                return guard.remove(&idx);
-            }
-        }
+        self.core.take(idx, timeout)
     }
 }
 
-/// Returns `true` when the two receipts agree on the execution-correctness
-/// fields: success status, gas used, and the write-set hash (the per-tx
-/// determinism witness). Enrichment fields (block number, tx index) are derived
-/// identically by both nodes, so the core three are the meaningful check.
+/// Returns `true` when the two receipts agree on the execution-output fields:
+/// success status, gas used, the write-set hash (the per-tx determinism
+/// witness), and the emitted **logs**. Logs are execution output carried on
+/// the wire and consumed downstream — `write_set_hash` covers state writes
+/// but not events, so a log-only divergence would otherwise pass silently.
+///
+/// Deliberately OUT of scope: the RPC enrichment fields (`nonce`, `from`,
+/// `to`, `contract_address`, `effective_gas_price`, `block_number`,
+/// `transaction_index`, `cumulative_gas_used`). They are derived
+/// deterministically from inputs this check already covers (the envelope, the
+/// canonical order, and the per-block `gas_used` sums), so a divergence there
+/// implies a divergence in a checked field — comparing them would only
+/// re-verify arithmetic, not execution.
 pub fn receipt_consistent(local: &Receipt, published: &Receipt) -> bool {
     local.status == published.status
         && local.gas_used == published.gas_used
         && local.write_set_hash == published.write_set_hash
+        && local.logs == published.logs
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +393,9 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
                     let reason =
                         format!("block {} write-set != BAL: {summary}", block.block_number);
                     self.divergence.record(reason.clone());
-                    return Err(ExecutorError::State(reason));
+                    // Divergence (not State): fatal + non-retryable, so no
+                    // engine retry loop can absorb it (see F10.1).
+                    return Err(ExecutorError::Divergence(reason));
                 }
             }
             None => {
@@ -321,6 +444,19 @@ impl ValidatorReceiptSink {
 
 impl TxReceiptsPublication for ValidatorReceiptSink {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        // LATCH: once a divergence is proven the sink keeps failing. The
+        // first failing publish consumed the published receipt from the
+        // buffer, so without this a caller that retries (the engine's
+        // must-deliver loop is belt-and-braces here — it no longer retries
+        // Divergence) would find an empty buffer, land in the "unverified"
+        // arm and quietly resume committing past a proven mismatch.
+        if self.divergence.is_halted() {
+            return Err(ExecutorError::Divergence(
+                self.divergence
+                    .reason()
+                    .unwrap_or_else(|| "validator halted on divergence".into()),
+            ));
+        }
         match msg {
             CMessage::Receipt(local) => match self.receipts.take(local.tx_idx, self.wait) {
                 Some(published) => {
@@ -328,18 +464,20 @@ impl TxReceiptsPublication for ValidatorReceiptSink {
                         Ok(())
                     } else {
                         let reason = format!(
-                            "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}) \
-                             vs published(status={}, gas={}, wsh={})",
+                            "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
+                             logs={}) vs published(status={}, gas={}, wsh={}, logs={})",
                             local.tx_idx,
                             local.status,
                             local.gas_used,
                             local.write_set_hash,
+                            local.logs.len(),
                             published.status,
                             published.gas_used,
                             published.write_set_hash,
+                            published.logs.len(),
                         );
                         self.divergence.record(reason.clone());
-                        Err(ExecutorError::State(reason))
+                        Err(ExecutorError::Divergence(reason))
                     }
                 }
                 None => {
@@ -440,7 +578,7 @@ mod tests {
         bals.insert(delta(1, 100)); // BAL says balance 100
         let err = q.submit(boundary(1), delta(1, 999)).unwrap_err(); // local says 999
 
-        assert!(matches!(err, ExecutorError::State(_)));
+        assert!(matches!(err, ExecutorError::Divergence(_)));
         assert!(div.is_halted());
         assert!(div.reason().unwrap().contains("write-set != BAL"));
     }
@@ -480,8 +618,100 @@ mod tests {
         let err = sink
             .publish(CMessage::Receipt(receipt(1, true, 21_000, 0xff)))
             .unwrap_err();
-        assert!(matches!(err, ExecutorError::State(_)));
+        assert!(matches!(err, ExecutorError::Divergence(_)));
         assert!(div.is_halted());
+
+        // F10.1 regression: a RETRY of the same publish (the engine's
+        // must-deliver loop) finds the buffer empty — it must KEEP failing
+        // via the divergence latch, not slide into the "unverified" Ok arm.
+        let err2 = sink
+            .publish(CMessage::Receipt(receipt(1, true, 21_000, 0xff)))
+            .unwrap_err();
+        assert!(matches!(err2, ExecutorError::Divergence(_)));
+    }
+
+    // F10.5: a log-only divergence (same status/gas/write-set hash) must trip
+    // the cross-check — logs are published execution output, not enrichment.
+    #[test]
+    fn log_only_divergence_fail_stops() {
+        use kardamom_types::WireLog;
+        let buf = ReceiptBuffer::new();
+        let div = Divergence::new();
+        let mut sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
+            .with_wait(Duration::from_millis(50));
+
+        let log = |topic: u8| WireLog {
+            address: Address::from([0x22; 20]),
+            topics: vec![B256::repeat_byte(topic)],
+            data: Default::default(),
+        };
+        let mut published = receipt(0, true, 21_000, 0xab);
+        published.logs = vec![log(0x01)];
+        let mut local = receipt(0, true, 21_000, 0xab);
+        local.logs = vec![log(0x02)];
+
+        buf.insert(published);
+        let err = sink.publish(CMessage::Receipt(local)).unwrap_err();
+        assert!(matches!(err, ExecutorError::Divergence(_)));
+        assert!(div.is_halted());
+    }
+
+    // F10.3: the receipt buffer mirrors the BAL catch-up skip — when the
+    // buffered head is far ahead of the requested tx_idx, the receipt has
+    // aged out of the live stream and take() must return None IMMEDIATELY
+    // instead of blocking the commit thread for the full wait per historical
+    // tx (the cold-start crawl).
+    #[test]
+    fn receipt_take_skips_aged_out_backlog_immediately() {
+        let buf = ReceiptBuffer::new();
+        buf.insert(receipt(10_000, true, 21_000, 0xab)); // live head, far ahead
+        let start = std::time::Instant::now();
+        let got = buf.take(BPosition::from_index(0), Duration::from_secs(5));
+        assert!(got.is_none(), "aged-out receipt must be skipped");
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "skip must not consume the wait window: {:?}",
+            start.elapsed()
+        );
+    }
+
+    // F10.6 / F01.4: an artifact arriving AFTER its take() gave up (skip or
+    // timeout) must not leak in the buffer forever — inserts below the
+    // consumer's cursor are dropped, and stale entries are pruned as the
+    // cursor advances.
+    #[test]
+    fn late_arrival_below_cursor_does_not_leak() {
+        let bals = BalBuffer::new();
+        // The consumer asked for block 5 and gave up (nothing buffered).
+        assert!(bals.take(5, Duration::from_millis(10)).is_none());
+        // BALs for blocks the cursor has passed arrive late: dropped.
+        bals.insert(delta(3, 100));
+        bals.insert(delta(4, 100));
+        assert_eq!(bals.len(), 0, "late below-cursor inserts must be dropped");
+        // An in-window insert still works.
+        bals.insert(delta(6, 100));
+        assert_eq!(bals.len(), 1);
+        assert!(bals.take(6, Duration::from_millis(10)).is_some());
+        // Entries below a later request are pruned by the take itself.
+        bals.insert(delta(7, 100));
+        assert!(bals.take(9, Duration::from_millis(10)).is_none());
+        assert_eq!(bals.len(), 0, "stale entry below the cursor must be pruned");
+    }
+
+    // F10.6: the buffer is bounded — a stalled consumer cannot make it hold
+    // the entire live stream in RAM; the oldest entry is evicted first (it
+    // can only become an "unverified" block, never a false divergence).
+    #[test]
+    fn buffer_is_bounded_evicting_oldest() {
+        let bals = BalBuffer::with_cap(3);
+        for b in 1..=5u64 {
+            bals.insert(delta(b, 100));
+        }
+        assert_eq!(bals.len(), 3);
+        // 1 and 2 were evicted; 3..=5 retained.
+        assert!(bals.take(3, Duration::from_millis(10)).is_some());
+        assert!(bals.take(4, Duration::from_millis(10)).is_some());
+        assert!(bals.take(5, Duration::from_millis(10)).is_some());
     }
 
     #[test]

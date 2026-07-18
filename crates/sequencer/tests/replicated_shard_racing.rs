@@ -15,6 +15,12 @@
 //!  * **Cold rejoin** — a replica that (re)starts mid-stream and hydrates its
 //!    nonce floor from committed state (the stateless-sequencer cache-miss
 //!    path) emits a suffix of its twin's sequence; merging it changes nothing.
+//!  * **Cold rejoin, misaligned floor** — hydration is only a *lower bound*
+//!    (the deployed binary wires an empty state DB, and even a real one can
+//!    trail refs the twin ordered but that aren't committed yet). The
+//!    stream-adaptive floor fast-forward (`nonce_floor_lag_ms`) adopts the
+//!    live join point after the lag bound, so the rejoiner still emits
+//!    exactly its twin's suffix instead of zombie-buffering forever.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -113,13 +119,21 @@ fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
 
 /// Run one replica over `stream`, returning its published refs.
 fn run_replica(stream: &[(TxDataLoc, TxEnvelope)], db: Arc<FakeStateDatabase>) -> Vec<TxRef> {
+    run_replica_with(shard0_cfg(), stream, db)
+}
+
+fn run_replica_with(
+    cfg: SequencerConfig,
+    stream: &[(TxDataLoc, TxEnvelope)],
+    db: Arc<FakeStateDatabase>,
+) -> Vec<TxRef> {
     let mut inbound = ScriptedTxData::default();
     for (loc, env) in stream {
         inbound.queue.push_back((*loc, env.clone()));
     }
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(shard0_cfg(), db);
+    let mut seq = Sequencer::new(cfg, db);
     while seq.run_once(&mut inbound, &mut b, &mut rc).unwrap() {}
     b.refs.lock().unwrap().clone()
 }
@@ -224,6 +238,68 @@ fn cold_rejoining_replica_emits_a_suffix_and_changes_nothing() {
     assert_eq!(encoded(&b), encoded(&a[half..]));
     // …so merging it into the canonical stream (A first — its records were
     // ordered while B was down) adds nothing.
+    let mut interleaved = a.clone();
+    interleaved.extend(b);
+    assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));
+}
+
+/// Cfg with the floor fast-forward firing immediately (zero lag), so the
+/// rejoin tests don't have to sleep through the production 5s bound.
+fn shard0_cfg_zero_lag() -> SequencerConfig {
+    SequencerConfig {
+        nonce_floor_lag_ms: 0,
+        ..shard0_cfg()
+    }
+}
+
+/// F02.1 regression: the DEPLOYED binary hydrates from an empty state DB
+/// (every floor seeds at 0). A restarted replica live-joins mid-stream, so
+/// every established sender's traffic buffers as "future" against nonces
+/// that will never reappear. The stream-adaptive floor fast-forward must
+/// adopt the join point and re-emit exactly the twin's suffix — not leave
+/// the replica a permanent zombie covering nobody.
+#[test]
+fn restarted_replica_with_empty_state_db_regains_coverage() {
+    let stream = shard_stream();
+    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+
+    // Replica B restarts and joins at the midpoint with NO state DB — the
+    // production wiring (EmptyStateDatabase ⇒ all floors hydrate at 0).
+    let half = stream.len() / 2;
+    let b = run_replica_with(
+        shard0_cfg_zero_lag(),
+        &stream[half..],
+        Arc::new(FakeStateDatabase::new()),
+    );
+
+    // B regains full coverage: its output is exactly A's suffix, and merging
+    // it into the canonical stream adds nothing.
+    assert_eq!(encoded(&b), encoded(&a[half..]));
+    let mut interleaved = a.clone();
+    interleaved.extend(b);
+    assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));
+}
+
+/// F02.2 regression: even with a real committed-state reader, one-shot
+/// hydration races in-flight ordering — the DB floor `c` can trail the
+/// live-join nonce `j` (the twin ordered `c..j` before B subscribed, not
+/// yet committed). The floor must fast-forward from `c` to `j`; the
+/// perfectly-aligned case (`c == j`, pinned above) is the one alignment
+/// that cannot happen under load.
+#[test]
+fn misaligned_hydration_floor_fast_forwards_to_the_join_point() {
+    let stream = shard_stream();
+    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+
+    let half = stream.len() / 2; // join nonce j = TX_PER_SENDER/2 per sender
+    let committed = TX_PER_SENDER / 2 - 2; // committed floor c < j
+    let db = FakeStateDatabase::new();
+    for s in (1..=SENDERS as u64).map(signer) {
+        db.set_nonce(s.address(), committed);
+    }
+    let b = run_replica_with(shard0_cfg_zero_lag(), &stream[half..], Arc::new(db));
+
+    assert_eq!(encoded(&b), encoded(&a[half..]));
     let mut interleaved = a.clone();
     interleaved.extend(b);
     assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));

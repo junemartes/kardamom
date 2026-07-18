@@ -12,17 +12,34 @@ use std::time::{Duration, Instant};
 
 #[test]
 fn init_and_scrape_without_ambient_runtime() {
-    let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     // Bind port 0 via a throwaway listener to pick a free port, then reuse it.
-    let free = std::net::TcpListener::bind(addr)
-        .unwrap()
-        .local_addr()
-        .unwrap();
-    kardamom_obs::init("obs-test", free, "runtime-free-host", "0.0.0", "deadbeef").unwrap();
+    // The pick-then-rebind window is racy (another process can grab the port
+    // in between — the exporter binds eagerly, so init fails if so), so retry
+    // with a fresh port; a bind failure happens before the global recorder is
+    // installed, which is what makes calling init again safe.
+    let mut free: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let mut last_err = None;
+    for _ in 0..5 {
+        free = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        match kardamom_obs::init("obs-test", free, "runtime-free-host", "0.0.0", "deadbeef") {
+            Ok(()) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if let Some(e) = last_err {
+        panic!("init never succeeded on a freshly-picked free port: {e:#}");
+    }
 
     metrics::gauge!("kardamom_obs_test_gauge").set(42.0);
 
-    // The exporter thread binds asynchronously; poll briefly.
+    // The listener is bound once init returns; poll briefly for the accept
+    // loop to start serving.
     let deadline = Instant::now() + Duration::from_secs(10);
     let body = loop {
         match TcpStream::connect(free) {

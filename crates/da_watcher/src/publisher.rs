@@ -1,6 +1,7 @@
 //! Outbound sink: the [`DepositPublisher`] trait the DA watcher writes
 //! [`kardamom_types::Deposit`] envelopes to. Production binds this to a
-//! `kardamom_log::TxDepositsPublisher`; tests use the in-memory fake in [`fakes`].
+//! `kardamom_log::aeron_live::TxDepositsPublisherHandle`; tests use the
+//! in-memory fake in [`fakes`].
 
 use kardamom_types::{BPosition, Deposit};
 

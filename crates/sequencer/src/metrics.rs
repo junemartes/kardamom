@@ -11,6 +11,7 @@ pub const TX_PUBLISHED_TO_B: &str = "kardamom_sequencer_tx_published_to_b_total"
 pub const TX_BUFFERED_FUTURE: &str = "kardamom_sequencer_tx_buffered_future_total";
 pub const TX_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
+pub const NONCE_FLOOR_FASTFORWARD: &str = "kardamom_sequencer_nonce_floor_fastforward_total";
 pub const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
 pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_duration_seconds";
 
@@ -34,6 +35,14 @@ pub fn record_eviction(partition: u32) {
     counter!(PENDING_BUFFER_EVICTIONS, "partition" => partition.to_string()).increment(1);
 }
 
+/// One per adopted sender when a stalled nonce floor fast-forwards past a
+/// gap (stream-adaptive rejoin hydration). A restarted replica regaining
+/// coverage shows up as a burst here; steady state is ~0, so alert on
+/// sustained non-zero rates (a chronically lagging floor source).
+pub fn record_floor_fastforward(partition: u32) {
+    counter!(NONCE_FLOOR_FASTFORWARD, "partition" => partition.to_string()).increment(1);
+}
+
 pub fn record_backpressure(partition: u32) {
     counter!(BACKPRESSURE_EVENTS, "partition" => partition.to_string()).increment(1);
 }
@@ -55,6 +64,7 @@ mod tests {
         record_buffered_future(0);
         record_past(0);
         record_eviction(0);
+        record_floor_fastforward(0);
         record_backpressure(0);
         record_nonce_check_latency(0, 0.0015);
     }

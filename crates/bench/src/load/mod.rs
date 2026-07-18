@@ -30,7 +30,7 @@ use tokio::sync::Semaphore;
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
 use crate::load::accounting::{EvalInput, Verdict, evaluate};
-use crate::load::engine::{Queues, Tracker, drain, pacer};
+use crate::load::engine::{Queues, Tracker, drain, join_submit_tasks, pacer};
 use crate::load::scrape::Scraper;
 
 /// Default Anvil/Hardhat test mnemonic (genesis prefunds accounts #0..#15).
@@ -231,6 +231,11 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     let scraper = build_scraper(&cfg);
     let tracker = Arc::new(Tracker::new()?);
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight.max(1) as usize));
+    let mut tasks = tokio::task::JoinSet::new();
+    // Outside chaos the ingress receipt cache is stable (no restarts), so an
+    // accepted tx whose receipt can't be re-fetched is a real must-deliver
+    // violation rather than restart noise — verify independently.
+    let verify_receipts = !cfg.chaos_mode;
 
     // --- ramp (soak mode only) -------------------------------------------
     let mut ramp = Vec::new();
@@ -242,6 +247,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
             &client,
             &sem,
             &tracker,
+            &mut tasks,
             &scraper,
             &mut queues,
             &mut ramp,
@@ -268,18 +274,33 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         Arc::clone(&client),
         Arc::clone(&sem),
         Arc::clone(&tracker),
+        &mut tasks,
         &mut queues,
         soak_rate,
         cfg.duration,
         cfg.retry_submit,
+        verify_receipts,
     )
     .await;
 
-    // Drain the receipt tail, then a short settle before the final read.
+    // Join the in-flight submit tasks (so the tail is classified, not merely
+    // "offered"), drain the receipt tail, then a short settle before the
+    // final read.
     let deadline = Instant::now() + cfg.drain_timeout;
+    join_submit_tasks(&mut tasks, deadline).await;
     drain(Arc::clone(&client), Arc::clone(&tracker), deadline).await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     let fin = scraper.snapshot().await;
+    // A chaos-restarted executor's block gauge resets to 0, so `final − base`
+    // can be ≤ 0 while it is healthily replaying. Take a recheck sample a few
+    // seconds later so `evaluate` can tell RECOVERING (gauge moving again)
+    // from FROZEN.
+    let recheck = if cfg.chaos_mode {
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        Some(scraper.snapshot().await)
+    } else {
+        None
+    };
 
     // --- verdict ---------------------------------------------------------
     let counts = tracker.counts();
@@ -297,6 +318,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         unlanded,
         base: &base,
         fin: &fin,
+        recheck: recheck.as_ref(),
         max_gap: cfg.max_gap,
         assert_all_delivered: cfg.assert_all_delivered,
         chaos_mode: cfg.chaos_mode,
@@ -336,6 +358,7 @@ async fn ramp_to_max(
     client: &Arc<HttpClient>,
     sem: &Arc<Semaphore>,
     tracker: &Arc<Tracker>,
+    tasks: &mut tokio::task::JoinSet<()>,
     scraper: &Scraper,
     queues: &mut Queues,
     ramp: &mut Vec<RampStep>,
@@ -350,10 +373,12 @@ async fn ramp_to_max(
             Arc::clone(client),
             Arc::clone(sem),
             Arc::clone(tracker),
+            tasks,
             queues,
             rate,
             step_dur,
             cfg.retry_submit,
+            !cfg.chaos_mode,
         )
         .await;
         let after = tracker.counts();

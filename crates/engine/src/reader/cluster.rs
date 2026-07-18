@@ -65,6 +65,13 @@ pub struct ClusterTxOrderingSubscription<E: ClusterEgress> {
     /// proves it precedes it (`end_tx_idx > index`); in live mode frames
     /// arrive in emission order, so an absent boundary is a FUTURE boundary.
     catching_up: bool,
+    /// Whether deliveries re-export the sealer's boundary stream as
+    /// `kardamom_sealer_*` metrics. Only ONE role per host should emit them
+    /// (the executor — the blessed observation point the probes/dashboards
+    /// scrape); the validator shares this subscription but suppresses the
+    /// emission so its exporter doesn't publish a second, lagging copy of the
+    /// series (see `crate::metrics`).
+    emit_sealer_metrics: bool,
 }
 
 impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
@@ -79,7 +86,14 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             pending_records: BTreeMap::new(),
             pending_boundaries: BTreeMap::new(),
             catching_up: false,
+            emit_sealer_metrics: true,
         }
+    }
+
+    /// Disable the `kardamom_sealer_*` re-export (validator role).
+    pub fn suppress_sealer_metrics(mut self) -> Self {
+        self.emit_sealer_metrics = false;
+        self
     }
 
     /// Deliver the next in-order item from the buffers, if provably next.
@@ -91,10 +105,14 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
         {
             let b = self.pending_boundaries.remove(&nb).unwrap();
             self.cursor.next_block.store(nb + 1, Ordering::Relaxed);
-            // The clustered sealer has no Prometheus endpoint; re-export its
-            // boundary stream here (see `crate::metrics`).
-            metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
-            metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(b.block_number as f64);
+            // The clustered sealer has no Prometheus endpoint; the EXECUTOR
+            // re-exports its boundary stream here (see `crate::metrics`). The
+            // validator constructs this subscription with the emission
+            // suppressed.
+            if self.emit_sealer_metrics {
+                metrics::counter!(crate::metrics::SEALER_BOUNDARIES_TOTAL).increment(1);
+                metrics::gauge!(crate::metrics::SEALER_BLOCK_NUMBER).set(b.block_number as f64);
+            }
             return Some((b.end_tx_idx, TxOrderingMessage::BoundaryStart(b)));
         }
         // A record is deliverable when nothing proves an earlier boundary is
@@ -135,6 +153,36 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             EgressItem::Boundary(b) => {
                 if b.block_number < nb {
                     return Ok(());
+                }
+                // Canonical-order guard (boundary-only gap across a session
+                // reconnect): a boundary we still owe downstream
+                // (block_number >= next_block) that seals at a record count
+                // BELOW the delivery cursor proves we already delivered
+                // records that canonically FOLLOW it — the missed boundary
+                // was emitted during a session outage, the reconnect's first
+                // live frame was exactly the next-index record (no key gap ⇒
+                // no catch-up), and the replayed boundary arrived too late.
+                // Delivering it now would seal its block with a later
+                // block's records inside: a silent canonical-order
+                // divergence between replicas. Fail-stop instead — a restart
+                // resumes from the persisted cursor and the REPLAY_FROM on
+                // connect re-delivers the whole window in order. (Entering
+                // catch-up on every session re-establishment would PREVENT
+                // the inversion, but the session thread lives in
+                // kardamom-cluster-adapter and exposes no reconnect signal;
+                // within one Aeron session frames are ordered, so this
+                // condition has no false positives.)
+                if b.end_tx_idx.as_index() < ni {
+                    tracing::error!(
+                        block = b.block_number,
+                        boundary_end = b.end_tx_idx.as_index(),
+                        delivered = ni,
+                        "boundary sealing below the delivery cursor — boundary-only gap across a reconnect"
+                    );
+                    return Err(ExecutorError::BoundaryMisaligned {
+                        end: b.end_tx_idx,
+                        last_seen: BPosition::from_index(ni),
+                    });
                 }
                 if b.block_number > nb && !self.catching_up {
                     tracing::info!(
@@ -186,51 +234,12 @@ impl<E: ClusterEgress> TxOrderingSubscription for ClusterTxOrderingSubscription<
     }
 }
 
-/// Aeron Cluster (Raft) sealer client config — the `[cluster]` TOML section
-/// shared by every role that reads the canonical stream (executor, validator).
-#[derive(Debug, Clone, serde::Deserialize, Default)]
-#[serde(default)]
-pub struct ClusterConfig {
-    /// Retained for config-file backward compatibility; IGNORED — cluster mode
-    /// is the only mode, so clients always connect to the cluster.
-    pub enabled: bool,
-    /// "memberId=host:port,…" cluster ingress endpoints.
-    pub ingress_endpoints: String,
-    pub initial_leader_member_id: i32,
-    pub ingress_stream_id: i32,
-    /// This client's egress (response) channel URI, e.g. "aeron:udp?endpoint=<ip>:<port>".
-    pub egress_channel: String,
-    pub egress_stream_id: i32,
-    pub keep_alive_interval_ms: u64,
-}
-
-impl ClusterConfig {
-    /// Sane stream-id / keepalive defaults when the TOML omits them.
-    pub fn defaults_applied(mut self) -> Self {
-        if self.ingress_stream_id == 0 {
-            self.ingress_stream_id = 101;
-        }
-        if self.egress_stream_id == 0 {
-            self.egress_stream_id = 102;
-        }
-        if self.keep_alive_interval_ms == 0 {
-            self.keep_alive_interval_ms = 1000;
-        }
-        self
-    }
-
-    pub fn to_live(&self) -> LiveClusterConfig {
-        let c = self.clone().defaults_applied();
-        LiveClusterConfig {
-            ingress_endpoints: c.ingress_endpoints,
-            initial_leader_member_id: c.initial_leader_member_id,
-            ingress_stream_id: c.ingress_stream_id,
-            egress_channel: c.egress_channel,
-            egress_stream_id: c.egress_stream_id,
-            keep_alive_interval_ms: c.keep_alive_interval_ms,
-        }
-    }
-}
+// The `[cluster]` TOML section (shared by every role that connects to the
+// cluster) has ONE definition, in `kardamom-cluster-adapter` next to the
+// `LiveClusterConfig` it maps onto; re-exported here so the existing
+// `kardamom_engine::reader::cluster::ClusterConfig` paths (executor,
+// validator) keep resolving.
+pub use kardamom_cluster_adapter::ClusterConfig;
 
 /// Connect to the cluster and wrap egress as a `TxOrderingSubscription`.
 /// The returned `LiveCluster` guard MUST be kept alive while the subscription is used.
@@ -420,6 +429,33 @@ mod tests {
             }
             other => panic!("expected boundary, got {other:?}"),
         }
+    }
+
+    // F07.2 regression: a boundary-only gap across a session reconnect.
+    // Cursor at (records=2, next block=1): records 0..1 delivered, block 1 not
+    // yet sealed. Boundary b1 was emitted during a brief session outage; the
+    // reconnect's first live frame is record 2 — exactly the next index, so no
+    // key gap is observed and live mode delivers it. The replayed boundary
+    // b1(end=2) then arrives; it canonically precedes record 2, so delivering
+    // it now would seal block 1 with block 2's first record inside. That
+    // inversion must FAIL-STOP (restart + cursor replay recovers gaplessly),
+    // never deliver.
+    #[test]
+    fn late_boundary_sealing_below_cursor_is_fatal() {
+        let egress = FakeEgress::new();
+        egress.push(encode_egress_record(2, &relayed_txref(1, 2)));
+        egress.push(encode_egress_boundary(1, 2, 1_000));
+        egress.close();
+        let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));
+        // Live mode: record 2 is next-index and delivers immediately.
+        let (p, m) = sub.next().unwrap();
+        assert_eq!(p.as_index(), 2);
+        assert!(matches!(m, TxOrderingMessage::TxRef(_)));
+        // The late replayed boundary proves the inversion → fatal.
+        assert!(matches!(
+            sub.next(),
+            Err(ExecutorError::BoundaryMisaligned { .. })
+        ));
     }
 
     #[test]

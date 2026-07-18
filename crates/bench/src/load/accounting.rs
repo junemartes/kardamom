@@ -25,7 +25,7 @@ pub struct KeepPace {
     pub advanced: Option<i64>,
     /// Sealer-minus-executor block gap at the end (clamped ≥ 0).
     pub gap: Option<i64>,
-    /// `OK` | `FROZEN` | `GAP>N` | `METRIC-MISSING`.
+    /// `OK` | `FROZEN` | `RECOVERING` | `GAP>N` | `METRIC-MISSING`.
     pub verdict: String,
 }
 
@@ -41,13 +41,20 @@ pub struct EvalInput<'a> {
     pub base: &'a MetricsSnapshot,
     /// Metric snapshot at the end (after a short settle).
     pub fin: &'a MetricsSnapshot,
+    /// Optional recheck snapshot taken a few seconds after `fin` (chaos runs):
+    /// a restarted executor's block gauge resets to 0 so `final − base` reads
+    /// ≤ 0 mid-replay; movement between `fin` and this sample distinguishes
+    /// RECOVERING from FROZEN.
+    pub recheck: Option<&'a MetricsSnapshot>,
     /// Max allowed sealer-minus-executor block gap.
     pub max_gap: u64,
     /// Fail if any accepted tx is missing a receipt.
     pub assert_all_delivered: bool,
-    /// Chaos framing: transient gap / service-down blips are informational
-    /// (a killed component is expected to be briefly unavailable); a never-
-    /// advancing executor (FROZEN) and missing receipts are still failures.
+    /// Chaos framing: transient gap / service-down blips and sequencer
+    /// past-nonce drops (submit-retry noise across an ingress restart) are
+    /// informational (a killed component is expected to be briefly
+    /// unavailable); a never-advancing executor (FROZEN) and missing receipts
+    /// are still failures.
     pub chaos_mode: bool,
 }
 
@@ -125,10 +132,23 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
                 failures.push(format!("executor {node}: block metric unreachable"));
             }
         } else if matches!(advanced, Some(a) if a <= 0) && sealer_adv > 0 {
-            verdict = "FROZEN".to_string();
-            failures.push(format!(
-                "executor {node}: FROZEN (advanced {advanced:?} while sealer advanced {sealer_adv})"
-            ));
+            // A restarted executor's gauge resets to 0, so `advanced` ≤ 0 can
+            // mean "replaying after a kill", not frozen. If the recheck sample
+            // shows the gauge moving past `fin`, it's recovering.
+            let recheck_blk = input.recheck.and_then(|r| {
+                r.executor_blocks
+                    .iter()
+                    .find(|(n, _)| n == node)
+                    .and_then(|(_, b)| *b)
+            });
+            if matches!((recheck_blk, *fin_blk), (Some(r), Some(f)) if r > f) {
+                verdict = "RECOVERING".to_string();
+            } else {
+                verdict = "FROZEN".to_string();
+                failures.push(format!(
+                    "executor {node}: FROZEN (advanced {advanced:?} while sealer advanced {sealer_adv})"
+                ));
+            }
         } else if matches!(gap, Some(g) if g > i64::try_from(input.max_gap).unwrap_or(i64::MAX)) {
             verdict = format!("GAP>{}", input.max_gap);
             if !input.chaos_mode {
@@ -182,8 +202,11 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
     if c.bad_status > 0 {
         failures.push(format!("{} receipt(s) had non-0x1 status", c.bad_status));
     }
-    // Unambiguous sequencer drops are a real failure (not just inference noise).
-    if matches!(seq_dropped, Some(d) if d > 0) {
+    // Unambiguous sequencer drops are a real failure (not just inference
+    // noise) — except under chaos, where a submit retried across an ingress
+    // restart (volatile dedup cache) can legitimately reach the sequencer
+    // twice; the delta stays reported in the verdict as a diagnostic.
+    if matches!(seq_dropped, Some(d) if d > 0) && !input.chaos_mode {
         failures.push(format!(
             "sequencer dropped {seq_dropped:?} past-nonce tx(s)"
         ));
@@ -240,6 +263,7 @@ mod tests {
             unlanded: 0,
             base: &base,
             fin: &fin,
+            recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
             chaos_mode: false,
@@ -257,6 +281,7 @@ mod tests {
             unlanded: 0,
             base: &base,
             fin: &fin,
+            recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
             chaos_mode: false,
@@ -276,6 +301,7 @@ mod tests {
             unlanded: 0,
             base: &base,
             fin: &fin,
+            recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
             chaos_mode: true,
@@ -295,6 +321,7 @@ mod tests {
             unlanded: 0,
             base: &base,
             fin: &fin,
+            recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
             chaos_mode: false,
@@ -306,6 +333,7 @@ mod tests {
             unlanded: 0,
             base: &base,
             fin: &fin,
+            recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
             chaos_mode: true,
@@ -315,6 +343,50 @@ mod tests {
             "gap should be soft in chaos mode: {:?}",
             chaos.failures
         );
+    }
+
+    #[test]
+    fn restarted_executor_with_moving_recheck_is_recovering_not_frozen() {
+        // exec-1 was hard-killed: gauge reset (10 → 3, advanced < 0) but the
+        // recheck sample shows it replaying (3 → 8) → RECOVERING, not FROZEN.
+        let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
+        let fin = snap(&[("exec-0", 50), ("exec-1", 3)], 50);
+        let recheck = snap(&[("exec-0", 51), ("exec-1", 8)], 51);
+        let v = evaluate(&EvalInput {
+            counts: counts(300, 300, 300, 0),
+            missing: 0,
+            unlanded: 0,
+            base: &base,
+            fin: &fin,
+            recheck: Some(&recheck),
+            max_gap: 5,
+            assert_all_delivered: true,
+            chaos_mode: true,
+        });
+        assert!(v.pass, "expected pass, failures: {:?}", v.failures);
+        let kp = v.keep_pace.iter().find(|k| k.node == "exec-1").unwrap();
+        assert_eq!(kp.verdict, "RECOVERING");
+    }
+
+    #[test]
+    fn restarted_executor_with_stalled_recheck_is_frozen() {
+        // Gauge reset and did NOT move by the recheck sample → still FROZEN.
+        let base = snap(&[("exec-0", 10), ("exec-1", 10)], 10);
+        let fin = snap(&[("exec-0", 50), ("exec-1", 3)], 50);
+        let recheck = snap(&[("exec-0", 51), ("exec-1", 3)], 51);
+        let v = evaluate(&EvalInput {
+            counts: counts(300, 300, 300, 0),
+            missing: 0,
+            unlanded: 0,
+            base: &base,
+            fin: &fin,
+            recheck: Some(&recheck),
+            max_gap: 5,
+            assert_all_delivered: true,
+            chaos_mode: true,
+        });
+        assert!(!v.pass);
+        assert!(v.failures.iter().any(|f| f.contains("FROZEN")));
     }
 
     #[test]
@@ -329,11 +401,35 @@ mod tests {
             unlanded: 0,
             base: &base,
             fin: &fin,
+            recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
             chaos_mode: false,
         });
         assert!(!v.pass);
         assert!(v.failures.iter().any(|f| f.contains("sequencer dropped")));
+    }
+
+    #[test]
+    fn sequencer_drop_is_soft_in_chaos() {
+        // Retry noise across an ingress restart can double-submit; the drop
+        // delta is reported but must not fail a chaos run.
+        let mut base = snap(&[("exec-0", 10)], 10);
+        base.seq_dropped_past = Some(0);
+        let mut fin = snap(&[("exec-0", 50)], 50);
+        fin.seq_dropped_past = Some(2);
+        let v = evaluate(&EvalInput {
+            counts: counts(300, 300, 300, 0),
+            missing: 0,
+            unlanded: 0,
+            base: &base,
+            fin: &fin,
+            recheck: None,
+            max_gap: 5,
+            assert_all_delivered: true,
+            chaos_mode: true,
+        });
+        assert!(v.pass, "expected pass, failures: {:?}", v.failures);
+        assert_eq!(v.seq_dropped, Some(2), "delta still reported");
     }
 }

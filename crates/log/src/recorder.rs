@@ -464,6 +464,9 @@ fn fetch_descriptor(archive: &Archive, recording_id: i64) -> Result<i32, LogErro
 /// against a long-lived archive). Lists by stream + empty channel fragment
 /// (matches any channel) and takes the highest recording id — recordings run
 /// for the process lifetime (auto_stop=false), so the newest is the live one.
+/// Pages through the WHOLE catalog: recording ids are archive-global across
+/// all streams, so the newest recording for this stream can sit beyond any
+/// single page (adopting a stale id would poll a dead recording's position).
 /// Aeron only lists recordings that have an in-progress image, so this returns
 /// `None` until a publisher has connected to the stream.
 fn active_recording_for_stream(archive: &Archive, stream_id: i32) -> Result<Option<i64>, LogError> {
@@ -492,22 +495,41 @@ fn active_recording_for_stream(archive: &Archive, stream_id: i32) -> Result<Opti
         }
     }
 
+    const PAGE: i32 = 100;
     let found: Rc<RefCell<Found>> = Rc::new(RefCell::new(Found { latest: None }));
-    let mut handler = Handler::leak(Consumer {
-        found: found.clone(),
-    });
     // Empty channel fragment matches any channel; stream_id narrows to ours.
     let any_channel = CString::new("").expect("empty fragment has no NUL");
-    // This runs every poll tick in `find_or_start_recording`'s wait loop;
-    // `list_recordings_for_uri` calls the consumer synchronously and drops the
-    // pointer on return, so release the leaked handler right away (before `?`,
-    // so the error path frees it too). Without this each tick leaked a boxed
-    // `Consumer` and the rusteron `Drop` guard logged a "release() was never
-    // called" error at ~2 Hz, drowning the recorder's logs.
-    let res =
-        archive.list_recordings_for_uri(0, 100, any_channel.as_c_str(), stream_id, Some(&handler));
-    handler.release();
-    res.map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+    // Page from record id 0 until a page comes back short (each call delivers
+    // up to PAGE matching descriptors, scanning the catalog in id order).
+    let mut from_record_id: i64 = 0;
+    loop {
+        // This runs every poll tick in `find_or_start_recording`'s wait loop;
+        // `list_recordings_for_uri` calls the consumer synchronously and drops
+        // the pointer on return, so release the leaked handler right away
+        // (before `?`, so the error path frees it too). Without this each tick
+        // leaked a boxed `Consumer` and the rusteron `Drop` guard logged a
+        // "release() was never called" error at ~2 Hz, drowning the recorder's
+        // logs.
+        let mut handler = Handler::leak(Consumer {
+            found: found.clone(),
+        });
+        let res = archive.list_recordings_for_uri(
+            from_record_id,
+            PAGE,
+            any_channel.as_c_str(),
+            stream_id,
+            Some(&handler),
+        );
+        handler.release();
+        let count = res.map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+        if count < PAGE {
+            break; // catalog exhausted
+        }
+        match found.borrow().latest {
+            Some(max_id) => from_record_id = max_id + 1,
+            None => break, // defensive: full page but no match recorded
+        }
+    }
 
     let g = found.borrow();
     Ok(g.latest)

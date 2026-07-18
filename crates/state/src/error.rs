@@ -28,6 +28,13 @@ pub enum StateError {
     #[error("recovery failed: {0}")]
     Recovery(String),
     #[error(
+        "genesis mismatch: this env was seeded from a different genesis (stored digest {stored}, supplied {supplied}); refusing to run on divergent genesis state"
+    )]
+    GenesisMismatch {
+        stored: alloy_primitives::B256,
+        supplied: alloy_primitives::B256,
+    },
+    #[error(
         "trie shadow-check mismatch at block {block}: incremental {incremental} != rebuilt {rebuilt}"
     )]
     ShadowMismatch {

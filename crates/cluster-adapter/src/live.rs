@@ -155,11 +155,34 @@ fn with_control_term_length(uri: &str) -> String {
     }
 }
 
+/// Startup config validation: both fields come from the operator's `[cluster]`
+/// TOML section (`egress_channel` usually via `--cluster-egress-endpoint`). An
+/// empty/missing section used to surface only as a silently dead session
+/// thread at runtime; [`connect`] now fails startup with a config error.
+fn validate_config(cfg: &LiveClusterConfig) -> Result<(), LiveError> {
+    if cfg.egress_channel.is_empty() {
+        return Err(LiveError(
+            "cluster config: egress_channel is empty — set [cluster] egress_channel \
+             or pass --cluster-egress-endpoint"
+                .into(),
+        ));
+    }
+    if member_ids(&cfg.ingress_endpoints).is_empty() {
+        return Err(LiveError(format!(
+            "cluster config: ingress_endpoints has no memberId=host:port entries \
+             (got {:?}) — set [cluster] ingress_endpoints",
+            cfg.ingress_endpoints
+        )));
+    }
+    Ok(())
+}
+
 fn connect_inner(
     rt: AeronRuntime,
     mut cfg: LiveClusterConfig,
     replay: Option<ReplayOnConnect>,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    validate_config(&cfg)?;
     cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
     // Egress subscription: the deliver closure ships each raw frame to the
     // session thread.
@@ -172,6 +195,33 @@ fn connect_inner(
     rt.open_subscription_with_deliver(&cfg.egress_channel, cfg.egress_stream_id, deliver)
         .map_err(|e| LiveError(format!("open egress subscription: {e}")))?;
 
+    // Initial ingress publication: opened HERE (not on the session thread) so
+    // a failure surfaces to the caller and fails startup, instead of leaving
+    // the owning binary alive with a silently dead session thread. Fall
+    // through dead member ids like the reconnect path does — any live member
+    // answers a connect (the leader with OK, a follower with a REDIRECT).
+    let initial = open_leader_pub(
+        &rt,
+        &cfg.ingress_endpoints,
+        cfg.initial_leader_member_id,
+        cfg.ingress_stream_id,
+    )
+    .map(|p| (cfg.initial_leader_member_id, p))
+    .or_else(|| {
+        open_next_member_pub(
+            &rt,
+            &cfg.ingress_endpoints,
+            cfg.initial_leader_member_id,
+            cfg.ingress_stream_id,
+        )
+    })
+    .ok_or_else(|| {
+        LiveError(format!(
+            "no usable initial cluster ingress endpoint in {:?}",
+            cfg.ingress_endpoints
+        ))
+    })?;
+
     let (req_tx, req_rx) = unbounded::<OfferReq>();
     let (out_tx, out_rx) = unbounded::<Vec<u8>>();
     let stop = Arc::new(AtomicBool::new(false));
@@ -179,7 +229,18 @@ fn connect_inner(
 
     let join = thread::Builder::new()
         .name("cluster-session".into())
-        .spawn(move || run_session(rt, cfg, replay, frame_rx, req_rx, out_tx, stop_thread))
+        .spawn(move || {
+            run_session(
+                rt,
+                cfg,
+                initial,
+                replay,
+                frame_rx,
+                req_rx,
+                out_tx,
+                stop_thread,
+            )
+        })
         .map_err(|e| LiveError(format!("spawn session thread: {e}")))?;
 
     Ok((
@@ -192,9 +253,12 @@ fn connect_inner(
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // 8 args is the natural shape: the
+// connect-time pieces (rt/cfg/initial pub) plus the four channel/stop seams.
 fn run_session(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
+    initial: (i32, PubHandle),
     replay: Option<ReplayOnConnect>,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
@@ -209,19 +273,11 @@ fn run_session(
     // Current ingress target + the member list to rotate through when connect
     // attempts go unanswered (the target may be a dead node; any LIVE member
     // answers a connect — the leader with OK, a follower with a REDIRECT to
-    // the leader — so round-robin always converges on the leader).
+    // the leader — so round-robin always converges on the leader). The
+    // INITIAL publication is opened by `connect_inner` so its failure fails
+    // startup rather than silently killing this thread.
     let mut endpoints = cfg.ingress_endpoints.clone();
-    let mut target_member = cfg.initial_leader_member_id;
-    let mut ingress = match open_leader_pub(&rt, &endpoints, target_member, cfg.ingress_stream_id) {
-        Some(p) => p,
-        None => {
-            tracing::error!(
-                endpoints = %endpoints,
-                "cluster session: no usable initial ingress endpoint"
-            );
-            return;
-        }
-    };
+    let (mut target_member, mut ingress) = initial;
 
     // Replay-request resend state: the request is publish()ed on the cluster
     // ingress, which right after a (re)connect is often still NOT_CONNECTED —
@@ -231,6 +287,14 @@ fn run_session(
     const REPLAY_RESEND_MS: u64 = 3_000;
     let mut replay_last_sent_ms: u64 = 0;
     let mut replay_cursor_at_send: (u64, u64) = (u64::MAX, u64::MAX);
+    // In-flight replay-request publish. `publish_bytes` blocks up to 10s
+    // waiting for the Aeron-thread ack, and THIS loop also owes the cluster
+    // its keep-alives — an ack wait here under backpressure (exactly the
+    // mass-reconnect churn the retrying publish exists for) could starve them
+    // into a session timeout. The rare send therefore runs on a short-lived
+    // helper thread; at most one is in flight (the resend cadence re-checks),
+    // and a failed publish is logged instead of discarded.
+    let mut replay_send_inflight: Option<JoinHandle<()>> = None;
 
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
     // publisher-only client (the sequencer) drops its `LiveEgress`, after which
@@ -293,6 +357,12 @@ fn run_session(
         if let Some(r) = &replay
             && driver.is_connected()
         {
+            if replay_send_inflight
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
+            {
+                replay_send_inflight = None;
+            }
             let cursor = (
                 r.next_index.load(std::sync::atomic::Ordering::Relaxed),
                 r.next_block.load(std::sync::atomic::Ordering::Relaxed),
@@ -304,8 +374,9 @@ fn run_session(
                 // measured from the most recent progress, not the last send.
                 replay_cursor_at_send = cursor;
                 replay_last_sent_ms = now;
-            } else if replay_last_sent_ms == 0
-                || now.saturating_sub(replay_last_sent_ms) >= REPLAY_RESEND_MS
+            } else if (replay_last_sent_ms == 0
+                || now.saturating_sub(replay_last_sent_ms) >= REPLAY_RESEND_MS)
+                && replay_send_inflight.is_none()
             {
                 let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
                 if let Some(framed) = driver.wrap_app(&req, now as i64) {
@@ -313,8 +384,26 @@ fn run_session(
                     // message is sent exactly when the ingress publication is
                     // at its busiest (mass reconnects under churn) — the
                     // best-effort deadline dropped it every 3s in lockstep
-                    // with the backpressure that caused the stall.
-                    let _ = ingress.publish_bytes(to_aligned(&framed));
+                    // with the backpressure that caused the stall. The ack
+                    // wait happens OFF this thread (see replay_send_inflight)
+                    // so it can never delay keep-alives, and a failure is
+                    // logged (the resend cadence retries it).
+                    let pub_handle = ingress.clone();
+                    match thread::Builder::new()
+                        .name("cluster-replay-pub".into())
+                        .spawn(move || {
+                            if let Err(e) = pub_handle.publish_bytes(to_aligned(&framed)) {
+                                tracing::warn!(
+                                    error = %e,
+                                    "cluster replay request publish failed (will resend)"
+                                );
+                            }
+                        }) {
+                        Ok(h) => replay_send_inflight = Some(h),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "spawn cluster replay publish thread");
+                        }
+                    }
                     tracing::info!(
                         next_index = cursor.0,
                         next_block = cursor.1,
@@ -461,5 +550,45 @@ mod tests {
             endpoint_for_member("0 = h0:9000 , 1 = h1:9001", 1).as_deref(),
             Some("h1:9001")
         );
+    }
+
+    fn valid_cfg() -> LiveClusterConfig {
+        LiveClusterConfig {
+            ingress_endpoints: "0=h0:9000,1=h1:9001".into(),
+            initial_leader_member_id: 0,
+            ingress_stream_id: 101,
+            egress_channel: "aeron:udp?endpoint=127.0.0.1:9050".into(),
+            egress_stream_id: 102,
+            keep_alive_interval_ms: 1000,
+        }
+    }
+
+    #[test]
+    fn validate_accepts_populated_config() {
+        assert!(validate_config(&valid_cfg()).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_empty_egress_channel() {
+        // An empty [cluster] section used to leave the owning binary alive
+        // with a silently dead session thread; connect must fail instead.
+        let cfg = LiveClusterConfig {
+            egress_channel: String::new(),
+            ..valid_cfg()
+        };
+        let err = validate_config(&cfg).unwrap_err();
+        assert!(err.to_string().contains("egress_channel"), "got {err}");
+    }
+
+    #[test]
+    fn validate_rejects_empty_or_unparseable_ingress_endpoints() {
+        for eps in ["", "not-an-endpoint-list"] {
+            let cfg = LiveClusterConfig {
+                ingress_endpoints: eps.into(),
+                ..valid_cfg()
+            };
+            let err = validate_config(&cfg).unwrap_err();
+            assert!(err.to_string().contains("ingress_endpoints"), "got {err}");
+        }
     }
 }

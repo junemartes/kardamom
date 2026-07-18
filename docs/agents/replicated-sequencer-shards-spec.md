@@ -58,17 +58,41 @@ The rotation itself is `SequencerConfig::rotate_partition` behind the new
 
 A (re)starting replica **joins the live stream only** — no archive replay.
 Its twin covered the outage, so replay would only re-offer records at risk of
-falling outside the sealer's dedup window (the double-ordering hazard). Nonce
-floors hydrate from committed state via the existing stateless-sequencer
-cache-miss path; the interim is absorbed by the pending buffer. The
-`cold_rejoining_replica_emits_a_suffix_and_changes_nothing` test pins this.
+falling outside the sealer's dedup window (the double-ordering hazard).
+
+Nonce-floor hydration is only a **lower bound** (the deployed binary wires an
+empty state DB, and even a real committed-state read trails the twin's
+in-flight ordering); rejoin correctness comes from the **stream-adaptive
+fast-forward**: when a sender's pending buffer has held a contiguous run
+strictly above the floor, unchanged, for longer than `nonce_floor_lag_ms`
+(default 5000 ms, well above ordering/commit latency), the gap provably is not
+in flight — live-join has no replay and the twin already ordered the missing
+nonces — so the floor adopts the lowest buffered nonce and the run publishes.
+Floors only ever skip forward (per-publisher nonce order is preserved), and
+re-offers of refs the twin already published are absorbed by the cluster's
+first-seen dedup. Each adoption emits a `warn!` and bumps
+`kardamom_sequencer_nonce_floor_fastforward_total`.
+
+Pinned by `restarted_replica_with_empty_state_db_regains_coverage` (empty
+state DB — the production wiring) and
+`misaligned_hydration_floor_fast_forwards_to_the_join_point` (committed floor
+strictly below the live-join nonce), alongside the original aligned-floor
+test; the chaos `sequencer-replica-kill` case asserts the restarted replica's
+`tx_published_to_b_total` advances post-restart.
 
 ## Observability
 
-Scraping `:9001` across the sequencer nodes (what `kardamom-load` and the
-Prometheus job do) now yields exactly **one replica per shard** (seq-a =
-node-0:shard-0, node-1:shard-1) — per-shard totals keep their pre-replication
-meaning. The seq-b twins on `:9011` are additional, not double-counted.
+Both replica groups export on all interfaces — seq-a on `:9001`, seq-b on
+`:9011` — and both are scraped (the dev Prometheus stack targets both ports
+with `replica: a|b` labels; the Nomad jobs stamp
+`KARDAMOM_HOST_ID=node<i>-seq-{a,b}` so every series identifies its replica).
+Because both replicas of a shard process the same stream, stream-derived
+per-shard totals (`tx_ingested`, `tx_published_to_b`, ...) exist **twice per
+`partition`** — aggregate them `max by (partition)`, never `sum` (the Grafana
+dashboard does; backpressure counters are real per-replica events and stay
+summed). A rejoining replica shows a burst on the "Nonce-floor fast-forwards"
+panel (`kardamom_sequencer_nonce_floor_fastforward_total`); sustained non-zero
+is the chronic-lag alert signal.
 
 ## Failure modes after this change
 
