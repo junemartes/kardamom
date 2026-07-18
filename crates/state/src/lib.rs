@@ -18,7 +18,8 @@ pub mod trie;
 pub mod writer;
 
 pub use checkpoint::{
-    CheckpointInfo, create_checkpoint, latest_checkpoint, prune_checkpoints, restore_checkpoint,
+    CheckpointInfo, create_checkpoint, has_state_db, latest_checkpoint, prune_checkpoints,
+    restore_checkpoint,
 };
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};

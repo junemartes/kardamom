@@ -123,7 +123,7 @@ pub fn restore_checkpoint(checkpoint: &Path, state_dir: &Path) -> Result<u64, St
     std::fs::create_dir_all(state_dir)?;
     // Refuse to clobber an existing populated state DB — restore is for a fresh
     // (wiped) node only.
-    if has_mdbx_data(state_dir)? {
+    if has_state_db(state_dir)? {
         return Err(StateError::Recovery(format!(
             "state dir {} already holds a DB; restore is for a fresh dir only",
             state_dir.display()
@@ -171,7 +171,10 @@ fn find_mdbx_data(dir: &Path) -> Result<Option<PathBuf>, StateError> {
 }
 
 /// True if `dir` already contains an mdbx data file (a populated state DB).
-fn has_mdbx_data(dir: &Path) -> Result<bool, StateError> {
+/// A caller can use this to decide whether a cold-start should restore a
+/// checkpoint (dir empty) or resume the existing DB — without opening the env
+/// (which would itself create the data file).
+pub fn has_state_db(dir: &Path) -> Result<bool, StateError> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
