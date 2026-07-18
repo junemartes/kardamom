@@ -43,6 +43,14 @@ pub struct IngressConfig {
     /// Which durability gate the proxy waits on before acking a tx. See
     /// [`kardamom_types::AckPolicy`] for the four modes.
     pub ack_policy: AckPolicy,
+    /// Max concurrent JSON-RPC connections. `submit_raw` parks each
+    /// submission's request until its receipt arrives, so steady-state
+    /// concurrent connections ≈ offered rate × receipt latency — which grows
+    /// exactly when the pipeline is slowest. jsonrpsee's default (100) capped
+    /// end-to-end throughput at 100/latency and turned overload into
+    /// connection refusals for every client of the replica. Sized so the
+    /// connection table is never the binding limit.
+    pub rpc_max_connections: u32,
 }
 
 impl Default for IngressConfig {
@@ -62,6 +70,7 @@ impl Default for IngressConfig {
             chain_id: 1,
             receipt_cache_capacity: 64 * 1024,
             ack_policy: AckPolicy::default(),
+            rpc_max_connections: 8192,
         }
     }
 }
