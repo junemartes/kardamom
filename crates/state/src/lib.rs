@@ -3,6 +3,7 @@
 //! See `` and the system for
 //! the protocol and crate-level invariants.
 
+pub mod checkpoint;
 pub mod compaction;
 pub mod env;
 pub mod error;
@@ -16,6 +17,9 @@ pub mod swap;
 pub mod trie;
 pub mod writer;
 
+pub use checkpoint::{
+    CheckpointInfo, create_checkpoint, latest_checkpoint, prune_checkpoints, restore_checkpoint,
+};
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;
