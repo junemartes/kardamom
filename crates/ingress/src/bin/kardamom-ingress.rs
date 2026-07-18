@@ -107,6 +107,15 @@ struct Args {
     /// Nomad job. Only consulted when the ack policy requires the quorum gate.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
+    /// Max concurrent JSON-RPC connections. Submissions park their connection
+    /// until the receipt arrives, so this must comfortably exceed offered
+    /// rate × receipt latency; see `IngressConfig::rpc_max_connections`.
+    #[arg(
+        long = "rpc-max-connections",
+        env = "KARDAMOM_RPC_MAX_CONNECTIONS",
+        default_value_t = 8192
+    )]
+    rpc_max_connections: u32,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -153,6 +162,7 @@ async fn main() -> Result<()> {
         partition_count_m: args.shards,
         ingress_id: args.ingress_id,
         ack_policy: args.ack_policy.into(),
+        rpc_max_connections: args.rpc_max_connections,
         ..IngressConfig::default()
     };
     // Wipe the binary-protocol binds for the v0 deployment; operators that
