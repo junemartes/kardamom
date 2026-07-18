@@ -21,6 +21,7 @@ pub mod executor;
 pub mod metrics;
 pub mod persist;
 pub mod reader;
+pub mod replay;
 pub mod state;
 
 pub use actor::{
@@ -36,6 +37,7 @@ pub use reader::{
     DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
     TxDataSubscription, TxOrderingSubscription,
 };
+pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};
 pub use state::{
     MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
     WriterApplyingQueue,

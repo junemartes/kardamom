@@ -123,6 +123,37 @@ than live channels, it can restart late and catch up; the failure mode is a
 growing L1-posting lag, not data loss. Its real dependencies are archive
 availability and L1 gas/RPC health.
 
+When live posting is enabled (`--dry-run=false` with `--l1-rpc`, `--l1-key`,
+`--settlement`, `--da-store`) it broadcasts each batch as a real EIP-4844 blob
+transaction to `KardamomL2Settlement`: L1 records the ordering + KZG versioned
+hashes, and the blob **bytes** are written to the DA store keyed by versioned
+hash (mirroring the EL-holds-commitments / DA-layer-holds-bytes split, since
+blob sidecars are pruned by the consensus layer after ~18 days).
+
+## Data-availability recovery (rebuild-from-L1)
+
+The bottom-of-the-stack backstop: even if **every** in-cluster durable copy is
+lost — the Raft log on a quorum of sealers *and* every node's `tx_ordering` /
+`tx_data` archive — the L2 state is still recoverable from L1 alone, because the
+posted blobs carry the full ordered `raw_tx` stream.
+
+`kardamom-reconstruct` walks the `BatchPosted` event log, fetches each batch's
+blobs from the DA store by the versioned hashes L1 committed to, decodes the
+KAR1 payload back into ordered blocks, and re-executes them through the **same**
+engine the live executor/validator use (`kardamom_engine::replay`) into a fresh
+trie-aware state DB. Because the state root is a pure function of genesis + the
+ordered transactions (receipts and canonical positions don't enter the trie),
+the reconstructed root is byte-identical to the canonical one. The
+`reconstruct_l1_e2e` test proves the whole loop end-to-end against a real L1
+(anvil): post → discard the originals → read L1 → fetch blobs → re-execute →
+assert root parity.
+
+Scope: L2 transactions. Deposits are absent from the DA payload (the batcher
+skips `DepositRef`s) but are independently re-derivable from L1 `DepositInitiated`
+events via the `da_watcher` path — interleaving them into the reconstruction is
+a documented follow-up, so a deposit-bearing range currently reconstructs its
+non-deposit state exactly and is flagged rather than silently diverging.
+
 ## DA-watcher
 
 Tick-based with an in-memory cursor: any RPC or publish error leaves the
@@ -147,9 +178,14 @@ by construction.
 
 ## Known gaps (untested failure surface)
 
-- **Archive *data* loss** — `archive-driver-loss` covers the process; nothing
-  yet wipes a node's archive volume and exercises executor resume or batcher
-  reads against missing segments.
+- **Archive *data* loss** — the total-loss case now has a recovery path
+  (rebuild-from-L1, above) proven by `reconstruct_l1_e2e`. Still open: a
+  *partial* wipe of one node's archive volume exercising executor resume /
+  batcher reads against missing segments, and a full-cluster DinD drill that
+  wipes archives live and rebuilds from the cluster's L1.
+- **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
+  transactions; re-deriving L1 deposits from `DepositInitiated` events and
+  interleaving them in canonical order is a follow-up.
 - **L1 outage** — the batcher's behavior under sustained L1 RPC failure /
   gas spikes is designed (lag + catch-up) but not chaos-tested.
 - **Validator divergence injection** — fail-stop is unit-tested, but no e2e
