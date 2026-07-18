@@ -190,7 +190,16 @@ where
     S: IngressSubscription + Clone + 'static,
     DB: StateDatabase + 'static,
 {
+    // A parked submit_raw holds its connection until the receipt arrives, so
+    // the connection cap — not the handler — becomes the throughput limit the
+    // moment it is smaller than offered-rate × receipt-latency. Take it from
+    // config instead of jsonrpsee's default (100); see
+    // `IngressConfig::rpc_max_connections`.
+    let server_cfg = jsonrpsee::server::ServerConfig::builder()
+        .max_connections(proxy.cfg.rpc_max_connections)
+        .build();
     let server = Server::builder()
+        .set_config(server_cfg)
         .set_http_middleware(tower::ServiceBuilder::new().layer(peer_addr_layer::PeerAddrLayer))
         .build(addr)
         .await
