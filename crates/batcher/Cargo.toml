@@ -14,6 +14,10 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 [dependencies]
 kardamom-types.workspace = true
 kardamom-log.workspace = true
+# Reconstruction (rebuild-from-L1) re-executes the decoded DA blocks through the
+# shared engine into a trie-aware state DB — the inverse of the live executor.
+kardamom-engine = { path = "../engine" }
+kardamom-state = { path = "../state" }
 # Pulled in as a regular dependency (not just dev-dep) primarily to force
 # build-order: kardamom-deployer's build.rs runs forge install + forge build,
 # populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
@@ -24,10 +28,16 @@ kardamom-log.workspace = true
 kardamom-deployer = { path = "../deployer" }
 
 alloy-primitives.workspace = true
-alloy-eips.workspace = true
+# `kzg` gives us the trusted-setup-backed sidecar builder (real blob commitments
+# + versioned hashes) for the live L1 broadcast path.
+alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-consensus.workspace = true
+alloy-network.workspace = true
 alloy-provider.workspace = true
 alloy-contract.workspace = true
+alloy-rpc-types-eth.workspace = true
 alloy-sol-types.workspace = true
+alloy-signer-local.workspace = true
 
 bytes.workspace = true
 rkyv.workspace = true
@@ -41,6 +51,9 @@ metrics.workspace = true
 kardamom-obs = { path = "../obs" }
 
 clap.workspace = true
+# Live L1 posting + the `kardamom-reconstruct` binary are async; genesis is TOML.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml.workspace = true
 
 [dev-dependencies]
 kardamom-log = { workspace = true, features = ["testing"] }
@@ -49,12 +62,19 @@ proptest = "1"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 criterion = { version = "0.7", features = ["html_reports"] }
 alloy-node-bindings.workspace = true
+alloy-consensus.workspace = true
+alloy-network.workspace = true
+alloy-signer-local.workspace = true
 serde_json.workspace = true
 reqwest = { workspace = true }
 
 [[bin]]
 name = "kardamom-batcher"
 path = "src/bin/kardamom-batcher.rs"
+
+[[bin]]
+name = "kardamom-reconstruct"
+path = "src/bin/kardamom-reconstruct.rs"
 
 [[bench]]
 name = "pack_throughput"

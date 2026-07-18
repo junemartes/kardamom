@@ -18,4 +18,6 @@ pub enum BatcherError {
     L1(String),
     #[error("config: {0}")]
     Config(String),
+    #[error("reconstruct: {0}")]
+    Reconstruct(String),
 }

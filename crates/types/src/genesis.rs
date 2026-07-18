@@ -29,6 +29,43 @@ pub struct AllocEntry {
 }
 
 impl Genesis {
+    /// Build the `(accounts, code)` allocation set for
+    /// [`crate::AccountChange`]-based genesis seeding (`kardamom_state::seed_genesis`).
+    ///
+    /// Every [`AllocEntry`] becomes one [`crate::AccountChange`] with its
+    /// declared balance/nonce; an empty-code account uses `code_hash =
+    /// B256::ZERO` (the executor/validator convention — kardamom does not use
+    /// the Ethereum `KECCAK_EMPTY` sentinel), and code bytes become a
+    /// [`crate::delta::CodeEntry`]. Using this shared builder keeps the
+    /// rebuild-from-L1 reconstructor's genesis byte-identical to the live
+    /// executor's, so their state roots match.
+    pub fn to_alloc(&self) -> (Vec<crate::AccountChange>, Vec<crate::delta::CodeEntry>) {
+        use alloy_primitives::{B256, keccak256};
+        let mut accounts = Vec::with_capacity(self.alloc.len());
+        let mut code = Vec::new();
+        for entry in &self.alloc {
+            let nonce = entry.nonce.unwrap_or(0);
+            let code_hash = entry
+                .code
+                .as_ref()
+                .map(|c| keccak256(c.as_ref()))
+                .unwrap_or(B256::ZERO);
+            accounts.push(crate::AccountChange {
+                address: entry.address,
+                nonce,
+                balance: entry.balance,
+                code_hash,
+            });
+            if let Some(c) = entry.code.as_ref() {
+                code.push(crate::delta::CodeEntry {
+                    code_hash,
+                    code: c.0.clone(),
+                });
+            }
+        }
+        (accounts, code)
+    }
+
     /// Semantic validation that can't be expressed in the type or derive.
     pub fn validate(&self) -> Result<(), GenesisError> {
         if self.chain_id == 0 {
