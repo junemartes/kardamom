@@ -19,8 +19,8 @@
 //! ```
 
 use crate::protocol::{
-    Egress, EventCode, decode_egress, encode_session_connect_request, encode_session_keep_alive,
-    wrap_session_message,
+    Egress, EventCode, decode_egress, encode_session_close_request, encode_session_connect_request,
+    encode_session_keep_alive, wrap_session_message,
 };
 
 /// App semantic version sent in `SessionConnectRequest.version`. This is the Aeron
@@ -286,6 +286,38 @@ impl SessionDriver {
         }
     }
 
+    /// Force the CURRENT session to be abandoned and a fresh one established
+    /// via the existing self-heal path (Failed → backoff → connect with a
+    /// rotate hint). Used by the transport when it has proof the session's
+    /// EGRESS path is dead while ingress still works — e.g. a canonical-stream
+    /// consumer whose egress image went silent: the cluster keeps serving
+    /// replay/live frames into a publication whose subscriber-side image no
+    /// longer delivers, the client's cursor never advances, and WITHOUT this
+    /// reset the client re-requests replay on the same dead session forever (a
+    /// permanent livelock). A NEW session makes the cluster open a NEW egress
+    /// publication (a fresh image end-to-end), and the consumer's
+    /// replay-on-connect closes the gap from its cursor.
+    ///
+    /// Returns a `SessionCloseRequest` frame for the old session (send it
+    /// best-effort on ingress so the cluster reaps the zombie instead of
+    /// keeping it alive on our keep-alives) when we were connected; `None`
+    /// (and no state change) otherwise — Connecting/Failed states already have
+    /// their own retry machinery.
+    pub fn force_reconnect(&mut self, reason: &str) -> Option<Vec<u8>> {
+        match self.state {
+            SessionState::Connected {
+                cluster_session_id,
+                leadership_term_id,
+                ..
+            } => {
+                let close = encode_session_close_request(leadership_term_id, cluster_session_id);
+                self.state = SessionState::Failed(reason.to_string());
+                Some(close)
+            }
+            _ => None,
+        }
+    }
+
     /// Frame an application `payload` for ingress (a `SessionMessageHeader`
     /// wrapping `payload`). `None` until the session is open.
     pub fn wrap_app(&self, payload: &[u8], timestamp: i64) -> Option<Vec<u8>> {
@@ -546,6 +578,56 @@ mod tests {
         // NOT be rotated away from it.
         assert_eq!(d.poll_outbound(1).len(), 1);
         assert!(!d.take_rotate_hint());
+    }
+
+    // CI-replay-loop regression: a consumer whose session egress goes silent
+    // must be able to FORCE a re-establishment — a close for the old session,
+    // then the normal Failed→backoff→connect self-heal — because re-requesting
+    // replay on a session with a dead egress image loops forever (the cluster
+    // serves frames + REPLAY_DONE into an image that no longer delivers).
+    #[test]
+    fn force_reconnect_closes_old_session_and_reestablishes() {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
+        d.on_egress(&ok_event(corr, 5, 9, 0));
+        assert!(d.is_connected());
+
+        let close = d.force_reconnect("egress silent").expect("was connected");
+        // The frame closes exactly the old session under its current term.
+        assert_eq!(
+            super::super::protocol::decode_two_i64(
+                &close,
+                super::super::protocol::TEMPLATE_SESSION_CLOSE_REQUEST
+            )
+            .unwrap(),
+            (9, 5)
+        );
+        // The old session is no longer usable for app messages.
+        assert!(matches!(d.state(), SessionState::Failed(_)));
+        assert!(d.wrap_app(b"x", 0).is_none());
+
+        // The self-heal path re-emits a connect (with a rotate hint) and the
+        // new session connects with a FRESH correlation + session id.
+        let out = d.poll_outbound(RECONNECT_BACKOFF_MS + 1);
+        assert_eq!(out.len(), 1);
+        assert!(d.take_rotate_hint(), "forced reconnect rotates the target");
+        let corr2 = decode_session_connect_request(&out[0])
+            .unwrap()
+            .correlation_id;
+        assert_ne!(corr2, corr);
+        d.on_egress(&ok_event(corr2, 6, 10, 1));
+        assert!(d.is_connected());
+        assert!(d.wrap_app(b"y", 0).is_some());
+    }
+
+    #[test]
+    fn force_reconnect_is_noop_unless_connected() {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        // Connecting: the connect-timeout machinery owns recovery.
+        assert!(d.force_reconnect("egress silent").is_none());
+        assert!(matches!(d.state(), SessionState::Connecting));
     }
 
     #[test]

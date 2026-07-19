@@ -446,6 +446,18 @@ public final class SealerClusteredService implements ClusteredService {
             it.remove();
             return sent + 1;
         }
+        if (done) {
+            // The DONE control frame was back-pressured. UN-LATCH it: while
+            // this session stays in pendingReplays, live broadcasts skip it,
+            // so any frame retained between the completed scan above and the
+            // eventual control send would be lost to this session FOREVER if
+            // DONE stayed latched (a latched controlKind skips the rescan).
+            // Rescanning on the next drain event is safe: already-served
+            // frames sit below the replay cursor and are skipped, so nothing
+            // is duplicated. REPLAY_UNAVAILABLE stays latched — it is derived
+            // from the retention floors and only becomes MORE true.
+            replay.controlKind = 0;
+        }
         return sent;
     }
 

@@ -285,6 +285,30 @@ fn run_session(
     // forever for a replay nobody asked for. Resend every REPLAY_RESEND_MS
     // until the consumer's cursor ADVANCES (progress = frames flowing again).
     const REPLAY_RESEND_MS: u64 = 3_000;
+    // Egress-liveness watchdog (canonical-stream consumers only): if the
+    // session is Connected but NO egress frame has arrived for this long, the
+    // session's egress path is dead — the sealer broadcasts a boundary every
+    // tick (≤2s) to every session, so a connected consumer can never
+    // legitimately see 10s of egress silence. This happens when the egress
+    // subscription's image dies under it (e.g. an unfillable gap after a >2s
+    // poll stall — the image goes end-of-stream and, with
+    // no_unavailable_image_handler, is never replaced) while the leader's
+    // offers to the session still SUCCEED (driver-level flow control keeps
+    // acking). Without the watchdog the client livelocks forever: cursor
+    // frozen, replay re-requested every 3s over the healthy ingress path, the
+    // sealer serving frames + REPLAY_DONE into an image that no longer
+    // delivers — observed as all cluster-e2e CI shards failing with every
+    // executor pinned at the same cursor. Forcing a session re-establishment
+    // makes the cluster open a NEW egress publication (fresh image
+    // end-to-end) and the consumer's replay-on-connect closes the gap from
+    // its cursor — the exact recovery REPLAY_FROM exists to make gapless.
+    // Publisher-only clients (no `replay`) legitimately receive ~no egress,
+    // so the watchdog is gated on being a consumer.
+    const EGRESS_SILENCE_RESET_MS: u64 = 10_000;
+    // Last time an egress frame arrived OR a session was (re)established —
+    // the silence window must restart on connect, or a fresh session would be
+    // reset before its first frame had a chance to arrive.
+    let mut egress_alive_at_ms: u64 = now_ms();
     let mut replay_last_sent_ms: u64 = 0;
     let mut replay_cursor_at_send: (u64, u64) = (u64::MAX, u64::MAX);
     // In-flight replay-request publish. `publish_bytes` blocks up to 10s
@@ -308,6 +332,7 @@ fn run_session(
         loop {
             match frame_rx.try_recv() {
                 Ok(frame) => {
+                    egress_alive_at_ms = now_ms();
                     for ev in driver.on_egress(&frame) {
                         match ev {
                             DriverEvent::AppMessage(payload) => {
@@ -336,6 +361,7 @@ fn run_session(
                                 // their delivery cursor on EVERY establishment;
                                 // force an immediate (re)send below.
                                 replay_last_sent_ms = 0;
+                                egress_alive_at_ms = now_ms();
                             }
                             DriverEvent::Failed(reason) => {
                                 tracing::error!(%reason, "cluster session failed");
@@ -347,6 +373,31 @@ fn run_session(
                 // A dropped LiveIngress/LiveEgress must NOT kill the session
                 // (the other half may still be in use); only `stop` terminates.
                 Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        // 1a. Egress-liveness watchdog (consumers only, see
+        // EGRESS_SILENCE_RESET_MS): a Connected session whose egress has been
+        // silent past the window is dead in the egress direction — force a
+        // re-establishment. The close for the OLD session goes best-effort on
+        // ingress (that direction still works — it kept delivering our replay
+        // requests) so the cluster reaps the zombie instead of keeping it
+        // alive on our keep-alives; the driver then reconnects via its normal
+        // Failed→backoff→connect path and the replay-on-connect below closes
+        // the canonical-stream gap from the cursor.
+        if replay.is_some() && driver.is_connected() {
+            let now = now_ms();
+            let silent_ms = now.saturating_sub(egress_alive_at_ms);
+            if silent_ms >= EGRESS_SILENCE_RESET_MS {
+                tracing::warn!(
+                    silent_ms,
+                    "cluster egress silent while connected — forcing session \
+                     re-establishment (replay-on-connect will close the gap)"
+                );
+                if let Some(close_frame) = driver.force_reconnect("egress silent") {
+                    ingress.publish_best_effort(to_aligned(&close_frame));
+                }
+                egress_alive_at_ms = now;
             }
         }
 
