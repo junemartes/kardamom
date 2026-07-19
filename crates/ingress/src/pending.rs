@@ -51,12 +51,25 @@ struct Watermarks {
     local: Option<BPosition>,
 }
 
+/// How long a sequencer rejection is held before releasing the parked client
+/// with an error, giving a racing SUCCESS the chance to win. With P racing
+/// sequencer replicas, a replica with a momentarily stale nonce floor can
+/// reject a tx its twin accepted and ordered; the rejection is emitted at
+/// ordering time while the receipt only lands after execution, so the error
+/// usually arrives FIRST. The grace must exceed the ordering→execution→receipt
+/// latency (tens of ms in the cluster); genuine rejections (both replicas
+/// reject) are merely delayed by this long, which a client submitting a
+/// duplicate can easily afford.
+pub const DEFAULT_TX_ERROR_GRACE: Duration = Duration::from_millis(500);
+
 pub struct PendingReceipts {
     policy: AckPolicy,
     map: PendingMap,
     /// Latest watermarks observed. Cached to avoid one-receiver-per-await
     /// fanout.
     latest: Arc<Mutex<Watermarks>>,
+    /// See [`DEFAULT_TX_ERROR_GRACE`]; overridable for tests.
+    error_grace: Duration,
 }
 
 impl Default for PendingReceipts {
@@ -67,10 +80,18 @@ impl Default for PendingReceipts {
 
 impl PendingReceipts {
     pub fn new(policy: AckPolicy) -> Self {
+        Self::with_error_grace(policy, DEFAULT_TX_ERROR_GRACE)
+    }
+
+    /// Like [`new`](Self::new) with an explicit rejection-release grace
+    /// (`Duration::ZERO` releases errors inline, with no success-override
+    /// window).
+    pub fn with_error_grace(policy: AckPolicy, error_grace: Duration) -> Self {
         Self {
             policy,
             map: Arc::new(DashMap::new()),
             latest: Arc::new(Mutex::new(Watermarks::default())),
+            error_grace,
         }
     }
 
@@ -118,10 +139,15 @@ impl PendingReceipts {
         }
     }
 
-    /// Called by the tx_errors watcher when the sequencer rejected an
-    /// inbound `(sender, nonce)`. Releases the parked client immediately
-    /// with a JSON-RPC error mapped from `reason`. Returns silently if no
-    /// client is parked for that key (the error is best-effort).
+    /// Called by the tx_errors watcher when a sequencer rejected an inbound
+    /// `(sender, nonce)`. Releases the parked client with a JSON-RPC error
+    /// mapped from `reason` — but only after the configured grace, and only if
+    /// no receipt has won by then: with racing sequencer replicas a rejection
+    /// from one replica can race a SUCCESS from its twin, and the success must
+    /// override the rejection (see [`DEFAULT_TX_ERROR_GRACE`]). A receipt that
+    /// already arrived (even one still gated on a durability watermark)
+    /// suppresses the error outright. Returns silently if no client is parked
+    /// for that key (the error is best-effort).
     pub async fn on_tx_error(&self, sender: Address, nonce: u64, reason: TxErrorReason) {
         let key = (sender, nonce);
         let entry = {
@@ -130,14 +156,33 @@ impl PendingReceipts {
             };
             r.value().clone()
         };
-        let mut e = entry.lock().await;
-        if let Some(resp) = e.responder.take() {
-            let err = match reason {
-                TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
-            };
-            let _ = resp.send(Err(err));
-            drop(e);
-            self.map.remove(&key);
+        let grace = self.error_grace;
+        let map = self.map.clone();
+        let release = async move {
+            if !grace.is_zero() {
+                tokio::time::sleep(grace).await;
+            }
+            let mut e = entry.lock().await;
+            // Success overrides rejection: a stored receipt (released or still
+            // watermark-gated) means the tx landed on the twin — drop the error.
+            if e.receipt.is_some() {
+                return;
+            }
+            if let Some(resp) = e.responder.take() {
+                let err = match reason {
+                    TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
+                };
+                let _ = resp.send(Err(err));
+                drop(e);
+                map.remove(&key);
+            }
+        };
+        if grace.is_zero() {
+            release.await;
+        } else {
+            // Defer off this watcher task so a burst of rejections doesn't
+            // serialize behind each other's grace sleeps.
+            tokio::spawn(release);
         }
     }
 
@@ -303,6 +348,112 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(p.len(), 0, "entry removed on release");
+    }
+
+    #[tokio::test]
+    async fn success_arriving_within_the_grace_overrides_a_rejection() {
+        // F02.6: with racing sequencer replicas, replica A's DuplicatedTx can
+        // arrive BEFORE replica B's receipt for the same tx. The rejection is
+        // held for the grace window; the receipt must win.
+        let p = Arc::new(PendingReceipts::with_error_grace(
+            AckPolicy::OnOffer,
+            Duration::from_millis(200),
+        ));
+        let sender = Address::repeat_byte(0x88);
+        let nonce = 5u64;
+        let position = pos(77);
+
+        let wait = p.register(sender, nonce);
+        let waiter =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Rejection first (replica A, stale floor)...
+        p.on_tx_error(
+            sender,
+            nonce,
+            TxErrorReason::DuplicatedTx { expected_nonce: 6 },
+        )
+        .await;
+        // ...then the twin's success, well inside the grace window.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        p.on_receipt(sender, nonce, dummy_receipt(position)).await;
+
+        let res = waiter
+            .await
+            .expect("join")
+            .expect("success must override the racing rejection");
+        assert_eq!(res.receipt.tx_idx, position);
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn rejection_releases_after_the_grace_when_no_success_arrives() {
+        // A genuine duplicate (both replicas reject, no receipt ever) still
+        // reaches the client — just delayed by the grace window.
+        let p = Arc::new(PendingReceipts::with_error_grace(
+            AckPolicy::OnOffer,
+            Duration::from_millis(50),
+        ));
+        let sender = Address::repeat_byte(0x99);
+        let nonce = 2u64;
+
+        let wait = p.register(sender, nonce);
+        let waiter =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        p.on_tx_error(
+            sender,
+            nonce,
+            TxErrorReason::DuplicatedTx { expected_nonce: 9 },
+        )
+        .await;
+        let err = waiter
+            .await
+            .expect("join")
+            .expect_err("no success arrived — the rejection must be released");
+        assert!(
+            matches!(err, IngressError::Duplicate((s, n)) if s == sender && n == nonce),
+            "got {err:?}"
+        );
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn watermark_gated_receipt_suppresses_a_rejection() {
+        // A receipt that arrived but is still parked on the durability gate
+        // already proves the tx landed — a late rejection must not evict it.
+        let p = Arc::new(PendingReceipts::with_error_grace(
+            AckPolicy::OnQuorum,
+            Duration::ZERO, // inline release path; the stored receipt must gate it
+        ));
+        let sender = Address::repeat_byte(0xAA);
+        let nonce = 1u64;
+        let position = pos(9);
+
+        let wait = p.register(sender, nonce);
+        let waiter =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Receipt arrives but quorum hasn't caught up — stored, not released.
+        p.on_receipt(sender, nonce, dummy_receipt(position)).await;
+        // Twin's rejection must be suppressed by the stored receipt.
+        p.on_tx_error(
+            sender,
+            nonce,
+            TxErrorReason::DuplicatedTx { expected_nonce: 2 },
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(p.len(), 1, "entry must survive the rejection");
+
+        // Quorum catches up → the success is delivered.
+        p.update_quorum_watermark(QuorumWatermark { position })
+            .await;
+        let res = waiter.await.expect("join").expect("receipt must win");
+        assert_eq!(res.receipt.tx_idx, position);
     }
 
     #[tokio::test]

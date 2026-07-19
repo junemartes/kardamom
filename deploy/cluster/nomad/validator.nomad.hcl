@@ -71,8 +71,10 @@ job "validator" {
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
           # This node's cluster-egress (response) endpoint for the validator's
-          # OWN cluster client session. Port 40230 — NOT 40210, which the
-          # co-resident executor's session already binds on the same node IP.
+          # OWN cluster client session. Port 40230 — kept distinct from 40210,
+          # the executors' egress port convention on THEIR nodes (nothing else
+          # binds either port on the aux node; distinct ports keep captures /
+          # debugging unambiguous).
           "--cluster-egress-endpoint", "${meta.node_ip}:40230",
           "--shards", "2",
           "--chain-id", "412346",
@@ -80,12 +82,14 @@ job "validator" {
           # Own state dir UNDER the shared persistent mount — never the
           # executor's /opt/kardamom/state root (separate mdbx env).
           "--state-dir", "/opt/kardamom/state/validator",
-          # Crash-recovery archive replay-merge endpoint for tx_data /
-          # tx_deposits (used only when the state DB is non-empty, i.e. on a
-          # restart mid-chain). tx_ordering recovery rides the cluster replay
-          # instead. Port 40131 on this node's IP (the executor's replay
-          # endpoint uses 40130 on ITS nodes; no co-residence, but keep them
-          # distinct anyway).
+          # Archive replay-merge endpoint for tx_data / tx_deposits. When this
+          # flag is set the streams are ALWAYS read via replay-merge (fresh
+          # starts included) — the exec thread skip-counts any already-committed
+          # prefix, and a fresh validator behind a loaded chain needs the
+          # historical envelopes live multicast no longer carries. tx_ordering
+          # recovery rides the cluster replay instead. Port 40131 on this
+          # node's IP (the executor's replay endpoint uses 40130 on ITS nodes;
+          # no co-residence, but keep them distinct anyway).
           "--replay-destination-endpoint", "${meta.node_ip}:40131",
           # Shadow-check the node-incremental state trie against a full rebuild
           # every 8th block; a walker bug fail-stops the validator (dead alloc =

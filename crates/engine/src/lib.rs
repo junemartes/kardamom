@@ -4,15 +4,17 @@
 //! `kardamom-validator`: M per-sequencer **tx_data** readers + the canonical
 //! **tx_ordering** reader joined by reference, per-tx revm execution, write-set
 //! / `BlockDelta` accumulation, and the reader→exec→commit orchestration. The
-//! commit stage is generalized over a `BlockSink` so each role decides what
-//! happens at each tx and block close (the executor publishes receipts + a BAL;
-//! the validator builds an MPT state root and cross-checks itself).
+//! commit stage is generalized over the existing [`StateWriterQueue`] and
+//! [`TxReceiptsPublication`] seams, so each role decides what happens at each
+//! tx and block close (the executor publishes receipts + a BAL; the validator
+//! builds an MPT state root and cross-checks itself).
 //!
 //! Block-STM is out of scope for v0; v1 will replace the single execution
 //! thread with parallel workers behind the same `TxDataSubscription` /
 //! `TxOrderingSubscription` interfaces.
 
 pub mod actor;
+pub mod bin_support;
 pub mod block_env;
 pub mod delta;
 pub mod error;

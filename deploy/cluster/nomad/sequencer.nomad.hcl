@@ -16,7 +16,11 @@
 # Colocated-replica port separation (host networking, two sequencer processes
 # per node): seq-b moves its Prometheus listener to :9011 and its per-node
 # cluster-egress (response) endpoint to :40211 (seq-a keeps the standard
-# :9001 / :40210).
+# :9001 / :40210). Both metrics listeners bind 0.0.0.0 — the binary default
+# is loopback, which is unreachable off-node in a host-network job and left
+# the replicas unscrapable. NOTE for consumers: both replicas of a shard
+# process the SAME tx stream, so per-shard tx totals exist once per replica —
+# aggregate stream-derived counters with `max by (partition)`, never `sum`.
 #
 # Shares the node Aeron media driver via the bind-mounted tmpfs aeron.dir.
 
@@ -93,6 +97,14 @@ job "sequencer" {
           # Uniform port 40210 (cluster_egress_port); uniqueness comes from node_ip.
           "--cluster-egress-endpoint", "${meta.node_ip}:40210",
         ]
+      }
+
+      env {
+        # Scrapable off-node (binary default is 127.0.0.1:9001); replica
+        # group "a" stamped on every metric so the two racing replicas of a
+        # shard are separable in Prometheus.
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9001"
+        KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-a"
       }
 
       # Cluster LogConfig (UDP multicast channels), consumed via --log-config.
@@ -178,8 +190,11 @@ job "sequencer" {
       }
 
       env {
-        # The seq-a process on this node owns the default :9001.
-        KARDAMOM_METRICS_ADDR = "127.0.0.1:9011"
+        # The seq-a process on this node owns :9001; bind 0.0.0.0 so the
+        # twin is scrapable off-node (loopback made seq-b invisible to
+        # monitoring — exactly what would hide a zombie replica).
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9011"
+        KARDAMOM_HOST_ID      = "node${meta.node_index}-seq-b"
       }
 
       template {

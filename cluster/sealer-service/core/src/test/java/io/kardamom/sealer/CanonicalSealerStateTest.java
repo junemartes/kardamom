@@ -177,6 +177,39 @@ class CanonicalSealerStateTest {
         assertFalse(restored.firstSeen(id(3)), "snapshotted id must still dedup");
     }
 
+    @Test
+    void load_rejects_id_count_above_capacity() {
+        // Snapshot taken with a window of 8 ids…
+        CanonicalSealerState original = new CanonicalSealerState(8, 1);
+        for (int i = 1; i <= 8; i++) {
+            original.onRecord(id(i), payload("p" + i));
+        }
+        byte[] snapshot = original.takeSnapshot();
+        // …must NOT silently load into a smaller configured window: dedup
+        // behaviour would diverge from a fresh state with the same config.
+        IllegalArgumentException e = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> CanonicalSealerState.load(snapshot, 4));
+        assertTrue(e.getMessage().contains("idCount"), "message names the field: " + e.getMessage());
+        // The same snapshot loads fine at (or above) the original capacity.
+        assertEquals(8, CanonicalSealerState.load(snapshot, 8).dedupSize());
+        assertEquals(8, CanonicalSealerState.load(snapshot, 16).dedupSize());
+    }
+
+    @Test
+    void load_rejects_truncated_snapshot() {
+        CanonicalSealerState original = new CanonicalSealerState(8, 1);
+        for (int i = 1; i <= 4; i++) {
+            original.onRecord(id(i), payload("p" + i));
+        }
+        byte[] snapshot = original.takeSnapshot();
+        // Chop off half of the id section (the F12.1 truncated-fragment shape):
+        // must fail with a DESCRIPTIVE error, not a raw BufferUnderflowException.
+        byte[] truncated = java.util.Arrays.copyOf(snapshot, snapshot.length - 2 * CanonicalSealerState.CANONICAL_ID_LEN - 7);
+        IllegalArgumentException e = org.junit.jupiter.api.Assertions.assertThrows(
+                IllegalArgumentException.class, () -> CanonicalSealerState.load(truncated, 8));
+        assertTrue(e.getMessage().contains("truncated"), "message says truncated: " + e.getMessage());
+    }
+
     // --- helpers ------------------------------------------------------------
 
     /** A fixed, reproducible script of records and ticks; returns the egress. */

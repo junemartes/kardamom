@@ -106,6 +106,65 @@ class SealerReplayTest {
         }
     }
 
+    /**
+     * CI-replay-loop regression: a client that requests replay WHILE live
+     * traffic keeps flowing must reach the live cursor and receive
+     * REPLAY_DONE. While a session is mid-replay it is SKIPPED by live
+     * broadcasts (frames arrive via the retained drain instead), so this
+     * exercises the drain serving frames that are retained DURING the replay
+     * — including the un-latch path when the DONE control frame is
+     * back-pressured after the scan (frames retained in that window must not
+     * be lost to the session). The full canonical prefix must arrive exactly
+     * once, in order.
+     */
+    @Test
+    @InterruptAfter(value = 90, unit = TimeUnit.SECONDS)
+    void replayDuringLiveTrafficReachesLiveCursorAndCompletes() {
+        try (TestCluster cluster = startCluster()) {
+        cluster.awaitLeader();
+        final RecordingEgressListener liveEgress = new RecordingEgressListener();
+        cluster.egressListener(liveEgress);
+        final AeronCluster client = cluster.connectClient();
+
+        // Phase 1: K records + at least one boundary retained.
+        for (int i = 0; i < K; i++) {
+            offerIngress(client, canonicalId(i));
+        }
+        awaitCondition(client, () ->
+                liveEgress.relayedIndexes.size() >= K && liveEgress.boundaryCount > 0);
+
+        // Phase 2: a NEW session that never saw records 0..K-1 live requests
+        // replay from genesis and IMMEDIATELY keeps publishing live traffic.
+        // The new records are relayed while the session is mid-replay, so
+        // they must reach it through the drain, in canonical order.
+        final int phase1Relayed = liveEgress.relayedIndexes.size();
+        final AeronCluster reconnected = cluster.reconnectClient();
+        offerReplayRequest(reconnected, 0L, 1L);
+        for (int i = 0; i < K; i++) {
+            offerIngress(reconnected, canonicalId(K + i));
+        }
+
+        // The reconnected session must converge to the LIVE cursor (all 2K
+        // records) and complete with REPLAY_DONE, never UNAVAILABLE.
+        awaitCondition(reconnected, () ->
+                liveEgress.relayedIndexes.size() >= phase1Relayed + 2 * K
+                        && liveEgress.replayDoneCount > 0);
+        assertEquals(0, liveEgress.replayUnavailableCount,
+                "replay within retention must never be refused");
+
+        // Delivery to the new session is the exact canonical prefix 0..2K-1,
+        // strictly in order, no duplicates: replayed frames (0..K-1) followed
+        // by the frames relayed while mid-replay (K..2K-1), all via the drain
+        // or post-DONE live broadcast.
+        final List<Long> got =
+                liveEgress.relayedIndexes.subList(phase1Relayed, liveEgress.relayedIndexes.size());
+        for (int i = 0; i < 2 * K; i++) {
+            assertEquals((long) i, got.get(i),
+                    "canonical order/coverage at position " + i + ": " + got);
+        }
+        }
+    }
+
     @Test
     @InterruptAfter(value = 90, unit = TimeUnit.SECONDS)
     void evictedRangeIsRefusedHonestly() {

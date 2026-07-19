@@ -63,6 +63,11 @@ impl<T> PendingBuffer<T> {
         self.inner.contains_key(&nonce)
     }
 
+    /// Lowest buffered nonce, if any.
+    pub fn lowest_nonce(&self) -> Option<u64> {
+        self.inner.keys().next().copied()
+    }
+
     pub fn insert(&mut self, nonce: u64, value: T) -> InsertOutcome {
         if self.capacity == 0 {
             return InsertOutcome::DroppedBufferDisabled;
@@ -94,6 +99,19 @@ impl<T> PendingBuffer<T> {
         }
         self.inner.insert(nonce, value);
         InsertOutcome::Inserted
+    }
+
+    /// Insert WITHOUT capacity enforcement (and regardless of a disabled,
+    /// capacity-0 buffer). Used ONLY by the backpressure rebuffer path
+    /// ([`crate::state::PartitionState::reinsert_for_retry`]): the items being
+    /// re-inserted were just drained OUT of this buffer (plus at most one
+    /// in-flight ingress item), so enforcing capacity here could evict the
+    /// lowest re-buffered nonce — permanently losing a ref whose nonce the
+    /// state machine already advanced past (exactly the data-loss class the
+    /// rebuffer exists to prevent). Any overshoot is transient and bounded by
+    /// one drained batch; the next successful flush drains it back out.
+    pub fn reinsert(&mut self, nonce: u64, value: T) {
+        self.inner.insert(nonce, value);
     }
 
     /// Drain the contiguous run of nonces starting at `start`. Stops at the

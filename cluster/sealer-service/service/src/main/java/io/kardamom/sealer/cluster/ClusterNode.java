@@ -41,7 +41,11 @@ public final class ClusterNode {
         final String archiveDir = System.getProperty("kardamom.archive.dir", "/opt/kardamom/archive");
         final int ingressStreamId = Integer.getInteger("kardamom.cluster.ingressStreamId", 101);
         final long tickMs = Long.getLong("kardamom.cluster.tickMs", 2000L);
-        final int dedupCapacity = Integer.getInteger("kardamom.cluster.dedupCapacity", 8192);
+        // Dedup window: must exceed worst-case racing-replica stall × peak
+        // unique-record throughput, and every member MUST use the same value —
+        // see SealerClusteredService.DEFAULT_DEDUP_CAPACITY for the sizing math.
+        final int dedupCapacity = Integer.getInteger(
+            "kardamom.cluster.dedupCapacity", SealerClusteredService.DEFAULT_DEDUP_CAPACITY);
 
         final String[] me = memberEndpoints(clusterMembers, memberId); // [ingress,consensus,log,catchup,archive]
 

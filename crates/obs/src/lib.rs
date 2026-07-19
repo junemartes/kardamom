@@ -50,6 +50,14 @@ pub fn init(
     // `init` from a plain non-async main. The channel hand-off makes init
     // fail-fast and guarantees the recorder is globally installed before
     // init returns (so `describe_*!`/`gauge!` below always hit it).
+    //
+    // Fail-fast includes the HTTP bind: metrics-exporter-prometheus (0.18)
+    // binds the TCP listener synchronously inside `build()`, so a port
+    // collision surfaces through `ready_tx` as an init error rather than a
+    // healthy-looking service with no /metrics. Pinned by the
+    // init_port_in_use integration test — if a dependency upgrade moves the
+    // bind into the exporter future's first poll, that test fails and the
+    // bind must be made eager here (e.g. pre-bind a std TcpListener).
     let host_id_owned = host_id.to_string();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     std::thread::Builder::new()

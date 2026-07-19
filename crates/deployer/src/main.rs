@@ -54,8 +54,9 @@ enum Command {
         #[arg(long = "l2-chain-id", required = true)]
         l2_chain_ids: Vec<u64>,
 
-        /// L2 minter addresses for ETHLockbox initialize. Must match `--l2-chain-id`
-        /// count when ETHLockbox is among the deployed ids.
+        /// L2 minter addresses, positionally paired with `--l2-chain-id`. Must
+        /// match its count when deploying ETHLockbox (initialize `_l2Minter`) or
+        /// KardamomL2Settlement (reused as the initialize `_l1Batcher`).
         #[arg(long = "l2-minter")]
         l2_minters: Vec<Address>,
 
@@ -121,13 +122,23 @@ async fn main() -> Result<()> {
             finalization_window,
         } => {
             let contract_ids = parse_ids(&ids)?;
-            if contract_ids.contains(&ContractId::EthLockbox)
-                && l2_chain_ids.len() != l2_minters.len()
-            {
+            // Every id whose init args index into `l2_minters` must be covered
+            // here, or the positional `l2_minters[i]` below panics (index out
+            // of bounds) instead of failing with a usable error.
+            let minter_consumers: Vec<&str> = contract_ids
+                .iter()
+                .filter_map(|id| match id {
+                    ContractId::EthLockbox => Some("ETHLockbox"),
+                    ContractId::KardamomL2Settlement => Some("KardamomL2Settlement"),
+                    ContractId::WithdrawalOutputOracle => None,
+                })
+                .collect();
+            if !minter_consumers.is_empty() && l2_chain_ids.len() != l2_minters.len() {
                 bail!(
-                    "--l2-chain-id ({}) and --l2-minter ({}) counts must match when deploying ETHLockbox",
+                    "--l2-chain-id ({}) and --l2-minter ({}) counts must match when deploying {}",
                     l2_chain_ids.len(),
-                    l2_minters.len()
+                    l2_minters.len(),
+                    minter_consumers.join(", ")
                 );
             }
             run_deploy(
@@ -236,6 +247,9 @@ async fn run_deploy(
                 ContractId::WithdrawalOutputOracle => {
                     oracle_init_args(attester, challenger, finalization_window)?
                 }
+                // NOTE: reuses the positional --l2-minter as the settlement
+                // contract's `_l1Batcher` (documented on the flag). A dedicated
+                // --l1-batcher flag is a follow-up if the roles ever diverge.
                 ContractId::KardamomL2Settlement => encode_address_arg(l2_minters[i]),
             };
             ops.push(Op::Deploy {

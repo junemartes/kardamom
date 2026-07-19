@@ -10,7 +10,15 @@
 //!
 //! Deletion tracking: every stored node we *descend into* is recorded; after the
 //! build, removals = visited_old_nodes − new_nodes(`split()`), which captures
-//! subtries that collapsed.
+//! subtries that collapsed. That alone is not enough: `tree_mask` bit `i` means
+//! "the child *subtree* under nibble `i` contains stored nodes", not "a node is
+//! stored at exactly `path+[i]`" — under an extension the stored node lives at a
+//! deeper path the exact-path lookup never sees. Whenever the exact-path lookup
+//! misses and a subtrie is rebuilt from its leaves, the whole nibble-path prefix
+//! is recorded in [`TrieUpdates::cleared`] and range-deleted before the new
+//! upserts land, so stored nodes hiding under extensions can never survive as
+//! stale orphans (which a later walk could otherwise exact-hit and use for
+//! `add_branch` skips — silent root divergence).
 
 use alloy_primitives::{B256, U256};
 use alloy_trie::{BranchNodeCompact, HashBuilder, Nibbles};
@@ -26,6 +34,20 @@ use crate::error::StateError;
 pub struct TrieUpdates {
     pub upserts: Vec<(Nibbles, BranchNodeCompact)>,
     pub removals: Vec<Nibbles>,
+    /// Nibble-path prefixes whose subtries were rebuilt from leaves because no
+    /// stored node existed at the exact path. Every stored node *under* such a
+    /// prefix (e.g. hiding at a deeper path behind an extension) is stale and
+    /// must be range-deleted **before** `upserts` are applied.
+    pub cleared: Vec<Nibbles>,
+}
+
+/// Per-walk record of which stored nodes were exact-hit (`visited`) and which
+/// subtrie prefixes were rebuilt from leaves after an exact-path miss
+/// (`cleared`).
+#[derive(Default)]
+struct WalkLog {
+    visited: Vec<Nibbles>,
+    cleared: Vec<Nibbles>,
 }
 
 /// Compute the account-trie root incrementally. `account_trie`/`hashed_accounts`
@@ -39,7 +61,7 @@ pub(crate) fn account_root(
     account_leaf: &dyn Fn(&super::AccountTrieParts) -> Vec<u8>,
 ) -> Result<(B256, TrieUpdates), StateError> {
     let mut hb = HashBuilder::default().with_updates(true);
-    let mut visited: Vec<Nibbles> = Vec::new();
+    let mut log = WalkLog::default();
     walk_account(
         tx,
         account_trie,
@@ -47,12 +69,12 @@ pub(crate) fn account_root(
         &Nibbles::new(),
         prefix_set,
         &mut hb,
-        &mut visited,
+        &mut log,
         account_leaf,
     )?;
     let root = hb.root();
     let (_, updated) = hb.split();
-    finalize(root, updated, visited)
+    finalize(root, updated, log)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -63,11 +85,16 @@ fn walk_account(
     path: &Nibbles,
     prefix_set: &PrefixSet,
     hb: &mut HashBuilder,
-    visited: &mut Vec<Nibbles>,
+    log: &mut WalkLog,
     account_leaf: &dyn Fn(&super::AccountTrieParts) -> Vec<u8>,
 ) -> Result<(), StateError> {
     match get_branch_node(tx, account_trie, None, path)? {
         None => {
+            // Full leaf rebuild of this subtrie. Stored nodes may still exist
+            // *under* this path (behind extensions, where the exact-path get
+            // can't see them) — mark the prefix for range-deletion so none of
+            // them survives as a stale orphan.
+            log.cleared.push(*path);
             for (k, parts) in collect_hashed_accounts_under(tx, hashed_accounts, path)? {
                 if parts.is_empty() {
                     continue;
@@ -76,7 +103,7 @@ fn walk_account(
             }
         }
         Some(node) => {
-            visited.push(*path);
+            log.visited.push(*path);
             let (tm, hm) = (node.tree_mask.get(), node.hash_mask.get());
             // Iterate ALL 16 nibbles, not just the stored node's (stale)
             // state_mask: a new account under a nibble absent from the old mask
@@ -97,7 +124,7 @@ fn walk_account(
                             &child,
                             prefix_set,
                             hb,
-                            visited,
+                            log,
                             account_leaf,
                         )?;
                     }
@@ -126,7 +153,7 @@ pub(crate) fn storage_root(
     prefix_set: &PrefixSet,
 ) -> Result<(B256, TrieUpdates), StateError> {
     let mut hb = HashBuilder::default().with_updates(true);
-    let mut visited: Vec<Nibbles> = Vec::new();
+    let mut log = WalkLog::default();
     walk_storage(
         tx,
         storage_trie,
@@ -135,11 +162,11 @@ pub(crate) fn storage_root(
         &Nibbles::new(),
         prefix_set,
         &mut hb,
-        &mut visited,
+        &mut log,
     )?;
     let root = hb.root();
     let (_, updated) = hb.split();
-    finalize(root, updated, visited)
+    finalize(root, updated, log)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -151,16 +178,19 @@ fn walk_storage(
     path: &Nibbles,
     prefix_set: &PrefixSet,
     hb: &mut HashBuilder,
-    visited: &mut Vec<Nibbles>,
+    log: &mut WalkLog,
 ) -> Result<(), StateError> {
     match get_branch_node(tx, storage_trie, Some(account_hash), path)? {
         None => {
+            // See walk_account: clear the prefix so stored nodes hiding under
+            // extensions can't outlive this leaf rebuild as stale orphans.
+            log.cleared.push(*path);
             for (k, v) in collect_hashed_storage_under(tx, hashed_storage, account_hash, path)? {
                 hb.add_leaf(Nibbles::unpack(k.as_slice()), &storage_leaf(v));
             }
         }
         Some(node) => {
-            visited.push(*path);
+            log.visited.push(*path);
             let (tm, hm) = (node.tree_mask.get(), node.hash_mask.get());
             for i in 0..16u8 {
                 let mut child = *path;
@@ -178,7 +208,7 @@ fn walk_storage(
                             &child,
                             prefix_set,
                             hb,
-                            visited,
+                            log,
                         )?;
                     }
                 } else {
@@ -200,17 +230,28 @@ fn storage_leaf(v: U256) -> Vec<u8> {
 }
 
 /// Build `TrieUpdates`: upserts = the nodes HashBuilder produced; removals =
-/// visited old nodes that are no longer present (collapsed subtries).
+/// visited old nodes that are no longer present (collapsed subtries); cleared =
+/// prefixes rebuilt from leaves, whose stored nodes (including any hiding at
+/// deeper paths under extensions, which the walk never exact-visits) must be
+/// range-deleted before the upserts land.
 fn finalize(
     root: B256,
     updated: alloy_trie::HashMap<Nibbles, BranchNodeCompact>,
-    visited: Vec<Nibbles>,
+    log: WalkLog,
 ) -> Result<(B256, TrieUpdates), StateError> {
     let upserts: Vec<(Nibbles, BranchNodeCompact)> =
         updated.iter().map(|(k, v)| (*k, v.clone())).collect();
-    let removals: Vec<Nibbles> = visited
+    let removals: Vec<Nibbles> = log
+        .visited
         .into_iter()
         .filter(|p| !updated.contains_key(p))
         .collect();
-    Ok((root, TrieUpdates { upserts, removals }))
+    Ok((
+        root,
+        TrieUpdates {
+            upserts,
+            removals,
+            cleared: log.cleared,
+        },
+    ))
 }

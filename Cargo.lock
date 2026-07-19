@@ -3730,7 +3730,9 @@ dependencies = [
  "kardamom-sequencer",
  "kardamom-types",
  "rkyv",
+ "serde",
  "thiserror 2.0.18",
+ "toml",
  "tracing",
 ]
 
@@ -3798,7 +3800,9 @@ dependencies = [
  "alloy-network",
  "alloy-primitives",
  "alloy-signer-local",
+ "anyhow",
  "bytes",
+ "clap",
  "crossbeam-channel",
  "dashmap",
  "kardamom-cluster-adapter",
@@ -3810,7 +3814,10 @@ dependencies = [
  "serde",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
+ "toml",
  "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

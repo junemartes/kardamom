@@ -18,8 +18,8 @@
 //!   ([`rpc_source::RpcL1Source`] — alloy-provider-backed).
 //! - [`publisher::DepositPublisher`] — sink for the
 //!   [`kardamom_types::Deposit`] records the watcher emits. Production wraps
-//!   `kardamom_log::TxDepositsPublisher`; tests use the in-memory fake in
-//!   [`publisher::fakes`].
+//!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`; tests use the
+//!   in-memory fake in [`publisher::fakes`].
 //! - [`watcher::process_once`] — pure, single-pass function (one tick). The
 //!   integration shape: read finalized tip, fetch logs in `(cursor, tip]`,
 //!   build a `Deposit` from each log, publish on `tx_deposits`, advance

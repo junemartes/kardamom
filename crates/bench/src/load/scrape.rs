@@ -57,7 +57,12 @@ pub struct MetricsSnapshot {
     pub seq_evictions: Option<u64>,
     /// Sequencer: backpressure events (summed over partitions).
     pub seq_backpressure: Option<u64>,
-    /// `(label, up)` for each scraped service (1 = up).
+    /// `(label, up)` for each service a scrape was ATTEMPTED for: `Some(1)` =
+    /// exporter reports up, `Some(0)` = exporter reports down OR the scrape
+    /// itself failed (unreachable counts as down — the end-of-run liveness
+    /// gate must not pass just because an exporter vanished), `None` =
+    /// scraped but the metric was absent. A service missing from this list
+    /// was never scraped (not in the scrape set).
     pub service_up: Vec<(String, Option<u64>)>,
 }
 
@@ -125,8 +130,13 @@ impl Scraper {
                 // single stalled executor doesn't mask sealer progress.
                 snap.sealer_block = snap.sealer_block.max(g(M_SEALER_BLOCK));
                 snap.sealer_boundaries = snap.sealer_boundaries.max(g(M_SEALER_BOUNDARIES));
-                snap.service_up
-                    .push((format!("executor@{node}"), g(M_SERVICE_UP)));
+                // A failed scrape is an explicit DOWN, not a missing value.
+                let up = if body.is_some() {
+                    g(M_SERVICE_UP)
+                } else {
+                    Some(0)
+                };
+                snap.service_up.push((format!("executor@{node}"), up));
             }
         }
         if self.wants("ingress") {
@@ -141,15 +151,28 @@ impl Scraper {
             snap.ingress_accepted = g(M_INGRESS_ACCEPTED);
             snap.ingress_rejected = g(M_INGRESS_REJECTED);
             snap.ingress_queue_depth = g(M_INGRESS_QUEUE);
+            // A failed scrape is an explicit DOWN, not a missing value.
+            let up = if body.is_some() {
+                g(M_SERVICE_UP)
+            } else {
+                Some(0)
+            };
             snap.service_up
-                .push((format!("ingress@{}", self.ingress_node), g(M_SERVICE_UP)));
+                .push((format!("ingress@{}", self.ingress_node), up));
         }
         if self.wants("sequencer") {
             // Sum the per-partition counters across all sequencer nodes.
             let (mut d, mut e, mut b) = (0u64, 0u64, 0u64);
             let (mut any_d, mut any_e, mut any_b) = (false, false, false);
             for node in &self.sequencer_nodes {
-                if let Some(body) = self.fetch(node, PORT_SEQUENCER).await {
+                let body = self.fetch(node, PORT_SEQUENCER).await;
+                if body.is_none() {
+                    // A failed scrape is an explicit DOWN entry — previously
+                    // the node was silently missing from service_up, so an
+                    // unreachable sequencer passed the liveness gate.
+                    snap.service_up.push((format!("sequencer@{node}"), Some(0)));
+                }
+                if let Some(body) = body {
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
                         if let Some(v) = sum_metric(&body, M_SEQ_DROPPED) {

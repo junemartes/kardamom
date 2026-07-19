@@ -263,3 +263,133 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
 
     h.abort();
 }
+
+/// F02.6: P=2 racing sequencer replicas. Replica A (stale nonce floor)
+/// REJECTS the tx and its rejection is fanned out twice (both replicas emit
+/// per-tx errors); replica B accepts it and the executor's receipt lands
+/// shortly after. The client must get the RECEIPT — the duplicate rejections
+/// are deduped and the success overrides the earlier rejection. Drives the
+/// full proxy watcher pipeline (tx_errors bus → dedup → pending grace →
+/// receipt bus release), which is what the live ingress uses.
+#[tokio::test(flavor = "multi_thread")]
+async fn racing_replica_rejection_is_overridden_by_twin_success() {
+    let cfg = IngressConfig {
+        partition_count_m: 2,
+        ack_policy: kardamom_types::AckPolicy::OnOffer,
+        pending_receipt_timeout: Duration::from_secs(5),
+        ..IngressConfig::default()
+    };
+    let (mock, mut partition_rx) = MockChannels::new(2);
+    let state_db = Arc::new(InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+
+    let receipt_bus = mock.receipt_bus.clone();
+    let error_bus = mock.tx_error_bus.clone();
+    let rx0 = partition_rx.remove(0);
+    let _rx1 = partition_rx.remove(0);
+    let pos = BPosition {
+        term_id: 0,
+        term_offset: 1,
+    };
+    let h = tokio::spawn(async move {
+        let mut rx0 = rx0;
+        if let Some(envelope) = rx0.recv().await {
+            let nonce = nonce_of(&envelope.raw_tx);
+            // Replica A wrongly rejects; the rejection arrives from BOTH
+            // replicas (2x fan-out) and BEFORE the twin's receipt.
+            for _ in 0..2 {
+                let _ = error_bus.send(kardamom_types::TxError {
+                    sender: envelope.sender,
+                    nonce,
+                    reason: kardamom_types::TxErrorReason::DuplicatedTx {
+                        expected_nonce: nonce + 1,
+                    },
+                });
+            }
+            // The twin ordered it; the receipt lands shortly after (well
+            // inside the rejection-release grace).
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let _ = receipt_bus.send(Receipt {
+                tx_idx: pos,
+                tx_hash: envelope.tx_hash,
+                status: true,
+                gas_used: 21_000,
+                logs: Vec::new(),
+                write_set_hash: B256::ZERO,
+                from: envelope.sender,
+                nonce,
+                ..Default::default()
+            });
+        }
+    });
+
+    let signer = loop {
+        let s = PrivateKeySigner::random();
+        if partition_for(s.address(), 2) == 0 {
+            break s;
+        }
+    };
+    let raw = common::sign_legacy(&signer, 0);
+    let resp = proxy
+        .submit_raw("127.0.0.1".parse().unwrap(), raw)
+        .await
+        .expect("success must override the racing replica's rejection");
+    assert!(resp.receipt.status);
+    assert_eq!(resp.receipt.from, signer.address());
+
+    h.abort();
+}
+
+/// F02.6 companion: a GENUINE duplicate (both replicas reject, no receipt
+/// ever arrives) must still reach the client as a Duplicate error — the
+/// dedup drops the twin's copy and the grace merely delays the release.
+#[tokio::test(flavor = "multi_thread")]
+async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
+    let cfg = IngressConfig {
+        partition_count_m: 2,
+        ack_policy: kardamom_types::AckPolicy::OnOffer,
+        pending_receipt_timeout: Duration::from_secs(5),
+        ..IngressConfig::default()
+    };
+    let (mock, mut partition_rx) = MockChannels::new(2);
+    let state_db = Arc::new(InMemoryStateDb::new());
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+
+    let error_bus = mock.tx_error_bus.clone();
+    let rx0 = partition_rx.remove(0);
+    let _rx1 = partition_rx.remove(0);
+    let h = tokio::spawn(async move {
+        let mut rx0 = rx0;
+        if let Some(envelope) = rx0.recv().await {
+            let nonce = nonce_of(&envelope.raw_tx);
+            // Both replicas reject; the copies may disagree on expected_nonce.
+            for expected in [7u64, 8u64] {
+                let _ = error_bus.send(kardamom_types::TxError {
+                    sender: envelope.sender,
+                    nonce,
+                    reason: kardamom_types::TxErrorReason::DuplicatedTx {
+                        expected_nonce: expected,
+                    },
+                });
+            }
+        }
+    });
+
+    let signer = loop {
+        let s = PrivateKeySigner::random();
+        if partition_for(s.address(), 2) == 0 {
+            break s;
+        }
+    };
+    let raw = common::sign_legacy(&signer, 0);
+    let err = proxy
+        .submit_raw("127.0.0.1".parse().unwrap(), raw)
+        .await
+        .expect_err("no replica accepted the tx — the rejection must be delivered");
+    assert!(
+        matches!(err, kardamom_ingress::IngressError::Duplicate(_)),
+        "expected Duplicate, got {err:?}"
+    );
+
+    h.abort();
+}

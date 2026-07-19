@@ -26,6 +26,15 @@ contract ETHLockbox is KardamomUUPSBase {
     /// @notice Output-root version byte; must match `WithdrawalOutputOracle`.
     uint8 internal constant OUTPUT_VERSION = 0;
 
+    /// @notice Domain tags for the withdrawals tree. Leaves and internal nodes
+    ///         are hashed under distinct one-byte prefixes so an internal-node
+    ///         preimage can never be replayed as a leaf (classic Merkle
+    ///         second-preimage hardening) — even if the withdrawal leaf format
+    ///         ever changes shape. Must match
+    ///         `kardamom_types::withdrawals::{LEAF_DOMAIN, NODE_DOMAIN}`.
+    bytes1 internal constant LEAF_DOMAIN = 0x00;
+    bytes1 internal constant NODE_DOMAIN = 0x01;
+
     uint64 public depositNonce;
     address public l2Minter;
 
@@ -60,6 +69,17 @@ contract ETHLockbox is KardamomUUPSBase {
 
     function initialize(address _l2Minter, address _outputOracle) external initializer {
         l2Minter = _l2Minter;
+        outputOracle = _outputOracle;
+    }
+
+    /// @notice V2 migration entry point: wire (or re-wire) the output oracle on a
+    ///         proxy initialized before the withdrawal off-ramp existed (the
+    ///         one-arg V1 `initialize`), which would otherwise be deposit-only
+    ///         forever (`initializer` blocks re-entry). Factory-gated — intended
+    ///         to be called via the factory's `upgradeToAndCall`, whose
+    ///         delegatecall preserves the factory as `msg.sender`.
+    function initializeV2(address _outputOracle) external reinitializer(2) {
+        if (msg.sender != FACTORY) revert NotFactory();
         outputOracle = _outputOracle;
     }
 
@@ -134,21 +154,27 @@ contract ETHLockbox is KardamomUUPSBase {
 
     /// @notice Recompute a Merkle root from `leaf` at `index` and its sibling
     ///         `proof`. Positional (index bit selects left/right at each level),
-    ///         keccak256 over packed pairs — matches the validator's tree builder.
+    ///         domain-separated keccak256 (`LEAF_DOMAIN` for the leaf,
+    ///         `NODE_DOMAIN` for internal pairs) — matches the validator's tree
+    ///         builder (`kardamom_types::withdrawals`). Reverts if `index` has
+    ///         set bits beyond `proof.length`, binding the claimed leaf position
+    ///         to the proof depth (otherwise many indices would "verify" the
+    ///         same proof).
     function _merkleRoot(bytes32 leaf, uint256 index, bytes32[] calldata proof)
         internal
         pure
         returns (bytes32)
     {
-        bytes32 node = leaf;
+        bytes32 node = keccak256(abi.encodePacked(LEAF_DOMAIN, leaf));
         for (uint256 i = 0; i < proof.length; i++) {
             if (index & 1 == 0) {
-                node = keccak256(abi.encodePacked(node, proof[i]));
+                node = keccak256(abi.encodePacked(NODE_DOMAIN, node, proof[i]));
             } else {
-                node = keccak256(abi.encodePacked(proof[i], node));
+                node = keccak256(abi.encodePacked(NODE_DOMAIN, proof[i], node));
             }
             index >>= 1;
         }
+        if (index != 0) revert BadInclusionProof();
         return node;
     }
 }

@@ -23,6 +23,13 @@ pub struct SequencerConfig {
     pub sequencer_id: u8,
     /// Per-sender future-nonce buffer capacity. Default 16.
     pub max_pending_per_sender: usize,
+    /// UNUSED (accepted for config compatibility): the stream-adaptive
+    /// nonce-floor fast-forward this bounded was removed — it adopted
+    /// client-abandoned nonce gaps into the canonical stream, which every
+    /// executor fail-stops on (see `PartitionState`'s note). The key still
+    /// parses so deployed TOMLs carrying it keep loading.
+    #[serde(default = "default_nonce_floor_lag_ms")]
+    pub nonce_floor_lag_ms: u64,
     /// Optional CPU core to pin this process to. `None` = no pin.
     pub core_id: Option<usize>,
     /// Backpressure behaviour when tx_ordering blocks.
@@ -33,50 +40,13 @@ pub struct SequencerConfig {
     pub cluster: ClusterConfig,
 }
 
-/// Aeron Cluster (Raft) sealer client config.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
-#[serde(default)]
-pub struct ClusterConfig {
-    /// Retained for config-file backward compatibility; IGNORED — cluster mode
-    /// is the only mode, so the sequencer always publishes to the cluster.
-    pub enabled: bool,
-    /// "memberId=host:port,…" cluster ingress endpoints.
-    pub ingress_endpoints: String,
-    pub initial_leader_member_id: i32,
-    pub ingress_stream_id: i32,
-    /// This client's egress (response) channel URI, e.g. "aeron:udp?endpoint=<ip>:<port>".
-    pub egress_channel: String,
-    pub egress_stream_id: i32,
-    pub keep_alive_interval_ms: u64,
+fn default_nonce_floor_lag_ms() -> u64 {
+    5_000
 }
 
-impl ClusterConfig {
-    /// Sane stream-id / keepalive defaults when the TOML omits them.
-    pub fn defaults_applied(mut self) -> Self {
-        if self.ingress_stream_id == 0 {
-            self.ingress_stream_id = 101;
-        }
-        if self.egress_stream_id == 0 {
-            self.egress_stream_id = 102;
-        }
-        if self.keep_alive_interval_ms == 0 {
-            self.keep_alive_interval_ms = 1000;
-        }
-        self
-    }
-
-    pub fn to_live(&self) -> kardamom_cluster_adapter::LiveClusterConfig {
-        let c = self.clone().defaults_applied();
-        kardamom_cluster_adapter::LiveClusterConfig {
-            ingress_endpoints: c.ingress_endpoints,
-            initial_leader_member_id: c.initial_leader_member_id,
-            ingress_stream_id: c.ingress_stream_id,
-            egress_channel: c.egress_channel,
-            egress_stream_id: c.egress_stream_id,
-            keep_alive_interval_ms: c.keep_alive_interval_ms,
-        }
-    }
-}
+// The `[cluster]` TOML section has ONE definition, shared by every cluster
+// client and re-exported from `kardamom-cluster-adapter`.
+pub use kardamom_cluster_adapter::ClusterConfig;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +62,7 @@ impl Default for SequencerConfig {
             partition_index: 0,
             sequencer_id: 0,
             max_pending_per_sender: 16,
+            nonce_floor_lag_ms: default_nonce_floor_lag_ms(),
             core_id: None,
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
             cluster: ClusterConfig::default(),
@@ -115,19 +86,24 @@ impl SequencerConfig {
 
     /// Rotate the shard assignment for a racing-replica group:
     /// `partition_index ← (partition_index + offset) % partition_count`,
-    /// with `sequencer_id` following the rotated partition (the
-    /// `sequencer_id == partition_index` invariant) unless
-    /// `keep_sequencer_id` is set (an explicit operator override).
+    /// with `sequencer_id` always following the rotated partition.
     ///
     /// A second replica group passes `offset = 1` so each node serves a
     /// different shard per group, guaranteeing the two replicas of any
     /// shard land on distinct nodes.
-    pub fn rotate_partition(&mut self, offset: u32, keep_sequencer_id: bool) {
+    ///
+    /// `sequencer_id` is unconditionally re-derived: the tx_data
+    /// subscription is keyed on `sequencer_id` while the wrong-shard guard
+    /// filters on `partition_index`, so a rotated replica with a diverging
+    /// explicit id would subscribe to one shard's stream and drop every
+    /// envelope as wrong-shard — and its twin would stamp a different
+    /// `TxRef.shard_id`, breaking the byte-identical-replica dedup
+    /// argument. The binary rejects `--sequencer-id` combined with
+    /// `--partition-offset` for the same reason.
+    pub fn rotate_partition(&mut self, offset: u32) {
         let m = self.partition_count.max(1);
         self.partition_index = (self.partition_index + offset) % m;
-        if !keep_sequencer_id {
-            self.sequencer_id = self.partition_index as u8;
-        }
+        self.sequencer_id = self.partition_index as u8;
     }
 }
 
@@ -177,7 +153,7 @@ mod tests {
             sequencer_id: 1,
             ..Default::default()
         };
-        cfg.rotate_partition(1, false);
+        cfg.rotate_partition(1);
         assert_eq!(cfg.partition_index, 0);
         assert_eq!(cfg.sequencer_id, 0);
         cfg.validate().unwrap();
@@ -190,22 +166,25 @@ mod tests {
             sequencer_id: 0,
             ..Default::default()
         };
-        peer.rotate_partition(1, false);
+        peer.rotate_partition(1);
         assert_eq!(peer.partition_index, 1);
         assert_eq!(peer.sequencer_id, 1);
     }
 
     #[test]
-    fn rotate_partition_keeps_explicit_sequencer_id() {
+    fn rotate_partition_overrides_explicit_sequencer_id() {
+        // A diverging explicit id would subscribe to tx_data stream 7 while
+        // the wrong-shard guard filters on partition 1 — dropping everything.
+        // Rotation therefore always re-derives sequencer_id.
         let mut cfg = SequencerConfig {
             partition_count: 2,
             partition_index: 0,
             sequencer_id: 7,
             ..Default::default()
         };
-        cfg.rotate_partition(1, true);
+        cfg.rotate_partition(1);
         assert_eq!(cfg.partition_index, 1);
-        assert_eq!(cfg.sequencer_id, 7);
+        assert_eq!(cfg.sequencer_id, 1);
     }
 
     #[test]

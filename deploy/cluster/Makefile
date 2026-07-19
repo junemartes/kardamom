@@ -8,23 +8,23 @@ NOMAD_ADDR := http://192.168.56.10:4646
 TAG := dev
 # Workspace root (this file lives in deploy/cluster/).
 ROOT := $(abspath ../..)
-# kardamom-recorder removed: durability is archive-at-the-sealer (the sealer
-# image carries the --archive-durability sidecar).
-SERVICES := ingress sequencer executor sealer da-watcher batcher
+# The Rust service binaries that get their own image. There is NO kardamom-
+# sealer binary (canonical ordering is the Java Aeron Cluster — see the
+# `cluster` image below) and NO kardamom-recorder (durability is archive-at-
+# the-sealer, folded into the cluster members).
+SERVICES := ingress sequencer executor validator da-watcher batcher
+# Java Aeron Cluster node jar (built by gradle; see images target).
+CLUSTER_JAR := $(ROOT)/cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
 
 .PHONY: up vms provision images deploy smoke status down clean validate check-contract
 
 ## up: full bring-up — VMs, provisioning, images, deploy. Run `make smoke`
-## separately: until the --log-config plumbing lands (issue #36) the services
-## use single-host IPC defaults, so the cross-host pipeline smoke test is
-## EXPECTED TO FAIL (see README "Required service changes").
+## separately to exercise the pipeline once the jobs settle.
 up: vms provision images deploy
 	@echo
 	@echo "==> Cluster is up. Run 'make smoke' to exercise the pipeline."
-	@echo "    NOTE: smoke is expected to FAIL until the channels-config plumbing"
-	@echo "    lands (issue #36) — see README 'Required service changes'."
 
-## vms: boot the 5 VMs
+## vms: boot the VMs (one per node_classes instance)
 vms:
 	vagrant up
 
@@ -46,6 +46,17 @@ images:
 			-t $(REGISTRY)/kardamom-$$svc:$(TAG) $(ROOT) || exit 1; \
 		docker push $(REGISTRY)/kardamom-$$svc:$(TAG) || exit 1; \
 	done
+	@# Java Aeron Cluster node (cluster.nomad.hcl pulls kardamom-cluster:$(TAG)).
+	@# The jar must be built first — fail loudly, or deploy.sh fails pulling.
+	@if [ ! -f "$(CLUSTER_JAR)" ]; then \
+		echo "ERROR: cluster jar not found at $(CLUSTER_JAR)"; \
+		echo "       Build it first: (cd $(ROOT)/cluster/sealer-service && ./gradlew :service:shadowJar)"; \
+		exit 1; \
+	fi
+	cp $(CLUSTER_JAR) docker/kardamom-cluster-node.jar
+	docker build -f docker/cluster.Dockerfile \
+		-t $(REGISTRY)/kardamom-cluster:$(TAG) docker
+	docker push $(REGISTRY)/kardamom-cluster:$(TAG)
 
 ## deploy: run the Aeron system job, then the service jobs (sealer first — it
 deploy:
@@ -58,7 +69,7 @@ smoke:
 ## status: cluster + job health (Nomad binds the VM IP, not localhost, so the
 ## CLI inside the VM needs NOMAD_ADDR pointed at it)
 status:
-	vagrant ssh r1 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); nomad node status && echo && nomad job status && echo && consul members'
+	vagrant ssh control-0 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); nomad node status && echo && nomad job status && echo && consul members'
 
 ## validate: static checks (run on a host with the toolchain; CI runs these too)
 validate:
@@ -76,10 +87,12 @@ check-contract:
 
 ## down: stop jobs and destroy VMs
 down:
-	-vagrant ssh r1 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); for j in $$(nomad job status -short 2>/dev/null | awk "NR>1{print \$$1}"); do nomad job stop -purge $$j; done' || true
+	-vagrant ssh control-0 -c 'export NOMAD_ADDR=$(NOMAD_ADDR); for j in $$(nomad job status -short 2>/dev/null | awk "NR>1{print \$$1}"); do nomad job stop -purge $$j; done' || true
 	vagrant destroy -f
 
-## clean: remove local built images
+## clean: remove local built images (+ the staged cluster jar)
 clean:
 	-docker image rm $(REGISTRY)/kardamom-aeron:$(TAG)
+	-docker image rm $(REGISTRY)/kardamom-cluster:$(TAG)
+	-rm -f docker/kardamom-cluster-node.jar
 	-@for svc in $(SERVICES); do docker image rm $(REGISTRY)/kardamom-$$svc:$(TAG); done

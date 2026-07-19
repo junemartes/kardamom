@@ -5,9 +5,16 @@
 //! tables) plus a hashed-state mirror (`hashed_accounts`/`hashed_storage`). Per
 //! block, [`update_for_block`] updates the mirror and walks only the changed
 //! key-prefixes ([`walker`], driven by a [`PrefixSet`] over [`cursor`]s),
-//! skipping unchanged subtries via their stored hash — turning the per-block
-//! root cost from O(all accounts) into ~O(changed keys). `crate::writer` drives
-//! it inside the block-commit txn so the root advances atomically with state.
+//! skipping unchanged subtries via their stored hash. On a large, dense trie
+//! this brings the per-block root cost down from O(all accounts) toward
+//! O(changed keys) — but not all the way: the skip only fires where a stored
+//! node sits at the exact child path with its hash bit set. Extension-shaped
+//! children (whose parent hash bit `HashBuilder` clears) and any subtrie whose
+//! node is stored deeper than the exact path get re-walked from leaves even
+//! when unchanged, so small/sparse tries — including any trie whose top-level
+//! node is an extension — repeatedly pay full-subtree rebuilds. `crate::writer`
+//! drives it inside the block-commit txn so the root advances atomically with
+//! state.
 //!
 //! The pure `state_root` / `storage_root` rebuild functions below are retained as
 //! the **shadow-check oracle** ([`rebuild_root`]) and the equivalence-test
@@ -68,9 +75,12 @@ impl StateRoot {
     }
 }
 
-/// Persist a walk's [`TrieUpdates`] to a node table: upsert each produced branch
-/// node and delete each collapsed path. `account_hash` namespaces storage-trie
-/// keys (`None` for the account trie). Used by the writer and the test harness.
+/// Persist a walk's [`TrieUpdates`] to a node table: range-delete each cleared
+/// subtrie prefix (stale nodes a leaf rebuild may have orphaned under
+/// extensions), then upsert each produced branch node, then delete each
+/// collapsed path. Clears run **before** upserts so freshly produced nodes
+/// inside a cleared region survive. `account_hash` namespaces storage-trie keys
+/// (`None` for the account trie). Used by the writer and the test harness.
 pub fn apply_trie_updates(
     txn: &RwTxSync,
     db: Database,
@@ -78,18 +88,10 @@ pub fn apply_trie_updates(
     updates: &TrieUpdates,
 ) -> Result<(), StateError> {
     use signet_libmdbx::WriteFlags;
-    let key = |path: &alloy_trie::Nibbles| -> Vec<u8> {
-        let nibs = path.to_vec();
-        match account_hash {
-            Some(a) => {
-                let mut k = Vec::with_capacity(32 + nibs.len());
-                k.extend_from_slice(a.as_slice());
-                k.extend_from_slice(&nibs);
-                k
-            }
-            None => nibs,
-        }
-    };
+    let key = |path: &alloy_trie::Nibbles| -> Vec<u8> { cursor::node_key(account_hash, path) };
+    for path in &updates.cleared {
+        del_prefix(txn, db, &key(path))?;
+    }
     for (path, node) in &updates.upserts {
         txn.put(
             db,
@@ -186,7 +188,12 @@ pub fn update_for_block(
             let mut key = ah.as_slice().to_vec();
             key.extend_from_slice(sh.as_slice());
             if val.is_zero() {
-                let _ = txn.del(t.hashed_storage, key, None);
+                // Absent-key deletes are fine; any other mdbx failure must
+                // surface, or the mirror silently diverges from the reference.
+                match txn.del(t.hashed_storage, key, None) {
+                    Ok(_) | Err(signet_libmdbx::MdbxError::NotFound) => {}
+                    Err(e) => return Err(e.into()),
+                }
             } else {
                 txn.put(
                     t.hashed_storage,
@@ -232,7 +239,10 @@ pub fn update_for_block(
             storage_root,
         };
         if parts.is_empty() {
-            let _ = txn.del(t.hashed_accounts, ah.as_slice(), None);
+            match txn.del(t.hashed_accounts, ah.as_slice(), None) {
+                Ok(_) | Err(signet_libmdbx::MdbxError::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
             del_prefix(txn, t.hashed_storage, ah.as_slice())?;
             del_prefix(txn, t.storage_trie, ah.as_slice())?;
         } else {

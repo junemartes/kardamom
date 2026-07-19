@@ -1,8 +1,11 @@
-//! `kardamom-bench-harness` — single-process node + bench with
+//! `kardamom-bench-harness` — single-process ingress stand-in + bench with
 //! `tracing-flame` and optional `pprof` recording scoped to the
 //! measurement window.
 //!
-//! See `kardamom_bench::harness` for the mechanism.
+//! The stand-in serves only the ingress write path (no `eth_call`), so only
+//! the `transfers` workload can run here; `calls`/`mixed` need a full node
+//! and are rejected with a clear error. See `kardamom_bench::harness` for
+//! the mechanism.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -13,12 +16,12 @@ use kardamom_bench::config::{
     DEFAULT_CONCURRENCY, DEFAULT_MAX_IN_FLIGHT, DEFAULT_TIMEOUT_STR, DEFAULT_TXS_PER_TASK,
 };
 use kardamom_bench::harness::Harness;
-use kardamom_bench::{BenchWorkflow, Benchmark, CallsWorkflow, MixedWorkflow, TransfersWorkflow};
+use kardamom_bench::{BenchWorkflow, Benchmark, TransfersWorkflow};
 
 #[derive(Parser, Debug)]
 #[command(
     name = "kardamom-bench-harness",
-    about = "Run the bench against an in-process kardamom node and write a tracing-flame SVG for the measurement window only."
+    about = "Run the bench against an in-process ingress stand-in (write path only) and write a tracing-flame SVG for the measurement window only."
 )]
 struct Args {
     /// Path to write the tracing-flame SVG. Ready to open in a browser
@@ -62,12 +65,14 @@ struct Args {
 
 #[derive(Subcommand, Debug)]
 enum WorkloadCmd {
-    /// Saturate the node's write path with signed value transfers.
+    /// Saturate the ingress stand-in's write path with signed value
+    /// transfers.
     Transfers,
-    /// Saturate the node's read path with `eth_call` to a deterministic
-    /// contract.
+    /// Unavailable here: needs `eth_call`, which the write-only ingress
+    /// stand-in does not serve. Use `kardamom-bench` against a full node.
     Calls,
-    /// Interleave transfers and calls per a 1:4 ratio.
+    /// Unavailable here: interleaves calls, which the write-only ingress
+    /// stand-in does not serve. Use `kardamom-bench` against a full node.
     Mixed,
 }
 
@@ -76,8 +81,11 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     match args.workload {
         WorkloadCmd::Transfers => harness_with(TransfersWorkflow::default(), &args).await,
-        WorkloadCmd::Calls => harness_with(CallsWorkflow::default(), &args).await,
-        WorkloadCmd::Mixed => harness_with(MixedWorkflow::default(), &args).await,
+        WorkloadCmd::Calls | WorkloadCmd::Mixed => anyhow::bail!(
+            "the in-process ingress stand-in serves only the write path (no eth_call), \
+             so `calls`/`mixed` cannot run here — use `transfers`, or run \
+             `kardamom-bench` against a node that serves reads"
+        ),
     }
 }
 

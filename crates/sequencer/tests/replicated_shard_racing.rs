@@ -15,6 +15,12 @@
 //!  * **Cold rejoin** — a replica that (re)starts mid-stream and hydrates its
 //!    nonce floor from committed state (the stateless-sequencer cache-miss
 //!    path) emits a suffix of its twin's sequence; merging it changes nothing.
+//!  * **Cold rejoin, misaligned floor** — hydration is only a *lower bound*
+//!    (the deployed binary wires an empty state DB, and even a real one can
+//!    trail refs the twin ordered but that aren't committed yet). The
+//!    stream-adaptive floor fast-forward (`nonce_floor_lag_ms`) adopts the
+//!    live join point after the lag bound, so the rejoiner still emits
+//!    exactly its twin's suffix instead of zombie-buffering forever.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -113,13 +119,21 @@ fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
 
 /// Run one replica over `stream`, returning its published refs.
 fn run_replica(stream: &[(TxDataLoc, TxEnvelope)], db: Arc<FakeStateDatabase>) -> Vec<TxRef> {
+    run_replica_with(shard0_cfg(), stream, db)
+}
+
+fn run_replica_with(
+    cfg: SequencerConfig,
+    stream: &[(TxDataLoc, TxEnvelope)],
+    db: Arc<FakeStateDatabase>,
+) -> Vec<TxRef> {
     let mut inbound = ScriptedTxData::default();
     for (loc, env) in stream {
         inbound.queue.push_back((*loc, env.clone()));
     }
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(shard0_cfg(), db);
+    let mut seq = Sequencer::new(cfg, db);
     while seq.run_once(&mut inbound, &mut b, &mut rc).unwrap() {}
     b.refs.lock().unwrap().clone()
 }
@@ -227,4 +241,91 @@ fn cold_rejoining_replica_emits_a_suffix_and_changes_nothing() {
     let mut interleaved = a.clone();
     interleaved.extend(b);
     assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));
+}
+
+/// F02.1 status pin (RE-OPENED, deliberate): the floor fast-forward was
+/// REMOVED after it published canonical nonce GAPS (CI run 29687514869: all
+/// three executors fatally NonceTooHigh'd in every shard — a sequencer
+/// cannot locally tell a twin-ordered gap from a client-abandoned one). A
+/// replica that rejoins mid-stream with an EMPTY state DB therefore buffers
+/// established senders and emits NOTHING for them — degraded P=1 coverage,
+/// but never canonical corruption. This test pins BOTH properties so a
+/// future fix must consciously flip the first assertion, and can never
+/// regress the second.
+#[test]
+fn rejoining_replica_with_empty_db_stalls_but_never_corrupts() {
+    let stream = shard_stream();
+    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+
+    // Replica B restarts and joins at the midpoint with an empty state DB
+    // (production wiring: every floor hydrates at 0).
+    let half = stream.len() / 2;
+    let b = run_replica(&stream[half..], Arc::new(FakeStateDatabase::new()));
+
+    // Re-opened limitation: B emits nothing (all traffic buffers as future).
+    assert!(
+        b.is_empty(),
+        "empty-DB rejoiner is expected to stall (F02.1 re-opened), got {} refs",
+        b.len()
+    );
+    // And the canonical stream is untouched by the zombie replica.
+    let mut interleaved = a.clone();
+    interleaved.extend(b);
+    assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));
+}
+
+/// CI round-4 regression (the executor-killing bug): a CLIENT-ABANDONED
+/// nonce hole — txs dropped at ingress under overload / a chaos outage, so
+/// they never reach tx_data — must NEVER be adopted into the canonical
+/// stream. The sender stalls at the hole; every published nonce run stays
+/// dense. (The removed fast-forward adopted the post-hole run after 5s,
+/// publishing a gapped stream that fatally NonceTooHigh'd every executor.)
+#[test]
+fn client_abandoned_nonce_hole_is_never_published_past() {
+    let full = shard_stream();
+    // Drop nonces 3 and 4 of sender 1 from the stream entirely (they never
+    // reached tx_data): the classic overload shape.
+    let victim = signer(1).address();
+    let stream: Vec<_> = full
+        .into_iter()
+        .filter(|(_, env)| {
+            if env.sender != victim {
+                return true;
+            }
+            use alloy_rlp::Decodable as _;
+            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
+            use alloy_consensus::transaction::Transaction as _;
+            !(e.nonce() == 3 || e.nonce() == 4)
+        })
+        .collect();
+
+    let refs = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+
+    // The victim's published nonces are exactly the dense prefix 0..=2 —
+    // nothing at or past the hole — and every sender's run is gapless.
+    use std::collections::HashMap;
+    let mut per_sender: HashMap<_, Vec<u64>> = HashMap::new();
+    for (loc, env) in &stream {
+        // Reconstruct (sender, nonce) for each published ref via its position.
+        if let Some(r) = refs.iter().find(|r| r.tx_data_position == loc.position) {
+            use alloy_rlp::Decodable as _;
+            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
+            use alloy_consensus::transaction::Transaction as _;
+            assert_eq!(r.tx_hash, env.tx_hash);
+            per_sender.entry(env.sender).or_default().push(e.nonce());
+        }
+    }
+    for (sender, mut nonces) in per_sender {
+        nonces.sort_unstable();
+        let expect_len = if sender == victim {
+            3 // 0,1,2 — stalled at the hole
+        } else {
+            TX_PER_SENDER as usize
+        };
+        assert_eq!(
+            nonces,
+            (0..expect_len as u64).collect::<Vec<_>>(),
+            "sender {sender:?} must publish a dense prefix only"
+        );
+    }
 }

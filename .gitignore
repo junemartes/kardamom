@@ -15,3 +15,7 @@ results/
 # solc compiler blob (fetched, not source)
 soljson-latest.js
 contracts/soljson-latest.js
+
+# python bytecode (e.g. deploy/cluster/scripts)
+__pycache__/
+*.pyc

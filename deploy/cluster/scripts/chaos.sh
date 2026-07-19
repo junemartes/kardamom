@@ -46,7 +46,10 @@
 #   CHAOS_RESCHEDULE_SLO_S   node-loss recovery SLO(default 120)
 #   CHAOS_LEADER_SLO_S       new-leader election SLO (default 30)
 #   CHAOS_CASES              space-separated cases (default a representative subset)
-#   INJECT_DELAY             secs of load before injecting (default 10)
+#   INJECT_DELAY             MIN secs of load before injecting (default 10)
+#   LOAD_FLOW_TIMEOUT_S      max extra secs to wait for load to actually flow
+#                            (ingress received counter advancing) before
+#                            refusing to inject (default 60)
 #   CHAOS_ACCT_BASE          first funded account index per case (default 7)
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
@@ -60,8 +63,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
-NOMAD_ADDR_INT="http://192.168.56.10:4646"
-CONTROL="kardamom-control-0"
+# Shared control-node helpers (on_control, running_alloc, count_running, ...).
+# shellcheck source=deploy/cluster/scripts/lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 # Explicit chain-id (ingress eth_chainId returns a default ≠ the cluster chain).
 CHAIN_ID="${CHAIN_ID:-412346}"
@@ -79,12 +84,19 @@ CHAOS_RESCHEDULE_SLO_S="${CHAOS_RESCHEDULE_SLO_S:-120}"
 CHAOS_LEADER_SLO_S="${CHAOS_LEADER_SLO_S:-30}"
 CHAOS_CASES="${CHAOS_CASES:-graceful-executor hard-executor cluster-leader-kill node-failure-executor}"
 INJECT_DELAY="${INJECT_DELAY:-10}"
+LOAD_FLOW_TIMEOUT_S="${LOAD_FLOW_TIMEOUT_S:-60}"
 # Each case's steady load uses ONE dedicated funded account (a fresh nonce chain
 # from 0), so cases never collide and never leave nonce gaps. Genesis funds
 # Anvil accounts #0..#15; ci-cluster.sh reserves #0 (gate) and #1..#6 (load
 # harness), leaving #7..#15 = up to 9 cases. CHAOS_ACCT advances per case.
 CHAOS_ACCT_BASE="${CHAOS_ACCT_BASE:-7}"
 CHAOS_ACCT="${CHAOS_ACCT_BASE}"
+# Sender→shard map for the 16 funded Anvil accounts (index = account number):
+# shard = first 8 bytes of keccak256(address) as a BE u64, mod partition_count=2
+# (crates/ingress/src/routing.rs::partition_for). Fixed addresses + fixed hash
+# ⇒ stable forever. Derivation: cast keccak <address> | cut -c3-18, % 2.
+# Used to PIN a case's load onto a specific shard (sequencer-replica-kill).
+ACCT_SHARD=(0 1 1 0 0 0 0 0 0 0 1 0 1 1 0 1)
 
 # Sealer/executor metrics ports + container names (mirror smoke-load defaults).
 # NOTE: the Java cluster node has no Prometheus endpoint; the executors
@@ -99,6 +111,8 @@ EXECUTOR_NODE="kardamom-executor-0"
 # replicas at ~the same block height, so any one is a valid liveness signal.
 EXECUTOR_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
 # Executor node bridge IPs (group_vars node_classes: executor ip_start=41).
+# exec_metrics() probes these DIRECTLY over the bridge first (exporter binds
+# 0.0.0.0:9004), with docker exec as the fallback.
 EXECUTOR_IPS=(192.168.56.41 192.168.56.42 192.168.56.43)
 EXECUTOR_PORT="${EXECUTOR_PORT:-9004}"
 # The executor's monotonically-advancing block gauge (crates/executor/src/metrics.rs:
@@ -121,24 +135,19 @@ trap cleanup EXIT
 
 [ -x "${LOAD_BIN}" ] || fail "kardamom-load not found/executable at ${LOAD_BIN}"
 
-# Run a command on the control node with NOMAD_ADDR set. $1 is a bash snippet
-# (may reference "$1".."$N"); remaining args are passed positionally.
-on_control() {
-  local script="$1"; shift
-  docker exec "${CONTROL}" bash -lc "export NOMAD_ADDR=${NOMAD_ADDR_INT}; ${script}" _ "$@"
-}
-
-# First RUNNING alloc id for a job, via Nomad's -t Go template (the proven form
-# from ci-cluster.sh's churn — robust to tabular-format changes).
-running_alloc() {
-  on_control 'nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}} {{end}}{{end}}" "$1"' "$1" 2>/dev/null \
-    | tr ' ' '\n' | grep -m1 .
-}
-
-# Count of RUNNING allocs for a job.
-count_running() {
-  on_control 'nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}x{{end}}{{end}}" "$1"' "$1" 2>/dev/null \
-    | tr -cd 'x' | wc -c | tr -d ' '
+# Fetch one executor node's /metrics body. Bridge-DIRECT first (the executor
+# exporter binds 0.0.0.0:9004 precisely so the chaos suite can probe it over
+# the cluster bridge — see executor.nomad.hcl), falling back to docker exec
+# for loopback-only deploys. The direct probe matters: a hard `docker kill` of
+# a privileged sibling can stall the runner's dockerd for tens of seconds,
+# taking every `docker exec` probe down with it and reading as a pipeline
+# stall when nothing is wrong (issue #76). $1 = index into EXECUTOR_NODES.
+exec_metrics() {
+  local i="$1"
+  curl -fsS --max-time 5 "http://${EXECUTOR_IPS[$i]}:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+    && return 0
+  timeout 8 docker exec "${EXECUTOR_NODES[$i]}" curl -fsS --max-time 5 \
+    "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null
 }
 
 # Sealer boundary-counter probe: the sealer's boundary stream as re-exported
@@ -151,9 +160,9 @@ sealer_boundaries() {
   # replaying/catching up) legitimately reports a low/frozen counter while its
   # peers — and the pipeline — are fine; pinning the probe to it reads as a
   # pipeline stall when nothing is wrong.
-  local n v best=""
-  for n in "${EXECUTOR_NODES[@]}"; do
-    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+  local i v best=""
+  for i in "${!EXECUTOR_NODES[@]}"; do
+    v="$(exec_metrics "${i}" \
       | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
@@ -180,13 +189,16 @@ val_metric() { # <metric-name> -> integer (empty on scrape failure)
 
 # validator-lapse case: PAUSE the validator process (docker pause the inner
 # container) for a window under sustained load, then resume. The validator's
-# live tx_bal multicast image lapses during the pause; on resume the
-# archive-backed refetch source must redeliver the missed BALs so every block
-# still VERIFIES (no growth in bal_missing) — and the validator must catch back
-# up. Asserts: refetch actually fired (bal_refetched grew), verification
-# coverage held (bal_missing did not grow), no divergence, and the validator
-# resumed committing. The pipeline itself is untouched (the validator is off the
-# hot path), so the standard load + progress verdicts still apply.
+# live tx_bal multicast image lapses during the pause; on resume the missed
+# BALs are still sitting in the live multicast TERM BUFFER, so the validator
+# drains them and keeps verifying, and the catch-up skip (#78) bounds the cost
+# of anything that aged out of the term buffer (those blocks commit unverified
+# instead of blocking 5s each). There is NO side-stream refetch mechanism —
+# that prototype was discarded. Asserts: verification coverage held
+# (bal_missing did not materially grow), the validator kept verifying past the
+# pre-pause count, caught back up, and saw no divergence. The pipeline itself
+# is untouched (the validator is off the hot path), so the standard load +
+# progress verdicts still apply.
 LAPSE_S="${LAPSE_S:-30}"
 run_validator_lapse() {
   local inner
@@ -199,17 +211,22 @@ run_validator_lapse() {
   # have no BAL and are committed unverified during a fast catch-up, so it
   # reaches the live head and only THEN verifies steadily. The lapse must hit a
   # verifying validator, not one still catching up.)
-  local t=0 vprev=-1 v_now e_now verified
+  local t=0 vprev=-1 v_now e_now verified warmed=0
   while [ "${t}" -lt 150 ]; do
     verified="$(val_metric validator_blocks_verified_total)"; verified="${verified:-0}"
     v_now="$(val_metric validator_committed_block)"; v_now="${v_now:-0}"
     e_now="$(executor_progress || echo 0)"
     if [ "${verified}" -gt 0 ] && [ "${verified}" -gt "${vprev}" ] \
        && [ "${v_now}" -gt 0 ] && [ $(( e_now - v_now )) -le 15 ]; then
+      warmed=1
       break
     fi
     vprev="${verified}"; sleep 6; t=$(( t + 6 ))
   done
+  # Pausing a validator that never verified would fail LATER with a misleading
+  # "did not resume verifying" — fail here with the real reason instead.
+  [ "${warmed}" -eq 1 ] \
+    || fail "validator-lapse: never warmed up within ${t}s (verified=${verified} block=${v_now} exec=${e_now}) — not verifying live BEFORE the pause"
   log "validator-lapse: warmed up (verified=${verified} block=${v_now} exec=${e_now}) after ${t}s"
 
   local m0 vf0
@@ -258,9 +275,9 @@ executor_progress() {
   # fine. Pinning the probe to that replica reads as "pipeline NOT progressing
   # (block 0 -> 0)" when nothing is wrong (observed on node-failure-executor
   # right after hard-executor restarted executor-0).
-  local n v best=""
-  for n in "${EXECUTOR_NODES[@]}"; do
-    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${EXECUTOR_PORT}/metrics" 2>/dev/null \
+  local i v best=""
+  for i in "${!EXECUTOR_NODES[@]}"; do
+    v="$(exec_metrics "${i}" \
       | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
@@ -268,30 +285,127 @@ executor_progress() {
   return 1
 }
 
+# Ingress submit counter (kardamom_ingress_tx_received_total) summed across the
+# active/active ingress nodes — the "is load actually flowing?" signal for the
+# injection gate in run_case. Ingress binds its exporter on loopback, so this
+# goes through docker exec. Prints the sum, or fails if no ingress answered.
+INGRESS_NODES=(kardamom-ingress-0 kardamom-ingress-1)
+INGRESS_PORT="${INGRESS_PORT:-9006}"
+ingress_received() {
+  local n v total=0 got=0
+  for n in "${INGRESS_NODES[@]}"; do
+    v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${INGRESS_PORT}/metrics" 2>/dev/null \
+      | awk '/^kardamom_ingress_tx_received_total/{ s += $NF } END { if (s != "") printf "%d", s }')"
+    [ -n "${v}" ] && { total=$(( total + v )); got=1; }
+  done
+  [ "${got}" -eq 1 ] && { printf '%s' "${total}"; return 0; }
+  return 1
+}
+
+# Restarted-replica health probe. KNOWN LIMITATION (re-opened F02.1): a
+# restarted replica hydrates nonce floors from an empty state DB, so for
+# ESTABLISHED senders it buffers refs as "future" and publishes nothing until
+# a global hydration signal exists — the shard runs at P=1 for those senders
+# (the racing twin covers them; fresh nonce-0 senders hydrate at floor 0 and
+# are covered immediately). The nonce-floor fast-forward that made a rejoiner
+# republish for established senders was REVERTED: under overload it forged
+# canonical nonce gaps (nonces dropped before tx_data are invisible to BOTH
+# replicas) and crashed every executor — see
+# docs/reviews/2026-07-17-30-commit-review/fixes-CI-replay-loop.md. So this
+# probe asserts what IS guaranteed: the restarted replica is alive and
+# scrapeable (exporter up, session established), NOT that it republishes for
+# the pinned established-sender load.
+assert_replica_healthy() { # <node-container> <node-ip> <metrics-port> [slo-secs]
+  local node="$1" ip="$2" port="$3" slo="${4:-90}" t=0 v
+  while :; do
+    # Bridge-direct first (exporters bind 0.0.0.0 since the replica-metrics
+    # fix), docker exec fallback — same rationale as exec_metrics().
+    v="$( { curl -fsS --max-time 5 "http://${ip}:${port}/metrics" 2>/dev/null \
+          || timeout 8 docker exec "${node}" curl -fsS --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null; } \
+        | awk '/^kardamom_sequencer_/{ n++ } END { printf "%d", n }')"
+    if [ -n "${v}" ] && [ "${v}" -gt 0 ]; then
+      log "restarted replica on ${node} (:${port}) is up and exporting (${v} sequencer metrics; established-sender coverage stays on the twin — re-opened F02.1)"
+      return 0
+    fi
+    [ "${t}" -ge "${slo}" ] \
+      && fail "restarted replica on ${node} (:${port}) never came up: metrics unscrapable within ${slo}s of restart"
+    sleep 5; t=$(( t + 5 ))
+  done
+}
+
 # --- injectors --------------------------------------------------------------
+
+# The injectors record WHAT they killed (stopped alloc id, or killed inner
+# container id + where) so assert_count can require observed REPLACEMENT, not
+# just a running count: right after a kill the doomed alloc can still report
+# ClientStatus==running on the first poll, so a bare count>=N check could pass
+# instantly against the OLD alloc without ever observing the outage — a
+# vacuous "recovered within SLO". assert_count consumes + clears these.
+KILLED_ALLOC=""
+KILLED_NODE=""; KILLED_TASK=""; KILLED_CID=""
 
 inject_graceful() { # <job>
   local alloc; alloc="$(running_alloc "$1")"
   [ -n "${alloc}" ] || fail "no running alloc to stop for job $1"
   log "graceful: nomad alloc stop ${alloc} (job $1)"
   on_control 'nomad alloc stop "$1"' "${alloc}" >/dev/null
+  KILLED_ALLOC="${alloc}"
 }
 
-inject_hard() { # <node-container> <task-name>
-  log "hard: docker kill inner ${2} container on ${1}"
-  docker exec "$1" sh -c 'docker kill $(docker ps --filter name='"$2"' -q | head -1)' >/dev/null \
-    || fail "could not hard-kill ${2} on ${1}"
+inject_hard() { # <node-container(s), space-separated candidates> <task-name>
+  # Multiple candidates cover tasks whose placement can move between cases
+  # (observed: after graceful-executor, the replacement alloc's container is
+  # not always back on executor-0 when hard-executor probes it). The first
+  # node actually running the task is killed; NO node running it is still a
+  # loud failure — never a vacuous pass.
+  local node cid=""
+  for node in $1; do
+    cid="$(docker exec "${node}" sh -c 'docker ps --filter name='"$2"' -q | head -1' 2>/dev/null)"
+    [ -n "${cid}" ] && break
+  done
+  [ -n "${cid}" ] || fail "no running ${2} container to hard-kill on any of: ${1}"
+  log "hard: docker kill inner ${2} container ${cid} on ${node}"
+  docker exec "${node}" docker kill "${cid}" >/dev/null \
+    || fail "could not hard-kill ${2} (${cid}) on ${node}"
+  KILLED_NODE="${node}"; KILLED_TASK="$2"; KILLED_CID="${cid}"
 }
 
 # --- assertions -------------------------------------------------------------
 
 assert_count() { # <job> <min-running> <slo-secs>
+  # Besides count>=N, require evidence the recovery actually HAPPENED when we
+  # know what was killed: a gracefully-stopped alloc must be replaced by a
+  # DIFFERENT running alloc id; a hard-killed inner task container must be
+  # running again under a NEW container id (Nomad restarts the task in-place —
+  # the alloc id survives, but docker restarts always mint a new container id).
+  local killed_alloc="${KILLED_ALLOC}" killed_node="${KILLED_NODE}"
+  local killed_task="${KILLED_TASK}" killed_cid="${KILLED_CID}"
+  KILLED_ALLOC=""; KILLED_NODE=""; KILLED_TASK=""; KILLED_CID=""
   local t=0
-  until [ "$(count_running "$1")" -ge "$2" ]; do
+  while :; do
+    if [ "$(count_running "$1")" -ge "$2" ]; then
+      if [ -n "${killed_alloc}" ]; then
+        # Replacement leg: >=N running allocs NOT counting the stopped one.
+        if [ "$(running_allocs "$1" | grep -cv "^${killed_alloc}\$")" -ge "$2" ]; then
+          log "$1 has >= $2 running alloc(s) after ${t}s (stopped alloc ${killed_alloc} replaced)"
+          return 0
+        fi
+      elif [ -n "${killed_cid}" ]; then
+        # Restart leg: same task name running again under a new container id.
+        local cid_now
+        cid_now="$(docker exec "${killed_node}" sh -c 'docker ps --filter name='"${killed_task}"' -q | head -1' 2>/dev/null || true)"
+        if [ -n "${cid_now}" ] && [ "${cid_now}" != "${killed_cid}" ]; then
+          log "$1 has >= $2 running alloc(s) after ${t}s (${killed_task} restarted on ${killed_node}: ${killed_cid} -> ${cid_now})"
+          return 0
+        fi
+      else
+        log "$1 has >= $2 running alloc(s) after ${t}s"
+        return 0
+      fi
+    fi
     sleep 3; t=$((t+3))
-    [ "${t}" -ge "$3" ] && fail "$1 did not reach >= $2 running within $3s (have $(count_running "$1"))"
+    [ "${t}" -ge "$3" ] && fail "$1 did not reach >= $2 running (with the killed alloc/task replaced) within $3s (have $(count_running "$1"))"
   done
-  log "$1 has >= $2 running alloc(s) after ${t}s"
 }
 
 assert_progress() {
@@ -425,42 +539,92 @@ run_case() { # <case-name>
 
   # One dedicated fresh funded account per case (single sender, nonces from 0)
   # so cases never collide / leave nonce gaps on the never-reset chain.
+  if [ "${name}" = "sequencer-replica-kill" ]; then
+    # PIN this case's load to SHARD 0 — the shard whose replica A is killed
+    # (seq-a on node-0). An arbitrary account lands on shard 0 or 1 by address
+    # hash, so ~half of runs would otherwise drive an UNTOUCHED shard and the
+    # failover assertions would prove nothing about the kill. Accounts skipped
+    # here are burned, never reused (their nonce chains stay untouched at 0).
+    while [ "${CHAOS_ACCT}" -le 15 ] && [ "${ACCT_SHARD[${CHAOS_ACCT}]}" -ne 0 ]; do
+      log "${name}: skipping funded account #${CHAOS_ACCT} (shard ${ACCT_SHARD[${CHAOS_ACCT}]}; case needs shard 0)"
+      CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
+    done
+  fi
   local acct="${CHAOS_ACCT}"
   CHAOS_ACCT=$(( CHAOS_ACCT + 1 ))
   [ "${acct}" -le 15 ] || fail "ran out of funded chaos accounts (#${acct} > 15); reduce CHAOS_CASES"
+
+  # Per-case load window. sequencer-replica-kill needs load still FLOWING
+  # after the killed replica's restart SLO — its post-restart coverage
+  # assertion observes the restarted replica publishing refs for the pinned
+  # shard, which requires live traffic — so its window is widened to cover
+  # inject + restart + margin regardless of the global CHAOS_CASE_S.
+  local case_s="${CHAOS_CASE_S}"
+  if [ "${name}" = "sequencer-replica-kill" ]; then
+    local min_s=$(( INJECT_DELAY + CHAOS_RESTART_SLO_S + 60 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+  fi
+
+  # Ingress baseline BEFORE the load starts, for the injection gate below.
+  local rx0
+  rx0="$(ingress_received || echo 0)"
 
   # Steady background load for the whole inject+recover window. Drain deadline
   # outlives the recovery SLO so txs accepted before/around the kill still
   # receipt after recovery.
   local drain=$(( CHAOS_RESCHEDULE_SLO_S + 60 ))
-  "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id "${CHAIN_ID}" --chaos-mode --duration "${CHAOS_CASE_S}s" \
+  "${LOAD_BIN}" --rpc "${RPC_URL}" --chain-id "${CHAIN_ID}" --chaos-mode --duration "${case_s}s" \
     --target-tps "${CHAOS_TPS}" --senders 1 --sender-offset "${acct}" \
     --nonce-start 0 --assert-all-delivered --completeness accepted \
     --max-gap "${LOAD_MAX_GAP}" --scrape executor,ingress,sequencer \
     --drain-timeout "${drain}s" --output "${out}" >"${logf}" 2>&1 &
   LOAD_PID=$!
 
+  # Injection gate: INJECT_DELAY is a MINIMUM, not proof that load is flowing —
+  # on a thrashed runner the harness can still be pre-generating/connecting
+  # when a fixed sleep expires, and a kill into an idle pipeline asserts
+  # nothing. Require the ingress received counter to move past its pre-load
+  # baseline (bounded by LOAD_FLOW_TIMEOUT_S) before injecting.
   sleep "${INJECT_DELAY}"
+  local rx1 waited=0
+  while :; do
+    rx1="$(ingress_received || echo "${rx0}")"
+    [ "${rx1}" -gt "${rx0}" ] && break
+    kill -0 "${LOAD_PID}" 2>/dev/null \
+      || fail "${name}: kardamom-load exited before any tx reached ingress (see ${logf})"
+    [ "${waited}" -ge "${LOAD_FLOW_TIMEOUT_S}" ] \
+      && fail "${name}: load not flowing after ${LOAD_FLOW_TIMEOUT_S}s (ingress received ${rx0} -> ${rx1}); refusing to inject into an idle pipeline"
+    sleep 3; waited=$(( waited + 3 ))
+  done
+  log "load flowing (ingress received ${rx0} -> ${rx1}); injecting"
 
   case "${name}" in
     graceful-executor)  inject_graceful executor;                       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
-    hard-executor)      inject_hard kardamom-executor-0 executor;       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-executor)      inject_hard "kardamom-executor-0 kardamom-executor-1 kardamom-executor-2" executor; assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
     graceful-ingress)   inject_graceful ingress;                        assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
     hard-ingress)       inject_hard kardamom-ingress-0 ingress;         assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
     # Sequencers run P=2 racing replicas per shard (job groups seq-a/seq-b,
     # 4 allocs total): a kill no longer stalls its shard — the twin on the
     # other node keeps ordering, so these also assert live pipeline progress.
     graceful-sequencer) inject_graceful sequencer;                      assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
-    hard-sequencer)     inject_hard kardamom-sequencer-0 sequencer;     assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
+    # Explicit task name: `name=sequencer` would match BOTH the sequencer-a and
+    # sequencer-b task containers and kill an arbitrary one.
+    hard-sequencer)     inject_hard kardamom-sequencer-0 sequencer-a;   assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
 
     sequencer-replica-kill)
       # HARD-kill a SPECIFIC replica (seq-a on node-0 = shard 0's replica A;
-      # its twin is seq-b on node-1). The shard must stay live with NO stall —
-      # the racing twin never stopped and the cluster dedups its refs — and
-      # the killed replica restarts to full strength (4/4).
+      # its twin is seq-b on node-1). The case's load is PINNED to shard 0
+      # (see the account selection above), so the assertions actually cover
+      # the shard that lost a replica: it must stay live with NO stall — the
+      # racing twin never stopped and the cluster dedups its refs — the killed
+      # replica restarts to full strength (4/4) and comes back healthy.
+      # Established-sender coverage on the rejoiner is a KNOWN gap (re-opened
+      # F02.1, see assert_replica_healthy).
       inject_hard kardamom-sequencer-0 sequencer-a
       assert_progress
       assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
+      # seq-a on node-0: sequencer ip lane starts at .21, seq-a metrics :9001.
+      assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
       ;;
     sealer-graceful)    inject_graceful sealer;                         assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
     # KNOWN GAP (single-sealer topology): after a HARD sealer crash the executors
@@ -545,6 +709,11 @@ run_case() { # <case-name>
       #      (driver + dependent-task restart chain, hence the wider SLO).
       local aeron_base
       aeron_base="$(count_running aeron)"
+      # A hiccuping nomad query reads as 0/empty; injecting anyway would make
+      # the post-kill `assert_count aeron >= 0` pass trivially and silently
+      # drop the "driver restarted" leg of the case.
+      [ "${aeron_base:-0}" -gt 0 ] \
+        || fail "archive-driver-loss: no running aeron allocs at baseline (got '${aeron_base}') — cannot assert driver recovery"
       log "archive-driver-loss: killing archiving-media-driver on kardamom-ingress-0 (aeron allocs baseline=${aeron_base})"
       inject_hard kardamom-ingress-0 archiving-media-driver
       assert_progress
@@ -690,9 +859,11 @@ run_case() { # <case-name>
       ;;
 
     validator-lapse)
-      # No component killed: pause the (off-hot-path) validator and assert its
-      # side-stream refetch recovers full verification coverage. All the
-      # validator-specific asserts live in the helper.
+      # No component killed: pause the (off-hot-path) validator and assert it
+      # resumes verifying with coverage held — the live term buffer redelivers
+      # the paused window on resume, and the catch-up skip (#78) bounds
+      # anything that aged out. All validator-specific asserts live in the
+      # helper.
       run_validator_lapse
       ;;
 

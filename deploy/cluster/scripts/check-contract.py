@@ -190,10 +190,12 @@ must_contain(
 
 # --- Aeron Cluster (Raft) sealer ------------------------------------------------
 # The 3-member cluster topology is the canonical contract here, but it is mirrored
-# as literals in three places that cannot read YAML:
+# as literals in four places that cannot read YAML:
 #   - nomad/cluster.nomad.hcl    : the -Dkardamom.cluster.members string + ingressStreamId
 #   - config/sequencer.toml.tpl  : the [cluster] ingress_endpoints + stream ids
 #   - config/executor.toml       : the [cluster] ingress_endpoints + stream ids
+#   - config/ingress.toml        : the [cluster] ingress_endpoints + stream ids
+#                                  (on-quorum watermark client)
 # Derive the expected member endpoints from node_classes.sealer (ip_start lane on
 # ip_prefix) + cluster_member_count + cluster_ports, then assert each mirror agrees.
 ip_prefix = scalar(gv, "ip_prefix")
@@ -270,7 +272,7 @@ if (
     expected_endpoints = ",".join(
         f"{i}={ip}:{p['ingress']}" for i, ip in enumerate(member_ips)
     )
-    for tpl in ("sequencer.toml.tpl", "executor.toml"):
+    for tpl in ("sequencer.toml.tpl", "executor.toml", "ingress.toml"):
         must_contain(
             CLUSTER / "config" / tpl,
             f'ingress_endpoints = "{expected_endpoints}"',
@@ -288,7 +290,8 @@ if (
         )
 # Per-node egress endpoint is injected by the Nomad job (port differs only by
 # node IP), so assert the job carries the flag with the canonical egress port.
-for job in ("sequencer", "executor"):
+# Ingress passes the same flag for its on-quorum watermark cluster client.
+for job in ("sequencer", "executor", "ingress"):
     must_contain(
         jobs / f"{job}.nomad.hcl",
         f"${{meta.node_ip}}:{cluster_egress_port}",

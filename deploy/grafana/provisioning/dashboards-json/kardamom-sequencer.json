@@ -64,13 +64,13 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_ingested_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "expr": "max by (partition) (rate(kardamom_sequencer_tx_ingested_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
           "legendFormat": "{{partition}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Ingest rate (rps by partition)",
+      "title": "Ingest rate (rps by partition, max across racing replicas)",
       "type": "timeseries"
     },
     {
@@ -82,13 +82,13 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_published_to_b_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "expr": "max by (partition) (rate(kardamom_sequencer_tx_published_to_b_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
           "legendFormat": "{{partition}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Publish-to-B rate (rps by partition)",
+      "title": "Publish-to-B rate (rps by partition, max across racing replicas)",
       "type": "timeseries"
     },
     {
@@ -100,13 +100,13 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_buffered_future_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "expr": "max by (partition) (rate(kardamom_sequencer_tx_buffered_future_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
           "legendFormat": "{{partition}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Tx buffered (future) rate",
+      "title": "Tx buffered (future) rate (max across replicas)",
       "type": "timeseries"
     },
     {
@@ -118,13 +118,13 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "sum by (partition) (rate(kardamom_sequencer_tx_dropped_past_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "expr": "max by (partition) (rate(kardamom_sequencer_tx_dropped_past_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
           "legendFormat": "{{partition}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Tx dropped (past) rate",
+      "title": "Tx dropped (past) rate (max across replicas)",
       "type": "timeseries"
     },
     {
@@ -142,7 +142,7 @@
           "refId": "A"
         }
       ],
-      "title": "Backpressure events",
+      "title": "Backpressure events (summed across replicas — real per-replica events)",
       "type": "timeseries"
     },
     {
@@ -186,13 +186,32 @@
       "targets": [
         {
           "datasource": {"type": "prometheus", "uid": "prometheus"},
-          "expr": "sum by (partition) (rate(kardamom_sequencer_pending_evictions_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "expr": "max by (partition) (rate(kardamom_sequencer_pending_evictions_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
           "legendFormat": "{{partition}}",
           "range": true,
           "refId": "A"
         }
       ],
-      "title": "Pending evictions rate",
+      "title": "Pending evictions rate (max across replicas)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "description": "Stalled nonce floors adopted from the live stream (per adopted sender). A restarted replica regaining coverage of established senders shows a burst here per replica; sustained non-zero means floors chronically lag (investigate). Per-replica series (host_id), NOT deduped: each replica's fast-forwards are real events.",
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 24},
+      "id": 8,
+      "options": {"legend": {"calcs": [], "displayMode": "list", "placement": "bottom", "showLegend": true}, "tooltip": {"mode": "multi", "sort": "none"}},
+      "targets": [
+        {
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "expr": "sum by (partition, host_id) (rate(kardamom_sequencer_nonce_floor_fastforward_total{host_id=~\"$host\", partition=~\"$partition\"}[1m]))",
+          "legendFormat": "{{partition}} {{host_id}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Nonce-floor fast-forwards (rejoin coverage recovery)",
       "type": "timeseries"
     },
     {

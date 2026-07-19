@@ -1,7 +1,14 @@
 # Spec: `--log-config` plumbing (#36) + deployable recorder/quorum process (#38)
 
 - **Date:** 2026-06-12
-- **Status:** Draft — pending plan approval
+- **Status:** Historical — **superseded** by archive-at-the-sealer durability.
+  The recorder/quorum machinery this spec designed (`kardamom-recorder`,
+  `run_watermark_loop`, `WatermarkPublisher`, `Recorder::start_a/start_b`,
+  Q-of-N aggregation) was later removed; the sealer's Aeron Cluster members
+  fold ordering + durability into the Raft log + archive, and the durable
+  watermark is the sealer archive's position. The `--log-config` plumbing
+  (#36) lives on. Kept as a point-in-time design record — do not implement
+  from it.
 - **Branch:** `claude/nomad-ansible-deploy` (PR #35)
 - **Issues:** #36 (channels config plumbing), #38 (recorder process), resolves #37
   (per-node rendering) by design; #39 (live batcher) stays out of scope.

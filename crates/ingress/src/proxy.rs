@@ -23,6 +23,7 @@ use crate::receipt_cache::ReceiptCache;
 use crate::routing::partition_for;
 use crate::seen_receipts::SeenReceipts;
 use crate::sig_verify::BatchVerifier;
+use crate::tx_error_dedup::TxErrorDedup;
 
 /// Drains a `broadcast::Receiver<T>` and forwards each item to `f`, swallowing
 /// `Lagged` and exiting on `Closed`. Used by the four proxy watcher tasks.
@@ -84,6 +85,12 @@ where
     /// must-deliver ack fires exactly once. No-op on the single-executor IPC
     /// path. See [`crate::seen_receipts`].
     pub(crate) seen_receipts: Arc<SeenReceipts>,
+    /// Consumer-side tx_errors dedup for P racing sequencer replicas: drops
+    /// the twin's duplicate copy of each per-tx rejection, and suppresses a
+    /// rejection once a success for the same `(sender, nonce)` was observed.
+    /// No-op on a single-replica (P=1) deployment. See
+    /// [`crate::tx_error_dedup`].
+    pub(crate) tx_error_dedup: Arc<TxErrorDedup>,
     pub(crate) publication: P,
     pub(crate) subscription: S,
     pub(crate) correlation_seq: Arc<AtomicU64>,
@@ -111,6 +118,7 @@ where
             pending: self.pending.clone(),
             cache: self.cache.clone(),
             seen_receipts: self.seen_receipts.clone(),
+            tx_error_dedup: self.tx_error_dedup.clone(),
             publication: self.publication.clone(),
             subscription: self.subscription.clone(),
             correlation_seq: self.correlation_seq.clone(),
@@ -138,6 +146,7 @@ where
         let pending = Arc::new(PendingReceipts::new(cfg.ack_policy));
         let cache = Arc::new(ReceiptCache::new(cfg.receipt_cache_capacity));
         let seen_receipts = Arc::new(SeenReceipts::default());
+        let tx_error_dedup = Arc::new(TxErrorDedup::default());
         let me = Self {
             cfg,
             rate_limiter,
@@ -145,6 +154,7 @@ where
             pending,
             cache,
             seen_receipts,
+            tx_error_dedup,
             publication,
             subscription,
             correlation_seq: Arc::new(AtomicU64::new(0)),
@@ -210,13 +220,28 @@ where
         // The sequencer emits a `TxError` on the tx_errors channel when it
         // rejects an inbound tx (duplicate / past-nonce today). Match it
         // against parked submissions by `(sender, nonce)` and release the
-        // client immediately with a JSON-RPC error rather than letting them
-        // wait for a receipt that will never arrive.
+        // client with a JSON-RPC error rather than letting them wait for a
+        // receipt that will never arrive.
+        //
+        // RACING-REPLICA DEDUP (F02.6): with P sequencer replicas racing per
+        // shard, BOTH replicas emit the same per-tx rejection (up to P copies
+        // here), and a rejection from one replica can race a SUCCESS from its
+        // twin. `tx_error_dedup` drops duplicate copies by
+        // `{sender, nonce, reason class}` and drops rejections already
+        // overridden by an observed receipt; `pending.on_tx_error` additionally
+        // holds the release for a short grace so a success arriving just after
+        // the rejection still wins.
         let rx = self.subscription.subscribe_tx_errors();
         let pending = self.pending.clone();
+        let dedup = self.tx_error_dedup.clone();
         spawn_broadcast_watcher(rx, move |err: TxError| {
             let pending = pending.clone();
+            let dedup = dedup.clone();
             async move {
+                if !dedup.observe_error(err.sender, err.nonce, &err.reason) {
+                    metrics::counter!(crate::metrics::TX_ERROR_DUPLICATE_TOTAL).increment(1);
+                    return;
+                }
                 pending.on_tx_error(err.sender, err.nonce, err.reason).await;
             }
         });
@@ -243,10 +268,12 @@ where
         let pending = self.pending.clone();
         let cache = self.cache.clone();
         let seen = self.seen_receipts.clone();
+        let error_dedup = self.tx_error_dedup.clone();
         spawn_broadcast_watcher(rx, move |receipt: Receipt| {
             let pending = pending.clone();
             let cache = cache.clone();
             let seen = seen.clone();
+            let error_dedup = error_dedup.clone();
             async move {
                 // First-wins: `insert` returns false if the hash was already
                 // present, i.e. this is a duplicate replica copy → drop it.
@@ -256,6 +283,9 @@ where
                 }
                 let sender = receipt.from;
                 let nonce = receipt.nonce;
+                // Success overrides rejection (F02.6): mark the outcome so a
+                // racing replica's late DuplicatedTx for this tx is dropped.
+                error_dedup.record_success(sender, nonce);
                 cache.insert(receipt.clone());
                 pending.on_receipt(sender, nonce, receipt).await;
             }

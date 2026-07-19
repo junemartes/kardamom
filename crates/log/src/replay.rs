@@ -52,7 +52,7 @@ use rusteron_archive::{
     AeronArchiveReplayMerge, Handler, Handlers,
 };
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::codec;
 use crate::config::AeronConfig;
@@ -72,6 +72,10 @@ pub struct ReplayMergeSubscriber<T, L = BPosition> {
     rx: UnboundedReceiver<(L, T)>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    /// Set by the poll thread when it dies with a fatal error (archive error,
+    /// coverage gap, decode failure, stuck merge). `None` after a clean stop.
+    /// See [`take_failure`](Self::take_failure).
+    failure: Arc<std::sync::Mutex<Option<LogError>>>,
 }
 
 /// Parameters for opening a replay-merge subscriber. The channels mirror the
@@ -128,6 +132,8 @@ where
         let (msg_tx, msg_rx) = unbounded_channel::<(L, T)>();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let failure = Arc::new(std::sync::Mutex::new(None));
+        let failure_thread = failure.clone();
 
         let join = thread::Builder::new()
             .name("kardamom-replay-merge".into())
@@ -139,7 +145,12 @@ where
                         msg_tx.send(rec).map_err(|_| ())
                     })
                 {
-                    warn!(error = %e, "replay-merge subscriber stopped with error");
+                    // A dead replay thread is a failed crash recovery, not a
+                    // clean end-of-stream: log at error level and record the
+                    // failure so the consumer can distinguish the closed
+                    // channel from a clean stop (and exit non-zero).
+                    error!(error = %e, "replay-merge subscriber stopped with error");
+                    *failure_thread.lock().expect("replay failure lock") = Some(e);
                 }
             })
             .map_err(|e| LogError::Aeron(format!("spawn replay-merge thread: {e}")))?;
@@ -148,6 +159,7 @@ where
             rx: msg_rx,
             stop,
             join: Some(join),
+            failure,
         })
     }
 
@@ -155,6 +167,15 @@ where
     /// subscriber is stopped.
     pub async fn recv(&mut self) -> Option<(L, T)> {
         self.rx.recv().await
+    }
+
+    /// Take the fatal error the poll thread died with, if any. After
+    /// [`recv`](Self::recv) returns `None`, `Some(_)` here means the replay
+    /// terminated abnormally (failed crash recovery) and the consumer must
+    /// treat it as an error — a `None` is a clean stop/end-of-stream. The
+    /// error is moved out; subsequent calls return `None`.
+    pub fn take_failure(&self) -> Option<LogError> {
+        self.failure.lock().expect("replay failure lock").take()
     }
 
     /// Borrow the receiver (e.g. to bridge into a sync channel).
@@ -224,23 +245,40 @@ where
         recording_id = desc.recording_id,
         session_id = desc.session_id,
         start_position = desc.start_position,
+        matching_recordings = desc.matching_recordings,
         stream_id = params.stream_id,
         "replay-merge: recording resolved"
     );
     // Single-session assumption: we replay exactly the latest recording for the
-    // stream. If its start_position is non-zero, the publisher (e.g. the sealer
-    // for tx_ordering) restarted and an EARLIER session holds records before
-    // this one — replaying only this recording would skip them, and the
-    // executor's boundary-alignment check would then crash-loop. Warn loudly so
-    // the gap is diagnosable rather than surfacing as an opaque misalignment.
+    // stream, and recovery correctness depends on GAPLESS coverage from the
+    // stream's origin (the executor skip-counts from record 0, so every record
+    // — even in the skipped prefix — must be replayable). Two ways coverage can
+    // be broken, both fatal (a warn would surface later as an opaque
+    // BoundaryMisaligned / join-timeout crash-loop):
+    //   1. More than one recording matches the stream: a restarted publisher
+    //      creates a NEW session whose recording starts at position 0 again, so
+    //      the earlier sessions' records are invisible to this replay.
+    //   2. The latest recording itself does not start at position 0 (the
+    //      recorder attached after the publication had already offered
+    //      fragments) — Aeron also rejects a replay from before a recording's
+    //      start_position.
+    // Stitching multiple recordings/sessions is future work; until then, fail
+    // hard with a diagnosable error instead of silently omitting records.
+    if desc.matching_recordings > 1 {
+        return Err(LogError::Aeron(format!(
+            "replay-merge: {} recordings exist for stream {} (publisher restarted?); \
+             replaying only the latest (id {}) would silently skip every earlier \
+             session's records — refusing to run an incomplete recovery",
+            desc.matching_recordings, params.stream_id, desc.recording_id
+        )));
+    }
     if desc.start_position != 0 {
-        warn!(
-            recording_id = desc.recording_id,
-            start_position = desc.start_position,
-            stream_id = params.stream_id,
-            "replay-merge: latest recording does not start at position 0 — an earlier \
-             publisher session may hold records this replay will skip"
-        );
+        return Err(LogError::Aeron(format!(
+            "replay-merge: recording {} for stream {} starts at position {} (not 0) — \
+             records published before the recording began cannot be replayed; \
+             refusing to run an incomplete recovery",
+            desc.recording_id, params.stream_id, desc.start_position
+        )));
     }
 
     // Manual-mode subscription filtered to the recording's session, so the
@@ -278,7 +316,10 @@ where
         &replay_destination,
         &live_destination,
         desc.recording_id,
-        0, // start_position: from the earliest recorded position
+        // Replay from the recording's own start (guaranteed 0 by the coverage
+        // check above; passing the descriptor's value keeps this correct if
+        // that invariant ever changes rather than hardcoding an assumption).
+        desc.start_position,
         rusteron_archive::Aeron::epoch_clock(),
         MERGE_PROGRESS_TIMEOUT_MS,
     )
@@ -346,17 +387,27 @@ where
 }
 
 /// A resolved recording: its id, the session id of the publication it records
-/// (needed to filter the replay-merge subscription to one stream), and its
-/// start position (used to detect a publisher-restart session gap).
+/// (needed to filter the replay-merge subscription to one stream), its start
+/// position, and how many recordings matched the stream in total (>1 means an
+/// earlier publisher session exists — a coverage gap for replay).
 struct ResolvedRecording {
     recording_id: i64,
     session_id: i32,
     start_position: i64,
+    matching_recordings: usize,
 }
 
-/// Find the most-recent recording for `stream_id`, waiting (until `stop`) for a
-/// publisher to connect so the recording appears in the catalog. Mirrors
-/// `recorder::active_recording_for_stream` but also captures the session id.
+/// Catalog page size per `list_recordings_for_uri` call. The catalog is paged
+/// through to exhaustion — recording ids are archive-global across all streams
+/// (10+ recorders per boot, one new recording per process restart), so the
+/// newest recording for a stream can sit far beyond the first page.
+const CATALOG_PAGE: i32 = 100;
+
+/// Find the most-recent recording for `stream_id` (paging through the whole
+/// archive catalog), waiting (until `stop`) for a publisher to connect so the
+/// recording appears in the catalog. Mirrors
+/// `recorder::active_recording_for_stream` but also captures the session id,
+/// start position, and total match count.
 fn resolve_recording(
     archive: &rusteron_archive::AeronArchive,
     stream_id: i32,
@@ -364,6 +415,7 @@ fn resolve_recording(
 ) -> Result<Option<ResolvedRecording>, LogError> {
     struct Found {
         latest: Cell<Option<(i64, i32, i64)>>,
+        matches: Cell<usize>,
     }
     struct Consumer {
         found: Rc<Found>,
@@ -375,6 +427,7 @@ fn resolve_recording(
         ) {
             let id = desc.recording_id();
             let entry = (id, desc.session_id(), desc.start_position());
+            self.found.matches.set(self.found.matches.get() + 1);
             let cur = self.found.latest.get();
             // Keep the highest recording id (the live one; recordings run for
             // the process lifetime with auto_stop=false).
@@ -390,26 +443,45 @@ fn resolve_recording(
     while !stop.load(Ordering::Acquire) {
         let found = Rc::new(Found {
             latest: Cell::new(None),
-        });
-        let mut handler = Handler::leak(Consumer {
-            found: found.clone(),
+            matches: Cell::new(0),
         });
         let any_channel = CString::new("").expect("empty fragment has no NUL");
-        let res = archive.list_recordings_for_uri(
-            0,
-            100,
-            any_channel.as_c_str(),
-            stream_id,
-            Some(&handler),
-        );
-        handler.release();
-        res.map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+        // Page from record id 0 until a page comes back short: each call scans
+        // the catalog in id order from `from_record_id` and delivers up to
+        // CATALOG_PAGE *matching* descriptors, so a full page means more
+        // catalog may remain beyond the highest id delivered.
+        let mut from_record_id: i64 = 0;
+        loop {
+            let mut handler = Handler::leak(Consumer {
+                found: found.clone(),
+            });
+            let res = archive.list_recordings_for_uri(
+                from_record_id,
+                CATALOG_PAGE,
+                any_channel.as_c_str(),
+                stream_id,
+                Some(&handler),
+            );
+            handler.release();
+            let count =
+                res.map_err(|e| LogError::Aeron(format!("list_recordings_for_uri: {e}")))?;
+            if count < CATALOG_PAGE {
+                break; // catalog exhausted
+            }
+            // A full page: continue after the highest matching id seen so far
+            // (the scan is in id order, so everything at or below it is done).
+            match found.latest.get() {
+                Some((max_id, _, _)) => from_record_id = max_id + 1,
+                None => break, // defensive: full page but no match recorded
+            }
+        }
 
         if let Some((recording_id, session_id, start_position)) = found.latest.get() {
             return Ok(Some(ResolvedRecording {
                 recording_id,
                 session_id,
                 start_position,
+                matching_recordings: found.matches.get(),
             }));
         }
         if !logged {

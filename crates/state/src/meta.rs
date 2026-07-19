@@ -24,6 +24,12 @@ pub const KEY_SCHEMA_VERSION: &[u8] = b"schema_version";
 /// idempotent across restarts independently of the block cursor (genesis is
 /// "block 0", so `last_committed_block` stays 0 until the first real block).
 pub const KEY_GENESIS_APPLIED: &[u8] = b"genesis_applied";
+/// Digest (32 B keccak) of the genesis allocations seeded into this env (see
+/// `crate::genesis`). Compared on every restart so a changed `--chain` file (or
+/// a node pointed at the wrong state dir) fails startup instead of silently
+/// running on divergent genesis state. May be absent on envs seeded before the
+/// digest existed; it is backfilled on the next start.
+pub const KEY_GENESIS_DIGEST: &[u8] = b"genesis_digest";
 /// Latest computed Ethereum MPT world-state root (32 B). Written by the
 /// trie-aware writer (`StateWriter::spawn_with_trie`) in the same RW txn as the
 /// block it commits; absent on databases written by the plain (non-trie)

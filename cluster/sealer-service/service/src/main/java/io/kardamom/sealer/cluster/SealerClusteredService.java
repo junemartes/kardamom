@@ -2,6 +2,8 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.ExclusivePublication;
 import io.aeron.Image;
+import io.aeron.ImageFragmentAssembler;
+import io.aeron.Publication;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
 import io.aeron.cluster.service.Cluster;
@@ -15,6 +17,7 @@ import java.util.Optional;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
+import org.agrona.concurrent.IdleStrategy;
 import org.agrona.concurrent.UnsafeBuffer;
 
 /**
@@ -61,6 +64,9 @@ public final class SealerClusteredService implements ClusteredService {
     /** Replay request: {@code [kind:1][from_index:u64 LE][from_block:u64 LE]}. */
     public static final byte KIND_REPLAY_REQUEST = 1;
 
+    /** Minimum valid replay-request length: kind + from_index + from_block. */
+    private static final int MIN_REPLAY_REQUEST_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
+
     /** Egress message kinds (first byte of every egress frame). */
     public static final byte EGRESS_KIND_RELAYED = 1;
     public static final byte EGRESS_KIND_BOUNDARY = 2;
@@ -71,6 +77,20 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     private static final int DEFAULT_RETENTION = 65536;
+
+    /**
+     * Default first-seen dedup window. SAFETY INVARIANT: the window must be
+     * larger than (worst-case racing-replica stall × peak unique-record
+     * throughput), or a replica that resumes after its ids were FIFO-evicted
+     * gets its re-offers accepted as fresh — the same tx ordered TWICE in the
+     * canonical log. At 10k unique tx/s the previous default of 8192 tolerated
+     * a stall of only ~0.8s (a single GC pause / cgroup throttle); 1&lt;&lt;17
+     * tolerates ~13s for ~20MB of heap and a ~4MB snapshot (snapshot I/O is
+     * chunked, see {@link #writeSnapshot}). All members MUST agree on the
+     * window ({@code -Dkardamom.cluster.dedupCapacity}) — it is part of the
+     * deterministic state machine.
+     */
+    public static final int DEFAULT_DEDUP_CAPACITY = 1 << 17;
 
     /** Correlation id used when scheduling the repeating boundary timer. */
     public static final long BOUNDARY_TIMER_CORRELATION_ID = 1L;
@@ -103,7 +123,9 @@ public final class SealerClusteredService implements ClusteredService {
      * client had no session are missed forever and its canonical stream has an
      * unrecoverable gap. Deterministic across members (derived from the
      * replicated log); NOT snapshotted (v1): a member restarted from snapshot
-     * serves REPLAY_UNAVAILABLE for pre-restart ranges, an honest degradation.
+     * initializes the retention floors from the restored state (see
+     * {@link #onStart}) and serves REPLAY_UNAVAILABLE for pre-restart ranges,
+     * an honest degradation.
      */
     private final java.util.ArrayDeque<RetainedFrame> retained = new java.util.ArrayDeque<>();
     private final int retentionCap =
@@ -111,6 +133,9 @@ public final class SealerClusteredService implements ClusteredService {
     /** First record index / boundary block still guaranteed retained. */
     private long firstRetainedIndex = 0L;
     private long firstRetainedBlock = CanonicalSealerState.GENESIS_BLOCK_NUMBER;
+
+    /** Malformed ingress frames dropped (logged at power-of-two counts). */
+    private long droppedFrameCount = 0;
 
     // Scratch buffers for ingress id extraction and egress framing. Reused to
     // avoid per-message allocation on the single cluster service thread.
@@ -128,16 +153,29 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     public SealerClusteredService() {
-        this(8192, CanonicalSealerState.TICK_INTERVAL_MS);
+        this(DEFAULT_DEDUP_CAPACITY, CanonicalSealerState.TICK_INTERVAL_MS);
     }
 
     @Override
     public void onStart(Cluster cluster, Image snapshotImage) {
         this.cluster = cluster;
         if (snapshotImage != null) {
-            // Restore canonical state from the cluster snapshot. The whole
-            // snapshot is a single message poll'd off the snapshot image.
-            this.state = loadFromSnapshot(snapshotImage);
+            // Restore canonical state from the cluster snapshot. An unreadable
+            // or empty snapshot image is FATAL: silently restarting at genesis
+            // while the rest of the cluster (and the log replayed after the
+            // snapshot point) assumes the snapshotted state is deterministic
+            // state-machine divergence.
+            final byte[] snapshot = readSnapshot(snapshotImage, cluster.idleStrategy());
+            this.state = CanonicalSealerState.load(snapshot, dedupCapacity);
+            // The retained deque is NOT snapshotted (v1): nothing before the
+            // restore point can ever be served, so the retention floors start
+            // at the first frame this member CAN retain — record index
+            // canonicalCount and boundary block blockNumber (the next ones to
+            // be emitted). Leaving the floors at genesis would answer a
+            // pre-snapshot replay request with a bogus REPLAY_DONE (a silent
+            // canonical gap) instead of the honest REPLAY_UNAVAILABLE.
+            this.firstRetainedIndex = state.canonicalCount();
+            this.firstRetainedBlock = state.blockNumber();
         } else {
             this.state = new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
         }
@@ -178,7 +216,8 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
-        // No-op.
+        // No-op: replay requests are served synchronously (no per-session
+        // replay state to clean up).
     }
 
     @Override
@@ -190,8 +229,9 @@ public final class SealerClusteredService implements ClusteredService {
             final int length,
             final Header header) {
         if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_REPLAY_REQUEST) {
-            if (length < 1 + Long.BYTES + Long.BYTES) {
-                return; // malformed replay request
+            if (length < MIN_REPLAY_REQUEST_LEN) {
+                onMalformedFrame("replay-request", length);
+                return;
             }
             final long fromIndex =
                 buffer.getLong(offset + 1, ByteOrder.LITTLE_ENDIAN);
@@ -202,6 +242,7 @@ public final class SealerClusteredService implements ClusteredService {
         }
         if (length < MIN_INGRESS_LEN) {
             // Malformed / too-short envelope: cannot contain kind + 32-byte id.
+            onMalformedFrame("ingress-envelope", length);
             return;
         }
         // Parse ONLY the 32-byte canonical id at its fixed offset; the payload
@@ -232,12 +273,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
-        final byte[] snapshot = state.takeSnapshot();
-        final UnsafeBuffer buf = new UnsafeBuffer(snapshot);
-        long result;
-        do {
-            result = snapshotPublication.offer(buf, 0, snapshot.length);
-        } while (result < 0 && retryable(result));
+        writeSnapshot(snapshotPublication, state.takeSnapshot(), cluster.idleStrategy());
     }
 
     @Override
@@ -258,28 +294,68 @@ public final class SealerClusteredService implements ClusteredService {
 
     // --- helpers ------------------------------------------------------------
 
-    private CanonicalSealerState loadFromSnapshot(final Image snapshotImage) {
-        final byte[][] holder = new byte[1][];
-        while (holder[0] == null) {
-            final int fragments = snapshotImage.poll(
-                    (buffer, offset, length, header) -> {
-                        final byte[] snapshot = new byte[length];
-                        buffer.getBytes(offset, snapshot);
-                        holder[0] = snapshot;
-                    },
-                    1);
+    /**
+     * Read the WHOLE snapshot byte stream off the snapshot image. Snapshots
+     * larger than the MTU arrive as MANY fragments (and, above
+     * {@code maxMessageLength}, as many messages — see {@link #writeSnapshot}),
+     * so fragments are reassembled with an {@link ImageFragmentAssembler} and
+     * messages concatenated until end-of-stream. A snapshot image that closes
+     * early or carries no bytes is FATAL — never fabricate genesis state.
+     */
+    static byte[] readSnapshot(final Image snapshotImage, final IdleStrategy idleStrategy) {
+        final ExpandableArrayBuffer assembled = new ExpandableArrayBuffer();
+        final int[] size = {0};
+        final ImageFragmentAssembler assembler = new ImageFragmentAssembler(
+                (buffer, offset, length, header) -> {
+                    assembled.putBytes(size[0], buffer, offset, length);
+                    size[0] += length;
+                });
+        while (!snapshotImage.isEndOfStream()) {
+            final int fragments = snapshotImage.poll(assembler, 16);
             if (fragments == 0) {
-                if (snapshotImage.isClosed() || snapshotImage.isEndOfStream()) {
-                    break;
+                if (snapshotImage.isClosed()) {
+                    throw new IllegalStateException(
+                        "snapshot image closed before end-of-stream (read " + size[0] + " bytes)");
                 }
-                cluster.idleStrategy().idle();
+                idleStrategy.idle();
+            } else {
+                idleStrategy.reset();
             }
         }
-        if (holder[0] == null) {
-            // Empty snapshot image (no data): start fresh at genesis.
-            return new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+        if (size[0] == 0) {
+            throw new IllegalStateException("snapshot image was empty");
         }
-        return CanonicalSealerState.load(holder[0], dedupCapacity);
+        final byte[] snapshot = new byte[size[0]];
+        assembled.getBytes(0, snapshot);
+        return snapshot;
+    }
+
+    /**
+     * Offer the full snapshot, chunked at the publication's
+     * {@code maxMessageLength} so ANY dedup-window size round-trips. A
+     * terminal offer result is FATAL: exiting silently would record an
+     * empty/truncated snapshot, and the member restoring from it would
+     * diverge (or refuse to start) with no recorded error.
+     */
+    static void writeSnapshot(
+            final ExclusivePublication snapshotPublication,
+            final byte[] snapshot,
+            final IdleStrategy idleStrategy) {
+        final UnsafeBuffer buf = new UnsafeBuffer(snapshot);
+        final int maxChunk = snapshotPublication.maxMessageLength();
+        int offset = 0;
+        while (offset < snapshot.length) {
+            final int chunk = Math.min(maxChunk, snapshot.length - offset);
+            long result;
+            while ((result = snapshotPublication.offer(buf, offset, chunk)) < 0) {
+                if (result == Publication.CLOSED || result == Publication.MAX_POSITION_EXCEEDED) {
+                    throw new IllegalStateException("snapshot offer failed terminally (" + result
+                        + ") at offset " + offset + "/" + snapshot.length);
+                }
+                idleStrategy.idle();
+            }
+            offset += chunk;
+        }
     }
 
     private void scheduleBoundaryTimer() {
@@ -293,11 +369,23 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Serve a client replay request: re-offer every retained frame at/after the
-     * requested cursor to the REQUESTING session only, then a REPLAY_DONE
+     * Serve a client replay request: re-offer every retained frame at/after
+     * the requested cursor to the REQUESTING session only, then a REPLAY_DONE
      * marker (or REPLAY_UNAVAILABLE when eviction has outrun the request).
      * Runs identically on every member from the replicated log; only the
      * leader's session offers reach the client.
+     *
+     * <p>Served SYNCHRONOUSLY, exactly as on main (validated green in the
+     * cluster e2e CI): the F07.3 timer-driven chunked drain — which also made
+     * live broadcasts SKIP mid-replay sessions — changed the steady-state
+     * egress flow and correlates with the all-shards consumer freeze at
+     * first-record time; correctness beats the leader-stall optimization it
+     * was after (see docs/reviews/2026-07-17-30-commit-review/
+     * fixes-CI-replay-loop.md). The stall is bounded in practice: a WEDGED
+     * consumer costs one {@link #OFFER_DEADLINE_NS} on its first frame and is
+     * then CLOSED (subsequent offers return CLOSED and are skipped
+     * immediately), and healthy consumers drain retained frames at line
+     * rate.</p>
      */
     private void handleReplayRequest(final ClientSession session, final long fromIndex, final long fromBlock) {
         if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
@@ -323,6 +411,7 @@ public final class SealerClusteredService implements ClusteredService {
         offerControl(session, EGRESS_KIND_REPLAY_DONE, state.canonicalCount(), state.blockNumber());
     }
 
+    /** Frame + offer a control message {@code kind(1) | a(8) | b(8)}. */
     private void offerControl(final ClientSession session, final byte kind, final long a, final long b) {
         final MutableDirectBuffer buf = egressBuffer;
         int pos = 0;
@@ -434,14 +523,25 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
 
-    /** Offer arbitrary raw bytes (a retained frame) to one session. */
+    /**
+     * Offer arbitrary raw bytes (a retained frame) to one session, with the
+     * same deadline-then-close semantics as {@link #offerToSession} — incl.
+     * the F07.5 terminal-result close (a MAX_POSITION_EXCEEDED egress is
+     * permanently dead; returning silently would leave a zombie session).
+     */
     private void offerBytesToSession(final ClientSession session, final byte[] frame) {
         final UnsafeBuffer buf = new UnsafeBuffer(frame);
         final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
         long result;
         do {
             result = session.offer(buf, 0, frame.length);
-            if (result >= 0 || !retryable(result)) {
+            if (result >= 0) {
+                return;
+            }
+            if (!retryable(result)) {
+                if (result != Publication.CLOSED) {
+                    session.close();
+                }
                 return;
             }
         } while (System.nanoTime() < deadline);
@@ -453,7 +553,19 @@ public final class SealerClusteredService implements ClusteredService {
         long result;
         do {
             result = session.offer(egressBuffer, 0, length);
-            if (result >= 0 || !retryable(result)) {
+            if (result >= 0) {
+                return;
+            }
+            if (!retryable(result)) {
+                // Terminal result. CLOSED means the session is already gone;
+                // any other terminal result (MAX_POSITION_EXCEEDED: the egress
+                // publication hit its position limit and is permanently dead)
+                // must CLOSE the session — returning silently would leave a
+                // zombie kept alive by ingress keep-alives while every frame
+                // for it is dropped.
+                if (result != Publication.CLOSED) {
+                    session.close();
+                }
                 return;
             }
         } while (System.nanoTime() < deadline);
@@ -475,12 +587,27 @@ public final class SealerClusteredService implements ClusteredService {
         // a ZOMBIE the client cannot detect (observed: a validator starved for
         // 30+ minutes on an intact session after a leader kill). CLOSED /
         // MAX_POSITION_EXCEEDED stay terminal.
-        if (offerResult == io.aeron.Publication.BACK_PRESSURED
-                || offerResult == io.aeron.Publication.ADMIN_ACTION
-                || offerResult == io.aeron.Publication.NOT_CONNECTED) {
+        if (offerResult == Publication.BACK_PRESSURED
+                || offerResult == Publication.ADMIN_ACTION
+                || offerResult == Publication.NOT_CONNECTED) {
             cluster.idleStrategy().idle();
             return true;
         }
         return false;
+    }
+
+    /**
+     * Count + log a dropped malformed frame. These are "should never happen"
+     * paths on an authoritative stream: if the hand-synced Java/Rust envelope
+     * ever drifts (see the TODO(envelope) above) the symptom must be a visible
+     * counter, not silent record loss. Logged at power-of-two counts so a
+     * framing-mismatch flood cannot drown stdout (which the chaos suite greps).
+     */
+    private void onMalformedFrame(final String what, final int length) {
+        droppedFrameCount++;
+        if (Long.bitCount(droppedFrameCount) == 1) {
+            System.out.println("cluster DROPPED malformed " + what + " memberId=" + memberId
+                + " length=" + length + " totalDropped=" + droppedFrameCount);
+        }
     }
 }
