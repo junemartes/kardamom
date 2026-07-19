@@ -17,7 +17,7 @@ use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{
-    BPosition, BlockDelta, Deposit, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
+    BPosition, Deposit, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
     TxOrderingMessage,
 };
 
@@ -128,11 +128,6 @@ pub type TxDepositsSubscriber = TypedSubscriber<Deposit>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
 pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
 
-/// TxBal: per-block BAL stream. Yields the executor's [`BlockDelta`] for each
-/// sealed block. Validators subscribe and cross-check their independent
-/// re-execution against it.
-pub type BalSubscriber = TypedSubscriber<BlockDelta>;
-
 /// Convenience bundle. Uses `Rc` (not `Arc`) because `AeronClient` is
 /// thread-confined (`!Send + !Sync`) and the entire subscriber stack lives
 /// on one Aeron-client thread by design.
@@ -207,15 +202,6 @@ impl Subscribers {
             &self.aeron,
             &self.ch.quorum_watermark_channel,
             self.ch.quorum_watermark_stream_id,
-        )
-    }
-
-    /// Subscribe to the per-block BAL stream (the executor's `BlockDelta`).
-    pub fn bal(&self) -> Result<BalSubscriber, LogError> {
-        TypedSubscriber::open(
-            &self.aeron,
-            &self.ch.tx_bal_channel,
-            self.ch.tx_bal_stream_id,
         )
     }
 }

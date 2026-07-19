@@ -62,12 +62,9 @@ aeron_tmpfs_size: "2g"
 # placement) and `tier` (a coarse group, for collocation/exclusion). Scaling a
 # class is a one-line `count` change — no node lists, inventories, or IP mirrors.
 #
-# Each worker-tier class runs ONE pipeline service. The 3 RECORDERS are NOT their
-# own class: they are a count=3 job COLLOCATED onto the worker tier (tier=worker)
-# with `distinct_hosts`, so each lands on a distinct worker node alongside that
-# node's service. (Step toward eventually merging the recorder + worker roles.)
-# Per-replica identity (recorder_id, partition-index) comes from
-# `${NOMAD_ALLOC_INDEX}`, not node meta.
+# Each worker-tier class runs ONE pipeline service. (The old standalone
+# recorders are gone: durability is archive-at-the-sealer, folded into the
+# Aeron Cluster members.)
 #
 # Replication semantics:
 #   control     1    singleton: consul+nomad server, registry, anvil L1
@@ -82,25 +79,19 @@ aeron_tmpfs_size: "2g"
 #                    multicast group and route to all sequencer shards. Scale by
 #                    bumping count (no channel edits — receipts are multicast,
 #                    correlation_id is namespaced by --ingress-id).
-#   executor    3    state applier; ONE RECORDER COLLOCATED PER EXECUTOR
+#   executor    3    state-machine replica appliers      (tier: worker)
 #   sealer      3    3-member Aeron Cluster (Raft) sealer — ordering +
 #                    durability fold into the Raft log + archive; members at
 #                    .51/.52/.53 (was a singleton tx_ordering MDC publisher)
-#   aux         1    da_watcher + batcher collocated     (tier: worker)
-#   recorder    3    quorum N=3, COLLOCATED 1:1 on the executor nodes
-#                    (role==executor, distinct_hosts; recorder_id = alloc index)
+#   aux         1    validator + da_watcher + batcher    (tier: worker)
 ip_prefix: "192.168.56"
 node_classes:
   control: { count: 1, ip_start: 10, tier: control }
   sequencer: { count: 2, ip_start: 21, tier: sequencer }
   ingress: { count: 2, ip_start: 31, tier: worker } # active/active: ingress-0@.31, ingress-1@.32
-  executor: { count: 3, ip_start: 41, tier: worker } # 3 exec nodes, each with a recorder
+  executor: { count: 3, ip_start: 41, tier: worker } # 3 state-machine replicas
   sealer: { count: 3, ip_start: 51, tier: worker } # 3-member Aeron Cluster (Raft) sealer (.51/.52/.53)
-  aux: { count: 1, ip_start: 61, tier: worker } # da_watcher + batcher
-
-# Number of recorders to collocate across the worker tier (quorum N; Q in
-# channels.toml). Must be <= the worker-tier node count (distinct_hosts).
-recorder_count: 3
+  aux: { count: 1, ip_start: 61, tier: worker } # validator + da_watcher + batcher
 
 # Concrete addresses derived from the class lanes (first instance of each), for
 # the few places that need a fixed target rather than Consul discovery.

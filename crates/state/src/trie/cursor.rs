@@ -20,7 +20,7 @@ const HASHED_ACCT: &str = "hashed_accounts";
 const HASHED_STOR: &str = "hashed_storage";
 
 /// Stored-node key = `[account_hash(32)?] ++ nibble_path(one byte per nibble)`.
-fn node_key(account_hash: Option<&B256>, path: &Nibbles) -> Vec<u8> {
+pub(crate) fn node_key(account_hash: Option<&B256>, path: &Nibbles) -> Vec<u8> {
     let nibs = path.to_vec();
     match account_hash {
         Some(a) => {

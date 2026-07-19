@@ -3,10 +3,15 @@
 //! The ingress `eth_sendRawTransaction` parks the caller until the receipt
 //! arrives (on-offer ack), so submit RTT ≈ end-to-end latency. To drive load
 //! *open-loop* (rate set by a pacer, not by completions) we spawn each submit
-//! as its own task — bounded by an in-flight semaphore — rather than awaiting
-//! one before issuing the next. Every tx is tracked by its locally-computed
-//! hash to a receipt; submits that error are retried, and a post-phase drain
-//! confirms any tx whose receipt hadn't landed inline.
+//! as its own task — bounded by an in-flight semaphore and collected in a
+//! [`tokio::task::JoinSet`] the caller joins before evaluating — rather than
+//! awaiting one before issuing the next. Every tx is tracked by its
+//! locally-computed hash to a receipt; submits that error are retried (after
+//! checking the tx didn't already land, so a duplicate isn't resubmitted),
+//! and a post-phase drain confirms any tx whose receipt hadn't landed inline.
+//! With `verify_receipts` (non-chaos soak) an accepted submit whose receipt
+//! can't be re-fetched stays pending and counts as `missing` if it never
+//! confirms — the independent must-deliver check.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -190,6 +195,7 @@ async fn submit_task(
     tx: PlannedTx,
     _permit: OwnedSemaphorePermit,
     retry: u32,
+    verify_receipts: bool,
 ) {
     tracker.offered.fetch_add(1, Ordering::Relaxed);
     let t0 = Instant::now();
@@ -203,20 +209,48 @@ async fn submit_task(
             break;
         }
         if attempt < retry {
+            // The errored attempt may still have landed (e.g. the connection
+            // died after ingress forwarded the tx). Resubmitting a landed tx
+            // registers as a past-nonce drop at the sequencer, so check for a
+            // receipt first and stop retrying if it's already there.
+            if let Some(status) = receipt_status(&client, tx.hash).await {
+                tracker.confirm(status, t0.elapsed());
+                return;
+            }
             tokio::time::sleep(Duration::from_millis(200 * (u64::from(attempt) + 1))).await;
         }
     }
     if accepted {
-        // on-offer: a successful submit means the receipt already arrived (the
-        // tx was executed + receipted), so count it delivered NOW. Do not gate
-        // delivery on a follow-up eth_getTransactionReceipt — the ingress's
-        // in-memory receipt cache is volatile across an ingress restart, which
-        // would otherwise false-flag already-delivered txs as "missing" during
-        // ingress chaos. Re-fetch only best-effort to check status / latency
-        // (assume success if the cache no longer has it).
         tracker.accepted.fetch_add(1, Ordering::Relaxed);
-        let status = receipt_status(&client, tx.hash).await.unwrap_or(1);
-        tracker.confirm(status, t0.elapsed());
+        // on-offer: a successful submit means the receipt already arrived (the
+        // tx was executed + receipted). Re-fetch it to check status/latency.
+        match receipt_status(&client, tx.hash).await {
+            Some(status) => tracker.confirm(status, t0.elapsed()),
+            None if verify_receipts => {
+                // Non-chaos soak: independently verify the on-offer contract.
+                // No receipt for an accepted tx → keep it pending; the drain
+                // re-polls it, and a never-confirmed leftover is counted
+                // `missing` (must-deliver violated).
+                tracker
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(
+                        tx.hash,
+                        Pending {
+                            submit_ts: t0,
+                            accepted: true,
+                        },
+                    );
+            }
+            None => {
+                // Chaos mode: the ingress's in-memory receipt cache is
+                // volatile across an ingress restart, so a failed re-fetch
+                // would false-flag already-delivered txs as "missing". Trust
+                // the on-offer ack and count it delivered with success status.
+                tracker.confirm(1, t0.elapsed());
+            }
+        }
     } else {
         // Submit never returned a hash. It may still have landed (a prior
         // attempt reached the chain despite the RPC erroring) — let the drain
@@ -242,16 +276,20 @@ async fn submit_task(
 }
 
 /// Drive submissions at `rate` tx/s for `dur`, spawning each as a bounded
-/// (`sem`) task. Returns early if the queues drain first. Submits keep being
-/// confirmed asynchronously; call [`drain`] afterwards to settle the tail.
+/// (`sem`) task collected in `tasks`. Returns early if the queues drain
+/// first. Submits keep being confirmed asynchronously; call
+/// [`join_submit_tasks`] then [`drain`] afterwards to settle the tail.
+#[allow(clippy::too_many_arguments)]
 pub async fn pacer(
     client: Arc<HttpClient>,
     sem: Arc<Semaphore>,
     tracker: Arc<Tracker>,
+    tasks: &mut tokio::task::JoinSet<()>,
     queues: &mut Queues,
     rate: u32,
     dur: Duration,
     retry: u32,
+    verify_receipts: bool,
 ) {
     if rate == 0 {
         return;
@@ -278,13 +316,37 @@ pub async fn pacer(
             let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
                 return;
             };
-            tokio::spawn(submit_task(
+            tasks.spawn(submit_task(
                 Arc::clone(&client),
                 Arc::clone(&tracker),
                 tx,
                 permit,
                 retry,
+                verify_receipts,
             ));
+        }
+    }
+}
+
+/// Await all spawned submit tasks (each internally bounded by the client's
+/// request timeout), giving up at `deadline` so a wedged task can't stall the
+/// verdict forever. Must run before [`drain`]/the final counts read: an
+/// in-flight task is counted `offered` but is not yet `accepted`, `missing`,
+/// or `unlanded`, so evaluating early misclassifies the tail.
+pub async fn join_submit_tasks(tasks: &mut tokio::task::JoinSet<()>, deadline: Instant) {
+    while !tasks.is_empty() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || tokio::time::timeout(remaining, tasks.join_next())
+                .await
+                .is_err()
+        {
+            tracing::warn!(
+                outstanding = tasks.len(),
+                "drain deadline hit with submit task(s) still in flight; \
+                 their txs are counted offered but not accepted/missing/unlanded"
+            );
+            break;
         }
     }
 }
@@ -322,8 +384,14 @@ pub async fn drain(client: Arc<HttpClient>, tracker: Arc<Tracker>, deadline: Ins
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::load::accounting::{EvalInput, evaluate};
     use crate::load::plan::PlannedTx;
+    use crate::load::scrape::MetricsSnapshot;
     use alloy_primitives::Bytes;
+    use jsonrpsee::RpcModule;
+    use jsonrpsee::http_client::HttpClientBuilder;
+    use jsonrpsee::server::{Server, ServerHandle};
+    use jsonrpsee::types::ErrorObjectOwned;
 
     fn tx(sender: usize, nonce: u64) -> PlannedTx {
         PlannedTx {
@@ -365,5 +433,161 @@ mod tests {
             (0, 0, 0, 0)
         );
         assert_eq!(t.remaining_pending(), (0, 0));
+    }
+
+    /// Mock ingress: counts `eth_sendRawTransaction` calls, either accepting
+    /// (returns a hash) or erroring every submit, and serves a fixed value for
+    /// `eth_getTransactionReceipt` (`Null` = receipt never found). The
+    /// returned `ServerHandle` must stay alive for the server's lifetime.
+    async fn mock_ingress(
+        accept_submits: bool,
+        receipt: serde_json::Value,
+    ) -> (Arc<HttpClient>, Arc<AtomicU64>, ServerHandle) {
+        let send_calls = Arc::new(AtomicU64::new(0));
+        let mut module = RpcModule::new(Arc::clone(&send_calls));
+        module
+            .register_method("eth_sendRawTransaction", move |_, calls, _| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                if accept_submits {
+                    Ok(B256::repeat_byte(0x11))
+                } else {
+                    Err(ErrorObjectOwned::owned(-32000, "boom", None::<()>))
+                }
+            })
+            .unwrap();
+        module
+            .register_method("eth_getTransactionReceipt", move |_, _, _| receipt.clone())
+            .unwrap();
+        let server = Server::builder().build("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = server.start(module);
+        let client = Arc::new(
+            HttpClientBuilder::default()
+                .build(format!("http://{addr}"))
+                .unwrap(),
+        );
+        (client, send_calls, handle)
+    }
+
+    async fn permit() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1)).acquire_owned().await.unwrap()
+    }
+
+    /// F15.1 regression: an ingress that acks a submit whose receipt never
+    /// materializes — the exact bug class the must-deliver gate exists to
+    /// catch — must flow into `Pending { accepted: true }`, survive the
+    /// drain, surface as `missing`, and fire the `assert_all_delivered` gate.
+    #[tokio::test]
+    async fn accepted_but_unreceipted_tx_counts_missing_and_fires_must_deliver() {
+        let (client, _, _handle) = mock_ingress(true, serde_json::Value::Null).await;
+        let tracker = Arc::new(Tracker::new().unwrap());
+        submit_task(
+            Arc::clone(&client),
+            Arc::clone(&tracker),
+            tx(0, 0),
+            permit().await,
+            0,
+            true, // verify_receipts (non-chaos soak)
+        )
+        .await;
+
+        let c = tracker.counts();
+        assert_eq!((c.offered, c.accepted, c.receipted), (1, 1, 0));
+
+        // The drain re-polls it (one pass — deadline already due) and still
+        // finds no receipt, so it stays pending as accepted.
+        drain(Arc::clone(&client), Arc::clone(&tracker), Instant::now()).await;
+        let (missing, unlanded) = tracker.remaining_pending();
+        assert_eq!(
+            (missing, unlanded),
+            (1, 0),
+            "accepted-but-unreceipted must surface as missing"
+        );
+
+        // ...and the verdict gate actually fires on it.
+        let base = MetricsSnapshot::default();
+        let fin = MetricsSnapshot::default();
+        let v = evaluate(&EvalInput {
+            counts: tracker.counts(),
+            missing,
+            unlanded,
+            base: &base,
+            fin: &fin,
+            recheck: None,
+            max_gap: 5,
+            assert_all_delivered: true,
+            chaos_mode: false,
+        });
+        assert!(!v.pass);
+        assert!(v.failures.iter().any(|f| f.contains("must-deliver")));
+    }
+
+    /// In chaos mode a failed post-accept re-fetch must NOT count as missing
+    /// (the ingress receipt cache is volatile across the restarts chaos
+    /// injects) — the on-offer ack is trusted and the tx counts delivered.
+    #[tokio::test]
+    async fn chaos_mode_trusts_on_offer_ack_when_receipt_refetch_fails() {
+        let (client, _, _handle) = mock_ingress(true, serde_json::Value::Null).await;
+        let tracker = Arc::new(Tracker::new().unwrap());
+        submit_task(
+            client,
+            Arc::clone(&tracker),
+            tx(0, 0),
+            permit().await,
+            0,
+            false,
+        )
+        .await;
+        let c = tracker.counts();
+        assert_eq!((c.accepted, c.receipted, c.bad_status), (1, 1, 0));
+        assert_eq!(tracker.remaining_pending(), (0, 0));
+    }
+
+    /// F15.2 regression: a submit whose RPC errored but whose tx actually
+    /// landed (receipt exists) must not be resubmitted — a duplicate would be
+    /// counted by the sequencer as a past-nonce drop and fail the run.
+    #[tokio::test]
+    async fn landed_tx_is_not_resubmitted_after_submit_error() {
+        let (client, send_calls, _handle) =
+            mock_ingress(false, serde_json::json!({"status": "0x1"})).await;
+        let tracker = Arc::new(Tracker::new().unwrap());
+        submit_task(
+            client,
+            Arc::clone(&tracker),
+            tx(0, 0),
+            permit().await,
+            3,
+            true,
+        )
+        .await;
+        assert_eq!(
+            send_calls.load(Ordering::Relaxed),
+            1,
+            "no duplicate resubmit once the receipt is found"
+        );
+        let c = tracker.counts();
+        assert_eq!(
+            (c.offered, c.accepted, c.receipted, c.bad_status),
+            (1, 0, 1, 0)
+        );
+        assert_eq!(tracker.remaining_pending(), (0, 0));
+    }
+
+    /// F15.4 regression: the verdict must not be read while submit tasks are
+    /// still in flight — `join_submit_tasks` waits for them (bounded).
+    #[tokio::test]
+    async fn join_submit_tasks_waits_for_in_flight_tasks() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { tokio::time::sleep(Duration::from_millis(50)).await });
+        join_submit_tasks(&mut tasks, Instant::now() + Duration::from_secs(5)).await;
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn join_submit_tasks_gives_up_at_deadline() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { tokio::time::sleep(Duration::from_secs(60)).await });
+        join_submit_tasks(&mut tasks, Instant::now() + Duration::from_millis(50)).await;
+        assert_eq!(tasks.len(), 1, "wedged task left behind after the deadline");
     }
 }

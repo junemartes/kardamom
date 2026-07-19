@@ -16,6 +16,14 @@ Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
 | `kardamom-executor` | `127.0.0.1:9004` | `kardamom-executor` |
 | `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
 | `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
+| `kardamom-validator` | `127.0.0.1:9007` | — (no dashboard yet) |
+
+The validator's default is `9007` precisely because `9006` is the ingress
+default: running both locally with defaults used to race for one socket (the
+loser's exporter only complains from a background thread — see the shared-addr
+warning below). The cluster deploy pins the validator to `0.0.0.0:9006` on the
+aux node instead (`validator.nomad.hcl`; no ingress runs there), so scrapes
+and `ci-cluster.sh`'s validator verdict still read `:9006` **in the cluster**.
 
 The sealer no longer appears here: canonical ordering runs as a Java
 clustered service inside an Aeron Cluster (`cluster/sealer-service/`), which

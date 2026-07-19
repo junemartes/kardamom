@@ -11,41 +11,24 @@
 //! (`last_committed_block` / `last_committed_end_tx_position`) and replays the
 //! canonical stream from the Aeron archives via a replay-merge, skip-counting
 //! past the cursor so already-committed blocks are never double-applied.
+//!
+//! The role-agnostic scaffolding (durability arg, genesis loading, the
+//! async→sync stream bridges, tracing/shutdown helpers) is shared with the
+//! validator binary via `kardamom_engine::bin_support`.
 
 use std::path::PathBuf;
-use std::sync::mpsc as sync_mpsc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use kardamom_engine::bin_support::{self, ReplayFailure, StateDurabilityArg};
 use kardamom_executor::{
     BalPublishingWriterQueue, CMessage, DepositSubscription, Executor, ExecutorConfig,
     ExecutorError, ExecutorFileConfig, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
     ResumePoint, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
 };
-use kardamom_log::aeron_live::{
-    AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxReceiptsPublisherHandle,
-};
+use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
-use kardamom_log::replay;
-use kardamom_state::{Durability, StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
-use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxDataLoc, TxEnvelope};
-
-/// CLI mirror of [`kardamom_state::Durability`] (clap renders the variants as
-/// `durable` / `safe-no-sync`).
-#[derive(Debug, Clone, Copy, clap::ValueEnum)]
-enum StateDurabilityArg {
-    Durable,
-    SafeNoSync,
-}
-
-impl From<StateDurabilityArg> for Durability {
-    fn from(a: StateDurabilityArg) -> Self {
-        match a {
-            StateDurabilityArg::Durable => Durability::Durable,
-            StateDurabilityArg::SafeNoSync => Durability::SafeNoSync,
-        }
-    }
-}
+use kardamom_state::{StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -112,8 +95,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     state_durability: StateDurabilityArg,
     /// UDP endpoint (`host:port`) the archive replay-merge binds to receive
-    /// **replayed** tx_data / tx_deposits fragments on crash recovery. Required
-    /// only when resuming a non-empty state DB; ignored on a fresh start.
+    /// **replayed** tx_data / tx_deposits fragments. When set, those streams
+    /// are ALWAYS read via the archive replay-merge (replayed from stream
+    /// origin, then followed live), so a restart at ANY point — including a
+    /// crash before the first commit — rejoins gaplessly. Unset ⇒ live
+    /// multicast/IPC (local runs; a non-empty state DB is then refused).
     /// (tx_ordering crash recovery is handled by the Aeron Cluster client, not
     /// by an archive replay-merge — see the tx_ordering subscription below.)
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
@@ -128,7 +114,7 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    init_tracing();
+    bin_support::init_tracing();
     let args = Args::parse();
     kardamom_obs::init(
         "executor",
@@ -190,24 +176,7 @@ async fn main() -> Result<()> {
     // --- State backend + crash-recovery decision (before the subscriptions,
     // because the tx_ordering subscription branches on whether we are resuming).
     // Load genesis (its chain_id is adopted when present).
-    let genesis = match args.chain.as_ref() {
-        Some(path) => Some(load_genesis(path)?),
-        None => None,
-    };
-    let chain_id = genesis
-        .as_ref()
-        .map(|g| g.chain_id)
-        .unwrap_or(args.chain_id);
-    if let Some(g) = &genesis
-        && args.chain_id != 1
-        && args.chain_id != g.chain_id
-    {
-        anyhow::bail!(
-            "--chain-id {} conflicts with genesis chain_id {}",
-            args.chain_id,
-            g.chain_id
-        );
-    }
+    let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
 
     // Open the libmdbx state env and read the durable cursor.
     let env = StateEnvBuilder::new(&args.state_dir)
@@ -216,10 +185,8 @@ async fn main() -> Result<()> {
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
     // Crash-recovery resume. A non-empty state DB means we restarted mid-chain:
-    // re-read tx_ordering from the archive (replay-merge) and skip-count past the
-    // durable cursor (see `ResumePoint` + the exec thread's skip logic). This
-    // requires the UDP-MDC transport (archive replay-merge does not work over the
-    // single-host IPC default), so over IPC a non-empty DB is still refused.
+    // the exec thread skip-counts the replayed canonical stream past the durable
+    // cursor (see `ResumePoint` + the exec thread's skip logic).
     let resume = if recovery.last_committed_block > 0 {
         let rp = ResumePoint {
             block: recovery.last_committed_block,
@@ -235,64 +202,53 @@ async fn main() -> Result<()> {
         None
     };
 
-    // On crash recovery (`resume.is_some()`) the tx_data / tx_deposits streams
-    // are read from the archive replay-merge instead of live, so the executor
-    // re-sees the full envelope history and can skip-count past its durable
-    // cursor AND re-execute any txs ordered while it was down. (tx_ordering is
-    // re-seen from the Aeron Cluster egress, not this archive endpoint — the
-    // cluster client replays the canonical stream on reconnect.) The replay
-    // endpoint is shared across the tx_data/tx_deposits streams (the media
-    // driver demuxes by stream id).
+    // tx_data / tx_deposits source: archive replay-merge on crash-recovery
+    // RESUME only; live multicast on a fresh start — main's gating, RESTORED.
+    // F13.3 made replay-merge unconditional whenever the endpoint is
+    // configured (to close the crash-before-first-commit window), which put
+    // an archive replay session + merge on every fresh-start consumer from
+    // boot. The cluster-e2e first-record freeze afflicts exactly the four
+    // fresh-start processes running that path, at a deterministic offset
+    // from merge open, on a branch where main is green — so per the
+    // correctness-beats-optimization rule the always-on gating is reverted
+    // until the freeze is pinned down (see docs/reviews/…/fixes-CI-replay-
+    // loop.md). Known cost, as on main: a crash BEFORE the first commit
+    // rejoins live mid-stream and relies on the bounded join timeout to fail
+    // loudly rather than replaying from origin. The replay endpoint is
+    // shared across the tx_data/tx_deposits streams (the media driver
+    // demuxes by stream id).
     let recovery_endpoints = if resume.is_some() {
-        let replay_dst = args.replay_destination_endpoint.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "crash recovery needs --replay-destination-endpoint (host:port) for tx_data / \
-                 tx_deposits archive replay-merge"
-            )
-        })?;
-        Some(replay_dst)
+        args.replay_destination_endpoint.clone()
     } else {
         None
     };
-
-    // M tx_data subscriptions, one per shard. We bridge each handle's
-    // async `recv()` to a synchronous `next()` (what the executor's reader
-    // thread expects) through a `std::sync::mpsc::channel`, with a
-    // dedicated tokio pump task per shard.
-    let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(args.shards as usize);
-    for shard_id in 0..args.shards {
-        // Live on a fresh start; archive replay-merge on crash recovery. Both
-        // paths yield (TxDataLoc, TxEnvelope): the live path reads the publisher
-        // session from the fragment header, and replay recovers the SAME session
-        // (frame-faithful), so the reader's session-keyed join works either way.
-        let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
-        if let Some(replay_dst) = recovery_endpoints.as_ref() {
-            let mut replay =
-                replay::open_tx_data_replay(&channels, &aeron_cfg, shard_id, replay_dst.clone())
-                    .with_context(|| format!("open tx_data replay-merge shard={shard_id}"))?;
-            tokio::spawn(async move {
-                while let Some(item) = replay.recv().await {
-                    if tx.send(item).is_err() {
-                        break;
-                    }
-                }
-            });
-        } else {
-            let mut handle = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
-                .with_context(|| format!("open TxDataSubscriberHandle shard={shard_id}"))?;
-            tokio::spawn(async move {
-                while let Some(item) = handle.recv().await {
-                    if tx.send(item).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        a_subs.push(Box::new(LiveTxDataSub {
-            sequencer_id: shard_id,
-            rx,
-        }));
+    if resume.is_some() && recovery_endpoints.is_none() {
+        anyhow::bail!(
+            "crash recovery needs --replay-destination-endpoint (host:port) for tx_data / \
+             tx_deposits archive replay-merge"
+        );
     }
+
+    // M tx_data subscriptions + tx_deposits, async→sync bridged (shared with
+    // the validator binary — see `bin_support`). A replay-merge that dies
+    // abnormally is a FAILED crash recovery: recorded on `replay_failure` and
+    // surfaced as a non-zero exit below, never a silent clean-looking stop.
+    let replay_failure = ReplayFailure::default();
+    let a_subs: Vec<Box<dyn TxDataSubscription>> = bin_support::open_tx_data_subs(
+        &rt,
+        &channels,
+        &aeron_cfg,
+        args.shards,
+        recovery_endpoints.as_deref(),
+        &replay_failure,
+    )?;
+    let dep_sub: Box<dyn DepositSubscription> = bin_support::open_tx_deposits_sub(
+        &rt,
+        &channels,
+        &aeron_cfg,
+        recovery_endpoints.as_deref(),
+        &replay_failure,
+    )?;
 
     // 1 tx_ordering subscription — ALWAYS the Aeron Cluster (Raft) egress. The
     // cluster has already deduped + totally ordered the stream and exposes a
@@ -332,35 +288,9 @@ async fn main() -> Result<()> {
         )
         .context("connect cluster tx_ordering subscription")?;
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
+    // The executor is the blessed emitter of the kardamom_sealer_* re-export
+    // (default-on in the shared subscription; the validator suppresses it).
     let b_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
-
-    // 1 tx_deposits subscription. The executor's deposit reader thread
-    // joins `(deposit_position, Deposit)` envelopes against the
-    // `DepositRef`s observed on tx_ordering; `source_hash` is the dedup
-    // key. Live on a fresh start; archive replay-merge on recovery.
-    let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
-    if let Some(replay_dst) = recovery_endpoints.as_ref() {
-        let mut replay = replay::open_tx_deposits_replay(&channels, &aeron_cfg, replay_dst.clone())
-            .context("open tx_deposits archive replay-merge subscriber")?;
-        tokio::spawn(async move {
-            while let Some(item) = replay.recv().await {
-                if d_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    } else {
-        let mut tx_deposits_handle = TxDepositsSubscriberHandle::open(&rt, &channels)
-            .context("open TxDepositsSubscriberHandle")?;
-        tokio::spawn(async move {
-            while let Some(item) = tx_deposits_handle.recv().await {
-                if d_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    }
-    let dep_sub: Box<dyn DepositSubscription> = Box::new(LiveTxDepositsSub { rx: d_rx });
 
     // tx_receipts publication. With MDS (fan-in) enabled, this replica
     // publishes both the receipt stream and the boundary side-stream to its
@@ -387,7 +317,7 @@ async fn main() -> Result<()> {
     // Seed genesis once into a fresh env (no-op if already seeded, e.g. on
     // recovery). Must run before StateWriter::spawn so the writer's initial
     // published snapshot already reflects genesis.
-    let (genesis_accounts, genesis_code) = build_genesis_alloc(genesis.as_ref());
+    let (genesis_accounts, genesis_code) = bin_support::build_genesis_alloc(genesis.as_ref());
     let seeded = seed_genesis(&env, &genesis_accounts, &genesis_code)
         .context("seed genesis into state env")?;
     tracing::info!(
@@ -417,29 +347,22 @@ async fn main() -> Result<()> {
         chain_id,
         ..ExecutorConfig::default()
     };
-    // During recovery the tx_ordering and per-shard tx_data streams replay
-    // independently from the archive and catch up at different rates, so the
-    // tight live join timeout (100 ms) would fire spuriously when a TxRef
-    // arrives before its replayed envelope. Relax it generously while resuming;
-    // a genuine missing-envelope still aborts, just after a longer grace.
-    // ALWAYS bounded, fresh starts included: a replica whose multicast tx_data
+    // ALWAYS bound the tx_data join wait: a replica whose multicast tx_data
     // image races a sequencer restart (new publisher session) can lose an
     // envelope, and an unbounded join wait then FREEZES that replica silently
     // while its peers advance (observed under the hard-sequencer chaos case:
     // one executor frozen at +0 blocks while the chain advanced 195). Failing
     // loudly hands recovery to the designed loop: nomad restarts the task and
-    // crash recovery replays the tx_data gap from the archive.
-    cfg.reader.join_timeout = std::time::Duration::from_secs(60);
-    if resume.is_some() {
-        cfg.reader.join_timeout = std::time::Duration::from_secs(30);
-    }
+    // crash recovery replays the tx_data gap from the archive. See
+    // `bounded_join_timeout` for why the fresh-start bound exceeds resume's.
+    cfg.reader.join_timeout = bin_support::bounded_join_timeout(resume.is_some());
     // Resume at the persisted cursor — 0 for a fresh genesis DB.
     let initial_block = recovery.last_committed_block;
 
     // The executor's main loop is sync (std::thread spawns underneath).
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
-    let join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
+    let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run(
             cfg,
             a_subs,
@@ -452,14 +375,29 @@ async fn main() -> Result<()> {
             initial_block,
             // On crash recovery `resume` carries the persisted cursor; the exec
             // thread skip-counts the replayed prefix past it. `None` on a fresh
-            // start. The tx_ordering subscription above is the matching archive
-            // replay-merge when this is `Some`.
+            // start.
             resume,
         )
     });
 
-    wait_for_shutdown().await;
-    tracing::info!("kardamom-executor: shutdown signal received; dropping runtime");
+    // Exit on WHICHEVER comes first: an operator shutdown signal, the engine
+    // loop finishing on its own (a fatal stream/join error), or a failed
+    // replay-merge recovery. Waiting only for SIGTERM left an errored executor
+    // lingering "alive" — metrics up, pipeline dead — instead of exiting so
+    // the orchestrator restarts it into the crash-recovery path.
+    let mut replay_failed: Option<String> = None;
+    let engine_result = tokio::select! {
+        _ = bin_support::wait_for_shutdown() => {
+            tracing::info!("kardamom-executor: shutdown signal received; dropping runtime");
+            None
+        }
+        failure = replay_failure.failed() => {
+            tracing::error!(error = %failure, "replay-merge recovery failed; shutting down");
+            replay_failed = Some(failure);
+            None
+        }
+        res = &mut join => Some(res),
+    };
     // Dropping the AeronRuntime closes every subscription, which causes
     // the tokio pump tasks to return None, which closes the sync mpsc
     // channels, which surfaces TxDataClosed / TxOrderingClosed to the
@@ -470,9 +408,17 @@ async fn main() -> Result<()> {
     // sender — i.e. when the `LiveCluster` guard is dropped. Drop it here so the
     // reader sees `TxOrderingClosed` and the executor loop can exit cleanly.
     drop(cluster_guard);
-    match join.await {
+    let joined = match engine_result {
+        Some(r) => r,
+        None => join.await,
+    };
+    let mut engine_error: Option<ExecutorError> = None;
+    match joined {
         Ok(Ok(())) => tracing::info!("executor main loop returned cleanly"),
-        Ok(Err(e)) => tracing::error!(error = %e, "executor main loop returned an error"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "executor main loop returned an error");
+            engine_error = Some(e);
+        }
         Err(e) => tracing::error!(error = %e, "executor task panicked"),
     }
     // Stop the state writer thread (closes the delta channel, joins, surfaces
@@ -481,94 +427,21 @@ async fn main() -> Result<()> {
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
     }
+    // Non-zero exits so the orchestrator can tell a failed recovery / dead
+    // pipeline from a clean shutdown (F13.4): exit status is the restart
+    // signal the whole "fail loudly, replay from the archive" loop keys on.
+    if let Some(failure) = replay_failed.or_else(|| replay_failure.get()) {
+        anyhow::bail!("replay-merge recovery failed: {failure}");
+    }
+    if let Some(e) = engine_error {
+        anyhow::bail!("executor pipeline failed: {e}");
+    }
     Ok(())
 }
 
-/// Load a kardamom genesis TOML and run its semantic validation
-/// (chain_id != 0, no duplicate alloc addresses).
-fn load_genesis(path: &std::path::Path) -> Result<kardamom_types::Genesis> {
-    let raw = std::fs::read_to_string(path).context("read genesis TOML")?;
-    let genesis: kardamom_types::Genesis = toml::from_str(&raw).context("parse genesis TOML")?;
-    genesis.validate().context("validate genesis")?;
-    Ok(genesis)
-}
-
-/// Build the genesis allocation set (accounts + code) from a `Genesis`, ready
-/// for [`seed_genesis`]. Every `AllocEntry` becomes one `AccountChange` with the
-/// declared balance/nonce and the keccak256 hash of its code (if any); the code
-/// bytes become a `CodeEntry` retrievable via `code_by_hash`. Returns empty vecs
-/// when no genesis was supplied.
-fn build_genesis_alloc(
-    genesis: Option<&kardamom_types::Genesis>,
-) -> (Vec<AccountChange>, Vec<CodeEntry>) {
-    use alloy_primitives::{B256, keccak256};
-    let mut accounts = Vec::new();
-    let mut code = Vec::new();
-    let Some(g) = genesis else {
-        return (accounts, code);
-    };
-    for entry in &g.alloc {
-        let nonce = entry.nonce.unwrap_or(0);
-        let code_hash = entry
-            .code
-            .as_ref()
-            .map(|c| keccak256(c.as_ref()))
-            .unwrap_or(B256::ZERO);
-        tracing::info!(
-            address = ?entry.address,
-            balance = %entry.balance,
-            nonce,
-            has_code = entry.code.is_some(),
-            "seeding genesis account"
-        );
-        accounts.push(AccountChange {
-            address: entry.address,
-            nonce,
-            balance: entry.balance,
-            code_hash,
-        });
-        if let Some(c) = entry.code.as_ref() {
-            // `AllocEntry.code` is `alloy_primitives::Bytes`; `CodeEntry.code`
-            // is `bytes::Bytes`. They wrap the same buffer (`c.0`).
-            code.push(CodeEntry {
-                code_hash,
-                code: c.0.clone(),
-            });
-        }
-    }
-    (accounts, code)
-}
-
 // ---------------------------------------------------------------------------
-// Adapters: async log handles → sync executor traits.
+// Role-specific adapter: tx_receipts publication.
 // ---------------------------------------------------------------------------
-
-struct LiveTxDataSub {
-    sequencer_id: u8,
-    rx: sync_mpsc::Receiver<(TxDataLoc, TxEnvelope)>,
-}
-
-impl TxDataSubscription for LiveTxDataSub {
-    fn sequencer_id(&self) -> u8 {
-        self.sequencer_id
-    }
-
-    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
-            sequencer_id: self.sequencer_id,
-        })
-    }
-}
-
-struct LiveTxDepositsSub {
-    rx: sync_mpsc::Receiver<(BPosition, Deposit)>,
-}
-
-impl DepositSubscription for LiveTxDepositsSub {
-    fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::DepositsClosed)
-    }
-}
 
 struct LiveTxReceiptsPub {
     handle: TxReceiptsPublisherHandle,
@@ -592,38 +465,5 @@ impl TxReceiptsPublication for LiveTxReceiptsPub {
                 .publish_boundary_best_effort(&b)
                 .map_err(|e| ExecutorError::State(format!("publish_boundary: {e}"))),
         }
-    }
-}
-
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-}
-
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Ctrl-C received");
     }
 }

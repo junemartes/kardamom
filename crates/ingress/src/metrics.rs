@@ -13,6 +13,16 @@ pub const QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
 /// receipt replayed by multiple executor replicas). 0 on the single-executor
 /// IPC path.
 pub const RECEIPT_DUPLICATE_TOTAL: &str = "kardamom_ingress_receipt_duplicate_total";
+/// Duplicate tx_errors dropped by the consumer-side dedup (P racing sequencer
+/// replicas each emit the same per-tx rejection, so every error arrives up to
+/// P times; a rejection already overridden by a success is also dropped).
+/// 0 on a single-replica (P=1) deployment.
+pub const TX_ERROR_DUPLICATE_TOTAL: &str = "kardamom_ingress_tx_error_duplicate_total";
+/// Malformed cluster egress frames dropped by the on-quorum watermark
+/// observer. The cluster stream is authoritative, so this should stay 0; a
+/// sustained non-zero means a Java/Rust envelope framing mismatch shipped and
+/// records are being silently lost (see `crate::cluster`).
+pub const CLUSTER_FRAME_DROPPED_TOTAL: &str = "kardamom_ingress_cluster_frames_dropped_total";
 
 pub fn describe() {
     metrics::describe_counter!(TX_RECEIVED_TOTAL, "tx submissions received");
@@ -28,6 +38,14 @@ pub fn describe() {
     metrics::describe_counter!(
         RECEIPT_DUPLICATE_TOTAL,
         "duplicate receipts dropped by tx_receipts MDS fan-in dedup (first-wins by tx hash)"
+    );
+    metrics::describe_counter!(
+        TX_ERROR_DUPLICATE_TOTAL,
+        "duplicate/overridden tx_errors dropped by the consumer-side dedup (racing sequencer replicas)"
+    );
+    metrics::describe_counter!(
+        CLUSTER_FRAME_DROPPED_TOTAL,
+        "malformed cluster egress frames dropped by the watermark observer (should stay 0)"
     );
 }
 
@@ -49,6 +67,8 @@ mod tests {
             TX_REJECTED_TOTAL,
             QUEUE_DEPTH,
             RECEIPT_DUPLICATE_TOTAL,
+            TX_ERROR_DUPLICATE_TOTAL,
+            CLUSTER_FRAME_DROPPED_TOTAL,
         ] {
             assert!(
                 name.starts_with("kardamom_ingress_"),

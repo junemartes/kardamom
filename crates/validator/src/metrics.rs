@@ -30,7 +30,9 @@ pub fn describe() {
     metrics::describe_gauge!(COMMITTED_BLOCK, "Highest block the validator has committed");
     metrics::describe_gauge!(
         STATE_ROOT_BLOCK,
-        "Block number of the most recent computed state root"
+        "Block number of the most recent OBSERVED MPT state root (set only when \
+         the committed snapshot actually yielded a root — an independent \
+         measurement, not a mirror of validator_committed_block)"
     );
 }
 
@@ -50,8 +52,15 @@ pub fn counter_receipt_missing() {
     metrics::counter!(RECEIPT_MISSING_TOTAL).increment(1);
 }
 
-/// Record that the validator has committed `block` (with its state root present).
+/// Record that the validator has committed `block`.
 pub fn set_committed_block(block: u64) {
     metrics::gauge!(COMMITTED_BLOCK).set(block as f64);
+}
+
+/// Record that `block`'s MPT state root was actually observed on the committed
+/// snapshot. Kept separate from [`set_committed_block`] so the "state root
+/// advancing" signal is a real measurement rather than a mirror of the
+/// committed-block gauge.
+pub fn set_state_root_block(block: u64) {
     metrics::gauge!(STATE_ROOT_BLOCK).set(block as f64);
 }

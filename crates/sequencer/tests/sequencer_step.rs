@@ -260,3 +260,46 @@ fn run_returns_when_channel_a_disconnected() {
     let result = seq.run(&mut channel_a, &mut b, &mut rc, shutdown);
     assert!(result.is_ok(), "{result:?}");
 }
+
+// CI first-record audit: the DEGENERATE single-tx-after-idle case. The smoke
+// test sends exactly ONE tx; if the retry of a backpressured ref were gated on
+// fresh ingress (which never comes), that lone ref would wedge forever. The
+// retry must be driven by run_once's drain-pending sweep alone, across
+// MULTIPLE consecutive backpressured passes, and publish exactly once.
+#[test]
+fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
+    let s = signer(40);
+    let env = signed_tx_envelope(&s, 0, 100);
+    let mut channel_a = ScriptedTxData::default();
+    channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env));
+    let mut b = InMemoryTxOrderingRefPublisher::default();
+    *b.fail_with_backpressure.lock().unwrap() = true;
+    let mut rc = InMemoryTxErrorPublisher::default();
+    let mut seq = Sequencer::new(
+        one_partition_cfg(),
+        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
+    );
+
+    // Ingress pass hits backpressure; then several ingress-EMPTY passes keep
+    // hitting backpressure — each must rewind and keep the ref pending.
+    for _ in 0..4 {
+        let r = seq.run_once(&mut channel_a, &mut b, &mut rc);
+        assert!(
+            matches!(r, Err(kardamom_sequencer::SequencerError::Backpressure)),
+            "backpressured pass must surface Backpressure, got {r:?}"
+        );
+        assert!(b.refs.lock().unwrap().is_empty(), "nothing accepted yet");
+    }
+
+    // Publisher recovers: the ref publishes from drain-pending with NO new
+    // ingress, exactly once.
+    *b.fail_with_backpressure.lock().unwrap() = false;
+    assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
+    let refs = b.refs.lock().unwrap();
+    assert_eq!(refs.len(), 1, "the lone ref publishes exactly once");
+    assert_eq!(refs[0].tx_data_position, pos(0));
+    drop(refs);
+    // And the machine is idle again (no duplicate retry).
+    assert!(!seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
+    assert_eq!(b.refs.lock().unwrap().len(), 1);
+}

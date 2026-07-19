@@ -59,7 +59,11 @@ impl<E: ClusterEgress> ClusterWatermarkObserver<E> {
                 }
                 Err(e) => {
                     // The cluster stream is authoritative, so this should never
-                    // happen in practice; drop the frame and keep observing.
+                    // happen in practice; drop the frame and keep observing —
+                    // but meter the drop so a framing mismatch (the hand-kept
+                    // Java/Rust envelope drifting) surfaces as a counter, not
+                    // just warn-level log volume.
+                    metrics::counter!(crate::metrics::CLUSTER_FRAME_DROPPED_TOTAL).increment(1);
                     tracing::warn!(error = %e, "ingress watermark: dropping malformed cluster egress frame");
                     continue;
                 }

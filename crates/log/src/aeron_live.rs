@@ -377,21 +377,7 @@ impl AeronRuntime {
         }
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
         for uri in uris {
-            let msg_tx = msg_tx.clone();
-            let deliver: DeliverFn =
-                Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
-                    match codec::materialize::<T>(bytes) {
-                        Ok(v) => {
-                            if msg_tx.send((pos, v)).is_err() {
-                                // Subscriber dropped its receiver.
-                            }
-                        }
-                        Err(e) => {
-                            error!(error = %e, "decode failed on subscription delivery");
-                        }
-                    }
-                });
-            self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+            self.open_subscription_with_deliver(uri, stream_id, typed_deliver(msg_tx.clone()))?;
         }
         Ok(msg_rx)
     }
@@ -413,17 +399,7 @@ impl AeronRuntime {
             >,
     {
         let (msg_tx, msg_rx) = unbounded_channel::<(BPosition, T)>();
-        let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
-            match codec::materialize::<T>(bytes) {
-                Ok(v) => {
-                    let _ = msg_tx.send((pos, v));
-                }
-                Err(e) => {
-                    error!(error = %e, "decode failed on subscription delivery");
-                }
-            }
-        });
-        let sub_id = self.open_subscription_with_deliver(uri, stream_id, deliver)?;
+        let sub_id = self.open_subscription_with_deliver(uri, stream_id, typed_deliver(msg_tx))?;
         Ok((sub_id, msg_rx))
     }
 
@@ -452,6 +428,30 @@ impl AeronRuntime {
         self.open_subscription_with_deliver(uri, stream_id, deliver)?;
         Ok(msg_rx)
     }
+}
+
+/// Build the standard typed deliver closure: decode each fragment as `T` and
+/// forward `(BPosition, T)` into `msg_tx` (a send error means the subscriber
+/// dropped its receiver — silently ignored; the sub keeps draining). Shared by
+/// [`AeronRuntime::open_subscription_merged`] and
+/// [`AeronRuntime::open_subscription_with_id`] so the decode/forward behaviour
+/// cannot drift between them.
+fn typed_deliver<T>(msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, T)>) -> DeliverFn
+where
+    T: rkyv::Archive + Send + 'static,
+    T::Archived: rkyv::Deserialize<T, rkyv::api::high::HighDeserializer<rkyv::rancor::Error>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, rkyv::rancor::Error>>,
+{
+    Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+        match codec::materialize::<T>(bytes) {
+            Ok(v) => {
+                let _ = msg_tx.send((pos, v));
+            }
+            Err(e) => {
+                error!(error = %e, "decode failed on subscription delivery");
+            }
+        }
+    })
 }
 
 impl Drop for AeronRuntime {
@@ -716,7 +716,32 @@ where
 
     while let Some(mut item) = pending.pop_front() {
         if blocked.contains(&item.pub_id) {
-            keep.push_back(item);
+            // Deadlines are enforced on EVERY retained entry each pass — not
+            // only when an entry reaches the head. Frames parked behind a
+            // blocked head would otherwise expire one-by-one (~OFFER_TIMEOUT
+            // each), so a caller ≥2 deep could hit its ack timeout while its
+            // frame was still queued — and then have the frame delivered late
+            // once the subscriber connected, after the caller already treated
+            // the publish as failed (and possibly re-submitted). Expiring on
+            // time here (OFFER_TIMEOUT < publish_bytes's ack timeout) means
+            // every ack resolves before its caller gives up, so a
+            // reported-failed publish is never delivered afterwards.
+            if now >= item.deadline {
+                let msg = "aeron offer failed: expired while queued behind a blocked \
+                           publication"
+                    .to_string();
+                match item.ack.take() {
+                    Some(ack) => {
+                        let _ = ack.send(Err(LogError::Aeron(msg)));
+                    }
+                    None => warn!(
+                        pub_id = item.pub_id,
+                        "best-effort publish expired while queued behind a blocked publication"
+                    ),
+                }
+            } else {
+                keep.push_back(item);
+            }
             continue;
         }
         match offer(&item) {
@@ -806,6 +831,14 @@ pub struct PubHandle {
 }
 
 impl PubHandle {
+    /// How long `publish_bytes` waits for the Aeron thread's ack. Must stay
+    /// comfortably ABOVE [`OFFER_TIMEOUT`] (the per-frame queue deadline,
+    /// enforced for every queued frame each drain pass): that ordering
+    /// guarantees the ack (delivered or expired) always resolves before this
+    /// timeout fires, so a caller can never give up on a frame that later gets
+    /// delivered behind its back.
+    const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
     /// Blocking publish with `BPosition` ack.
     pub fn publish_bytes(&self, bytes: AlignedVec) -> Result<BPosition, LogError> {
         let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
@@ -817,7 +850,7 @@ impl PubHandle {
             })
             .map_err(|_| LogError::Aeron("aeron thread dropped".into()))?;
         ack_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(Self::ACK_TIMEOUT)
             .map_err(|_| LogError::Aeron("publish_bytes timed out".into()))?
     }
 
@@ -1497,6 +1530,54 @@ mod drain_pending_tests {
             }
             other => panic!("expected an Aeron error ack, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn queued_frame_behind_blocked_head_expires_at_its_own_deadline() {
+        // F16.5 regression: a frame parked BEHIND a blocked head must have its
+        // deadline evaluated every pass — not only once it reaches the head.
+        // Otherwise a caller could hit its ack timeout while the frame is
+        // still queued, and the frame would be delivered late after the
+        // caller already treated the publish as failed.
+        let now = Instant::now();
+        let (head, head_rx) = pending(0, 0xA1, now, 5_000); // head: not yet expired
+        let (tail, tail_rx) = pending(0, 0xB2, now, 0); // tail: deadline == now
+        let mut q = VecDeque::from([head, tail]);
+
+        let mut offered: Vec<u8> = Vec::new();
+        drain_pending_inner(&mut q, now, |item| {
+            offered.push(item.bytes.as_slice()[0]);
+            OfferResult::Code(-2) // head back-pressures
+        });
+        // Only the head was offered; the expired tail must NOT be offered
+        // (that would deliver it out of FIFO order after the caller gave up).
+        assert_eq!(offered, vec![0xA1]);
+        assert_eq!(q.len(), 1, "only the unexpired head is retained");
+        assert_eq!(q[0].bytes.as_slice()[0], 0xA1);
+        assert!(head_rx.try_recv().is_err(), "head still pending");
+        match tail_rx.try_recv() {
+            Ok(Err(LogError::Aeron(m))) => assert!(
+                m.contains("expired while queued"),
+                "expired-in-queue error should say so: {m}"
+            ),
+            other => panic!("expected an expired-in-queue error ack, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn queued_frame_behind_blocked_head_with_live_deadline_is_retained() {
+        // Companion to the expiry test: an unexpired frame behind a blocked
+        // head stays queued in order (no reordering, no premature error).
+        let now = Instant::now();
+        let (head, _head_rx) = pending(0, 0xA1, now, 5_000);
+        let (tail, tail_rx) = pending(0, 0xB2, now, 5_000);
+        let mut q = VecDeque::from([head, tail]);
+
+        drain_pending_inner(&mut q, now, |_| OfferResult::Code(-2));
+        assert_eq!(q.len(), 2, "both frames retained, still in order");
+        assert_eq!(q[0].bytes.as_slice()[0], 0xA1);
+        assert_eq!(q[1].bytes.as_slice()[0], 0xB2);
+        assert!(tail_rx.try_recv().is_err(), "tail must not be acked yet");
     }
 
     #[test]

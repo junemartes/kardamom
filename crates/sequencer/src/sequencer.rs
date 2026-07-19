@@ -32,6 +32,16 @@
 //! activity since startup) hit the state-DB cache-miss path the first
 //! time they're observed.
 //!
+//! Cold-rejoin caveat (F02.1, RE-OPENED): hydration only provides a
+//! *lower bound* on a sender's next nonce, so a restarted replica that
+//! live-joins mid-stream buffers established senders' traffic against
+//! nonces that will never reappear and does not regain coverage of them
+//! (P=1 for those senders until its twin also restarts). The "stream-
+//! adaptive floor fast-forward" that closed this was REMOVED: it could not
+//! distinguish twin-ordered gaps from client-abandoned ones, and adopting
+//! the latter published canonical nonce gaps that fatally NonceTooHigh'd
+//! every executor (see PartitionState's note + the CI round-4 analysis).
+//!
 //! See also [`crate::outbound`] for the trait surface and in-memory fakes
 //! used by tests.
 
@@ -203,16 +213,57 @@ impl<DB: StateDatabase> Sequencer<DB> {
         }
     }
 
+    /// Publish a batch of drained `(sender, nonce, meta)` refs in order. On
+    /// B-backpressure the failed item AND every item not yet published are
+    /// rebuffered (in reverse, so each sender's floor ends rewound to its
+    /// lowest unpublished nonce) — dropping the tail would permanently lose
+    /// refs whose nonces the state machine already advanced past.
+    fn flush_drained<B>(
+        &mut self,
+        b: &mut B,
+        drained: Vec<(alloy_primitives::Address, u64, RefMetadata)>,
+        ctx: &'static str,
+    ) -> Result<(), SequencerError>
+    where
+        B: TxOrderingRefPublisher,
+    {
+        let mut iter = drained.into_iter();
+        while let Some((sender, n, meta)) = iter.next() {
+            match self.publish_ref(b, &meta) {
+                Ok(()) => {
+                    trace!(
+                        nonce = n,
+                        correlation_id = meta.correlation_id,
+                        ctx,
+                        "published ref"
+                    );
+                }
+                Err(SequencerError::Backpressure) => {
+                    let mut rest: Vec<_> = std::iter::once((sender, n, meta)).chain(iter).collect();
+                    while let Some((s, n2, m)) = rest.pop() {
+                        self.state.reinsert_for_retry(s, n2, m);
+                    }
+                    return Err(SequencerError::Backpressure);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
     /// Drive one ingress message through the state machine. Returns
-    /// `Ok(true)` if work was done, `Ok(false)` if both the retry-drain and
-    /// the tx_data poll were empty.
+    /// `Ok(true)` if work was done, `Ok(false)` if the retry-drain, the
+    /// floor fast-forward sweep, and the tx_data poll were all empty.
     ///
     /// Order of operations:
     ///  1. First flush any metadata sitting at `pending[next_nonce]` (these
     ///     are the rebuffered-after-backpressure entries). If the B publish
     ///     blocks again, re-rewind and return `Backpressure` without
     ///     touching tx_data.
-    ///  2. Then poll tx_data for the next observed envelope and process it.
+    ///  2. Then fast-forward any nonce floor that has been stalled behind a
+    ///     buffered future-run for longer than the configured lag bound
+    ///     (cold-rejoin coverage recovery — see the module docs).
+    ///  3. Then poll tx_data for the next observed envelope and process it.
     pub fn run_once<I, B, R>(
         &mut self,
         channel_a: &mut I,
@@ -226,19 +277,15 @@ impl<DB: StateDatabase> Sequencer<DB> {
     {
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
-            for (sender, n, meta) in pending {
-                if let Err(SequencerError::Backpressure) = self.publish_ref(b, &meta) {
-                    self.state.reinsert_for_retry(sender, n, meta);
-                    return Err(SequencerError::Backpressure);
-                }
-                trace!(
-                    nonce = n,
-                    correlation_id = meta.correlation_id,
-                    "published ref (drain-pending)"
-                );
-            }
+            self.flush_drained(b, pending, "drain-pending")?;
             return Ok(true);
         }
+
+        // (The nonce-floor fast-forward sweep that ran here was REMOVED: it
+        // adopted client-abandoned nonce holes into the canonical stream and
+        // fatally NonceTooHigh'd every executor under ingress overload /
+        // chaos outages. A sender with an unfillable gap now stalls here —
+        // recoverable — exactly as on main. See PartitionState's note.)
 
         let Some((tx_data_loc, envelope)) = channel_a.poll()? else {
             return Ok(false);
@@ -305,27 +352,11 @@ impl<DB: StateDatabase> Sequencer<DB> {
             NonceOutcome::Past => metrics::record_past(self.cfg.partition_index),
         }
 
+        let mut publishes = Vec::new();
         for action in result.actions {
             match action {
                 ProcessAction::Publish { nonce: n, payload } => {
-                    match self.publish_ref(b, &payload) {
-                        Ok(()) => {
-                            trace!(
-                                nonce = n,
-                                correlation_id = payload.correlation_id,
-                                "published ref"
-                            );
-                        }
-                        Err(SequencerError::Backpressure) => {
-                            // Roll back: the state machine had advanced for
-                            // this tx but the canonical ref never landed on
-                            // B. The reinsert re-buffers the metadata so the
-                            // retry replays the same publish.
-                            self.state.reinsert_for_retry(sender, n, payload);
-                            return Err(SequencerError::Backpressure);
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    publishes.push((sender, n, payload));
                 }
                 ProcessAction::ReportDuplicate {
                     nonce: n,
@@ -339,6 +370,9 @@ impl<DB: StateDatabase> Sequencer<DB> {
                 }
             }
         }
+        // On backpressure the state machine is rolled back: the reinsert
+        // re-buffers every unpublished ref so the retry replays them.
+        self.flush_drained(b, publishes, "ingress")?;
         Ok(true)
     }
 

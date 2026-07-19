@@ -37,8 +37,12 @@ impl LogConfig {
     pub fn from_toml_path(path: &Path) -> Result<Self, LogError> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| LogError::Config(format!("read log-config {}: {e}", path.display())))?;
-        toml::from_str(&raw)
-            .map_err(|e| LogError::Config(format!("parse log-config {}: {e}", path.display())))
+        let cfg: Self = toml::from_str(&raw)
+            .map_err(|e| LogError::Config(format!("parse log-config {}: {e}", path.display())))?;
+        cfg.channels
+            .validate()
+            .map_err(|e| LogError::Config(format!("invalid log-config {}: {e}", path.display())))?;
+        Ok(cfg)
     }
 
     /// Resolve the effective `LogConfig` for a service binary: load it from
@@ -185,9 +189,11 @@ pub struct ChannelsConfig {
 
     /// TxBal: the per-block BAL (Block Access List — the executor's
     /// `BlockDelta`: account/storage/code mutations + receipts for a sealed
-    /// block). The sequencer-side executor publishes one `BlockDelta` per block;
+    /// block). EVERY executor replica publishes one `BlockDelta` per block on
+    /// this same group/stream (validators may see one copy per replica —
+    /// harmless: inserts are idempotent overwrites keyed by block number);
     /// validators subscribe and cross-check their independent re-execution
-    /// against it. RAM only, single publisher (the executor).
+    /// against it. RAM only.
     pub tx_bal_channel: String,
     pub tx_bal_stream_id: i32,
 
@@ -221,6 +227,30 @@ impl ChannelsConfig {
     /// single-channel IPC default (`tx_receipts_channel`).
     pub fn tx_receipts_mds_enabled(&self) -> bool {
         !self.tx_receipts_control_channel.is_empty()
+    }
+
+    /// Cross-field invariants serde cannot express; called by
+    /// [`LogConfig::from_toml_path`] so a misconfigured deployment fails at
+    /// load time with a message instead of misbehaving later.
+    ///
+    /// MDS receipt fan-in computes per-replica ports as `base + 2*i (+ 1)` in
+    /// UNSIGNED arithmetic — a zero/negative base (the field stays `i32` for
+    /// TOML-friendly signed parsing) would otherwise wrap silently into a
+    /// nonsense endpoint port, and a base too close to 65535 would overflow
+    /// the valid port range for the highest replica.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.tx_receipts_mds_enabled() {
+            let base = self.tx_receipts_endpoint_base_port;
+            let highest = i64::from(base) + 2 * i64::from(self.tx_receipts_executor_count) + 1;
+            if base <= 0 || highest > i64::from(u16::MAX) {
+                return Err(format!(
+                    "tx_receipts_endpoint_base_port ({base}) invalid with MDS enabled \
+                     (tx_receipts_control_channel set): need 0 < base and \
+                     base + 2*tx_receipts_executor_count + 1 <= 65535"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The UDP endpoint executor replica `replica_idx` publishes its RECEIPT
@@ -584,6 +614,63 @@ mod tests {
             Some("aeron:udp?endpoint=192.168.56.31:40023")
         );
         assert_eq!(ch.tx_receipts_stream_id, 1002);
+    }
+
+    #[test]
+    fn mds_nonpositive_base_port_rejected() {
+        // A negative base used to wrap via `as u32` into a nonsense port;
+        // it must now fail at load time with a config error.
+        for port in ["-40020", "0"] {
+            let f = write_tmp(&format!(
+                r#"
+                [channels]
+                tx_receipts_control_channel = "aeron:udp?control-mode=manual"
+                tx_receipts_endpoint_host = "192.168.56.31"
+                tx_receipts_endpoint_base_port = {port}
+                tx_receipts_executor_count = 3
+                "#
+            ));
+            let err = LogConfig::from_toml_path(f.path())
+                .expect_err("non-positive MDS base port must be rejected");
+            assert!(matches!(err, LogError::Config(_)), "got {err:?}");
+            assert!(
+                err.to_string().contains("tx_receipts_endpoint_base_port"),
+                "got {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn mds_base_port_overflowing_u16_rejected() {
+        // Highest replica endpoint (base + 2*count + 1) must stay a valid port.
+        let f = write_tmp(
+            r#"
+            [channels]
+            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
+            tx_receipts_endpoint_host = "192.168.56.31"
+            tx_receipts_endpoint_base_port = 65530
+            tx_receipts_executor_count = 3
+            "#,
+        );
+        LogConfig::from_toml_path(f.path()).expect_err("overflowing MDS base port rejected");
+    }
+
+    #[test]
+    fn mds_valid_base_port_accepted_and_non_mds_port_unchecked() {
+        // The deploy-shaped MDS config still loads…
+        let f = write_tmp(
+            r#"
+            [channels]
+            tx_receipts_control_channel = "aeron:udp?control-mode=manual"
+            tx_receipts_endpoint_host = "192.168.56.31"
+            tx_receipts_endpoint_base_port = 40020
+            tx_receipts_executor_count = 3
+            "#,
+        );
+        LogConfig::from_toml_path(f.path()).expect("valid MDS config loads");
+        // …and the base port is only validated when MDS is actually enabled.
+        let f = write_tmp("[channels]\ntx_receipts_endpoint_base_port = 0\n");
+        LogConfig::from_toml_path(f.path()).expect("port unchecked without MDS");
     }
 
     #[test]

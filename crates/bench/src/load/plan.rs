@@ -3,9 +3,10 @@
 //! Unlike [`crate::signers::presign_transfers`] (which returns a flat,
 //! round-robined byte vec), this builds **per-sender** queues of
 //! [`PlannedTx`] — each carrying the locally-computed transaction hash and
-//! its nonce — so the engine can (a) submit each sender's txs in strict
-//! nonce order and (b) track every tx by hash to a receipt independent of
-//! the submit response.
+//! its nonce — so the engine can (a) pop each sender's txs in per-sender
+//! FIFO nonce order (submits are spawned as concurrent tasks, so wire order
+//! — and hence arrival order at ingress — is not strict) and (b) track every
+//! tx by hash to a receipt independent of the submit response.
 
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;

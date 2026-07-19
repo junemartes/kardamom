@@ -154,7 +154,15 @@ impl<T> PartitionState<T> {
             .pending
             .entry(sender)
             .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
-        let _ = buf.insert(nonce, payload);
+        // UNBOUNDED insert: a capacity-enforcing insert here can EVICT the
+        // lowest rebuffered nonce when the buffer is (still) full — e.g. a
+        // full future-run drained by `process` plus the in-flight ingress item
+        // rebuffered after backpressure overshoots capacity by one, and the
+        // eviction would silently lose a ref the floor already rewound below
+        // (a permanent per-sender gap). The rebuffered items were accounted
+        // for by this buffer moments ago; capacity re-applies to fresh
+        // ingress only.
+        buf.reinsert(nonce, payload);
     }
 
     /// Walk every sender whose pending buffer has an entry at its expected
@@ -183,6 +191,24 @@ impl<T> PartitionState<T> {
         }
         out
     }
+
+    // NOTE — `fast_forward_stalled` (the F02.1/F02.2 "stream-adaptive
+    // nonce-floor fast-forward") was REMOVED after CI run 29687514869: a
+    // sequencer cannot locally distinguish "the twin already ordered the gap"
+    // (the rejoin case it was built for) from "NOBODY ordered the gap" (a
+    // client-abandoned nonce hole — txs dropped at ingress under overload or
+    // during a chaos outage, so they never reached tx_data at all). In the
+    // second case BOTH replicas adopt the same hole and publish a canonical
+    // stream with a nonce gap, which every executor fail-stops on
+    // (revm NonceTooHigh is fatal) — observed as all three executors
+    // crash-looping in all five cluster-e2e shards (load: tx 3836 vs state
+    // 3833 at the 600tps overload step; chaos: tx 4098 vs state 1818 after a
+    // leader-kill window). A stalled sender must stall HERE, where it is
+    // recoverable, never poison the canonical stream. This re-opens F02.1's
+    // rejoined-replica-coverage finding; a sound fix needs a global signal
+    // (e.g. hydrating floors from a canonical/receipt stream), not a local
+    // timeout. See docs/reviews/2026-07-17-30-commit-review/
+    // fixes-CI-replay-loop.md (round 4).
 }
 
 #[cfg(test)]
@@ -308,6 +334,52 @@ mod tests {
             .collect();
         assert_eq!(published, vec![0, 1, 2, 3, 4]);
         assert_eq!(st.next_nonce(s(1)), 5);
+    }
+
+    // CI first-record audit: rebuffering a backpressured batch must NEVER
+    // lose a ref. A FULL future-run (capacity items) drained by `process`
+    // plus the in-flight ingress item is capacity+1 items; re-inserting them
+    // through the capacity-enforcing `insert` evicted the lowest nonce — a
+    // silent, permanent per-sender gap. The reinsert path is now unbounded.
+    #[test]
+    fn full_buffer_backpressure_rebuffer_loses_nothing() {
+        let cap = 4;
+        let mut st: PartitionState<u32> = PartitionState::new(cap);
+        // Fill the buffer to capacity with the future run 1..=cap.
+        for n in 1..=cap as u64 {
+            assert!(matches!(
+                st.process(s(1), n, 100 + n as u32).outcome,
+                NonceOutcome::Buffered
+            ));
+        }
+        // Nonce 0 arrives: the full run drains for publishing (cap+1 items).
+        let out = st.process(s(1), 0, 100);
+        assert_eq!(out.actions.len(), cap + 1);
+        // Backpressure on the FIRST publish: rebuffer the whole batch in
+        // reverse, exactly as `flush_drained` does.
+        let mut batch: Vec<(u64, u32)> = (0..=cap as u64).map(|n| (n, 100 + n as u32)).collect();
+        while let Some((n, p)) = batch.pop() {
+            st.reinsert_for_retry(s(1), n, p);
+        }
+        assert_eq!(st.next_nonce(s(1)), 0, "floor rewound to lowest");
+        // The retry drain must return ALL cap+1 refs — nothing evicted.
+        let drained = st.drain_pending();
+        let nonces: Vec<u64> = drained.iter().map(|(_, n, _)| *n).collect();
+        assert_eq!(nonces, (0..=cap as u64).collect::<Vec<_>>());
+        assert_eq!(st.next_nonce(s(1)), cap as u64 + 1);
+    }
+
+    // CI first-record audit: a capacity-0 (buffering disabled) config must
+    // still not lose a MATCHED ref that hit backpressure — the rebuffer path
+    // bypasses the disabled-buffer drop too.
+    #[test]
+    fn disabled_buffer_still_rebuffers_backpressured_match() {
+        let mut st: PartitionState<u32> = PartitionState::new(0);
+        let out = st.process(s(1), 0, 100);
+        assert_eq!(out.actions.len(), 1);
+        st.reinsert_for_retry(s(1), 0, 100);
+        let drained = st.drain_pending();
+        assert_eq!(drained, vec![(s(1), 0, 100)]);
     }
 
     #[test]

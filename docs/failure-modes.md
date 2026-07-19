@@ -89,10 +89,15 @@ first-seen dedup keeps one.
 
 - **Replica crash / hard kill** (`sequencer-replica-kill`,
   `graceful-`/`hard-sequencer`) — **no stall**: the twin never stopped. Chaos
-  asserts live pipeline progress during the outage and 4/4 allocs back within
-  the restart SLO. The restarted replica joins live (no archive replay — its
-  twin covered the gap, and replay could overshoot the sealer's dedup window)
-  and hydrates nonce floors from committed state.
+  asserts live pipeline progress during the outage, 4/4 allocs back within
+  the restart SLO, and that the restarted replica actually publishes refs
+  again. The restarted replica joins live (no archive replay — its twin
+  covered the gap, and replay could overshoot the sealer's dedup window);
+  hydrated nonce floors are only a lower bound, and the stream-adaptive
+  fast-forward (`nonce_floor_lag_ms`, default 5 s) advances a stalled floor
+  to the live join point so the replica regains full coverage —
+  `kardamom_sequencer_nonce_floor_fastforward_total` spikes on rejoin (see
+  the replicated-sequencer-shards spec, "Restart / rejoin semantics").
 - **Sequencer node loss** — cross-placement guarantees every shard keeps one
   replica; redundancy (not availability) degrades until the node returns.
 - **Both replicas of one shard down** — that shard stalls; this is now the

@@ -7,9 +7,9 @@ name: cluster-e2e
 # + chaos suite. See deploy/cluster/scripts/{ci-cluster,chaos}.sh.
 #
 # The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
-# replaces the single sealer, so the sequencer + executor binaries are built WITH
-# their `cluster` feature (they fail-fast otherwise) and the Java cluster image is
-# built from the gradle shadowJar.
+# replaces the single sealer. The cluster transport is unconditional in the Rust
+# binaries (no cargo feature to toggle); the Java cluster image is built from the
+# gradle shadowJar.
 #
 # The FULL suite runs on every trigger, SHARDED across runners (each shard brings
 # up its own cluster and runs one slice): one `load` shard (5-min soak), three
@@ -107,10 +107,6 @@ jobs:
 
       # Build the service binaries once on the host; ci-service.Dockerfile then
       # wraps each into a thin image (the in-image workspace build is too slow).
-      # The deploy is CLUSTER mode (cluster.nomad.hcl + [cluster].enabled=true in
-      # the sequencer/executor configs), so kardamom-sequencer + kardamom-executor
-      # MUST be built WITH their `cluster` feature or they fail-fast at startup
-      # ("built without the 'cluster' feature"). The other 3 bins are feature-clean.
       # kardamom-load is the sustained-load + chaos harness ci-cluster.sh runs from
       # target/release (it stays on the runner, not in a service image).
       - name: cargo build --release (service binaries + load harness)

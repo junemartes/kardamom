@@ -1,7 +1,8 @@
 //! The `BenchWorkflow` trait — the unit of pluggability for this crate.
 //!
 //! A `BenchWorkflow` knows three things:
-//! - what genesis state it needs (for the in-process harness),
+//! - what genesis state it expects (descriptive — provisioned by external
+//!   harnesses; the in-process ingress stand-in doesn't consume it),
 //! - how to assemble its per-task work vecs against a live RPC client
 //!   (signer derivation, presigning, preflight checks),
 //! - how to dispatch one item and report which histogram bucket the timing
@@ -33,11 +34,15 @@ pub trait BenchWorkflow: Clone + Send + Sync + 'static {
     /// insert. Keep the strings static so callers can compare by pointer.
     fn methods(&self) -> &'static [&'static str];
 
-    /// Genesis allocs needed by this workflow on an in-process node:
-    /// prefunded signer EOAs and deployed contracts. Workflows that target
-    /// a remote node (caller is responsible for chain state) return
-    /// `Ok(vec![])`. Fallible so workflows that derive accounts from a
-    /// mnemonic can surface a bad-phrase error instead of panicking.
+    /// Genesis allocs this workflow expects to exist on the target chain:
+    /// prefunded signer EOAs and deployed contracts. Since `kardamom-node`
+    /// was removed no runtime path consumes this — the in-process ingress
+    /// stand-in accepts submissions without balance checks — so it is
+    /// descriptive: external harnesses (and the future full-pipeline
+    /// harness) can use it to provision chain state. Workflows that leave
+    /// chain state to the caller return `Ok(vec![])`. Fallible so workflows
+    /// that derive accounts from a mnemonic can surface a bad-phrase error
+    /// instead of panicking.
     ///
     /// # Errors
     ///

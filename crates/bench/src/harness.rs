@@ -79,10 +79,11 @@ impl<W: BenchWorkflow> Harness<W> {
     ///
     /// # Errors
     ///
-    /// Errors if the genesis derived from `workflow.genesis_alloc` is
-    /// invalid, the in-process RPC server can't bind, the workflow's
+    /// Errors if the in-process RPC server can't bind, the workflow's
     /// `prepare`/`dispatch` fails, or any of the output files (flame,
-    /// pprof, report JSON) can't be written.
+    /// pprof, report JSON) can't be written. (`workflow.genesis_alloc`
+    /// is not consulted: the ingress stand-in accepts submissions without
+    /// balance checks, so no genesis state is built or validated.)
     ///
     /// # Panics
     ///

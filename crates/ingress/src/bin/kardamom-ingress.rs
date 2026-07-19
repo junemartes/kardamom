@@ -191,7 +191,17 @@ async fn main() -> Result<()> {
     // publishers here. They make the full transaction envelopes durable so the
     // executor can replay them on crash recovery; without them only the
     // canonical order survives a restart, not the bytes to re-execute.
+    //
+    // Each recorder reports its startup outcome on `recorder_ready_rx`; main
+    // BLOCKS on all of them (after the tx_data publications are open, before
+    // serving RPC) so no transaction can be accepted before its shard's
+    // recording is active — recovery replays from record 0 and needs every
+    // envelope, so a birth-of-stream gap would permanently break executor
+    // crash recovery. A recorder startup failure is fatal: the operator asked
+    // for --archive-durability, so serving without it would be a silent lie.
     let recorder_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (recorder_ready_tx, recorder_ready_rx) =
+        std::sync::mpsc::channel::<(u8, Result<i64, String>)>();
     let recorder_handles = if args.archive_durability {
         spawn_tx_data_recorders(
             args.aeron_dir.clone(),
@@ -199,6 +209,7 @@ async fn main() -> Result<()> {
             aeron_cfg.clone(),
             args.shards as u8,
             recorder_stop.clone(),
+            recorder_ready_tx,
         )
     } else {
         Vec::new()
@@ -212,6 +223,15 @@ async fn main() -> Result<()> {
 
     let publication = LiveIngressPublication::open(&rt, &channels, args.shards as u8)
         .context("open IngressPublication")?;
+
+    // Recorder barrier (see the recorder-spawn comment above): with the
+    // tx_data publications now open, every shard's recording can materialise.
+    // Wait for all of them to be confirmed active (or fail startup) BEFORE the
+    // JSON-RPC server accepts its first transaction.
+    if args.archive_durability {
+        wait_for_recorders(&recorder_ready_rx, args.shards as u8)
+            .context("archive durability requested but tx_data recorders failed to start")?;
+    }
     let subscription =
         LiveIngressSubscription::open(&rt, &channels, args.recorder_id, executor_count)
             .context("open IngressSubscription")?;
@@ -273,15 +293,17 @@ async fn main() -> Result<()> {
 
 /// Spawn one archive recorder thread per tx_data shard. Each connects its own
 /// (thread-confined) archive session, starts recording its shard's tx_data
-/// publication, and holds the recording alive until `stop` is set. The
-/// recording itself runs in the ArchivingMediaDriver; the thread only keeps the
-/// session connected and re-adopts an existing recording on restart.
+/// publication, reports its startup outcome on `ready`, and holds the
+/// recording alive until `stop` is set. The recording itself runs in the
+/// ArchivingMediaDriver; the thread only keeps the session connected and
+/// re-adopts an existing recording on restart.
 fn spawn_tx_data_recorders(
     aeron_dir: Option<PathBuf>,
     channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
     shards: u8,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
 ) -> Vec<std::thread::JoinHandle<()>> {
     (0..shards)
         .map(|sid| {
@@ -289,12 +311,18 @@ fn spawn_tx_data_recorders(
             let channels = channels.clone();
             let aeron_cfg = aeron_cfg.clone();
             let stop = stop.clone();
+            let ready = ready.clone();
             std::thread::Builder::new()
                 .name(format!("ingress-tx-data-recorder-{sid}"))
                 .spawn(move || {
-                    if let Err(e) =
-                        run_tx_data_recorder(aeron_dir.as_deref(), &channels, &aeron_cfg, sid, stop)
-                    {
+                    if let Err(e) = run_tx_data_recorder(
+                        aeron_dir.as_deref(),
+                        &channels,
+                        &aeron_cfg,
+                        sid,
+                        stop,
+                        ready,
+                    ) {
                         tracing::error!(shard = sid, error = %e, "tx_data recorder exited with error");
                     }
                 })
@@ -303,14 +331,55 @@ fn spawn_tx_data_recorders(
         .collect()
 }
 
+/// Block until every one of the `shards` recorder threads has reported on
+/// `ready`, failing on the first reported error (or on timeout). This is the
+/// F13.2 barrier: publish/RPC must not start before the recordings are active.
+fn wait_for_recorders(
+    ready: &std::sync::mpsc::Receiver<(u8, Result<i64, String>)>,
+    shards: u8,
+) -> Result<()> {
+    // Generous per-recorder budget: the publications are already open, so the
+    // recording normally materialises within one catalog-poll tick (~500ms);
+    // the timeout only bounds a wedged/unreachable archive.
+    const RECORDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
+    for _ in 0..shards {
+        match ready.recv_timeout(RECORDER_READY_TIMEOUT) {
+            Ok((sid, Ok(recording_id))) => {
+                tracing::info!(
+                    shard = sid,
+                    recording_id,
+                    "tx_data recording confirmed active"
+                );
+            }
+            Ok((sid, Err(e))) => {
+                anyhow::bail!("tx_data recorder for shard {sid} failed to start: {e}");
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "timed out ({RECORDER_READY_TIMEOUT:?}) waiting for a tx_data recording \
+                     to become active: {e}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run_tx_data_recorder(
     aeron_dir: Option<&std::path::Path>,
     channels: &ChannelsConfig,
     aeron_cfg: &AeronConfig,
     sid: u8,
     stop: Arc<std::sync::atomic::AtomicBool>,
+    ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
 ) -> Result<()> {
-    let session = connect_archive(aeron_dir, aeron_cfg).context("connect archive")?;
+    let session = match connect_archive(aeron_dir, aeron_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = ready.send((sid, Err(format!("connect archive: {e}"))));
+            return Err(e).context("connect archive");
+        }
+    };
     let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
     let recorder = match Recorder::start_stream(
         session.archive,
@@ -318,17 +387,25 @@ fn run_tx_data_recorder(
         channels.tx_data_stream_id(sid),
         RecorderKind::TxData { sequencer_id: sid },
         &mut should_stop,
-    )
-    .context("start tx_data recording")?
-    {
-        Some(r) => r,
-        None => return Ok(()), // stopped before the recording materialised
+    ) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            // Stopped before the recording materialised (shutdown during
+            // startup); report it so a waiting barrier doesn't hang.
+            let _ = ready.send((sid, Err("stopped before the recording materialised".into())));
+            return Ok(());
+        }
+        Err(e) => {
+            let _ = ready.send((sid, Err(format!("start tx_data recording: {e}"))));
+            return Err(e).context("start tx_data recording");
+        }
     };
     tracing::info!(
         shard = sid,
         recording_id = recorder.recording_id(),
         "ingress: recording tx_data shard"
     );
+    let _ = ready.send((sid, Ok(recorder.recording_id())));
     // Hold the recording (and its archive session) alive until shutdown.
     while !stop.load(std::sync::atomic::Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(500));

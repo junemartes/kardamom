@@ -25,6 +25,11 @@ CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="$(cd "${CLUSTER_DIR}/../.." && pwd)"
 cd "${CLUSTER_DIR}"
 
+# Shared control-node helpers (on_control, running_alloc, all_allocs, ...) —
+# the same ones chaos.sh uses.
+# shellcheck source=deploy/cluster/scripts/lib.sh
+source "${SCRIPT_DIR}/lib.sh"
+
 NET=kardamom-net
 SUBNET=192.168.56.0/24
 REGISTRY=192.168.56.10:5000
@@ -531,9 +536,8 @@ else
   # never collide with account #0 (reserved for the smoke gate + churn re-smoke).
   SMOKE_SENDER_OFFSET=1 ./scripts/smoke-load.sh
   log "subscriber-churn: stopping one executor alloc and re-running smoke"
-  docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
-    alloc=$(nomad job allocs -t "{{range .}}{{if eq .ClientStatus \"running\"}}{{.ID}}{{end}}{{end}}" executor 2>/dev/null | head -c 36); \
-    [ -n "$alloc" ] && nomad alloc stop "$alloc" || true' || true
+  alloc="$(running_alloc executor || true)"
+  [ -n "${alloc}" ] && on_control 'nomad alloc stop "$1"' "${alloc}" || true
   sleep 5
   # Re-smoke from a dedicated account (#17), disjoint from the gate (#0) and the
   # ingress-churn re-smoke (#16) — every check owns its own nonce-0 account.
@@ -567,7 +571,8 @@ PK="0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0" \
   RPC_URL="http://192.168.56.32:8545" ./scripts/smoke.sh
 
 # --- 7c. Validator sync + keep-up verdict -------------------------------------
-# The validator (validator.nomad.hcl, one alloc on an executor-class node)
+# The validator (validator.nomad.hcl, one alloc on the aux node — kept out of
+# the executor-chaos blast radius)
 # followed everything the shard just did — bring-up, smoke, load and/or chaos —
 # re-executing every block through the shared engine and cross-checking against
 # the executors' receipts + per-block BAL, advancing an MPT state root. Assert:
@@ -673,17 +678,28 @@ diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_dive
 diverged="$(printf '%.0f' "${diverged:-0}")"
 (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
 # The metric resets if the alloc restarted (recovery loop); a PRE-restart
-# divergence still shows in the alloc log — catch it there too.
-if docker exec kardamom-control-0 bash -lc 'export NOMAD_ADDR=http://192.168.56.10:4646; \
-    alloc=$(nomad job allocs -t "{{range .}}{{.ID}} {{end}}" validator 2>/dev/null | awk "{print \$1}"); \
-    nomad alloc logs "$alloc" 2>/dev/null' 2>/dev/null | grep -q "halted on divergence"; then
-  echo "FAIL: validator halted on divergence (found in alloc log)" >&2
+# divergence still shows in the alloc log — catch it there too. Check EVERY
+# alloc of the job (not just the first): a rescheduled validator gets a new
+# alloc, and the "halted on divergence" line would live in the OLD alloc's log.
+divergence_logged=0
+while read -r valloc; do
+  [[ -z "${valloc}" ]] && continue
+  if on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+      | grep -q "halted on divergence"; then
+    divergence_logged=1
+    break
+  fi
+done < <(all_allocs validator)
+if (( divergence_logged == 1 )); then
+  echo "FAIL: validator halted on divergence (found in alloc ${valloc} log)" >&2
   exit 1
 fi
-# Incremental-trie shadow-check (--trie-shadow-check 1 in validator.nomad.hcl):
-# every committed block recomputed the state root by FULL rebuild and compared
-# it to the node-incremental walker's. A mismatch fail-stops the validator
-# (caught by the liveness probe above); assert the counters directly too.
+# Incremental-trie shadow-check (--trie-shadow-check 8 in validator.nomad.hcl):
+# every 8th committed block recomputes the state root by FULL rebuild and
+# compares it to the node-incremental walker's (every-block checking would
+# saturate a CI core — see the cadence rationale in validator.nomad.hcl). A
+# mismatch fail-stops the validator (caught by the liveness probe above);
+# assert the counters directly too.
 # Runs on every shard: the validator commits blocks (v_blk > 0 asserted above
 # on both the load and chaos paths), so checks_total must be > 0 everywhere.
 shadow_checks="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" kardamom_state_trie_shadow_checks_total)"

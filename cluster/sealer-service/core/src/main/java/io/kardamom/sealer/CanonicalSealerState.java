@@ -204,6 +204,24 @@ public final class CanonicalSealerState {
         long canonicalCount = buf.getLong();
         long blockNumber = buf.getLong();
         int idCount = buf.getInt();
+        if (idCount < 0 || idCount > dedupCapacity) {
+            // A snapshot taken with a LARGER configured window than this
+            // member's would silently rebuild an oversized window that
+            // firstSeen shrinks by only one entry per insert — dedup behaviour
+            // would differ from a fresh state with the same config, a
+            // determinism hazard if members ever disagree on the capacity.
+            // Fail loudly instead; shrinking the window across a restart
+            // requires an explicit migration, not a silent truncation.
+            throw new IllegalArgumentException(
+                    "snapshot idCount " + idCount + " outside [0, dedupCapacity="
+                            + dedupCapacity + "] — members must agree on the configured window");
+        }
+        if ((long) idCount * CANONICAL_ID_LEN > buf.remaining()) {
+            throw new IllegalArgumentException(
+                    "truncated snapshot: idCount " + idCount + " needs "
+                            + ((long) idCount * CANONICAL_ID_LEN) + " bytes, only "
+                            + buf.remaining() + " remaining");
+        }
 
         CanonicalSealerState state = new CanonicalSealerState(dedupCapacity, blockNumber);
         for (int i = 0; i < idCount; i++) {

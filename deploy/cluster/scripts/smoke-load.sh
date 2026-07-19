@@ -104,6 +104,10 @@ if (( BASH_VERSINFO[0] < 4 )); then
   exit 1
 fi
 
+log()  { echo "==> $*"; }
+warn() { echo "WARN: $*" >&2; }
+fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
+
 # --- config -----------------------------------------------------------------
 RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 CHAIN_ID="${CHAIN_ID:-412346}"
@@ -148,13 +152,22 @@ SENDER_KEYS=(
   0x8166f546bab6da521a8369cab06c5d2b9e46670292d85c875ee9ec20e84ffb61
 )
 
-# Clamp the sender offset to [0, 15] and the sender count to [1, 16], keeping the
+# Validate the sender offset and clamp the sender count to [1, 16], keeping the
 # offset+count window inside the 16-key table so senders never wrap back onto a
 # reserved low account (e.g. account #0, reserved for scripts/smoke.sh).
-if (( SMOKE_SENDER_OFFSET < 0 )); then SMOKE_SENDER_OFFSET=0; fi
-if (( SMOKE_SENDER_OFFSET > ${#SENDER_KEYS[@]} - 1 )); then SMOKE_SENDER_OFFSET=$(( ${#SENDER_KEYS[@]} - 1 )); fi
+# A NEGATIVE offset is a hard error rather than a clamp: silently clamping to 0
+# would land the load back on exactly the reserved account the knob exists to
+# avoid, reintroducing the nonce collision with no diagnostic.
+if (( SMOKE_SENDER_OFFSET < 0 )); then
+  fail "SMOKE_SENDER_OFFSET=${SMOKE_SENDER_OFFSET} is negative (offset 0 is the reserved smoke account; pass 0..$(( ${#SENDER_KEYS[@]} - 1 )))"
+fi
+if (( SMOKE_SENDER_OFFSET > ${#SENDER_KEYS[@]} - 1 )); then
+  warn "SMOKE_SENDER_OFFSET=${SMOKE_SENDER_OFFSET} exceeds the key table; clamping to $(( ${#SENDER_KEYS[@]} - 1 ))"
+  SMOKE_SENDER_OFFSET=$(( ${#SENDER_KEYS[@]} - 1 ))
+fi
 if (( SMOKE_SENDERS < 1 )); then SMOKE_SENDERS=1; fi
 if (( SMOKE_SENDERS > ${#SENDER_KEYS[@]} - SMOKE_SENDER_OFFSET )); then
+  warn "SMOKE_SENDERS=${SMOKE_SENDERS} does not fit above offset ${SMOKE_SENDER_OFFSET}; clamping to $(( ${#SENDER_KEYS[@]} - SMOKE_SENDER_OFFSET ))"
   SMOKE_SENDERS=$(( ${#SENDER_KEYS[@]} - SMOKE_SENDER_OFFSET ))
 fi
 
@@ -170,10 +183,6 @@ WORK="$(mktemp -d)"
 # shellcheck disable=SC2329  # invoked indirectly by the EXIT trap below.
 cleanup() { rm -rf "${WORK}"; }
 trap cleanup EXIT
-
-log()  { echo "==> $*"; }
-warn() { echo "WARN: $*" >&2; }
-fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
 
 # --- preflight --------------------------------------------------------------
 command -v cast >/dev/null 2>&1 || fail "foundry 'cast' not on PATH (needed to sign txs)"
@@ -256,12 +265,40 @@ read_block_metric() {
   to_int "${val}"
 }
 
-# Executor node -> IP map (best-effort; only used when METRICS_VIA_DOCKER=0).
-declare -A NODE_IP=(
-  [kardamom-r1]=192.168.56.11 [kardamom-r2]=192.168.56.12 [kardamom-r3]=192.168.56.13
-  [kardamom-w1]=192.168.56.21 [kardamom-w2]=192.168.56.22
-)
-node_ip() { echo "${NODE_IP[$1]:-127.0.0.1}"; }
+# Node -> IP map, generated from the node-class model in group_vars/all.yml
+# (the same single source of truth ci-cluster.sh materialises the cluster
+# from: <class>-<i> gets ip_prefix.<ip_start+i>). Only needed when
+# METRICS_VIA_DOCKER=0 (direct bridge scrapes); an unmappable node is a hard
+# error there — falling back to 127.0.0.1 would scrape the WRONG host and
+# surface as a bogus METRIC-MISSING.
+declare -A NODE_IP=()
+GROUP_VARS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ansible/group_vars/all.yml"
+if [[ "${METRICS_VIA_DOCKER}" != "1" ]]; then
+  [[ -f "${GROUP_VARS}" ]] || fail "METRICS_VIA_DOCKER=0 needs ${GROUP_VARS} to derive node IPs"
+  while read -r _name _ip; do
+    [[ -z "${_name}" ]] && continue
+    NODE_IP["kardamom-${_name}"]="${_ip}"
+  done < <(python3 - "${GROUP_VARS}" <<'PY'
+# Same no-PyYAML regex parse as ci-cluster.sh / check-contract.py.
+import re, sys
+text = open(sys.argv[1]).read()
+pref = re.search(r'^ip_prefix:\s*"([\d.]+)"', text, re.M).group(1)
+for m in re.finditer(
+        r'^\s{2}(\w+):\s*\{\s*count:\s*(\d+),\s*ip_start:\s*(\d+)', text, re.M):
+    cls, count, ip_start = m.group(1), int(m.group(2)), int(m.group(3))
+    for i in range(count):
+        print(f"{cls}-{i} {pref}.{ip_start + i}")
+PY
+  )
+fi
+node_ip() {
+  if [[ "${METRICS_VIA_DOCKER}" == "1" ]]; then
+    echo "127.0.0.1"   # unused on the docker-exec path
+  else
+    [[ -n "${NODE_IP[$1]:-}" ]] || fail "no bridge IP known for node $1 (not in group_vars node_classes?)"
+    echo "${NODE_IP[$1]}"
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # 1. PRE-SIGN all txs offline (cast mktx, explicit nonce — no RPC round-trip).

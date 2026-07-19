@@ -58,6 +58,9 @@ struct Args {
     /// second Nomad group of racing replicas reuse the same node-derived
     /// `--partition-index` while serving a rotated shard, so the two
     /// replicas of any shard land on different nodes deterministically.
+    /// Incompatible with an explicit `--sequencer-id` (the tx_data
+    /// subscription and `TxRef.shard_id` must both follow the rotated
+    /// shard).
     /// Racing replicas are safe by construction: refs encode
     /// deterministically from the shared per-shard tx_data stream and the
     /// Aeron Cluster dedups records by canonical_id first-seen — the same
@@ -106,8 +109,19 @@ async fn main() -> anyhow::Result<()> {
         cfg.partition_count = m;
     }
     if args.partition_offset != 0 {
+        // An explicit --sequencer-id combined with rotation would subscribe
+        // to tx_data stream `sequencer_id` while the wrong-shard guard
+        // filters on the rotated `partition_index`: the replica would
+        // silently drop every envelope (and its TxRefs would stamp a
+        // shard_id its twin doesn't, breaking byte-identical dedup).
+        anyhow::ensure!(
+            args.sequencer_id.is_none(),
+            "--sequencer-id cannot be combined with --partition-offset: \
+             the sequencer id must follow the rotated shard \
+             (sequencer_id == partition_index)"
+        );
         let raw_index = cfg.partition_index;
-        cfg.rotate_partition(args.partition_offset, args.sequencer_id.is_some());
+        cfg.rotate_partition(args.partition_offset);
         tracing::info!(
             raw_index,
             offset = args.partition_offset,
@@ -158,6 +172,12 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_for_deposits = shutdown.clone();
 
     let state_db = Arc::new(EmptyStateDatabase);
+    tracing::info!(
+        "nonce floors: no committed-state reader wired (EmptyStateDatabase); \
+         cold senders seed at 0. NOTE: a restarted replica does NOT regain \
+         coverage of established senders (F02.1 re-opened — the floor \
+         fast-forward was removed for publishing canonical nonce gaps)"
+    );
     let cfg_clone = cfg.clone();
 
     // tx_ordering is ALWAYS published to the Aeron Cluster (Raft) ingress. The
@@ -341,9 +361,15 @@ impl TxErrorPublisher for LiveTxErrorPub {
 }
 
 // ---------------------------------------------------------------------------
-// Empty StateDatabase: cache-miss hydration always seeds at nonce 0. Sound for
-// fresh chains; on warm restarts the operator should wire a real read-only
-// libmdbx snapshot here. Lives in the bin because it's a deployment choice.
+// Empty StateDatabase: cache-miss hydration always seeds at nonce 0, i.e. a
+// floor that can only LAG the true next nonce (never lead it — so no valid tx
+// is ever spuriously rejected). KNOWN LIMITATION (F02.1, re-opened): a
+// restarted replica buffers established senders' traffic against the stale
+// floor and does not regain coverage of them; the floor fast-forward that
+// closed this was removed for adopting client-abandoned gaps into the
+// canonical stream (fatal to executors). Wiring a real committed-state
+// reader here is the sound fix. Lives in the bin because it's a deployment
+// choice.
 // ---------------------------------------------------------------------------
 
 struct EmptyStateDatabase;

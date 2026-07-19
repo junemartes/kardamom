@@ -30,8 +30,10 @@ pub const TABLE_TX_HASH_INDEX: &str = "tx_hash_index";
 pub const TABLE_META: &str = "meta";
 
 // --- Incremental state-trie tables (schema v2; see crate::trie) ---
-// Stored intermediate branch nodes, keyed by trie PATH (len-prefixed packed
-// nibbles); the hashed-state mirror holds the leaves keyed by keccak. See
+// Stored intermediate branch nodes, keyed by trie PATH (raw *unpacked* nibbles,
+// one nibble per byte, so lexicographic mdbx order == trie order — see
+// trie/cursor.rs::node_key; storage-trie keys prepend the 32-byte account
+// hash); the hashed-state mirror holds the leaves keyed by keccak. See
 // docs/specs/2026-06-23-incremental-trie-design.md.
 pub const TABLE_ACCOUNT_TRIE: &str = "account_trie";
 pub const TABLE_STORAGE_TRIE: &str = "storage_trie";
@@ -228,6 +230,39 @@ mod tests {
             err,
             StateError::BadEncoding { table, expected: 32, got: 31 } if table == TABLE_STORAGE
         ));
+    }
+
+    #[test]
+    fn block_key_layout_is_pinned() {
+        // `headers` is an at-rest format: the key is the block number as 8
+        // big-endian bytes. Pin the exact byte layout (no decoder exists).
+        assert_eq!(
+            encode_block_key(0x0102_0304_0506_0708),
+            [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+        );
+        assert_eq!(encode_block_key(0), [0u8; 8]);
+    }
+
+    #[test]
+    fn header_value_layout_is_pinned() {
+        // `headers` value is an at-rest format: term_id (i32 BE) ++ term_offset
+        // (i32 BE) ++ l2_timestamp (u64 BE) ++ 4 reserved zero bytes = 20 bytes.
+        let v = HeaderValue {
+            end_tx_idx: BPosition {
+                term_id: 0x0102_0304,
+                term_offset: 0x0506_0708,
+            },
+            l2_timestamp: 0x1112_1314_1516_1718,
+        };
+        assert_eq!(
+            encode_header_value(&v),
+            [
+                0x01, 0x02, 0x03, 0x04, // term_id BE
+                0x05, 0x06, 0x07, 0x08, // term_offset BE
+                0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // l2_timestamp BE
+                0x00, 0x00, 0x00, 0x00, // reserved
+            ]
+        );
     }
 
     #[test]

@@ -72,10 +72,12 @@ const MAX_DELIVERY: Duration = Duration::from_millis(1500);
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p kardamom-log --features docker-e2e --test offer_starvation -- --ignored`"]
 async fn back_pressured_publish_does_not_starve_a_live_subscription() {
-    if !docker_available().await {
-        eprintln!("skipping: docker not available");
-        return;
-    }
+    // Explicit opt-in test (`--features docker-e2e -- --ignored`): a missing
+    // Docker must fail loudly, not silently pass via an early return.
+    assert!(
+        docker_available().await,
+        "docker not available — required for this --ignored docker-e2e test"
+    );
 
     let cluster = AeronTestCluster::single_node()
         .await
