@@ -19,6 +19,10 @@ path = "src/bin/harness.rs"
 name = "kardamom-load"
 path = "src/bin/load.rs"
 
+[[bin]]
+name = "kardamom-perf"
+path = "src/bin/perf.rs"
+
 [dependencies]
 kardamom-types.workspace = true
 kardamom-ingress = { path = "../ingress" }
