@@ -55,6 +55,17 @@ with three distinct, tested modes:
   keep progressing; the returned node rejoins to 3/3. Replicas are
   deterministic state machines, so one dead or lagging replica never blocks
   the others.
+- **State-DB volume loss** (`state-checkpoint-restore`) — a *wiped* state DB
+  (not just a process crash) would otherwise force a re-sync from genesis,
+  replaying the entire canonical stream — unbounded as the chain ages. With
+  `--checkpoint-dir` the executor writes periodic consistent snapshots
+  (`compact_to`, an online RO copy that never blocks the writer) and, on a
+  cold start against an empty state dir, restores the newest checkpoint
+  *before* opening the env — so the normal resume path replays only the short
+  tail. Because the replicas are deterministic at the same block, a **peer**
+  executor's checkpoint is a valid restore source; the chaos case wipes
+  executor-0's state, re-replicates executor-1's checkpoint, and asserts
+  executor-0 restores from it (not a genesis re-sync) and rejoins.
 - **Wedged (frozen)** — an executor whose block gauge is flat *while sealer
   boundaries keep advancing* is the load harness's FROZEN verdict; that
   contrast (rather than absolute progress) is what distinguishes a wedged

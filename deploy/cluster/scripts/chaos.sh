@@ -487,6 +487,48 @@ run_case() { # <case-name>
       assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
       ;;
 
+    state-checkpoint-restore)
+      # DATA-loss drill: WIPE executor-0's state DB (and its own checkpoints),
+      # then restore from a PEER executor's checkpoint. Executor replicas are
+      # deterministic state machines at the same block, so executor-1's checkpoint
+      # is a valid restore source. On restart, executor-0 finds an empty state DB
+      # + the peer checkpoint and restores it BEFORE opening the env — replaying
+      # only the tail instead of re-syncing from genesis. Expected, in order:
+      #   1. the fleet degrades 3->2 and keeps progressing (deterministic replicas);
+      #   2. executor-0 restarts and RESTORES FROM THE CHECKPOINT (asserted via the
+      #      "restored state from checkpoint" log line — else it silently fell back
+      #      to a full genesis re-sync, which this case exists to prevent);
+      #   3. executor count returns to 3.
+      local peer_ck="" ex0_inner
+      log "state-checkpoint-restore: waiting for a checkpoint on peer executor-1"
+      for _ in $(seq 1 15); do
+        peer_ck="$(docker exec kardamom-executor-1 bash -lc \
+          'ls /opt/kardamom/checkpoints/checkpoint-* 2>/dev/null | head -1' 2>/dev/null || true)"
+        [ -n "${peer_ck}" ] && break
+        sleep 5
+      done
+      [ -n "${peer_ck}" ] || fail "state-checkpoint-restore: peer executor-1 produced no checkpoint"
+      log "state-checkpoint-restore: killing executor-0 + wiping its state DB and checkpoints"
+      inject_hard kardamom-executor-0 executor
+      docker exec kardamom-executor-0 bash -lc 'rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*' \
+        || fail "state-checkpoint-restore: could not wipe executor-0 state"
+      log "state-checkpoint-restore: re-replicating checkpoints from executor-1"
+      docker exec kardamom-executor-1 tar -C /opt/kardamom -cf - checkpoints \
+        | docker exec -i kardamom-executor-0 tar -C /opt/kardamom -xf - \
+        || fail "state-checkpoint-restore: checkpoint copy failed"
+      # The surviving replicas must keep the pipeline progressing on 2.
+      assert_executor_progress 180
+      # executor-0 restarts, restores from the peer checkpoint, rejoins to 3.
+      assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
+      ex0_inner="$(docker exec kardamom-executor-0 bash -lc \
+        'docker ps --format "{{.Names}}" | grep -i executor | head -1')"
+      [ -n "${ex0_inner}" ] || fail "state-checkpoint-restore: no executor container on executor-0 after restart"
+      docker exec kardamom-executor-0 bash -lc \
+        "docker logs ${ex0_inner} 2>&1 | grep -q 'restored state from checkpoint'" \
+        || fail "state-checkpoint-restore: executor-0 did NOT restore from checkpoint (fell back to genesis re-sync)"
+      log "state-checkpoint-restore: executor-0 restored from peer checkpoint + rejoined (no genesis re-sync)"
+      ;;
+
     archive-driver-loss)
       # HARD-kill the Aeron SUBSTRATE (the `aeron` system job's combined
       # ArchivingMediaDriver task) on the ingress-0 node — not the ingress task
