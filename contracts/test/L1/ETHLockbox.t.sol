@@ -107,8 +107,8 @@ contract ETHLockboxTest is Test {
         return keccak256(abi.encodePacked(bytes1(0x00), wh));
     }
 
-    function _hashNode(bytes32 l, bytes32 r) internal pure returns (bytes32) {
-        return keccak256(abi.encodePacked(bytes1(0x01), l, r));
+    function _hashNode(bytes32 left, bytes32 right) internal pure returns (bytes32) {
+        return keccak256(abi.encodePacked(bytes1(0x01), left, right));
     }
 
     /// Fund the lockbox as if deposits had filled it, and register a 2-leaf
