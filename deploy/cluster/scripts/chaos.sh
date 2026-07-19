@@ -345,14 +345,22 @@ inject_graceful() { # <job>
   KILLED_ALLOC="${alloc}"
 }
 
-inject_hard() { # <node-container> <task-name>
-  local cid
-  cid="$(docker exec "$1" sh -c 'docker ps --filter name='"$2"' -q | head -1')"
-  [ -n "${cid}" ] || fail "no running ${2} container to hard-kill on ${1}"
-  log "hard: docker kill inner ${2} container ${cid} on ${1}"
-  docker exec "$1" docker kill "${cid}" >/dev/null \
-    || fail "could not hard-kill ${2} (${cid}) on ${1}"
-  KILLED_NODE="$1"; KILLED_TASK="$2"; KILLED_CID="${cid}"
+inject_hard() { # <node-container(s), space-separated candidates> <task-name>
+  # Multiple candidates cover tasks whose placement can move between cases
+  # (observed: after graceful-executor, the replacement alloc's container is
+  # not always back on executor-0 when hard-executor probes it). The first
+  # node actually running the task is killed; NO node running it is still a
+  # loud failure — never a vacuous pass.
+  local node cid=""
+  for node in $1; do
+    cid="$(docker exec "${node}" sh -c 'docker ps --filter name='"$2"' -q | head -1' 2>/dev/null)"
+    [ -n "${cid}" ] && break
+  done
+  [ -n "${cid}" ] || fail "no running ${2} container to hard-kill on any of: ${1}"
+  log "hard: docker kill inner ${2} container ${cid} on ${node}"
+  docker exec "${node}" docker kill "${cid}" >/dev/null \
+    || fail "could not hard-kill ${2} (${cid}) on ${node}"
+  KILLED_NODE="${node}"; KILLED_TASK="$2"; KILLED_CID="${cid}"
 }
 
 # --- assertions -------------------------------------------------------------
@@ -585,7 +593,7 @@ run_case() { # <case-name>
 
   case "${name}" in
     graceful-executor)  inject_graceful executor;                       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
-    hard-executor)      inject_hard kardamom-executor-0 executor;       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-executor)      inject_hard "kardamom-executor-0 kardamom-executor-1 kardamom-executor-2" executor; assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
     graceful-ingress)   inject_graceful ingress;                        assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
     hard-ingress)       inject_hard kardamom-ingress-0 ingress;         assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
     # Sequencers run P=2 racing replicas per shard (job groups seq-a/seq-b,
