@@ -166,9 +166,16 @@ sealer_boundaries() {
 VALIDATOR_NODE="${VALIDATOR_NODE:-kardamom-aux-0}"
 VALIDATOR_PORT="${VALIDATOR_PORT:-9006}"
 val_metric() { # <metric-name> -> integer (empty on scrape failure)
+  # `|| true` is load-bearing: under `set -euo pipefail` a failed curl (the
+  # validator's exporter routinely stalls >5s right after `docker unpause`
+  # while it chews through the lapse backlog) would otherwise kill the whole
+  # script mid-case with NO fail() message — the validator-lapse case died
+  # exactly this way on its first post-unpause probe. Empty output is the
+  # documented contract; callers default it.
   timeout 8 docker exec "${VALIDATOR_NODE}" curl -fsS --max-time 5 \
     "http://127.0.0.1:${VALIDATOR_PORT}/metrics" 2>/dev/null \
-    | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { printf "%d", $NF; exit }'
+    | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+    || true
 }
 
 # validator-lapse case: PAUSE the validator process (docker pause the inner
@@ -500,6 +507,54 @@ run_case() { # <case-name>
       inject_hard kardamom-ingress-0 archiving-media-driver
       assert_progress
       assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
+      assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      ;;
+
+    archive-tx-data-wipe)
+      # DATA-loss drill (not just process loss): permanently WIPE ingress-0's
+      # tx_data archive volume, then restore it from ingress-1's mirror. tx_data
+      # is UDP multicast, so BOTH ingress archives record every publisher's shard
+      # streams — the segments are byte-identical across the two nodes (verified
+      # by sha256), so a single node's archive loss is survivable and the peer is
+      # an exact restore source. This exercises `kardamom-archive-rereplicate`'s
+      # mechanism (segment + catalog mirror). Expected outcome, in order:
+      #   1. the pipeline keeps progressing on ingress-1 (active/active) while
+      #      ingress-0's substrate is down;
+      #   2. after re-replicating ingress-1's segments + catalog, the restarted
+      #      ingress-0 archive adopts them and Aeron's own `ArchiveTool verify`
+      #      reports every recording OK;
+      #   3. ingress + aeron return to full strength.
+      local aeron_base ac0 verify_out
+      aeron_base="$(count_running aeron)"
+      log "archive-tx-data-wipe: killing aeron substrate on kardamom-ingress-0 + wiping its tx_data archive volume"
+      inject_hard kardamom-ingress-0 archiving-media-driver
+      # Simulate permanent volume loss while the driver is down (segments + catalog).
+      docker exec kardamom-ingress-0 bash -lc \
+        'rm -f /opt/kardamom/archive/dir/*.rec /opt/kardamom/archive/dir/archive.catalog' \
+        || fail "archive-tx-data-wipe: could not wipe ingress-0 archive"
+      # Re-replicate from the surviving peer (ingress-1): stream its archive dir
+      # across. This is the transport that kardamom-archive-rereplicate wraps for
+      # an operator (peer copy -> mirror_archive -> verify_mirror).
+      log "archive-tx-data-wipe: re-replicating archive from kardamom-ingress-1 mirror"
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
+        | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
+        || fail "archive-tx-data-wipe: re-replication copy failed"
+      # The pipeline must have ridden through on ingress-1 the whole time.
+      assert_progress
+      # aeron restarts (system job) and adopts the restored archive.
+      assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
+      # Verify the restored archive with Aeron's own tool: every recording OK.
+      ac0="$(docker exec kardamom-ingress-0 bash -lc \
+        'docker ps --format "{{.Names}}" | grep archiving-media-driver | head -1')"
+      [ -n "${ac0}" ] || fail "archive-tx-data-wipe: no aeron container on ingress-0 after restart"
+      verify_out="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker exec ${ac0} bash -lc 'java -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir verify 2>&1'" || true)"
+      echo "${verify_out}" | grep -qE "recordingId=.*OK" \
+        || fail "archive-tx-data-wipe: restored archive failed ArchiveTool verify: ${verify_out}"
+      if echo "${verify_out}" | grep -qiE "ERR |invalid|FAILED"; then
+        fail "archive-tx-data-wipe: restored archive verify reported errors: ${verify_out}"
+      fi
+      log "archive-tx-data-wipe: restored archive verified OK on ingress-0 (2-copy redundancy recovered)"
       assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
       ;;
 

@@ -8,6 +8,7 @@ pub mod config;
 pub mod harness;
 pub mod load;
 pub mod mnemonic;
+pub mod perf;
 pub mod report;
 pub mod signers;
 pub mod workflow;

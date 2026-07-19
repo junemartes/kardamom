@@ -174,15 +174,27 @@ by construction.
   to full strength.
 - **Archives** — durable `tx_ordering` (folded into the Raft log + per-member
   archive) and per-sequencer `tx_data`; they underpin executor resume and the
-  batcher.
+  batcher. `tx_data` is **already 2× node-redundant**: it is a UDP-multicast
+  stream, and both ingress replicas run an archive recorder that joins the group,
+  so each ingress node's archive captures *every* publisher's shard streams. The
+  two archives are byte-identical (same recording ids + segment checksums), which
+  makes the peer an exact restore source. What was missing — and what
+  `archive-tx-data-wipe` + `kardamom-archive-rereplicate` add — is the path back
+  to full redundancy after a loss: a wiped node's archive is restored by
+  file-mirroring the surviving peer's segments + catalog (rusteron-archive does
+  not expose Aeron's network `replicate()`), and the restored archive passes
+  Aeron's own `ArchiveTool verify`. Without it, losing one copy leaves the *next*
+  loss fatal, and a volume wipe hangs the executor's `resolve_recording`.
 
 ## Known gaps (untested failure surface)
 
-- **Archive *data* loss** — the total-loss case now has a recovery path
-  (rebuild-from-L1, above) proven by `reconstruct_l1_e2e`. Still open: a
-  *partial* wipe of one node's archive volume exercising executor resume /
-  batcher reads against missing segments, and a full-cluster DinD drill that
-  wipes archives live and rebuilds from the cluster's L1.
+- **Archive *data* loss** — total loss has the rebuild-from-L1 path (above,
+  `reconstruct_l1_e2e`); single-node `tx_data` archive loss has the
+  re-replicate-from-peer path (`archive-tx-data-wipe` chaos case +
+  `kardamom-archive-rereplicate`). Still open: `tx_ordering` archive re-replication
+  (today it self-heals only via the Java cluster's Raft log replication on
+  rejoin), and executor resume against a partially-missing (not fully wiped)
+  segment set.
 - **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
   transactions; re-deriving L1 deposits from `DepositInitiated` events and
   interleaving them in canonical order is a follow-up.

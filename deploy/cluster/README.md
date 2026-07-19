@@ -196,6 +196,34 @@ container `cluster-e2e` job exercises. The single-host IPC defaults (no
 `--log-config`) remain the known-good path. Also exercise the
 UDP-over-host-networking tuning (MTU, `SO_RCVBUF`, archive fsync on VM disk).
 
+## Performance pipeline (`kardamom-perf`)
+
+`kardamom-perf` (`crates/bench`, `bin/perf.rs`) automates the saturation
+campaign against this stack: fresh bring-up, ramp to the sustainable edge,
+then a steady soak while async-profiler samples the sealer Raft leader's JVM
+(itimer mode — works inside the nested containers, no perf_events needed).
+
+```
+cargo build --release -p kardamom-bench --bin kardamom-perf
+kardamom-perf up                      # build + purge + fresh KEEP=1 deploy
+kardamom-perf run --fresh             # up, then ramp -> profile -> report
+kardamom-perf report --dir <outdir>   # re-render summary.md from artifacts
+```
+
+Each `run` writes a timestamped directory (default `target/perf/perf-<ts>/`):
+`discovery-report.json` (the ramp), `load-report.json` (the profiled soak),
+`flame.html` / `flame.svg` / `stacks.collapsed` (the profile), a mid-soak
+`cpu-snapshot.txt` of every node container, and `summary.md` tying it
+together (edge tx/s, delivery verdict, latency percentiles, CPU by node,
+and the leader profile bucketed into service logic vs Aeron substrate).
+
+Account budget: the discovery ramp signs from genesis accounts #1..#6 and the
+profiled soak from #7..#15 (#0/#16 belong to the deploy's smoke gates), so a
+`run` needs the fresh chain `up` deploys — nonces are managed locally
+(ingress has no `eth_getTransactionCount`). `run --fresh` does both in one
+go; profiling knobs (`--ceiling`, `--soak-fraction`, `--profile-secs`, ...)
+are documented in `--help`.
+
 ## Sustained-load + chaos suite
 
 The `cluster-e2e` workflow runs the full suite on every trigger, **sharded
