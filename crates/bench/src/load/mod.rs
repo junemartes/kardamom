@@ -106,7 +106,7 @@ pub struct LoadConfig {
 }
 
 /// One ramp step's sustainability evaluation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct RampStep {
     /// Offered rate for this step (tx/s).
     pub rate: u32,
@@ -121,7 +121,7 @@ pub struct RampStep {
 }
 
 /// Serialized harness report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct LoadReport {
     /// `"soak"` or `"chaos"`.
     pub mode: String,

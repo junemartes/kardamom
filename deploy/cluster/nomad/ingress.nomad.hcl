@@ -110,6 +110,18 @@ job "ingress" {
           # docs/agents/resilient-ingress-spec.md D3.
           "--ingress-id", "${NOMAD_ALLOC_INDEX}",
           "--ack-policy", "${var.ack_policy}",
+          # INTERIM failover shedding (issue #85): parked submit_raw requests
+          # hold their connection until receipt, so a small cap makes ingress
+          # stop admitting work within ~C/rate seconds of the pipeline
+          # stalling. The sequencer advances nonce state on cluster offers
+          # that are not yet committed, and a leader failover under sustained
+          # admission seals a nonce gap that halts every executor — the cap
+          # keeps the sequencer's void-offer window near zero (the pre-#81
+          # behaviour, now explicit). Remove when the publish path gets
+          # offer-until-committed replay. Costs nothing in healthy operation:
+          # steady-state occupancy is rate × latency (≈ 2 connections at CI
+          # load); saturation campaigns should raise the flag explicitly.
+          "--rpc-max-connections", "100",
           # Cluster mode: this node's cluster-egress (response) endpoint for the
           # on-quorum watermark observer's Aeron Cluster client. Uniform port
           # 40210 (cluster_egress_port); uniqueness comes from the ingress

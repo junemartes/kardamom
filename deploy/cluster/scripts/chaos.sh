@@ -166,9 +166,16 @@ sealer_boundaries() {
 VALIDATOR_NODE="${VALIDATOR_NODE:-kardamom-aux-0}"
 VALIDATOR_PORT="${VALIDATOR_PORT:-9006}"
 val_metric() { # <metric-name> -> integer (empty on scrape failure)
+  # `|| true` is load-bearing: under `set -euo pipefail` a failed curl (the
+  # validator's exporter routinely stalls >5s right after `docker unpause`
+  # while it chews through the lapse backlog) would otherwise kill the whole
+  # script mid-case with NO fail() message — the validator-lapse case died
+  # exactly this way on its first post-unpause probe. Empty output is the
+  # documented contract; callers default it.
   timeout 8 docker exec "${VALIDATOR_NODE}" curl -fsS --max-time 5 \
     "http://127.0.0.1:${VALIDATOR_PORT}/metrics" 2>/dev/null \
-    | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { printf "%d", $NF; exit }'
+    | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+    || true
 }
 
 # validator-lapse case: PAUSE the validator process (docker pause the inner

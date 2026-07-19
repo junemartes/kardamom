@@ -13,7 +13,7 @@ use crate::load::engine::Counts;
 use crate::load::scrape::MetricsSnapshot;
 
 /// Per-executor keep-pace evaluation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct KeepPace {
     /// Executor node-container name.
     pub node: String,
@@ -52,7 +52,7 @@ pub struct EvalInput<'a> {
 }
 
 /// The harness verdict + computed accounting, serialized into the report.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct Verdict {
     /// Overall pass/fail.
     pub pass: bool,
