@@ -293,6 +293,12 @@ impl<DB: StateDatabase> Sequencer<DB> {
                 metrics::record_buffered_future(self.cfg.partition_index);
                 metrics::record_eviction(self.cfg.partition_index);
             }
+            NonceOutcome::RejectedTooFar { .. } => {
+                // Furthest-future nonce shed to protect the drainable run; the
+                // client re-submits it once it is back within the window. Counts
+                // as an eviction for observability (load-shed, not a wedge).
+                metrics::record_eviction(self.cfg.partition_index);
+            }
             NonceOutcome::BufferedDisabled => {
                 metrics::record_buffered_future(self.cfg.partition_index);
             }
