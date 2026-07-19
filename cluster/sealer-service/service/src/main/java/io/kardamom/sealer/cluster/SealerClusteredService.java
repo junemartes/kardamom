@@ -13,8 +13,6 @@ import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
-import java.util.Iterator;
-import java.util.Map;
 import java.util.Optional;
 import org.agrona.DirectBuffer;
 import org.agrona.ExpandableArrayBuffer;
@@ -97,16 +95,6 @@ public final class SealerClusteredService implements ClusteredService {
     /** Correlation id used when scheduling the repeating boundary timer. */
     public static final long BOUNDARY_TIMER_CORRELATION_ID = 1L;
 
-    /**
-     * Correlation id of the fast self-rescheduling timer that drains pending
-     * replays in bounded chunks. A cluster TIMER (not
-     * {@code doBackgroundWork}) because Aeron forbids session offers outside
-     * log-driven callbacks ("sending messages or scheduling timers is not
-     * allowed from doBackgroundWork"); it only exists while a replay is
-     * pending, so the extra log traffic is bounded to catch-up windows.
-     */
-    public static final long REPLAY_TIMER_CORRELATION_ID = 2L;
-
     /** Tick cadence for the boundary timer (ms). Matches the 250 ms L2 tick. */
     private final long tickIntervalMs;
     private final int dedupCapacity;
@@ -146,53 +134,6 @@ public final class SealerClusteredService implements ClusteredService {
     private long firstRetainedIndex = 0L;
     private long firstRetainedBlock = CanonicalSealerState.GENESIS_BLOCK_NUMBER;
 
-    /**
-     * An in-progress replay for one client session, drained INCREMENTALLY in
-     * bounded, non-blocking chunks from the {@link #REPLAY_TIMER_CORRELATION_ID}
-     * timer — never in one synchronous burst on the request. Serving up to
-     * {@code retentionCap} frames inline in the replay-request handler, with a
-     * 1s offer deadline PER FRAME, could stall the single clustered-service
-     * thread (and with it every session's egress and all log processing) for
-     * minutes on one slow consumer.
-     */
-    private static final class PendingReplay {
-        final long fromIndex;
-        final long fromBlock;
-        /** Next wanted record index / boundary block (advance as frames send). */
-        long nextIndex;
-        long nextBlock;
-        long served;
-        /** Terminal control frame owed to the session, when non-zero. */
-        byte controlKind;
-        /** Last time (ns) an offer to this session succeeded; -1 = not started. */
-        long lastProgressNs = -1;
-
-        PendingReplay(final long fromIndex, final long fromBlock) {
-            this.fromIndex = fromIndex;
-            this.fromBlock = fromBlock;
-            this.nextIndex = fromIndex;
-            this.nextBlock = fromBlock;
-        }
-    }
-
-    /** Pending replays keyed by cluster session id (drained in request order). */
-    private final java.util.LinkedHashMap<Long, PendingReplay> pendingReplays =
-        new java.util.LinkedHashMap<>();
-
-    /** Max frames offered per session per replay-drain timer event. */
-    private static final int REPLAY_CHUNK_LIMIT = 256;
-
-    /**
-     * A replaying session that accepts NO frame for this long is closed (the
-     * background drain is non-blocking, so unlike the live path's 1s
-     * {@link #OFFER_DEADLINE_NS} a wedged replay consumer would otherwise
-     * never be reaped — live broadcasts skip sessions mid-replay). 5s: a
-     * client actively draining a replay is never back-pressured that long,
-     * but a CI CPU spike or GC pause is ridden out.
-     */
-    private static final long REPLAY_STALL_TIMEOUT_NS =
-        java.util.concurrent.TimeUnit.SECONDS.toNanos(5);
-
     /** Malformed ingress frames dropped (logged at power-of-two counts). */
     private long droppedFrameCount = 0;
 
@@ -200,10 +141,6 @@ public final class SealerClusteredService implements ClusteredService {
     // avoid per-message allocation on the single cluster service thread.
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer();
-    /** Scratch for control frames offered from the background replay drain. */
-    private final ExpandableArrayBuffer controlBuffer = new ExpandableArrayBuffer();
-    /** Reusable wrapper for offering retained frames without re-allocating. */
-    private final UnsafeBuffer retainedWrapBuffer = new UnsafeBuffer();
 
     public SealerClusteredService(int dedupCapacity, long tickIntervalMs, int memberId) {
         this.dedupCapacity = dedupCapacity;
@@ -270,11 +207,6 @@ public final class SealerClusteredService implements ClusteredService {
         // Re-arming with the SAME correlation id is idempotent: Aeron replaces
         // the pending timer rather than double-scheduling.
         scheduleBoundaryTimer();
-        // The replay-drain timer lives in the leader's wheel too: re-arm it if
-        // this member still has replays to serve (same lost-timer hazard).
-        if (!pendingReplays.isEmpty()) {
-            scheduleReplayTimer();
-        }
     }
 
     @Override
@@ -284,7 +216,8 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
-        pendingReplays.remove(session.id());
+        // No-op: replay requests are served synchronously (no per-session
+        // replay state to clean up).
     }
 
     @Override
@@ -329,13 +262,6 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onTimerEvent(long correlationId, long timestamp) {
-        if (correlationId == REPLAY_TIMER_CORRELATION_ID) {
-            drainPendingReplays(System.nanoTime());
-            if (!pendingReplays.isEmpty()) {
-                scheduleReplayTimer(); // one-shot: re-arm while work remains
-            }
-            return;
-        }
         if (correlationId != BOUNDARY_TIMER_CORRELATION_ID) {
             return;
         }
@@ -364,139 +290,6 @@ public final class SealerClusteredService implements ClusteredService {
     @Override
     public void onTerminate(Cluster cluster) {
         // No external resources to release.
-    }
-
-    // --- incremental replay drain --------------------------------------------
-
-    /**
-     * Drain pending replays in bounded chunks, driven by the
-     * {@link #REPLAY_TIMER_CORRELATION_ID} timer. Egress offers are
-     * member-local IO (only the leader's reach clients; follower offers are
-     * mocked, so followers drain instantly), so per-member progress
-     * differences here cannot diverge replicated state.
-     */
-    private void drainPendingReplays(final long nowNs) {
-        final Iterator<Map.Entry<Long, PendingReplay>> it = pendingReplays.entrySet().iterator();
-        while (it.hasNext()) {
-            final Map.Entry<Long, PendingReplay> entry = it.next();
-            final ClientSession session = cluster.getClientSession(entry.getKey());
-            if (session == null || session.isClosing()) {
-                it.remove();
-                continue;
-            }
-            serveReplayChunk(session, entry.getValue(), it, nowNs);
-        }
-    }
-
-    /**
-     * Serve one bounded, non-blocking chunk of a pending replay. Back-pressure
-     * pauses the drain until the next drain-timer event instead of spinning; a
-     * session that accepts nothing for {@link #REPLAY_STALL_TIMEOUT_NS} is
-     * closed (never silently skipped — a zombie the client cannot detect).
-     */
-    private int serveReplayChunk(
-            final ClientSession session,
-            final PendingReplay replay,
-            final Iterator<Map.Entry<Long, PendingReplay>> it,
-            final long nowNs) {
-        if (replay.lastProgressNs < 0) {
-            replay.lastProgressNs = nowNs;
-        }
-        // Eviction may have outrun an in-progress replay: frames the client
-        // still needs are gone, so the only honest answer is UNAVAILABLE.
-        if (replay.controlKind == 0
-                && (replay.nextIndex < firstRetainedIndex || replay.nextBlock < firstRetainedBlock)) {
-            replay.controlKind = EGRESS_KIND_REPLAY_UNAVAILABLE;
-        }
-        int sent = 0;
-        if (replay.controlKind == 0) {
-            for (final RetainedFrame f : retained) {
-                final boolean wanted = f.boundary ? f.key >= replay.nextBlock : f.key >= replay.nextIndex;
-                if (!wanted) {
-                    continue; // below the request, or already served
-                }
-                retainedWrapBuffer.wrap(f.frame);
-                if (!offerOnce(session, replay, retainedWrapBuffer, f.frame.length, it, nowNs)) {
-                    return sent;
-                }
-                if (f.boundary) {
-                    replay.nextBlock = f.key + 1;
-                } else {
-                    replay.nextIndex = f.key + 1;
-                }
-                replay.served++;
-                if (++sent >= REPLAY_CHUNK_LIMIT) {
-                    return sent;
-                }
-            }
-            // Scanned to the retention tail: everything wanted has been served.
-            replay.controlKind = EGRESS_KIND_REPLAY_DONE;
-        }
-        final boolean done = replay.controlKind == EGRESS_KIND_REPLAY_DONE;
-        final int len = frameControl(
-                controlBuffer,
-                replay.controlKind,
-                done ? state.canonicalCount() : firstRetainedIndex,
-                done ? state.blockNumber() : firstRetainedBlock);
-        if (offerOnce(session, replay, controlBuffer, len, it, nowNs)) {
-            System.out.println("cluster REPLAY memberId=" + memberId
-                + " session=" + session.id() + " from=(" + replay.fromIndex + "," + replay.fromBlock
-                + ") " + (done ? "served=" + replay.served + " retained=" + retained.size()
-                    : "UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")"));
-            it.remove();
-            return sent + 1;
-        }
-        if (done) {
-            // The DONE control frame was back-pressured. UN-LATCH it: while
-            // this session stays in pendingReplays, live broadcasts skip it,
-            // so any frame retained between the completed scan above and the
-            // eventual control send would be lost to this session FOREVER if
-            // DONE stayed latched (a latched controlKind skips the rescan).
-            // Rescanning on the next drain event is safe: already-served
-            // frames sit below the replay cursor and are skipped, so nothing
-            // is duplicated. REPLAY_UNAVAILABLE stays latched — it is derived
-            // from the retention floors and only becomes MORE true.
-            replay.controlKind = 0;
-        }
-        return sent;
-    }
-
-    /**
-     * Single non-blocking offer attempt for the replay drain. Returns true
-     * on success. On transient results just returns false (retried next duty
-     * cycle) unless the session has stalled past the timeout; terminal results
-     * close the session (except CLOSED, which already is) and drop the replay.
-     */
-    private boolean offerOnce(
-            final ClientSession session,
-            final PendingReplay replay,
-            final DirectBuffer buffer,
-            final int length,
-            final Iterator<Map.Entry<Long, PendingReplay>> it,
-            final long nowNs) {
-        final long result = session.offer(buffer, 0, length);
-        if (result >= 0) {
-            replay.lastProgressNs = nowNs;
-            return true;
-        }
-        if (result == Publication.BACK_PRESSURED
-                || result == Publication.ADMIN_ACTION
-                || result == Publication.NOT_CONNECTED) {
-            if (nowNs - replay.lastProgressNs > REPLAY_STALL_TIMEOUT_NS) {
-                System.out.println("cluster REPLAY memberId=" + memberId
-                    + " session=" + session.id() + " STALLED — closing session");
-                session.close();
-                it.remove();
-            }
-            return false;
-        }
-        // Terminal (CLOSED / MAX_POSITION_EXCEEDED): drop the replay; close
-        // unless the session is already closed.
-        if (result != Publication.CLOSED) {
-            session.close();
-        }
-        it.remove();
-        return false;
     }
 
     // --- helpers ------------------------------------------------------------
@@ -575,35 +368,52 @@ public final class SealerClusteredService implements ClusteredService {
         }
     }
 
-    /** Arm the replay-drain timer for the next cluster-time millisecond. */
-    private void scheduleReplayTimer() {
-        final long deadline = cluster.time() + 1;
-        while (!cluster.scheduleTimer(REPLAY_TIMER_CORRELATION_ID, deadline)) {
-            cluster.idleStrategy().idle();
-        }
-    }
-
     /**
-     * Register a client replay request. The retained frames are served
-     * INCREMENTALLY from the replay-drain timer — never inline here on the
-     * single cluster service thread (see {@link PendingReplay}) — and end
-     * with a REPLAY_DONE marker (or REPLAY_UNAVAILABLE when eviction has
-     * outrun the request). Runs identically on every member from the
-     * replicated log; only the leader's session offers reach the client.
+     * Serve a client replay request: re-offer every retained frame at/after
+     * the requested cursor to the REQUESTING session only, then a REPLAY_DONE
+     * marker (or REPLAY_UNAVAILABLE when eviction has outrun the request).
+     * Runs identically on every member from the replicated log; only the
+     * leader's session offers reach the client.
+     *
+     * <p>Served SYNCHRONOUSLY, exactly as on main (validated green in the
+     * cluster e2e CI): the F07.3 timer-driven chunked drain — which also made
+     * live broadcasts SKIP mid-replay sessions — changed the steady-state
+     * egress flow and correlates with the all-shards consumer freeze at
+     * first-record time; correctness beats the leader-stall optimization it
+     * was after (see docs/reviews/2026-07-17-30-commit-review/
+     * fixes-CI-replay-loop.md). The stall is bounded in practice: a WEDGED
+     * consumer costs one {@link #OFFER_DEADLINE_NS} on its first frame and is
+     * then CLOSED (subsequent offers return CLOSED and are skipped
+     * immediately), and healthy consumers drain retained frames at line
+     * rate.</p>
      */
     private void handleReplayRequest(final ClientSession session, final long fromIndex, final long fromBlock) {
-        final PendingReplay replay = new PendingReplay(fromIndex, fromBlock);
         if (fromIndex < firstRetainedIndex || fromBlock < firstRetainedBlock) {
-            replay.controlKind = EGRESS_KIND_REPLAY_UNAVAILABLE;
+            // stdout, like the role lines: grep-able next to the chaos suite's
+            // other signals (the service has no other logger).
+            System.out.println("cluster REPLAY memberId=" + memberId
+                + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
+                + ") UNAVAILABLE floor=(" + firstRetainedIndex + "," + firstRetainedBlock + ")");
+            offerControl(session, EGRESS_KIND_REPLAY_UNAVAILABLE, firstRetainedIndex, firstRetainedBlock);
+            return;
         }
-        // A re-request from the same session (the client resends every 3s until
-        // its cursor advances) simply replaces the in-progress drain.
-        pendingReplays.put(session.id(), replay);
-        scheduleReplayTimer();
+        long served = 0;
+        for (final RetainedFrame f : retained) {
+            final boolean wanted = f.boundary ? f.key >= fromBlock : f.key >= fromIndex;
+            if (wanted) {
+                offerBytesToSession(session, f.frame);
+                served++;
+            }
+        }
+        System.out.println("cluster REPLAY memberId=" + memberId
+            + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
+            + ") served=" + served + " retained=" + retained.size());
+        offerControl(session, EGRESS_KIND_REPLAY_DONE, state.canonicalCount(), state.blockNumber());
     }
 
-    /** Frame a control message {@code kind(1) | a(8) | b(8)} into {@code buf}. */
-    private static int frameControl(final MutableDirectBuffer buf, final byte kind, final long a, final long b) {
+    /** Frame + offer a control message {@code kind(1) | a(8) | b(8)}. */
+    private void offerControl(final ClientSession session, final byte kind, final long a, final long b) {
+        final MutableDirectBuffer buf = egressBuffer;
         int pos = 0;
         buf.putByte(pos, kind);
         pos += Byte.BYTES;
@@ -611,7 +421,7 @@ public final class SealerClusteredService implements ClusteredService {
         pos += Long.BYTES;
         buf.putLong(pos, b, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
-        return pos;
+        offerToSession(session, pos);
     }
 
     /** Retain an already-framed egress frame for future replays (bounded). */
@@ -639,13 +449,6 @@ public final class SealerClusteredService implements ClusteredService {
         // broadcast boundaries but no records, tripping the executor's
         // BoundaryMisaligned check (want_count>have_count). Mirrors offerBoundary.
         for (final ClientSession session : cluster.clientSessions()) {
-            if (pendingReplays.containsKey(session.id())) {
-                // Mid-replay sessions get this frame from the background drain
-                // (it was retained above) — offering it live too would both
-                // duplicate it and let replay back-pressure trip the live
-                // path's deadline-then-close on a healthy catching-up client.
-                continue;
-            }
             offerToSession(session, len);
         }
     }
@@ -676,9 +479,6 @@ public final class SealerClusteredService implements ClusteredService {
         retain(len, true, boundary.blockNumber);
         // Boundaries are broadcast to every open client session.
         for (final ClientSession session : cluster.clientSessions()) {
-            if (pendingReplays.containsKey(session.id())) {
-                continue; // served from the background drain; see offerRelayed
-            }
             offerToSession(session, len);
         }
     }
@@ -722,6 +522,31 @@ public final class SealerClusteredService implements ClusteredService {
      * cascade (observed: all three executors restarting at once).
      */
     private static final long OFFER_DEADLINE_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(1);
+
+    /**
+     * Offer arbitrary raw bytes (a retained frame) to one session, with the
+     * same deadline-then-close semantics as {@link #offerToSession} — incl.
+     * the F07.5 terminal-result close (a MAX_POSITION_EXCEEDED egress is
+     * permanently dead; returning silently would leave a zombie session).
+     */
+    private void offerBytesToSession(final ClientSession session, final byte[] frame) {
+        final UnsafeBuffer buf = new UnsafeBuffer(frame);
+        final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
+        long result;
+        do {
+            result = session.offer(buf, 0, frame.length);
+            if (result >= 0) {
+                return;
+            }
+            if (!retryable(result)) {
+                if (result != Publication.CLOSED) {
+                    session.close();
+                }
+                return;
+            }
+        } while (System.nanoTime() < deadline);
+        session.close();
+    }
 
     private void offerToSession(final ClientSession session, final int length) {
         final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;

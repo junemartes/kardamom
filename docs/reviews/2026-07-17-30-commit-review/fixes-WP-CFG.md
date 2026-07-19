@@ -80,7 +80,12 @@ member redirects to the leader), so a merely-down initial leader doesn't fail
 startup. `run_session` takes the `(member, PubHandle)` pair and no longer has
 a log-and-return path.
 
-### F05.3 [L] — blocking publish_bytes (10s ack) on the session loop; Result discarded — FIXED
+### F05.3 [L] — blocking publish_bytes (10s ack) on the session loop; Result discarded — PARTIALLY REVERTED
+> **REVERTED post-CI (helper thread)**: the `cluster-replay-pub` off-loop
+> publish is reverted to main's inline `publish_bytes` on the session loop
+> while the cluster-e2e first-record freeze is pinned down (see
+> fixes-CI-replay-loop.md). The non-discarded `Result` (a warn on failure)
+> is kept. The original text below is kept for the record.
 `crates/cluster-adapter/src/live.rs`: the retrying replay-request publish now
 runs on a short-lived named helper thread (`cluster-replay-pub`), so the
 Aeron-ack wait (up to 10s under exactly the reconnect-churn backpressure this

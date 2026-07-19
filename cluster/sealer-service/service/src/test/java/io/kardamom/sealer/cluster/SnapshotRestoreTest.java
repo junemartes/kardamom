@@ -137,7 +137,6 @@ class SnapshotRestoreTest {
             // the retained deque is empty, so a DONE here would be a silent gap.
             final StubSession behind = cluster.addSession(7);
             service.onSessionMessage(behind, 0, replayRequest(0, 1), 0, 17, null);
-            drain(service);
             assertEquals(1, behind.offered.size(), "exactly one control frame");
             assertEquals(SealerClusteredService.EGRESS_KIND_REPLAY_UNAVAILABLE, behind.offered.get(0)[0],
                     "pre-snapshot replay must be UNAVAILABLE, not DONE");
@@ -149,7 +148,6 @@ class SnapshotRestoreTest {
             // exact rather than merely conservative.
             final StubSession caughtUp = cluster.addSession(8);
             service.onSessionMessage(caughtUp, 0, replayRequest(count, block), 0, 17, null);
-            drain(service);
             assertEquals(1, caughtUp.offered.size(), "exactly one control frame");
             assertEquals(SealerClusteredService.EGRESS_KIND_REPLAY_DONE, caughtUp.offered.get(0)[0],
                     "replay from the restore point itself must complete");
@@ -175,14 +173,6 @@ class SnapshotRestoreTest {
         }
         IDLE.reset();
         return sub.imageAtIndex(0);
-    }
-
-    private static void drain(final SealerClusteredService service) {
-        // The replay drain is chunked across replay-timer events; a handful
-        // suffices for these tiny replays (stub offers always succeed).
-        for (int i = 0; i < 16; i++) {
-            service.onTimerEvent(SealerClusteredService.REPLAY_TIMER_CORRELATION_ID, 0);
-        }
     }
 
     private static ExpandableArrayBuffer replayRequest(final long fromIndex, final long fromBlock) {

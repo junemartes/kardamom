@@ -311,15 +311,6 @@ fn run_session(
     let mut egress_alive_at_ms: u64 = now_ms();
     let mut replay_last_sent_ms: u64 = 0;
     let mut replay_cursor_at_send: (u64, u64) = (u64::MAX, u64::MAX);
-    // In-flight replay-request publish. `publish_bytes` blocks up to 10s
-    // waiting for the Aeron-thread ack, and THIS loop also owes the cluster
-    // its keep-alives — an ack wait here under backpressure (exactly the
-    // mass-reconnect churn the retrying publish exists for) could starve them
-    // into a session timeout. The rare send therefore runs on a short-lived
-    // helper thread; at most one is in flight (the resend cadence re-checks),
-    // and a failed publish is logged instead of discarded.
-    let mut replay_send_inflight: Option<JoinHandle<()>> = None;
-
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
     // publisher-only client (the sequencer) drops its `LiveEgress`, after which
     // we stop routing application payloads (and never accumulate them) but keep
@@ -408,12 +399,6 @@ fn run_session(
         if let Some(r) = &replay
             && driver.is_connected()
         {
-            if replay_send_inflight
-                .as_ref()
-                .is_some_and(JoinHandle::is_finished)
-            {
-                replay_send_inflight = None;
-            }
             let cursor = (
                 r.next_index.load(std::sync::atomic::Ordering::Relaxed),
                 r.next_block.load(std::sync::atomic::Ordering::Relaxed),
@@ -425,35 +410,29 @@ fn run_session(
                 // measured from the most recent progress, not the last send.
                 replay_cursor_at_send = cursor;
                 replay_last_sent_ms = now;
-            } else if (replay_last_sent_ms == 0
-                || now.saturating_sub(replay_last_sent_ms) >= REPLAY_RESEND_MS)
-                && replay_send_inflight.is_none()
+            } else if replay_last_sent_ms == 0
+                || now.saturating_sub(replay_last_sent_ms) >= REPLAY_RESEND_MS
             {
                 let req = crate::wire::encode_replay_request(cursor.0, cursor.1);
                 if let Some(framed) = driver.wrap_app(&req, now as i64) {
                     // RETRYING publish, not best-effort: this rare, critical
                     // message is sent exactly when the ingress publication is
-                    // at its busiest (mass reconnects under churn) — the
-                    // best-effort deadline dropped it every 3s in lockstep
-                    // with the backpressure that caused the stall. The ack
-                    // wait happens OFF this thread (see replay_send_inflight)
-                    // so it can never delay keep-alives, and a failure is
-                    // logged (the resend cadence retries it).
-                    let pub_handle = ingress.clone();
-                    match thread::Builder::new()
-                        .name("cluster-replay-pub".into())
-                        .spawn(move || {
-                            if let Err(e) = pub_handle.publish_bytes(to_aligned(&framed)) {
-                                tracing::warn!(
-                                    error = %e,
-                                    "cluster replay request publish failed (will resend)"
-                                );
-                            }
-                        }) {
-                        Ok(h) => replay_send_inflight = Some(h),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "spawn cluster replay publish thread");
-                        }
+                    // at its busiest (mass reconnects under churn) — a
+                    // best-effort deadline would drop it every 3s in lockstep
+                    // with the backpressure that caused the stall. Published
+                    // INLINE on this loop, exactly as on main (validated
+                    // green in cluster e2e CI): the F05.3 helper-thread
+                    // offload changed the only client-side ordering in the
+                    // replay path and is reverted with the F07.3 server-side
+                    // redesign while the CI freeze is being pinned down; the
+                    // ack wait is bounded (10s) and the 90s cluster session
+                    // timeout tolerates it. The Result is still surfaced
+                    // (F05.3's real defect was DISCARDING it).
+                    if let Err(e) = ingress.publish_bytes(to_aligned(&framed)) {
+                        tracing::warn!(
+                            error = %e,
+                            "cluster replay request publish failed (will resend)"
+                        );
                     }
                     tracing::info!(
                         next_index = cursor.0,
