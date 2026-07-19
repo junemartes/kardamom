@@ -173,10 +173,10 @@ async fn main() -> anyhow::Result<()> {
 
     let state_db = Arc::new(EmptyStateDatabase);
     tracing::info!(
-        nonce_floor_lag_ms = cfg.nonce_floor_lag_ms,
         "nonce floors: no committed-state reader wired (EmptyStateDatabase); \
-         cold senders seed at 0 and rejoin coverage relies on the \
-         stream-adaptive floor fast-forward"
+         cold senders seed at 0. NOTE: a restarted replica does NOT regain \
+         coverage of established senders (F02.1 re-opened — the floor \
+         fast-forward was removed for publishing canonical nonce gaps)"
     );
     let cfg_clone = cfg.clone();
 
@@ -363,14 +363,13 @@ impl TxErrorPublisher for LiveTxErrorPub {
 // ---------------------------------------------------------------------------
 // Empty StateDatabase: cache-miss hydration always seeds at nonce 0, i.e. a
 // floor that can only LAG the true next nonce (never lead it — so no valid tx
-// is ever spuriously rejected). Correctness on warm restarts comes from the
-// stream-adaptive floor fast-forward (`nonce_floor_lag_ms`): an established
-// sender whose live traffic buffers above the stale floor has the floor
-// adopted from the stream after the lag bound, so a restarted replica regains
-// coverage instead of zombie-buffering forever. Wiring a real read-only
-// committed-state reader here remains a pure optimization (it skips the one
-// fast-forward wait per rejoined sender). Lives in the bin because it's a
-// deployment choice.
+// is ever spuriously rejected). KNOWN LIMITATION (F02.1, re-opened): a
+// restarted replica buffers established senders' traffic against the stale
+// floor and does not regain coverage of them; the floor fast-forward that
+// closed this was removed for adopting client-abandoned gaps into the
+// canonical stream (fatal to executors). Wiring a real committed-state
+// reader here is the sound fix. Lives in the bin because it's a deployment
+// choice.
 // ---------------------------------------------------------------------------
 
 struct EmptyStateDatabase;

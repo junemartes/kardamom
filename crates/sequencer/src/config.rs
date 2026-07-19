@@ -23,21 +23,11 @@ pub struct SequencerConfig {
     pub sequencer_id: u8,
     /// Per-sender future-nonce buffer capacity. Default 16.
     pub max_pending_per_sender: usize,
-    /// Stream-adaptive nonce-floor fast-forward lag (milliseconds).
-    ///
-    /// A (re)starting replica live-joins its shard's tx_data mid-stream, so
-    /// an established sender's next tx arrives at some nonce `k` strictly
-    /// above the locally hydrated floor, and the missing nonces `floor..k`
-    /// will never reappear (live-join, no replay — the twin already ordered
-    /// them). When a sender's pending buffer has held a run strictly above
-    /// the floor for longer than this lag (i.e. comfortably past the
-    /// ordering/commit latency bound, so the gap provably isn't in flight),
-    /// the floor fast-forwards to the lowest buffered nonce and the run is
-    /// published. Safe under racing replicas: refs the twin already offered
-    /// are absorbed by the cluster's first-seen dedup, and a fast-forward
-    /// only skips forward — per-publisher nonce order is preserved.
-    ///
-    /// `0` fast-forwards immediately (test-only). Default 5000 ms.
+    /// UNUSED (accepted for config compatibility): the stream-adaptive
+    /// nonce-floor fast-forward this bounded was removed — it adopted
+    /// client-abandoned nonce gaps into the canonical stream, which every
+    /// executor fail-stops on (see `PartitionState`'s note). The key still
+    /// parses so deployed TOMLs carrying it keep loading.
     #[serde(default = "default_nonce_floor_lag_ms")]
     pub nonce_floor_lag_ms: u64,
     /// Optional CPU core to pin this process to. `None` = no pin.

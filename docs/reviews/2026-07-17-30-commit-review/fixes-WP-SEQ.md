@@ -49,7 +49,17 @@ refreshed whenever it stalls, not consulted once).
 
 ## Per-finding status
 
-### F02.1 [H] — FIXED
+### F02.1 [H] — ~~FIXED~~ REVERTED (RE-OPENED)
+> **REVERTED post-CI (run 29687514869)**: the stream-adaptive floor
+> fast-forward adopted CLIENT-ABANDONED nonce holes (txs dropped at ingress
+> under overload / chaos outages — never on tx_data, so ordered by NOBODY)
+> and published canonical nonce gaps; every executor fail-stops on
+> `NonceTooHigh`, killing all replicas in all five e2e shards. A sequencer
+> cannot locally distinguish that case from the rejoin case this fix
+> targeted (the doc below already conceded this). Removed wholesale; a
+> rejoined replica again does not regain coverage of established senders
+> until a global hydration signal exists. `nonce_floor_lag_ms` still parses
+> (unused). See fixes-CI-replay-loop.md round 4. Original text kept below.
 Files: `crates/sequencer/src/state.rs`, `crates/sequencer/src/pending.rs`,
 `crates/sequencer/src/sequencer.rs`, `crates/sequencer/src/config.rs`,
 `crates/sequencer/src/metrics.rs`, `crates/sequencer/src/bin/kardamom-sequencer.rs`,
@@ -72,7 +82,7 @@ Files: `crates/sequencer/src/state.rs`, `crates/sequencer/src/pending.rs`,
   mid-stream with an **empty** state DB (the production wiring) and must emit exactly its
   twin's suffix; first-seen merge adds nothing. This is the precise zombie scenario.
 
-### F02.2 [M] — FIXED
+### F02.2 [M] — ~~FIXED~~ mechanism REVERTED (see F02.1 note above); the adjacent flush_drained data-loss fix below STANDS (with the reinsert-overflow eviction fixed on top — see fixes-CI-replay-loop.md round 3)
 Same mechanism (the floor is re-evaluated whenever it stalls, not one-shot). Regression
 test `misaligned_hydration_floor_fast_forwards_to_the_join_point` pins the misaligned case
 the finding called out as untested: DB floor `c` strictly below the live-join nonce `j`

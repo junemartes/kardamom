@@ -32,24 +32,22 @@
 //! activity since startup) hit the state-DB cache-miss path the first
 //! time they're observed.
 //!
-//! Cold-rejoin floors are additionally stream-adaptive: hydration only
-//! provides a *lower bound* on a sender's next nonce (the deployed binary
-//! has no committed-state reader, and even a real one can trail refs the
-//! racing twin ordered but that aren't committed yet). When a sender's
-//! pending buffer holds a run strictly above the floor for longer than
-//! `SequencerConfig::nonce_floor_lag_ms` — i.e. the gap provably isn't in
-//! flight — the floor fast-forwards to the lowest buffered nonce (see
-//! [`PartitionState::fast_forward_stalled`]), so a restarted replica
-//! regains coverage of established senders instead of buffering their
-//! traffic forever against nonces that will never reappear (live-join, no
-//! replay).
+//! Cold-rejoin caveat (F02.1, RE-OPENED): hydration only provides a
+//! *lower bound* on a sender's next nonce, so a restarted replica that
+//! live-joins mid-stream buffers established senders' traffic against
+//! nonces that will never reappear and does not regain coverage of them
+//! (P=1 for those senders until its twin also restarts). The "stream-
+//! adaptive floor fast-forward" that closed this was REMOVED: it could not
+//! distinguish twin-ordered gaps from client-abandoned ones, and adopting
+//! the latter published canonical nonce gaps that fatally NonceTooHigh'd
+//! every executor (see PartitionState's note + the CI round-4 analysis).
 //!
 //! See also [`crate::outbound`] for the trait surface and in-memory fakes
 //! used by tests.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
@@ -283,28 +281,11 @@ impl<DB: StateDatabase> Sequencer<DB> {
             return Ok(true);
         }
 
-        let stalled = self.state.fast_forward_stalled(
-            Instant::now(),
-            Duration::from_millis(self.cfg.nonce_floor_lag_ms),
-        );
-        if !stalled.is_empty() {
-            let mut last_sender = None;
-            for (sender, n, _) in &stalled {
-                if last_sender != Some(*sender) {
-                    metrics::record_floor_fastforward(self.cfg.partition_index);
-                    warn!(
-                        sender = ?sender,
-                        adopted_nonce = n,
-                        lag_ms = self.cfg.nonce_floor_lag_ms,
-                        "nonce floor fast-forwarded past a stalled gap \
-                         (stream-adaptive rejoin hydration)"
-                    );
-                    last_sender = Some(*sender);
-                }
-            }
-            self.flush_drained(b, stalled, "floor-fast-forward")?;
-            return Ok(true);
-        }
+        // (The nonce-floor fast-forward sweep that ran here was REMOVED: it
+        // adopted client-abandoned nonce holes into the canonical stream and
+        // fatally NonceTooHigh'd every executor under ingress overload /
+        // chaos outages. A sender with an unfillable gap now stalls here —
+        // recoverable — exactly as on main. See PartitionState's note.)
 
         let Some((tx_data_loc, envelope)) = channel_a.poll()? else {
             return Ok(false);

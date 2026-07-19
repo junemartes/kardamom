@@ -230,3 +230,96 @@ clock that drives the merge horizon.
 - Docker-gated `kardamom-log` suites (`aeron_live_e2e`, `offer_starvation`,
   `offer_connect_race`) — 3/3 pass.
 - `cargo clippy` on touched crates — clean; `cargo fmt --all` applied.
+
+## Round 4: F13.3 gating revert FIXED the freeze — new failure is a real executor kill, not scrape wiring
+
+CI run 29687514869 (with fd85769: F13.3 resume-only gating + the reinsert
+fix): the smoke gate PASSES and the pipeline processes ~23k canonical
+records. **The first-record freeze is resolved — root cause confirmed as the
+F13.3 always-on tx_data replay-merge on fresh-start consumers.**
+
+The remaining all-shard failure is NOT the metrics/scrape wiring (that was
+audited and is correct: executors bind `0.0.0.0:9004` via
+`executor.nomad.hcl` `--metrics-addr` with `network_mode = "host"`, and the
+harness's `docker exec <node> curl 127.0.0.1:9004/metrics`
+(`crates/bench/src/load/scrape.rs::fetch`) shares the node netns). The
+checks that fired — `accounting.rs:132` "block metric unreachable" and
+`:187` `kardamom_service_up=0` — correctly flagged executors that were
+**dead**:
+
+- Load shard: at the 600tps overload step (accept ratio 0.346 — ingress
+  drops), all three executors crashed with
+  `revm execution failure at tx TxIndex(23002): Transaction(NonceTooHigh
+  { tx: 3836, state: 3833 })` — with 6 senders, 23001/6 ≈ 3833: the canonical
+  stream itself contained a per-sender NONCE GAP.
+- Chaos-cluster shard: same signature after the leader-kill outage window
+  (`NonceTooHigh { tx: 4098, state: 1818 }` — 2280 nonces skipped), then
+  `CHAOS FAIL: pipeline NOT progressing`.
+- Both then crash-looped: crash-recovery `join timeout: TxRef … not found
+  within 30000 ms` and a reconnect storm of `cluster session failed
+  reason=concurrent session limit` (leaked 90s sessions from the crash loop
+  exhaust the CM's session cap). The load shard's `base=None` keep-pace
+  values are explained by the crash landing BEFORE the soak baseline
+  snapshot (base is taken after the ramp).
+
+### Root cause: the F02.1/F02.2 nonce-floor fast-forward poisons the canonical stream
+
+`PartitionState::fast_forward_stalled` adopted the lowest buffered nonce
+after a 5s stall. It was designed for the rejoin case ("the twin already
+ordered the gap — first-seen dedup absorbs re-offers"), but a sequencer
+cannot locally distinguish that from a CLIENT-ABANDONED hole: under ingress
+overload or a chaos outage, some nonces are dropped before tx_data, so
+NEITHER replica ever sees them — both replicas observe the identical stall
+and both adopt the identical post-hole run, publishing a canonical stream
+with a real nonce gap. Executors treat an invalid canonical tx as fatal
+(`revm NonceTooHigh` → pipeline exit), so one overloaded sender kills every
+executor replica simultaneously — the exact designed-in corner the WP-SEQ
+doc waved through as "surfaces the gap at the executor". On main (no
+fast-forward) the same overload merely stalls those senders at the
+sequencer (their post-hole txs never ack and time out client-side), which
+is why main was green under the identical load profile.
+
+### Fix (this round, working tree)
+
+- **REVERTED the fast-forward wholesale** (`crates/sequencer/src/state.rs`:
+  `fast_forward_stalled` + stall marks removed; `sequencer.rs` sweep
+  removed; `metrics.rs` counter removed; `config.rs` keeps
+  `nonce_floor_lag_ms` parsing for TOML compat, documented as unused; bin
+  startup log rewritten). A stalled sender now stalls at the sequencer —
+  recoverable — never in the canonical stream. **F02.1 is consciously
+  RE-OPENED** (rejoined replica does not regain coverage of established
+  senders); a sound fix needs a global signal (committed-state reader or a
+  canonical/receipt-stream hydration), noted in code and here.
+- Regression tests pinning the safe semantics:
+  `replicated_shard_racing.rs::client_abandoned_nonce_hole_is_never_published_past`
+  (the round-4 killer shape: a hole in tx_data → every published per-sender
+  nonce run stays dense, victim stalls at the hole) and
+  `rejoining_replica_with_empty_db_stalls_but_never_corrupts` (pins the
+  re-opened limitation AND canonical integrity, so a future fix must flip
+  the first assertion deliberately). The two tests that pinned fast-forward
+  behavior are removed with the mechanism.
+
+### Follow-ups surfaced by the cascade (not fixed here)
+
+1. Executor fatality on an invalid canonical tx: any nonce gap that DOES
+   reach the canonical stream kills all replicas at once. The L2-standard
+   alternative is a deterministic skip of invalid txs. Systemic decision,
+   out of scope.
+2. Crash-recovery `join timeout: TxRef not found` crash-loop after a
+   mid-load executor death (resume-path replay-merge) deserves its own
+   investigation.
+3. Cluster `concurrent session limit` during crash loops: dead clients'
+   sessions linger the full 90s timeout and exhaust the CM session cap;
+   `LiveCluster::drop` could send a best-effort `SessionCloseRequest`.
+
+### Round-4 verification
+
+- `cargo test -p kardamom-sequencer` — 12/12 suites pass (43 lib incl. the
+  reinsert no-loss tests; racing suite 5/5 incl. the two new regression
+  tests; sequencer_step 9/9 incl. single-tx-after-idle).
+- `cargo test -p kardamom-bench` — pass (scrape/accounting untouched — the
+  checks were right).
+- `cargo check --workspace --all-targets` — clean;
+  `cargo clippy -p kardamom-sequencer --all-targets` — clean;
+  `cargo fmt --all` applied; `bash -n` on ci-cluster.sh / smoke-load.sh /
+  chaos.sh — OK (unmodified).
