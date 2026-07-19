@@ -202,25 +202,28 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    // tx_data / tx_deposits source: archive replay-merge whenever a replay
-    // destination is configured (archive-backed deploys), live multicast
-    // otherwise (local/IPC). Gating replay on `resume.is_some()` (a non-empty
-    // DB) conflated "fresh chain" with "crashed before the first commit" /
-    // "started behind a chain with history": in both of those the live
-    // multicast no longer carries the historical envelopes, so a mid-stream
-    // join crash-loops on join timeouts forever. With the flag present, the
-    // streams replay from origin and the exec thread's skip-count handles any
-    // already-committed prefix.
-    let recovery_endpoints = args.replay_destination_endpoint.clone();
+    // tx_data / tx_deposits source: archive replay-merge on crash-recovery
+    // RESUME only; live multicast on a fresh start — main's gating, RESTORED.
+    // F13.3 made replay-merge unconditional whenever the endpoint is
+    // configured (to close the crash-before-first-commit window), which put
+    // an archive replay session + merge on every fresh-start consumer from
+    // boot. The cluster-e2e first-record freeze afflicts exactly the four
+    // fresh-start processes running that path, at a deterministic offset
+    // from merge open, on a branch where main is green — so per the
+    // correctness-beats-optimization rule the always-on gating is reverted
+    // until the freeze is pinned down (see docs/reviews/…/fixes-CI-replay-
+    // loop.md). Known cost, as on main: a crash BEFORE the first commit
+    // rejoins live mid-stream and relies on the bounded join timeout to
+    // fail loudly rather than replaying from origin.
+    let recovery_endpoints = if resume.is_some() {
+        args.replay_destination_endpoint.clone()
+    } else {
+        None
+    };
     if resume.is_some() && recovery_endpoints.is_none() {
         anyhow::bail!(
             "crash recovery needs --replay-destination-endpoint (host:port) for tx_data / \
              tx_deposits archive replay-merge"
-        );
-    }
-    if resume.is_none() && recovery_endpoints.is_some() {
-        tracing::info!(
-            "fresh start with archive configured: replaying tx_data / tx_deposits from stream origin"
         );
     }
 

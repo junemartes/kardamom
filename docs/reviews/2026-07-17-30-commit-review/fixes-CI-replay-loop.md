@@ -98,22 +98,113 @@ what remains on top is startup validation, snapshot correctness, terminal-
 result closes, retention floors, the dedup default, counters, and the
 watchdog safety net — each argued above to be outside the steady-state flow.
 
+## Round 3: replay revert in, CI still red — upstream audit
+
+CI re-ran with the F07.3/F05.3 revert (commit f2c8f2c): **all 5 shards still
+fail identically.** This clears the replay path (its redesign was never the
+cause — consistent with the log evidence that it served correctly) and
+confirms the fault is upstream: the first tx's canonical record never enters
+the log, and the four fresh-start consumers' tx_ordering cursors freeze at
+the same moment. Audit of the four directed suspects:
+
+### Suspect 1 — WP-SEQ `flush_drained` rebuffer, single-tx-after-idle. VERDICT: SAFE (one real adjacent bug found and fixed)
+
+Trace for the degenerate smoke case (one tx, then silence), from code:
+`run_once` ingress path → `process()` Matched → `flush_drained` →
+backpressure → `flush_drained` (`crates/sequencer/src/sequencer.rs`,
+"ingress" call site) rebuffers via `reinsert_for_retry`, which REWINDS the
+floor to the failed nonce and buffers the payload
+(`crates/sequencer/src/state.rs::reinsert_for_retry`). The retry is driven by
+`run_once`'s FIRST step — `drain_pending()`
+(`state.rs::drain_pending`: `expected == lowest` after the rewind, so
+`drain_consecutive_from(expected)` yields it) — which needs **no fresh
+ingress**; `run()` re-enters after a 10µs sleep on `Backpressure`. The lone
+tx retries every pass until accepted. Rebuffer order (reverse) is correct:
+the floor ends at the lowest unpublished nonce.
+**Adjacent bug (fixed):** `reinsert_for_retry` used the capacity-enforcing
+`PendingBuffer::insert`, which on a FULL buffer evicts the LOWEST nonce
+(`crates/sequencer/src/pending.rs::insert`, `EvictedOldest`). A full future
+run (capacity items) drained by `process()` plus the in-flight ingress item
+is capacity+1 rebuffered items → the final (lowest) reinsert evicted a ref
+whose nonce the floor had already rewound below — a silent permanent
+per-sender gap. Same failure with a capacity-0 (disabled) buffer, which
+silently DROPPED the rebuffered match. Fix: new unbounded
+`PendingBuffer::reinsert` used only by `reinsert_for_retry` (overshoot is
+transient, bounded by one drained batch). Not the CI cause (needs a full
+buffer; the smoke case has an empty one), but a real data-loss bug in the
+reviewed change. Tests:
+`sequencer_step.rs::single_tx_after_idle_survives_repeated_backpressure_without_new_ingress`
+(4 backpressured passes with no new ingress, then publish exactly once),
+`state.rs::full_buffer_backpressure_rebuffer_loses_nothing`,
+`state.rs::disabled_buffer_still_rebuffers_backpressured_match`.
+
+### Suspect 2 — `fast_forward_stalled` at first-tx. VERDICT: SAFE
+
+`state.rs::fast_forward_stalled` iterates ONLY senders with a non-empty
+pending (future-nonce) buffer and only fires when `lowest > expected` has
+been unchanged for `nonce_floor_lag_ms`. A fresh smoke sender's nonce-0 tx
+hydrates at floor 0 (`sequencer.rs::hydrate_if_unknown` → `Ok(None)` → 0),
+matches, and never enters `pending` — so no stall mark can exist and the
+floor cannot jump past nonce 0. Boundary-only traffic is invisible to
+`PartitionState` entirely (it sees only tx_data envelopes), so no
+"stream ahead" misread is possible. Pinned by existing test
+`fast_forward_ignores_senders_without_a_gap`.
+
+### Suspect 3 — F13.3 always-on replay-merge at first-envelope. VERDICT: cannot wedge in-process; node-level interference cannot be excluded — GATING REVERTED to main's
+
+In-process it cannot block or divert anything shared: the merge runs on its
+own `kardamom-replay-merge` thread with its own archive client
+(`crates/log/src/replay.rs`, 10ms idle loop — no spin), bridged via
+unbounded channels (`crates/engine/src/bin_support.rs::open_tx_data_subs` —
+`std::sync::mpsc::channel` + tokio pump, no blocking sends), and the
+consumers' tx_ordering runs on a DEDICATED cluster runtime
+(`kardamom-executor.rs`: `cluster_rt`). A hard merge failure would error-log
+and exit non-zero (F13.4b) — no such logs; no failure occurred.
+What cannot be excluded from CI logs is node/driver-level interference: the
+always-on path holds 12 archive replay sessions (4 processes × 3 streams)
+against the ingress-node archives from boot, and the freeze lands at a
+deterministic ~60s (= `MERGE_PROGRESS_TIMEOUT_MS` horizon) offset from merge
+open in BOTH analysed runs, on EXACTLY the four processes running this path,
+on a branch where main (resume-only gating) is green. Per the
+correctness-beats rule the gating is reverted to main's `resume.is_some()`
+in both bins (`kardamom-executor.rs`, `kardamom-validator.rs`): fresh starts
+use live multicast again; crash-recovery resume keeps the replay-merge (and
+keeps F13.1's hard coverage failures, F13.2's recorder barrier, F13.4b's
+non-zero exit — all resume-path correctness fixes). Known reverted cost, as
+on main: a crash before the first commit rejoins live mid-stream and relies
+on the bounded join timeout to fail loudly.
+
+### Suspect 4 — ingress `tx_error_dedup` / `PendingReceipts` grace. VERDICT: SAFE
+
+`crates/ingress/src/pending.rs::on_tx_error`: the 500ms grace only DELAYS
+releasing a parked client with a sequencer REJECTION, and suppresses that
+rejection when a receipt exists (`e.receipt.is_some()`). The receipt/success
+path (`on_receipt` → responder) is untouched. For the smoke tx no sequencer
+ever emitted a `TxError` (no rejection, no record), so the whole path is a
+no-op; the RPC failed through the plain `pending_receipt_timeout` arm. Also
+confirmed from `proxy.rs`: the error was the TIMEOUT arm, which means
+`publish_tx_data` returned Ok (a publish failure returns
+"partition-unavailable" instead) — the envelope reached the tx_data
+publication with a connected subscriber (at minimum the recorder); the
+sequencers show no trace of ever receiving it (no ingest effects, no
+backpressure warns, no record, no rejection).
+
 ## Root-cause statement (honest form)
 
 The all-shards failure is a consumer-side canonical-stream freeze at
 first-record time introduced between `70d0823` and the review-fix commit; the
 replay protocol itself functions (requests arrive, frames + `REPLAY_DONE` are
-served on the correct sessions). The freeze's final drop point (which of:
-driver-level silent drop, transport interaction with the redesigned
-serve/skip pattern, or an engine-side consumer stall) could not be uniquely
-pinned from CI logs; the F07.3/F05.3 redesign is the only steady-state
-behavioral delta in that path and is reverted wholesale rather than patched.
-If the next CI run still fails with the revert in place, the fault is
-provably OUTSIDE the replay path (prime remaining suspect: the F13.3
-always-on tx_data replay-merge, which activates on all four affected
-consumers and whose first-envelope transition coincides with the freeze
-instant; the sequencers' simultaneous publish failure would then need its own
-explanation — e.g. their shared-runtime interaction at envelope time).
+served on the correct sessions). Round 3 (replay revert in, still 5/5 red)
+proves the fault is OUTSIDE the replay path. The remaining branch delta on
+the frozen processes' data plane was F13.3's always-on tx_data replay-merge
+— now reverted to main's resume-only gating (see the Suspect 3 verdict:
+in-process it is provably clean; the node-level archive-session load and the
+~60s merge-horizon alignment of the freeze instant in both runs make it the
+strongest remaining candidate). Also fixed on the way: a real data-loss bug
+in WP-SEQ's backpressure rebuffer (Suspect 1). The smoke-time "coincidence"
+in both runs is explained without causation: the deploy pipeline reaches the
+smoke test at a near-deterministic offset from consumer start, the same
+clock that drives the merge horizon.
 
 ## Tests
 

@@ -202,27 +202,30 @@ async fn main() -> Result<()> {
         None
     };
 
-    // tx_data / tx_deposits source: archive replay-merge whenever a replay
-    // destination is configured (archive-backed deploys; requires the UDP-MDC
-    // transport — replay-merge does not work over the single-host IPC
-    // default), live multicast otherwise. Gating replay on `resume.is_some()`
-    // (a non-empty DB) left a crash-BEFORE-the-first-commit window: a restart
-    // then took the fresh-start path with live subscribers, joined mid-stream,
-    // and crash-looped on join timeouts / OutOfOrderTx forever (the DB stays
-    // at block 0, so restarting never helped). With the flag present the
-    // streams replay from origin regardless, and the skip-count handles any
-    // already-committed prefix. The replay endpoint is shared across the
-    // tx_data/tx_deposits streams (the media driver demuxes by stream id).
-    let recovery_endpoints = args.replay_destination_endpoint.clone();
+    // tx_data / tx_deposits source: archive replay-merge on crash-recovery
+    // RESUME only; live multicast on a fresh start — main's gating, RESTORED.
+    // F13.3 made replay-merge unconditional whenever the endpoint is
+    // configured (to close the crash-before-first-commit window), which put
+    // an archive replay session + merge on every fresh-start consumer from
+    // boot. The cluster-e2e first-record freeze afflicts exactly the four
+    // fresh-start processes running that path, at a deterministic offset
+    // from merge open, on a branch where main is green — so per the
+    // correctness-beats-optimization rule the always-on gating is reverted
+    // until the freeze is pinned down (see docs/reviews/…/fixes-CI-replay-
+    // loop.md). Known cost, as on main: a crash BEFORE the first commit
+    // rejoins live mid-stream and relies on the bounded join timeout to fail
+    // loudly rather than replaying from origin. The replay endpoint is
+    // shared across the tx_data/tx_deposits streams (the media driver
+    // demuxes by stream id).
+    let recovery_endpoints = if resume.is_some() {
+        args.replay_destination_endpoint.clone()
+    } else {
+        None
+    };
     if resume.is_some() && recovery_endpoints.is_none() {
         anyhow::bail!(
             "crash recovery needs --replay-destination-endpoint (host:port) for tx_data / \
              tx_deposits archive replay-merge"
-        );
-    }
-    if resume.is_none() && recovery_endpoints.is_some() {
-        tracing::info!(
-            "fresh start with archive configured: replaying tx_data / tx_deposits from stream origin"
         );
     }
 
