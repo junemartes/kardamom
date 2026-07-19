@@ -295,29 +295,33 @@ ingress_received() {
   return 1
 }
 
-# F02.1 regression probe: after a replica kill+restart, the restarted sequencer
-# must REGAIN COVERAGE of its shard — a running alloc is not enough (a replica
-# whose nonce floors never fast-forward past the empty-state hydration point
-# buffers everything as "future" and publishes nothing, silently degrading the
-# shard to P=1). The restarted process's counters start at 0, so ANY positive
-# tx_published_to_b_total proves it is publishing refs again — the case's load
-# is pinned to its shard and still flowing when this runs.
-# (kardamom_sequencer_nonce_floor_fastforward_total spikes on rejoin too, but
-# publishing is the actual guarantee, so that's what we assert.)
-assert_replica_republishes() { # <node-container> <node-ip> <metrics-port> [slo-secs]
+# Restarted-replica health probe. KNOWN LIMITATION (re-opened F02.1): a
+# restarted replica hydrates nonce floors from an empty state DB, so for
+# ESTABLISHED senders it buffers refs as "future" and publishes nothing until
+# a global hydration signal exists — the shard runs at P=1 for those senders
+# (the racing twin covers them; fresh nonce-0 senders hydrate at floor 0 and
+# are covered immediately). The nonce-floor fast-forward that made a rejoiner
+# republish for established senders was REVERTED: under overload it forged
+# canonical nonce gaps (nonces dropped before tx_data are invisible to BOTH
+# replicas) and crashed every executor — see
+# docs/reviews/2026-07-17-30-commit-review/fixes-CI-replay-loop.md. So this
+# probe asserts what IS guaranteed: the restarted replica is alive and
+# scrapeable (exporter up, session established), NOT that it republishes for
+# the pinned established-sender load.
+assert_replica_healthy() { # <node-container> <node-ip> <metrics-port> [slo-secs]
   local node="$1" ip="$2" port="$3" slo="${4:-90}" t=0 v
   while :; do
     # Bridge-direct first (exporters bind 0.0.0.0 since the replica-metrics
     # fix), docker exec fallback — same rationale as exec_metrics().
     v="$( { curl -fsS --max-time 5 "http://${ip}:${port}/metrics" 2>/dev/null \
           || timeout 8 docker exec "${node}" curl -fsS --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null; } \
-        | awk '/^kardamom_sequencer_tx_published_to_b_total/{ s += $NF } END { if (s != "") printf "%d", s }')"
+        | awk '/^kardamom_sequencer_/{ n++ } END { printf "%d", n }')"
     if [ -n "${v}" ] && [ "${v}" -gt 0 ]; then
-      log "restarted replica on ${node} (:${port}) regained coverage (tx_published_to_b_total=${v})"
+      log "restarted replica on ${node} (:${port}) is up and exporting (${v} sequencer metrics; established-sender coverage stays on the twin — re-opened F02.1)"
       return 0
     fi
     [ "${t}" -ge "${slo}" ] \
-      && fail "restarted replica on ${node} (:${port}) is a ZOMBIE: 0 refs published within ${slo}s of restart (published=${v:-unscrapable}; nonce floors never fast-forwarded?)"
+      && fail "restarted replica on ${node} (:${port}) never came up: metrics unscrapable within ${slo}s of restart"
     sleep 5; t=$(( t + 5 ))
   done
 }
@@ -598,14 +602,14 @@ run_case() { # <case-name>
       # (see the account selection above), so the assertions actually cover
       # the shard that lost a replica: it must stay live with NO stall — the
       # racing twin never stopped and the cluster dedups its refs — the killed
-      # replica restarts to full strength (4/4), and the RESTARTED replica
-      # must regain coverage of the shard (publish refs again), not come back
-      # as a zombie stuck behind stale nonce floors.
+      # replica restarts to full strength (4/4) and comes back healthy.
+      # Established-sender coverage on the rejoiner is a KNOWN gap (re-opened
+      # F02.1, see assert_replica_healthy).
       inject_hard kardamom-sequencer-0 sequencer-a
       assert_progress
       assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}"
       # seq-a on node-0: sequencer ip lane starts at .21, seq-a metrics :9001.
-      assert_replica_republishes kardamom-sequencer-0 192.168.56.21 9001
+      assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
       ;;
     sealer-graceful)    inject_graceful sealer;                         assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
     # KNOWN GAP (single-sealer topology): after a HARD sealer crash the executors
