@@ -21,7 +21,17 @@ pub enum ProcessAction<T> {
 pub enum NonceOutcome {
     Matched,
     Buffered,
-    BufferedEvicting { evicted_nonce: u64 },
+    /// Buffered this nonce; a further-future nonce (`evicted_nonce`) was dropped
+    /// to make room, preserving the drainable low run. The dropped tx is
+    /// far-future and re-submitted by the client before it is needed.
+    BufferedEvicting {
+        evicted_nonce: u64,
+    },
+    /// This nonce was itself the furthest-future and the buffer was full, so it
+    /// was rejected (not buffered) to protect the drainable low run.
+    RejectedTooFar {
+        nonce: u64,
+    },
     BufferedReplaced,
     BufferedDisabled,
     Past,
@@ -86,9 +96,10 @@ impl<T> PartitionState<T> {
             let outcome = match buf.insert(nonce, payload) {
                 InsertOutcome::Inserted => NonceOutcome::Buffered,
                 InsertOutcome::Replaced => NonceOutcome::BufferedReplaced,
-                InsertOutcome::EvictedOldest { evicted_nonce } => {
+                InsertOutcome::EvictedFuture { evicted_nonce } => {
                     NonceOutcome::BufferedEvicting { evicted_nonce }
                 }
+                InsertOutcome::RejectedTooFar { nonce } => NonceOutcome::RejectedTooFar { nonce },
                 InsertOutcome::DroppedBufferDisabled => NonceOutcome::BufferedDisabled,
             };
             return ProcessResult {
@@ -256,15 +267,47 @@ mod tests {
     }
 
     #[test]
-    fn buffer_full_evicts_oldest() {
+    fn buffer_full_rejects_furthest_future() {
+        // Capacity 2, buffer {5,6}; incoming 7 is the furthest-future → rejected,
+        // NOT evicting the low run. (Old behaviour evicted 5 and wedged.)
         let mut st: PartitionState<u32> = PartitionState::new(2);
         st.process(s(1), 5, 5);
         st.process(s(1), 6, 6);
         let out = st.process(s(1), 7, 7);
-        assert_eq!(
-            out.outcome,
-            NonceOutcome::BufferedEvicting { evicted_nonce: 5 }
-        );
+        assert_eq!(out.outcome, NonceOutcome::RejectedTooFar { nonce: 7 });
+    }
+
+    #[test]
+    fn overflow_then_expected_arrives_drains_full_run_no_wedge() {
+        // The end-to-end regression guard: a sender floods far-future nonces past
+        // capacity, then its expected nonce (0) finally arrives. With lowest-wins
+        // the contiguous run 0..=3 survives and publishes in order — the sender
+        // is never permanently wedged. (Old evict-oldest would have dropped 0's
+        // successors and stalled the sender forever.)
+        let mut st: PartitionState<u32> = PartitionState::new(4);
+        // expected is 0; buffer the near run 1..=4 (fills capacity 4).
+        for n in 1..=4u64 {
+            st.process(s(1), n, n as u32);
+        }
+        // Flood far-future nonces — all rejected, near run untouched.
+        for n in 50..70u64 {
+            assert_eq!(
+                st.process(s(1), n, n as u32).outcome,
+                NonceOutcome::RejectedTooFar { nonce: n }
+            );
+        }
+        // Expected 0 arrives → publishes 0,1,2,3,4 in order (the retained run).
+        let out = st.process(s(1), 0, 0);
+        let published: Vec<u64> = out
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                ProcessAction::Publish { nonce, .. } => Some(*nonce),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published, vec![0, 1, 2, 3, 4]);
+        assert_eq!(st.next_nonce(s(1)), 5);
     }
 
     #[test]
