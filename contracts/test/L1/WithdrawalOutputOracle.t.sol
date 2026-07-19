@@ -162,7 +162,8 @@ contract WithdrawalOutputOracleTest is Test {
         pure
         returns (bytes memory)
     {
-        return abi.encodeWithSelector(WithdrawalOutputOracle.initialize.selector, att, chal, window);
+        bytes4 sel = WithdrawalOutputOracle.initialize.selector;
+        return abi.encodeWithSelector(sel, att, chal, window);
     }
 
     function test_initialize_rejects_zero_attester() public {
