@@ -59,6 +59,7 @@
     - "{{ paths.base }}"
     - "{{ paths.archive_dir }}"
     - "{{ paths.state_dir }}"
+    - "{{ paths.checkpoints_dir }}"
     - "{{ paths.config_dir }}"
 
 - name: Create the Aeron tmpfs mount point
