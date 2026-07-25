@@ -17,15 +17,16 @@
 //!
 //! The WAITER owns each entry: [`PendingWait`] holds the only long-lived
 //! strong `Arc`; the map indexes entries through `Weak`. The watcher paths
-//! (`on_receipt` / `on_tx_error` / `release_satisfied`) are readers — they
-//! `upgrade()` and treat a dead `Weak` as "no client parked". So when a
-//! client disconnects and jsonrpsee drops the RPC handler future, the entry
-//! dies WITH the future on every path, past or future — no removal call has
-//! to be remembered (the #81 "pending-registry cleanup on cancelled RPC
-//! futures" follow-up, which leaked exactly such entries). The only possible
-//! residue is a dead `(key, Weak)` slot, which reads as absent everywhere
-//! and is reaped by the wait's `Drop` (identity-guarded) or opportunistically
-//! by the next reader that trips over it.
+//! (`on_receipt` / `on_tx_error` / `release_satisfied`) are PURE READERS —
+//! they `upgrade()` and treat a dead `Weak` as "no client parked"; they
+//! never remove anything. The wait's `Drop` is the SINGLE removal site: it
+//! reaps the slot (identity-guarded) before the entry Arc dies, so however
+//! the wait ends — receipt, rejection, timeout, or the RPC handler future
+//! being dropped on client disconnect — slot and entry go together, and a
+//! dead `Weak` is never observable in the map. No removal call has to be
+//! remembered anywhere else (the #81 "pending-registry cleanup on cancelled
+//! RPC futures" follow-up leaked exactly because cleanup was a discipline
+//! spread across paths).
 
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -57,28 +58,18 @@ struct Entry {
 /// submitting handler holds (see the module docs' ownership topology).
 type PendingMap = Arc<DashMap<(Address, u64), Weak<Mutex<Entry>>>>;
 
-/// Look up the live entry for `key`. A dead `Weak` is indistinguishable from
-/// an absent key to callers — the parked client is gone — and its slot is
-/// reaped in passing (guarded, so a concurrent re-register is spared).
+/// Look up the live entry for `key`. A dead `Weak` (unobservable in
+/// practice — see the module docs) is indistinguishable from an absent key:
+/// the parked client is gone either way.
 fn lookup(map: &PendingMap, key: &(Address, u64)) -> Option<Arc<Mutex<Entry>>> {
-    let upgraded = map.get(key).map(|r| r.value().upgrade());
-    // The shard read-guard is dropped here; never call remove* under it.
-    match upgraded {
-        None => None,
-        Some(Some(entry)) => Some(entry),
-        Some(None) => {
-            map.remove_if(key, |_, w| w.strong_count() == 0);
-            set_queue_depth(map);
-            None
-        }
-    }
+    map.get(key).and_then(|r| r.value().upgrade())
 }
 
-/// Remove `key`'s slot ONLY if it still indexes `entry` (pointer identity),
-/// then refresh the depth gauge. Every removal goes through this guard: a
-/// re-`register` of the same (sender, nonce) replaces the slot with a NEW
-/// entry, and a stale remover (a late receipt/rejection for the old
-/// registration, an old wait's Drop) must never evict the new registration.
+/// The single removal path, called from `PendingWait::drop`: remove `key`'s
+/// slot ONLY if it still indexes `entry` (pointer identity), then refresh
+/// the depth gauge. The guard matters because a re-`register` of the same
+/// (sender, nonce) replaces the slot with a NEW entry, and the OLD wait's
+/// later Drop must never evict the new registration.
 fn remove_slot(map: &PendingMap, key: &(Address, u64), entry: &Arc<Mutex<Entry>>) {
     map.remove_if(key, |_, w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(entry)));
     set_queue_depth(map);
@@ -185,12 +176,8 @@ impl PendingReceipts {
         if self.gate_satisfied(&latest, receipt.tx_idx)
             && let Some(resp) = e.responder.take()
         {
+            // Release only; the woken waiter's Drop removes the slot.
             let _ = resp.send(Ok(ReceiptResponse { receipt }));
-            drop(e);
-            // Eager slot reap so the map only holds genuinely-parked entries
-            // (gauge accuracy + the release_satisfied walk); the wait's Drop
-            // is the guaranteed backstop.
-            remove_slot(&self.map, &key, &entry);
         }
     }
 
@@ -214,7 +201,6 @@ impl PendingReceipts {
         let weak = Arc::downgrade(&entry);
         drop(entry);
         let grace = self.error_grace;
-        let map = self.map.clone();
         let release = async move {
             if !grace.is_zero() {
                 tokio::time::sleep(grace).await;
@@ -232,9 +218,8 @@ impl PendingReceipts {
                 let err = match reason {
                     TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
                 };
+                // Release only; the woken waiter's Drop removes the slot.
                 let _ = resp.send(Err(err));
-                drop(e);
-                remove_slot(&map, &key, &entry);
             }
         };
         if grace.is_zero() {
@@ -260,21 +245,16 @@ impl PendingReceipts {
     }
 
     /// Walk every parked entry and release the ones whose stored receipt's
-    /// B-position is now covered by the configured durability gate.
+    /// B-position is now covered by the configured durability gate. A pure
+    /// reader like every watcher path: it releases through the oneshot and
+    /// leaves slot removal to the woken waiter's Drop.
     async fn release_satisfied(&self) {
         let latest = *self.latest.lock().await;
-        type Snap = Vec<((Address, u64), Weak<Mutex<Entry>>)>;
-        let snapshot: Snap = self
-            .map
-            .iter()
-            .map(|r| (*r.key(), r.value().clone()))
-            .collect();
-        for (key, weak) in snapshot {
+        let snapshot: Vec<Weak<Mutex<Entry>>> =
+            self.map.iter().map(|r| r.value().clone()).collect();
+        for weak in snapshot {
             let Some(entry) = weak.upgrade() else {
-                // Dead slot (client gone since the snapshot): reap in passing.
-                self.map.remove_if(&key, |_, w| w.strong_count() == 0);
-                set_queue_depth(&self.map);
-                continue;
+                continue; // waiter gone since the snapshot
             };
             let mut e = entry.lock().await;
             let release = e
@@ -285,8 +265,6 @@ impl PendingReceipts {
             if release && let Some(resp) = e.responder.take() {
                 let receipt = e.receipt.clone().expect("checked is_some above");
                 let _ = resp.send(Ok(ReceiptResponse { receipt }));
-                drop(e);
-                remove_slot(&self.map, &key, &entry);
             }
         }
     }
@@ -352,20 +330,18 @@ impl PendingWait {
 
 impl Drop for PendingWait {
     fn drop(&mut self) {
-        // Reap this wait's map slot. NOT needed for correctness — a dead
-        // Weak already reads as absent to every watcher — but it is the only
-        // TRAFFIC-INDEPENDENT reap trigger: `release_satisfied` walks the
-        // map solely on watermark updates, which never flow in the deployed
-        // on-offer ack mode, and the per-key lookup reap needs a receipt or
-        // rejection that an abandoned nonce-gap tx never gets. Without this,
-        // dead slots from client disconnects accumulate unboundedly under
-        // on-offer churn and the queue-depth gauge (map len) stays inflated.
-        // Idempotent: a wait released via receipt/rejection had its slot
-        // removed by the watcher already, and the identity guard skips any
-        // newer registration under the same key. Sync + lock-free apart from
-        // the dashmap shard, so it is safe in an async Drop. The entry
-        // itself dies when `self.entry` — its only long-lived strong ref —
-        // drops right after this body.
+        // THE single removal site for map slots (watchers are pure readers
+        // that release through the oneshot only). Runs however the wait ends
+        // — receipt, rejection, timeout, or the RPC handler future being
+        // dropped on client disconnect — and, crucially, it is the only
+        // trigger that fires WITHOUT any further traffic on this key: in the
+        // deployed on-offer ack mode the map is never walked, and an
+        // abandoned nonce-gap key never sees another receipt or rejection.
+        // The slot is removed BEFORE `self.entry` (the only long-lived
+        // strong ref) drops right after this body, so a dead Weak is never
+        // observable in the map. Identity-guarded, so an old wait's Drop
+        // spares a newer registration under the same key. Sync + lock-free
+        // apart from the dashmap shard, so it is safe in an async Drop.
         remove_slot(&self.map, &self.key, &self.entry);
     }
 }
@@ -752,17 +728,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_dead_slot_reads_as_absent_and_is_reaped_on_lookup() {
-        // The residue class the Weak topology permits: a (key, Weak) slot
-        // whose entry died without a Drop-side reap (not reachable through
-        // the public API — simulated directly). Readers must treat it as
-        // absent and collect it in passing.
+    async fn a_dead_slot_reads_as_absent() {
+        // Structurally unreachable through the public API (Drop removes the
+        // slot BEFORE its entry dies) — simulated directly to pin the reader
+        // contract anyway: a dead Weak means "no client parked", never a
+        // panic or a release.
         let p = PendingReceipts::new(AckPolicy::OnOffer);
         let sender = Address::repeat_byte(0xB5);
         p.map.insert((sender, 3), Weak::new());
-        assert_eq!(p.len(), 1);
         p.on_receipt(sender, 3, dummy_receipt(pos(1))).await;
-        assert_eq!(p.len(), 0, "dead slot must be reaped by the lookup");
+        p.on_tx_error(sender, 3, TxErrorReason::DuplicatedTx { expected_nonce: 9 })
+            .await;
     }
 
     #[tokio::test]
