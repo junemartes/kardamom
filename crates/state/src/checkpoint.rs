@@ -11,6 +11,9 @@
 //!
 //! Creation reuses [`compact_to`] (`mdbx_env_copy` + `MDBX_CP_COMPACT`) against
 //! an online RO snapshot, so the live env keeps serving reads/writes throughout.
+//! The copy lands under a hidden tmp name and is renamed into place when
+//! complete, so anything visible as `checkpoint-*` is a full, consistent image
+//! that will never change again — copying one concurrently is always safe.
 //! Restore is a plain file copy of the checkpoint env into a fresh state dir;
 //! the normal startup path then sees a non-empty DB and resumes from its
 //! `last_committed_block` cursor.
@@ -59,9 +62,37 @@ pub fn create_checkpoint(
         info!(block, path = %dest.display(), "checkpoint for block already present; skipping");
         return Ok(CheckpointInfo { block, path: dest });
     }
-    compact_to(env, &dest)?;
+    // Compact under a hidden tmp name and rename into place only when the copy
+    // is complete: peers copy checkpoints while we write (chaos re-replication,
+    // peer restore), and a half-written env under its final name would hand
+    // them a torn mdbx image. Hidden names don't parse as `checkpoint-*`, so
+    // `latest_checkpoint`/`prune_checkpoints` never see in-progress copies.
+    sweep_stale_tmp(checkpoints_dir)?;
+    let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
+    compact_to(env, &tmp)?;
+    std::fs::rename(&tmp, &dest)?;
     info!(block, path = %dest.display(), "created state checkpoint");
     Ok(CheckpointInfo { block, path: dest })
+}
+
+/// Remove leftover `.checkpoint-*.tmp` entries (a writer crashed mid-compact).
+/// Safe to run before compacting because there is a single checkpoint writer
+/// per directory.
+fn sweep_stale_tmp(checkpoints_dir: &Path) -> Result<(), StateError> {
+    for entry in std::fs::read_dir(checkpoints_dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        if s.starts_with(".checkpoint-") && s.ends_with(".tmp") {
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Return the highest-block checkpoint under `checkpoints_dir`, or `None` if
@@ -298,6 +329,37 @@ mod tests {
             latest_checkpoint(ckpt_dir.path()).unwrap().unwrap().block,
             7
         );
+    }
+
+    #[test]
+    fn create_sweeps_stale_tmp_and_leaves_no_residue() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let ckpt_dir = tempfile::tempdir().unwrap();
+        let addr = Address::from([0x5; 20]);
+        let env = StateEnvBuilder::new(src_dir.path())
+            .durability(Durability::SafeNoSync)
+            .open()
+            .unwrap();
+        commit_blocks(&env, addr, 2);
+
+        // Plant a stale tmp dir from a "crashed" earlier writer.
+        let stale = ckpt_dir.path().join(".checkpoint-000000000000000001.tmp");
+        std::fs::create_dir_all(&stale).unwrap();
+
+        let c = create_checkpoint(&env, ckpt_dir.path()).unwrap();
+        assert!(c.path.exists());
+        assert!(!stale.exists());
+        let tmp_residue = std::fs::read_dir(ckpt_dir.path())
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(tmp_residue, 0);
     }
 
     #[test]

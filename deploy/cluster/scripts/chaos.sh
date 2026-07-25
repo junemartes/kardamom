@@ -729,9 +729,27 @@ run_case() { # <case-name>
       docker exec kardamom-executor-0 bash -lc 'rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*' \
         || fail "state-checkpoint-restore: could not wipe executor-0 state"
       log "state-checkpoint-restore: re-replicating checkpoints from executor-1"
-      docker exec kardamom-executor-1 tar -C /opt/kardamom -cf - checkpoints \
-        | docker exec -i kardamom-executor-0 tar -C /opt/kardamom -xf - \
-        || fail "state-checkpoint-restore: checkpoint copy failed"
+      # Copy ONE complete checkpoint, not the whole dir: the writer adds a new
+      # checkpoint every interval and prunes old ones, so tar-ing the parent
+      # races with that churn ("file changed as we read it", exit 1). Visible
+      # checkpoint-* dirs are immutable (compacted under a tmp name, renamed
+      # into place when done); the retry covers only the narrow window where
+      # the picked checkpoint is pruned mid-copy.
+      local ck_name="" copied=0
+      for _ in 1 2 3; do
+        ck_name="$(docker exec kardamom-executor-1 bash -lc \
+          'ls -d /opt/kardamom/checkpoints/checkpoint-* 2>/dev/null | sort | tail -1' \
+          | xargs -rn1 basename)"
+        [ -n "${ck_name}" ] || { sleep 2; continue; }
+        docker exec kardamom-executor-0 bash -lc 'rm -rf /opt/kardamom/checkpoints/*'
+        if docker exec kardamom-executor-1 tar -C /opt/kardamom -cf - "checkpoints/${ck_name}" \
+          | docker exec -i kardamom-executor-0 tar -C /opt/kardamom -xf -; then
+          copied=1
+          break
+        fi
+        sleep 2
+      done
+      [ "${copied}" = 1 ] || fail "state-checkpoint-restore: checkpoint copy failed"
       # The surviving replicas must keep the pipeline progressing on 2.
       assert_executor_progress 180
       # executor-0 restarts, restores from the peer checkpoint, rejoins to 3.
