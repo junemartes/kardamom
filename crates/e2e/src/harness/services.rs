@@ -2,9 +2,10 @@
 //!
 //! Binaries are resolved from the same cargo target dir the test executable
 //! ran from (`target/<profile>/deps/<test>` → `target/<profile>/`), so
-//! `cargo build --bins -p kardamom-{ingress,sequencer,executor}` before
-//! `cargo test -p e2e` is the whole contract — the mechanism the deleted
-//! multiprocess e2e used. Services attach to the shared media driver via
+//! `cargo build --bins -p kardamom-{ingress,sequencer,executor,validator,
+//! state,da-watcher}` before `cargo test -p e2e` is the whole contract — the
+//! mechanism the deleted multiprocess e2e used. (`just test-e2e-local` and
+//! the chain-semantics CI job build exactly that set.) Services attach to the shared media driver via
 //! `--aeron-dir` and use the built-in single-host IPC channel defaults (no
 //! `--log-config`), the documented known-good local topology.
 
@@ -34,7 +35,9 @@ pub fn bin(name: &str) -> Result<PathBuf> {
     anyhow::ensure!(
         p.is_file(),
         "{} not found — build the service binaries first: \
-         `cargo build -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor --bins`",
+         `cargo build --bins -p kardamom-ingress -p kardamom-sequencer \
+         -p kardamom-executor -p kardamom-validator -p kardamom-state \
+         -p kardamom-da-watcher` (or just `just test-e2e-local`)",
         p.display()
     );
     Ok(p)
