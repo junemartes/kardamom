@@ -17,6 +17,11 @@ pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_d
 // Lag detection + receipt-floor resync (docs/agents/sequencer-lag-resync-spec.md).
 pub const RESYNC_MODE: &str = "kardamom_sequencer_resync_mode";
 pub const RESYNC_ENTERED: &str = "kardamom_sequencer_resync_entered_total";
+/// Bumped by the egress FEED thread the moment it observes a lag signature
+/// (boundary-arrival gap past the silence threshold) — starvation-proof,
+/// unlike `RESYNC_ENTERED`, which requires the publish loop to be running.
+/// The chaos suite asserts on THIS counter.
+pub const RESYNC_LAG_SUSPECTED: &str = "kardamom_sequencer_resync_lag_suspected_total";
 pub const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skipped_executed_total";
 pub const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
 pub const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
@@ -57,6 +62,10 @@ pub fn record_resync_mode(partition: u32, active: bool) {
 pub fn record_resync_enter(partition: u32) {
     counter!(RESYNC_ENTERED, "partition" => partition.to_string()).increment(1);
     record_resync_mode(partition, true);
+}
+
+pub fn record_lag_suspected(partition: u32) {
+    counter!(RESYNC_LAG_SUSPECTED, "partition" => partition.to_string()).increment(1);
 }
 
 pub fn record_resync_skip(partition: u32) {

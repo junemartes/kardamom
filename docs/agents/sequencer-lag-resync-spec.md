@@ -121,9 +121,25 @@ The primary trigger simply stops discarding:
 
 No wire change, no Java change, no cross-host clock comparison; the trigger measures the
 count-based horizon directly, so the compound-failure residue below largely evaporates.
-**Boundary silence** doubles as a trigger: no boundary for `boundary_silence_ticks`
-(default 5) tick intervals ⇒ the replica is partitioned/disconnected from egress and must
-assume lag ⇒ enter resync (covers the case where the watermark is unavailable).
+
+**Silence detection lives in the egress FEED thread, not the publish loop** *(as
+implemented — the first CI run of `sequencer-lapse` failed the draft design two ways,
+run 30163255470)*:
+
+- The publish loop can be **blocked exactly when lag happens**: `LiveIngress::offer` waits
+  on the session thread's reply, and after a process freeze the sealer has closed the
+  session (1 s offer deadline) and the session thread is mid reconnect/backoff — the loop
+  sat inside `publish_ref` for ~70 s and a loop-evaluated silence check never ran, missing
+  a 30 s freeze entirely. The feed thread polls egress with a bounded wait
+  (`recv_timeout(500 ms)`), measures **boundary inter-arrival gaps** (a freeze appears as
+  one wall-clock gap between the last pre-freeze arrival and the first post-resume one),
+  and raises a **sticky lag flag** (`SharedWatermark::flag_lag`, largest-gap-wins) plus the
+  starvation-proof `resync_lag_suspected_total` metric. The controller consumes the flag on
+  the loop's next turn — however late; detection cannot be missed, only the response
+  delayed.
+- Liveness is **boundary arrival, not count change**: idle traffic emits a boundary every
+  cluster tick with an unchanged `end_tx_idx`, which a value-change tracker mistakes for
+  silence (observed as enter/exit thrash every 10 s — 60 spurious enters in one shard run).
 
 Secondary triggers (belt-and-suspenders, all cheap and local):
 
@@ -166,6 +182,9 @@ yamllint/contract CI check that already guards channel config drift.
 
 ## Observability
 
+- `kardamom_sequencer_resync_lag_suspected_total` — bumped by the feed thread at detection
+  time; starvation-proof (the chaos suite asserts on THIS, tightly; `entered_total` follows
+  when the loop next turns, asserted with a wide window)
 - `kardamom_sequencer_resync_mode` (gauge 0/1) and `…_resync_entered_total`
 - `kardamom_sequencer_resync_skipped_executed_total` — provable-duplicate skips
 - `kardamom_sequencer_receipt_floor_senders` / `…_receipt_floor_lag_seconds`

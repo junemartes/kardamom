@@ -247,18 +247,71 @@ async fn main() -> anyhow::Result<()> {
     let (resync_controller, floor_tx, watermark) =
         kardamom_sequencer::resync::resync_channel(cfg.resync.clone(), cfg.partition_index);
 
+    // The FEED thread is the silence authority: it measures BOUNDARY-ARRIVAL
+    // gaps (idle traffic still emits a boundary every cluster tick, so
+    // arrivals — not count changes — are the liveness signal) and raises the
+    // sticky lag flag + a starvation-proof metric. It must never block
+    // unboundedly (recv_timeout), because the publish loop CAN — a session
+    // offer waits on the session thread, which after a process freeze is mid
+    // reconnect — and a detector that only runs when the loop runs misses
+    // the freeze entirely (observed: sequencer-lapse, CI run 30163255470).
     let watermark_thread = std::thread::Builder::new()
         .name("cluster-egress-watermark".into())
         .spawn({
             let mut egress = cluster_egress;
+            let silence_ms = cfg.resync.boundary_silence_ms;
+            let partition = cfg.partition_index;
             move || {
-                use kardamom_cluster_adapter::gateway::ClusterEgress;
-                use kardamom_cluster_adapter::wire::{EgressItem, decode_egress};
-                // recv() blocks; returns None when the session thread drops
-                // (cluster_guard drop at shutdown) — the thread then exits.
-                while let Some(frame) = egress.recv() {
-                    if let Ok(EgressItem::Boundary(b)) = decode_egress(&frame) {
-                        watermark.store(b.end_tx_idx.as_index());
+                use kardamom_cluster_adapter::live::EgressPoll;
+                use kardamom_cluster_adapter::wire::{self, EgressItem, decode_egress};
+                use kardamom_sequencer::metrics as seq_metrics;
+                let mut last_boundary_at: Option<std::time::Instant> = None;
+                let mut flag = |at: &mut Option<std::time::Instant>, now: std::time::Instant| {
+                    if let Some(prev) = *at {
+                        let gap = now.duration_since(prev).as_millis() as u64;
+                        if gap >= silence_ms {
+                            watermark.flag_lag(gap);
+                            seq_metrics::record_lag_suspected(partition);
+                            tracing::info!(
+                                partition,
+                                gap_ms = gap,
+                                "sequencer LAG suspected (boundary-arrival gap)"
+                            );
+                            // Re-arm from now so a persistent outage flags
+                            // once per silence window, not per poll.
+                            *at = Some(now);
+                        }
+                    }
+                };
+                loop {
+                    match egress.recv_timeout(Duration::from_millis(500)) {
+                        EgressPoll::Frame(frame) => {
+                            // Cheap kind check FIRST: relayed records arrive
+                            // at full line rate on every replica, and fully
+                            // decoding them here just to discard them is
+                            // measurable CPU on the shared CI hosts.
+                            if frame.first() != Some(&wire::EGRESS_KIND_BOUNDARY) {
+                                continue;
+                            }
+                            if let Ok(EgressItem::Boundary(b)) = decode_egress(&frame) {
+                                let now = std::time::Instant::now();
+                                // A 30 s freeze shows up HERE as one long
+                                // inter-arrival gap: the backlog drains
+                                // instantly on resume, but the gap between
+                                // the last pre-freeze arrival and this one
+                                // is wall-clock real.
+                                flag(&mut last_boundary_at, now);
+                                last_boundary_at = Some(now);
+                                watermark.store(b.end_tx_idx.as_index());
+                            }
+                        }
+                        EgressPoll::Idle => {
+                            // Egress silent while we are demonstrably alive:
+                            // partitioned from egress (or the cluster's
+                            // boundary clock is dead) — same response.
+                            flag(&mut last_boundary_at, std::time::Instant::now());
+                        }
+                        EgressPoll::Closed => return,
                     }
                 }
             }

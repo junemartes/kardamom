@@ -45,21 +45,48 @@ pub struct FloorUpdate {
     pub executed_nonce: u64,
 }
 
-/// Latest cluster boundary `end_tx_idx` (the global canonical count), written
-/// by the egress-watermark thread, read by the publish loop. Zero until the
-/// first boundary is observed.
+/// Shared state between the egress-watermark FEED thread and the publish
+/// loop's controller:
+///
+/// - `count` — latest boundary `end_tx_idx` (the global canonical count).
+/// - `lag_gap_ms` — a STICKY lag flag: the feed thread sets it when it
+///   observes a boundary inter-arrival gap past the silence threshold, and
+///   the controller consumes it (swap-to-0) on its next iteration. Sticky
+///   because the publish loop can be BLOCKED for long stretches exactly when
+///   lag happens (`LiveIngress::offer` waits on the session thread, which is
+///   mid-reconnect after e.g. a process freeze) — a point-in-time check the
+///   loop must be running to catch was observed to miss a 30 s freeze
+///   entirely (sequencer-lapse CI, run 30163255470). Boundary ARRIVALS are
+///   the liveness signal, not count changes: idle traffic emits boundaries
+///   every tick with an unchanged count, which a value-change tracker
+///   mistakes for silence (observed as enter/exit thrash every 10 s).
 #[derive(Clone, Default)]
-pub struct SharedWatermark(Arc<AtomicU64>);
+pub struct SharedWatermark {
+    count: Arc<AtomicU64>,
+    lag_gap_ms: Arc<AtomicU64>,
+}
 
 impl SharedWatermark {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn store(&self, count: u64) {
-        self.0.store(count, Ordering::Release);
+        self.count.store(count, Ordering::Release);
     }
     pub fn load(&self) -> u64 {
-        self.0.load(Ordering::Acquire)
+        self.count.load(Ordering::Acquire)
+    }
+    /// Feed thread: flag an observed boundary-arrival gap (ms). Keeps the
+    /// LARGEST unconsumed gap so a later smaller gap can't shadow a freeze.
+    pub fn flag_lag(&self, gap_ms: u64) {
+        self.lag_gap_ms.fetch_max(gap_ms, Ordering::AcqRel);
+    }
+    /// Controller: consume the pending lag flag, if any.
+    pub fn take_lag(&self) -> Option<u64> {
+        match self.lag_gap_ms.swap(0, Ordering::AcqRel) {
+            0 => None,
+            gap => Some(gap),
+        }
     }
 }
 
@@ -126,8 +153,7 @@ pub struct ResyncController {
     floor_rx: Receiver<FloorUpdate>,
     watermark: SharedWatermark,
     last_watermark: u64,
-    last_watermark_change: Instant,
-    /// Set once the first boundary has been observed — silence before the
+    /// Set once the first boundary has been observed — a jump before the
     /// session has ever delivered a boundary is indistinct from startup.
     watermark_seen: bool,
     stall_since: Option<Instant>,
@@ -153,7 +179,6 @@ impl ResyncController {
             floor_rx,
             watermark,
             last_watermark: 0,
-            last_watermark_change: Instant::now(),
             watermark_seen: false,
             stall_since: None,
             calm_since: None,
@@ -197,37 +222,26 @@ impl ResyncController {
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
+    ///
+    /// Silence detection does NOT happen here: this method only runs when the
+    /// publish loop is running, and the loop can be blocked in a session
+    /// offer exactly while lag is happening. The egress FEED thread is the
+    /// silence authority — it flags boundary-arrival gaps into the sticky
+    /// [`SharedWatermark::flag_lag`], consumed here whenever the loop next
+    /// turns. The jump check stays here as a second, loop-local signal.
     pub fn observe(&mut self, now: Instant) {
         let w = self.watermark.load();
         metrics::record_canonical_watermark(self.partition, w);
+        if let Some(gap_ms) = self.watermark.take_lag() {
+            self.enter(EnterReason::BoundarySilence { silent_ms: gap_ms });
+        }
         if w != self.last_watermark {
-            // Measure the gap BEFORE resetting the change stamp: after a
-            // full-process freeze the first post-resume read sees both a
-            // jump and a long silent interval — either alone must trigger.
-            let silent = now.duration_since(self.last_watermark_change);
             let jump = w.saturating_sub(self.last_watermark);
-            if self.watermark_seen {
-                if jump >= self.cfg.enter_threshold() {
-                    self.enter(EnterReason::WatermarkJump { gap: jump });
-                } else if silent.as_millis() as u64 >= self.cfg.boundary_silence_ms {
-                    self.enter(EnterReason::BoundarySilence {
-                        silent_ms: silent.as_millis() as u64,
-                    });
-                }
+            if self.watermark_seen && jump >= self.cfg.enter_threshold() {
+                self.enter(EnterReason::WatermarkJump { gap: jump });
             }
             self.last_watermark = w;
-            self.last_watermark_change = now;
             self.watermark_seen = true;
-        } else if self.watermark_seen {
-            let silent = now.duration_since(self.last_watermark_change);
-            if silent.as_millis() as u64 >= self.cfg.boundary_silence_ms {
-                self.enter(EnterReason::BoundarySilence {
-                    silent_ms: silent.as_millis() as u64,
-                });
-                // Re-arm so a persistent outage does not re-enter every
-                // iteration (enter() is idempotent but the log would spam).
-                self.last_watermark_change = now;
-            }
         }
         self.maybe_exit(now);
     }
@@ -271,10 +285,11 @@ impl ResyncController {
         if !self.active {
             return;
         }
-        let silent_ms = now.duration_since(self.last_watermark_change).as_millis() as u64;
-        let calm = self.watermark_seen
-            && silent_ms < self.cfg.boundary_silence_ms
-            && self.stall_since.is_none();
+        // Calm = the feed thread has raised no unconsumed lag flag (checked
+        // just above in observe) and the publish path is not stalled. The
+        // watermark advancing is NOT required: an idle-but-healthy cluster
+        // emits boundaries with an unchanged count.
+        let calm = self.watermark_seen && self.stall_since.is_none();
         if !calm {
             self.calm_since = None;
             return;
@@ -320,9 +335,9 @@ mod tests {
     }
 
     fn calm_down(c: &mut ResyncController, w: &SharedWatermark, t: &mut Instant) {
-        // Advance the watermark a little every 500ms until the exit hold
-        // elapses — fresh boundaries, no stall.
-        for i in 1..=8u64 {
+        // Boundaries flowing (count advancing), no lag flag, no stall: the
+        // exit hold elapses across a few observes.
+        for i in 1..=6u64 {
             w.store(c.last_watermark + i);
             *t += Duration::from_millis(500);
             c.observe(*t);
@@ -351,15 +366,37 @@ mod tests {
     }
 
     #[test]
-    fn boundary_silence_enters() {
+    fn feed_lag_flag_enters_even_if_raised_while_loop_was_blocked() {
         let (mut c, _tx, w) = mk(ResyncConfig::default());
         let mut t = Instant::now();
         calm_down(&mut c, &w, &mut t);
-        // No watermark change for > boundary_silence_ms.
-        t += Duration::from_millis(10_001);
+        // The FEED thread observed a 30 s boundary-arrival gap while the
+        // publish loop was blocked in a session offer; the flag is sticky
+        // and consumed on the loop's next turn — however late.
+        w.flag_lag(30_000);
+        t += Duration::from_millis(70_000);
         c.observe(t);
-        assert!(c.active(), "silence must re-enter resync");
-        let _ = w;
+        assert!(c.active(), "sticky lag flag must enter resync");
+        // A second, smaller gap flagged before consumption must not shadow
+        // a larger one (fetch_max).
+        w.flag_lag(12_000);
+        w.flag_lag(3_000);
+        assert_eq!(w.take_lag(), Some(12_000));
+    }
+
+    #[test]
+    fn idle_boundaries_do_not_thrash() {
+        // Idle traffic: boundaries arrive but the count never advances. The
+        // controller must stay OUT of resync (silence is judged by boundary
+        // ARRIVAL in the feed thread, not by count changes here).
+        let (mut c, _tx, w) = mk(ResyncConfig::default());
+        let mut t = Instant::now();
+        calm_down(&mut c, &w, &mut t);
+        for _ in 0..10 {
+            t += Duration::from_millis(10_000);
+            c.observe(t); // count unchanged, no lag flag raised
+            assert!(!c.active(), "idle must not re-enter resync");
+        }
     }
 
     #[test]

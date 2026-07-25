@@ -291,9 +291,10 @@ run_sequencer_lapse() {
   inner="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
   [ -n "${inner}" ] || fail "sequencer-lapse: no inner sequencer-a container on kardamom-sequencer-0"
 
-  local r0
+  local l0 r0
+  l0="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"; l0="${l0:-0}"
   r0="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r0="${r0:-0}"
-  log "sequencer-lapse: pausing ${inner} for ${SEQ_LAPSE_S}s (resync_entered=${r0})"
+  log "sequencer-lapse: pausing ${inner} for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0})"
   docker exec kardamom-sequencer-0 docker pause "${inner}" >/dev/null \
     || fail "sequencer-lapse: docker pause failed"
   sleep "${SEQ_LAPSE_S}"
@@ -304,22 +305,37 @@ run_sequencer_lapse() {
   # The pipeline never depended on the paused replica — the twin raced on.
   assert_progress
 
-  # The lapsed replica must notice on its own: its boundary-silence window
-  # (default 10s < SEQ_LAPSE_S) elapsed while it was frozen, so the first
-  # post-resume trigger evaluation enters resync. Counter, not gauge: the
-  # mode may already have exited by the time we scrape (enter is sticky in
-  # _entered_total, mode is not).
-  local t=0 r1
+  # DETECTION: the egress feed thread measures the pause as one long
+  # boundary-arrival gap (> the 10s silence window) and bumps
+  # lag_suspected_total within moments of resume. This counter is
+  # starvation-proof — asserted FIRST and tightly.
+  local t=0 l1
+  while :; do
+    l1="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"; l1="${l1:-0}"
+    [ "${l1}" -gt "${l0}" ] && break
+    [ "${t}" -ge 60 ] \
+      && fail "sequencer-lapse: lag never suspected within 60s of resume (lag_suspected ${l0} -> ${l1})"
+    sleep 5; t=$(( t + 5 ))
+  done
+  log "sequencer-lapse: lag suspected (${l0} -> ${l1})"
+
+  # RESPONSE: the controller consumes the sticky flag on the publish loop's
+  # next turn and enters resync. The loop can legitimately be BLOCKED in a
+  # session offer while its closed session reconnects (the sealer closes a
+  # frozen consumer's session within ~1s of the pause), so this window is
+  # WIDE — the flag is sticky and cannot be missed, only late.
+  local r1
+  t=0
   while :; do
     r1="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r1="${r1:-0}"
     [ "${r1}" -gt "${r0}" ] && break
-    [ "${t}" -ge 60 ] \
-      && fail "sequencer-lapse: resync never engaged within 60s of resume (entered ${r0} -> ${r1})"
+    [ "${t}" -ge 180 ] \
+      && fail "sequencer-lapse: resync never engaged within 180s of resume (entered ${r0} -> ${r1}; lag was suspected ${l0} -> ${l1})"
     sleep 5; t=$(( t + 5 ))
   done
   log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1})"
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
-  log "sequencer-lapse PASS: progress held, resync engaged, replica healthy"
+  log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }
 # Cluster-mode progress probe: the most-recently-committed block number as seen
 # by the executor (kardamom_executor_block_number gauge on :9004). The Java

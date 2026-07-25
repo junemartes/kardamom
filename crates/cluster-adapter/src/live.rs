@@ -103,6 +103,30 @@ pub struct LiveEgress {
     out_rx: Receiver<Vec<u8>>,
 }
 
+/// Result of a bounded-wait egress poll ([`LiveEgress::recv_timeout`]).
+#[derive(Debug)]
+pub enum EgressPoll {
+    /// A frame arrived.
+    Frame(Vec<u8>),
+    /// Nothing arrived within the timeout; the session thread is still alive.
+    Idle,
+    /// The session thread is gone (cluster guard dropped) — stop polling.
+    Closed,
+}
+
+impl LiveEgress {
+    /// Bounded-wait receive, for consumers that must keep OBSERVING while
+    /// egress is silent (the sequencer's lag-detection feed measures
+    /// inter-arrival gaps — a blocking `recv` cannot notice silence).
+    pub fn recv_timeout(&mut self, timeout: std::time::Duration) -> EgressPoll {
+        match self.out_rx.recv_timeout(timeout) {
+            Ok(frame) => EgressPoll::Frame(frame),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => EgressPoll::Idle,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => EgressPoll::Closed,
+        }
+    }
+}
+
 impl ClusterEgress for LiveEgress {
     fn recv(&mut self) -> Option<Vec<u8>> {
         self.out_rx.recv().ok()
