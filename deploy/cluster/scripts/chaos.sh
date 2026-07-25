@@ -320,20 +320,24 @@ run_sequencer_lapse() {
   log "sequencer-lapse: lag suspected (${l0} -> ${l1})"
 
   # RESPONSE: the controller consumes the sticky flag on the publish loop's
-  # next turn and enters resync. The loop can legitimately be BLOCKED in a
-  # session offer while its closed session reconnects (the sealer closes a
-  # frozen consumer's session within ~1s of the pause), so this window is
-  # WIDE — the flag is sticky and cannot be missed, only late.
-  local r1
+  # next turn and is then IN resync mode — either freshly entered
+  # (entered_total increments) or still there from an unexited earlier
+  # trigger (mode gauge == 1; entered can't increment when already active).
+  # The loop can legitimately be BLOCKED in a session offer while its closed
+  # session reconnects (the sealer closes a frozen consumer's session within
+  # ~1s of the pause), so this window is WIDE — the flag is sticky and
+  # cannot be missed, only late.
+  local r1 mode
   t=0
   while :; do
     r1="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r1="${r1:-0}"
-    [ "${r1}" -gt "${r0}" ] && break
+    mode="$(seqa_metric kardamom_sequencer_resync_mode)"; mode="${mode:-0}"
+    { [ "${r1}" -gt "${r0}" ] || [ "${mode}" -ge 1 ]; } && break
     [ "${t}" -ge 180 ] \
-      && fail "sequencer-lapse: resync never engaged within 180s of resume (entered ${r0} -> ${r1}; lag was suspected ${l0} -> ${l1})"
+      && fail "sequencer-lapse: resync never engaged within 180s of resume (entered ${r0} -> ${r1}, mode ${mode}; lag was suspected ${l0} -> ${l1})"
     sleep 5; t=$(( t + 5 ))
   done
-  log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1})"
+  log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1}, mode ${mode})"
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
   log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }

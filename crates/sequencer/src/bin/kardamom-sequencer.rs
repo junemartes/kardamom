@@ -265,7 +265,18 @@ async fn main() -> anyhow::Result<()> {
                 use kardamom_cluster_adapter::live::EgressPoll;
                 use kardamom_cluster_adapter::wire::{self, EgressItem, decode_egress};
                 use kardamom_sequencer::metrics as seq_metrics;
-                let mut last_boundary_at: Option<std::time::Instant> = None;
+                // Anchored at FEED START, not None: the cluster emits a
+                // boundary every tick, so "never seen a boundary" past the
+                // silence window IS the lag state — a restarted replica
+                // whose session never (re)establishes must flag, not stay
+                // silent forever (observed: seq-a restarted by an earlier
+                // chaos kill sat egress-dead through the whole lapse case
+                // with lag_suspected pinned at 0 — CI run 30164871699).
+                // While the condition persists, the re-arm below repeats the
+                // flag once per silence window — a bounded, genuinely
+                // alarming heartbeat.
+                let mut last_boundary_at: Option<std::time::Instant> =
+                    Some(std::time::Instant::now());
                 let mut flag = |at: &mut Option<std::time::Instant>, now: std::time::Instant| {
                     if let Some(prev) = *at {
                         let gap = now.duration_since(prev).as_millis() as u64;
@@ -318,8 +329,18 @@ async fn main() -> anyhow::Result<()> {
         })
         .context("spawn egress-watermark thread")?;
 
+    // DEDICATED receipts runtime: receipt decode runs at full line rate, and
+    // the main `rt`'s polling thread must stay dedicated to the tx_data
+    // subscription (same isolation rationale as `cluster_rt` above; sharing
+    // was observed to collapse the sequencer's sustainable ingest rate).
+    let receipts_rt = match args.aeron_dir.as_ref() {
+        Some(dir) => {
+            AeronRuntime::spawn_with_dir(dir).context("spawn receipts AeronRuntime with dir")?
+        }
+        None => AeronRuntime::spawn_default().context("spawn receipts AeronRuntime")?,
+    };
     let receipts_sub = open_tx_receipts(
-        &rt,
+        &receipts_rt,
         &channels,
         args.executor_count
             .unwrap_or(channels.tx_receipts_executor_count),

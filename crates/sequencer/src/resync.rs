@@ -231,11 +231,13 @@ impl ResyncController {
     /// turns. The jump check stays here as a second, loop-local signal.
     pub fn observe(&mut self, now: Instant) {
         let w = self.watermark.load();
-        metrics::record_canonical_watermark(self.partition, w);
         if let Some(gap_ms) = self.watermark.take_lag() {
             self.enter(EnterReason::BoundarySilence { silent_ms: gap_ms });
         }
         if w != self.last_watermark {
+            // Gauge recorded on CHANGE only — observe runs every loop
+            // iteration and the metrics macro allocates its label each call.
+            metrics::record_canonical_watermark(self.partition, w);
             let jump = w.saturating_sub(self.last_watermark);
             if self.watermark_seen && jump >= self.cfg.enter_threshold() {
                 self.enter(EnterReason::WatermarkJump { gap: jump });

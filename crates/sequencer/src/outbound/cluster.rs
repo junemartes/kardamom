@@ -79,7 +79,11 @@ pub fn cluster_ref_publisher_with_egress(
     rt: kardamom_log::aeron_live::AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
-    let (cluster, ingress, egress) = live::connect(rt, cfg)?;
+    // Boundaries ONLY: line-rate record frames are dropped at the session
+    // thread instead of being allocated + channelled to a receiver that
+    // discards them (the session thread also services the publish offers).
+    let (cluster, ingress, egress) =
+        live::connect_with_egress_kind_filter(rt, cfg, wire::EGRESS_KIND_BOUNDARY)?;
     Ok((cluster, ClusterRefPublisher::new(ingress), egress))
 }
 
