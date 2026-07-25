@@ -305,6 +305,18 @@ fn run_session(
     // Publisher-only clients (no `replay`) legitimately receive ~no egress,
     // so the watchdog is gated on being a consumer.
     const EGRESS_SILENCE_RESET_MS: u64 = 10_000;
+    // Backoff cap for consecutive fruitless resets. A forced re-establishment
+    // leaks its predecessor session server-side for up to the cluster's 90s
+    // session timeout, so hammering reconnects at a fixed 10s cadence is a
+    // zombie-session factory: with several consumers it exhausts the module's
+    // concurrent-session slots and locks OUT even healthy publishers
+    // (observed live during a dead-boundary-clock incident: ~400 churned
+    // sessions, every connect rejected "concurrent session limit"). Doubling
+    // the window per fruitless reset (up to this cap) keeps the first retry
+    // fast while capping steady-state churn well below the reap rate; any
+    // real egress frame resets the backoff.
+    const EGRESS_SILENCE_RESET_MAX_MS: u64 = 60_000;
+    let mut egress_silence_reset_ms: u64 = EGRESS_SILENCE_RESET_MS;
     // Last time an egress frame arrived OR a session was (re)established —
     // the silence window must restart on connect, or a fresh session would be
     // reset before its first frame had a chance to arrive.
@@ -324,6 +336,9 @@ fn run_session(
             match frame_rx.try_recv() {
                 Ok(frame) => {
                     egress_alive_at_ms = now_ms();
+                    // Real egress: the path works again — reset the watchdog
+                    // backoff so a FUTURE outage gets the fast first retry.
+                    egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
                     for ev in driver.on_egress(&frame) {
                         match ev {
                             DriverEvent::AppMessage(payload) => {
@@ -379,9 +394,10 @@ fn run_session(
         if replay.is_some() && driver.is_connected() {
             let now = now_ms();
             let silent_ms = now.saturating_sub(egress_alive_at_ms);
-            if silent_ms >= EGRESS_SILENCE_RESET_MS {
+            if silent_ms >= egress_silence_reset_ms {
                 tracing::warn!(
                     silent_ms,
+                    next_window_ms = (egress_silence_reset_ms * 2).min(EGRESS_SILENCE_RESET_MAX_MS),
                     "cluster egress silent while connected — forcing session \
                      re-establishment (replay-on-connect will close the gap)"
                 );
@@ -389,6 +405,9 @@ fn run_session(
                     ingress.publish_best_effort(to_aligned(&close_frame));
                 }
                 egress_alive_at_ms = now;
+                // Fruitless-reset backoff (reset on the next real frame).
+                egress_silence_reset_ms =
+                    (egress_silence_reset_ms * 2).min(EGRESS_SILENCE_RESET_MAX_MS);
             }
         }
 
