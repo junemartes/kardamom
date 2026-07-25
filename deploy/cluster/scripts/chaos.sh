@@ -466,8 +466,14 @@ assert_executors_converged() { # <case>
   while :; do
     max=""; bad=""; blk=()
     for i in "${!EXECUTOR_NODES[@]}"; do
+      # `|| true` is load-bearing (same class as val_metric's): under
+      # `set -euo pipefail` a failed scrape — e.g. the just-returned node's
+      # exporter not up yet — otherwise kills the whole script silently, with
+      # no fail() message (pipefail makes the assignment itself fail). The
+      # probes above only survive because they run in `$(… || true)` subshells.
       v="$(exec_metrics "${i}" \
-        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+        || true)"
       if [ -n "${v}" ]; then
         blk[i]="${v}"
         if [ -z "${max}" ] || [ "${v}" -gt "${max}" ]; then max="${v}"; fi
