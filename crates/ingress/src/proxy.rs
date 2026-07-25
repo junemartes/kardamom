@@ -360,10 +360,9 @@ where
 
         // Park *before* publishing — the receipt can arrive on the cache
         // channel before we'd otherwise have registered, especially under load.
+        // The queue-depth gauge is maintained by the registry itself (every
+        // insert/remove path, including a cancelled handler's Drop).
         let wait = self.pending.register(sender, nonce);
-
-        // Update queue depth after parking.
-        metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(self.pending.len() as f64);
 
         // Publish onto tx_data[shard]. The shard is selected by sender-
         // address hash (`partition_for(sender, K)`) so every tx from a given
@@ -392,9 +391,6 @@ where
         let result = wait
             .await_with_timeout(self.cfg.pending_receipt_timeout)
             .await;
-
-        // Update queue depth after the wait completes (slot removed on receipt or timeout).
-        metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(self.pending.len() as f64);
 
         // Count accepted/rejected on the terminal outcome (not at publish
         // time) so a single submission never increments both.

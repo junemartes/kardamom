@@ -12,8 +12,23 @@
 //! shared quorum watermark. `OnOffer` skips the watermark wait entirely.
 //! `OnLocalFsync` waits on this node's per-recorder fsync stream.
 //! `OnLocalFsyncAndQuorum` requires both to have advanced past the position.
+//!
+//! ## Ownership topology (leak-proof by construction)
+//!
+//! The WAITER owns each entry: [`PendingWait`] holds the only long-lived
+//! strong `Arc`; the map indexes entries through `Weak`. The watcher paths
+//! (`on_receipt` / `on_tx_error` / `release_satisfied`) are PURE READERS —
+//! they `upgrade()` and treat a dead `Weak` as "no client parked"; they
+//! never remove anything. The wait's `Drop` is the SINGLE removal site: it
+//! reaps the slot (identity-guarded) before the entry Arc dies, so however
+//! the wait ends — receipt, rejection, timeout, or the RPC handler future
+//! being dropped on client disconnect — slot and entry go together, and a
+//! dead `Weak` is never observable in the map. No removal call has to be
+//! remembered anywhere else (the #81 "pending-registry cleanup on cancelled
+//! RPC futures" follow-up leaked exactly because cleanup was a discipline
+//! spread across paths).
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use alloy_primitives::Address;
@@ -38,10 +53,34 @@ struct Entry {
     receipt: Option<Receipt>,
 }
 
-/// Map shard used by both `PendingReceipts` and the `PendingWait` it hands
-/// out. Aliased to keep clippy's type-complexity lint happy and to make the
-/// "shared between caller and consumer" property obvious.
-type PendingMap = Arc<DashMap<(Address, u64), Arc<Mutex<Entry>>>>;
+/// The registry's index. Values are `Weak`: the map can find an entry but
+/// never keeps one alive — the strong ref lives in the `PendingWait` the
+/// submitting handler holds (see the module docs' ownership topology).
+type PendingMap = Arc<DashMap<(Address, u64), Weak<Mutex<Entry>>>>;
+
+/// Look up the live entry for `key`. A dead `Weak` (unobservable in
+/// practice — see the module docs) is indistinguishable from an absent key:
+/// the parked client is gone either way.
+fn lookup(map: &PendingMap, key: &(Address, u64)) -> Option<Arc<Mutex<Entry>>> {
+    map.get(key).and_then(|r| r.value().upgrade())
+}
+
+/// The single removal path, called from `PendingWait::drop`: remove `key`'s
+/// slot ONLY if it still indexes `entry` (pointer identity), then refresh
+/// the depth gauge. The guard matters because a re-`register` of the same
+/// (sender, nonce) replaces the slot with a NEW entry, and the OLD wait's
+/// later Drop must never evict the new registration.
+fn remove_slot(map: &PendingMap, key: &(Address, u64), entry: &Arc<Mutex<Entry>>) {
+    map.remove_if(key, |_, w| std::ptr::eq(w.as_ptr(), Arc::as_ptr(entry)));
+    set_queue_depth(map);
+}
+
+/// The registry owns the queue-depth gauge: depth changes exactly when an
+/// entry is inserted or removed, including removals on paths no proxy code
+/// runs (a cancelled handler's `PendingWait::drop`).
+fn set_queue_depth(map: &PendingMap) {
+    metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(map.len() as f64);
+}
 
 /// Tracked watermarks. Whichever fields the policy doesn't need remain `None`
 /// forever and the gate skips them.
@@ -98,19 +137,26 @@ impl PendingReceipts {
     /// Two-phase register: returns a `PendingWait` the caller awaits with a
     /// timeout. Calling code must `register` *before* publishing the tx so
     /// the receipt cannot beat the registration.
+    ///
+    /// The returned `PendingWait` holds the entry's ONLY strong ref (the map
+    /// gets a `Weak`): however the wait ends — receipt, rejection, timeout,
+    /// or the CALLER'S FUTURE BEING DROPPED (client disconnect cancelling
+    /// the RPC handler) — the entry dies with it and its slot is reaped.
+    /// The cancelled-future path used to leak the entry forever (the #81
+    /// "pending-registry cleanup on cancelled RPC futures" follow-up).
     pub fn register(&self, sender: Address, nonce: u64) -> PendingWait {
         let (tx, rx) = oneshot::channel();
-        self.map.insert(
-            (sender, nonce),
-            Arc::new(Mutex::new(Entry {
-                responder: Some(tx),
-                receipt: None,
-            })),
-        );
+        let entry = Arc::new(Mutex::new(Entry {
+            responder: Some(tx),
+            receipt: None,
+        }));
+        self.map.insert((sender, nonce), Arc::downgrade(&entry));
+        set_queue_depth(&self.map);
         PendingWait {
             rx,
             key: (sender, nonce),
             map: self.map.clone(),
+            entry,
         }
     }
 
@@ -121,11 +167,8 @@ impl PendingReceipts {
     /// watermark update.
     pub async fn on_receipt(&self, sender: Address, nonce: u64, receipt: Receipt) {
         let key = (sender, nonce);
-        let entry = {
-            let Some(r) = self.map.get(&key) else {
-                return;
-            };
-            r.value().clone()
+        let Some(entry) = lookup(&self.map, &key) else {
+            return;
         };
         let mut e = entry.lock().await;
         e.receipt = Some(receipt.clone());
@@ -133,9 +176,8 @@ impl PendingReceipts {
         if self.gate_satisfied(&latest, receipt.tx_idx)
             && let Some(resp) = e.responder.take()
         {
+            // Release only; the woken waiter's Drop removes the slot.
             let _ = resp.send(Ok(ReceiptResponse { receipt }));
-            drop(e);
-            self.map.remove(&key);
         }
     }
 
@@ -150,18 +192,22 @@ impl PendingReceipts {
     /// for that key (the error is best-effort).
     pub async fn on_tx_error(&self, sender: Address, nonce: u64, reason: TxErrorReason) {
         let key = (sender, nonce);
-        let entry = {
-            let Some(r) = self.map.get(&key) else {
-                return;
-            };
-            r.value().clone()
+        let Some(entry) = lookup(&self.map, &key) else {
+            return;
         };
+        // The deferred release holds only a Weak across the grace sleep: a
+        // client that disconnects mid-grace lets its entry die immediately
+        // instead of being kept alive by a pending-error task.
+        let weak = Arc::downgrade(&entry);
+        drop(entry);
         let grace = self.error_grace;
-        let map = self.map.clone();
         let release = async move {
             if !grace.is_zero() {
                 tokio::time::sleep(grace).await;
             }
+            let Some(entry) = weak.upgrade() else {
+                return; // client gone; nothing to release
+            };
             let mut e = entry.lock().await;
             // Success overrides rejection: a stored receipt (released or still
             // watermark-gated) means the tx landed on the twin — drop the error.
@@ -172,9 +218,8 @@ impl PendingReceipts {
                 let err = match reason {
                     TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
                 };
+                // Release only; the woken waiter's Drop removes the slot.
                 let _ = resp.send(Err(err));
-                drop(e);
-                map.remove(&key);
             }
         };
         if grace.is_zero() {
@@ -200,17 +245,17 @@ impl PendingReceipts {
     }
 
     /// Walk every parked entry and release the ones whose stored receipt's
-    /// B-position is now covered by the configured durability gate.
+    /// B-position is now covered by the configured durability gate. A pure
+    /// reader like every watcher path: it releases through the oneshot and
+    /// leaves slot removal to the woken waiter's Drop.
     async fn release_satisfied(&self) {
         let latest = *self.latest.lock().await;
-        type Snap = Vec<((Address, u64), Arc<Mutex<Entry>>)>;
-        let snapshot: Snap = self
-            .map
-            .iter()
-            .map(|r| (*r.key(), r.value().clone()))
-            .collect();
-        let mut to_release: Vec<(Address, u64)> = Vec::new();
-        for (key, entry) in snapshot {
+        let snapshot: Vec<Weak<Mutex<Entry>>> =
+            self.map.iter().map(|r| r.value().clone()).collect();
+        for weak in snapshot {
+            let Some(entry) = weak.upgrade() else {
+                continue; // waiter gone since the snapshot
+            };
             let mut e = entry.lock().await;
             let release = e
                 .receipt
@@ -220,11 +265,7 @@ impl PendingReceipts {
             if release && let Some(resp) = e.responder.take() {
                 let receipt = e.receipt.clone().expect("checked is_some above");
                 let _ = resp.send(Ok(ReceiptResponse { receipt }));
-                to_release.push(key);
             }
-        }
-        for k in to_release {
-            self.map.remove(&k);
         }
     }
 
@@ -238,6 +279,9 @@ impl PendingReceipts {
         local_ok && quorum_ok
     }
 
+    /// Number of registered slots. Equals the number of live parks in
+    /// practice: every drop path reaps its own slot before the entry dies,
+    /// so dead `Weak`s never persist beyond a reader's opportunistic reap.
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -250,25 +294,55 @@ impl PendingReceipts {
 /// Handle returned by [`PendingReceipts::register`]. Await it (with a
 /// timeout) to receive the published receipt once both the receipt-cache
 /// stream and the watermark stream have caught up.
+///
+/// This handle holds the entry's ONLY long-lived strong `Arc` — the map
+/// indexes it through a `Weak`. Dropping the handle therefore kills the
+/// entry on every path, and no watcher can mistake it for a parked client
+/// afterwards (upgrade fails). This is what bounds the registry under client
+/// disconnects: jsonrpsee drops the RPC handler future when the connection
+/// dies, the future's `PendingWait` drops with it, and the entry dies right
+/// there instead of leaking until process restart (#81 follow-up). `Drop`
+/// also reaps the map slot (identity-guarded, so a replacement registration
+/// is untouched) and refreshes the queue-depth gauge.
 pub struct PendingWait {
     rx: oneshot::Receiver<Result<ReceiptResponse, IngressError>>,
     key: (Address, u64),
     map: PendingMap,
+    entry: Arc<Mutex<Entry>>,
 }
 
 impl PendingWait {
     pub async fn await_with_timeout(
-        self,
+        mut self,
         timeout: Duration,
     ) -> Result<ReceiptResponse, IngressError> {
-        match tokio::time::timeout(timeout, self.rx).await {
+        // `&mut self.rx` (oneshot::Receiver is Unpin) rather than consuming
+        // the field: `self` must stay whole so its Drop — the single cleanup
+        // path for timeout AND cancellation — runs when this future
+        // completes or is dropped mid-await.
+        match tokio::time::timeout(timeout, &mut self.rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => Err(IngressError::Internal("oneshot dropped".into())),
-            Err(_) => {
-                self.map.remove(&self.key);
-                Err(IngressError::Timeout)
-            }
+            Err(_) => Err(IngressError::Timeout),
         }
+    }
+}
+
+impl Drop for PendingWait {
+    fn drop(&mut self) {
+        // THE single removal site for map slots (watchers are pure readers
+        // that release through the oneshot only). Runs however the wait ends
+        // — receipt, rejection, timeout, or the RPC handler future being
+        // dropped on client disconnect — and, crucially, it is the only
+        // trigger that fires WITHOUT any further traffic on this key: in the
+        // deployed on-offer ack mode the map is never walked, and an
+        // abandoned nonce-gap key never sees another receipt or rejection.
+        // The slot is removed BEFORE `self.entry` (the only long-lived
+        // strong ref) drops right after this body, so a dead Weak is never
+        // observable in the map. Identity-guarded, so an old wait's Drop
+        // spares a newer registration under the same key. Sync + lock-free
+        // apart from the dashmap shard, so it is safe in an async Drop.
+        remove_slot(&self.map, &self.key, &self.entry);
     }
 }
 
@@ -604,6 +678,111 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, IngressError::Timeout));
+        assert_eq!(p.len(), 0);
+    }
+
+    // --- Cancelled-future cleanup (the #81 follow-up) ---------------------
+
+    #[tokio::test]
+    async fn dropping_an_unresolved_wait_removes_its_entry() {
+        // The core leak: a client disconnect drops the RPC handler future,
+        // which drops the PendingWait without any of the release paths
+        // running. The entry must leave the map right there.
+        let p = PendingReceipts::new(AckPolicy::OnOffer);
+        let wait = p.register(Address::repeat_byte(0xB1), 4);
+        assert_eq!(p.len(), 1);
+        drop(wait);
+        assert_eq!(p.len(), 0, "dropped wait must unregister its entry");
+    }
+
+    #[tokio::test]
+    async fn aborting_a_parked_await_cleans_up() {
+        // Same, through the real shape: the wait is parked inside
+        // await_with_timeout when the owning task is aborted (the future is
+        // dropped mid-await, exactly what jsonrpsee does on disconnect).
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+        let wait = p.register(Address::repeat_byte(0xB2), 7);
+        let task =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(60)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(p.len(), 1, "parked");
+        task.abort();
+        let _ = task.await;
+        assert_eq!(p.len(), 0, "abort must unregister the parked entry");
+    }
+
+    #[tokio::test]
+    async fn stale_wait_drop_spares_a_replacement_registration() {
+        // (sender, nonce) re-registered while an old wait still exists: the
+        // old wait's Drop is identity-guarded and must NOT evict the new
+        // registration.
+        let p = PendingReceipts::new(AckPolicy::OnOffer);
+        let sender = Address::repeat_byte(0xB3);
+        let stale = p.register(sender, 1);
+        let fresh = p.register(sender, 1); // replaces the slot
+        assert_eq!(p.len(), 1);
+        drop(stale);
+        assert_eq!(p.len(), 1, "stale drop must spare the replacement");
+        drop(fresh);
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dead_slot_reads_as_absent() {
+        // Structurally unreachable through the public API (Drop removes the
+        // slot BEFORE its entry dies) — simulated directly to pin the reader
+        // contract anyway: a dead Weak means "no client parked", never a
+        // panic or a release.
+        let p = PendingReceipts::new(AckPolicy::OnOffer);
+        let sender = Address::repeat_byte(0xB5);
+        p.map.insert((sender, 3), Weak::new());
+        p.on_receipt(sender, 3, dummy_receipt(pos(1))).await;
+        p.on_tx_error(sender, 3, TxErrorReason::DuplicatedTx { expected_nonce: 9 })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn grace_task_does_not_keep_a_disconnected_entry_alive() {
+        // The deferred rejection-release holds only a Weak across its grace
+        // sleep: a client that disconnects mid-grace must free its entry
+        // immediately, not after the grace fires.
+        let p = Arc::new(PendingReceipts::with_error_grace(
+            AckPolicy::OnOffer,
+            Duration::from_millis(100),
+        ));
+        let sender = Address::repeat_byte(0xB6);
+        let wait = p.register(sender, 6);
+        let weak = Arc::downgrade(&wait.entry);
+        p.on_tx_error(sender, 6, TxErrorReason::DuplicatedTx { expected_nonce: 9 })
+            .await;
+        drop(wait); // disconnect mid-grace
+        assert_eq!(
+            weak.strong_count(),
+            0,
+            "the pending grace task must not keep the entry alive"
+        );
+        assert_eq!(p.len(), 0);
+        // Let the grace fire against the dead weak: must be a clean no-op.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_registration_still_releases_on_receipt() {
+        // End-to-end on the replacement: after a stale wait is dropped, the
+        // fresh registration still parks and releases normally.
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+        let sender = Address::repeat_byte(0xB4);
+        let position = pos(12);
+        let stale = p.register(sender, 0);
+        let fresh = p.register(sender, 0);
+        drop(stale);
+        let waiter =
+            tokio::spawn(async move { fresh.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        p.on_receipt(sender, 0, dummy_receipt(position)).await;
+        let res = waiter.await.unwrap().expect("fresh wait must release");
+        assert_eq!(res.receipt.tx_idx, position);
         assert_eq!(p.len(), 0);
     }
 }

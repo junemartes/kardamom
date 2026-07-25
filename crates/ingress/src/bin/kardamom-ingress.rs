@@ -116,6 +116,22 @@ struct Args {
         default_value_t = 8192
     )]
     rpc_max_connections: u32,
+    /// L2 chain id returned by `eth_chainId`. Purely informational to clients
+    /// (the ingress recovers senders from the tx's own EIP-155 signature), but
+    /// tooling that queries `eth_chainId` before signing needs it to match the
+    /// executor's `--chain-id`.
+    #[arg(long, env = "KARDAMOM_CHAIN_ID", default_value_t = 1)]
+    chain_id: u64,
+    /// Max time (milliseconds) a submit parks waiting for its receipt (and ack
+    /// gate) before the client gets a `-32000` timeout. The park bounds every
+    /// `eth_sendRawTransaction` — a nonce-gap tx that never becomes executable
+    /// surfaces as exactly this timeout.
+    #[arg(
+        long = "pending-receipt-timeout-ms",
+        env = "KARDAMOM_PENDING_RECEIPT_TIMEOUT_MS",
+        default_value_t = 30_000
+    )]
+    pending_receipt_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug, clap::ValueEnum)]
@@ -163,6 +179,8 @@ async fn main() -> Result<()> {
         ingress_id: args.ingress_id,
         ack_policy: args.ack_policy.into(),
         rpc_max_connections: args.rpc_max_connections,
+        chain_id: args.chain_id,
+        pending_receipt_timeout: Duration::from_millis(args.pending_receipt_timeout_ms),
         ..IngressConfig::default()
     };
     // Wipe the binary-protocol binds for the v0 deployment; operators that

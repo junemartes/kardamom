@@ -1,0 +1,82 @@
+name: chain-semantics-e2e
+
+on:
+  # Target L of the chain-semantics suite
+  # (docs/agents/chain-semantics-e2e-suite-spec.md): the scenario drivers
+  # against the local stack — real service binaries + a 1-member Java Aeron
+  # Cluster sealer + per-test media drivers, observed through JSON-RPC and
+  # /metrics only. Runs on every PR; opt out with the `skip-chain-semantics`
+  # label for changes that cannot affect the pipeline (e.g. docs-only PRs).
+  # Target C (the same drivers on the ci-cluster.sh DinD cluster) lands as a
+  # cluster-e2e shard separately.
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Mirrors AERON_JAR_VERSION in the justfile (`just aeron-jar`).
+  AERON_JAR_VERSION: 1.45.0
+
+jobs:
+  chain-semantics:
+    if: >-
+      !contains(github.event.pull_request.labels.*.name, 'skip-chain-semantics')
+    name: chain-semantics-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # The rusteron-* crates compile the Aeron C client from source via a
+      # cmake build script.
+      - name: Install system build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential
+
+      - uses: dtolnay/rust-toolchain@stable
+      # Foundry supplies `forge`: the deployer crate's build script shells
+      # out to it to embed contract bytecode, and `-p e2e --tests` builds the
+      # deployer. Pinned concrete version (stable/latest hit the GitHub
+      # releases API and 403 under the runner's unauthenticated rate limit).
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.1
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: chain-semantics-e2e
+
+      - name: Build the sealer jar
+        working-directory: cluster/sealer-service
+        run: ./gradlew :service:shadowJar
+
+      - name: Cache the aeron-all jar
+        run: |
+          mkdir -p /tmp/kardamom-aeron-local
+          curl -fsSL "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
+            -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
+
+      - name: Build service binaries
+        run: |
+          cargo build --locked --bins \
+            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor
+
+      # Each test brings up its own stack (2 JVMs + 4 service processes);
+      # cap parallelism at 2 on the shared runner.
+      - name: Run the chain-semantics suite (Target L)
+        run: |
+          cargo test -p e2e --features full-pipeline-e2e \
+            --test chain_semantics --locked \
+            -- --ignored --nocapture --test-threads=2
