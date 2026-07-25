@@ -127,16 +127,29 @@ pub fn connect(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, None)
+    connect_inner(rt, cfg, None, false)
 }
 
-/// [`connect`], plus a replay request on every session establishment.
+/// [`connect`], plus an egress-subscribe announcement on every session
+/// establishment: for canonical-stream consumers that need no replay (e.g.
+/// the ingress watermark observer, which derives watermarks from live
+/// egress only). Without the announcement the service excludes the session
+/// from the per-record egress fan-out.
+pub fn connect_subscribed(
+    rt: AeronRuntime,
+    cfg: LiveClusterConfig,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    connect_inner(rt, cfg, None, true)
+}
+
+/// [`connect`], plus a replay request on every session establishment
+/// (implies the egress-subscribe announcement).
 pub fn connect_with_replay(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
     replay: ReplayOnConnect,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, Some(replay))
+    connect_inner(rt, cfg, Some(replay), true)
 }
 
 /// Append a small term-length to a cluster control channel unless the URI
@@ -181,6 +194,7 @@ fn connect_inner(
     rt: AeronRuntime,
     mut cfg: LiveClusterConfig,
     replay: Option<ReplayOnConnect>,
+    subscribe: bool,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
     validate_config(&cfg)?;
     cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
@@ -235,6 +249,7 @@ fn connect_inner(
                 cfg,
                 initial,
                 replay,
+                subscribe,
                 frame_rx,
                 req_rx,
                 out_tx,
@@ -260,6 +275,7 @@ fn run_session(
     cfg: LiveClusterConfig,
     initial: (i32, PubHandle),
     replay: Option<ReplayOnConnect>,
+    subscribe: bool,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
     out_tx: Sender<Vec<u8>>,
@@ -323,6 +339,14 @@ fn run_session(
     let mut egress_alive_at_ms: u64 = now_ms();
     let mut replay_last_sent_ms: u64 = 0;
     let mut replay_cursor_at_send: (u64, u64) = (u64::MAX, u64::MAX);
+    // Egress-subscribe announcement resend state: like the replay request,
+    // the announcement rides the ingress publication which is often not yet
+    // connected right after (re)connect — resend every SUBSCRIBE_RESEND_MS
+    // until the first app egress frame proves the service has us in the
+    // fan-out (a boundary arrives within one tick, ≤2s).
+    const SUBSCRIBE_RESEND_MS: u64 = 3_000;
+    let mut subscribe_last_sent_ms: u64 = 0;
+    let mut subscribe_confirmed = false;
     // Whether an egress consumer (a `LiveEgress`) is still attached. A
     // publisher-only client (the sequencer) drops its `LiveEgress`, after which
     // we stop routing application payloads (and never accumulate them) but keep
@@ -342,6 +366,7 @@ fn run_session(
                     for ev in driver.on_egress(&frame) {
                         match ev {
                             DriverEvent::AppMessage(payload) => {
+                                subscribe_confirmed = true;
                                 if egress_alive && out_tx.send(payload).is_err() {
                                     egress_alive = false; // consumer dropped
                                 }
@@ -367,6 +392,8 @@ fn run_session(
                                 // their delivery cursor on EVERY establishment;
                                 // force an immediate (re)send below.
                                 replay_last_sent_ms = 0;
+                                subscribe_last_sent_ms = 0;
+                                subscribe_confirmed = false;
                                 egress_alive_at_ms = now_ms();
                             }
                             DriverEvent::Failed(reason) => {
@@ -408,6 +435,29 @@ fn run_session(
                 // Fruitless-reset backoff (reset on the next real frame).
                 egress_silence_reset_ms =
                     (egress_silence_reset_ms * 2).min(EGRESS_SILENCE_RESET_MAX_MS);
+            }
+        }
+
+        // 1a'. Egress-subscribe announcement (canonical-stream consumers):
+        // send on session establishment and RE-SEND until the first app
+        // egress frame arrives (see SUBSCRIBE_RESEND_MS above).
+        if subscribe && driver.is_connected() && !subscribe_confirmed {
+            let now = now_ms();
+            if subscribe_last_sent_ms == 0
+                || now.saturating_sub(subscribe_last_sent_ms) >= SUBSCRIBE_RESEND_MS
+            {
+                let req = crate::wire::encode_subscribe();
+                if let Some(framed) = driver.wrap_app(&req, now as i64) {
+                    if let Err(e) = ingress.publish_bytes(to_aligned(&framed)) {
+                        tracing::warn!(
+                            error = %e,
+                            "cluster egress-subscribe publish failed (will resend)"
+                        );
+                    } else {
+                        tracing::info!("cluster egress-subscribe announced");
+                    }
+                    subscribe_last_sent_ms = now;
+                }
             }
         }
 

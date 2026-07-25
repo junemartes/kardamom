@@ -15,6 +15,7 @@ import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
 import java.util.Optional;
 import org.agrona.DirectBuffer;
+import org.agrona.collections.LongHashSet;
 import org.agrona.ExpandableArrayBuffer;
 import org.agrona.MutableDirectBuffer;
 import org.agrona.concurrent.IdleStrategy;
@@ -63,6 +64,14 @@ public final class SealerClusteredService implements ClusteredService {
     public static final byte KIND_INGRESS_RECORD = 0;
     /** Replay request: {@code [kind:1][from_index:u64 LE][from_block:u64 LE]}. */
     public static final byte KIND_REPLAY_REQUEST = 1;
+    /**
+     * Egress-subscribe announcement: {@code [kind:2]} — the sending session is
+     * a canonical-stream consumer and wants the per-record/per-boundary egress
+     * broadcast. Publisher-only sessions (sequencers) never send it, so the
+     * leader stops paying one unicast offer per record for sessions that drop
+     * the payload client-side anyway.
+     */
+    public static final byte KIND_SUBSCRIBE = 2;
 
     /** Minimum valid replay-request length: kind + from_index + from_block. */
     private static final int MIN_REPLAY_REQUEST_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
@@ -103,6 +112,19 @@ public final class SealerClusteredService implements ClusteredService {
 
     private Cluster cluster;
     private CanonicalSealerState state;
+
+    /**
+     * Session ids that announced themselves as canonical-stream consumers
+     * (a {@link #KIND_SUBSCRIBE} frame, or any replay request). DETERMINISM:
+     * mutated only from logged session messages and {@code onSessionClose}
+     * (both log-driven), so every member holds the identical set and a new
+     * leader fans out to the same sessions. Deliberately NOT snapshotted: a
+     * restart-from-snapshot severs every client connection, each client
+     * re-announces on its next session establishment, and until the first
+     * announcement arrives {@link #offerToConsumers} falls back to
+     * broadcast-to-all so nothing can starve.
+     */
+    private final LongHashSet consumerSessions = new LongHashSet();
 
     /** One retained, already-framed egress frame (record or boundary). */
     private static final class RetainedFrame {
@@ -235,8 +257,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionClose(ClientSession session, long timestamp, CloseReason closeReason) {
-        // No-op: replay requests are served synchronously (no per-session
-        // replay state to clean up).
+        consumerSessions.remove(session.id());
     }
 
     @Override
@@ -247,6 +268,10 @@ public final class SealerClusteredService implements ClusteredService {
             final int offset,
             final int length,
             final Header header) {
+        if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_SUBSCRIBE) {
+            consumerSessions.add(session.id());
+            return;
+        }
         if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_REPLAY_REQUEST) {
             if (length < MIN_REPLAY_REQUEST_LEN) {
                 onMalformedFrame("replay-request", length);
@@ -256,6 +281,9 @@ public final class SealerClusteredService implements ClusteredService {
                 buffer.getLong(offset + 1, ByteOrder.LITTLE_ENDIAN);
             final long fromBlock =
                 buffer.getLong(offset + 1 + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
+            // A replay request is a consumer announcing itself as surely as a
+            // SUBSCRIBE frame does.
+            consumerSessions.add(session.id());
             handleReplayRequest(session, fromIndex, fromBlock);
             // A replay request is exactly what a consumer sends when it sees
             // no egress — if that's because THIS member's boundary clock died
@@ -498,14 +526,35 @@ public final class SealerClusteredService implements ClusteredService {
     private void offerRelayed(final Relayed relayed) {
         final int len = frameRelayed(relayed);
         retain(len, false, relayed.index);
-        // Broadcast the relayed canonical record to EVERY client session, not just
-        // the sender. The executor replicas consume the canonical tx_ordering stream
-        // from egress on their OWN sessions (they never publish ingress), so offering
-        // only to the sending session (the sequencer) starved them: they received the
-        // broadcast boundaries but no records, tripping the executor's
-        // BoundaryMisaligned check (want_count>have_count). Mirrors offerBoundary.
+        offerToConsumers(len);
+    }
+
+    /**
+     * Offer the frame staged in {@link #egressBuffer} to every session that
+     * announced itself as a canonical-stream consumer — the executors,
+     * validator, and ingress observers, but NOT the publisher-only sequencer
+     * sessions that used to receive (and client-side drop) every record: on a
+     * saturated leader the per-session unicast offer is the dominant cost, so
+     * halving the session list directly buys ceiling. Falls back to
+     * broadcast-to-all while no consumer has announced itself (pre-subscribe
+     * window right after a restart, or a mixed-version deploy whose clients
+     * never send SUBSCRIBE) so nothing can starve; the executor replicas
+     * consume the canonical stream on their OWN sessions, which is why the
+     * fan-out must reach beyond the sending session at all (the original
+     * starvation bug: boundaries arrived, records didn't, tripping
+     * BoundaryMisaligned want_count&gt;have_count).
+     */
+    private void offerToConsumers(final int len) {
+        if (consumerSessions.isEmpty()) {
+            for (final ClientSession session : cluster.clientSessions()) {
+                offerToSession(session, len);
+            }
+            return;
+        }
         for (final ClientSession session : cluster.clientSessions()) {
-            offerToSession(session, len);
+            if (consumerSessions.contains(session.id())) {
+                offerToSession(session, len);
+            }
         }
     }
 
@@ -533,10 +582,8 @@ public final class SealerClusteredService implements ClusteredService {
     private void offerBoundary(final Boundary boundary) {
         final int len = frameBoundary(boundary);
         retain(len, true, boundary.blockNumber);
-        // Boundaries are broadcast to every open client session.
-        for (final ClientSession session : cluster.clientSessions()) {
-            offerToSession(session, len);
-        }
+        // Boundaries reach the same consumer set as relayed records.
+        offerToConsumers(len);
     }
 
     /**
