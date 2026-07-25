@@ -886,10 +886,16 @@ run_case() { # <case-name>
       # (Run via a one-off container on the node — the daemon is down.)
       verify_pre="$(docker exec kardamom-ingress-0 bash -lc \
         "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
          -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
          verify -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+      if echo "${verify_pre}" | grep -q 'Exception'; then
+        echo "${verify_pre}" | tail -20
+        fail "archive-corruption: verify tool crashed (not a detection)"
+      fi
       echo "${verify_pre}" | grep -qiE 'ERR|invalid|checksum|fail' \
-        || fail "archive-corruption: CRC-armed verify did NOT flag the corrupted segment (detection hole)"
+        || { echo "${verify_pre}" | tail -20; \
+             fail "archive-corruption: CRC-armed verify did NOT flag the corrupted segment (detection hole)"; }
       log "archive-corruption: corruption detected by CRC-armed verify"
       # HEAL through the Rust tool on the runner: stage both copies, --diff
       # must name the corrupted segment, --heal repairs exactly it.
@@ -920,13 +926,19 @@ run_case() { # <case-name>
       for rid in $(echo "${verify_pre}" | grep -oE 'recordingId=[0-9]+' | cut -d= -f2 | sort -u); do
         docker exec kardamom-ingress-0 bash -lc \
           "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
            -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
            mark-valid ${rid}" >/dev/null 2>&1 || true
       done
       verify_post="$(docker exec kardamom-ingress-0 bash -lc \
         "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
          -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
          verify -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+      if echo "${verify_post}" | grep -q 'Exception'; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify tool crashed"
+      fi
       if ! echo "${verify_post}" | grep -qE 'recordingId=.*OK'; then
         echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify shows no OK recordings"
