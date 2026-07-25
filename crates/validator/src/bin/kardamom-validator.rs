@@ -438,27 +438,43 @@ async fn main() -> Result<()> {
     };
     drop(rt);
     drop(cluster_guard);
-    let mut diverged = divergence.is_halted();
     let joined = match engine_result {
         Some(r) => r,
         None => join.await,
     };
+    let mut engine_error = false;
     match joined {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "validator main loop returned an error");
-            diverged = true;
+            engine_error = true;
         }
-        Err(e) => tracing::error!(error = %e, "validator task panicked"),
+        Err(e) => {
+            tracing::error!(error = %e, "validator task panicked");
+            engine_error = true;
+        }
     }
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
     }
-    if diverged {
+    // Exit 2 is RESERVED for a proven divergence (the latch records before the
+    // engine surfaces `Divergence`) — the page-the-humans signal. Any other
+    // engine failure (a stream error, a replay-window overrun needing resync)
+    // is an availability problem, not an integrity one, and must not
+    // impersonate it: exit 1 and let the orchestrator restart.
+    if divergence.is_halted() {
         if let Some(reason) = divergence.reason() {
             tracing::error!(reason = %reason, "validator halted on divergence");
         }
         std::process::exit(2);
+    }
+    if engine_error {
+        tracing::error!(
+            "validator halted on an engine error (NOT a proven divergence); if the \
+             cluster refused replay (resync required), rebuild state via \
+             kardamom-reconstruct or restore a checkpoint"
+        );
+        std::process::exit(1);
     }
     Ok(())
 }

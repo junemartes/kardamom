@@ -197,10 +197,14 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             EgressItem::ReplayDone { .. } => {
                 self.catching_up = false;
             }
-            EgressItem::ReplayUnavailable { oldest_index, .. } => {
+            EgressItem::ReplayUnavailable {
+                oldest_index,
+                oldest_block,
+            } => {
                 return Err(ExecutorError::ClusterReplayUnavailable {
                     from_index: ni,
                     oldest_index,
+                    oldest_block,
                 });
             }
         }
@@ -365,6 +369,7 @@ mod tests {
             sub.next(),
             Err(ExecutorError::ClusterReplayUnavailable {
                 oldest_index: 100,
+                oldest_block: 7,
                 ..
             })
         ));

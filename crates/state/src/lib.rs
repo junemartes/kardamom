@@ -4,6 +4,7 @@
 //! the protocol and crate-level invariants.
 
 pub mod checkpoint;
+pub mod checkpoint_transfer;
 pub mod compaction;
 pub mod env;
 pub mod error;
@@ -18,9 +19,10 @@ pub mod trie;
 pub mod writer;
 
 pub use checkpoint::{
-    CheckpointInfo, create_checkpoint, has_state_db, latest_checkpoint, prune_checkpoints,
-    restore_checkpoint,
+    CheckpointInfo, create_checkpoint, has_state_db, latest_checkpoint, park_state_db,
+    prune_checkpoints, restore_checkpoint,
 };
+pub use checkpoint_transfer::{fetch_best_checkpoint, fetch_latest_checkpoint, serve_checkpoints};
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;

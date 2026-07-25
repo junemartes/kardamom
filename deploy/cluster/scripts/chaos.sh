@@ -763,6 +763,52 @@ run_case() { # <case-name>
       log "state-checkpoint-restore: executor-0 restored from peer checkpoint + rejoined (no genesis re-sync)"
       ;;
 
+    replay-window-resync)
+      # FULL-RESYNC drill: WIPE executor-1's state DB and checkpoints, then let
+      # the node repair ITSELF — no harness-side checkpoint copy. A wiped node
+      # cannot re-sync from genesis (the cluster retains a bounded canonical
+      # window; a REPLAY_FROM below its floor is refused with
+      # REPLAY_UNAVAILABLE), so on restart the executor must fetch a checkpoint
+      # from a peer replica over the checkpoint-serve port (9014) BEFORE its
+      # first join, restore it, and resume from there. Expected, in order:
+      #   1. the fleet degrades 3->2 and keeps progressing;
+      #   2. executor-1 restarts, FETCHES a peer checkpoint (asserted via the
+      #      "fetched checkpoint from peer" log line — the line only this new
+      #      self-heal path emits) and restores it ("restored state from
+      #      checkpoint");
+      #   3. executor count returns to 3 and the fleet converges.
+      # (Victim is executor-1, not executor-0, so this case and
+      # state-checkpoint-restore stay independent when they run back-to-back.)
+      local ex1_inner
+      log "replay-window-resync: waiting for a checkpoint on peer executor-0"
+      for _ in $(seq 1 15); do
+        docker exec kardamom-executor-0 bash -lc \
+          'ls /opt/kardamom/checkpoints/checkpoint-* >/dev/null 2>&1' && break
+        sleep 5
+      done
+      docker exec kardamom-executor-0 bash -lc \
+        'ls /opt/kardamom/checkpoints/checkpoint-* >/dev/null 2>&1' \
+        || fail "replay-window-resync: peer executor-0 produced no checkpoint"
+      log "replay-window-resync: killing executor-1 + wiping its state DB and checkpoints"
+      inject_hard kardamom-executor-1 executor
+      docker exec kardamom-executor-1 bash -lc 'rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*' \
+        || fail "replay-window-resync: could not wipe executor-1 state"
+      # The surviving replicas must keep the pipeline progressing on 2.
+      assert_executor_progress 180
+      # executor-1 restarts, self-heals from a peer checkpoint, rejoins to 3.
+      assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
+      ex1_inner="$(docker exec kardamom-executor-1 bash -lc \
+        'docker ps --format "{{.Names}}" | grep -i executor | head -1')"
+      [ -n "${ex1_inner}" ] || fail "replay-window-resync: no executor container on executor-1 after restart"
+      docker exec kardamom-executor-1 bash -lc \
+        "docker logs ${ex1_inner} 2>&1 | grep -q 'fetched checkpoint from peer'" \
+        || fail "replay-window-resync: executor-1 did NOT fetch a peer checkpoint (self-heal path not taken)"
+      docker exec kardamom-executor-1 bash -lc \
+        "docker logs ${ex1_inner} 2>&1 | grep -q 'restored state from checkpoint'" \
+        || fail "replay-window-resync: executor-1 fetched but did NOT restore the peer checkpoint"
+      log "replay-window-resync: executor-1 self-healed from a peer checkpoint (fetch + restore + rejoin)"
+      ;;
+
     archive-driver-loss)
       # HARD-kill the Aeron SUBSTRATE (the `aeron` system job's combined
       # ArchivingMediaDriver task) on the ingress-0 node — not the ingress task
