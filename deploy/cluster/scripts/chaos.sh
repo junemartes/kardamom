@@ -347,20 +347,18 @@ run_sequencer_lapse() {
     fi
     if [ "${t}" -ge 240 ]; then
       seqa_debug
-      # OBSERVATIONAL (issue #99): a hard-killed-and-restarted replica's
-      # cluster session dies every ~90s (keep-alives never arrive) — a
-      # PRE-EXISTING bug this mechanism is the first thing to observe.
-      # Until #99 is fixed, a restarted replica reaching this case has no
-      # working egress and detection cannot fire; failing the shard on it
-      # blocks CI on the wrong bug. The safety asserts (progress, load
-      # verdict, per-replica convergence) remain ENFORCING. Re-arm to
-      # fail() when #99 closes.
-      log "sequencer-lapse: OBSERVATIONAL MISS (issue #99): lag not suspected within 240s (lag_suspected ${l0} -> ${l1:-scrape-failed}, ${good} good scrapes)"
-      break
+      # RE-ARMED: #99 (predecessor session corpse cycling the restarted
+      # replica's session, starving its egress) is fixed by the
+      # foreign-session event filter — a lapsed replica's feed thread has a
+      # working egress again and MUST detect the pause.
+      if [ "${good}" -eq 0 ]; then
+        fail "sequencer-lapse: metrics endpoint unreachable for 240s after resume (0 successful scrapes) — replica presumed dead, cannot judge detection"
+      fi
+      fail "sequencer-lapse: lag never suspected within 240s of resume (lag_suspected ${l0} -> ${l1:-?}, ${good} good scrapes)"
     fi
     sleep 10; t=$(( t + 10 ))
   done
-  [ "${l1:-0}" -gt "${l0}" ] && log "sequencer-lapse: lag suspected (${l0} -> ${l1})"
+  log "sequencer-lapse: lag suspected (${l0} -> ${l1})"
 
   # RESPONSE: the controller consumes the sticky flag on the publish loop's
   # next turn and is then IN resync mode — either freshly entered
@@ -381,15 +379,14 @@ run_sequencer_lapse() {
         break
       fi
     fi
-    if [ "${t}" -ge 120 ]; then
-      # OBSERVATIONAL until issue #99 closes (see the detection loop above).
-      log "sequencer-lapse: OBSERVATIONAL MISS (issue #99): resync not engaged within 120s (entered ${r0} -> ${r1:-scrape-failed}, mode ${mode:-scrape-failed})"
-      break
+    if [ "${t}" -ge 240 ]; then
+      seqa_debug
+      fail "sequencer-lapse: resync never engaged within 240s of resume (entered ${r0} -> ${r1:-scrape-failed}, mode ${mode:-scrape-failed}; lag was suspected ${l0} -> ${l1})"
     fi
     sleep 10; t=$(( t + 10 ))
   done
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
-  log "sequencer-lapse PASS (safety asserts): progress held, replica exporting; detection asserts observational pending #99"
+  log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }
 # Cluster-mode progress probe: the most-recently-committed block number as seen
 # by the executor (kardamom_executor_block_number gauge on :9004). The Java
