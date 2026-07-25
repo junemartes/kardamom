@@ -139,6 +139,23 @@ pub fn encode_header_value(v: &HeaderValue) -> [u8; 20] {
     out
 }
 
+pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
+    if bytes.len() != 20 {
+        return Err(StateError::BadEncoding {
+            table: TABLE_HEADERS,
+            expected: 20,
+            got: bytes.len(),
+        });
+    }
+    Ok(HeaderValue {
+        end_tx_idx: BPosition {
+            term_id: i32::from_be_bytes(bytes[..4].try_into().expect("4 bytes")),
+            term_offset: i32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes")),
+        },
+        l2_timestamp: u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes")),
+    })
+}
+
 // ---------- receipts ----------
 //
 // Key: BPosition (8 bytes — i32 BE term_id ++ i32 BE term_offset). The codec

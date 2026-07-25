@@ -12,19 +12,18 @@
 
 use std::path::Path;
 use std::sync::mpsc as sync_mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use kardamom_log::aeron_live::{AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle};
 use kardamom_log::config::{AeronConfig, ChannelsConfig};
-use kardamom_log::replay;
+use kardamom_log::refetch::{ArchiveRefetcher, RefetchConfig};
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxDataLoc, TxEnvelope};
 
 use crate::error::ExecutorError;
-use crate::reader::{DepositSubscription, TxDataSubscription};
+use crate::reader::{DepositSubscription, JoinRecovery, JoinRecoveryFactory, TxDataSubscription};
 
 /// CLI mirror of [`kardamom_state::Durability`] (clap renders the variants as
 /// `durable` / `safe-no-sync`).
@@ -149,57 +148,6 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 }
 
 // ---------------------------------------------------------------------------
-// Replay-merge failure surfacing (F13.4): a failed crash recovery must exit
-// non-zero, not look like a clean end-of-stream.
-// ---------------------------------------------------------------------------
-
-/// Shared slot recording the first fatal replay-merge failure observed by any
-/// of the bridge pump tasks. The replay subscriber reports a fatal poll-thread
-/// error (archive error, coverage gap, decode failure, stuck merge) as a
-/// closed channel plus [`kardamom_log::replay::ReplayMergeSubscriber::take_failure`];
-/// without this slot the closed channel is indistinguishable from a clean
-/// shutdown and the process exits 0 on a FAILED crash recovery. The binary's
-/// main loop selects on [`failed`](Self::failed) and exits non-zero.
-///
-/// Designed for a single waiter (the binary main); any number of recorders.
-#[derive(Clone, Default)]
-pub struct ReplayFailure {
-    slot: Arc<Mutex<Option<String>>>,
-    notify: Arc<tokio::sync::Notify>,
-}
-
-impl ReplayFailure {
-    /// Record a fatal replay failure (first one wins) and wake the waiter.
-    pub fn record(&self, stream: &str, error: impl std::fmt::Display) {
-        let msg = format!("{stream}: {error}");
-        tracing::error!(error = %msg, "replay-merge recovery failed");
-        let mut slot = self.slot.lock().expect("replay failure lock");
-        if slot.is_none() {
-            *slot = Some(msg);
-        }
-        drop(slot);
-        // `notify_one` stores a permit if the waiter has not parked yet, so a
-        // failure recorded before `failed()` is polled is never lost.
-        self.notify.notify_one();
-    }
-
-    /// The recorded failure, if any.
-    pub fn get(&self) -> Option<String> {
-        self.slot.lock().expect("replay failure lock").clone()
-    }
-
-    /// Wait until a failure is recorded, then return it.
-    pub async fn failed(&self) -> String {
-        loop {
-            if let Some(msg) = self.get() {
-                return msg;
-            }
-            self.notify.notified().await;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Async log handles → sync engine traits, with the per-shard pump tasks.
 // ---------------------------------------------------------------------------
 
@@ -235,49 +183,31 @@ impl DepositSubscription for LiveTxDepositsSub {
 /// (dedicated tokio pump task per shard; must be called inside a tokio
 /// runtime).
 ///
-/// Live multicast when `replay_dst` is `None`; archive replay-merge (replay
-/// from the recording's origin, then follow live) when `Some` — both paths
-/// yield `(TxDataLoc, TxEnvelope)` with the ORIGINAL publisher session (replay
-/// is frame-faithful), so the reader's session-keyed join works either way.
-/// A replay pump that ends abnormally records on `failure` so the binary
-/// exits non-zero instead of treating a failed recovery as a clean stop.
+/// ALWAYS live multicast — including on a crash-recovery resume. The old
+/// resume path opened an archive replay-merge against the LOCAL node's
+/// archive instead, but no consumer node records tx_data (the durability
+/// recordings live on the ingress nodes), so that merge waited forever for a
+/// recording that never materialises and a resuming process had NO tx_data
+/// source at all. Envelopes the live subscription missed (down-window, image
+/// lapse, blackout) are recovered in-band by the reader's join-miss refetch
+/// against the REMOTE durability archives — see [`archive_join_recovery`].
 pub fn open_tx_data_subs(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
-    aeron_cfg: &AeronConfig,
     shards: u8,
-    replay_dst: Option<&str>,
-    failure: &ReplayFailure,
 ) -> Result<Vec<Box<dyn TxDataSubscription>>> {
     let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(shards as usize);
     for shard_id in 0..shards {
         let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
-        if let Some(replay_dst) = replay_dst {
-            let mut replay =
-                replay::open_tx_data_replay(channels, aeron_cfg, shard_id, replay_dst.to_string())
-                    .with_context(|| format!("open tx_data replay-merge shard={shard_id}"))?;
-            let failure = failure.clone();
-            tokio::spawn(async move {
-                while let Some(item) = replay.recv().await {
-                    if tx.send(item).is_err() {
-                        return; // consumer gone (shutdown)
-                    }
+        let mut handle = TxDataSubscriberHandle::open(rt, channels, shard_id)
+            .with_context(|| format!("open TxDataSubscriberHandle shard={shard_id}"))?;
+        tokio::spawn(async move {
+            while let Some(item) = handle.recv().await {
+                if tx.send(item).is_err() {
+                    break;
                 }
-                if let Some(e) = replay.take_failure() {
-                    failure.record(&format!("tx_data[{shard_id}] replay-merge"), e);
-                }
-            });
-        } else {
-            let mut handle = TxDataSubscriberHandle::open(rt, channels, shard_id)
-                .with_context(|| format!("open TxDataSubscriberHandle shard={shard_id}"))?;
-            tokio::spawn(async move {
-                while let Some(item) = handle.recv().await {
-                    if tx.send(item).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
+            }
+        });
         a_subs.push(Box::new(LiveTxDataSub {
             sequencer_id: shard_id,
             rx,
@@ -286,43 +216,110 @@ pub fn open_tx_data_subs(
     Ok(a_subs)
 }
 
-/// Open the tx_deposits subscription (async→sync bridged), live or archive
-/// replay-merge — the deposit-path mirror of [`open_tx_data_subs`].
+/// Open the tx_deposits subscription (async→sync bridged) — the deposit-path
+/// mirror of [`open_tx_data_subs`], always live for the same reason.
 pub fn open_tx_deposits_sub(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
-    aeron_cfg: &AeronConfig,
-    replay_dst: Option<&str>,
-    failure: &ReplayFailure,
 ) -> Result<Box<dyn DepositSubscription>> {
     let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
-    if let Some(replay_dst) = replay_dst {
-        let mut replay =
-            replay::open_tx_deposits_replay(channels, aeron_cfg, replay_dst.to_string())
-                .context("open tx_deposits archive replay-merge subscriber")?;
-        let failure = failure.clone();
-        tokio::spawn(async move {
-            while let Some(item) = replay.recv().await {
-                if d_tx.send(item).is_err() {
-                    return;
-                }
+    let mut handle = TxDepositsSubscriberHandle::open(rt, channels)
+        .context("open TxDepositsSubscriberHandle")?;
+    tokio::spawn(async move {
+        while let Some(item) = handle.recv().await {
+            if d_tx.send(item).is_err() {
+                break;
             }
-            if let Some(e) = replay.take_failure() {
-                failure.record("tx_deposits replay-merge", e);
-            }
-        });
-    } else {
-        let mut handle = TxDepositsSubscriberHandle::open(rt, channels)
-            .context("open TxDepositsSubscriberHandle")?;
-        tokio::spawn(async move {
-            while let Some(item) = handle.recv().await {
-                if d_tx.send(item).is_err() {
-                    break;
-                }
-            }
-        });
-    }
+        }
+    });
     Ok(Box::new(LiveTxDepositsSub { rx: d_rx }))
+}
+
+// ---------------------------------------------------------------------------
+// Join-miss archive refetch wiring.
+// ---------------------------------------------------------------------------
+
+/// [`JoinRecovery`] over the remote durability archives, via
+/// [`kardamom_log::refetch::ArchiveRefetcher`].
+struct ArchiveJoinRecovery {
+    refetcher: ArchiveRefetcher,
+    tx_data_stream_base: i32,
+    tx_deposits_stream_id: i32,
+}
+
+impl JoinRecovery for ArchiveJoinRecovery {
+    fn recover_tx_data(
+        &mut self,
+        shard_id: u8,
+        session_id: i32,
+        from: BPosition,
+        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
+    ) -> Result<u64, String> {
+        self.refetcher
+            .fetch_tx_data(
+                self.tx_data_stream_base + shard_id as i32,
+                session_id,
+                from,
+                sink,
+            )
+            .map_err(|e| e.to_string())
+    }
+
+    fn recover_deposits(
+        &mut self,
+        from: BPosition,
+        sink: &mut dyn FnMut(BPosition, Deposit),
+    ) -> Result<u64, String> {
+        self.refetcher
+            .fetch_deposits(self.tx_deposits_stream_id, from, sink)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// Build the join-miss refetch factory from config, or `None` when no
+/// durability-archive endpoints are configured (single-host/IPC runs) or the
+/// node-local transport endpoints weren't supplied. The factory is invoked
+/// inside the reader thread (the refetcher's Aeron resources are
+/// thread-bound), and the refetcher itself is fully lazy — no Aeron resources
+/// exist until the first join miss.
+pub fn archive_join_recovery(
+    channels: &ChannelsConfig,
+    aeron_cfg: &AeronConfig,
+    aeron_dir: Option<&Path>,
+    response_endpoint: Option<&str>,
+    replay_endpoint: Option<&str>,
+) -> Option<JoinRecoveryFactory> {
+    if aeron_cfg.tx_data_archive_endpoints.is_empty()
+        && aeron_cfg.tx_deposits_archive_endpoints.is_empty()
+    {
+        return None;
+    }
+    let (Some(response_endpoint), Some(replay_endpoint)) = (response_endpoint, replay_endpoint)
+    else {
+        tracing::warn!(
+            "durability-archive endpoints configured but no local refetch endpoints \
+             (--archive-control-response-endpoint / --replay-destination-endpoint); \
+             join-miss refetch DISABLED — a lost envelope will be fatal"
+        );
+        return None;
+    };
+    let cfg = RefetchConfig {
+        tx_data_endpoints: aeron_cfg.tx_data_archive_endpoints.clone(),
+        tx_deposits_endpoints: aeron_cfg.tx_deposits_archive_endpoints.clone(),
+        response_endpoint: response_endpoint.to_string(),
+        replay_endpoint: replay_endpoint.to_string(),
+        aeron_dir: aeron_dir.map(|p| p.to_path_buf()),
+        aeron: aeron_cfg.clone(),
+    };
+    let tx_data_stream_base = channels.tx_data_stream_id_base;
+    let tx_deposits_stream_id = channels.tx_deposits_stream_id;
+    Some(Box::new(move || {
+        Some(Box::new(ArchiveJoinRecovery {
+            refetcher: ArchiveRefetcher::new(cfg),
+            tx_data_stream_base,
+            tx_deposits_stream_id,
+        }) as Box<dyn JoinRecovery>)
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -366,17 +363,38 @@ pub async fn wait_for_shutdown() {
 mod tests {
     use super::*;
 
-    // F13.4 regression (unit level): a failure recorded BEFORE the waiter
-    // parks must still complete `failed()` — the permit is stored.
-    #[tokio::test]
-    async fn replay_failure_recorded_before_wait_is_not_lost() {
-        let f = ReplayFailure::default();
-        f.record("tx_data[3] replay-merge", "archive gone");
-        let msg = f.failed().await;
-        assert!(msg.contains("tx_data[3]"), "{msg}");
-        assert!(msg.contains("archive gone"), "{msg}");
-        // First failure wins.
-        f.record("tx_deposits replay-merge", "later");
-        assert!(f.get().unwrap().contains("tx_data[3]"));
+    // The factory gates on config: no archive endpoints ⇒ no recovery (plain
+    // bounded join); endpoints without local transport ⇒ disabled with a loud
+    // warn (never a half-configured client).
+    #[test]
+    fn recovery_factory_gates_on_config() {
+        let channels = ChannelsConfig::default();
+        let mut aeron = AeronConfig::default();
+        assert!(
+            archive_join_recovery(
+                &channels,
+                &aeron,
+                None,
+                Some("10.0.0.1:40140"),
+                Some("10.0.0.1:40130")
+            )
+            .is_none(),
+            "no endpoints configured ⇒ None"
+        );
+        aeron.tx_data_archive_endpoints = vec!["192.168.56.31:8010".into()];
+        assert!(
+            archive_join_recovery(&channels, &aeron, None, None, None).is_none(),
+            "endpoints but no local transport ⇒ None"
+        );
+        let f = archive_join_recovery(
+            &channels,
+            &aeron,
+            None,
+            Some("10.0.0.1:40140"),
+            Some("10.0.0.1:40130"),
+        );
+        assert!(f.is_some(), "fully configured ⇒ factory");
+        // The factory itself is safe to run without Aeron (fully lazy).
+        assert!(f.unwrap()().is_some());
     }
 }

@@ -82,15 +82,14 @@ job "validator" {
           # Own state dir UNDER the shared persistent mount — never the
           # executor's /opt/kardamom/state root (separate mdbx env).
           "--state-dir", "/opt/kardamom/state/validator",
-          # Archive replay-merge endpoint for tx_data / tx_deposits. When this
-          # flag is set the streams are ALWAYS read via replay-merge (fresh
-          # starts included) — the exec thread skip-counts any already-committed
-          # prefix, and a fresh validator behind a loaded chain needs the
-          # historical envelopes live multicast no longer carries. tx_ordering
-          # recovery rides the cluster replay instead. Port 40131 on this
-          # node's IP (the executor's replay endpoint uses 40130 on ITS nodes;
-          # no co-residence, but keep them distinct anyway).
+          # Join-miss archive refetch (tx_data / tx_deposits): a canonical ref
+          # whose envelope the live multicast missed is replayed in-band from
+          # the durability archives listed in channels.toml. Replayed fragments
+          # land on 40131, archive-control responses on 40141 (the executor
+          # uses 40130/40140 on ITS nodes; no co-residence, but keep them
+          # distinct anyway). tx_ordering recovery rides the cluster replay.
           "--replay-destination-endpoint", "${meta.node_ip}:40131",
+          "--archive-control-response-endpoint", "${meta.node_ip}:40141",
           # Shadow-check the node-incremental state trie against a full rebuild
           # every 8th block; a walker bug fail-stops the validator (dead alloc =
           # verdict failure) and bumps kardamom_state_trie_shadow_mismatch_total.
