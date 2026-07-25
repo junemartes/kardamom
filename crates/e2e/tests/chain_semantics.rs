@@ -99,15 +99,14 @@ async fn s5_connection_cap_refusal_is_prompt() {
         .expect("S5 cap");
 }
 
-/// The #81 pending-registry-leak canary. KNOWN TO FAIL until the "cleanup on
-/// cancelled RPC futures" follow-up lands; opt in with KARDAMOM_E2E_CANARY=1.
+/// Regression test for the #81 pending-registry leak (fixed in #91, the
+/// Weak-indexed registry): client-aborted parked submits must leave no
+/// registry entries behind — queue depth returns to baseline once the park
+/// bound passes. Shipped as an env-gated known-failure canary until the fix
+/// landed; runs unconditionally now.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
-async fn s5_queue_depth_canary_known_81_leak() {
-    if std::env::var("KARDAMOM_E2E_CANARY").as_deref() != Ok("1") {
-        eprintln!("SKIP: set KARDAMOM_E2E_CANARY=1 to run the #81 leak canary (known failure)");
-        return;
-    }
+async fn s5_queue_depth_recovers_after_client_aborts() {
     let park = Duration::from_secs(4);
     let stack = LocalStack::launch(StackConfig {
         ingress: IngressOptions {

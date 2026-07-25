@@ -278,9 +278,6 @@ test-e2e-local: aeron-jar cluster-jar
         --bins --locked
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
         --locked -- --ignored --nocapture --test-threads=2
-    # NOTE: the s5 queue-depth canary self-skips unless KARDAMOM_E2E_CANARY=1
-    # — it pins the KNOWN #81 pending-registry leak and fails until that
-    # follow-up lands.
 
 # ---------------------------------------------------------------------------
 # Multi-node cluster (deploy/cluster) — HOST dependencies.

@@ -16,8 +16,9 @@
 //!
 //! Two probes need dedicated stacks and live as separate drivers below:
 //! [`connection_cap_refusal`] (a tiny `--rpc-max-connections`) and
-//! [`queue_depth_canary`] (the known #81 pending-registry leak on cancelled
-//! RPC futures — expected to FAIL until that follow-up lands).
+//! [`queue_depth_canary`] (regression guard for the #81 pending-registry
+//! leak on cancelled RPC futures, fixed in #91 by the Weak-indexed
+//! registry).
 
 use std::time::Duration;
 
@@ -262,12 +263,12 @@ pub async fn connection_cap_refusal(
     Ok(())
 }
 
-/// #81 pending-registry-leak canary: cancel in-flight gap submits at the
-/// CLIENT (dropping the connection mid-park) and require
-/// `kardamom_ingress_queue_depth` to return to 0 once the server-side park
-/// bound has passed. KNOWN TO FAIL until the #81 "pending-registry cleanup on
-/// cancelled RPC futures" follow-up lands — the harness runs it only when
-/// `KARDAMOM_E2E_CANARY=1` so the suite stays green while the leak is open.
+/// Regression guard for the #81 pending-registry leak (fixed in #91): cancel
+/// in-flight gap submits at the CLIENT (dropping the connection mid-park)
+/// and require `kardamom_ingress_queue_depth` to return to baseline once the
+/// server-side park bound has passed. With the Weak-indexed registry the
+/// dropped handler future kills its entry and its `Drop` reaps the slot —
+/// this pins that property end-to-end.
 pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Result<()> {
     let signers = l2::dev_signers((sender_base + n) as u32)?;
     let to = Address::from([0x57u8; 20]);
@@ -306,8 +307,8 @@ pub async fn queue_depth_canary(t: &Target, sender_base: usize, n: usize) -> Res
     )
     .await
     .context(
-        "KNOWN #81 LEAK: cancelled RPC futures leave (sender, nonce) entries in the \
-              pending registry",
+        "#81 leak regression: cancelled RPC futures left (sender, nonce) entries in the \
+         pending registry (fixed in #91 — did the Weak-indexed registry regress?)",
     )?;
     Ok(())
 }
