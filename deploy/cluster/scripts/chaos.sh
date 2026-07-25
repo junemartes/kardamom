@@ -929,7 +929,7 @@ run_case() { # <case-name>
         echo "${verify_pre}" | tail -20
         fail "archive-corruption: verify tool crashed (not a detection)"
       fi
-      echo "${verify_pre}" | grep -q "recordingId=${rid}) ERR" \
+      echo "${verify_pre}" | grep -qE "recordingId=${rid}[,)].* ERR" \
         || { echo "${verify_pre}" | tail -20; \
              fail "archive-corruption: CRC-armed verify did NOT flag recording ${rid} (detection hole)"; }
       log "archive-corruption: corruption detected by CRC-armed verify"
@@ -976,7 +976,7 @@ run_case() { # <case-name>
         echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify does not show recording ${rid} OK"
       fi
-      if echo "${verify_post}" | grep -q "recordingId=${rid}) ERR"; then
+      if echo "${verify_post}" | grep -qE "recordingId=${rid}[,)].* ERR"; then
         echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify still reports errors on recording ${rid}"
       fi
