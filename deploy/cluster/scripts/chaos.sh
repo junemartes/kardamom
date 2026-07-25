@@ -797,16 +797,29 @@ run_case() { # <case-name>
       assert_executor_progress 180
       # executor-1 restarts, self-heals from a peer checkpoint, rejoins to 3.
       assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
-      ex1_inner="$(docker exec kardamom-executor-1 bash -lc \
-        'docker ps --format "{{.Names}}" | grep -i executor | head -1')"
-      [ -n "${ex1_inner}" ] || fail "replay-window-resync: no executor container on executor-1 after restart"
-      docker exec kardamom-executor-1 bash -lc \
-        "docker logs ${ex1_inner} 2>&1 | grep -q 'fetched checkpoint from peer'" \
-        || fail "replay-window-resync: executor-1 did NOT fetch a peer checkpoint (self-heal path not taken)"
-      docker exec kardamom-executor-1 bash -lc \
-        "docker logs ${ex1_inner} 2>&1 | grep -q 'restored state from checkpoint'" \
-        || fail "replay-window-resync: executor-1 fetched but did NOT restore the peer checkpoint"
-      log "replay-window-resync: executor-1 self-healed from a peer checkpoint (fetch + restore + rejoin)"
+      # Fetch + restore take real time (a checkpoint image is hundreds of MB
+      # and the node tries every peer that advertises something newer), so
+      # poll for the two log lines instead of grepping once — the first CI run
+      # failed with the restore landing 1.3s after a one-shot grep.
+      local t=0 fetched=0 restored=0
+      while :; do
+        ex1_inner="$(docker exec kardamom-executor-1 bash -lc \
+          'docker ps --format "{{.Names}}" | grep -i executor | head -1' 2>/dev/null || true)"
+        if [ -n "${ex1_inner}" ]; then
+          docker exec kardamom-executor-1 bash -lc \
+            "docker logs ${ex1_inner} 2>&1 | grep -q 'fetched checkpoint from peer'" && fetched=1
+          docker exec kardamom-executor-1 bash -lc \
+            "docker logs ${ex1_inner} 2>&1 | grep -q 'restored state from checkpoint'" && restored=1
+          [ "${fetched}" = 1 ] && [ "${restored}" = 1 ] && break
+        fi
+        sleep 5; t=$((t+5))
+        if [ "${t}" -ge 90 ]; then
+          [ "${fetched}" = 1 ] \
+            || fail "replay-window-resync: executor-1 did NOT fetch a peer checkpoint (self-heal path not taken)"
+          fail "replay-window-resync: executor-1 fetched but did NOT restore the peer checkpoint within 90s"
+        fi
+      done
+      log "replay-window-resync: executor-1 self-healed from a peer checkpoint (fetch + restore + rejoin, ${t}s)"
       ;;
 
     archive-driver-loss)
