@@ -21,10 +21,37 @@ pub struct Proc {
 
 impl Proc {
     /// Spawn `cmd` with stdout+stderr appended to `log_path`.
+    ///
+    /// The child is given `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the
+    /// test process. `Drop` handles the ordinary paths, but it cannot run if
+    /// the test binary is killed outright — `cargo test | head` closing the
+    /// pipe (SIGPIPE), a CI step timeout, a panic in the runtime shutdown.
+    /// Without this, every such interruption strands a media driver, a sealer
+    /// JVM and four services; they then compete for CPU and Aeron resources
+    /// and the NEXT run fails at bring-up looking like a flake. (Observed
+    /// exactly that locally: 17 orphaned JVMs after a series of piped runs.)
     pub fn spawn(name: &str, mut cmd: Command, log_path: PathBuf) -> Result<Self> {
         let log = std::fs::File::create(&log_path)
             .with_context(|| format!("create log file {}", log_path.display()))?;
         let log_err = log.try_clone().context("clone log handle")?;
+        #[cfg(target_os = "linux")]
+        unsafe {
+            use std::os::unix::process::CommandExt;
+            cmd.pre_exec(|| {
+                // SAFETY: async-signal-safe single syscall, the only thing
+                // permitted between fork and exec.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Guard the race where the parent died between fork and here:
+                // without this the child would keep running with no signal
+                // pending, which is the very leak PDEATHSIG exists to prevent.
+                if libc::getppid() == 1 {
+                    libc::raise(libc::SIGKILL);
+                }
+                Ok(())
+            });
+        }
         let child = cmd
             .stdin(Stdio::null())
             .stdout(Stdio::from(log))

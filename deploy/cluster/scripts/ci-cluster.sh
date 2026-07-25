@@ -501,6 +501,39 @@ if [[ -x "${LOAD_BIN}" ]]; then
     log "RUN_LOAD=0 — skipping sustained-load stage (chaos-only shard)"
   fi
 
+  # --- chain-semantics suite (Target C) --------------------------------
+  # The SAME scenario drivers the Target-L tests run
+  # (crates/e2e/src/scenarios, docs/agents/chain-semantics-e2e-suite-spec.md),
+  # pointed at this cluster instead of a single-host stack: nonce ordering,
+  # gap non-processing, RPC liveness and validator/executor consistency, all
+  # observed through the ingress JSON-RPC + the services' /metrics.
+  #
+  # OFF by default (RUN_SEMANTICS=0) so it only runs on its own shard and can
+  # never affect the load / chaos shards. Executor, sequencer and validator
+  # metrics all bind 0.0.0.0 in their Nomad jobs, so the runner scrapes them
+  # directly (the same way chaos.sh's progress probe does); the ingress binds
+  # loopback-only, so the one probe that needs ingress metrics self-skips.
+  #
+  # Accounts: this shard runs no load/chaos, so only the smoke gate (#0) has
+  # been used — the semantics cases own #1..#15 (see the ledger above).
+  if [[ "${RUN_SEMANTICS:-0}" == "1" ]]; then
+    SEMANTICS_BIN="${ROOT}/target/release/kardamom-semantics"
+    if [[ -x "${SEMANTICS_BIN}" ]]; then
+      log "chain-semantics suite (Target C): ${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency}"
+      "${SEMANTICS_BIN}" \
+        --rpc http://192.168.56.31:8545 --chain-id 412346 \
+        --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
+        --sequencer-metrics 192.168.56.21:9001,192.168.56.22:9001 \
+        --validator-metrics 192.168.56.61:9006 \
+        --pending-receipt-timeout-ms "${SEMANTICS_PARK_MS:-30000}" \
+        --account-base "${SEMANTICS_ACCOUNT_BASE:-1}" \
+        --cases "${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency}"
+    else
+      log "ERROR: RUN_SEMANTICS=1 but ${SEMANTICS_BIN} is not staged"
+      exit 1
+    fi
+  fi
+
   if [[ "${RUN_CHAOS:-1}" == "1" ]]; then
     # The chaos suite kills pipeline components under steady load and asserts they
     # auto-recover AND every accepted tx still receipts. The COMPONENT cases
