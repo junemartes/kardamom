@@ -43,6 +43,24 @@ struct Entry {
 /// "shared between caller and consumer" property obvious.
 type PendingMap = Arc<DashMap<(Address, u64), Arc<Mutex<Entry>>>>;
 
+/// Remove `key` from the map ONLY if it still holds `entry` (pointer
+/// identity), then refresh the depth gauge. Every removal goes through this
+/// guard: a re-`register` of the same (sender, nonce) replaces the map slot
+/// with a NEW entry, and a stale remover (a late receipt/rejection for the
+/// old registration, an old wait's Drop) must never evict the new
+/// registration.
+fn remove_entry(map: &PendingMap, key: &(Address, u64), entry: &Arc<Mutex<Entry>>) {
+    map.remove_if(key, |_, v| Arc::ptr_eq(v, entry));
+    set_queue_depth(map);
+}
+
+/// The registry owns the queue-depth gauge: depth changes exactly when an
+/// entry is inserted or removed, including removals on paths no proxy code
+/// runs (a cancelled handler's `PendingWait::drop`).
+fn set_queue_depth(map: &PendingMap) {
+    metrics::gauge!(crate::metrics::QUEUE_DEPTH).set(map.len() as f64);
+}
+
 /// Tracked watermarks. Whichever fields the policy doesn't need remain `None`
 /// forever and the gate skips them.
 #[derive(Default, Clone, Copy)]
@@ -98,19 +116,26 @@ impl PendingReceipts {
     /// Two-phase register: returns a `PendingWait` the caller awaits with a
     /// timeout. Calling code must `register` *before* publishing the tx so
     /// the receipt cannot beat the registration.
+    ///
+    /// Cleanup is owned by the returned `PendingWait`'s `Drop`: however the
+    /// wait ends — receipt, rejection, timeout, or the CALLER'S FUTURE BEING
+    /// DROPPED (client disconnect cancelling the RPC handler) — the entry
+    /// leaves the map. The cancelled-future path used to leak the entry
+    /// forever (the #81 "pending-registry cleanup on cancelled RPC futures"
+    /// follow-up).
     pub fn register(&self, sender: Address, nonce: u64) -> PendingWait {
         let (tx, rx) = oneshot::channel();
-        self.map.insert(
-            (sender, nonce),
-            Arc::new(Mutex::new(Entry {
-                responder: Some(tx),
-                receipt: None,
-            })),
-        );
+        let entry = Arc::new(Mutex::new(Entry {
+            responder: Some(tx),
+            receipt: None,
+        }));
+        self.map.insert((sender, nonce), entry.clone());
+        set_queue_depth(&self.map);
         PendingWait {
             rx,
             key: (sender, nonce),
             map: self.map.clone(),
+            entry,
         }
     }
 
@@ -135,7 +160,7 @@ impl PendingReceipts {
         {
             let _ = resp.send(Ok(ReceiptResponse { receipt }));
             drop(e);
-            self.map.remove(&key);
+            remove_entry(&self.map, &key, &entry);
         }
     }
 
@@ -174,7 +199,7 @@ impl PendingReceipts {
                 };
                 let _ = resp.send(Err(err));
                 drop(e);
-                map.remove(&key);
+                remove_entry(&map, &key, &entry);
             }
         };
         if grace.is_zero() {
@@ -209,7 +234,6 @@ impl PendingReceipts {
             .iter()
             .map(|r| (*r.key(), r.value().clone()))
             .collect();
-        let mut to_release: Vec<(Address, u64)> = Vec::new();
         for (key, entry) in snapshot {
             let mut e = entry.lock().await;
             let release = e
@@ -220,11 +244,9 @@ impl PendingReceipts {
             if release && let Some(resp) = e.responder.take() {
                 let receipt = e.receipt.clone().expect("checked is_some above");
                 let _ = resp.send(Ok(ReceiptResponse { receipt }));
-                to_release.push(key);
+                drop(e);
+                remove_entry(&self.map, &key, &entry);
             }
-        }
-        for k in to_release {
-            self.map.remove(&k);
         }
     }
 
@@ -250,25 +272,44 @@ impl PendingReceipts {
 /// Handle returned by [`PendingReceipts::register`]. Await it (with a
 /// timeout) to receive the published receipt once both the receipt-cache
 /// stream and the watermark stream have caught up.
+///
+/// Dropping the handle unregisters its entry (identity-guarded, so a
+/// replacement registration is untouched). This is what bounds the registry
+/// under client disconnects: jsonrpsee drops the RPC handler future when the
+/// connection dies, the future's `PendingWait` drops with it, and the entry
+/// (plus the queue-depth gauge) is cleaned up right there instead of leaking
+/// until process restart (#81 follow-up).
 pub struct PendingWait {
     rx: oneshot::Receiver<Result<ReceiptResponse, IngressError>>,
     key: (Address, u64),
     map: PendingMap,
+    entry: Arc<Mutex<Entry>>,
 }
 
 impl PendingWait {
     pub async fn await_with_timeout(
-        self,
+        mut self,
         timeout: Duration,
     ) -> Result<ReceiptResponse, IngressError> {
-        match tokio::time::timeout(timeout, self.rx).await {
+        // `&mut self.rx` (oneshot::Receiver is Unpin) rather than consuming
+        // the field: `self` must stay whole so its Drop — the single cleanup
+        // path for timeout AND cancellation — runs when this future
+        // completes or is dropped mid-await.
+        match tokio::time::timeout(timeout, &mut self.rx).await {
             Ok(Ok(res)) => res,
             Ok(Err(_)) => Err(IngressError::Internal("oneshot dropped".into())),
-            Err(_) => {
-                self.map.remove(&self.key);
-                Err(IngressError::Timeout)
-            }
+            Err(_) => Err(IngressError::Timeout),
         }
+    }
+}
+
+impl Drop for PendingWait {
+    fn drop(&mut self) {
+        // Idempotent: a wait released via receipt/rejection was already
+        // removed by the watcher (and the identity guard skips any newer
+        // registration under the same key). Sync + lock-free apart from the
+        // dashmap shard, so it is safe in an async Drop.
+        remove_entry(&self.map, &self.key, &self.entry);
     }
 }
 
@@ -604,6 +645,71 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, IngressError::Timeout));
+        assert_eq!(p.len(), 0);
+    }
+
+    // --- Cancelled-future cleanup (the #81 follow-up) ---------------------
+
+    #[tokio::test]
+    async fn dropping_an_unresolved_wait_removes_its_entry() {
+        // The core leak: a client disconnect drops the RPC handler future,
+        // which drops the PendingWait without any of the release paths
+        // running. The entry must leave the map right there.
+        let p = PendingReceipts::new(AckPolicy::OnOffer);
+        let wait = p.register(Address::repeat_byte(0xB1), 4);
+        assert_eq!(p.len(), 1);
+        drop(wait);
+        assert_eq!(p.len(), 0, "dropped wait must unregister its entry");
+    }
+
+    #[tokio::test]
+    async fn aborting_a_parked_await_cleans_up() {
+        // Same, through the real shape: the wait is parked inside
+        // await_with_timeout when the owning task is aborted (the future is
+        // dropped mid-await, exactly what jsonrpsee does on disconnect).
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+        let wait = p.register(Address::repeat_byte(0xB2), 7);
+        let task =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(60)).await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(p.len(), 1, "parked");
+        task.abort();
+        let _ = task.await;
+        assert_eq!(p.len(), 0, "abort must unregister the parked entry");
+    }
+
+    #[tokio::test]
+    async fn stale_wait_drop_spares_a_replacement_registration() {
+        // (sender, nonce) re-registered while an old wait still exists: the
+        // old wait's Drop is identity-guarded and must NOT evict the new
+        // registration.
+        let p = PendingReceipts::new(AckPolicy::OnOffer);
+        let sender = Address::repeat_byte(0xB3);
+        let stale = p.register(sender, 1);
+        let fresh = p.register(sender, 1); // replaces the slot
+        assert_eq!(p.len(), 1);
+        drop(stale);
+        assert_eq!(p.len(), 1, "stale drop must spare the replacement");
+        drop(fresh);
+        assert_eq!(p.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn replacement_registration_still_releases_on_receipt() {
+        // End-to-end on the replacement: after a stale wait is dropped, the
+        // fresh registration still parks and releases normally.
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+        let sender = Address::repeat_byte(0xB4);
+        let position = pos(12);
+        let stale = p.register(sender, 0);
+        let fresh = p.register(sender, 0);
+        drop(stale);
+        let waiter =
+            tokio::spawn(async move { fresh.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        p.on_receipt(sender, 0, dummy_receipt(position)).await;
+        let res = waiter.await.unwrap().expect("fresh wait must release");
+        assert_eq!(res.receipt.tx_idx, position);
         assert_eq!(p.len(), 0);
     }
 }
