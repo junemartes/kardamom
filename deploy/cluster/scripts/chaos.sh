@@ -448,6 +448,51 @@ assert_executor_progress() {
   done
 }
 
+# Per-replica recovery verdict: EVERY executor must individually converge to
+# the fleet head before a case may pass. The MAX-across-replicas progress
+# probe above keeps transient scrape gaps from failing a healthy run — but it
+# also MASKS a replica that never recovered (wedged or crash-looping behind
+# the fleet): the suite stayed green through months of every restarted
+# executor being permanently broken, because ONE untouched replica carried
+# every probe. A resilience suite that cannot see 2/3 of the fleet dead
+# proves nothing, so every case now ends with this convergence check:
+# within EXEC_CONVERGE_SLO_S, every executor's OWN gauge must be scrapeable
+# and within EXEC_CONVERGE_LAG blocks of the fleet head.
+EXEC_CONVERGE_SLO_S="${EXEC_CONVERGE_SLO_S:-150}"
+EXEC_CONVERGE_LAG="${EXEC_CONVERGE_LAG:-50}"
+assert_executors_converged() { # <case>
+  local case_name="$1" t=0 i v max ok bad lag
+  local -a blk
+  while :; do
+    max=""; bad=""; blk=()
+    for i in "${!EXECUTOR_NODES[@]}"; do
+      v="$(exec_metrics "${i}" \
+        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+      if [ -n "${v}" ]; then
+        blk[i]="${v}"
+        if [ -z "${max}" ] || [ "${v}" -gt "${max}" ]; then max="${v}"; fi
+      else
+        bad="${bad} ${EXECUTOR_NODES[$i]}=unreachable"
+      fi
+    done
+    if [ -z "${bad}" ] && [ -n "${max}" ]; then
+      ok=1
+      for i in "${!EXECUTOR_NODES[@]}"; do
+        lag=$(( max - blk[i] ))
+        [ "${lag}" -le "${EXEC_CONVERGE_LAG}" ] \
+          || { ok=0; bad="${bad} ${EXECUTOR_NODES[$i]}=lag:${lag}"; }
+      done
+      if [ "${ok}" -eq 1 ]; then
+        log "${case_name}: all ${#EXECUTOR_NODES[@]} executors converged (head ${max}, per-replica lag <= ${EXEC_CONVERGE_LAG}) after ${t}s"
+        return 0
+      fi
+    fi
+    [ "${t}" -ge "${EXEC_CONVERGE_SLO_S}" ] \
+      && fail "${case_name}: executor fleet NOT fully recovered within ${EXEC_CONVERGE_SLO_S}s (head=${max:-?};${bad# })"
+    sleep 5; t=$(( t + 5 ))
+  done
+}
+
 # Cluster-mode "must NOT progress": the executor's block gauge must stay FLAT
 # over a window (quorum lost → no new commits → no false progress). $1 = window.
 assert_executor_stalled() {
@@ -843,6 +888,13 @@ run_case() { # <case-name>
     node-failure-*)         assert_executor_progress 180 ;;
     *)                      assert_progress ;;
   esac
+
+  # EVERY case must leave a fully-healthy executor fleet, not just "some
+  # replica progressing" — see assert_executors_converged. This is what makes
+  # a green run meaningful: a case whose kill target (or an innocent
+  # bystander, e.g. an executor wedged by a sequencer restart) never truly
+  # recovers now fails HERE instead of hiding behind the fleet-max probes.
+  assert_executors_converged "${name}"
 
   # Let the background load finish its window + drain, then check its verdict.
   wait "${LOAD_PID}" || true
