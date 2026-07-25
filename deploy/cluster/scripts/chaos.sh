@@ -286,6 +286,23 @@ seqa_metric() { # <metric-name> -> integer sum across label lines (empty on scra
   | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { s += $NF } END { printf "%d", s }' \
   || true
 }
+# Forensics for sequencer-lapse failures: container identity (was the task
+# REPLACED under us? same container still running?), the full resync metric
+# block, and the current sequencer-a container's recent log lines. The first
+# CI iterations of this case failed with signatures explainable only by
+# process identity confusion — make the next one self-diagnosing.
+seqa_debug() {
+  log "sequencer-lapse DEBUG: inner containers on kardamom-sequencer-0:"
+  docker exec kardamom-sequencer-0 sh -c 'docker ps -a --format "{{.Names}} {{.Status}}" | head -6' 2>/dev/null || true
+  log "sequencer-lapse DEBUG: resync metrics at .21:9001:"
+  { curl -fsS --max-time 5 "http://192.168.56.21:9001/metrics" 2>/dev/null \
+    || timeout 8 docker exec kardamom-sequencer-0 curl -fsS --max-time 5 "http://127.0.0.1:9001/metrics" 2>/dev/null; } \
+    | grep -E "resync|watermark|floor" | head -12 || true
+  log "sequencer-lapse DEBUG: current sequencer-a log tail:"
+  docker exec kardamom-sequencer-0 sh -c \
+    'docker logs --tail 20 "$(docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a")" 2>&1 | grep -E "RESYNC|LAG|resync|panic" | tail -10' 2>/dev/null || true
+}
+
 run_sequencer_lapse() {
   local inner
   inner="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
@@ -313,8 +330,10 @@ run_sequencer_lapse() {
   while :; do
     l1="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"; l1="${l1:-0}"
     [ "${l1}" -gt "${l0}" ] && break
-    [ "${t}" -ge 60 ] \
-      && fail "sequencer-lapse: lag never suspected within 60s of resume (lag_suspected ${l0} -> ${l1})"
+    if [ "${t}" -ge 60 ]; then
+      seqa_debug
+      fail "sequencer-lapse: lag never suspected within 60s of resume (lag_suspected ${l0} -> ${l1})"
+    fi
     sleep 5; t=$(( t + 5 ))
   done
   log "sequencer-lapse: lag suspected (${l0} -> ${l1})"

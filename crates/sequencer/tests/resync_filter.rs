@@ -97,8 +97,10 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
 
     // A receipt for nonce 0 exists (twin covered it) → floor 1. The floor
     // advances the state machine BEFORE the stale envelope is processed, so
-    // the skip happens via the ordinary Past/DuplicatedTx path — never a
-    // publish of a proven-executed nonce.
+    // the envelope lands on the `Past` path — but as a receipt-PROVEN skip:
+    // no publish, and NO DuplicatedTx notice (the tx executed; reporting it
+    // as a duplicate to ingress would be spurious — and growing
+    // dropped_past here broke the load harness's seq_clean verdict).
     floor_tx
         .send(FloorUpdate {
             sender: s.address(),
@@ -112,17 +114,10 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 1, "nonce 0 skipped (proven), nonce 1 published");
     assert_eq!(refs[0].tx_data_position, pos(64));
-    let errs = rc.errors.lock().unwrap();
-    assert_eq!(
-        errs.len(),
-        1,
-        "the skip surfaces as DuplicatedTx to ingress"
+    assert!(
+        rc.errors.lock().unwrap().is_empty(),
+        "a receipt-proven skip is not a client error"
     );
-    assert_eq!(errs[0].nonce, 0);
-    assert!(matches!(
-        errs[0].reason,
-        kardamom_sequencer::TxErrorReason::DuplicatedTx { expected_nonce: 1 }
-    ));
 }
 
 #[test]

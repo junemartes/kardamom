@@ -396,21 +396,40 @@ impl<DB: StateDatabase> Sequencer<DB> {
                 metrics::record_buffered_future(self.cfg.partition_index);
             }
             NonceOutcome::Past => {
-                metrics::record_past(self.cfg.partition_index);
-                // A past nonce that the receipt floor PROVES executed is a
-                // lag-drained duplicate skipped on execution evidence (the
-                // twin covered it) — distinct from an ordinary client
-                // double-submit, which trips `Past` without a floor.
+                // Two DIFFERENT things surface as `Past`, and conflating
+                // them broke the load harness's seq_clean verdict (CI run
+                // 30166583138: seq_clean=false from 200 tps — the ramp
+                // ceiling collapsed to 100):
+                //
+                // - RECEIPT-PROVEN skip: the receipt floor advanced past
+                //   this nonce because the tx already EXECUTED (the twin
+                //   ordered it and the order→execute→receipt round trip
+                //   outran this replica's inbound processing — routine for
+                //   the marginally-behind twin under load). This is the
+                //   resync mechanism absorbing a duplicate: NOT sequencer
+                //   dirt (`dropped_past` stays flat, seq_clean holds) and
+                //   NOT a client error (the tx succeeded; a DuplicatedTx
+                //   notice would be spurious and could race the receipt at
+                //   ingress).
+                // - ordinary client double-submit / stale nonce: no floor
+                //   proof — counted and reported exactly as before.
                 if self
                     .resync
                     .as_ref()
                     .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
                 {
                     metrics::record_resync_skip(self.cfg.partition_index);
+                } else {
+                    metrics::record_past(self.cfg.partition_index);
                 }
             }
         }
 
+        let proven_executed = |n: u64| {
+            self.resync
+                .as_ref()
+                .is_some_and(|r| r.floor(sender).is_some_and(|f| f > n))
+        };
         let mut publishes = Vec::new();
         for action in result.actions {
             match action {
@@ -421,11 +440,15 @@ impl<DB: StateDatabase> Sequencer<DB> {
                     nonce: n,
                     expected_nonce,
                 } => {
-                    rc.publish_error(TxError {
-                        sender,
-                        nonce: n,
-                        reason: TxErrorReason::DuplicatedTx { expected_nonce },
-                    });
+                    // Suppressed for receipt-proven skips (see above): the
+                    // client's tx executed; there is nothing to report.
+                    if !proven_executed(n) {
+                        rc.publish_error(TxError {
+                            sender,
+                            nonce: n,
+                            reason: TxErrorReason::DuplicatedTx { expected_nonce },
+                        });
+                    }
                 }
             }
         }
