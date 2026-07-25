@@ -244,6 +244,19 @@ yamllint/contract CI check that already guards channel config drift.
     signal than the boundary watermark the sealer already broadcasts to every publisher
     session for free.
 
+## What the chaos case surfaced (issue #99)
+
+The `sequencer-lapse` CI iterations exposed a PRE-EXISTING session-lifecycle bug this
+mechanism is the first thing able to observe: a hard-killed-and-restarted replica's cluster
+session dies every ~90 s (`cluster session failed reason=TIMEOUT` at exactly
+`sessionTimeoutNs` — the cluster never receives its keep-alives), churning
+open→timeout→reconnect forever. Publishers never consumed egress before this PR, so the
+state was invisible — every load/chaos verdict passes while the shard silently runs P=1.
+Until #99 is fixed, the case's DETECTION asserts (`lag_suspected`, resync engagement) run
+observationally (logged, non-failing) — a restarted replica has no working egress for the
+feed to measure — while the safety asserts (pipeline progress, load verdict, per-replica
+convergence, replica exporting) remain enforcing. Re-arm them when #99 closes.
+
 ## Non-goals / future
 
 - **Deposit refs**: `DepositRef` dedups on `source_hash` and has no nonce chain; the M-way
