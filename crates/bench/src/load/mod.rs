@@ -493,9 +493,21 @@ async fn ramp_to_max(
         } else {
             0.0
         };
+        // Subscribe mode: an ack means *published*, not *receipted*, so the
+        // accept ratio alone would let the ramp sail past the pipeline's
+        // drain rate (admission stays 1.0 while receipts queue). Require
+        // receipts to keep pace with offers within the step, with slack for
+        // the in-flight tail at the step boundary.
+        #[allow(clippy::cast_precision_loss)]
+        let recv_ok = if mode == SubmitMode::Subscribe && offered > 0 {
+            let receipted = after.receipted - before.receipted;
+            receipted as f64 / offered as f64 >= 0.95
+        } else {
+            true
+        };
         let gap_ok = step_gap_ok(&s0, &s1, cfg.max_gap);
         let seq_clean = step_seq_clean(&s0, &s1);
-        let sustainable = accept_ratio >= 0.99 && gap_ok && seq_clean;
+        let sustainable = accept_ratio >= 0.99 && recv_ok && gap_ok && seq_clean;
         tracing::info!(
             rate,
             offered,
