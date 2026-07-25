@@ -84,6 +84,10 @@ job "executor" {
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           "/opt/kardamom/state:/opt/kardamom/state",
+          # Periodic state checkpoints (fast cold-start recovery). Kept on a
+          # distinct path from state_dir so a state-DB wipe can be recovered from
+          # a checkpoint here (or from a peer executor's, re-replicated in).
+          "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
         ]
         args = [
           "--config", "/local/executor.toml",
@@ -112,6 +116,11 @@ job "executor" {
           # recovery is handled by the Aeron Cluster client's REPLAY_FROM.)
           "--replay-destination-endpoint", "${meta.node_ip}:40130",
           "--archive-control-response-endpoint", "${meta.node_ip}:40140",
+          # Fast cold-start recovery: restore the newest checkpoint into a
+          # wiped/empty state_dir before startup (replaying only the tail, not
+          # from genesis), and write a checkpoint every 20s as the chain advances.
+          "--checkpoint-dir", "/opt/kardamom/checkpoints",
+          "--checkpoint-interval-secs", "20",
           # Bind the Prometheus exporter on ALL interfaces (default is
           # loopback): the chaos suite probes it DIRECTLY over the cluster
           # bridge (http://<node_ip>:9004/metrics), keeping dockerd out of

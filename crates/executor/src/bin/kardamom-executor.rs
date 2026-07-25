@@ -28,6 +28,9 @@ use kardamom_executor::{
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
+use kardamom_state::checkpoint::{
+    create_checkpoint, latest_checkpoint, prune_checkpoints, restore_checkpoint,
+};
 use kardamom_state::{StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
 
 #[derive(Debug, Parser)]
@@ -111,6 +114,21 @@ struct Args {
     /// `--replay-destination-endpoint` for refetch to engage.
     #[arg(long, env = "KARDAMOM_ARCHIVE_CONTROL_RESPONSE")]
     archive_control_response_endpoint: Option<String>,
+    /// Directory for periodic state checkpoints (fast cold-start recovery). When
+    /// set, a wiped/empty `state_dir` is restored from the newest checkpoint here
+    /// before startup (replaying only the tail instead of re-syncing from
+    /// genesis), and — if `checkpoint_interval_secs > 0` — new checkpoints are
+    /// written here as the chain advances. A peer's checkpoint dir is a valid
+    /// restore source (executor replicas are deterministic at the same block).
+    #[arg(long, env = "KARDAMOM_CHECKPOINT_DIR")]
+    checkpoint_dir: Option<PathBuf>,
+    /// Interval, in seconds, between periodic state checkpoints. 0 disables
+    /// checkpoint creation (restore-only). Ignored unless `checkpoint_dir` is set.
+    #[arg(long, default_value_t = 0)]
+    checkpoint_interval_secs: u64,
+    /// Number of recent checkpoints to retain (older ones are pruned).
+    #[arg(long, default_value_t = 3)]
+    checkpoint_keep: u64,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9004")]
     metrics_addr: std::net::SocketAddr,
@@ -185,12 +203,70 @@ async fn main() -> Result<()> {
     // Load genesis (its chain_id is adopted when present).
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
 
+    // Fast cold-start recovery: if the state dir is empty (a fresh/wiped node)
+    // and a checkpoint is available, restore the newest one BEFORE opening the
+    // env. Startup then sees a populated DB and resumes from the checkpoint's
+    // block — replaying only the tail instead of re-syncing from genesis.
+    if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
+        // Fresh iff the state dir has no mdbx data file — checked WITHOUT opening
+        // the env (opening would itself create the data file and defeat restore).
+        let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
+            .context("probe state dir")?;
+        if fresh {
+            match latest_checkpoint(ckpt_dir).context("scan checkpoint dir")? {
+                Some(ckpt) => {
+                    let block = restore_checkpoint(&ckpt.path, &args.state_dir)
+                        .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
+                    tracing::info!(
+                        restored_block = block,
+                        checkpoint = %ckpt.path.display(),
+                        "restored state from checkpoint; will replay tail from here"
+                    );
+                }
+                None => tracing::info!(
+                    checkpoint_dir = %ckpt_dir.display(),
+                    "no checkpoint available; fresh start will re-sync from genesis"
+                ),
+            }
+        }
+    }
+
     // Open the libmdbx state env and read the durable cursor.
     let env = StateEnvBuilder::new(&args.state_dir)
         .durability(args.state_durability.into())
         .open()
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
+
+    // Periodic checkpointing (fast recovery for OTHER nodes, and for this node
+    // on a future wipe). compact_to runs against an online RO snapshot, so it
+    // never blocks the writer. Guarded by an interval; prunes to `checkpoint_keep`.
+    if let (Some(ckpt_dir), true) = (
+        args.checkpoint_dir.clone(),
+        args.checkpoint_interval_secs > 0,
+    ) {
+        let ckpt_env = env.clone();
+        let interval = std::time::Duration::from_secs(args.checkpoint_interval_secs);
+        let keep = args.checkpoint_keep;
+        std::thread::Builder::new()
+            .name("kardamom-checkpointer".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(interval);
+                    match create_checkpoint(&ckpt_env, &ckpt_dir) {
+                        Ok(info) => {
+                            if info.block > keep
+                                && let Err(e) = prune_checkpoints(&ckpt_dir, info.block - keep + 1)
+                            {
+                                tracing::warn!(error = %e, "checkpoint prune failed");
+                            }
+                        }
+                        Err(e) => tracing::warn!(error = %e, "checkpoint creation failed"),
+                    }
+                }
+            })
+            .context("spawn checkpointer thread")?;
+    }
     // Crash-recovery resume. A non-empty state DB means we restarted mid-chain:
     // the cluster client replays the canonical stream FROM this cursor and the
     // reader/exec threads seed their absolute counters from it (see

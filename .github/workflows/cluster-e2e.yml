@@ -133,7 +133,7 @@ jobs:
         run: |
           case "${{ matrix.shard }}" in
             load)            { echo "RUN_LOAD=1"; echo "RUN_CHAOS=0"; echo "LOAD_DURATION_S=300"; echo "LOAD_TARGET_TPS=800"; echo "LOAD_SENDERS=6"; } ;;
-            chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor"; } ;;
+            chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor state-checkpoint-restore"; } ;;
             # archive-driver-loss kills the Aeron SUBSTRATE (ArchivingMediaDriver
             # system task) under ingress-0 — active/active must ride through a
             # node losing its driver + durability recorder, not just its task.
