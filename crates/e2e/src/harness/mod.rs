@@ -303,38 +303,33 @@ impl LocalStack {
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        // Both consumers are now committed through the same block, so their
-        // DBs are comparable regardless of how the processes end. SIGTERM
-        // first; SIGKILL on overrun is SAFE here (mdbx commits are atomic and
-        // the drain above proved everything is committed) — but it is not
-        // silent: `sigterm_honored` reports it.
-        //
-        // KNOWN BUG (found by this scenario): the VALIDATOR does not exit on
-        // SIGTERM — it survives 90s+ even with a healthy pipeline, while the
-        // executor exits immediately from the same shutdown shape. In the
-        // cluster that means Nomad SIGKILLs the validator on every
-        // stop/deploy and its mdbx env never closes gracefully. Tracked as a
-        // follow-up; the fallback below keeps this scenario meaningful in the
-        // meantime.
+        // Both consumers are committed through the same block now, so SIGTERM
+        // them and require a CLEAN exit from each. This doubles as the
+        // regression test for the receipts-pump ownership cycle that made the
+        // validator ignore SIGTERM entirely (fixed by
+        // `TxReceiptsSubscriberHandle::into_receiver`): before the fix the
+        // validator sat through 90s+ of SIGTERM, so a 20s bound catches any
+        // return of that deadlock. `terminate` SIGKILLs on overrun, which
+        // keeps the DBs comparable either way (commits are atomic), but the
+        // assertions below make a regression loud rather than silent.
         let honored = ShutdownReport {
             executor: self.executor.proc.terminate(Duration::from_secs(20)),
             validator: self
                 .validator
                 .as_mut()
-                .map(|v| v.proc.terminate(Duration::from_secs(10))),
+                .map(|v| v.proc.terminate(Duration::from_secs(20))),
         };
-        anyhow::ensure!(
-            honored.executor,
-            "executor did not exit on SIGTERM (this one is expected to)"
-        );
-        if honored.validator == Some(false) {
-            eprintln!(
-                "NOTE: validator ignored SIGTERM and was SIGKILLed — known shutdown bug; \
-                 state comparison below is still valid (both DBs committed through the \
-                 same block before the kill)"
-            );
-        }
         self.shutdown_report = honored;
+        anyhow::ensure!(
+            self.shutdown_report.executor,
+            "executor did not exit on SIGTERM within 20s"
+        );
+        anyhow::ensure!(
+            self.shutdown_report.validator != Some(false),
+            "validator did not exit on SIGTERM within 20s — the Aeron-runtime \
+             ownership cycle in the receipts pump is back (see \
+             TxReceiptsSubscriberHandle::into_receiver)"
+        );
         Ok(())
     }
 

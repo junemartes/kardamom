@@ -252,14 +252,20 @@ by construction.
   onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)
   and asserts the documented fail-stop — the halting log line and exit 2.
   (Lapse recovery is covered by `validator-lapse`.)
-- **Validator ignores SIGTERM** — found by the chain-semantics suite's
-  graceful-shutdown phase: the validator survives 90 s+ of a single SIGTERM
-  even with a healthy pipeline, while the executor exits immediately from the
-  same shutdown shape (a second SIGTERM does end it). Nomad therefore
-  SIGKILLs the validator on every stop/deploy and its mdbx env never closes
-  gracefully. Harmless for durability (commits are atomic), but it hides
-  shutdown errors and delays every restart by the kill timeout. Not yet
-  root-caused.
+- ~~**Validator ignores SIGTERM**~~ — **FIXED** (found by the
+  chain-semantics suite's graceful-shutdown phase). The validator survived
+  90 s+ of a single SIGTERM while the executor exited immediately from the
+  same shutdown shape, so Nomad SIGKILLed it on every stop/deploy. Root
+  cause: `TxReceiptsSubscriberHandle` carries an `AeronRuntime` clone (for
+  MDS destination churn) and the validator moved the whole handle into its
+  receipts pump task — an ownership cycle, since the runtime shuts down only
+  when its last clone drops, that shutdown is what ends `recv()`, and the
+  pump was holding the clone that prevented it. `drop(rt)` in `main` became a
+  no-op, the engine's tx_data subscriptions never closed, and the join never
+  returned. Fixed by `TxReceiptsSubscriberHandle::into_receiver()` (drops the
+  clone, keeps the receiver), applied in the validator and pre-emptively in
+  the ingress, which had the same shape masked by `main` returning without a
+  join. Regression-tested by the suite's graceful shutdown (20 s bound).
 - **Load-harness scrapes still ride `docker exec`** — the chaos *probes*
   moved to direct HTTP (issue #76), but `kardamom-load --metrics-via-docker`
   remains the default; a runner-wide exec stall can still degrade its

@@ -524,7 +524,7 @@ impl LiveIngressSubscription {
         // proxy dedups by tx hash downstream (first-wins) — this layer just
         // aggregates the streams. Legacy IPC: a plain subscription on the
         // shared `tx_receipts_channel`.
-        let mut receipts_sub = if mds {
+        let receipts_sub = if mds {
             let sub = TxReceiptsSubscriberHandle::open_mds(rt, channels)
                 .map_err(|e| IngressError::Internal(format!("open tx_receipts (MDS): {e}")))?;
             attach_executor_endpoints(channels, executor_count, false, |uri| {
@@ -536,9 +536,15 @@ impl LiveIngressSubscription {
             TxReceiptsSubscriberHandle::open(rt, channels)
                 .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?
         };
+        // `into_receiver()`: the handle's AeronRuntime clone must NOT travel
+        // into the pump task — that ownership cycle keeps the runtime alive
+        // forever (see `TxReceiptsSubscriberHandle::into_receiver`). Harmless
+        // here today only because `main` returns without joining on the
+        // streams; it made the validator unkillable by SIGTERM.
+        let mut receipts_rx = receipts_sub.into_receiver();
         let tx = receipts_tx.clone();
         tokio::spawn(async move {
-            while let Some((_pos, r)) = receipts_sub.recv().await {
+            while let Some((_pos, r)) = receipts_rx.recv().await {
                 let _ = tx.send(r);
             }
         });

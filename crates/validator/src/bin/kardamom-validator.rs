@@ -282,14 +282,26 @@ async fn main() -> Result<()> {
     }
 
     // tx_receipts: the executor's published receipts (MDS fan-in in the cluster).
+    //
+    // `into_receiver()` is load-bearing for shutdown: the handle carries an
+    // `AeronRuntime` clone (for MDS destination churn), and moving that clone
+    // into this pump task would deadlock process exit — the runtime shuts
+    // down only when its last clone drops, that shutdown is what ends
+    // `recv()`, and this task would be holding the clone that prevents it.
+    // The symptom was a validator that ignored SIGTERM entirely (`drop(rt)`
+    // became a no-op, so the engine's tx_data subscriptions never closed and
+    // the join below never returned) while the executor — which publishes
+    // receipts rather than subscribing — shut down fine. MDS destinations are
+    // attached inside `open_tx_receipts`, so nothing needs the clone after
+    // this point.
     {
         let executor_count = args
             .executor_count
             .unwrap_or(channels.tx_receipts_executor_count);
-        let mut handle = open_tx_receipts(&rt, &channels, executor_count)?;
+        let mut rx = open_tx_receipts(&rt, &channels, executor_count)?.into_receiver();
         let receipts = receipts.clone();
         tokio::spawn(async move {
-            while let Some((_pos, r)) = handle.recv().await {
+            while let Some((_pos, r)) = rx.recv().await {
                 receipts.insert(r);
             }
         });
