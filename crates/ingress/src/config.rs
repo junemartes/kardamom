@@ -51,6 +51,12 @@ pub struct IngressConfig {
     /// connection refusals for every client of the replica. Sized so the
     /// connection table is never the binding limit.
     pub rpc_max_connections: u32,
+    /// Pending-registry depth beyond which new submissions are shed with an
+    /// explicit retryable `Overloaded` error instead of parked. A registry
+    /// this deep means the pipeline is not draining; parking more submits
+    /// only builds the wedge (parked submits pin connections and their
+    /// senders' later nonces). Depth 0 sheds everything (test hook).
+    pub pending_shed_depth: usize,
 }
 
 impl Default for IngressConfig {
@@ -71,6 +77,7 @@ impl Default for IngressConfig {
             receipt_cache_capacity: 64 * 1024,
             ack_policy: AckPolicy::default(),
             rpc_max_connections: 8192,
+            pending_shed_depth: 16_384,
         }
     }
 }

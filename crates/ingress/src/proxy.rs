@@ -428,6 +428,19 @@ where
     ) -> Result<ValidatedSubmission, IngressError> {
         metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
 
+        // Overload valve: when the pending registry is this deep the pipeline
+        // is not draining — shed new submissions with an explicit retryable
+        // error instead of parking them into a wedge (the pre-#86 failure
+        // mode: parked submits pinned every connection slot and the ingress
+        // refused ALL clients). Applies to both submit paths; depth 0 sheds
+        // everything (used by tests).
+        let depth = self.pending.len();
+        if depth >= self.cfg.pending_shed_depth {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "overloaded")
+                .increment(1);
+            return Err(IngressError::Overloaded(depth));
+        }
+
         if let Err(e) = self.rate_limiter.check(client_ip) {
             let _ = e; // unit error
             metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "rate-limited")

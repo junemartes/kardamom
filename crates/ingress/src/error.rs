@@ -22,19 +22,29 @@ pub enum IngressError {
     Internal(String),
     #[error("duplicate (sender, nonce): {0:?}")]
     Duplicate((Address, u64)),
+    #[error(
+        "evicted by sequencer overload shed (sender, nonce): {0:?} — resubmit \
+         once the nonce is within the reorder window"
+    )]
+    Evicted((Address, u64)),
+    #[error("ingress overloaded: {0} submissions pending — retry with backoff")]
+    Overloaded(usize),
 }
 
 impl From<IngressError> for ErrorObjectOwned {
     fn from(err: IngressError) -> Self {
         let code = match &err {
-            // limit exceeded (server-specific)
-            IngressError::RateLimited(_) => -32005,
+            // limit exceeded (server-specific): retryable overload class
+            IngressError::RateLimited(_) | IngressError::Overloaded(_) => -32005,
             // invalid params
             IngressError::Decode(_)
             | IngressError::SignatureInvalid
             | IngressError::Duplicate(_) => -32602,
-            // generic server error
-            IngressError::PartitionUnavailable(_) | IngressError::Timeout => -32000,
+            // generic server error; Evicted is retryable once the sender's
+            // nonce is back within the reorder window
+            IngressError::PartitionUnavailable(_)
+            | IngressError::Timeout
+            | IngressError::Evicted(_) => -32000,
             // internal
             IngressError::Internal(_) => -32603,
         };
