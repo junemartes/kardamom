@@ -1,7 +1,8 @@
 # Sequencer Lag Detection + Receipt-Floor Resync — Spec
 
 - **Date:** 2026-07-25
-- **Status:** Draft for review
+- **Status:** Implemented (same PR); sections marked *as implemented* record where the build
+  deviated from the draft
 - **Extends:** `replicated-sequencer-shards-spec.md` (P=2 racing replicas),
   `sealer-aeron-cluster-failover-spec.md` (cluster dedup window)
 
@@ -69,14 +70,32 @@ Deployment note: the deployed binary currently wires `EmptyStateDatabase`
 (`crates/sequencer/src/bin/kardamom-sequencer.rs` — floors seed at 0); the receipts
 subscription is the first real executed-truth source in the sequencer process.
 
-### Resync mode (the response)
+### The response: floors drive the nonce state machine directly
 
-While in resync mode, the publish loop consults the floor before each `Publish` action:
+*(As implemented — the floor advance subsumes the per-publish filter this section originally
+described: floors drain at the top of every loop iteration, so the state machine's expected
+nonce is always current before any publish action is computed.)*
 
-- `floor(sender) > tx.nonce` → **skip**, count `resync_skipped_executed_total`. The skip is
-  final for this replica (the tx is executed; nothing downstream needs the ref).
-- otherwise → **publish normally** (twin-covered-but-unexecuted refs were ordered recently,
-  hence still inside the dedup window; uncovered refs MUST be published regardless of age).
+Every raised floor is applied to `PartitionState` via `advance_floor(sender, floor)`:
+`next_nonce` jumps to the floor (never regresses) and buffered entries below it are dropped —
+each a receipt-**proven** duplicate, counted in `resync_skipped_executed_total`. A stale
+incoming envelope below the floor then takes the ordinary `Past` path and surfaces to the
+client as `DuplicatedTx` (also counted when the floor proves it). Everything unproven —
+twin-covered-but-unexecuted (recently ordered, still inside the dedup window) or genuinely
+uncovered — publishes normally.
+
+The floor advance is **always on**, not gated on resync mode: it is proof-backed and
+therefore unconditionally safe, and keeping it continuous minimizes duplicate re-offers into
+the cluster. Resync *mode* is the trigger/observability envelope — the enter/exit signal the
+chaos suite and operators watch.
+
+Two receipt classes are excluded from floor evidence:
+
+- **`nonce == 0` receipts** — deposit receipts stamp a filler `nonce: 0` (deposits execute
+  with the nonce check disabled) and are indistinguishable on the wire from a genuine
+  first-tx receipt; treating one as proof could wrongly `Past`-reject a sender's first tx.
+  Floors therefore only ever prove from nonce ≥ 1 — degradation toward publish.
+- **Other shards' senders** — filtered at the receipts thread, keeping the floor map bounded.
 
 Deposit refs are NOT filtered in v1 (see Non-goals).
 
@@ -108,11 +127,9 @@ assume lag ⇒ enter resync (covers the case where the watermark is unavailable)
 
 Secondary triggers (belt-and-suspenders, all cheap and local):
 
-- **Frontier age** (fallback when egress is silent AND the session is down): local
-  monotonic arrival stamps; alarm at `θ = resync_enter_fraction × dedup_capacity /
-  design_peak_tps` (≈ 3.3 s at defaults).
-- **Session churn**: any re-`Connected` after the first, or a backpressure-rewind
-  persisting longer than θ.
+- **Publish stall** (as implemented, replacing the drafted frontier-age stamps): continuous
+  backpressure — which a not-yet-reconnected cluster session also maps to — persisting past
+  `publish_stall_ms` (default 10 s). Covers session churn and wedges the egress signals miss.
 - **Startup**: always start in resync mode (subsumes part of cold rejoin; see F02.1 below).
 
 Exit resync when the watermark gap has stayed below half the enter threshold (hysteresis)
@@ -137,11 +154,12 @@ endpoint) — out of scope here.
 
 | Knob | Default | Notes |
 | --- | --- | --- |
-| `--cluster-dedup-capacity` | `131072` | MUST equal `-Dkardamom.cluster.dedupCapacity`; assert at startup log level, surface in metrics for the CI contract check |
-| `--resync-enter-fraction` | `0.25` | watermark-gap enter threshold, as a fraction of capacity |
-| `--resync-boundary-silence-ticks` | `5` | boundary-silence trigger (× the cluster tick interval) |
-| `--resync-design-peak-tps` | `10000` | fallback frontier-age trigger only; matches the window's sizing math |
-| `--tx-receipts-*` | existing channel flags | reuse the validator's receipts-subscription wiring |
+| `--cluster-dedup-capacity` | `131072` | `[resync] dedup_capacity`; MUST equal `-Dkardamom.cluster.dedupCapacity` — logged at startup as the contract line |
+| `--resync-enter-percent` | `25` | `[resync] enter_percent` — watermark-jump enter threshold, percent of capacity (integer so the config stays `Eq`) |
+| `--resync-boundary-silence-ms` | `10000` | `[resync] boundary_silence_ms` — 5 × the 2000 ms deploy tick |
+| `[resync] publish_stall_ms` | `10000` | publish-stall secondary trigger (TOML only) |
+| `[resync] exit_hold_ms` | `2000` | exit hysteresis (TOML only) |
+| `--executor-count` | from channels config | tx_receipts MDS parity with the validator; unused on the multicast deploy |
 
 The capacity knob introduces a new must-agree pair with the JVM sysprop. Add it to the
 yamllint/contract CI check that already guards channel config drift.
@@ -161,12 +179,14 @@ yamllint/contract CI check that already guards channel config drift.
 
 1. **Unit** (`PartitionState` + floor filter): skip-iff-floor-proves; floor monotonicity;
    missed-receipt degradation publishes; sole-survivor publishes all.
-2. **Chaos case `sequencer-lapse`** (mirrors `validator-lapse`): under load, `docker pause`
-   ONE replica of a shard for a window sized past a shrunken dedup capacity (set
-   `dedupCapacity` low for the case so the horizon is reachable at CHAOS_TPS), resume.
-   Assert: no executor halt, zero divergence, pipeline progress verdicts pass,
-   `resync_skipped_executed_total > 0` on the paused replica, and the twin covered the gap
-   (every accepted tx receipts).
+2. **Chaos case `sequencer-lapse`** (mirrors `validator-lapse`; as implemented, in the
+   `chaos-sequencer` CI shard): under shard-pinned load, `docker pause` shard 0's replica A
+   for `SEQ_LAPSE_S` (30 s > the 10 s boundary-silence window), resume. Assert: pipeline
+   progress held throughout (twin covered), `resync_entered_total` INCREMENTED across the
+   pause on the paused replica, the replica keeps exporting, and the standard load +
+   per-replica convergence verdicts pass. (The case exercises detection + the safe response
+   at the default window; actually overrunning the 2^17 horizon at CHAOS_TPS=200 would need
+   a ~11-minute pause or a shrunken `dedupCapacity` — a local/manual variant, not CI.)
 3. **Cold-rejoin regression**: restart a replica mid-stream, assert buffered established
    senders unstick via receipt floors (F02.1 partial-closure behavior) and NO nonce gap is
    ever published (the NonceTooHigh guard the removed fix failed).

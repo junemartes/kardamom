@@ -54,6 +54,7 @@
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
 #        graceful-sequencer hard-sequencer sequencer-replica-kill
+#        sequencer-lapse
 #        sealer-graceful sealer-hard
 #        node-failure-executor archive-driver-loss
 #        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
@@ -261,6 +262,64 @@ run_validator_lapse() {
   [ $(( m1 - m0 )) -le 5 ] || fail "validator-lapse: coverage REGRESSED — bal_missing grew ${m0}->${m1} across the pause (the lapse window was not covered by the live term buffer)"
   [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after resume"
   log "validator-lapse PASS: caught up (block ${v1}, lag $(( e_now - v1 ))), kept verifying ${vf0}->${vf1}, bal_missing ${m0}->${m1}, 0 divergences"
+}
+
+# sequencer-lapse case: PAUSE one racing replica of shard 0 (seq-a on
+# kardamom-sequencer-0) for a window under pinned shard-0 load, then resume.
+# The twin (seq-b, other node) keeps ordering — the pipeline must never
+# stall. On resume the paused replica must DETECT the lapse (boundary-silence
+# / watermark-jump on the cluster egress it now consumes) and enter
+# receipt-floor resync (docs/agents/sequencer-lag-resync-spec.md) instead of
+# blindly re-offering its stale backlog: proven-executed refs are dropped on
+# receipt evidence, everything else publishes (the cluster dedup absorbs
+# within-window re-offers exactly as before). Asserts: pipeline progress
+# held, kardamom_sequencer_resync_entered_total INCREMENTED across the pause
+# (the startup enter predates the case), the replica is still exporting
+# after resume, and the standard load + convergence verdicts apply.
+SEQ_LAPSE_S="${SEQ_LAPSE_S:-30}"
+seqa_metric() { # <metric-name> -> integer sum across label lines (empty on scrape failure)
+  # seq-a on node-0: sequencer ip lane starts at .21, seq-a metrics :9001
+  # (mirrors assert_replica_healthy's bridge-first + exec-fallback probe).
+  { curl -fsS --max-time 5 "http://192.168.56.21:9001/metrics" 2>/dev/null \
+    || timeout 8 docker exec kardamom-sequencer-0 curl -fsS --max-time 5 \
+      "http://127.0.0.1:9001/metrics" 2>/dev/null; } \
+  | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { s += $NF } END { printf "%d", s }' \
+  || true
+}
+run_sequencer_lapse() {
+  local inner
+  inner="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
+  [ -n "${inner}" ] || fail "sequencer-lapse: no inner sequencer-a container on kardamom-sequencer-0"
+
+  local r0
+  r0="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r0="${r0:-0}"
+  log "sequencer-lapse: pausing ${inner} for ${SEQ_LAPSE_S}s (resync_entered=${r0})"
+  docker exec kardamom-sequencer-0 docker pause "${inner}" >/dev/null \
+    || fail "sequencer-lapse: docker pause failed"
+  sleep "${SEQ_LAPSE_S}"
+  docker exec kardamom-sequencer-0 docker unpause "${inner}" >/dev/null \
+    || fail "sequencer-lapse: docker unpause failed"
+  log "sequencer-lapse: resumed; twin must have covered (no stall)"
+
+  # The pipeline never depended on the paused replica — the twin raced on.
+  assert_progress
+
+  # The lapsed replica must notice on its own: its boundary-silence window
+  # (default 10s < SEQ_LAPSE_S) elapsed while it was frozen, so the first
+  # post-resume trigger evaluation enters resync. Counter, not gauge: the
+  # mode may already have exited by the time we scrape (enter is sticky in
+  # _entered_total, mode is not).
+  local t=0 r1
+  while :; do
+    r1="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r1="${r1:-0}"
+    [ "${r1}" -gt "${r0}" ] && break
+    [ "${t}" -ge 60 ] \
+      && fail "sequencer-lapse: resync never engaged within 60s of resume (entered ${r0} -> ${r1})"
+    sleep 5; t=$(( t + 5 ))
+  done
+  log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1})"
+  assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
+  log "sequencer-lapse PASS: progress held, resync engaged, replica healthy"
 }
 # Cluster-mode progress probe: the most-recently-committed block number as seen
 # by the executor (kardamom_executor_block_number gauge on :9004). The Java
@@ -591,9 +650,9 @@ run_case() { # <case-name>
 
   # One dedicated fresh funded account per case (single sender, nonces from 0)
   # so cases never collide / leave nonce gaps on the never-reset chain.
-  if [ "${name}" = "sequencer-replica-kill" ]; then
+  if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ]; then
     # PIN this case's load to SHARD 0 — the shard whose replica A is killed
-    # (seq-a on node-0). An arbitrary account lands on shard 0 or 1 by address
+    # (or paused). An arbitrary account lands on shard 0 or 1 by address
     # hash, so ~half of runs would otherwise drive an UNTOUCHED shard and the
     # failover assertions would prove nothing about the kill. Accounts skipped
     # here are burned, never reused (their nonce chains stay untouched at 0).
@@ -614,6 +673,12 @@ run_case() { # <case-name>
   local case_s="${CHAOS_CASE_S}"
   if [ "${name}" = "sequencer-replica-kill" ]; then
     local min_s=$(( INJECT_DELAY + CHAOS_RESTART_SLO_S + 60 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+  fi
+  # sequencer-lapse: load must still be flowing after the pause window so the
+  # resumed replica's resync + the twin-coverage verdicts observe live traffic.
+  if [ "${name}" = "sequencer-lapse" ]; then
+    local min_s=$(( INJECT_DELAY + SEQ_LAPSE_S + 60 ))
     [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
   fi
 
@@ -935,6 +1000,13 @@ run_case() { # <case-name>
       # anything that aged out. All validator-specific asserts live in the
       # helper.
       run_validator_lapse
+      ;;
+
+    sequencer-lapse)
+      # No component killed: pause ONE racing replica of shard 0 and assert
+      # the twin covers (no stall) while the resumed replica detects the
+      # lapse and enters receipt-floor resync. All asserts in the helper.
+      run_sequencer_lapse
       ;;
 
     *) fail "unknown chaos case: ${name}" ;;

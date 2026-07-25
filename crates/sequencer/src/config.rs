@@ -38,6 +38,11 @@ pub struct SequencerConfig {
     /// cluster ingress — there is no longer a non-cluster path.
     #[serde(default)]
     pub cluster: ClusterConfig,
+    /// Lag detection + receipt-floor resync knobs
+    /// (docs/agents/sequencer-lag-resync-spec.md). `resync.dedup_capacity`
+    /// MUST equal the cluster's `-Dkardamom.cluster.dedupCapacity`.
+    #[serde(default)]
+    pub resync: crate::resync::ResyncConfig,
 }
 
 fn default_nonce_floor_lag_ms() -> u64 {
@@ -66,6 +71,7 @@ impl Default for SequencerConfig {
             core_id: None,
             backpressure_policy: BackpressurePolicy::ReturnImmediately,
             cluster: ClusterConfig::default(),
+            resync: crate::resync::ResyncConfig::default(),
         }
     }
 }
