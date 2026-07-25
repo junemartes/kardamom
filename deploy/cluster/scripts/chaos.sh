@@ -325,16 +325,34 @@ run_sequencer_lapse() {
   # DETECTION: the egress feed thread measures the pause as one long
   # boundary-arrival gap (> the 10s silence window) and bumps
   # lag_suspected_total within moments of resume. This counter is
-  # starvation-proof — asserted FIRST and tightly.
-  local t=0 l1
+  # starvation-proof — asserted FIRST.
+  #
+  # SCRAPE FAILURE IS NOT ZERO: seqa_metric returns EMPTY when the scrape
+  # fails, and the pause/unpause (on a node whose inner dockerd already
+  # absorbed two docker-kills from earlier cases) can wedge exec-based
+  # fallbacks for minutes (the issue-#76 pattern) — three CI iterations
+  # failed with "0 -> 0" that was actually unreachable-endpoint defaulted
+  # to zero. Require REAL samples: only successful scrapes count toward
+  # the verdict, every sample is logged, and the clock is generous because
+  # it must outlive an exec stall.
+  local t=0 l1 raw good=0
   while :; do
-    l1="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"; l1="${l1:-0}"
-    [ "${l1}" -gt "${l0}" ] && break
-    if [ "${t}" -ge 60 ]; then
-      seqa_debug
-      fail "sequencer-lapse: lag never suspected within 60s of resume (lag_suspected ${l0} -> ${l1})"
+    raw="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"
+    if [ -n "${raw}" ]; then
+      l1="${raw}"; good=$(( good + 1 ))
+      log "sequencer-lapse: sample t=${t}s lag_suspected=${l1} (scrape ok #${good})"
+      [ "${l1}" -gt "${l0}" ] && break
+    else
+      log "sequencer-lapse: sample t=${t}s SCRAPE FAILED (not counted as zero)"
     fi
-    sleep 5; t=$(( t + 5 ))
+    if [ "${t}" -ge 240 ]; then
+      seqa_debug
+      if [ "${good}" -eq 0 ]; then
+        fail "sequencer-lapse: metrics endpoint unreachable for 240s after resume (0 successful scrapes) — replica process presumed dead/unreachable, cannot judge detection"
+      fi
+      fail "sequencer-lapse: lag never suspected within 240s of resume (lag_suspected ${l0} -> ${l1:-?}, ${good} good scrapes)"
+    fi
+    sleep 10; t=$(( t + 10 ))
   done
   log "sequencer-lapse: lag suspected (${l0} -> ${l1})"
 
@@ -349,14 +367,18 @@ run_sequencer_lapse() {
   local r1 mode
   t=0
   while :; do
-    r1="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r1="${r1:-0}"
-    mode="$(seqa_metric kardamom_sequencer_resync_mode)"; mode="${mode:-0}"
-    { [ "${r1}" -gt "${r0}" ] || [ "${mode}" -ge 1 ]; } && break
-    [ "${t}" -ge 180 ] \
-      && fail "sequencer-lapse: resync never engaged within 180s of resume (entered ${r0} -> ${r1}, mode ${mode}; lag was suspected ${l0} -> ${l1})"
-    sleep 5; t=$(( t + 5 ))
+    r1="$(seqa_metric kardamom_sequencer_resync_entered_total)"
+    mode="$(seqa_metric kardamom_sequencer_resync_mode)"
+    if [ -n "${r1}" ]; then
+      { [ "${r1}" -gt "${r0}" ] || [ "${mode:-0}" -ge 1 ]; } && break
+    fi
+    if [ "${t}" -ge 240 ]; then
+      seqa_debug
+      fail "sequencer-lapse: resync never engaged within 240s of resume (entered ${r0} -> ${r1:-scrape-failed}, mode ${mode:-scrape-failed}; lag was suspected ${l0} -> ${l1})"
+    fi
+    sleep 10; t=$(( t + 10 ))
   done
-  log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1}, mode ${mode})"
+  log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1}, mode ${mode:-0})"
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
   log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }
