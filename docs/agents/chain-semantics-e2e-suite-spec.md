@@ -1,7 +1,7 @@
 # Chain-Semantics E2E Test Suite — Spec
 
 - **Date:** 2026-07-25
-- **Status:** Proposed design; awaiting review
+- **Status:** Approved; PR-1 (Target-L harness + S3/S4/S5 + CI workflow) implemented on `test/chain-semantics-e2e`
 - **Goal (definition of done):** an e2e suite proving the rollup's **chain semantics** end-to-end — bridge round-trips against a real anvil L1, nonce-ordering guarantees over real JSON-RPC, validator↔executor state parity, batcher/DA↔validator root parity, and state-DB integrity — with each scenario written once and run on **two targets**: a fast deterministic single-host harness (`crates/e2e/tests/`, green in a dedicated CI job well under the cluster-e2e budget, plus a revived `just test-e2e-local`) and the **real CI cluster** (a new `semantics` shard in `cluster-e2e.yml` on the standard `ci-cluster.sh` DinD bring-up).
 
 ## Background / current state

@@ -240,32 +240,47 @@ aeron-driver-down:
     fi
     echo ">> MD stopped"
 
-# Run the e2e tests locally against a host-native Aeron Media Driver. Set
-# the MD up first, run the in-process + multi-process variants, then tear
-# the MD down. Use this on macOS where the Dockerised MD path doesn't work.
-test-e2e-local: aeron-driver-up
+# Ensure the aeron-all jar is cached (the e2e harness spawns its own
+# ArchivingMediaDrivers from it; `aeron-driver-up` shares the same cache).
+aeron-jar:
     #!/usr/bin/env bash
     set -euo pipefail
-    DIR={{AERON_LOCAL_ROOT}}/dir
-    trap 'just aeron-driver-down' EXIT
+    JAR={{AERON_LOCAL_ROOT}}/aeron-all-{{AERON_JAR_VERSION}}.jar
+    mkdir -p {{AERON_LOCAL_ROOT}}
+    if [[ ! -f "$JAR" ]]; then
+        echo ">> downloading aeron-all-{{AERON_JAR_VERSION}}.jar"
+        curl -fsSL "https://repo1.maven.org/maven2/io/aeron/aeron-all/{{AERON_JAR_VERSION}}/aeron-all-{{AERON_JAR_VERSION}}.jar" -o "$JAR"
+    fi
+    echo "$JAR"
+
+# Build the Java Aeron Cluster sealer jar (gradle :service:shadowJar). The
+# e2e harness auto-discovers the output path; override with
+# KARDAMOM_CLUSTER_JAR.
+cluster-jar:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    JH="$(just java-home)"
+    cd cluster/sealer-service
+    JAVA_HOME="$JH" ./gradlew :service:shadowJar -q
+    echo "cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar"
+
+# Run the chain-semantics e2e suite (Target L) locally: real service
+# binaries + a 1-member Java Aeron Cluster sealer + per-test media drivers,
+# driven through JSON-RPC/metrics only. Spec:
+# docs/agents/chain-semantics-e2e-suite-spec.md. Each test brings up its own
+# stack (2 JVMs + 4 service processes), so parallelism is capped at 2.
+test-e2e-local: aeron-jar cluster-jar
+    #!/usr/bin/env bash
+    set -euo pipefail
     SHIM="$(just java-shim)"
-    PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
-        cargo test -p e2e --features full-pipeline-e2e \
-            --test full_pipeline_e2e --locked -- --ignored --nocapture proof_of_pipeline
-    PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)" KARDAMOM_AERON_DIR="$DIR" \
-        cargo test -p e2e --features full-pipeline-e2e \
-            --test multiprocess_e2e --locked -- --ignored --nocapture --test-threads=1 \
-            multiprocess_e2e_signed_transfer_round_trip \
-            multiprocess_e2e_deposit_round_trip \
-            anvil_pipeline_e2e_l1_deposit_and_l2_round_trip
-    # NOTE: multiprocess_quorum_e2e_recorder_quorum_and_redundancy is run
-    # explicitly (not here): the on-quorum gate keys off the archive's recording
-    # position, whose catch-up latency on a single shared host archive is timing
-    # -sensitive. True 3-archive quorum + recorder-loss redundancy is validated
-    # by the cluster-e2e workflow. Run the single-host variant by name with:
-    #   just aeron-driver-up && KARDAMOM_AERON_DIR=/tmp/kardamom-aeron-local/dir \
-    #     cargo test -p e2e --features full-pipeline-e2e --test multiprocess_e2e \
-    #     -- --ignored --nocapture multiprocess_quorum
+    export PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)"
+    cargo build -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
+        --bins --locked
+    cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
+        --locked -- --ignored --nocapture --test-threads=2
+    # NOTE: the s5 queue-depth canary self-skips unless KARDAMOM_E2E_CANARY=1
+    # — it pins the KNOWN #81 pending-registry leak and fails until that
+    # follow-up lands.
 
 # ---------------------------------------------------------------------------
 # Multi-node cluster (deploy/cluster) — HOST dependencies.

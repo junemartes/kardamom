@@ -6,10 +6,26 @@ publish = false
 
 [features]
 default = []
-# Run the full-pipeline cross-component test under real Aeron in Docker.
-# Implies the `docker-e2e` testcontainers harness. Off by default so the
-# standard CI stays fast; the dedicated docker-e2e CI job opts in.
-full-pipeline-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
+# Enable the chain-semantics harness + scenario drivers (src/harness,
+# src/scenarios) and the full-pipeline tests that bind them to the local
+# stack. Also implies the `docker-e2e` testcontainers harness used by the
+# throughput bench. Off by default so the standard CI stays fast; the
+# chain-semantics-e2e CI job opts in.
+full-pipeline-e2e = [
+    "kardamom-log/docker-e2e",
+    "kardamom-log/testing",
+    "dep:alloy-consensus",
+    "dep:alloy-eips",
+    "dep:alloy-network",
+    "dep:alloy-signer-local",
+    "dep:anyhow",
+    "dep:hex",
+    "dep:jsonrpsee",
+    "dep:kardamom-bench",
+    "dep:libc",
+    "dep:serde_json",
+    "dep:tempfile",
+]
 
 [lib]
 path = "src/lib.rs"
@@ -23,6 +39,20 @@ bytes.workspace = true
 rkyv.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+# Chain-semantics harness deps — optional, activated by `full-pipeline-e2e`
+# so the default build stays as light as before.
+alloy-consensus = { workspace = true, optional = true }
+alloy-eips = { workspace = true, optional = true }
+alloy-network = { workspace = true, optional = true }
+alloy-signer-local = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+hex = { version = "0.4", optional = true }
+jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
+kardamom-bench = { path = "../bench", optional = true }
+libc = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tempfile = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Note: docker-e2e is activated only when the `full-pipeline-e2e`

@@ -122,6 +122,10 @@ job "ingress" {
           # steady-state occupancy is rate × latency (≈ 2 connections at CI
           # load); saturation campaigns should raise the flag explicitly.
           "--rpc-max-connections", "100",
+          # eth_chainId must report the real L2 chain id (group_vars
+          # chain_id); without this the ingress served the compiled-in
+          # default (1) and every client had to hardcode the chain.
+          "--chain-id", "412346",
           # Cluster mode: this node's cluster-egress (response) endpoint for the
           # on-quorum watermark observer's Aeron Cluster client. Uniform port
           # 40210 (cluster_egress_port); uniqueness comes from the ingress
