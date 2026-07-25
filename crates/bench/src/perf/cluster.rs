@@ -77,7 +77,7 @@ done"#
         docker_exec(
             node,
             "rm -rf /opt/kardamom/state /opt/kardamom/cluster /opt/kardamom/archive \
-             /opt/kardamom/aeron-mount/* 2>/dev/null; \
+             /opt/kardamom/checkpoints /opt/kardamom/aeron-mount/* 2>/dev/null; \
              mkdir -p /opt/kardamom/state /opt/kardamom/archive",
         )
         .with_context(|| format!("wipe {node}"))?;
