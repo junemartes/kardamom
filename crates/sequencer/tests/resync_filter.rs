@@ -113,7 +113,11 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     assert_eq!(refs.len(), 1, "nonce 0 skipped (proven), nonce 1 published");
     assert_eq!(refs[0].tx_data_position, pos(64));
     let errs = rc.errors.lock().unwrap();
-    assert_eq!(errs.len(), 1, "the skip surfaces as DuplicatedTx to ingress");
+    assert_eq!(
+        errs.len(),
+        1,
+        "the skip surfaces as DuplicatedTx to ingress"
+    );
     assert_eq!(errs[0].nonce, 0);
     assert!(matches!(
         errs[0].reason,
