@@ -911,20 +911,28 @@ run_case() { # <case-name>
       tar -C "${tmp_dir}/victim" -cf - "dir/${seg_name}" \
         | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
         || fail "archive-corruption: writing healed segment back failed"
-      docker exec kardamom-ingress-0 bash -lc \
-        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
-         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
-         describe-all 2>/dev/null | grep -oE 'recordingId=[0-9]+' | cut -d= -f2 | sort -u \
-         | while read -r rid; do java -cp /opt/aeron/aeron-all.jar \
-             io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir mark-valid \"\${rid}\" >/dev/null 2>&1 || true; done" \
-        >/dev/null 2>&1 || true
+      # The detection verify marked the failing recording INVALID in the
+      # catalog; clear the marks now that the bytes are healed. Recording ids
+      # are harvested on the RUNNER from the pre-heal verify output (one
+      # mark-valid container per id — a shell loop inside the node would run
+      # `java` on the node itself, where it doesn't exist).
+      local rid
+      for rid in $(echo "${verify_pre}" | grep -oE 'recordingId=[0-9]+' | cut -d= -f2 | sort -u); do
+        docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           mark-valid ${rid}" >/dev/null 2>&1 || true
+      done
       verify_post="$(docker exec kardamom-ingress-0 bash -lc \
         "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
          -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
          verify -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
-      echo "${verify_post}" | grep -qE 'recordingId=.*OK' \
-        || fail "archive-corruption: post-heal verify shows no OK recordings"
+      if ! echo "${verify_post}" | grep -qE 'recordingId=.*OK'; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify shows no OK recordings"
+      fi
       if echo "${verify_post}" | grep -qiE 'ERR |invalid|FAILED'; then
+        echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify still reports errors"
       fi
       rm -rf "${tmp_dir}"
