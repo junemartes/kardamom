@@ -818,8 +818,17 @@ run_case() { # <case-name>
       # Re-replicate from the surviving peer (ingress-1): stream its archive dir
       # across. This is the transport that kardamom-archive-rereplicate wraps for
       # an operator (peer copy -> mirror_archive -> verify_mirror).
+      #
+      # NEVER transplant archive-mark.dat from a LIVE source: the peer's daemon
+      # heartbeats it, so the copy looks "active" to the victim's restarting
+      # Archive, which then crash-loops on 'active Mark file detected' until the
+      # copied heartbeat ages out — observed blowing the 60s restart SLO (the
+      # recurring 'aeron did not reach >= 8 running (have 7)' flake, on main and
+      # PRs). The victim's own mark file was deliberately preserved by the wipe
+      # above and its heartbeat died with the killed driver, so it is already
+      # stale by restart time and the daemon starts cleanly.
       log "archive-tx-data-wipe: re-replicating archive from kardamom-ingress-1 mirror"
-      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive --exclude='dir/archive-mark.dat' -cf - dir \
         | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
         || fail "archive-tx-data-wipe: re-replication copy failed"
       # The pipeline must have ridden through on ingress-1 the whole time.

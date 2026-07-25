@@ -224,6 +224,17 @@ by construction.
   the *next* loss fatal, and a volume wipe hangs the executor's
   `resolve_recording`.
 
+  Two files must never be transplanted from a **live** source, and both bit
+  the chaos suite before they were understood: `archive-mark.dat` (the live
+  daemon heartbeats it, so a copy looks *active* to the destination's
+  restarting Archive, which crash-loops on `active Mark file detected` until
+  the copied heartbeat ages out — the recurring "aeron did not reach ≥ 8
+  running" restart-SLO failure), and the catalog's per-entry checksums for
+  actively-recording entries (rewritten mid-copy → torn entries that fail a
+  CRC-armed verify; issue #98). `mirror_archive` therefore never copies the
+  mark file — the destination daemon recreates its own — and the catalog copy
+  from a live source remains a known gap until #98 lands.
+
   **Corruption** (present-but-wrong bytes) is covered separately
   (`archive-corruption`): the archive driver records per-data-frame **CRC32s**
   (`aeron.archive.record.checksum`) and validates them on replay

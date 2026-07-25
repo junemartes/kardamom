@@ -10,10 +10,17 @@
 //!
 //! rusteron-archive does not expose Aeron's network `replicate()`, so
 //! re-replication is a **file-level segment mirror**: copy every `.rec` segment
-//! plus the `archive.catalog` and `archive-mark.dat` (both ingress archives
-//! share identical recording ids, so the catalog transplants cleanly). The copy
-//! is format-agnostic — it does not parse the raw Aeron segment framing; a
-//! deeper integrity pass is `aeron-archive verify` on the restored node.
+//! plus the `archive.catalog` (both ingress archives share identical recording
+//! ids, so the catalog transplants cleanly). The copy is format-agnostic — it
+//! does not parse the raw Aeron segment framing; a deeper integrity pass is
+//! `aeron-archive verify` on the restored node.
+//!
+//! `archive-mark.dat` is **never** copied: a live source daemon heartbeats its
+//! mark file, so a transplanted copy looks "active" to the destination's
+//! restarting Archive, which then crash-loops on `active Mark file detected`
+//! until the copied heartbeat ages out (observed blowing the chaos restart SLO).
+//! The destination daemon recreates its own mark on start; the mark carries no
+//! recording data.
 //!
 //! Operational note: the destination archive daemon **must be stopped** during
 //! the copy (it holds the catalog open). The chaos case / runbook stops the
@@ -23,9 +30,9 @@ use std::path::Path;
 
 use crate::error::BatcherError;
 
-/// Aeron archive files the mirror transplants besides the `.rec` segments.
+/// The one non-`.rec` file the mirror transplants. The mark file
+/// (`archive-mark.dat`) is deliberately NOT copied — see the module doc.
 const CATALOG_FILE: &str = "archive.catalog";
-const MARK_FILE: &str = "archive-mark.dat";
 
 /// What a [`mirror_archive`] run copied.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -33,11 +40,10 @@ pub struct MirrorReport {
     pub segments_copied: usize,
     pub bytes_copied: u64,
     pub catalog_copied: bool,
-    pub mark_copied: bool,
 }
 
 /// Mirror the Aeron archive directory `source_dir` into `dest_dir`: every
-/// `*.rec` segment plus `archive.catalog` / `archive-mark.dat`. Existing files
+/// `*.rec` segment plus `archive.catalog` (never the mark file). Existing files
 /// in `dest_dir` are overwritten. `source_dir` / `dest_dir` are the archive's
 /// `dir/` directory (where the `.rec` files live).
 ///
@@ -57,8 +63,7 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
         let name_str = name.to_string_lossy();
         let is_rec = path.extension().is_some_and(|x| x == "rec");
         let is_catalog = name_str == CATALOG_FILE;
-        let is_mark = name_str == MARK_FILE;
-        if !(is_rec || is_catalog || is_mark) {
+        if !(is_rec || is_catalog) {
             continue;
         }
         let bytes = std::fs::copy(&path, dest_dir.join(&name))?;
@@ -67,7 +72,6 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
             report.bytes_copied += bytes;
         }
         report.catalog_copied |= is_catalog;
-        report.mark_copied |= is_mark;
     }
 
     if report.segments_copied == 0 {
@@ -200,21 +204,23 @@ mod tests {
     }
 
     #[test]
-    fn mirrors_segments_catalog_and_mark() {
+    fn mirrors_segments_and_catalog_but_never_the_mark() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
         write(src.path(), "0-0.rec", &[1u8; 4096]);
         write(src.path(), "1-0.rec", &[2u8; 8192]);
         write(src.path(), CATALOG_FILE, &[9u8; 1024]);
-        write(src.path(), MARK_FILE, &[7u8; 512]);
-        // A non-archive file must be ignored.
+        // A live source's mark file must NOT be transplanted (the destination
+        // daemon would see it as active and crash-loop) — and non-archive
+        // files must be ignored.
+        write(src.path(), "archive-mark.dat", &[7u8; 512]);
         write(src.path(), "notes.txt", b"ignore me");
 
         let report = mirror_archive(src.path(), dst.path()).unwrap();
         assert_eq!(report.segments_copied, 2);
         assert_eq!(report.bytes_copied, 4096 + 8192);
         assert!(report.catalog_copied);
-        assert!(report.mark_copied);
+        assert!(!dst.path().join("archive-mark.dat").exists());
 
         // Bytes are identical and the stray file was skipped.
         assert_eq!(
