@@ -247,9 +247,48 @@ by construction.
   interleaving them in canonical order is a follow-up.
 - **L1 outage** — the batcher's behavior under sustained L1 RPC failure /
   gas spikes is designed (lag + catch-up) but not chaos-tested.
-- **Validator divergence injection** — fail-stop is unit-tested, but no e2e
-  case feeds the validator a corrupted receipt/BAL stream. (Lapse recovery
-  *is* now covered by `validator-lapse`.)
+- ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics
+  suite's `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta`
+  onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)
+  and asserts the documented fail-stop — the halting log line and exit 2.
+  (Lapse recovery is covered by `validator-lapse`.)
+- ~~**Withdrawals could never be attested**~~ — **FIXED** (found by the
+  chain-semantics suite's S2 bridge round-trip). The validator's attester
+  collected withdrawal leaves from the committed `BlockDelta`, but the engine
+  finalizes every delta with an EMPTY receipts vec (receipts travel on
+  tx_receipts instead — `PendingDelta::finalize`). So
+  `collect_withdrawal_leaves` always returned nothing: every posted output
+  carried `leaves=0` and committed to the empty withdrawals root, no
+  `MessagePassed` leaf was ever provable, and **no withdrawal could be
+  finalized on L1** — the L2→L1 half of the bridge was inert. The attester's
+  unit tests passed throughout because they feed a delta that *does* carry
+  receipts, a shape the live pipeline never produces. Fixed by
+  `AttestingReceiptSink`, which tees leaves off the receipt stream (where the
+  logs actually are) and flushes them per block boundary. Regression-tested
+  end-to-end by `s2_bridge_withdrawal_round_trip`.
+- **The persisted `receipts` / `tx_hash_index` tables are always empty** —
+  same root cause, still open. Because `BlockDelta.receipts` is always empty,
+  the state writer never populates either table, so
+  `StateDatabase::{get_receipt, get_tx_position}` can only ever return `None`
+  and the documented "`eth_getTransactionReceipt(hash)` → `get_tx_position` →
+  `get_receipt`" read path cannot work. Receipts survive only in the ingress's
+  in-RAM cache, so a restart loses them. Populating the delta's receipts on
+  the executor's commit path would fix it, but it adds a per-tx clone to the
+  hot path — worth its own PR with a saturation run.
+- ~~**Validator ignores SIGTERM**~~ — **FIXED** (found by the
+  chain-semantics suite's graceful-shutdown phase). The validator survived
+  90 s+ of a single SIGTERM while the executor exited immediately from the
+  same shutdown shape, so Nomad SIGKILLed it on every stop/deploy. Root
+  cause: `TxReceiptsSubscriberHandle` carries an `AeronRuntime` clone (for
+  MDS destination churn) and the validator moved the whole handle into its
+  receipts pump task — an ownership cycle, since the runtime shuts down only
+  when its last clone drops, that shutdown is what ends `recv()`, and the
+  pump was holding the clone that prevented it. `drop(rt)` in `main` became a
+  no-op, the engine's tx_data subscriptions never closed, and the join never
+  returned. Fixed by `TxReceiptsSubscriberHandle::into_receiver()` (drops the
+  clone, keeps the receiver), applied in the validator and pre-emptively in
+  the ingress, which had the same shape masked by `main` returning without a
+  join. Regression-tested by the suite's graceful shutdown (20 s bound).
 - **Load-harness scrapes still ride `docker exec`** — the chaos *probes*
   moved to direct HTTP (issue #76), but `kardamom-load --metrics-via-docker`
   remains the default; a runner-wide exec stall can still degrade its

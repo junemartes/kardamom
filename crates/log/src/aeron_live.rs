@@ -1108,6 +1108,26 @@ impl TxReceiptsSubscriberHandle {
     pub fn try_recv(&mut self) -> Option<(BPosition, Receipt)> {
         self.rx.try_recv().ok()
     }
+
+    /// Drop the handle's `AeronRuntime` clone, keeping only the receiver.
+    ///
+    /// USE THIS when the receiver is moved into a long-lived pump task that
+    /// ends on `recv() == None`. Keeping the whole handle there creates an
+    /// ownership CYCLE that makes the process unkillable by SIGTERM: the
+    /// runtime shuts down only when its LAST clone drops
+    /// ([`AeronRuntime::drop`]), the shutdown is what closes subscriptions,
+    /// and closing them is what makes `recv()` return `None` — so a pump
+    /// task holding a clone waits for a shutdown that its own clone is
+    /// preventing. `drop(rt)` in `main` then silently does nothing, every
+    /// other subscription stays open, and any thread joining on
+    /// end-of-stream hangs forever.
+    ///
+    /// Destinations can no longer be attached/detached afterwards, so call
+    /// it only once MDS membership is established (destinations attached at
+    /// open time survive — they live in the driver, not in this handle).
+    pub fn into_receiver(self) -> UnboundedReceiver<(BPosition, Receipt)> {
+        self.rx
+    }
 }
 
 /// TxReceipts subscriber for boundaries. Mirrors

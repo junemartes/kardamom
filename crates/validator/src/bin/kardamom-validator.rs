@@ -38,7 +38,7 @@ use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsSubscriberHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_state::{StateEnvBuilder, StateWriter, TrieMode, read_recovery_point, seed_genesis};
 use kardamom_types::BlockDelta;
-use kardamom_validator::attester::{self, AttesterConfig, AttestingWriterQueue};
+use kardamom_validator::attester::{self, AttesterConfig};
 use kardamom_validator::{
     BalBuffer, Divergence, ReceiptBuffer, ValidatorReceiptSink, ValidatorWriterQueue, metrics,
 };
@@ -282,14 +282,26 @@ async fn main() -> Result<()> {
     }
 
     // tx_receipts: the executor's published receipts (MDS fan-in in the cluster).
+    //
+    // `into_receiver()` is load-bearing for shutdown: the handle carries an
+    // `AeronRuntime` clone (for MDS destination churn), and moving that clone
+    // into this pump task would deadlock process exit — the runtime shuts
+    // down only when its last clone drops, that shutdown is what ends
+    // `recv()`, and this task would be holding the clone that prevents it.
+    // The symptom was a validator that ignored SIGTERM entirely (`drop(rt)`
+    // became a no-op, so the engine's tx_data subscriptions never closed and
+    // the join below never returned) while the executor — which publishes
+    // receipts rather than subscribing — shut down fine. MDS destinations are
+    // attached inside `open_tx_receipts`, so nothing needs the clone after
+    // this point.
     {
         let executor_count = args
             .executor_count
             .unwrap_or(channels.tx_receipts_executor_count);
-        let mut handle = open_tx_receipts(&rt, &channels, executor_count)?;
+        let mut rx = open_tx_receipts(&rt, &channels, executor_count)?.into_receiver();
         let receipts = receipts.clone();
         tokio::spawn(async move {
-            while let Some((_pos, r)) = handle.recv().await {
+            while let Some((_pos, r)) = rx.recv().await {
                 receipts.insert(r);
             }
         });
@@ -350,14 +362,23 @@ async fn main() -> Result<()> {
              (got a partial set)"
         ),
     };
-    // Tee each committed block's withdrawal leaves into the attester (a
-    // no-op wrapper when attestation is disabled). Boxed so both arms feed
-    // the same generic `Executor::run` parameter.
-    let sw_queue: Box<dyn StateWriterQueue> = match &attester_handle {
-        Some(h) => Box::new(AttestingWriterQueue::new(sw_queue, h.clone())),
-        None => Box::new(sw_queue),
+    let sw_queue: Box<dyn StateWriterQueue> = Box::new(sw_queue);
+
+    // Tee each block's withdrawal leaves into the attester from the RECEIPT
+    // stream (a plain sink when attestation is disabled).
+    //
+    // NOT from the BlockDelta: the engine finalizes every delta with an empty
+    // receipts vec (receipts travel on tx_receipts), so the previous
+    // `AttestingWriterQueue` wiring collected nothing — every posted output
+    // carried `leaves=0`, no withdrawal was ever attested, and none could be
+    // finalized on L1. Caught end-to-end by the chain-semantics suite's S2.
+    let c_pub: Box<dyn kardamom_engine::TxReceiptsPublication> = {
+        let sink = ValidatorReceiptSink::new(receipts.clone(), divergence.clone());
+        match &attester_handle {
+            Some(h) => Box::new(attester::AttestingReceiptSink::new(sink, h.clone())),
+            None => Box::new(sink),
+        }
     };
-    let c_pub = ValidatorReceiptSink::new(receipts.clone(), divergence.clone());
 
     // Background poller: expose committed-block + state-root height as
     // metrics, and feed each block's observed MPT root to the attester.

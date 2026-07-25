@@ -194,6 +194,76 @@ pub fn sign_transfer(
     })
 }
 
+/// Sign a legacy contract-creation tx. `init_code` is the deployment
+/// bytecode; 100k gas covers the trivial creates the scenarios deploy.
+pub fn sign_create(
+    signer: &DerivedSigner,
+    chain_id: u64,
+    nonce: u64,
+    init_code: &[u8],
+) -> Result<SignedTransfer> {
+    let mut tx = TxLegacy {
+        chain_id: Some(chain_id),
+        nonce,
+        gas_price: 1_000_000_000,
+        gas_limit: 100_000,
+        to: TxKind::Create,
+        value: U256::ZERO,
+        input: Bytes::copy_from_slice(init_code),
+    };
+    let sig = signer
+        .signer
+        .sign_transaction_sync(&mut tx)
+        .with_context(|| format!("sign create nonce {nonce}"))?;
+    let signed = tx.into_signed(sig);
+    let hash = *signed.hash();
+    let envelope: TxEnvelope = signed.into();
+    let mut bytes = Vec::with_capacity(160);
+    envelope.encode_2718(&mut bytes);
+    Ok(SignedTransfer {
+        raw: Bytes::from(bytes),
+        hash,
+        sender: signer.address,
+        nonce,
+    })
+}
+
+/// Sign a legacy call to `to` carrying `value` and `input` (contract calls
+/// such as the withdrawal predeploy's `initiateWithdrawal`).
+pub fn sign_call(
+    signer: &DerivedSigner,
+    chain_id: u64,
+    nonce: u64,
+    to: Address,
+    value: U256,
+    input: &[u8],
+) -> Result<SignedTransfer> {
+    let mut tx = TxLegacy {
+        chain_id: Some(chain_id),
+        nonce,
+        gas_price: 1_000_000_000,
+        gas_limit: 200_000,
+        to: TxKind::Call(to),
+        value,
+        input: Bytes::copy_from_slice(input),
+    };
+    let sig = signer
+        .signer
+        .sign_transaction_sync(&mut tx)
+        .with_context(|| format!("sign call nonce {nonce}"))?;
+    let signed = tx.into_signed(sig);
+    let hash = *signed.hash();
+    let envelope: TxEnvelope = signed.into();
+    let mut bytes = Vec::with_capacity(200);
+    envelope.encode_2718(&mut bytes);
+    Ok(SignedTransfer {
+        raw: Bytes::from(bytes),
+        hash,
+        sender: signer.address,
+        nonce,
+    })
+}
+
 /// Deterministic in-place Fisher–Yates shuffle (xorshift64*), so scenario
 /// orderings are reproducible from a seed without pulling in `rand`.
 pub fn seeded_shuffle<T>(items: &mut [T], mut seed: u64) {

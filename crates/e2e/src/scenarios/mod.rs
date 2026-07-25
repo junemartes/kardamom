@@ -8,6 +8,10 @@
 //! Target-C `ci-cluster.sh` DinD cluster later (PR-4 swaps the metrics
 //! transport for docker-exec probes behind this same struct).
 
+pub mod bridge;
+pub mod consistency;
+pub mod crash_recovery;
+pub mod divergence;
 pub mod nonce_gap;
 pub mod nonce_unordered;
 pub mod rpc_liveness;
@@ -32,6 +36,12 @@ pub const EXEC_BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 pub const SEQ_DROPPED_PAST: &str = "kardamom_sequencer_tx_dropped_past_total";
 pub const SEQ_EVICTIONS: &str = "kardamom_sequencer_pending_evictions_total";
 pub const INGRESS_QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
+pub const VALIDATOR_COMMITTED_BLOCK: &str = "validator_committed_block";
+pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";
+pub const VALIDATOR_BAL_MISSING: &str = "validator_bal_missing_total";
+pub const VALIDATOR_DIVERGENCE: &str = "validator_divergence_total";
+pub const TRIE_SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
+pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";
 
 /// One pipeline under test, reduced to its observable seams.
 pub struct Target {
@@ -42,6 +52,8 @@ pub struct Target {
     pub ingress_metrics: SocketAddr,
     pub executor_metrics: SocketAddr,
     pub sequencer_metrics: Vec<SocketAddr>,
+    /// Present when the stack runs a validator (S6/S7).
+    pub validator_metrics: Option<SocketAddr>,
 }
 
 impl Target {
@@ -49,6 +61,15 @@ impl Target {
         let s = metrics::scrape(self.executor_metrics).await?;
         s.value(name)
             .with_context(|| format!("executor metric {name} absent"))
+    }
+
+    pub async fn validator_metric(&self, name: &str) -> Result<f64> {
+        let addr = self
+            .validator_metrics
+            .context("target has no validator (StackConfig::validator)")?;
+        let s = metrics::scrape(addr).await?;
+        s.value(name)
+            .with_context(|| format!("validator metric {name} absent"))
     }
 
     pub async fn ingress_metric(&self, name: &str) -> Result<f64> {

@@ -68,10 +68,14 @@ jobs:
           curl -fsSL "https://repo1.maven.org/maven2/io/aeron/aeron-all/${AERON_JAR_VERSION}/aeron-all-${AERON_JAR_VERSION}.jar" \
             -o "/tmp/kardamom-aeron-local/aeron-all-${AERON_JAR_VERSION}.jar"
 
+      # Every binary a scenario spawns or shells out to: the pipeline three,
+      # the validator (S6/S7), statecheck (S6's CLI check), and the da-watcher
+      # (S1/S2 bridge).
       - name: Build service binaries
         run: |
           cargo build --locked --bins \
-            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor
+            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
+            -p kardamom-validator -p kardamom-state -p kardamom-da-watcher
 
       # Each test brings up its own stack (2 JVMs + 4 service processes);
       # cap parallelism at 2 on the shared runner.
