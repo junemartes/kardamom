@@ -556,7 +556,17 @@ fn run_session(
             }
         }
 
-        thread::sleep(Duration::from_millis(1));
+        // Wait for work instead of sleeping through it: block until an egress
+        // frame or an offer request is READY (not consumed — the drain loops
+        // at the top of the iteration consume), capped at 1ms so the
+        // keep-alive/replay/subscribe duties keep their cadence. The
+        // unconditional 1ms sleep here put up to 1ms of latency under EVERY
+        // sequencer offer (two of these hand-offs per tx), a hard ~1-2k tx/s
+        // cap per shard on the offer path.
+        let mut sel = crossbeam_channel::Select::new();
+        sel.recv(&frame_rx);
+        sel.recv(&req_rx);
+        let _ = sel.ready_timeout(Duration::from_millis(1));
     }
 }
 
