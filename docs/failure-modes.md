@@ -214,14 +214,32 @@ by construction.
   batcher. `tx_data` is **already 2× node-redundant**: it is a UDP-multicast
   stream, and both ingress replicas run an archive recorder that joins the group,
   so each ingress node's archive captures *every* publisher's shard streams. The
-  two archives are byte-identical (same recording ids + segment checksums), which
-  makes the peer an exact restore source. What was missing — and what
-  `archive-tx-data-wipe` + `kardamom-archive-rereplicate` add — is the path back
-  to full redundancy after a loss: a wiped node's archive is restored by
-  file-mirroring the surviving peer's segments + catalog (rusteron-archive does
-  not expose Aeron's network `replicate()`), and the restored archive passes
-  Aeron's own `ArchiveTool verify`. Without it, losing one copy leaves the *next*
-  loss fatal, and a volume wipe hangs the executor's `resolve_recording`.
+  two archives are byte-identical (same recording ids, verified by content
+  compare), which makes the peer an exact restore source. What was missing —
+  and what `archive-tx-data-wipe` + `kardamom-archive-rereplicate` add — is the
+  path back to full redundancy after a loss: a wiped node's archive is restored
+  by file-mirroring the surviving peer's segments + catalog (rusteron-archive
+  does not expose Aeron's network `replicate()`), and the restored archive
+  passes Aeron's own `ArchiveTool verify`. Without it, losing one copy leaves
+  the *next* loss fatal, and a volume wipe hangs the executor's
+  `resolve_recording`.
+
+  **Corruption** (present-but-wrong bytes) is covered separately
+  (`archive-corruption`): the archive driver records per-data-frame **CRC32s**
+  (`aeron.archive.record.checksum`) and validates them on replay
+  (`aeron.archive.replay.checksum`), so a CRC-armed
+  `ArchiveTool verify -a -checksum` detects a length-preserving byte flip that
+  a size check cannot see. Repair is *targeted*: `kardamom-archive-rereplicate
+  --diff` names exactly the segments that diverge from the mirror,
+  `--heal --segments` copies only those (daemon stopped, as with the full
+  mirror), and the CRC verdict arbitrates which side was corrupt — mirror
+  inequality alone only proves one of them is. On the **live** path the
+  executor's join-miss refetcher rotates to the mirror archive when a replay
+  produces no fragments (the corrupt-recording signature once replay-side CRC
+  validation is on), so a reader never stays pinned to a bad copy. The offline
+  segment reader also fail-stops on structural damage (a zeroed or undersized
+  frame header with data behind it is `Corruption`, no longer a silent
+  truncation that read as a live tail).
 - **The observation path itself** (issue #76, fixed) — `docker kill` of a
   privileged DinD node stalls host-dockerd `docker exec` runner-wide for
   minutes, blacking out every exec-based probe at once; for three days this
@@ -238,10 +256,10 @@ by construction.
 - **Archive *data* loss** — total loss has the rebuild-from-L1 path (above,
   `reconstruct_l1_e2e`); single-node `tx_data` archive loss has the
   re-replicate-from-peer path (`archive-tx-data-wipe` chaos case +
-  `kardamom-archive-rereplicate`). Still open: `tx_ordering` archive re-replication
-  (today it self-heals only via the Java cluster's Raft log replication on
-  rejoin), and executor resume against a partially-missing (not fully wiped)
-  segment set.
+  `kardamom-archive-rereplicate`); single-segment *corruption* has the
+  CRC-verify + targeted-heal path (`archive-corruption` chaos case). Still
+  open: `tx_ordering` archive re-replication (today it self-heals only via the
+  Java cluster's Raft log replication on rejoin).
 - **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
   transactions; re-deriving L1 deposits from `DepositInitiated` events and
   interleaving them in canonical order is a follow-up.

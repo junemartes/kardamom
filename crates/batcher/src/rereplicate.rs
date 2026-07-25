@@ -80,36 +80,115 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
 }
 
 /// Verify `dest_dir` mirrors `source_dir`: every source `.rec` exists in dest
-/// with an identical byte length. Returns the number of segments verified.
-/// A fast post-copy gate; `aeron-archive verify` is the deeper (frame-level)
-/// check run on the restored node before the daemon rejoins.
+/// with **identical content** (chunked byte compare — a length-preserving
+/// corruption is exactly the case a size check cannot see). Returns the number
+/// of segments verified; a divergence is `BatcherError::Corruption` naming
+/// every differing segment. `aeron-archive verify` (CRC-armed) remains the
+/// arbiter of WHICH side is corrupt — mirror inequality alone only proves that
+/// one of them is.
 pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, BatcherError> {
+    let diverged = diff_mirror(source_dir, dest_dir)?;
+    if !diverged.is_empty() {
+        return Err(BatcherError::Corruption(format!(
+            "segments diverge from mirror: {}",
+            diverged.join(", ")
+        )));
+    }
     let mut verified = 0usize;
+    for entry in std::fs::read_dir(source_dir)? {
+        if entry?.path().extension().is_some_and(|x| x == "rec") {
+            verified += 1;
+        }
+    }
+    Ok(verified)
+}
+
+/// Compare every source `.rec` against its mirror copy in `dest_dir` and
+/// return the names of segments that are missing or whose bytes differ. The
+/// heal path copies exactly this set (instead of the whole archive).
+pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<Vec<String>, BatcherError> {
+    let mut diverged = Vec::new();
     for entry in std::fs::read_dir(source_dir)? {
         let entry = entry?;
         let path = entry.path();
         if !path.extension().is_some_and(|x| x == "rec") {
             continue;
         }
-        let src_len = entry.metadata()?.len();
+        let name = entry.file_name().to_string_lossy().into_owned();
         let dest = dest_dir.join(entry.file_name());
-        let dest_len = std::fs::metadata(&dest)
-            .map_err(|e| {
-                BatcherError::Reconstruct(format!(
-                    "mirrored segment {} missing: {e}",
-                    entry.file_name().to_string_lossy()
-                ))
-            })?
-            .len();
-        if src_len != dest_len {
+        if !dest.is_file() || files_differ(&path, &dest)? {
+            diverged.push(name);
+        }
+    }
+    diverged.sort();
+    Ok(diverged)
+}
+
+/// Chunked byte compare — segments can be large, so never slurp whole files.
+fn files_differ(a: &Path, b: &Path) -> Result<bool, BatcherError> {
+    use std::io::Read;
+    if std::fs::metadata(a)?.len() != std::fs::metadata(b)?.len() {
+        return Ok(true);
+    }
+    let mut fa = std::io::BufReader::new(std::fs::File::open(a)?);
+    let mut fb = std::io::BufReader::new(std::fs::File::open(b)?);
+    let mut ba = vec![0u8; 64 * 1024];
+    let mut bb = vec![0u8; 64 * 1024];
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(false);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(true);
+        }
+    }
+}
+
+/// What a [`heal_from_mirror`] run repaired.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct HealReport {
+    pub segments_healed: usize,
+    pub bytes_copied: u64,
+}
+
+/// Targeted repair: copy ONLY the named `.rec` segments from the surviving
+/// mirror into `dest_dir`, leaving everything else untouched (a whole-archive
+/// re-copy is `mirror_archive`). Names must be bare segment file names — the
+/// output of [`diff_mirror`] or of a CRC-armed `ArchiveTool verify`.
+///
+/// Same operational constraint as the full mirror: the destination archive
+/// daemon must be stopped during the copy.
+pub fn heal_from_mirror(
+    source_dir: &Path,
+    dest_dir: &Path,
+    segments: &[String],
+) -> Result<HealReport, BatcherError> {
+    if segments.is_empty() {
+        return Err(BatcherError::Reconstruct(
+            "no segments named — nothing to heal".into(),
+        ));
+    }
+    let mut report = HealReport::default();
+    for name in segments {
+        // Bare `.rec` file names only — reject anything path-like.
+        if name.contains('/') || name.contains('\\') || !name.ends_with(".rec") {
             return Err(BatcherError::Reconstruct(format!(
-                "segment {} size mismatch: source {src_len} != dest {dest_len}",
-                entry.file_name().to_string_lossy()
+                "invalid segment name {name:?} — expected a bare *.rec file name"
             )));
         }
-        verified += 1;
+        let src = source_dir.join(name);
+        if !src.is_file() {
+            return Err(BatcherError::Reconstruct(format!(
+                "segment {name} missing from source mirror {}",
+                source_dir.display()
+            )));
+        }
+        report.bytes_copied += std::fs::copy(&src, dest_dir.join(name))?;
+        report.segments_healed += 1;
     }
-    Ok(verified)
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -169,6 +248,74 @@ mod tests {
         // Corrupt the destination copy (simulate a partial transfer).
         write(dst.path(), "0-0.rec", &[1u8; 100]);
         let err = verify_mirror(src.path(), dst.path()).unwrap_err();
-        assert!(matches!(err, BatcherError::Reconstruct(_)));
+        assert!(matches!(err, BatcherError::Corruption(_)));
+    }
+
+    #[test]
+    fn verify_detects_length_preserving_byte_flip() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "0-0.rec", &[1u8; 4096]);
+        mirror_archive(src.path(), dst.path()).unwrap();
+        // Flip one byte mid-file, length unchanged — invisible to a size
+        // check, which is exactly the corruption this verify must catch.
+        let mut corrupt = vec![1u8; 4096];
+        corrupt[2048] ^= 0xFF;
+        write(dst.path(), "0-0.rec", &corrupt);
+        let err = verify_mirror(src.path(), dst.path()).unwrap_err();
+        assert!(matches!(err, BatcherError::Corruption(_)));
+    }
+
+    #[test]
+    fn diff_names_exactly_the_diverged_segments() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "0-0.rec", &[1u8; 1024]);
+        write(src.path(), "1-0.rec", &[2u8; 1024]);
+        write(src.path(), "2-0.rec", &[3u8; 1024]);
+        mirror_archive(src.path(), dst.path()).unwrap();
+        let mut corrupt = vec![2u8; 1024];
+        corrupt[7] ^= 0x01;
+        write(dst.path(), "1-0.rec", &corrupt);
+        std::fs::remove_file(dst.path().join("2-0.rec")).unwrap();
+
+        let diverged = diff_mirror(src.path(), dst.path()).unwrap();
+        assert_eq!(diverged, vec!["1-0.rec".to_string(), "2-0.rec".to_string()]);
+    }
+
+    #[test]
+    fn heal_copies_only_named_segments() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "0-0.rec", &[1u8; 1024]);
+        write(src.path(), "1-0.rec", &[2u8; 1024]);
+        mirror_archive(src.path(), dst.path()).unwrap();
+        let mut corrupt = vec![2u8; 1024];
+        corrupt[100] ^= 0xFF;
+        write(dst.path(), "1-0.rec", &corrupt);
+        // Also locally modify the healthy one to prove heal doesn't touch it.
+        write(dst.path(), "0-0.rec", &[9u8; 1024]);
+
+        let report = heal_from_mirror(src.path(), dst.path(), &["1-0.rec".to_string()]).unwrap();
+        assert_eq!(report.segments_healed, 1);
+        assert_eq!(
+            std::fs::read(dst.path().join("1-0.rec")).unwrap(),
+            vec![2u8; 1024]
+        );
+        assert_eq!(
+            std::fs::read(dst.path().join("0-0.rec")).unwrap(),
+            vec![9u8; 1024]
+        );
+    }
+
+    #[test]
+    fn heal_rejects_path_like_and_missing_names() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "0-0.rec", &[1u8; 64]);
+        for bad in ["../evil.rec", "sub/0-0.rec", "0-0.dat", "missing.rec"] {
+            let err = heal_from_mirror(src.path(), dst.path(), &[bad.to_string()]).unwrap_err();
+            assert!(matches!(err, BatcherError::Reconstruct(_)), "{bad}");
+        }
     }
 }

@@ -20,4 +20,10 @@ pub enum BatcherError {
     Config(String),
     #[error("reconstruct: {0}")]
     Reconstruct(String),
+    /// Archive data that is present but wrong: a segment whose bytes diverge
+    /// from the redundant copy, or a malformed frame mid-file (not a live
+    /// tail). Distinct from `Reconstruct` so callers can route to the heal
+    /// path rather than treating it as an operational error.
+    #[error("archive corruption: {0}")]
+    Corruption(String),
 }
