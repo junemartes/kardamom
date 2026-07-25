@@ -44,10 +44,10 @@ for n in ${NODES}; do
   done
 done
 
-echo "==> [iter] wiping durable state on every node (state/cluster/archive/aeron-mount)"
+echo "==> [iter] wiping durable state on every node (state/cluster/archive/aeron-mount/checkpoints)"
 for n in ${NODES}; do
   docker exec "$n" bash -lc \
-    'rm -rf /opt/kardamom/state/* /opt/kardamom/cluster/* /opt/kardamom/archive/* /opt/kardamom/aeron-mount/* 2>/dev/null; true' \
+    'rm -rf /opt/kardamom/state/* /opt/kardamom/cluster/* /opt/kardamom/archive/* /opt/kardamom/aeron-mount/* /opt/kardamom/checkpoints/* 2>/dev/null; true' \
     || echo "WARN: wipe failed on $n"
 done
 
