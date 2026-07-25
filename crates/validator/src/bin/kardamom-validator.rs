@@ -27,7 +27,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use kardamom_engine::bin_support::{self, ReplayFailure, StateDurabilityArg};
+use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_engine::reader::cluster::ClusterConfig;
 use kardamom_engine::{
     DepositSubscription, Executor, ExecutorConfig, ExecutorError, MdbxSnapshotSource,
@@ -98,14 +98,19 @@ struct Args {
     /// every block. Costs a full rebuild on the sampled blocks.
     #[arg(long, env = "KARDAMOM_TRIE_SHADOW_CHECK")]
     trie_shadow_check: Option<u64>,
-    /// UDP endpoint the archive replay-merge binds to receive replayed
-    /// tx_data / tx_deposits fragments. When set, those streams are ALWAYS
-    /// read via the archive replay-merge (replayed from stream origin, then
-    /// followed live) — required for crash recovery, and also what lets a
-    /// fresh validator re-execute a chain with history (tx_ordering recovery
-    /// is the cluster client's replay, not the archive).
+    /// UDP endpoint (`host:port`) on this node where **refetched** tx_data /
+    /// tx_deposits fragments land (join-miss recovery from the remote
+    /// durability archives; see the executor's flag of the same name). Unset
+    /// ⇒ refetch disabled; a lost envelope is then fatal after the join
+    /// timeout. (tx_ordering recovery is the cluster client's replay, not
+    /// this path.)
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
     replay_destination_endpoint: Option<String>,
+    /// UDP endpoint (`host:port`) on this node for the refetch client's
+    /// archive-control RESPONSES. Required alongside
+    /// `--replay-destination-endpoint` for refetch to engage.
+    #[arg(long, env = "KARDAMOM_ARCHIVE_CONTROL_RESPONSE")]
+    archive_control_response_endpoint: Option<String>,
     /// This node's cluster-egress endpoint `ip:port`. Overrides/sets the
     /// [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
     /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
@@ -193,6 +198,7 @@ async fn main() -> Result<()> {
         let rp = ResumePoint {
             block: recovery.last_committed_block,
             record_count: recovery.last_fsynced_b_position.as_index(),
+            l2_timestamp: recovery.last_committed_l2_timestamp,
         };
         tracing::info!(
             resume_block = rp.block,
@@ -202,51 +208,22 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    // tx_data / tx_deposits source: archive replay-merge on crash-recovery
-    // RESUME only; live multicast on a fresh start — main's gating, RESTORED.
-    // F13.3 made replay-merge unconditional whenever the endpoint is
-    // configured (to close the crash-before-first-commit window), which put
-    // an archive replay session + merge on every fresh-start consumer from
-    // boot. The cluster-e2e first-record freeze afflicts exactly the four
-    // fresh-start processes running that path, at a deterministic offset
-    // from merge open, on a branch where main is green — so per the
-    // correctness-beats-optimization rule the always-on gating is reverted
-    // until the freeze is pinned down (see docs/reviews/…/fixes-CI-replay-
-    // loop.md). Known cost, as on main: a crash BEFORE the first commit
-    // rejoins live mid-stream and relies on the bounded join timeout to
-    // fail loudly rather than replaying from origin.
-    let recovery_endpoints = if resume.is_some() {
-        args.replay_destination_endpoint.clone()
-    } else {
-        None
-    };
-    if resume.is_some() && recovery_endpoints.is_none() {
-        anyhow::bail!(
-            "crash recovery needs --replay-destination-endpoint (host:port) for tx_data / \
-             tx_deposits archive replay-merge"
-        );
-    }
 
     // M tx_data subscriptions + tx_deposits (async→sync bridged), identical to
-    // the executor. A replay-merge that dies abnormally is a FAILED crash
-    // recovery: it is recorded on `replay_failure` and exits non-zero below,
-    // instead of masquerading as a clean end-of-stream.
-    let replay_failure = ReplayFailure::default();
-    let a_subs: Vec<Box<dyn TxDataSubscription>> = bin_support::open_tx_data_subs(
-        &rt,
+    // the executor: ALWAYS live, with the down-window/lapse gap recovered
+    // in-band by the reader's join-miss refetch against the remote durability
+    // archives (the resume-gated replay-merge this replaces pointed at the
+    // LOCAL archive, which records neither stream).
+    let a_subs: Vec<Box<dyn TxDataSubscription>> =
+        bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let dep_sub: Box<dyn DepositSubscription> = bin_support::open_tx_deposits_sub(&rt, &channels)?;
+    let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
-        args.shards,
-        recovery_endpoints.as_deref(),
-        &replay_failure,
-    )?;
-    let dep_sub: Box<dyn DepositSubscription> = bin_support::open_tx_deposits_sub(
-        &rt,
-        &channels,
-        &aeron_cfg,
-        recovery_endpoints.as_deref(),
-        &replay_failure,
-    )?;
+        args.aeron_dir.as_deref(),
+        args.archive_control_response_endpoint.as_deref(),
+        args.replay_destination_endpoint.as_deref(),
+    );
 
     // 1 tx_ordering subscription — ALWAYS the Aeron Cluster (Raft) egress,
     // exactly as in the executor. The cluster has already deduped + totally
@@ -442,23 +419,19 @@ async fn main() -> Result<()> {
             sw_queue,
             initial_block,
             resume,
+            // Join-miss archive refetch (None on single-host/IPC runs).
+            join_recovery,
         )
     });
 
-    // Exit on WHICHEVER comes first: an operator shutdown signal, the engine
-    // loop finishing on its own (a divergence fail-stop or a stream error), or
-    // a failed replay-merge recovery. Waiting only for SIGTERM would leave a
-    // halted validator lingering "alive" — metrics up, chain frozen — hiding
-    // the very fail-stop signal the divergence machinery exists to surface.
-    let mut replay_failed: Option<String> = None;
+    // Exit on WHICHEVER comes first: an operator shutdown signal, or the
+    // engine loop finishing on its own (a divergence fail-stop or a stream
+    // error). Waiting only for SIGTERM would leave a halted validator
+    // lingering "alive" — metrics up, chain frozen — hiding the very
+    // fail-stop signal the divergence machinery exists to surface.
     let engine_result = tokio::select! {
         _ = bin_support::wait_for_shutdown() => {
             tracing::info!("kardamom-validator: shutdown signal received; dropping runtime");
-            None
-        }
-        failure = replay_failure.failed() => {
-            tracing::error!(error = %failure, "replay-merge recovery failed; shutting down");
-            replay_failed = Some(failure);
             None
         }
         res = &mut join => Some(res),
@@ -486,11 +459,6 @@ async fn main() -> Result<()> {
             tracing::error!(reason = %reason, "validator halted on divergence");
         }
         std::process::exit(2);
-    }
-    if let Some(failure) = replay_failed.or_else(|| replay_failure.get()) {
-        // A failed crash recovery must be visible to the orchestrator as a
-        // non-zero exit (F13.4) — it is NOT a clean shutdown.
-        anyhow::bail!("replay-merge recovery failed: {failure}");
     }
     Ok(())
 }

@@ -164,6 +164,7 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             writer_q,
             0,
             None,
+            None,
         )
     });
 

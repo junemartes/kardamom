@@ -137,6 +137,22 @@ public final class SealerClusteredService implements ClusteredService {
     /** Malformed ingress frames dropped (logged at power-of-two counts). */
     private long droppedFrameCount = 0;
 
+    /**
+     * Cluster time of the last boundary tick (or timer arm) — the
+     * boundary-clock LIVENESS watermark. Pending cluster timers live in the
+     * leader's wheel only, and rapid election churn (a killed leader
+     * restarting and re-contesting) can strand EVERY member without a live
+     * timer: a term's re-arm from {@link #onNewLeadershipTermEvent} is only
+     * actioned by a module that is (still) leader when the call lands, so a
+     * re-arm racing a subsequent election is silently dropped — the clock
+     * then stops forever while elections, replay serving and session traffic
+     * all look healthy ("leader elected but nothing commits", observed live:
+     * every executor frozen while ~400 sessions churned through the
+     * egress-silence watchdog). {@link #maybeReviveBoundaryClock()} uses this
+     * watermark to revive the clock from log-driven callbacks.
+     */
+    private long lastBoundaryClockMs = 0L;
+
     // Scratch buffers for ingress id extraction and egress framing. Reused to
     // avoid per-message allocation on the single cluster service thread.
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
@@ -211,7 +227,10 @@ public final class SealerClusteredService implements ClusteredService {
 
     @Override
     public void onSessionOpen(ClientSession session, long timestamp) {
-        // Nothing session-specific to track; canonical state is global.
+        // Nothing session-specific to track; canonical state is global. But a
+        // session opening is a log-driven moment where timer scheduling is
+        // sanctioned — use it to revive a dead boundary clock (see helper).
+        maybeReviveBoundaryClock();
     }
 
     @Override
@@ -238,6 +257,10 @@ public final class SealerClusteredService implements ClusteredService {
             final long fromBlock =
                 buffer.getLong(offset + 1 + Long.BYTES, ByteOrder.LITTLE_ENDIAN);
             handleReplayRequest(session, fromIndex, fromBlock);
+            // A replay request is exactly what a consumer sends when it sees
+            // no egress — if that's because THIS member's boundary clock died
+            // (lost pending timer after election churn), revive it now.
+            maybeReviveBoundaryClock();
             return;
         }
         if (length < MIN_INGRESS_LEN) {
@@ -258,6 +281,11 @@ public final class SealerClusteredService implements ClusteredService {
 
         final Optional<Relayed> relayed = state.onRecord(canonicalIdScratch, payload);
         relayed.ifPresent(this::offerRelayed);
+        // Records relaying while blocks never seal is the dead-clock signature
+        // (canonical stream advances, boundary cadence gone) — revive here so
+        // sustained ingress load heals the clock without waiting for a
+        // consumer reconnect.
+        maybeReviveBoundaryClock();
     }
 
     @Override
@@ -366,6 +394,34 @@ public final class SealerClusteredService implements ClusteredService {
         while (!cluster.scheduleTimer(BOUNDARY_TIMER_CORRELATION_ID, deadline)) {
             cluster.idleStrategy().idle();
         }
+        lastBoundaryClockMs = cluster.time();
+    }
+
+    /**
+     * Revive a dead boundary clock. Called from the log-driven callbacks that
+     * KEEP firing in the wedged state ({@link #onSessionMessage} — ingress
+     * records and the reconnect storm's replay requests; {@link #onSessionOpen}
+     * — every reconnect), where scheduling timers is sanctioned. If this
+     * member is the leader and no tick (or arm) has been observed for three
+     * tick intervals, the pending timer was lost — re-arm it. Idempotent (the
+     * shared correlation id replaces rather than double-schedules), and the
+     * watermark reset in {@link #scheduleBoundaryTimer()} keeps this from
+     * re-arming on every message while the fresh expiry is still in flight.
+     * A fully idle cluster (no clients at all) cannot self-revive — but with
+     * no consumers there is nobody to observe boundaries either, and the
+     * first (re)connect heals it here.
+     */
+    private void maybeReviveBoundaryClock() {
+        if (cluster.role() != Cluster.Role.LEADER) {
+            return;
+        }
+        final long now = cluster.time();
+        if (lastBoundaryClockMs != 0L && now - lastBoundaryClockMs <= 3 * tickIntervalMs) {
+            return;
+        }
+        System.out.println("cluster boundary-clock REVIVE memberId=" + memberId
+            + " idleMs=" + (lastBoundaryClockMs == 0L ? -1 : now - lastBoundaryClockMs));
+        scheduleBoundaryTimer();
     }
 
     /**

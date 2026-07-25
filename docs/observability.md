@@ -11,9 +11,9 @@ Defaults (override with `--metrics-addr` or `KARDAMOM_METRICS_ADDR`):
 
 | Service | Default address | Dashboard UID |
 | --- | --- | --- |
-| `kardamom-sequencer` | `127.0.0.1:9001` | `kardamom-sequencer` |
+| `kardamom-sequencer` | `127.0.0.1:9001` (replica group seq-b: `:9011`) | `kardamom-sequencer` |
 | `kardamom-batcher` | `127.0.0.1:9002` | `kardamom-batcher` |
-| `kardamom-executor` | `127.0.0.1:9004` | `kardamom-executor` |
+| `kardamom-executor` | `127.0.0.1:9004` (cluster deploy binds `0.0.0.0`) | `kardamom-executor` |
 | `kardamom-da-watcher` | `127.0.0.1:9005` | `kardamom-da-watcher` |
 | `kardamom-ingress` | `127.0.0.1:9006` | `kardamom-ingress` |
 | `kardamom-validator` | `127.0.0.1:9007` | — (no dashboard yet) |
@@ -24,6 +24,11 @@ loser's exporter only complains from a background thread — see the shared-addr
 warning below). The cluster deploy pins the validator to `0.0.0.0:9006` on the
 aux node instead (`validator.nomad.hcl`; no ingress runs there), so scrapes
 and `ci-cluster.sh`'s validator verdict still read `:9006` **in the cluster**.
+
+One more port-map footnote: with P=2 racing sequencer replicas per shard, the
+second Nomad group (`seq-b`) moves to `:9011` on the same nodes; scraping
+`:9001` across the sequencer nodes still yields exactly one replica per shard,
+so per-shard totals keep their pre-replication meaning.
 
 The sealer no longer appears here: canonical ordering runs as a Java
 clustered service inside an Aeron Cluster (`cluster/sealer-service/`), which
@@ -48,6 +53,17 @@ them through `host.docker.internal`, which works as-is on Docker Desktop
 service must be started with `--metrics-addr 0.0.0.0:<port>` (or another
 non-loopback bind) to be reachable.
 
+In the **cluster deploy** the executor job binds `0.0.0.0:9004` deliberately:
+the chaos suite probes executors directly over the cluster bridge
+(`http://<node_ip>:9004/metrics`) instead of through `docker exec`, because
+killing a privileged DinD node can stall host-dockerd exec runner-wide for
+minutes — which used to black out every exec-based probe at once and
+masquerade as total pipeline failure (issue #76). The exporter itself also
+runs on a dedicated thread inside every service (`kardamom_obs::init`), so
+`/metrics` keeps answering even if the service's own runtime wedges:
+"wedged but alive" reads as `kardamom_service_up == 1` with stale gauges,
+not as node loss.
+
 Every binary also takes `--host-id <STRING>` (env `KARDAMOM_HOST_ID`, default
 `local`). It's
 stamped on every emitted metric as the `host_id` label, alongside an automatic
@@ -57,7 +73,13 @@ dashboard exposes a `host` template variable; per-service dashboards inherit it.
 ### Naming convention
 
 `kardamom_<service>_<subsystem>_<name>_<unit>` (e.g. `kardamom_sequencer_tx_ingested_total`,
-`kardamom_executor_block_apply_duration_seconds`). The executor exposes a
+`kardamom_executor_block_apply_duration_seconds`). One deviation: the
+validator's metrics are unprefixed `validator_*` —
+`validator_committed_block`, `validator_blocks_verified_total`,
+`validator_bal_missing_total`, `validator_receipt_missing_total`,
+`validator_divergence_total`, `validator_state_root_block` — consumed by the
+ci-cluster validator verdict and the `validator-lapse` chaos case rather than
+a dashboard. The executor exposes a
 `kardamom_executor_block_number` gauge for the chain head, plus the
 re-exported `kardamom_sealer_block_number` / `kardamom_sealer_boundaries_emitted_total`
 observed from cluster egress (see above).

@@ -96,6 +96,19 @@ pub struct AeronConfig {
     /// Archive control **response** channel. Also `aeron:ipc` — responses ride
     /// the shared media driver back to the recorder.
     pub archive_control_response_channel: String,
+
+    /// Remote durability-archive control endpoints (`host:port`) whose
+    /// archives record the **tx_data** streams (the ingress nodes — tx_data is
+    /// multicast and every ingress archive records every publisher's shard
+    /// streams, so each entry is a full mirror; consumers rotate through them
+    /// on failure). Used by the join-miss archive refetch
+    /// ([`crate::refetch`]); empty (the default) disables refetch.
+    #[serde(default)]
+    pub tx_data_archive_endpoints: Vec<String>,
+
+    /// Same for the **tx_deposits** stream (the da-watcher's node records it).
+    #[serde(default)]
+    pub tx_deposits_archive_endpoints: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -343,6 +356,8 @@ impl Default for AeronConfig {
             catalog_file_sync_level: 1,
             archive_control_request_channel: "aeron:ipc".into(),
             archive_control_response_channel: "aeron:ipc".into(),
+            tx_data_archive_endpoints: Vec::new(),
+            tx_deposits_archive_endpoints: Vec::new(),
         }
     }
 }
