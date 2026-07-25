@@ -32,6 +32,7 @@ pub mod error;
 mod offer_retry;
 pub mod publisher;
 pub mod recorder;
+pub mod refetch;
 pub mod replay;
 pub mod subscriber;
 pub mod supervisor;

@@ -187,6 +187,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             writer_q,
             0,
             None,
+            None,
         )
     });
 

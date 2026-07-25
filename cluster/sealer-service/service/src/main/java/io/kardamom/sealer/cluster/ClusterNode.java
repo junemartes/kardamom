@@ -173,6 +173,17 @@ public final class ClusterNode {
             // slot for at most 90s, acceptable for this deployment's small,
             // long-lived client set.
             .sessionTimeoutNs(java.util.concurrent.TimeUnit.SECONDS.toNanos(90))
+            // The Aeron default (10) sits AT this deployment's legitimate
+            // session count (3 executors + validator + 4 sequencer publishers
+            // + transient smoke/load clients), so ANY reconnect churn locks
+            // everyone out: a forced re-establishment leaks its predecessor
+            // session for up to the 90s timeout above, and a consumer-side
+            // egress-silence storm (observed live: ~400 sessions churned while
+            // the boundary clock was dead) exhausts the slots within seconds —
+            // rejected connects then hammer the module further. 256 gives the
+            // storm three orders of headroom while the 90s timeout still reaps
+            // zombies.
+            .maxConcurrentSessions(256)
             // leaderHeartbeatTimeoutNs stays at Aeron's 10s default: raising it
             // to 20s was tried and made real failovers ~20s slower (leader-kill
             // recovery blew the 60s pipeline-progress SLO), while the "leader

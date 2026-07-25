@@ -312,6 +312,7 @@ fn m4_canonical_b_order_drives_receipts() {
             writer_q,
             0,
             None,
+            None,
         )
     });
 
@@ -470,6 +471,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             Imm,
             writer_q,
             0,
+            None,
             None,
         )
     });
