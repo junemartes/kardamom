@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use e2e::harness::services::IngressOptions;
 use e2e::harness::{LocalStack, StackConfig};
-use e2e::scenarios::{nonce_gap, nonce_unordered, rpc_liveness};
+use e2e::scenarios::{consistency, divergence, nonce_gap, nonce_unordered, rpc_liveness};
 
 /// Client request bound, kept above every server-side park bound used here.
 fn client_timeout(park: Duration) -> Duration {
@@ -121,4 +121,66 @@ async fn s5_queue_depth_recovers_after_client_aborts() {
     rpc_liveness::queue_depth_canary(&t, 1, 3)
         .await
         .expect("S5 canary");
+}
+
+/// S6: the validator independently re-executes everything the executor
+/// executes, verifies it against the executor's streams — and after a
+/// graceful shutdown, the two libmdbx databases hold byte-identical chain
+/// state (plus both pass the `kardamom_state::integrity` sweep, run both as
+/// a library and through the `kardamom-statecheck` binary).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s6_validator_matches_executor() {
+    let mut stack = LocalStack::launch(StackConfig {
+        validator: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    consistency::run(&t, consistency::Params::default())
+        .await
+        .expect("S6 live phase");
+
+    stack.shutdown_graceful().await.expect("graceful shutdown");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    consistency::verify_state_dirs(&exec_dir, &val_dir).expect("S6 offline phase");
+
+    // Same verdict through the operational CLI.
+    let statecheck = e2e::harness::services::bin("kardamom-statecheck").expect("statecheck bin");
+    let out = std::process::Command::new(statecheck)
+        .arg(&exec_dir)
+        .arg("--compare")
+        .arg(&val_dir)
+        .output()
+        .expect("run statecheck");
+    assert!(
+        out.status.success(),
+        "kardamom-statecheck failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// S7: prove the divergence tripwire actually fires — a corrupt BAL on the
+/// real tx_bal channel must halt the validator with the documented exit 2.
+/// Closes the docs/failure-modes.md "divergence injection" gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s7_corrupt_bal_halts_validator() {
+    let mut stack = LocalStack::launch(StackConfig {
+        validator: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    divergence::corrupt_bal_halts_validator(&mut stack, &t)
+        .await
+        .expect("S7");
 }

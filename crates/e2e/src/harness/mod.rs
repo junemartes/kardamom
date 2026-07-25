@@ -13,6 +13,7 @@
 //! root (its path is printed) for post-mortem digging.
 
 pub mod aeron;
+pub mod inject;
 pub mod l2;
 pub mod metrics;
 pub mod proc;
@@ -40,6 +41,12 @@ pub struct StackConfig {
     pub sealer_members: usize,
     pub cluster_tick_ms: u64,
     pub ingress: IngressOptions,
+    /// Also run `kardamom-validator` (S6/S7). Off by default — the nonce/RPC
+    /// scenarios don't need it and stacks stay lighter without it.
+    pub validator: bool,
+    /// Trie shadow-check cadence for the validator (`Some(1)` = every block,
+    /// the semantics-suite default; the cluster runs 8).
+    pub trie_shadow_check: Option<u64>,
 }
 
 impl Default for StackConfig {
@@ -49,8 +56,19 @@ impl Default for StackConfig {
             sealer_members: 1,
             cluster_tick_ms: 250,
             ingress: IngressOptions::default(),
+            validator: false,
+            trie_shadow_check: Some(1),
         }
     }
+}
+
+/// Which services exited on SIGTERM (vs. needing the SIGKILL fallback) during
+/// [`LocalStack::shutdown_graceful`]. `validator` is `None` when the stack
+/// runs without one.
+#[derive(Debug, Default)]
+pub struct ShutdownReport {
+    pub executor: bool,
+    pub validator: Option<bool>,
 }
 
 pub struct LocalStack {
@@ -59,11 +77,13 @@ pub struct LocalStack {
     // order.
     ingress: SpawnedIngress,
     executor: Spawned,
+    validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
     sealer: SealerCluster,
     driver: MediaDriver,
     root: tempfile::TempDir,
     keep: bool,
+    shutdown_report: ShutdownReport,
     pub cfg: StackConfig,
 }
 
@@ -113,16 +133,23 @@ impl LocalStack {
             sequencers.push(services::spawn_sequencer(&spec, i)?);
         }
         let executor = services::spawn_executor(&spec)?;
+        let validator = if cfg.validator {
+            Some(services::spawn_validator(&spec, cfg.trie_shadow_check)?)
+        } else {
+            None
+        };
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
 
         let stack = Self {
             ingress,
             executor,
+            validator,
             sequencers,
             sealer,
             driver,
             root,
             keep,
+            shutdown_report: ShutdownReport::default(),
             cfg,
         };
 
@@ -158,6 +185,9 @@ impl LocalStack {
             ("ingress".to_string(), self.ingress.metrics_addr),
             ("executor".to_string(), self.executor.metrics_addr),
         ];
+        if let Some(val) = &self.validator {
+            v.push(("validator".to_string(), val.metrics_addr));
+        }
         for (i, s) in self.sequencers.iter().enumerate() {
             v.push((format!("sequencer-{i}"), s.metrics_addr));
         }
@@ -175,6 +205,7 @@ impl LocalStack {
             ingress_metrics: self.ingress.metrics_addr,
             executor_metrics: self.executor.metrics_addr,
             sequencer_metrics: self.sequencers.iter().map(|s| s.metrics_addr).collect(),
+            validator_metrics: self.validator.as_ref().map(|v| v.metrics_addr),
         })
     }
 
@@ -183,10 +214,140 @@ impl LocalStack {
         self.root.path().to_path_buf()
     }
 
+    /// The shared media driver's `aeron.dir` (for test-side stream injection).
+    pub fn aeron_dir(&self) -> PathBuf {
+        self.driver.aeron_dir.clone()
+    }
+
+    pub fn executor_state_dir(&self) -> Option<PathBuf> {
+        self.executor.state_dir.clone()
+    }
+
+    pub fn validator_state_dir(&self) -> Option<PathBuf> {
+        self.validator.as_ref().and_then(|v| v.state_dir.clone())
+    }
+
+    /// Freeze the executor (SIGSTOP): its genuine BAL/receipt publications
+    /// stop so an injected corrupt frame faces no competition (S7).
+    pub fn suspend_executor(&self) {
+        self.executor.proc.suspend();
+    }
+
+    pub fn resume_executor(&self) {
+        self.executor.proc.resume();
+    }
+
+    /// Wait for the validator process to exit on its own; returns its exit
+    /// code (S7 expects the divergence fail-stop's exit 2).
+    pub fn wait_validator_exit(&mut self, timeout: Duration) -> Option<Option<i32>> {
+        self.validator.as_mut()?.proc.wait_exit(timeout)
+    }
+
+    pub fn validator_log(&self) -> Option<String> {
+        let v = self.validator.as_ref()?;
+        std::fs::read_to_string(&v.proc.log_path).ok()
+    }
+
+    /// Stop the pipeline so both state DBs freeze at the SAME final block,
+    /// then shut the executor + validator down cleanly (mdbx envs closed) for
+    /// offline inspection.
+    ///
+    /// Order matters twice over:
+    /// 1. ingress + sequencers die first, so no new transactions enter;
+    /// 2. the sealer is **SIGSTOPped, not killed** — that halts the boundary
+    ///    clock (otherwise it keeps stamping empty blocks and the two
+    ///    consumers never settle on a common head) while leaving the cluster
+    ///    sessions intact. Killing it instead wedges shutdown: the Rust
+    ///    cluster client treats a vanished sealer as a reconnect-with-backoff
+    ///    case and retries forever, so the reader never sees end-of-stream
+    ///    and the process ignores SIGTERM until the harness SIGKILLs it.
+    /// 3. only then SIGTERM the consumers, which close their mdbx envs.
+    pub async fn shutdown_graceful(&mut self) -> Result<()> {
+        self.ingress.proc.terminate(Duration::from_secs(10));
+        for s in &mut self.sequencers {
+            s.proc.terminate(Duration::from_secs(10));
+        }
+        for p in &self.sealer.procs {
+            p.suspend();
+        }
+
+        // Drain: executor's block freezes (no more boundaries) and the
+        // validator catches up to the same block.
+        let exec_addr = self.executor.metrics_addr;
+        let val_addr = self.validator.as_ref().map(|v| v.metrics_addr);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut last_exec = -1.0f64;
+        loop {
+            let exec_block = metrics::scrape(exec_addr)
+                .await?
+                .value(crate::scenarios::EXEC_BLOCK_NUMBER)
+                .unwrap_or(0.0);
+            let val_ok = match val_addr {
+                None => true,
+                Some(addr) => {
+                    let committed = metrics::scrape(addr)
+                        .await?
+                        .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                        .unwrap_or(0.0);
+                    committed == exec_block
+                }
+            };
+            if val_ok && exec_block == last_exec {
+                break; // stable across one interval AND validator caught up
+            }
+            last_exec = exec_block;
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "drain: executor/validator did not settle on a common block in 60s"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Both consumers are now committed through the same block, so their
+        // DBs are comparable regardless of how the processes end. SIGTERM
+        // first; SIGKILL on overrun is SAFE here (mdbx commits are atomic and
+        // the drain above proved everything is committed) — but it is not
+        // silent: `sigterm_honored` reports it.
+        //
+        // KNOWN BUG (found by this scenario): the VALIDATOR does not exit on
+        // SIGTERM — it survives 90s+ even with a healthy pipeline, while the
+        // executor exits immediately from the same shutdown shape. In the
+        // cluster that means Nomad SIGKILLs the validator on every
+        // stop/deploy and its mdbx env never closes gracefully. Tracked as a
+        // follow-up; the fallback below keeps this scenario meaningful in the
+        // meantime.
+        let honored = ShutdownReport {
+            executor: self.executor.proc.terminate(Duration::from_secs(20)),
+            validator: self
+                .validator
+                .as_mut()
+                .map(|v| v.proc.terminate(Duration::from_secs(10))),
+        };
+        anyhow::ensure!(
+            honored.executor,
+            "executor did not exit on SIGTERM (this one is expected to)"
+        );
+        if honored.validator == Some(false) {
+            eprintln!(
+                "NOTE: validator ignored SIGTERM and was SIGKILLed — known shutdown bug; \
+                 state comparison below is still valid (both DBs committed through the \
+                 same block before the kill)"
+            );
+        }
+        self.shutdown_report = honored;
+        Ok(())
+    }
+
+    /// Which services honored SIGTERM during [`Self::shutdown_graceful`].
+    pub fn shutdown_report(&self) -> &ShutdownReport {
+        &self.shutdown_report
+    }
+
     fn dump_tails(&self) {
         eprintln!("=== stack log tails ({}) ===", self.root.path().display());
         let procs: Vec<&proc::Proc> = std::iter::once(&self.ingress.proc)
             .chain(std::iter::once(&self.executor.proc))
+            .chain(self.validator.as_ref().map(|v| &v.proc))
             .chain(self.sequencers.iter().map(|s| &s.proc))
             .chain(self.sealer.procs.iter())
             .chain(std::iter::once(&self.driver.proc))

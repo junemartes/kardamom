@@ -247,9 +247,19 @@ by construction.
   interleaving them in canonical order is a follow-up.
 - **L1 outage** — the batcher's behavior under sustained L1 RPC failure /
   gas spikes is designed (lag + catch-up) but not chaos-tested.
-- **Validator divergence injection** — fail-stop is unit-tested, but no e2e
-  case feeds the validator a corrupted receipt/BAL stream. (Lapse recovery
-  *is* now covered by `validator-lapse`.)
+- ~~**Validator divergence injection**~~ — **CLOSED**: the chain-semantics
+  suite's `s7_corrupt_bal_halts_validator` publishes a corrupt `BlockDelta`
+  onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)
+  and asserts the documented fail-stop — the halting log line and exit 2.
+  (Lapse recovery is covered by `validator-lapse`.)
+- **Validator ignores SIGTERM** — found by the chain-semantics suite's
+  graceful-shutdown phase: the validator survives 90 s+ of a single SIGTERM
+  even with a healthy pipeline, while the executor exits immediately from the
+  same shutdown shape (a second SIGTERM does end it). Nomad therefore
+  SIGKILLs the validator on every stop/deploy and its mdbx env never closes
+  gracefully. Harmless for durability (commits are atomic), but it hides
+  shutdown errors and delays every restart by the kill timeout. Not yet
+  root-caused.
 - **Load-harness scrapes still ride `docker exec`** — the chaos *probes*
   moved to direct HTTP (issue #76), but `kardamom-load --metrics-via-docker`
   remains the default; a runner-wide exec stall can still degrade its

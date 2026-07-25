@@ -73,6 +73,8 @@ pub struct ServiceSpec<'a> {
 pub struct Spawned {
     pub proc: Proc,
     pub metrics_addr: SocketAddr,
+    /// The service's libmdbx state dir (executor/validator only).
+    pub state_dir: Option<PathBuf>,
 }
 
 pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
@@ -111,6 +113,7 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
     Ok(Spawned {
         proc,
         metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
+        state_dir: None,
     })
 }
 
@@ -145,6 +148,47 @@ pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
     Ok(Spawned {
         proc,
         metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
+        state_dir: Some(state_dir),
+    })
+}
+
+/// Spawn `kardamom-validator` with its own state dir and the trie
+/// shadow-check at the given cadence (`Some(1)` = every block, the
+/// semantics-suite default; the production cluster runs 8).
+pub fn spawn_validator(spec: &ServiceSpec<'_>, trie_shadow_check: Option<u64>) -> Result<Spawned> {
+    let cfg_path = spec.root.join("validator.toml");
+    std::fs::write(&cfg_path, cluster_toml(spec.cluster_ingress_endpoints))?;
+    let state_dir = spec.root.join("validator-state");
+    std::fs::create_dir_all(&state_dir)?;
+    let metrics_port = free_tcp_port()?;
+    let egress_port = free_udp_port()?;
+    let mut cmd = Command::new(bin("kardamom-validator")?);
+    cmd.arg("--config")
+        .arg(&cfg_path)
+        .arg("--aeron-dir")
+        .arg(spec.aeron_dir)
+        .args(["--shards", &spec.shards.to_string()])
+        .args(["--chain-id", &spec.chain_id.to_string()])
+        .arg("--chain")
+        .arg(spec.genesis)
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .args(["--state-durability", "safe-no-sync"])
+        .args([
+            "--cluster-egress-endpoint",
+            &format!("127.0.0.1:{egress_port}"),
+        ])
+        .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--host-id", "e2e-validator"]);
+    if let Some(n) = trie_shadow_check {
+        cmd.args(["--trie-shadow-check", &n.to_string()]);
+    }
+    cmd.env("RUST_LOG", "info");
+    let proc = Proc::spawn("validator", cmd, spec.root.join("validator.log"))?;
+    Ok(Spawned {
+        proc,
+        metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
+        state_dir: Some(state_dir),
     })
 }
 

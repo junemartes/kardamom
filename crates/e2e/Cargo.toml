@@ -22,6 +22,7 @@ full-pipeline-e2e = [
     "dep:hex",
     "dep:jsonrpsee",
     "dep:kardamom-bench",
+    "dep:kardamom-state",
     "dep:libc",
     "dep:serde_json",
     "dep:tempfile",
@@ -50,6 +51,7 @@ anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
 kardamom-bench = { path = "../bench", optional = true }
+kardamom-state = { path = "../state", optional = true }
 libc = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

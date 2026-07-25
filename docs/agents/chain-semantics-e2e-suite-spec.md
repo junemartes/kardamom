@@ -1,7 +1,7 @@
 # Chain-Semantics E2E Test Suite — Spec
 
 - **Date:** 2026-07-25
-- **Status:** Approved; PR-1 (Target-L harness + S3/S4/S5 + CI workflow) implemented on `test/chain-semantics-e2e`
+- **Status:** Approved. PR-1 (Target-L harness + S3/S4/S5 + CI workflow) **merged** (#90, with the #81 pending-registry fix it found). PR-2 (S6/S7 + `kardamom_state::integrity` + S9a/c) implemented on `test/chain-semantics-s6-s9`.
 - **Goal (definition of done):** an e2e suite proving the rollup's **chain semantics** end-to-end — bridge round-trips against a real anvil L1, nonce-ordering guarantees over real JSON-RPC, validator↔executor state parity, batcher/DA↔validator root parity, and state-DB integrity — with each scenario written once and run on **two targets**: a fast deterministic single-host harness (`crates/e2e/tests/`, green in a dedicated CI job well under the cluster-e2e budget, plus a revived `just test-e2e-local`) and the **real CI cluster** (a new `semantics` shard in `cluster-e2e.yml` on the standard `ci-cluster.sh` DinD bring-up).
 
 ## Background / current state
@@ -148,6 +148,13 @@ S8 on Target C stays deferred until batcher live posting is rewired for the clus
 5. **PR-5 — DA parity (S8) + crash case (S9b) on Target L:** harness canonical collector; wires `kardamom-reconstruct --expect-root` into CI for the first time.
 
 Each PR lands with its scenarios green in the relevant workflow, gated on the full check set per repo convention. PR-4 is validated with a full local-cluster run before merge (per the standing local-validation directive).
+
+## Findings (bugs the suite surfaced)
+
+1. **#81 pending-registry leak** — reproduced by S5's queue-depth probe, fixed in #90 (Weak-indexed registry, waiter-owned entries, `Drop` as the single removal site). The probe now runs unconditionally as a regression test.
+2. **`eth_chainId` served the compiled-in default `1`** everywhere, including the deployed 412346 cluster — there was no chain-id flag at all. Added in #90 and wired into `ingress.nomad.hcl`.
+3. **The validator does not exit on SIGTERM** (found by S6's graceful-shutdown phase). It survives 90 s+ of a single SIGTERM even with a healthy pipeline and an alive sealer, while the executor — which has the same `select!`/`drop(rt)`/`drop(cluster_guard)`/`join` shutdown shape — exits immediately. A second SIGTERM ends it. Operationally this means Nomad SIGKILLs the validator on every stop/deploy, so its mdbx env never closes gracefully. **Open; needs its own PR.** S6 tolerates it safely (the drain proves both DBs are committed through the same block before any kill, and mdbx commits are atomic) and reports it via `LocalStack::shutdown_report()` rather than papering over it.
+4. **Every state DB stores a `meta[state_root]`, including executor DBs** — `seed_genesis` writes it unconditionally, so a plain-writer (`TrieMode::Off`) DB carries the *genesis* root frozen at block 0 while its chain advances. Not a bug, but it invalidates the natural reading of "executor DBs have no root" (as the earlier survey concluded); S6 pins the real asymmetry instead (the two roots must differ), and `integrity::sweep` documents that its rebuild check validates the genesis-era trie on executor DBs.
 
 ## Open questions
 
