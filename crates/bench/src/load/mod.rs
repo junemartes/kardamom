@@ -30,7 +30,7 @@ use tokio::sync::Semaphore;
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
 use crate::load::accounting::{EvalInput, Verdict, evaluate};
-use crate::load::engine::{Queues, Tracker, drain, join_submit_tasks, pacer};
+use crate::load::engine::{Queues, SubmitMode, Tracker, drain, join_submit_tasks, pacer};
 use crate::load::scrape::Scraper;
 
 /// Default Anvil/Hardhat test mnemonic (genesis prefunds accounts #0..#15).
@@ -95,6 +95,10 @@ pub struct LoadConfig {
     pub scrape: Vec<String>,
     /// `docker exec` scrape vs direct.
     pub metrics_via_docker: bool,
+    /// Submit via `kardamom_sendRawTransactionAsync` + receive receipts on a
+    /// `kardamom_subscribeReceipts` WebSocket feed, instead of the parked
+    /// `eth_sendRawTransaction`. In-flight txs then hold no connections.
+    pub subscribe: bool,
     /// Executor node-container names.
     pub executor_nodes: Vec<String>,
     /// Ingress node-container name.
@@ -143,6 +147,73 @@ pub struct LoadReport {
     pub lat_max_us: u64,
     /// Completeness + drop accounting + keep-pace.
     pub verdict: Verdict,
+}
+
+/// Subscribe-mode receipt feed: one WebSocket subscription (filtered to the
+/// run's senders) confirming txs into the shared tracker. Reconnects forever
+/// — chaos restarts the ingress under it — and the drain's HTTP polling
+/// settles anything that slipped through a gap. Aborted by the caller.
+async fn receipt_feed_task(ws_url: String, senders: Vec<Address>, tracker: Arc<Tracker>) {
+    use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
+    use jsonrpsee::ws_client::WsClientBuilder;
+
+    loop {
+        let client = match WsClientBuilder::default().build(&ws_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "receipt feed: ws connect failed; retrying");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        let sub: Result<Subscription<serde_json::Value>, _> = client
+            .subscribe(
+                "kardamom_subscribeReceipts",
+                rpc_params![Some(senders.clone())],
+                "kardamom_unsubscribeReceipts",
+            )
+            .await;
+        let mut sub = match sub {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "receipt feed: subscribe failed; retrying");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+        tracing::info!("receipt feed: subscribed");
+        while let Some(item) = sub.next().await {
+            let Ok(v) = item else { continue };
+            match v["type"].as_str() {
+                Some("receipt") => {
+                    let r = &v["receipt"];
+                    let Some(hash) = r["transactionHash"]
+                        .as_str()
+                        .and_then(|s| s.parse::<alloy_primitives::B256>().ok())
+                    else {
+                        continue;
+                    };
+                    let status = r["status"]
+                        .as_str()
+                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(0);
+                    tracker.confirm_from_feed(hash, status);
+                }
+                Some("txError") => {
+                    tracing::warn!(payload = %v, "receipt feed: sequencer rejection");
+                }
+                Some("lagged") => {
+                    tracing::warn!(
+                        payload = %v,
+                        "receipt feed: lagged — drain will settle the gap"
+                    );
+                }
+                _ => {}
+            }
+        }
+        tracing::warn!("receipt feed: stream ended; reconnecting");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
 }
 
 async fn preflight_chain_id(client: &HttpClient) -> anyhow::Result<u64> {
@@ -236,6 +307,26 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     // accepted tx whose receipt can't be re-fetched is a real must-deliver
     // violation rather than restart noise — verify independently.
     let verify_receipts = !cfg.chaos_mode;
+    let mode = if cfg.subscribe {
+        SubmitMode::Subscribe
+    } else {
+        SubmitMode::Blocking
+    };
+
+    // Subscribe mode: receipts arrive on one multiplexed WebSocket feed
+    // (filtered to this run's senders) instead of on each submit's parked
+    // connection. Runs for the whole ramp + soak; aborted after the drain.
+    let feed = if cfg.subscribe {
+        let ws_url = cfg.rpc.replacen("http", "ws", 1);
+        let addrs: Vec<Address> = signers.iter().map(|s| s.address).collect();
+        Some(tokio::spawn(receipt_feed_task(
+            ws_url,
+            addrs,
+            Arc::clone(&tracker),
+        )))
+    } else {
+        None
+    };
 
     // --- ramp (soak mode only) -------------------------------------------
     let mut ramp = Vec::new();
@@ -280,6 +371,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         cfg.duration,
         cfg.retry_submit,
         verify_receipts,
+        mode,
     )
     .await;
 
@@ -289,6 +381,9 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     let deadline = Instant::now() + cfg.drain_timeout;
     join_submit_tasks(&mut tasks, deadline).await;
     drain(Arc::clone(&client), Arc::clone(&tracker), deadline).await;
+    if let Some(feed) = feed {
+        feed.abort();
+    }
     tokio::time::sleep(Duration::from_secs(3)).await;
     let fin = scraper.snapshot().await;
     // A chaos-restarted executor's block gauge resets to 0, so `final − base`
@@ -364,6 +459,11 @@ async fn ramp_to_max(
     ramp: &mut Vec<RampStep>,
 ) -> u32 {
     let step_dur = Duration::from_secs(cfg.ramp_step_secs.max(1));
+    let mode = if cfg.subscribe {
+        SubmitMode::Subscribe
+    } else {
+        SubmitMode::Blocking
+    };
     let mut discovered = 0u32;
     let mut rate = cfg.ramp_step_tps.max(1);
     while rate <= cfg.target_tps {
@@ -379,6 +479,7 @@ async fn ramp_to_max(
             step_dur,
             cfg.retry_submit,
             !cfg.chaos_mode,
+            mode,
         )
         .await;
         let after = tracker.counts();

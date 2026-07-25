@@ -32,6 +32,20 @@ const HIST_LOW_US: u64 = 1;
 const HIST_HIGH_US: u64 = 60_000_000;
 const HIST_SIGFIGS: u8 = 3;
 
+/// How a submit acks and how its receipt is observed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitMode {
+    /// `eth_sendRawTransaction`: the RPC parks until the receipt arrives, so
+    /// a successful submit *is* the delivery confirmation (one held
+    /// connection per in-flight tx).
+    Blocking,
+    /// `kardamom_sendRawTransactionAsync`: the RPC acks at publish; receipts
+    /// arrive out-of-band on the `kardamom_subscribeReceipts` feed (see
+    /// `receipt_feed_task`), with the drain's `eth_getTransactionReceipt`
+    /// polling as the catch-all.
+    Subscribe,
+}
+
 /// Per-sender FIFO queues consumed round-robin, preserving per-sender nonce
 /// order (a sender's nonce k is popped before k+1).
 pub struct Queues {
@@ -98,6 +112,9 @@ pub struct Tracker {
     bad_status: AtomicU64,
     lat_us: Mutex<Histogram<u64>>,
     pending: Mutex<HashMap<B256, Pending>>,
+    /// Subscribe mode only: receipts whose feed notification arrived before
+    /// their submit task registered in `pending` (feed vs ack race).
+    early: Mutex<HashMap<B256, u64>>,
 }
 
 impl Tracker {
@@ -117,7 +134,58 @@ impl Tracker {
                 HIST_SIGFIGS,
             )?),
             pending: Mutex::new(HashMap::new()),
+            early: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Feed-side confirmation (subscribe mode): settle the pending entry for
+    /// `hash`, or stash the status if the submit task hasn't registered yet.
+    pub fn confirm_from_feed(&self, hash: B256, status: u64) {
+        let settled = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&hash);
+        match settled {
+            Some(p) => self.confirm(status, p.submit_ts.elapsed()),
+            None => {
+                self.early
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(hash, status);
+            }
+        }
+    }
+
+    /// Submit-side registration (subscribe mode): park the accepted tx until
+    /// its feed notification, settling immediately if the notification won
+    /// the race.
+    fn await_feed(&self, hash: B256, submit_ts: Instant) {
+        self.pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                hash,
+                Pending {
+                    submit_ts,
+                    accepted: true,
+                },
+            );
+        let early = self
+            .early
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&hash);
+        let Some(status) = early else { return };
+        if self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&hash)
+            .is_some()
+        {
+            self.confirm(status, submit_ts.elapsed());
+        }
     }
 
     /// Snapshot the cumulative counters.
@@ -189,6 +257,7 @@ async fn receipt_status(client: &HttpClient, hash: B256) -> Option<u64> {
     u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn submit_task(
     client: Arc<HttpClient>,
     tracker: Arc<Tracker>,
@@ -196,14 +265,17 @@ async fn submit_task(
     _permit: OwnedSemaphorePermit,
     retry: u32,
     verify_receipts: bool,
+    mode: SubmitMode,
 ) {
+    let method = match mode {
+        SubmitMode::Blocking => "eth_sendRawTransaction",
+        SubmitMode::Subscribe => "kardamom_sendRawTransactionAsync",
+    };
     tracker.offered.fetch_add(1, Ordering::Relaxed);
     let t0 = Instant::now();
     let mut accepted = false;
     for attempt in 0..=retry {
-        let res: Result<B256, _> = client
-            .request("eth_sendRawTransaction", rpc_params![tx.raw.clone()])
-            .await;
+        let res: Result<B256, _> = client.request(method, rpc_params![tx.raw.clone()]).await;
         if res.is_ok() {
             accepted = true;
             break;
@@ -222,6 +294,13 @@ async fn submit_task(
     }
     if accepted {
         tracker.accepted.fetch_add(1, Ordering::Relaxed);
+        if mode == SubmitMode::Subscribe {
+            // The ack only means *published* — the receipt arrives on the
+            // subscription feed (or the drain's polling settles it). No
+            // chaos-mode ack-trust here: delivery is verified for real.
+            tracker.await_feed(tx.hash, t0);
+            return;
+        }
         // on-offer: a successful submit means the receipt already arrived (the
         // tx was executed + receipted). Re-fetch it to check status/latency.
         match receipt_status(&client, tx.hash).await {
@@ -290,6 +369,7 @@ pub async fn pacer(
     dur: Duration,
     retry: u32,
     verify_receipts: bool,
+    mode: SubmitMode,
 ) {
     if rate == 0 {
         return;
@@ -323,6 +403,7 @@ pub async fn pacer(
                 permit,
                 retry,
                 verify_receipts,
+                mode,
             ));
         }
     }
@@ -488,6 +569,7 @@ mod tests {
             permit().await,
             0,
             true, // verify_receipts (non-chaos soak)
+            SubmitMode::Blocking,
         )
         .await;
 
@@ -536,6 +618,7 @@ mod tests {
             permit().await,
             0,
             false,
+            SubmitMode::Blocking,
         )
         .await;
         let c = tracker.counts();
@@ -558,6 +641,7 @@ mod tests {
             permit().await,
             3,
             true,
+            SubmitMode::Blocking,
         )
         .await;
         assert_eq!(
