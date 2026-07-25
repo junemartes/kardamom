@@ -359,7 +359,7 @@ async fn s8_da_parity_batcher_matches_validator() {
             if committed < head {
                 return Ok(None);
             }
-            Ok(e2e::scenarios::da_parity::validator_root(&val_dir)?)
+            e2e::scenarios::da_parity::validator_root(&val_dir)
         },
     )
     .await
