@@ -2,7 +2,7 @@
 
 - **Date:** 2026-07-25
 - **Status:** Proposed design; awaiting review
-- **Goal (definition of done):** a deterministic, single-host e2e suite (`crates/e2e/tests/`) that proves the rollup's **chain semantics** end-to-end — bridge round-trips against a real anvil L1, nonce-ordering guarantees over real JSON-RPC, validator↔executor state parity, batcher/DA↔validator root parity, and state-DB integrity — running green in a dedicated CI job in well under the cluster-e2e budget, plus a revived `just test-e2e-local`.
+- **Goal (definition of done):** an e2e suite proving the rollup's **chain semantics** end-to-end — bridge round-trips against a real anvil L1, nonce-ordering guarantees over real JSON-RPC, validator↔executor state parity, batcher/DA↔validator root parity, and state-DB integrity — with each scenario written once and run on **two targets**: a fast deterministic single-host harness (`crates/e2e/tests/`, green in a dedicated CI job well under the cluster-e2e budget, plus a revived `just test-e2e-local`) and the **real CI cluster** (a new `semantics` shard in `cluster-e2e.yml` on the standard `ci-cluster.sh` DinD bring-up).
 
 ## Background / current state
 
@@ -26,7 +26,12 @@ The **chaos suite** (`deploy/cluster/scripts/chaos.sh`, `cluster-e2e.yml`, 5 Din
 
 ## Design overview
 
-**One new harness, nine scenarios, zero DinD.** Revive `crates/e2e` as the home of a *semantics* suite that runs the real binaries as local child processes against a real anvil L1 and the real Java Aeron Cluster sealer — the cluster-only successor of the deleted multiprocess e2e.
+**Target-agnostic scenario drivers, two execution targets.** Each scenario is written once as a driver library in `crates/e2e/src/scenarios/` that talks only to externally observable seams — ingress JSON-RPC, L1 RPC + contract addresses, per-service `/metrics`, and (where available) state dirs for offline checks. The drivers then run against:
+
+- **Target L (local)** — a fast single-host harness: real binaries as child processes, real anvil L1, real Java Aeron Cluster sealer (1 member), one shared media driver. Seconds of bring-up; runs per-PR; supports the full assertion set including offline mdbx deep-compares, SIGKILL crash cases, and stream-level fault injection. This is the cluster-only successor of the deleted multiprocess e2e.
+- **Target C (cluster)** — **the real e2e setup the rest of CI uses**: the 12-node DinD cluster brought up by `deploy/cluster/scripts/ci-cluster.sh` (the same path as every `cluster-e2e.yml` shard), with the 3-member Raft sealer, active/active ingress, UDP multicast side-streams, Nomad supervision, and the in-cluster anvil at `192.168.56.10:8546`. A new `semantics` shard runs the same drivers against it after the standard bring-up + smoke gate. This catches what a single-host IPC harness structurally cannot: real quorum ordering, lossy multicast BAL delivery, cross-node timing.
+
+Target L exists because semantics bugs should fail in seconds on every PR; Target C exists because the semantics must hold on the topology we actually ship. Same driver code, different fixture — divergence between the two targets is itself signal.
 
 ```
                        ┌────────────────────────────── test process ──────────────────────────────┐
@@ -109,24 +114,46 @@ Workload → drain → harness collector assembles ordered blocks → `pack_bloc
 **S9 — `db_integrity_and_crash_consistency`**
 (a) The `integrity` sweep runs on executor + validator DBs at the end of **every** scenario above (shared teardown hook). (b) Dedicated crash case: SIGKILL the executor mid-load → restart → `read_recovery_point` resumes without genesis re-sync → drain → sweep green + S6 deep-compare green. (c) Detector non-vacuity: restart executor against a mutated genesis TOML → refuses with `GenesisMismatch`; flip a byte in a `receipts` value on a *copy* of the DB → sweep reports `RkyvDecode`/`BadEncoding` (proving the sweep would catch real rot).
 
+## Target C — running the drivers on the real CI cluster
+
+Mechanics, reusing what `chaos.sh`/`ci-cluster.sh` already established:
+
+- **Entry point:** a `kardamom-semantics` driver binary (thin CLI over the scenario libraries, like `kardamom-load` is over `load/`) invoked by `ci-cluster.sh` after the smoke gate, parameterized by `RPC_URL=192.168.56.31:8545`, `L1_RPC=…:8546`, `CHAIN_ID=412346`, contract addresses, and the metrics topology. Scenario selection via `SEMANTICS_CASES`, mirroring `CHAOS_CASES`.
+- **Metrics:** scraped via `docker exec kardamom-<node> curl 127.0.0.1:<port>` exactly as `chaos.sh` and `kardamom-load --metrics-via-docker` do (executor `:9004`, validator `:9006` on aux).
+- **Offline state checks (S6 deep-compare, S9 sweep):** quiesce load → `nomad alloc stop` the executor and validator allocs → `docker cp` their state dirs off the nodes → run the `statecheck` compare on the runner → restart allocs. Copying a stopped writer's mdbx is safe; this also doubles as a restart-recovery exercise on the real topology.
+- **Account budget:** each scenario owns dedicated funded accounts starting at nonce 0, extending the existing ledger (`ci-cluster.sh:476` — smoke #0, load #1–6, chaos #7–15, churn #16–17; semantics takes a new contiguous block, sized in `genesis/dev.toml`).
+- **Expected Target-C deltas, encoded in the drivers not skipped silently:** `validator_bal_missing_total` is `== 0` on Target L but only *bounded* on Target C (lossy multicast is by design); S7 stream injection and S9's SIGKILL are Target-L-only (Target C's fault surface belongs to chaos); S4's timing asserts use the deployed 30 s `pending_receipt_timeout` unless the ingress job adopts the new flag.
+
+**Cluster wiring the semantics shard needs (today's CI never exercises the bridge):**
+
+1. `ci-cluster.sh` currently deploys **no L1 contracts** — `deploy.sh` warns and hands the da-watcher a placeholder lockbox address (`deploy.sh:125-129`). Add a deploy phase after anvil is up: run `kardamom-deploy` (ensure-factory + lockbox/oracle/settlement, short finalization window) against `…:8546` from the orchestrator, export the addresses into the da-watcher/validator job vars. This makes CI's da-watcher watch a *real* lockbox for the first time.
+2. `deploy/cluster/config/genesis/dev.toml` lacks the `L2ToL1MessagePasser` predeploy (only `chains/dev-withdrawals.toml` has it) — add it so S2 can run on Target C.
+3. `validator.nomad.hcl` has no attester wiring — add optional `--l1-rpc-url/--output-oracle/--attester-key` vars (attester key = a dedicated anvil dev key, same convention as `withdrawal_e2e.rs`).
+
+S8 on Target C stays deferred until batcher live posting is rewired for the cluster topology (the bin still expects pre-#67 archive segment files); the spec's harness-side collector is a Target-L construct.
+
 ## CI + local integration
 
-- **New workflow `chain-semantics-e2e.yml`** (parallel to `docker-e2e.yml`, opt-out label `skip-chain-semantics`): ubuntu-latest; deps = cmake/uuid/libbsd/ssl (rusteron build), temurin JDK 17 + `./gradlew :service:shadowJar`, foundry `v1.7.1` (anvil + forge for the deployer build script), aeron-all jar (justfile-pinned version); `cargo build -p … --bins` then `cargo test -p e2e --features full-pipeline-e2e -- --ignored`. Budget: bring-up is seconds per scenario (vs ~30 min per DinD shard); whole suite target **< 20 min**. Shard into two jobs (bridge+DA / nonce+consistency) only if the single job crowds the budget.
-- **`just test-e2e-local`**: repoint the currently-dangling recipe at the new suite (it already handles the Java shim / JDK detection); add a `just cluster-jar` helper for the shadowJar.
-- Not touched: `cluster-e2e.yml` and chaos stay the resilience gate; this suite is the semantics gate. The two share `kardamom-load` internals but no infrastructure.
+- **Target L — new workflow `chain-semantics-e2e.yml`** (parallel to `docker-e2e.yml`, opt-out label `skip-chain-semantics`): ubuntu-latest; deps = cmake/uuid/libbsd/ssl (rusteron build), temurin JDK 17 + `./gradlew :service:shadowJar`, foundry `v1.7.1` (anvil + forge for the deployer build script), aeron-all jar (justfile-pinned version); `cargo build -p … --bins` then `cargo test -p e2e --features full-pipeline-e2e -- --ignored`. Budget: bring-up is seconds per scenario (vs ~30 min per DinD shard); whole suite target **< 20 min**. Shard into two jobs (bridge+DA / nonce+consistency) only if the single job crowds the budget.
+- **Target C — a sixth `semantics` shard in the `cluster-e2e.yml` matrix**, alongside `load`/`chaos-*`: standard `ci-cluster.sh` bring-up + smoke gate, then `RUN_SEMANTICS=1 SEMANTICS_CASES="bridge nonce rpc consistency integrity"` runs the `kardamom-semantics` driver. Same 75-minute shard budget and failure-dump conventions as the existing shards.
+- **`just test-e2e-local`**: repoint the currently-dangling recipe at the Target-L suite (it already handles the Java shim / JDK detection); add a `just cluster-jar` helper for the shadowJar. Target C runs locally via the existing `local-cluster.sh` path with the same env knobs.
+- Chaos stays the resilience gate; this suite is the semantics gate. They share `ci-cluster.sh`, the metrics-probe conventions, and the funded-account ledger, but assert different things.
 
 ## Phasing / PR breakdown
 
-1. **PR-1 — harness + nonce/RPC semantics (S3, S4, S5):** no L1 contracts needed (anvil not even required — da-watcher/attester off); includes the ingress timeout flag, the justfile revival, and the CI workflow. Proves the harness shape early on the least plumbing.
+1. **PR-1 — drivers + Target-L harness + nonce/RPC semantics (S3, S4, S5):** no L1 contracts needed (anvil not even required — da-watcher/attester off); includes the ingress timeout flag, the justfile revival, and the `chain-semantics-e2e.yml` workflow. Proves the driver/harness split early on the least plumbing.
 2. **PR-2 — consistency + injection (S6, S7) + integrity sweep (S9a/c):** adds `kardamom_state::integrity` + `statecheck`.
-3. **PR-3 — bridge round-trip (S1, S2):** anvil + deployer wiring in the harness; attester enabled.
-4. **PR-4 — DA parity (S8) + crash case (S9b):** harness canonical collector; wires `kardamom-reconstruct --expect-root` into CI for the first time.
+3. **PR-3 — bridge round-trip (S1, S2) on Target L:** anvil + deployer wiring in the harness; attester enabled.
+4. **PR-4 — Target C:** `kardamom-semantics` CLI, the `semantics` shard in `cluster-e2e.yml`, and the cluster wiring (contract-deploy phase in `ci-cluster.sh`, message-passer predeploy in the cluster genesis, attester vars in `validator.nomad.hcl`). Runs S1–S6 + S9a against the real CI cluster.
+5. **PR-5 — DA parity (S8) + crash case (S9b) on Target L:** harness canonical collector; wires `kardamom-reconstruct --expect-root` into CI for the first time.
 
-Each PR lands with its scenarios green in the new workflow, gated on the full check set per repo convention.
+Each PR lands with its scenarios green in the relevant workflow, gated on the full check set per repo convention. PR-4 is validated with a full local-cluster run before merge (per the standing local-validation directive).
 
 ## Open questions
 
-1. **Single-member sealer default** — semantics scenarios run a 1-member Raft cluster for speed; OK, or should S6 run 3-member to also exercise egress ordering across a real quorum? (Phase-1 includes a 15-minute spike validating 1-member `ClusterNode` boot; 3-member is a constructor arg either way.)
-2. **S5 leak canary** — land `#[ignore]`d as a pinned known-failure pointing at the #81 pending-registry follow-up, or hold PR-1 until that leak is fixed and land it green?
-3. **Sequencer cold-floor (F02.1)** — a sequencer restarted mid-run hydrates every sender at nonce 0 (`EmptyStateDatabase`) and wedges established senders. Worth a pinned `#[ignore]` scenario here, or leave it to the recovery roadmap where the fix will land?
-4. **CI placement** — separate `chain-semantics-e2e.yml` (proposed) vs. folding into `docker-e2e.yml`? Separate keeps the opt-out labels and failure signals clean.
+1. **S5 leak canary** — land `#[ignore]`d as a pinned known-failure pointing at the #81 pending-registry follow-up, or hold PR-1 until that leak is fixed and land it green?
+2. **Sequencer cold-floor (F02.1)** — a sequencer restarted mid-run hydrates every sender at nonce 0 (`EmptyStateDatabase`) and wedges established senders. Worth a pinned `#[ignore]` scenario here, or leave it to the recovery roadmap where the fix will land?
+3. **Target C shard cost** — a sixth DinD shard adds ~1 runner-hour per PR. Run on every PR like the other shards, or `workflow_dispatch` + main-only until it proves stable?
+4. **Cluster genesis change** — adding the message-passer predeploy to `deploy/cluster/config/genesis/dev.toml` changes the genesis digest for every future cluster bring-up (fresh clusters only; existing DBs would refuse via `GenesisMismatch`). Fine to fold into PR-4, or stage separately?
+
+(Resolved by the two-target design: the local sealer stays 1-member — Target C exercises the real 3-member quorum.)
