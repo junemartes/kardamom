@@ -440,12 +440,8 @@ mod tests {
             tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        p.on_tx_error(
-            sender,
-            nonce,
-            TxErrorReason::Evicted { expected_nonce: 18 },
-        )
-        .await;
+        p.on_tx_error(sender, nonce, TxErrorReason::Evicted { expected_nonce: 18 })
+            .await;
 
         let res = waiter.await.expect("join");
         match res {
