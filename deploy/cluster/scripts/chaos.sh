@@ -889,7 +889,7 @@ run_case() { # <case-name>
       # it must start from a provably-clean recording: baseline OK -> corrupt
       # -> ERR -> heal -> OK is then a closed loop. Every verify/mark-valid is
       # scoped to that recording (segment name = <recordingId>-<base>.rec).
-      local seg="" seg_name="" rid="" cand cand_name cand_rid cand_out
+      local seg="" seg_name="" rid="" seg_ext=0 cand cand_name cand_rid cand_out cand_ext
       for cand in $(docker exec kardamom-ingress-0 bash -lc \
           'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
         cand_name="$(basename "${cand}")"
@@ -901,8 +901,18 @@ run_case() { # <case-name>
            verify ${cand_rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
         if echo "${cand_out}" | grep -q "recordingId=${cand_rid}) OK" \
           && ! echo "${cand_out}" | grep -q ') ERR'; then
-          seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"
-          break
+          # Segment files are PRE-ALLOCATED (equal apparent size, ls -S order
+          # arbitrary): a flip at a fixed offset can land in unrecorded zero
+          # padding, which verify rightly ignores. Require real recorded data
+          # (last non-zero byte >= 8KB) and remember the extent so the flip
+          # lands mid-recorded-range.
+          cand_ext="$(docker exec kardamom-ingress-0 python3 -c \
+            "import sys; b=open('${cand}','rb').read(); print(len(b.rstrip(b'\x00')))" 2>/dev/null || echo 0)"
+          if [ "${cand_ext:-0}" -ge 8192 ]; then
+            seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"; seg_ext="${cand_ext}"
+            break
+          fi
+          continue
         fi
         # The probe marks a failing entry INVALID — put its state back as found.
         docker exec kardamom-ingress-0 bash -lc \
@@ -913,10 +923,12 @@ run_case() { # <case-name>
       done
       [ -n "${seg}" ] \
         || fail "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad — see issue #98)"
-      # Corrupt 16 bytes at offset 1024 — mid recorded data, length unchanged.
-      log "archive-corruption: flipping bytes mid-file in ${seg_name} (recording ${rid})"
+      # Corrupt 16 bytes at HALF the recorded extent — provably inside real
+      # frame data, length unchanged.
+      local flip_at=$(( seg_ext / 2 ))
+      log "archive-corruption: flipping bytes at ${flip_at}/${seg_ext} in ${seg_name} (recording ${rid})"
       docker exec kardamom-ingress-0 bash -lc \
-        "printf 'KARDAMOM-CHAOS!!' | dd of=${seg} bs=1 seek=1024 count=16 conv=notrunc status=none" \
+        "printf 'KARDAMOM-CHAOS!!' | dd of=${seg} bs=1 seek=${flip_at} count=16 conv=notrunc status=none" \
         || fail "archive-corruption: byte flip failed"
       # DETECTION: CRC-armed verify on the frozen victim must NOT be clean.
       # (Run via a one-off container on the node — the daemon is down.)
