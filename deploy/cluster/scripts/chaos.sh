@@ -882,18 +882,38 @@ run_case() { # <case-name>
       on_control 'nomad node drain -enable -yes -deadline 2m "$1"' "${node_id}" >/dev/null \
         || fail "archive-corruption: drain enable failed"
       sleep 5
-      # Corrupt 16 bytes at offset 1024 of the largest .rec — mid recorded
-      # data, length unchanged.
-      seg="$(docker exec kardamom-ingress-0 bash -lc 'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -1')"
-      [ -n "${seg}" ] || fail "archive-corruption: no .rec segments on ingress-0"
-      seg_name="$(basename "${seg}")"
-      # Scope every verify/mark-valid below to THIS segment's recording: the
-      # segment filename is <recordingId>-<segmentBasePosition>.rec. A
-      # whole-archive -checksum verify also trips over torn catalog ENTRIES
-      # inherited from archive-tx-data-wipe's live-peer catalog copy (active
-      # recordings rewrite their entries mid-copy) — a real gap, tracked
-      # separately, but not what this case tests.
-      local rid="${seg_name%%-*}"
+      # Pick a victim recording that verifies CLEAN at baseline. The archive's
+      # catalog was restored from the live peer by archive-tx-data-wipe, and
+      # which entries got torn in that copy is a per-run lottery (issue #98) —
+      # this case tests SEGMENT corruption detect/heal, not catalog repair, so
+      # it must start from a provably-clean recording: baseline OK -> corrupt
+      # -> ERR -> heal -> OK is then a closed loop. Every verify/mark-valid is
+      # scoped to that recording (segment name = <recordingId>-<base>.rec).
+      local seg="" seg_name="" rid="" cand cand_name cand_rid cand_out
+      for cand in $(docker exec kardamom-ingress-0 bash -lc \
+          'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
+        cand_name="$(basename "${cand}")"
+        cand_rid="${cand_name%%-*}"
+        cand_out="$(docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           verify ${cand_rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+        if echo "${cand_out}" | grep -q "recordingId=${cand_rid}) OK" \
+          && ! echo "${cand_out}" | grep -q ') ERR'; then
+          seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"
+          break
+        fi
+        # The probe marks a failing entry INVALID — put its state back as found.
+        docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           mark-valid ${cand_rid}" >/dev/null 2>&1 || true
+      done
+      [ -n "${seg}" ] \
+        || fail "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad — see issue #98)"
+      # Corrupt 16 bytes at offset 1024 — mid recorded data, length unchanged.
       log "archive-corruption: flipping bytes mid-file in ${seg_name} (recording ${rid})"
       docker exec kardamom-ingress-0 bash -lc \
         "printf 'KARDAMOM-CHAOS!!' | dd of=${seg} bs=1 seek=1024 count=16 conv=notrunc status=none" \
