@@ -21,7 +21,8 @@ use std::time::Duration;
 use e2e::harness::services::IngressOptions;
 use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
-    bridge, consistency, crash_recovery, divergence, nonce_gap, nonce_unordered, rpc_liveness,
+    bridge, consistency, crash_recovery, da_parity, divergence, nonce_gap, nonce_unordered,
+    rpc_liveness,
 };
 
 /// Client request bound, kept above every server-side park bound used here.
@@ -300,4 +301,81 @@ async fn s9_executor_crash_recovery_is_consistent() {
     let exec_dir = stack.executor_state_dir().expect("executor state dir");
     let val_dir = stack.validator_state_dir().expect("validator state dir");
     consistency::verify_state_dirs(&exec_dir, &val_dir).expect("post-crash state comparison");
+}
+
+/// S8: what the batcher posts to L1, re-executed from L1 alone, must equal
+/// the state root the validator independently computed — the "batcher's state
+/// matches the validator's" guarantee. Posts REAL EIP-4844 blobs to anvil and
+/// runs the real `kardamom-reconstruct --expect-root` (whose gate had no
+/// caller anywhere before this scenario).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s8_da_parity_batcher_matches_validator() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        validator: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let l1 = stack.l1().expect("l1");
+    let params = da_parity::Params::default();
+
+    // 1. Run a deposit-free workload and recover the canonical blocks it
+    //    produced from the pipeline's own receipts.
+    let blocks = da_parity::run_workload(&t, &params)
+        .await
+        .expect("S8 workload");
+
+    // 2. Post them to L1 as real blob transactions.
+    let da_dir = tempfile::tempdir().expect("da dir");
+    let da_store = kardamom_batcher::da_store::FsBlobStore::open(da_dir.path()).expect("da store");
+    da_parity::post_to_l1(l1, l1.settlement, &blocks, &da_store)
+        .await
+        .expect("S8 post to L1");
+    da_parity::assert_batches_on_l1(l1, l1.settlement, blocks.len(), &da_store)
+        .await
+        .expect("S8 L1 batch log");
+
+    // 3. The parity target: the validator's own committed root, read from its
+    //    live DB once the chain has settled on it.
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    let expected_root = e2e::harness::metrics::poll_until(
+        "validator root covering the workload",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async {
+            let committed = t
+                .validator_metric(e2e::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                .await
+                .unwrap_or(0.0) as u64;
+            let head = blocks.last().map(|b| b.block_number).unwrap_or(0);
+            if committed < head {
+                return Ok(None);
+            }
+            Ok(e2e::scenarios::da_parity::validator_root(&val_dir)?)
+        },
+    )
+    .await
+    .expect("validator root");
+
+    // 4. Rebuild from L1 alone; the roots must match.
+    let recon_dir = tempfile::tempdir().expect("recon dir");
+    let genesis =
+        e2e::harness::services::repo_root().join("deploy/cluster/config/genesis/dev.toml");
+    da_parity::reconstruct_and_compare(
+        &l1.rpc_url(),
+        l1.settlement,
+        da_dir.path(),
+        &genesis,
+        recon_dir.path(),
+        expected_root,
+    )
+    .expect("S8 DA parity");
 }
