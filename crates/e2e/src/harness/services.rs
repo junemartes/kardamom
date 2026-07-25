@@ -70,6 +70,37 @@ pub struct ServiceSpec<'a> {
     pub genesis: &'a Path,
 }
 
+/// L1 wiring for the bridge scenarios: the da-watcher needs the lockbox to
+/// watch, and the validator's attester needs the oracle + a key.
+pub struct L1Wiring {
+    pub rpc_url: String,
+    pub lockbox: String,
+    pub oracle: String,
+    pub attester_key: String,
+}
+
+/// Spawn `kardamom-da-watcher` against the anvil L1. `--poll-interval-secs 1`
+/// (vs the 12 s production default) keeps deposit latency inside a test's
+/// patience.
+pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned> {
+    let metrics_port = free_tcp_port()?;
+    let mut cmd = Command::new(bin("kardamom-da-watcher")?);
+    cmd.args(["--l1-rpc", &l1.rpc_url])
+        .args(["--lockbox", &l1.lockbox])
+        .args(["--poll-interval-secs", "1"])
+        .arg("--aeron-dir")
+        .arg(spec.aeron_dir)
+        .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--host-id", "e2e-da-watcher"]);
+    cmd.env("RUST_LOG", "info");
+    let proc = Proc::spawn("da-watcher", cmd, spec.root.join("da-watcher.log"))?;
+    Ok(Spawned {
+        proc,
+        metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
+        state_dir: None,
+    })
+}
+
 pub struct Spawned {
     pub proc: Proc,
     pub metrics_addr: SocketAddr,
@@ -155,7 +186,11 @@ pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
 /// Spawn `kardamom-validator` with its own state dir and the trie
 /// shadow-check at the given cadence (`Some(1)` = every block, the
 /// semantics-suite default; the production cluster runs 8).
-pub fn spawn_validator(spec: &ServiceSpec<'_>, trie_shadow_check: Option<u64>) -> Result<Spawned> {
+pub fn spawn_validator(
+    spec: &ServiceSpec<'_>,
+    trie_shadow_check: Option<u64>,
+    attester: Option<&L1Wiring>,
+) -> Result<Spawned> {
     let cfg_path = spec.root.join("validator.toml");
     std::fs::write(&cfg_path, cluster_toml(spec.cluster_ingress_endpoints))?;
     let state_dir = spec.root.join("validator-state");
@@ -182,6 +217,15 @@ pub fn spawn_validator(spec: &ServiceSpec<'_>, trie_shadow_check: Option<u64>) -
         .args(["--host-id", "e2e-validator"]);
     if let Some(n) = trie_shadow_check {
         cmd.args(["--trie-shadow-check", &n.to_string()]);
+    }
+    // L1 output attestation: all three flags together or none (the binary
+    // rejects a partial set). `--attester-post-interval 1` posts an output
+    // per block so a withdrawal becomes finalizable promptly.
+    if let Some(l1) = attester {
+        cmd.args(["--l1-rpc-url", &l1.rpc_url])
+            .args(["--output-oracle", &l1.oracle])
+            .args(["--attester-key", &l1.attester_key])
+            .args(["--attester-post-interval", "1"]);
     }
     cmd.env("RUST_LOG", "info");
     let proc = Proc::spawn("validator", cmd, spec.root.join("validator.log"))?;

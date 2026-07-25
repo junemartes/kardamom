@@ -14,6 +14,7 @@
 
 pub mod aeron;
 pub mod inject;
+pub mod l1;
 pub mod l2;
 pub mod metrics;
 pub mod proc;
@@ -47,6 +48,32 @@ pub struct StackConfig {
     /// Trie shadow-check cadence for the validator (`Some(1)` = every block,
     /// the semantics-suite default; the cluster runs 8).
     pub trie_shadow_check: Option<u64>,
+    /// Which L2 genesis to run. Bridge scenarios need
+    /// [`Genesis::DevWithdrawals`] for the `L2ToL1MessagePasser` predeploy.
+    pub genesis: Genesis,
+    /// Bring up anvil + the bridge contracts, the da-watcher, and (when a
+    /// validator runs) its L1 output attester.
+    pub l1: bool,
+}
+
+/// The L2 genesis a stack boots from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Genesis {
+    /// `deploy/cluster/config/genesis/dev.toml` — 18 prefunded dev accounts,
+    /// no withdrawal predeploy. What the deployed cluster runs.
+    ClusterDev,
+    /// `chains/dev-withdrawals.toml` — the `L2ToL1MessagePasser` predeploy at
+    /// `0x42…16`, but only account #0 is prefunded.
+    DevWithdrawals,
+}
+
+impl Genesis {
+    fn path(self, repo: &std::path::Path) -> PathBuf {
+        match self {
+            Genesis::ClusterDev => repo.join("deploy/cluster/config/genesis/dev.toml"),
+            Genesis::DevWithdrawals => repo.join("chains/dev-withdrawals.toml"),
+        }
+    }
 }
 
 impl Default for StackConfig {
@@ -58,6 +85,8 @@ impl Default for StackConfig {
             ingress: IngressOptions::default(),
             validator: false,
             trie_shadow_check: Some(1),
+            genesis: Genesis::ClusterDev,
+            l1: false,
         }
     }
 }
@@ -76,11 +105,15 @@ pub struct LocalStack {
     // to, and the temp root outlives everything. Fields drop in declaration
     // order.
     ingress: SpawnedIngress,
+    da_watcher: Option<Spawned>,
     executor: Spawned,
     validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
     sealer: SealerCluster,
     driver: MediaDriver,
+    /// Anvil + the bridge contracts (`StackConfig::l1`). Dropped last among
+    /// the services so a scenario's L1 queries stay live until teardown.
+    l1: Option<l1::L1>,
     root: tempfile::TempDir,
     keep: bool,
     shutdown_report: ShutdownReport,
@@ -88,9 +121,33 @@ pub struct LocalStack {
 }
 
 impl LocalStack {
+    /// Bring up a stack. Returns `Ok(None)` only when `cfg.l1` is set and the
+    /// `anvil` binary is absent — bridge scenarios then skip instead of
+    /// failing on a machine without Foundry, matching the convention of the
+    /// crate-level anvil tests.
+    pub async fn launch_opt(cfg: StackConfig) -> Result<Option<Self>> {
+        let l1 = if cfg.l1 {
+            match l1::L1::launch(DEV_CHAIN_ID).await? {
+                Some(l1) => Some(l1),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Self::launch_with_l1(cfg, l1).await.map(Some)
+    }
+
     pub async fn launch(cfg: StackConfig) -> Result<Self> {
+        anyhow::ensure!(
+            !cfg.l1,
+            "use LocalStack::launch_opt for L1-backed stacks (it skips cleanly without anvil)"
+        );
+        Self::launch_with_l1(cfg, None).await
+    }
+
+    async fn launch_with_l1(cfg: StackConfig, l1: Option<l1::L1>) -> Result<Self> {
         let repo = services::repo_root();
-        let genesis = repo.join("deploy/cluster/config/genesis/dev.toml");
+        let genesis = cfg.genesis.path(&repo);
         anyhow::ensure!(
             genesis.is_file(),
             "genesis not found at {}",
@@ -133,20 +190,36 @@ impl LocalStack {
             sequencers.push(services::spawn_sequencer(&spec, i)?);
         }
         let executor = services::spawn_executor(&spec)?;
+        let wiring = l1.as_ref().map(|l| services::L1Wiring {
+            rpc_url: l.rpc_url(),
+            lockbox: l.lockbox.to_string(),
+            oracle: l.oracle.to_string(),
+            attester_key: l1::ATTESTER_KEY.to_string(),
+        });
         let validator = if cfg.validator {
-            Some(services::spawn_validator(&spec, cfg.trie_shadow_check)?)
+            Some(services::spawn_validator(
+                &spec,
+                cfg.trie_shadow_check,
+                wiring.as_ref(),
+            )?)
         } else {
             None
+        };
+        let da_watcher = match &wiring {
+            Some(w) => Some(services::spawn_da_watcher(&spec, w)?),
+            None => None,
         };
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
 
         let stack = Self {
             ingress,
+            da_watcher,
             executor,
             validator,
             sequencers,
             sealer,
             driver,
+            l1,
             root,
             keep,
             shutdown_report: ShutdownReport::default(),
@@ -188,6 +261,9 @@ impl LocalStack {
         if let Some(val) = &self.validator {
             v.push(("validator".to_string(), val.metrics_addr));
         }
+        if let Some(w) = &self.da_watcher {
+            v.push(("da-watcher".to_string(), w.metrics_addr));
+        }
         for (i, s) in self.sequencers.iter().enumerate() {
             v.push((format!("sequencer-{i}"), s.metrics_addr));
         }
@@ -214,6 +290,11 @@ impl LocalStack {
         self.root.path().to_path_buf()
     }
 
+    /// The anvil L1 + bridge contracts (`StackConfig::l1`).
+    pub fn l1(&self) -> Option<&l1::L1> {
+        self.l1.as_ref()
+    }
+
     /// The shared media driver's `aeron.dir` (for test-side stream injection).
     pub fn aeron_dir(&self) -> PathBuf {
         self.driver.aeron_dir.clone()
@@ -225,6 +306,18 @@ impl LocalStack {
 
     pub fn validator_state_dir(&self) -> Option<PathBuf> {
         self.validator.as_ref().and_then(|v| v.state_dir.clone())
+    }
+
+    /// SIGSTOP the sealer so it stops stamping block boundaries: the chain
+    /// settles on one final head and stays there. Scenarios that must reason
+    /// about "the current block" without racing it (S2 matches a withdrawal
+    /// to the attested output for its block) freeze the clock first. The
+    /// sealer is suspended, not killed — killing it makes the consumers'
+    /// cluster clients retry forever and wedges shutdown.
+    pub fn freeze_block_clock(&self) {
+        for p in &self.sealer.procs {
+            p.suspend();
+        }
     }
 
     /// Freeze the executor (SIGSTOP): its genuine BAL/receipt publications
@@ -264,6 +357,9 @@ impl LocalStack {
     /// 3. only then SIGTERM the consumers, which close their mdbx envs.
     pub async fn shutdown_graceful(&mut self) -> Result<()> {
         self.ingress.proc.terminate(Duration::from_secs(10));
+        if let Some(w) = &mut self.da_watcher {
+            w.proc.terminate(Duration::from_secs(10));
+        }
         for s in &mut self.sequencers {
             s.proc.terminate(Duration::from_secs(10));
         }
@@ -343,6 +439,7 @@ impl LocalStack {
         let procs: Vec<&proc::Proc> = std::iter::once(&self.ingress.proc)
             .chain(std::iter::once(&self.executor.proc))
             .chain(self.validator.as_ref().map(|v| &v.proc))
+            .chain(self.da_watcher.as_ref().map(|w| &w.proc))
             .chain(self.sequencers.iter().map(|s| &s.proc))
             .chain(self.sealer.procs.iter())
             .chain(std::iter::once(&self.driver.proc))

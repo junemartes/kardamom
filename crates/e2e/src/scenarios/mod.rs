@@ -8,6 +8,7 @@
 //! Target-C `ci-cluster.sh` DinD cluster later (PR-4 swaps the metrics
 //! transport for docker-exec probes behind this same struct).
 
+pub mod bridge;
 pub mod consistency;
 pub mod divergence;
 pub mod nonce_gap;

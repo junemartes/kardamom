@@ -252,6 +252,29 @@ by construction.
   onto the real `tx_bal` channel (executor SIGSTOPped so nothing competes)
   and asserts the documented fail-stop — the halting log line and exit 2.
   (Lapse recovery is covered by `validator-lapse`.)
+- ~~**Withdrawals could never be attested**~~ — **FIXED** (found by the
+  chain-semantics suite's S2 bridge round-trip). The validator's attester
+  collected withdrawal leaves from the committed `BlockDelta`, but the engine
+  finalizes every delta with an EMPTY receipts vec (receipts travel on
+  tx_receipts instead — `PendingDelta::finalize`). So
+  `collect_withdrawal_leaves` always returned nothing: every posted output
+  carried `leaves=0` and committed to the empty withdrawals root, no
+  `MessagePassed` leaf was ever provable, and **no withdrawal could be
+  finalized on L1** — the L2→L1 half of the bridge was inert. The attester's
+  unit tests passed throughout because they feed a delta that *does* carry
+  receipts, a shape the live pipeline never produces. Fixed by
+  `AttestingReceiptSink`, which tees leaves off the receipt stream (where the
+  logs actually are) and flushes them per block boundary. Regression-tested
+  end-to-end by `s2_bridge_withdrawal_round_trip`.
+- **The persisted `receipts` / `tx_hash_index` tables are always empty** —
+  same root cause, still open. Because `BlockDelta.receipts` is always empty,
+  the state writer never populates either table, so
+  `StateDatabase::{get_receipt, get_tx_position}` can only ever return `None`
+  and the documented "`eth_getTransactionReceipt(hash)` → `get_tx_position` →
+  `get_receipt`" read path cannot work. Receipts survive only in the ingress's
+  in-RAM cache, so a restart loses them. Populating the delta's receipts on
+  the executor's commit path would fix it, but it adds a per-tx clone to the
+  hot path — worth its own PR with a saturation run.
 - ~~**Validator ignores SIGTERM**~~ — **FIXED** (found by the
   chain-semantics suite's graceful-shutdown phase). The validator survived
   90 s+ of a single SIGTERM while the executor exited immediately from the
