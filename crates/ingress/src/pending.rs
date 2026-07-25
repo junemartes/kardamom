@@ -352,12 +352,20 @@ impl PendingWait {
 
 impl Drop for PendingWait {
     fn drop(&mut self) {
-        // Reap this wait's map slot. Idempotent: a wait released via
-        // receipt/rejection had its slot removed by the watcher already, and
-        // the identity guard skips any newer registration under the same
-        // key. Sync + lock-free apart from the dashmap shard, so it is safe
-        // in an async Drop. The entry itself dies when `self.entry` — its
-        // only long-lived strong ref — drops right after this body.
+        // Reap this wait's map slot. NOT needed for correctness — a dead
+        // Weak already reads as absent to every watcher — but it is the only
+        // TRAFFIC-INDEPENDENT reap trigger: `release_satisfied` walks the
+        // map solely on watermark updates, which never flow in the deployed
+        // on-offer ack mode, and the per-key lookup reap needs a receipt or
+        // rejection that an abandoned nonce-gap tx never gets. Without this,
+        // dead slots from client disconnects accumulate unboundedly under
+        // on-offer churn and the queue-depth gauge (map len) stays inflated.
+        // Idempotent: a wait released via receipt/rejection had its slot
+        // removed by the watcher already, and the identity guard skips any
+        // newer registration under the same key. Sync + lock-free apart from
+        // the dashmap shard, so it is safe in an async Drop. The entry
+        // itself dies when `self.entry` — its only long-lived strong ref —
+        // drops right after this body.
         remove_slot(&self.map, &self.key, &self.entry);
     }
 }
