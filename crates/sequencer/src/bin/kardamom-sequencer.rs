@@ -277,7 +277,7 @@ async fn main() -> anyhow::Result<()> {
                 // alarming heartbeat.
                 let mut last_boundary_at: Option<std::time::Instant> =
                     Some(std::time::Instant::now());
-                let mut flag = |at: &mut Option<std::time::Instant>, now: std::time::Instant| {
+                let flag = |at: &mut Option<std::time::Instant>, now: std::time::Instant| {
                     if let Some(prev) = *at {
                         let gap = now.duration_since(prev).as_millis() as u64;
                         if gap >= silence_ms {
