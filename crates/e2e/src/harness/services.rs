@@ -71,6 +71,18 @@ pub struct ServiceSpec<'a> {
     pub shards: u32,
     pub chain_id: u64,
     pub genesis: &'a Path,
+    /// `--log-config` for every service. `None` uses the built-in single-host
+    /// IPC defaults (the blessed local path). Set only for the
+    /// archive-durability variant, which needs `[aeron]` archive settings —
+    /// the `[channels]` defaults are inherited, so the topology is unchanged.
+    pub log_config: Option<&'a Path>,
+}
+
+/// Add `--log-config` when the spec carries one.
+fn with_log_config(cmd: &mut Command, spec: &ServiceSpec<'_>) {
+    if let Some(p) = spec.log_config {
+        cmd.arg("--log-config").arg(p);
+    }
 }
 
 /// L1 wiring for the bridge scenarios: the da-watcher needs the lockbox to
@@ -92,8 +104,9 @@ pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned
         .args(["--lockbox", &l1.lockbox])
         .args(["--poll-interval-secs", "1"])
         .arg("--aeron-dir")
-        .arg(spec.aeron_dir)
-        .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .arg(spec.aeron_dir);
+    with_log_config(&mut cmd, spec);
+    cmd.args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-da-watcher"]);
     cmd.env("RUST_LOG", "info");
     let proc = Proc::spawn("da-watcher", cmd, spec.root.join("da-watcher.log"))?;
@@ -138,6 +151,7 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", &format!("e2e-seq-{index}")]);
+    with_log_config(&mut cmd, spec);
     cmd.env("RUST_LOG", "info");
     let proc = Proc::spawn(
         &format!("sequencer-{index}"),
@@ -152,11 +166,25 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
 }
 
 pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
+    spawn_executor_at(spec, None)
+}
+
+/// Spawn (or RESPAWN) the executor. `fixed_metrics_port` reuses a previous
+/// instance's port so a restarted executor keeps the address scenarios
+/// already hold — the crash-recovery scenario restarts it against the same
+/// state dir, which is what drives the resume-from-cursor path.
+pub fn spawn_executor_at(
+    spec: &ServiceSpec<'_>,
+    fixed_metrics_port: Option<u16>,
+) -> Result<Spawned> {
     let cfg_path = spec.root.join("executor.toml");
     std::fs::write(&cfg_path, cluster_toml(spec.cluster_ingress_endpoints))?;
     let state_dir = spec.root.join("executor-state");
     std::fs::create_dir_all(&state_dir)?;
-    let metrics_port = free_tcp_port()?;
+    let metrics_port = match fixed_metrics_port {
+        Some(p) => p,
+        None => free_tcp_port()?,
+    };
     let egress_port = free_udp_port()?;
     let mut cmd = Command::new(bin("kardamom-executor")?);
     cmd.arg("--config")
@@ -177,8 +205,30 @@ pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-exec"]);
+    with_log_config(&mut cmd, spec);
+    // Join-miss refetch: only meaningful alongside a log config that lists
+    // durability-archive endpoints (the archive-durability variant). Without
+    // it a restarted executor cannot obtain envelopes for canonical records
+    // replayed from before the crash, and aborts by design.
+    if spec.log_config.is_some() {
+        cmd.args([
+            "--replay-destination-endpoint",
+            &format!("127.0.0.1:{}", free_udp_port()?),
+        ])
+        .args([
+            "--archive-control-response-endpoint",
+            &format!("127.0.0.1:{}", free_udp_port()?),
+        ]);
+    }
     cmd.env("RUST_LOG", "info");
-    let proc = Proc::spawn("executor", cmd, spec.root.join("executor.log"))?;
+    // A respawn logs to its own file so the pre-crash log survives for
+    // post-mortem (Proc::spawn truncates).
+    let log = if fixed_metrics_port.is_some() {
+        "executor-restarted.log"
+    } else {
+        "executor.log"
+    };
+    let proc = Proc::spawn("executor", cmd, spec.root.join(log))?;
     Ok(Spawned {
         proc,
         metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
@@ -218,6 +268,7 @@ pub fn spawn_validator(
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-validator"]);
+    with_log_config(&mut cmd, spec);
     if let Some(n) = trie_shadow_check {
         cmd.args(["--trie-shadow-check", &n.to_string()]);
     }
@@ -283,6 +334,14 @@ pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<Sp
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-ingress"]);
+    with_log_config(&mut cmd, spec);
+    // The ingress is the tx_data RECORDER: with this flag every shard's
+    // publication is recorded into the shared archive, which is what makes a
+    // crashed consumer's join-miss refetch (and the fsync watermark that
+    // drives its resume cursor) possible at all.
+    if spec.log_config.is_some() {
+        cmd.arg("--archive-durability");
+    }
     cmd.env("RUST_LOG", "info");
     let proc = Proc::spawn("ingress", cmd, spec.root.join("ingress.log"))?;
     Ok(SpawnedIngress {

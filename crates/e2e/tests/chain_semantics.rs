@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use e2e::harness::services::IngressOptions;
 use e2e::harness::{LocalStack, StackConfig};
-use e2e::scenarios::{bridge, consistency, divergence, nonce_gap, nonce_unordered, rpc_liveness};
+use e2e::scenarios::{
+    bridge, consistency, crash_recovery, divergence, nonce_gap, nonce_unordered, rpc_liveness,
+};
 
 /// Client request bound, kept above every server-side park bound used here.
 fn client_timeout(park: Duration) -> Duration {
@@ -250,4 +252,52 @@ async fn s2_bridge_withdrawal_round_trip() {
     bridge::finalize_withdrawal(l1, ticket, &val_dir)
         .await
         .expect("S2 finalize");
+}
+
+/// S9b: an unclean executor death (SIGKILL) must not corrupt or lose state —
+/// the restarted process resumes from its persisted cursor instead of
+/// re-syncing from genesis, the chain keeps working, and its DB still matches
+/// the validator's (which never restarted) byte for byte.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn s9_executor_crash_recovery_is_consistent() {
+    let mut stack = LocalStack::launch(StackConfig {
+        validator: true,
+        // Crash recovery REQUIRES the durability archive: the restarted
+        // executor replays canonical records from its persisted cursor, and
+        // the envelopes for those records were published while it was down.
+        archive_durability: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let params = crash_recovery::Params::default();
+
+    let pre_crash_block = crash_recovery::phase_before_crash(&t, &params)
+        .await
+        .expect("S9b pre-crash phase");
+
+    stack.crash_executor();
+    stack.restart_executor().expect("restart executor");
+
+    crash_recovery::phase_after_restart(&t, &params, pre_crash_block)
+        .await
+        .expect("S9b post-restart phase");
+
+    // Resume, not genesis re-sync: the restarted process says so explicitly.
+    let log = stack.restarted_executor_log().unwrap_or_default();
+    assert!(
+        log.contains("resuming from persisted state cursor"),
+        "restarted executor did not resume from its cursor; log tail:\n{}",
+        log.lines().rev().take(15).collect::<Vec<_>>().join("\n")
+    );
+
+    // And the state survived the crash intact.
+    stack.shutdown_graceful().await.expect("graceful shutdown");
+    let exec_dir = stack.executor_state_dir().expect("executor state dir");
+    let val_dir = stack.validator_state_dir().expect("validator state dir");
+    consistency::verify_state_dirs(&exec_dir, &val_dir).expect("post-crash state comparison");
 }

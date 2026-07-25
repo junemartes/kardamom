@@ -10,6 +10,7 @@
 
 pub mod bridge;
 pub mod consistency;
+pub mod crash_recovery;
 pub mod divergence;
 pub mod nonce_gap;
 pub mod nonce_unordered;

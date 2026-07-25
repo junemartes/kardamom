@@ -54,6 +54,13 @@ pub struct StackConfig {
     /// Bring up anvil + the bridge contracts, the da-watcher, and (when a
     /// validator runs) its L1 output attester.
     pub l1: bool,
+    /// Record tx_data into the shared Aeron archive (ingress
+    /// `--archive-durability`) and enable the consumers' join-miss refetch.
+    /// Required for CRASH RECOVERY: a restarted consumer replays canonical
+    /// records from its persisted cursor, and the envelopes for those records
+    /// were published while it was down — only the archive still has them.
+    /// Costs a recorder-startup barrier at bring-up, so it is opt-in.
+    pub archive_durability: bool,
 }
 
 /// The L2 genesis a stack boots from.
@@ -87,6 +94,7 @@ impl Default for StackConfig {
             trie_shadow_check: Some(1),
             genesis: Genesis::ClusterDev,
             l1: false,
+            archive_durability: false,
         }
     }
 }
@@ -176,6 +184,28 @@ impl LocalStack {
             .context("bring-up join")??
         };
 
+        // Archive-durability variant: a log config that keeps the built-in
+        // IPC `[channels]` defaults (omitted fields inherit) and adds only the
+        // `[aeron]` archive settings the recorder + refetch need.
+        let log_config = if cfg.archive_durability {
+            let p = root.path().join("channels.toml");
+            std::fs::write(
+                &p,
+                format!(
+                    "[aeron]\narchive_dir = \"{}\"\n\
+                     tx_data_archive_endpoints = [\"{}\"]\n\
+                     tx_deposits_archive_endpoints = [\"{}\"]\n",
+                    driver.archive_dir.display(),
+                    driver.archive_control_endpoint,
+                    driver.archive_control_endpoint,
+                ),
+            )
+            .context("write archive log-config")?;
+            Some(p)
+        } else {
+            None
+        };
+
         let spec = ServiceSpec {
             root: root.path(),
             aeron_dir: &driver.aeron_dir,
@@ -183,6 +213,7 @@ impl LocalStack {
             shards: cfg.shards,
             chain_id: DEV_CHAIN_ID,
             genesis: &genesis,
+            log_config: log_config.as_deref(),
         };
 
         let mut sequencers = Vec::with_capacity(cfg.shards as usize);
@@ -318,6 +349,42 @@ impl LocalStack {
         for p in &self.sealer.procs {
             p.suspend();
         }
+    }
+
+    /// SIGKILL the executor — an unclean crash, no shutdown hooks, no final
+    /// flush. What survives is exactly what mdbx committed.
+    pub fn crash_executor(&mut self) {
+        self.executor.proc.kill();
+    }
+
+    /// Restart the executor against the SAME state dir and metrics port, so
+    /// it takes the resume-from-persisted-cursor path rather than a genesis
+    /// re-sync (and scenarios keep the address they already hold).
+    pub fn restart_executor(&mut self) -> Result<()> {
+        let repo = services::repo_root();
+        let genesis = self.cfg.genesis.path(&repo);
+        let log_config = self
+            .cfg
+            .archive_durability
+            .then(|| self.root.path().join("channels.toml"));
+        let spec = ServiceSpec {
+            root: self.root.path(),
+            aeron_dir: &self.driver.aeron_dir,
+            cluster_ingress_endpoints: &self.sealer.ingress_endpoints,
+            shards: self.cfg.shards,
+            chain_id: DEV_CHAIN_ID,
+            genesis: &genesis,
+            log_config: log_config.as_deref(),
+        };
+        let port = self.executor.metrics_addr.port();
+        self.executor = services::spawn_executor_at(&spec, Some(port))?;
+        Ok(())
+    }
+
+    /// Tail of the RESTARTED executor's log (the crash-recovery scenario
+    /// asserts on its resume line).
+    pub fn restarted_executor_log(&self) -> Option<String> {
+        std::fs::read_to_string(self.root.path().join("executor-restarted.log")).ok()
     }
 
     /// Freeze the executor (SIGSTOP): its genuine BAL/receipt publications
