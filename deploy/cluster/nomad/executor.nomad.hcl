@@ -102,13 +102,16 @@ job "executor" {
           "--shards", "2",
           "--chain-id", "412346",
           "--chain", "/local/genesis.toml",
-          # Crash-recovery archive replay-merge endpoint for tx_data / tx_deposits
-          # (used only when the state DB is non-empty, i.e. on a restart). Bind on
-          # this node's cluster NIC (${meta.node_ip}) at port 40130; one executor
-          # per node (distinct_hosts) so no cross-replica collision. (tx_ordering
-          # recovery is handled by the Aeron Cluster client, so there is no
-          # separate live-destination endpoint anymore.)
+          # Join-miss archive refetch (tx_data / tx_deposits): a canonical ref
+          # whose envelope the live multicast missed (down-window, image lapse,
+          # blackout) is replayed in-band from the durability archives listed in
+          # channels.toml (ingress .31/.32; aux .61). Replayed fragments land on
+          # 40130, archive-control responses on 40140, both on this node's
+          # cluster NIC (${meta.node_ip}); one executor per node
+          # (distinct_hosts) so no cross-replica collision. (tx_ordering
+          # recovery is handled by the Aeron Cluster client's REPLAY_FROM.)
           "--replay-destination-endpoint", "${meta.node_ip}:40130",
+          "--archive-control-response-endpoint", "${meta.node_ip}:40140",
           # Bind the Prometheus exporter on ALL interfaces (default is
           # loopback): the chaos suite probes it DIRECTLY over the cluster
           # bridge (http://<node_ip>:9004/metrics), keeping dockerd out of

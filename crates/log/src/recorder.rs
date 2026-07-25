@@ -101,6 +101,19 @@ pub fn connect_archive(
     aeron_dir: Option<&Path>,
     cfg: &AeronConfig,
 ) -> Result<ArchiveSession, LogError> {
+    connect_archive_with_timeout(aeron_dir, cfg, Duration::from_secs(30))
+}
+
+/// [`connect_archive`] with a caller-chosen connect timeout. The recorder's
+/// boot-time connect keeps the generous 30s default; inline callers (the
+/// join-miss refetch, which runs inside a join-timeout budget and must fail
+/// over to another endpoint quickly when an archive node is down) pass a
+/// short one.
+pub fn connect_archive_with_timeout(
+    aeron_dir: Option<&Path>,
+    cfg: &AeronConfig,
+    connect_timeout: Duration,
+) -> Result<ArchiveSession, LogError> {
     let ctx = rusteron_archive::AeronContext::new()
         .map_err(|e| LogError::Aeron(format!("archive AeronContext::new: {e}")))?;
     if let Some(dir) = aeron_dir {
@@ -130,11 +143,19 @@ pub fn connect_archive(
         .map_err(|e| LogError::Aeron(format!("set_control_request_channel: {e}")))?;
     actx.set_control_response_channel(resp.as_c_str())
         .map_err(|e| LogError::Aeron(format!("set_control_response_channel: {e}")))?;
-    actx.set_message_timeout_ns(60_000_000_000)
+    // Control-message timeout scales with the connect timeout (never below the
+    // recorder's historical 60s when connecting patiently; a short-timeout
+    // inline caller gets equally snappy per-operation failure).
+    let message_timeout_ns: u64 = if connect_timeout >= Duration::from_secs(30) {
+        60_000_000_000
+    } else {
+        (connect_timeout.as_nanos() as u64).max(1_000_000_000)
+    };
+    actx.set_message_timeout_ns(message_timeout_ns)
         .map_err(|e| LogError::Aeron(format!("set_message_timeout_ns: {e}")))?;
     let archive = rusteron_archive::AeronArchiveAsyncConnect::new_with_aeron(&actx, &aeron)
         .map_err(|e| LogError::Aeron(format!("archive async connect: {e}")))?
-        .poll_blocking(Duration::from_secs(30))
+        .poll_blocking(connect_timeout)
         .map_err(|e| LogError::Aeron(format!("archive connect poll: {e}")))?;
     Ok(ArchiveSession {
         _aeron: aeron,

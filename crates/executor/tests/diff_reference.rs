@@ -276,6 +276,7 @@ fn actor_receipts_match_naive_reference() {
             writer_q,
             0,
             None,
+            None,
         )
     });
 

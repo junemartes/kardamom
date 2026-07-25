@@ -54,6 +54,14 @@ archive_control_request_channel = "aeron:ipc"
 archive_control_response_channel = "aeron:ipc"
 # Where the sealer-archive segment files live (bind-mounted; paths.archive_dir).
 archive_dir = "/opt/kardamom/archive"
+# Remote durability archives for the join-miss refetch (crates/log/src/refetch.rs):
+# a consumer whose live multicast missed an envelope replays the missing range
+# from these archives instead of dying. tx_data is recorded by BOTH ingress
+# nodes (multicast ⇒ each archive is a full mirror — either endpoint serves any
+# range; consumers rotate on failure). tx_deposits is recorded by the
+# da-watcher's node (aux). Ports = service_ports.aeron_archive_control (8010).
+tx_data_archive_endpoints = ["192.168.56.31:8010", "192.168.56.32:8010"]
+tx_deposits_archive_endpoints = ["192.168.56.61:8010"]
 
 [quorum]
 # VESTIGIAL after the move to archive-at-the-sealer durability. There is no

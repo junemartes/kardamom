@@ -195,6 +195,51 @@ impl DepositJoinBuffer {
     }
 }
 
+/// Archive-backed envelope recovery for join misses.
+///
+/// The tx_data / tx_deposits side streams are lossy multicast: a canonical ref
+/// whose envelope never arrived (image lapsed under load, publisher raced a
+/// subscriber restart, node-kill blackout) used to be terminal — the bounded
+/// join fired and the whole process died, betting that restart-recovery could
+/// replay the gap (it couldn't: the durability recordings live on OTHER nodes'
+/// archives). Implementations of this trait close that gap in-band: fetch the
+/// missing range from a remote durability archive and feed the join buffer,
+/// so a transient loss costs one bounded stall instead of a process death.
+/// The join timeout stays the final arbiter — if the archives can't produce
+/// the envelope either, the reader still fails loudly.
+///
+/// Implementations own their transport (endpoints, failover, backoff) and are
+/// called from the tx_ordering reader thread, so one call must stay well
+/// under the join-timeout budget.
+///
+/// Not `Send`: the Aeron archive client types are thread-bound, so the
+/// recovery is constructed INSIDE the reader thread via a
+/// [`JoinRecoveryFactory`] and never crosses threads.
+pub trait JoinRecovery {
+    /// Fetch tx_data envelopes for `shard_id` recorded at/after `from` on the
+    /// publisher session `session_id`, feeding each into `sink` (which inserts
+    /// into the join buffer). Returns the number of envelopes recovered.
+    fn recover_tx_data(
+        &mut self,
+        shard_id: u8,
+        session_id: i32,
+        from: BPosition,
+        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
+    ) -> Result<u64, String>;
+
+    /// Fetch tx_deposits recorded at/after `from` (any publisher session),
+    /// feeding each into `sink`. Returns the number of deposits recovered.
+    fn recover_deposits(
+        &mut self,
+        from: BPosition,
+        sink: &mut dyn FnMut(BPosition, Deposit),
+    ) -> Result<u64, String>;
+}
+
+/// Constructs the (thread-bound) [`JoinRecovery`] inside the reader thread.
+/// Returning `None` (e.g. config absent) leaves the plain bounded join.
+pub type JoinRecoveryFactory = Box<dyn FnOnce() -> Option<Box<dyn JoinRecovery>> + Send>;
+
 /// Tunables for the reader / join layer.
 #[derive(Clone, Debug)]
 pub struct ReaderConfig {
@@ -203,6 +248,12 @@ pub struct ReaderConfig {
     /// "few µs of A-publisher lag is fine, anything more is upstream
     /// failure" comment in the plan.
     pub join_timeout: Duration,
+    /// How long a join waits in-band before the first archive-refetch attempt
+    /// (when a [`JoinRecovery`] is wired). Long enough that ordinary publisher
+    /// lag never triggers a refetch; short enough that a real loss recovers
+    /// well inside the join budget. Further attempts repeat on the same
+    /// cadence until `join_timeout` expires.
+    pub join_refetch_after: Duration,
     /// Polling interval used during the join wait. Trade-off: smaller =
     /// faster recovery from lag, more CPU; larger = vice versa. 50 µs is
     /// well below the 100 ms ceiling.
@@ -223,6 +274,7 @@ impl Default for ReaderConfig {
     fn default() -> Self {
         Self {
             join_timeout: Duration::from_millis(100),
+            join_refetch_after: Duration::from_secs(10),
             join_poll_interval: Duration::from_micros(50),
             buffer_warn_threshold: 10_000,
             dedup_window: 1 << 20,
@@ -344,12 +396,23 @@ impl DedupWindow {
 /// `TxRef`, joins against `buffer` (with a bounded wait) and forwards
 /// `(position, envelope)` to `exec_out`. For each `BoundaryStart`, forwards
 /// directly.
+///
+/// `start_tx_idx` seeds the executor-local record counter: 0 on a fresh
+/// start, the persisted cursor's record count on a resume — the canonical
+/// source delivers from the cursor onward, and the indices this reader
+/// assigns are checked downstream against ABSOLUTE boundary counts.
+///
+/// `recovery_factory`, when wired, turns a join miss into an archive refetch
+/// instead of an immediate death — see [`JoinRecovery`]. It runs once, inside
+/// this thread (the recovery's Aeron resources are thread-bound).
 pub fn spawn_tx_ordering_reader<B>(
     mut b_sub: B,
     buffer: JoinBuffer,
     deposit_buffer: DepositJoinBuffer,
     cfg: ReaderConfig,
     exec_out: Sender<ReaderToExec>,
+    start_tx_idx: TxIndex,
+    recovery_factory: Option<JoinRecoveryFactory>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     B: TxOrderingSubscription + 'static,
@@ -357,7 +420,9 @@ where
     thread::Builder::new()
         .name("executor-reader-b".into())
         .spawn(move || {
-            let mut next_tx_idx = TxIndex::ZERO;
+            let mut recovery: Option<Box<dyn JoinRecovery>> =
+                recovery_factory.and_then(|f| f());
+            let mut next_tx_idx = start_tx_idx;
             let mut last_warn_len: usize = 0;
             // Canonical-id dedup. Under the MDS topology the P sequencers per
             // shard each republish the same `(tx_hash, shard, tx_data_position)`
@@ -386,14 +451,7 @@ where
                             );
                             continue;
                         }
-                        let env = match wait_for_envelope(
-                            &buffer,
-                            tx_ref.shard_id,
-                            tx_ref.tx_data_session_id,
-                            tx_ref.tx_data_position,
-                            cfg.join_timeout,
-                            cfg.join_poll_interval,
-                        ) {
+                        let env = match join_envelope(&buffer, &mut recovery, &tx_ref, &cfg) {
                             Some(e) => e,
                             None => {
                                 warn!(
@@ -402,7 +460,7 @@ where
                                     session_id = tx_ref.tx_data_session_id,
                                     tx_data_position = ?tx_ref.tx_data_position,
                                     timeout_ms = cfg.join_timeout.as_millis() as u64,
-                                    "join timeout: TxRef has no envelope on tx_data; aborting"
+                                    "join timeout: TxRef has no envelope on tx_data (archive refetch exhausted); aborting"
                                 );
                                 return Err(ExecutorError::JoinTimeout {
                                     sequencer_id: tx_ref.shard_id,
@@ -449,11 +507,11 @@ where
                             );
                             continue;
                         }
-                        let (resolved_pos, deposit) = match wait_for_deposit(
+                        let (resolved_pos, deposit) = match join_deposit(
                             &deposit_buffer,
-                            dep_ref.source_hash,
-                            cfg.join_timeout,
-                            cfg.join_poll_interval,
+                            &mut recovery,
+                            &dep_ref,
+                            &cfg,
                         ) {
                             Some(d) => d,
                             None => {
@@ -508,6 +566,150 @@ where
 
 /// Spin-wait for `(sequencer_id, session_id, tx_data_position)` to appear in
 /// `buffer`, returning `Some(env)` on success or `None` after `timeout`.
+/// Join a `TxRef` against the buffer with the full join budget, interleaving
+/// bounded archive-refetch attempts when a [`JoinRecovery`] is wired.
+///
+/// Timeline: wait `join_refetch_after` in-band (covers ordinary publisher
+/// lag); on a miss, refetch the missing range from the durability archives
+/// and keep waiting, repeating until `join_timeout` is spent. Without a
+/// recovery this degenerates to today's single bounded wait. A refetch
+/// error is non-fatal here (endpoints rotate inside the impl; the final
+/// arbiter stays the join timeout).
+fn join_envelope(
+    buffer: &JoinBuffer,
+    recovery: &mut Option<Box<dyn JoinRecovery>>,
+    tx_ref: &kardamom_types::TxRef,
+    cfg: &ReaderConfig,
+) -> Option<TxEnvelope> {
+    let (shard, session, pos) = (
+        tx_ref.shard_id,
+        tx_ref.tx_data_session_id,
+        tx_ref.tx_data_position,
+    );
+    let deadline = Instant::now() + cfg.join_timeout;
+    let first_slice = match recovery {
+        Some(_) => cfg.join_refetch_after.min(cfg.join_timeout),
+        None => cfg.join_timeout,
+    };
+    if let Some(env) = wait_for_envelope(
+        buffer,
+        shard,
+        session,
+        pos,
+        first_slice,
+        cfg.join_poll_interval,
+    ) {
+        return Some(env);
+    }
+    loop {
+        let Some(r) = recovery.as_mut() else {
+            return None; // no recovery wired: the single wait above was the budget
+        };
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        warn!(
+            target: "kardamom_executor::reader",
+            sequencer_id = shard,
+            session_id = session,
+            tx_data_position = ?pos,
+            "join miss on tx_data — refetching from durability archive"
+        );
+        let mut recovered = 0u64;
+        match r.recover_tx_data(shard, session, pos, &mut |loc, env| {
+            buffer.insert(shard, loc.session_id, loc.position, env);
+            recovered += 1;
+        }) {
+            Ok(_) => tracing::info!(
+                target: "kardamom_executor::reader",
+                sequencer_id = shard,
+                recovered,
+                "archive refetch complete"
+            ),
+            Err(e) => warn!(
+                target: "kardamom_executor::reader",
+                sequencer_id = shard,
+                error = %e,
+                "archive refetch failed; will retry within the join budget"
+            ),
+        }
+        let slice = cfg
+            .join_refetch_after
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if slice.is_zero() {
+            return buffer.take(shard, session, pos);
+        }
+        if let Some(env) =
+            wait_for_envelope(buffer, shard, session, pos, slice, cfg.join_poll_interval)
+        {
+            return Some(env);
+        }
+    }
+}
+
+/// Deposit twin of [`join_envelope`]: bounded wait keyed by `source_hash`,
+/// with archive refetch of the tx_deposits stream from the ref's position.
+fn join_deposit(
+    buffer: &DepositJoinBuffer,
+    recovery: &mut Option<Box<dyn JoinRecovery>>,
+    dep_ref: &kardamom_types::DepositRef,
+    cfg: &ReaderConfig,
+) -> Option<(BPosition, Deposit)> {
+    let deadline = Instant::now() + cfg.join_timeout;
+    let first_slice = match recovery {
+        Some(_) => cfg.join_refetch_after.min(cfg.join_timeout),
+        None => cfg.join_timeout,
+    };
+    if let Some(d) = wait_for_deposit(
+        buffer,
+        dep_ref.source_hash,
+        first_slice,
+        cfg.join_poll_interval,
+    ) {
+        return Some(d);
+    }
+    loop {
+        let r = recovery.as_mut()?;
+        if Instant::now() >= deadline {
+            return None;
+        }
+        warn!(
+            target: "kardamom_executor::reader",
+            source_hash = ?dep_ref.source_hash,
+            deposit_position = ?dep_ref.deposit_position,
+            "join miss on tx_deposits — refetching from durability archive"
+        );
+        let mut recovered = 0u64;
+        match r.recover_deposits(dep_ref.deposit_position, &mut |pos, dep| {
+            buffer.insert(pos, dep);
+            recovered += 1;
+        }) {
+            Ok(_) => tracing::info!(
+                target: "kardamom_executor::reader",
+                recovered,
+                "deposit archive refetch complete"
+            ),
+            Err(e) => warn!(
+                target: "kardamom_executor::reader",
+                error = %e,
+                "deposit archive refetch failed; will retry within the join budget"
+            ),
+        }
+        let slice = cfg
+            .join_refetch_after
+            .min(deadline.saturating_duration_since(Instant::now()));
+        if slice.is_zero() {
+            return buffer.take(dep_ref.source_hash);
+        }
+        if let Some(d) =
+            wait_for_deposit(buffer, dep_ref.source_hash, slice, cfg.join_poll_interval)
+        {
+            return Some(d);
+        }
+    }
+}
+
 fn wait_for_envelope(
     buffer: &JoinBuffer,
     sequencer_id: u8,
@@ -696,6 +898,8 @@ mod tests {
             DepositJoinBuffer::new(),
             ReaderConfig::default(),
             tx,
+            TxIndex::ZERO,
+            None,
         );
         h.join().expect("no panic").expect("ok");
 
@@ -762,7 +966,15 @@ mod tests {
             ))]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(2);
-        let h = spawn_tx_ordering_reader(b, buf, DepositJoinBuffer::new(), cfg, tx);
+        let h = spawn_tx_ordering_reader(
+            b,
+            buf,
+            DepositJoinBuffer::new(),
+            cfg,
+            tx,
+            TxIndex::ZERO,
+            None,
+        );
         h.join().expect("no panic").expect("ok");
         a_inserter.join().unwrap();
 
@@ -794,7 +1006,15 @@ mod tests {
             ))]),
         };
         let (tx, _rx) = bounded::<ReaderToExec>(2);
-        let h = spawn_tx_ordering_reader(b, buf, DepositJoinBuffer::new(), cfg, tx);
+        let h = spawn_tx_ordering_reader(
+            b,
+            buf,
+            DepositJoinBuffer::new(),
+            cfg,
+            tx,
+            TxIndex::ZERO,
+            None,
+        );
         let res = h.join().expect("no panic");
         assert!(matches!(
             res,
@@ -829,6 +1049,8 @@ mod tests {
             DepositJoinBuffer::new(),
             ReaderConfig::default(),
             tx,
+            TxIndex::ZERO,
+            None,
         );
         h.join().expect("no panic").expect("ok");
 
@@ -941,6 +1163,8 @@ mod tests {
             DepositJoinBuffer::new(),
             ReaderConfig::default(),
             tx,
+            TxIndex::ZERO,
+            None,
         )
         .join()
         .expect("no panic")
