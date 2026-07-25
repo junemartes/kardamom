@@ -182,6 +182,12 @@ async fn run_case(case: &str, t: &Target, base: usize, have_ingress_metrics: boo
                     senders: 3,
                     transfers_per_sender: 12,
                     sender_base: base + 10,
+                    // tx_bal is UDP multicast here, not IPC: a dropped BAL
+                    // leaves a block unverified, which the design explicitly
+                    // tolerates (it is never a divergence). Budget a few for
+                    // the workload's own blocks; a validator receiving NO
+                    // BALs still blows through this.
+                    max_bal_missing: 3.0,
                 },
             )
             .await

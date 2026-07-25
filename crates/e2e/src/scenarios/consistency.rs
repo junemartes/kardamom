@@ -7,10 +7,12 @@
 //! databases.
 //!
 //! Live phase ([`run`], target-agnostic): mixed workload (transfers +
-//! contract creates), drain, then assert the validator verified blocks with
-//! zero divergence, zero missing BALs (an all-IPC single host has no lossy
-//! hop), the per-block trie shadow-check found no mismatch, and the
-//! validator's committed cursor reached the executor's.
+//! contract creates), drain, then assert — as DELTAS over the workload, so a
+//! validator that replayed a backlog before catching up is judged on what it
+//! does now — that it verified new blocks, missed no more BALs than its
+//! budget allows (zero on IPC, a small budget on the cluster's lossy
+//! multicast), never diverged, ran the per-block trie shadow-check without a
+//! mismatch, and caught its committed cursor up to the executor's.
 //!
 //! Offline phase ([`verify_state_dirs`], runs after a graceful shutdown —
 //! Target C obtains the dirs via `docker cp`): `kardamom_state::sweep` on
@@ -33,10 +35,25 @@ use crate::harness::metrics::poll_until;
 /// runtime, the minimal real CREATE.
 const TINY_INIT_CODE: &[u8] = &[0x60, 0x01, 0x60, 0x00, 0x53, 0x60, 0x01, 0x60, 0x00, 0xf3];
 
+/// Sequential transactions submitted AFTER the validator has caught up, to
+/// ask "does verification work on fresh blocks?" — see the probe below.
+const PROBE_TXS: u64 = 5;
+
 pub struct Params {
     pub senders: usize,
     pub transfers_per_sender: usize,
     pub sender_base: usize,
+    /// How many BALs the validator may miss FOR THIS SCENARIO'S OWN BLOCKS.
+    ///
+    /// Zero on Target L: one host, IPC transport, no lossy hop. On Target C
+    /// `tx_bal` is UDP multicast, which is lossy by design — a dropped BAL
+    /// leaves that block unverified and is explicitly not a divergence — so
+    /// the cluster runner allows a small budget. The check is a DELTA across
+    /// the workload rather than an absolute count, because a validator that
+    /// replayed a backlog before catching up legitimately commits those older
+    /// blocks unverified (`BalBuffer`'s catch-up mode), and that history says
+    /// nothing about whether it is verifying now.
+    pub max_bal_missing: f64,
 }
 
 impl Default for Params {
@@ -45,6 +62,7 @@ impl Default for Params {
             senders: 4,
             transfers_per_sender: 24,
             sender_base: 1,
+            max_bal_missing: 0.0,
         }
     }
 }
@@ -55,6 +73,18 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     let baseline = SeqCounters::snapshot(t).await?;
     let applied_before = t
         .executor_metric(super::EXEC_TX_APPLIED)
+        .await
+        .unwrap_or(0.0);
+    // Baselines for the validator counters: everything below is asserted as a
+    // DELTA over this scenario's workload, so a validator that started behind
+    // a running chain is judged on what it does now, not on the backlog it
+    // committed unverified while catching up.
+    let verified_before = t
+        .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
+        .await
+        .unwrap_or(0.0);
+    let missing_before = t
+        .validator_metric(super::VALIDATOR_BAL_MISSING)
         .await
         .unwrap_or(0.0);
 
@@ -108,16 +138,69 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         },
     )
     .await?;
-    let verified = t.validator_metric(super::VALIDATOR_BLOCKS_VERIFIED).await?;
-    anyhow::ensure!(verified > 0.0, "validator verified no blocks");
+    // VERIFICATION PROBE. The bulk workload above deliberately gets the
+    // validator behind, and a validator behind the head commits blocks
+    // UNVERIFIED on purpose — `BalBuffer`'s catch-up mode treats a BAL older
+    // than the backlog lookbehind as unrecoverable rather than crawling. So
+    // "did verification happen?" cannot be asked of burst blocks; it has to
+    // be asked of fresh ones, with the validator caught up (the poll above
+    // guarantees that). A handful of sequential transactions spans a few
+    // blocks, so a single lost multicast BAL cannot decide the outcome.
+    let verified_before = t
+        .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
+        .await
+        .unwrap_or(verified_before);
+    let missing_before = t
+        .validator_metric(super::VALIDATOR_BAL_MISSING)
+        .await
+        .unwrap_or(missing_before);
+    let probe_signer = &signers[p.sender_base];
+    let applied_pre_probe = t.executor_metric(super::EXEC_TX_APPLIED).await?;
+    for i in 0..PROBE_TXS {
+        let nonce = p.transfers_per_sender as u64 + 1 + i;
+        let tx = l2::sign_transfer(probe_signer, t.chain_id, nonce, to, 1)?;
+        t.rpc
+            .send_raw(&tx.raw)
+            .await
+            .result
+            .map_err(|e| anyhow::anyhow!("probe tx {i}: {e}"))?;
+    }
+    t.wait_executor_applied(
+        applied_pre_probe + PROBE_TXS as f64,
+        Duration::from_secs(30),
+    )
+    .await?;
+    let verified = poll_until(
+        "validator verifies the probe blocks",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async {
+            let v = t
+                .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
+                .await
+                .unwrap_or(0.0);
+            Ok((v > verified_before).then_some(v))
+        },
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "validator verified no fresh block while caught up (stuck at {verified_before}) — \
+             every probe block was committed unverified"
+        )
+    })?;
     let missing = t
         .validator_metric(super::VALIDATOR_BAL_MISSING)
         .await
         .unwrap_or(0.0);
+    let missed = missing - missing_before;
     anyhow::ensure!(
-        missing == 0.0,
-        "validator missed {missing} BALs on an all-IPC host"
+        missed <= p.max_bal_missing,
+        "validator missed {missed} BALs on the probe blocks (budget {}); a missing BAL leaves \
+         a block unverified — tolerated on lossy multicast, never on IPC",
+        p.max_bal_missing
     );
+    let _ = verified;
     let divergence = t
         .validator_metric(super::VALIDATOR_DIVERGENCE)
         .await
