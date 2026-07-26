@@ -71,6 +71,8 @@ RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 # Explicit chain-id (ingress eth_chainId returns a default ≠ the cluster chain).
 CHAIN_ID="${CHAIN_ID:-412346}"
 LOAD_BIN="${LOAD_BIN:-${ROOT}/target/release/kardamom-load}"
+# Archive repair tool (archive-corruption case); built with the service bins.
+REREP_BIN="${REREP_BIN:-${ROOT}/target/release/kardamom-archive-rereplicate}"
 CHAOS_TPS="${CHAOS_TPS:-50}"
 CHAOS_CASE_S="${CHAOS_CASE_S:-45}"
 LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}"
@@ -875,8 +877,17 @@ run_case() { # <case-name>
       # Re-replicate from the surviving peer (ingress-1): stream its archive dir
       # across. This is the transport that kardamom-archive-rereplicate wraps for
       # an operator (peer copy -> mirror_archive -> verify_mirror).
+      #
+      # NEVER transplant archive-mark.dat from a LIVE source: the peer's daemon
+      # heartbeats it, so the copy looks "active" to the victim's restarting
+      # Archive, which then crash-loops on 'active Mark file detected' until the
+      # copied heartbeat ages out — observed blowing the 60s restart SLO (the
+      # recurring 'aeron did not reach >= 8 running (have 7)' flake, on main and
+      # PRs). The victim's own mark file was deliberately preserved by the wipe
+      # above and its heartbeat died with the killed driver, so it is already
+      # stale by restart time and the daemon starts cleanly.
       log "archive-tx-data-wipe: re-replicating archive from kardamom-ingress-1 mirror"
-      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive --exclude='dir/archive-mark.dat' -cf - dir \
         | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
         || fail "archive-tx-data-wipe: re-replication copy failed"
       # The pipeline must have ridden through on ingress-1 the whole time.
@@ -895,6 +906,169 @@ run_case() { # <case-name>
         fail "archive-tx-data-wipe: restored archive verify reported errors: ${verify_out}"
       fi
       log "archive-tx-data-wipe: restored archive verified OK on ingress-0 (2-copy redundancy recovered)"
+      assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      ;;
+
+    archive-corruption)
+      # DATA-corruption drill (present-but-wrong, not missing): flip bytes
+      # mid-segment in ingress-0's tx_data archive — length preserved, so a
+      # size check can't see it — then DETECT it with a CRC-armed
+      # `ArchiveTool verify` (record-time CRC32 is enabled in the driver) and
+      # HEAL only the corrupt segment from ingress-1's mirror via
+      # `kardamom-archive-rereplicate --diff/--heal`. File-level surgery
+      # requires the victim's archive daemon STOPPED throughout, so the node is
+      # drained for the window (pipeline rides on ingress-1, as the other
+      # archive cases prove). Expected, in order:
+      #   1. pre-heal verify FAILS on the corrupted archive (detection);
+      #   2. the Rust tool's --diff names the corrupted segment and --heal
+      #      repairs exactly it from the mirror;
+      #   3. post-heal CRC verify is clean, the node undrains, and aeron +
+      #      ingress return to strength with the pipeline having progressed.
+      local aeron_base node_id seg seg_name aeron_img tmp_dir verify_pre verify_post diverged
+      [ -x "${REREP_BIN}" ] || fail "archive-corruption: kardamom-archive-rereplicate not at ${REREP_BIN}"
+      aeron_base="$(count_running aeron)"
+      [ -n "${aeron_base}" ] && [ "${aeron_base}" -gt 0 ] \
+        || fail "archive-corruption: aeron baseline unavailable — refusing a vacuous pass"
+      # Hold ingress-0 down for the whole surgery window: drain evicts the
+      # aeron system task (which holds the catalog open) and keeps it down
+      # until we undrain — a hard kill would race nomad's restart.
+      node_id="$(on_control 'nomad node status -verbose 2>/dev/null | awk "/ingress-0/ {print \$1; exit}"')"
+      [ -n "${node_id}" ] || fail "archive-corruption: could not resolve ingress-0 node id"
+      aeron_img="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker ps -a --format '{{.Image}} {{.Names}}' | awk '/archiving/ {print \$1; exit}'")"
+      [ -n "${aeron_img}" ] || fail "archive-corruption: could not resolve the aeron image on ingress-0"
+      log "archive-corruption: draining ingress-0 node (${node_id})"
+      on_control 'nomad node drain -enable -yes -deadline 2m "$1"' "${node_id}" >/dev/null \
+        || fail "archive-corruption: drain enable failed"
+      sleep 5
+      # Pick a victim recording that verifies CLEAN at baseline. The archive's
+      # catalog was restored from the live peer by archive-tx-data-wipe, and
+      # which entries got torn in that copy is a per-run lottery (issue #98) —
+      # this case tests SEGMENT corruption detect/heal, not catalog repair, so
+      # it must start from a provably-clean recording: baseline OK -> corrupt
+      # -> ERR -> heal -> OK is then a closed loop. Every verify/mark-valid is
+      # scoped to that recording (segment name = <recordingId>-<base>.rec).
+      local seg="" seg_name="" rid="" flip_at=-1 cand cand_name cand_rid cand_out cand_flip
+      for cand in $(docker exec kardamom-ingress-0 bash -lc \
+          'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
+        cand_name="$(basename "${cand}")"
+        cand_rid="${cand_name%%-*}"
+        cand_out="$(docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           verify ${cand_rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+        if echo "${cand_out}" | grep -q "recordingId=${cand_rid}) OK" \
+          && ! echo "${cand_out}" | grep -q ') ERR'; then
+          # Segment files are PRE-ALLOCATED (equal apparent size, ls -S order
+          # arbitrary), and a flip landing in a frame HEADER can send verify's
+          # frame-walk out of bounds (observed: JVM SIGSEGV in the CRC32
+          # intrinsic) instead of a clean ERR. Walk the Aeron data-frame
+          # headers and pick a flip offset INSIDE the payload of the largest
+          # real data frame (type 0x01, skipping padding frames); -1 means the
+          # segment has no usable frame — try the next candidate.
+          cand_flip="$(docker exec kardamom-ingress-0 python3 -c "
+b = open('${cand}', 'rb').read()
+pos = 0; best = -1; bestlen = 0
+while pos + 32 <= len(b):
+    ln = int.from_bytes(b[pos:pos+4], 'little', signed=True)
+    if ln <= 0:
+        break  # first zero-length header = start of the unrecorded tail
+    typ = int.from_bytes(b[pos+6:pos+8], 'little')
+    if typ == 1 and ln >= 96 and pos + ln <= len(b) and ln > bestlen:
+        best = pos; bestlen = ln
+    pos += (ln + 31) // 32 * 32
+print(best + 40 if best >= 0 else -1)
+" 2>/dev/null || echo -1)"
+          if [ "${cand_flip:--1}" -ge 0 ]; then
+            seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"; flip_at="${cand_flip}"
+            break
+          fi
+          continue
+        fi
+        # The probe marks a failing entry INVALID — put its state back as found.
+        docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           mark-valid ${cand_rid}" >/dev/null 2>&1 || true
+      done
+      [ -n "${seg}" ] \
+        || fail "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad — see issue #98)"
+      # Corrupt 16 bytes inside a data frame's PAYLOAD — length unchanged,
+      # frame structure intact, so verify reports a checksum ERR instead of
+      # chasing a bogus frame length.
+      log "archive-corruption: flipping payload bytes at ${flip_at} in ${seg_name} (recording ${rid})"
+      docker exec kardamom-ingress-0 bash -lc \
+        "printf 'KARDAMOM-CHAOS!!' | dd of=${seg} bs=1 seek=${flip_at} count=16 conv=notrunc status=none" \
+        || fail "archive-corruption: byte flip failed"
+      # DETECTION: CRC-armed verify on the frozen victim must NOT be clean.
+      # (Run via a one-off container on the node — the daemon is down.)
+      verify_pre="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
+         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+         verify ${rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+      if echo "${verify_pre}" | grep -q 'Exception'; then
+        echo "${verify_pre}" | tail -20
+        fail "archive-corruption: verify tool crashed (not a detection)"
+      fi
+      echo "${verify_pre}" | grep -qE "recordingId=${rid}[,)].* ERR" \
+        || { echo "${verify_pre}" | tail -20; \
+             fail "archive-corruption: CRC-armed verify did NOT flag recording ${rid} (detection hole)"; }
+      log "archive-corruption: corruption detected by CRC-armed verify"
+      # HEAL through the Rust tool on the runner: stage both copies, --diff
+      # must name the corrupted segment, --heal repairs exactly it.
+      tmp_dir="$(mktemp -d)"
+      mkdir -p "${tmp_dir}/victim" "${tmp_dir}/mirror"
+      docker exec kardamom-ingress-0 tar -C /opt/kardamom/archive -cf - dir \
+        | tar -C "${tmp_dir}/victim" -xf - || fail "archive-corruption: staging victim copy failed"
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
+        | tar -C "${tmp_dir}/mirror" -xf - || fail "archive-corruption: staging mirror copy failed"
+      diverged="$("${REREP_BIN}" --diff --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" || true)"
+      echo "${diverged}" | grep -q "${seg_name}" \
+        || fail "archive-corruption: --diff did not name the corrupted segment ${seg_name}"
+      "${REREP_BIN}" --heal --segments "${seg_name}" --no-verify \
+        --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" \
+        | grep -q 'healed segments=1' \
+        || fail "archive-corruption: --heal did not repair the segment"
+      # Put ONLY the healed segment back, then re-validate + clear any INVALID
+      # marks the detection verify persisted.
+      tar -C "${tmp_dir}/victim" -cf - "dir/${seg_name}" \
+        | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
+        || fail "archive-corruption: writing healed segment back failed"
+      # The detection verify marked the failing recording INVALID in the
+      # catalog; clear the marks now that the bytes are healed. Recording ids
+      # are harvested on the RUNNER from the pre-heal verify output (one
+      # mark-valid container per id — a shell loop inside the node would run
+      # `java` on the node itself, where it doesn't exist).
+      docker exec kardamom-ingress-0 bash -lc \
+        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
+         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+         mark-valid ${rid}" >/dev/null 2>&1 || true
+      verify_post="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
+         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+         verify ${rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+      if echo "${verify_post}" | grep -q 'Exception'; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify tool crashed"
+      fi
+      if ! echo "${verify_post}" | grep -q "recordingId=${rid}) OK"; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify does not show recording ${rid} OK"
+      fi
+      if echo "${verify_post}" | grep -qE "recordingId=${rid}[,)].* ERR"; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify still reports errors on recording ${rid}"
+      fi
+      rm -rf "${tmp_dir}"
+      log "archive-corruption: healed + CRC verify clean; undraining ingress-0"
+      on_control 'nomad node drain -disable -yes "$1"' "${node_id}" >/dev/null \
+        || fail "archive-corruption: drain disable failed"
+      assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
       assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
       ;;
 

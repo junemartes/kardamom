@@ -104,3 +104,63 @@ fn segment_path_uses_canonical_layout() {
     let p = TypedSegmentReader::<TxOrderingMessage>::segment_path(dir, 5, 16777216);
     assert_eq!(p, std::path::Path::new("/tmp/archive/5-16777216.rec"));
 }
+
+#[test]
+fn zeroed_header_with_data_behind_is_corruption() {
+    // A wiped length field mid-file previously read as a clean live tail —
+    // silent data loss. With real frames behind the zeroed header it must
+    // surface as Corruption.
+    let mut buf = Vec::new();
+    append_frame(&mut buf, pos(0), &tx(1));
+    let wipe_at = buf.len();
+    append_frame(&mut buf, pos(128), &tx(2));
+    buf[wipe_at..wipe_at + 4].fill(0); // zero the second frame's length
+
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(&buf).unwrap();
+
+    let reader = TxDataSegmentReader::open(f.path()).unwrap();
+    let results: Vec<_> = reader.collect();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_ok());
+    assert!(matches!(
+        results[1],
+        Err(kardamom_batcher::BatcherError::Corruption(_))
+    ));
+}
+
+#[test]
+fn zero_filled_tail_still_stops_cleanly() {
+    // The legitimate case the corruption check must NOT flag: a pre-allocated
+    // zero-filled tail after the last real frame.
+    let mut buf = Vec::new();
+    append_frame(&mut buf, pos(0), &tx(1));
+    buf.extend_from_slice(&[0u8; 256]);
+
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(&buf).unwrap();
+
+    let reader = TxDataSegmentReader::open(f.path()).unwrap();
+    let records: Vec<_> = reader.collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(records.len(), 1);
+}
+
+#[test]
+fn undersized_frame_length_is_corruption() {
+    let mut buf = Vec::new();
+    append_frame(&mut buf, pos(0), &tx(1));
+    let at = buf.len();
+    buf.extend_from_slice(&8u32.to_le_bytes()); // len 8 < header size 16
+    buf.extend_from_slice(&[0xAB; 12]);
+    let _ = at;
+
+    let mut f = NamedTempFile::new().unwrap();
+    f.write_all(&buf).unwrap();
+
+    let reader = TxDataSegmentReader::open(f.path()).unwrap();
+    let results: Vec<_> = reader.collect();
+    assert!(matches!(
+        results.last().unwrap(),
+        Err(kardamom_batcher::BatcherError::Corruption(_))
+    ));
+}

@@ -105,8 +105,30 @@ where
         }
         let buf = &self.bytes[self.pos..];
         let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        if len < FRAME_HEADER_LEN || self.pos + len > self.bytes.len() {
-            // Truncated active segment — stop.
+        if len == 0 {
+            // A pre-allocated / not-yet-written tail is zero-filled. A zero
+            // length followed by ANY non-zero byte is a damaged header with
+            // real data behind it — corruption, not a live tail. Without this
+            // check a mid-file length wipe silently truncates the stream.
+            if buf.iter().any(|&b| b != 0) {
+                let at = self.pos;
+                self.pos = self.bytes.len(); // fuse the iterator
+                return Some(Err(BatcherError::Corruption(format!(
+                    "zeroed frame header followed by data at segment offset {at}"
+                ))));
+            }
+            return None;
+        }
+        if len < FRAME_HEADER_LEN {
+            // No legitimate frame is smaller than its own header.
+            let at = self.pos;
+            self.pos = self.bytes.len(); // fuse the iterator
+            return Some(Err(BatcherError::Corruption(format!(
+                "frame length {len} below header size at segment offset {at}"
+            ))));
+        }
+        if self.pos + len > self.bytes.len() {
+            // Truncated active segment (a frame mid-write at the tail) — stop.
             return None;
         }
         // bytes 4..8 reserved
