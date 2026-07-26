@@ -217,6 +217,7 @@ impl PendingReceipts {
             if let Some(resp) = e.responder.take() {
                 let err = match reason {
                     TxErrorReason::DuplicatedTx { .. } => IngressError::Duplicate((sender, nonce)),
+                    TxErrorReason::Evicted { .. } => IngressError::Evicted((sender, nonce)),
                 };
                 // Release only; the woken waiter's Drop removes the slot.
                 let _ = resp.send(Err(err));
@@ -421,6 +422,34 @@ mod tests {
             matches!(err, IngressError::Duplicate((s, n)) if s == sender && n == nonce),
             "got {err:?}"
         );
+        assert_eq!(p.len(), 0, "entry removed on release");
+    }
+
+    #[tokio::test]
+    async fn eviction_releases_the_parked_wait_with_an_evicted_error() {
+        // The wedge fix: a sequencer overload-shed (Evicted) must error the
+        // parked submit instead of leaving it waiting for a receipt that can
+        // never arrive (the pre-fix silent evict permanently gapped the
+        // sender and pinned the connection until timeout).
+        let p = Arc::new(PendingReceipts::new(AckPolicy::OnOffer));
+        let sender = Address::repeat_byte(0x77);
+        let nonce = 21u64;
+
+        let wait = p.register(sender, nonce);
+        let waiter =
+            tokio::spawn(async move { wait.await_with_timeout(Duration::from_secs(5)).await });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        p.on_tx_error(sender, nonce, TxErrorReason::Evicted { expected_nonce: 18 })
+            .await;
+
+        let res = waiter.await.expect("join");
+        match res {
+            Err(IngressError::Evicted((s, n))) => {
+                assert_eq!((s, n), (sender, nonce));
+            }
+            other => panic!("expected Evicted release, got {other:?}"),
+        }
         assert_eq!(p.len(), 0, "entry removed on release");
     }
 

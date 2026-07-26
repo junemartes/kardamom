@@ -64,6 +64,38 @@ fn receipt_for(sender: Address, nonce: u64, tx_hash: B256, idx: i32) -> Receipt 
     }
 }
 
+/// With `pending_shed_depth: 0` (shed-everything test hook) every submission
+/// must be rejected with the retryable Overloaded error instead of parking —
+/// overload becomes degradation, not a wedge.
+#[tokio::test]
+async fn overloaded_ingress_sheds_submissions_with_a_clear_error() {
+    let cfg = IngressConfig {
+        chain_id: 1,
+        pending_shed_depth: 0,
+        ..IngressConfig::default()
+    };
+    let (mock, _rx) = MockChannels::new(SHARDS);
+    let state_db = Arc::new(InMemoryStateDb::new());
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db);
+    let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let (local, _handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
+    let client = HttpClientBuilder::default()
+        .build(format!("http://{local}"))
+        .unwrap();
+
+    let signer = PrivateKeySigner::random();
+    let (_env, raw, _addr) = common::sign_legacy_tx(&signer, 0);
+    let res: Result<B256, _> = client
+        .request("kardamom_sendRawTransactionAsync", rpc_params![raw])
+        .await;
+    let err = res.expect_err("submission must be shed");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("overloaded"),
+        "error must name the overload: {msg}"
+    );
+}
+
 /// The async submit must return the canonical tx hash without any receipt
 /// having been published — i.e. it must not park like
 /// `eth_sendRawTransaction` does.
