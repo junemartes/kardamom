@@ -121,11 +121,19 @@ first-seen dedup keeps one.
   the restart SLO, and that the restarted replica actually publishes refs
   again. The restarted replica joins live (no archive replay — its twin
   covered the gap, and replay could overshoot the sealer's dedup window);
-  hydrated nonce floors are only a lower bound, and the stream-adaptive
-  fast-forward (`nonce_floor_lag_ms`, default 5 s) advances a stalled floor
-  to the live join point so the replica regains full coverage —
-  `kardamom_sequencer_nonce_floor_fastforward_total` spikes on rejoin (see
-  the replicated-sequencer-shards spec, "Restart / rejoin semantics").
+  hydrated nonce floors are only a lower bound, and **receipt-floor resync**
+  advances a stalled floor on execution evidence from the tx_receipts
+  stream — buffered nonces the twin already got executed drop as proven
+  duplicates and the run unsticks (the stream-adaptive `nonce_floor_lag_ms`
+  fast-forward this replaces was REMOVED for publishing canonical nonce
+  gaps; the config key still parses but is inert — see
+  `docs/agents/sequencer-lag-resync-spec.md`).
+- **Replica lagged/paused** (`sequencer-lapse`) — a replica frozen past the
+  boundary-silence window detects the lapse itself (egress boundary-arrival
+  gap → sticky lag flag → resync mode) and skips only receipt-proven
+  duplicates on resume; everything unproven publishes and the cluster dedup
+  absorbs it. A predecessor session corpse can no longer cycle the restarted
+  replica's session (foreign-session event filter, issue #99).
 - **Sequencer node loss** — cross-placement guarantees every shard keeps one
   replica; redundancy (not availability) degrades until the node returns.
 - **Both replicas of one shard down** — that shard stalls; this is now the

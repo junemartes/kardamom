@@ -103,6 +103,30 @@ pub struct LiveEgress {
     out_rx: Receiver<Vec<u8>>,
 }
 
+/// Result of a bounded-wait egress poll ([`LiveEgress::recv_timeout`]).
+#[derive(Debug)]
+pub enum EgressPoll {
+    /// A frame arrived.
+    Frame(Vec<u8>),
+    /// Nothing arrived within the timeout; the session thread is still alive.
+    Idle,
+    /// The session thread is gone (cluster guard dropped) — stop polling.
+    Closed,
+}
+
+impl LiveEgress {
+    /// Bounded-wait receive, for consumers that must keep OBSERVING while
+    /// egress is silent (the sequencer's lag-detection feed measures
+    /// inter-arrival gaps — a blocking `recv` cannot notice silence).
+    pub fn recv_timeout(&mut self, timeout: std::time::Duration) -> EgressPoll {
+        match self.out_rx.recv_timeout(timeout) {
+            Ok(frame) => EgressPoll::Frame(frame),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => EgressPoll::Idle,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => EgressPoll::Closed,
+        }
+    }
+}
+
 impl ClusterEgress for LiveEgress {
     fn recv(&mut self) -> Option<Vec<u8>> {
         self.out_rx.recv().ok()
@@ -127,7 +151,7 @@ pub fn connect(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, None)
+    connect_inner(rt, cfg, None, None)
 }
 
 /// [`connect`], plus a replay request on every session establishment.
@@ -136,7 +160,22 @@ pub fn connect_with_replay(
     cfg: LiveClusterConfig,
     replay: ReplayOnConnect,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
-    connect_inner(rt, cfg, Some(replay))
+    connect_inner(rt, cfg, Some(replay), None)
+}
+
+/// [`connect`], but the session thread forwards ONLY egress app frames whose
+/// leading kind byte equals `kind` to the [`LiveEgress`] — everything else is
+/// dropped at the source. For publisher-side consumers that want boundaries
+/// only (the sequencer's lag-detection feed): relayed records arrive at full
+/// line rate, and allocating + channelling each one to a receiver that
+/// discards it measurably taxes the session thread, which also services the
+/// publish offers (observed as a collapsed load ceiling, CI run 30164871699).
+pub fn connect_with_egress_kind_filter(
+    rt: AeronRuntime,
+    cfg: LiveClusterConfig,
+    kind: u8,
+) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
+    connect_inner(rt, cfg, None, Some(kind))
 }
 
 /// Append a small term-length to a cluster control channel unless the URI
@@ -181,6 +220,7 @@ fn connect_inner(
     rt: AeronRuntime,
     mut cfg: LiveClusterConfig,
     replay: Option<ReplayOnConnect>,
+    egress_kind_filter: Option<u8>,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
     validate_config(&cfg)?;
     cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
@@ -235,6 +275,7 @@ fn connect_inner(
                 cfg,
                 initial,
                 replay,
+                egress_kind_filter,
                 frame_rx,
                 req_rx,
                 out_tx,
@@ -253,13 +294,14 @@ fn connect_inner(
     ))
 }
 
-#[allow(clippy::too_many_arguments)] // 8 args is the natural shape: the
-// connect-time pieces (rt/cfg/initial pub) plus the four channel/stop seams.
+#[allow(clippy::too_many_arguments)] // 9 args is the natural shape: the
+// connect-time pieces (rt/cfg/initial pub/filter) plus the four channel/stop seams.
 fn run_session(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
     initial: (i32, PubHandle),
     replay: Option<ReplayOnConnect>,
+    egress_kind_filter: Option<u8>,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
     out_tx: Sender<Vec<u8>>,
@@ -342,7 +384,9 @@ fn run_session(
                     for ev in driver.on_egress(&frame) {
                         match ev {
                             DriverEvent::AppMessage(payload) => {
-                                if egress_alive && out_tx.send(payload).is_err() {
+                                let wanted =
+                                    egress_kind_filter.is_none_or(|k| payload.first() == Some(&k));
+                                if wanted && egress_alive && out_tx.send(payload).is_err() {
                                     egress_alive = false; // consumer dropped
                                 }
                             }
