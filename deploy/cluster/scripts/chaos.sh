@@ -311,12 +311,28 @@ run_sequencer_lapse() {
   local l0 r0
   l0="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"; l0="${l0:-0}"
   r0="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r0="${r0:-0}"
-  log "sequencer-lapse: pausing ${inner} for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0})"
-  docker exec kardamom-sequencer-0 docker pause "${inner}" >/dev/null \
-    || fail "sequencer-lapse: docker pause failed"
-  sleep "${SEQ_LAPSE_S}"
-  docker exec kardamom-sequencer-0 docker unpause "${inner}" >/dev/null \
-    || fail "sequencer-lapse: docker unpause failed"
+  # SIGSTOP/SIGCONT, NOT `docker pause`: the nested cgroup freezer inside a
+  # privileged DinD node can silently no-op (observed: a "paused" replica
+  # kept serving metrics and never lapsed — the detection asserts failed
+  # because there was no lapse to detect; CI run 30178211248). Signals hit
+  # the task's PID 1 (the sequencer binary) regardless of freezer
+  # delegation. The mid-freeze probe below makes a silent no-op IMPOSSIBLE:
+  # a frozen process cannot answer HTTP, so if metrics still respond the
+  # case fails loudly instead of asserting against a replica that never
+  # lapsed. (validator-lapse shares the docker-pause pattern and never
+  # verifies its freeze — flagged for follow-up, see PR notes.)
+  log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0})"
+  docker exec kardamom-sequencer-0 docker kill -s STOP "${inner}" >/dev/null \
+    || fail "sequencer-lapse: SIGSTOP failed"
+  sleep 3
+  if curl -fsS --max-time 3 "http://192.168.56.21:9001/metrics" >/dev/null 2>&1; then
+    docker exec kardamom-sequencer-0 docker kill -s CONT "${inner}" >/dev/null 2>&1 || true
+    fail "sequencer-lapse: freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
+  fi
+  log "sequencer-lapse: freeze verified (metrics endpoint dark)"
+  sleep $(( SEQ_LAPSE_S - 3 ))
+  docker exec kardamom-sequencer-0 docker kill -s CONT "${inner}" >/dev/null \
+    || fail "sequencer-lapse: SIGCONT failed"
   log "sequencer-lapse: resumed; twin must have covered (no stall)"
 
   # The pipeline never depended on the paused replica — the twin raced on.
