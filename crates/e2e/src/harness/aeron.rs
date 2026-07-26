@@ -40,6 +40,9 @@ pub struct MediaDriver {
     pub proc: Proc,
     pub aeron_dir: PathBuf,
     pub archive_dir: PathBuf,
+    /// The archive's UDP control endpoint. Refetch clients (the executor's
+    /// join-miss recovery) address the archive here.
+    pub archive_control_endpoint: String,
 }
 
 impl MediaDriver {
@@ -96,6 +99,7 @@ impl MediaDriver {
             proc,
             aeron_dir,
             archive_dir,
+            archive_control_endpoint: format!("127.0.0.1:{ctrl}"),
         })
     }
 }

@@ -129,6 +129,19 @@ struct Args {
     /// Number of recent checkpoints to retain (older ones are pruned).
     #[arg(long, default_value_t = 3)]
     checkpoint_keep: u64,
+    /// TCP address on which to serve this node's newest checkpoint to peer
+    /// executors (`GET /checkpoint/latest`). Replicas are deterministic state
+    /// machines, so any replica's checkpoint is a valid restore source for
+    /// another. Requires `--checkpoint-dir`.
+    #[arg(long, env = "KARDAMOM_CHECKPOINT_SERVE_ADDR")]
+    checkpoint_serve_addr: Option<std::net::SocketAddr>,
+    /// Comma-separated peer checkpoint servers (`host:port`) to fetch a
+    /// checkpoint from when local state can't reach the chain: a fresh/wiped
+    /// node whose genesis replay aged out of the cluster retention window, or
+    /// a resuming node whose cursor did (`REPLAY_UNAVAILABLE`). Requires
+    /// `--checkpoint-dir`.
+    #[arg(long, env = "KARDAMOM_CHECKPOINT_PEERS", value_delimiter = ',')]
+    checkpoint_peers: Vec<String>,
     /// Address for the Prometheus /metrics HTTP listener.
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9004")]
     metrics_addr: std::net::SocketAddr,
@@ -208,12 +221,28 @@ async fn main() -> Result<()> {
     // env. Startup then sees a populated DB and resumes from the checkpoint's
     // block — replaying only the tail instead of re-syncing from genesis.
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
+        // Serve this node's checkpoints to peers (the other side of the peer
+        // fetch below). Best-effort infrastructure, but a bad bind address is
+        // a deploy bug — fail startup loudly.
+        if let Some(addr) = args.checkpoint_serve_addr {
+            kardamom_state::serve_checkpoints(addr, ckpt_dir.clone())
+                .context("bind checkpoint serve address")?;
+        }
         // Fresh iff the state dir has no mdbx data file — checked WITHOUT opening
         // the env (opening would itself create the data file and defeat restore).
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe state dir")?;
         if fresh {
-            match latest_checkpoint(ckpt_dir).context("scan checkpoint dir")? {
+            let mut local = latest_checkpoint(ckpt_dir).context("scan checkpoint dir")?;
+            // No local checkpoint: fetch one from a peer replica before the
+            // first join. A fresh node joining an old chain can NOT re-sync
+            // from genesis — the cluster's canonical stream is retained only
+            // over a bounded window, so REPLAY_FROM(genesis) would be refused
+            // (REPLAY_UNAVAILABLE) once lifetime traffic exceeds it.
+            if local.is_none() && !args.checkpoint_peers.is_empty() {
+                local = kardamom_state::fetch_best_checkpoint(&args.checkpoint_peers, ckpt_dir, 1);
+            }
+            match local {
                 Some(ckpt) => {
                     let block = restore_checkpoint(&ckpt.path, &args.state_dir)
                         .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
@@ -225,7 +254,9 @@ async fn main() -> Result<()> {
                 }
                 None => tracing::info!(
                     checkpoint_dir = %ckpt_dir.display(),
-                    "no checkpoint available; fresh start will re-sync from genesis"
+                    "no checkpoint available locally or from peers; fresh start will \
+                     replay from genesis (refused if the chain outgrew the cluster \
+                     retention window — then a peer checkpoint or rebuild-from-L1 is required)"
                 ),
             }
         }
@@ -476,6 +507,76 @@ async fn main() -> Result<()> {
     // of the delta sender are already dropped.
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
+    }
+    // Replay-window overrun: the durable cursor fell below the cluster's
+    // retention floor, so resuming from it can never succeed — every restart
+    // would re-request the same refused REPLAY_FROM (a deterministic crash
+    // loop). Repair BEFORE exiting: fetch a peer checkpoint at/above the floor
+    // and park the stale DB; the next restart then takes the ordinary
+    // fresh-start restore path and resumes from the fetched checkpoint. Doing
+    // the repair at exit (rather than looping in-process) keeps a single
+    // startup path and stays crash-safe at every step — fetch is
+    // atomic-rename, and the DB is parked only after a qualifying checkpoint
+    // is already on disk.
+    if let Some(ExecutorError::ClusterReplayUnavailable {
+        from_index,
+        oldest_index,
+        oldest_block,
+    }) = &engine_error
+    {
+        let oldest_block = *oldest_block;
+        tracing::warn!(
+            from_index,
+            oldest_index,
+            oldest_block,
+            "cluster replay unavailable — attempting checkpoint fallback"
+        );
+        match (
+            args.checkpoint_dir.as_ref(),
+            args.checkpoint_peers.is_empty(),
+        ) {
+            (Some(ckpt_dir), false) => {
+                match kardamom_state::fetch_best_checkpoint(
+                    &args.checkpoint_peers,
+                    ckpt_dir,
+                    oldest_block,
+                ) {
+                    Some(ckpt) => {
+                        kardamom_state::park_state_db(&args.state_dir)
+                            .context("park stale state DB")?;
+                        metrics::counter!(
+                            kardamom_executor::metrics::RESYNC_TOTAL,
+                            "outcome" => "peer-checkpoint"
+                        )
+                        .increment(1);
+                        tracing::info!(
+                            checkpoint_block = ckpt.block,
+                            "resync prepared: peer checkpoint staged, stale state parked; \
+                             restart will restore and resume from it"
+                        );
+                    }
+                    None => {
+                        metrics::counter!(
+                            kardamom_executor::metrics::RESYNC_TOTAL,
+                            "outcome" => "unrecoverable"
+                        )
+                        .increment(1);
+                        tracing::error!(
+                            oldest_block,
+                            "resync fallback failed: no peer checkpoint at or above the \
+                             retention floor — operator action required (restore a \
+                             checkpoint into --checkpoint-dir, or rebuild-from-L1 with \
+                             kardamom-reconstruct into --state-dir)"
+                        );
+                    }
+                }
+            }
+            _ => tracing::error!(
+                "resync fallback unavailable (--checkpoint-dir/--checkpoint-peers not \
+                 configured) — operator action required (rebuild-from-L1 with \
+                 kardamom-reconstruct, or restore a peer checkpoint manually)"
+            ),
+        }
     }
     // Non-zero exits so the orchestrator can tell a failed recovery / dead
     // pipeline from a clean shutdown (F13.4): exit status is the restart

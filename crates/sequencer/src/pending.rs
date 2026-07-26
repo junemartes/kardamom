@@ -114,6 +114,18 @@ impl<T> PendingBuffer<T> {
         self.inner.insert(nonce, value);
     }
 
+    /// Drop every buffered entry with nonce `< floor`, returning how many were
+    /// dropped. Used by the receipt-floor advance
+    /// ([`crate::state::PartitionState::advance_floor`]): entries below an
+    /// executed-truth floor are proven duplicates of already-executed txs, so
+    /// dropping them can never create a canonical gap.
+    pub fn drop_below(&mut self, floor: u64) -> usize {
+        let keep = self.inner.split_off(&floor);
+        let dropped = self.inner.len();
+        self.inner = keep;
+        dropped
+    }
+
     /// Drain the contiguous run of nonces starting at `start`. Stops at the
     /// first gap. Returned items are removed from the buffer.
     pub fn drain_consecutive_from(&mut self, start: u64) -> DrainConsecutive<'_, T> {

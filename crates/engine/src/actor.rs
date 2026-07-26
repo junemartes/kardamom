@@ -87,6 +87,14 @@ impl StateWriterQueue for Box<dyn StateWriterQueue> {
     }
 }
 
+// Same reason on the receipts seam: the validator boxes its sink so the
+// optional attester tee can wrap it at runtime.
+impl TxReceiptsPublication for Box<dyn TxReceiptsPublication> {
+    fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        (**self).publish(msg)
+    }
+}
+
 /// Where a restarted executor resumes from, derived from the persisted state
 /// cursor (`kardamom_state::RecoveryPoint`). The canonical stream source (the
 /// cluster's `REPLAY_FROM` on connect) delivers **from this cursor onward** —

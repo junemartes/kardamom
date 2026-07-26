@@ -13,6 +13,8 @@
 //! root (its path is printed) for post-mortem digging.
 
 pub mod aeron;
+pub mod inject;
+pub mod l1;
 pub mod l2;
 pub mod metrics;
 pub mod proc;
@@ -40,6 +42,45 @@ pub struct StackConfig {
     pub sealer_members: usize,
     pub cluster_tick_ms: u64,
     pub ingress: IngressOptions,
+    /// Also run `kardamom-validator` (S6/S7). Off by default — the nonce/RPC
+    /// scenarios don't need it and stacks stay lighter without it.
+    pub validator: bool,
+    /// Trie shadow-check cadence for the validator (`Some(1)` = every block,
+    /// the semantics-suite default; the cluster runs 8).
+    pub trie_shadow_check: Option<u64>,
+    /// Which L2 genesis to run. Bridge scenarios need
+    /// [`Genesis::DevWithdrawals`] for the `L2ToL1MessagePasser` predeploy.
+    pub genesis: Genesis,
+    /// Bring up anvil + the bridge contracts, the da-watcher, and (when a
+    /// validator runs) its L1 output attester.
+    pub l1: bool,
+    /// Record tx_data into the shared Aeron archive (ingress
+    /// `--archive-durability`) and enable the consumers' join-miss refetch.
+    /// Required for CRASH RECOVERY: a restarted consumer replays canonical
+    /// records from its persisted cursor, and the envelopes for those records
+    /// were published while it was down — only the archive still has them.
+    /// Costs a recorder-startup barrier at bring-up, so it is opt-in.
+    pub archive_durability: bool,
+}
+
+/// The L2 genesis a stack boots from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Genesis {
+    /// `deploy/cluster/config/genesis/dev.toml` — 18 prefunded dev accounts,
+    /// no withdrawal predeploy. What the deployed cluster runs.
+    ClusterDev,
+    /// `chains/dev-withdrawals.toml` — the `L2ToL1MessagePasser` predeploy at
+    /// `0x42…16`, but only account #0 is prefunded.
+    DevWithdrawals,
+}
+
+impl Genesis {
+    fn path(self, repo: &std::path::Path) -> PathBuf {
+        match self {
+            Genesis::ClusterDev => repo.join("deploy/cluster/config/genesis/dev.toml"),
+            Genesis::DevWithdrawals => repo.join("chains/dev-withdrawals.toml"),
+        }
+    }
 }
 
 impl Default for StackConfig {
@@ -49,8 +90,22 @@ impl Default for StackConfig {
             sealer_members: 1,
             cluster_tick_ms: 250,
             ingress: IngressOptions::default(),
+            validator: false,
+            trie_shadow_check: Some(1),
+            genesis: Genesis::ClusterDev,
+            l1: false,
+            archive_durability: false,
         }
     }
+}
+
+/// Which services exited on SIGTERM (vs. needing the SIGKILL fallback) during
+/// [`LocalStack::shutdown_graceful`]. `validator` is `None` when the stack
+/// runs without one.
+#[derive(Debug, Default)]
+pub struct ShutdownReport {
+    pub executor: bool,
+    pub validator: Option<bool>,
 }
 
 pub struct LocalStack {
@@ -58,19 +113,49 @@ pub struct LocalStack {
     // to, and the temp root outlives everything. Fields drop in declaration
     // order.
     ingress: SpawnedIngress,
+    da_watcher: Option<Spawned>,
     executor: Spawned,
+    validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
     sealer: SealerCluster,
     driver: MediaDriver,
+    /// Anvil + the bridge contracts (`StackConfig::l1`). Dropped last among
+    /// the services so a scenario's L1 queries stay live until teardown.
+    l1: Option<l1::L1>,
     root: tempfile::TempDir,
     keep: bool,
+    shutdown_report: ShutdownReport,
     pub cfg: StackConfig,
 }
 
 impl LocalStack {
+    /// Bring up a stack. Returns `Ok(None)` only when `cfg.l1` is set and the
+    /// `anvil` binary is absent — bridge scenarios then skip instead of
+    /// failing on a machine without Foundry, matching the convention of the
+    /// crate-level anvil tests.
+    pub async fn launch_opt(cfg: StackConfig) -> Result<Option<Self>> {
+        let l1 = if cfg.l1 {
+            match l1::L1::launch(DEV_CHAIN_ID).await? {
+                Some(l1) => Some(l1),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        Self::launch_with_l1(cfg, l1).await.map(Some)
+    }
+
     pub async fn launch(cfg: StackConfig) -> Result<Self> {
+        anyhow::ensure!(
+            !cfg.l1,
+            "use LocalStack::launch_opt for L1-backed stacks (it skips cleanly without anvil)"
+        );
+        Self::launch_with_l1(cfg, None).await
+    }
+
+    async fn launch_with_l1(cfg: StackConfig, l1: Option<l1::L1>) -> Result<Self> {
         let repo = services::repo_root();
-        let genesis = repo.join("deploy/cluster/config/genesis/dev.toml");
+        let genesis = cfg.genesis.path(&repo);
         anyhow::ensure!(
             genesis.is_file(),
             "genesis not found at {}",
@@ -99,6 +184,28 @@ impl LocalStack {
             .context("bring-up join")??
         };
 
+        // Archive-durability variant: a log config that keeps the built-in
+        // IPC `[channels]` defaults (omitted fields inherit) and adds only the
+        // `[aeron]` archive settings the recorder + refetch need.
+        let log_config = if cfg.archive_durability {
+            let p = root.path().join("channels.toml");
+            std::fs::write(
+                &p,
+                format!(
+                    "[aeron]\narchive_dir = \"{}\"\n\
+                     tx_data_archive_endpoints = [\"{}\"]\n\
+                     tx_deposits_archive_endpoints = [\"{}\"]\n",
+                    driver.archive_dir.display(),
+                    driver.archive_control_endpoint,
+                    driver.archive_control_endpoint,
+                ),
+            )
+            .context("write archive log-config")?;
+            Some(p)
+        } else {
+            None
+        };
+
         let spec = ServiceSpec {
             root: root.path(),
             aeron_dir: &driver.aeron_dir,
@@ -106,6 +213,7 @@ impl LocalStack {
             shards: cfg.shards,
             chain_id: DEV_CHAIN_ID,
             genesis: &genesis,
+            log_config: log_config.as_deref(),
         };
 
         let mut sequencers = Vec::with_capacity(cfg.shards as usize);
@@ -113,16 +221,39 @@ impl LocalStack {
             sequencers.push(services::spawn_sequencer(&spec, i)?);
         }
         let executor = services::spawn_executor(&spec)?;
+        let wiring = l1.as_ref().map(|l| services::L1Wiring {
+            rpc_url: l.rpc_url(),
+            lockbox: l.lockbox.to_string(),
+            oracle: l.oracle.to_string(),
+            attester_key: l1::ATTESTER_KEY.to_string(),
+        });
+        let validator = if cfg.validator {
+            Some(services::spawn_validator(
+                &spec,
+                cfg.trie_shadow_check,
+                wiring.as_ref(),
+            )?)
+        } else {
+            None
+        };
+        let da_watcher = match &wiring {
+            Some(w) => Some(services::spawn_da_watcher(&spec, w)?),
+            None => None,
+        };
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
 
         let stack = Self {
             ingress,
+            da_watcher,
             executor,
+            validator,
             sequencers,
             sealer,
             driver,
+            l1,
             root,
             keep,
+            shutdown_report: ShutdownReport::default(),
             cfg,
         };
 
@@ -158,6 +289,12 @@ impl LocalStack {
             ("ingress".to_string(), self.ingress.metrics_addr),
             ("executor".to_string(), self.executor.metrics_addr),
         ];
+        if let Some(val) = &self.validator {
+            v.push(("validator".to_string(), val.metrics_addr));
+        }
+        if let Some(w) = &self.da_watcher {
+            v.push(("da-watcher".to_string(), w.metrics_addr));
+        }
         for (i, s) in self.sequencers.iter().enumerate() {
             v.push((format!("sequencer-{i}"), s.metrics_addr));
         }
@@ -175,6 +312,7 @@ impl LocalStack {
             ingress_metrics: self.ingress.metrics_addr,
             executor_metrics: self.executor.metrics_addr,
             sequencer_metrics: self.sequencers.iter().map(|s| s.metrics_addr).collect(),
+            validator_metrics: self.validator.as_ref().map(|v| v.metrics_addr),
         })
     }
 
@@ -183,10 +321,192 @@ impl LocalStack {
         self.root.path().to_path_buf()
     }
 
+    /// The anvil L1 + bridge contracts (`StackConfig::l1`).
+    pub fn l1(&self) -> Option<&l1::L1> {
+        self.l1.as_ref()
+    }
+
+    /// The shared media driver's `aeron.dir` (for test-side stream injection).
+    pub fn aeron_dir(&self) -> PathBuf {
+        self.driver.aeron_dir.clone()
+    }
+
+    pub fn executor_state_dir(&self) -> Option<PathBuf> {
+        self.executor.state_dir.clone()
+    }
+
+    pub fn validator_state_dir(&self) -> Option<PathBuf> {
+        self.validator.as_ref().and_then(|v| v.state_dir.clone())
+    }
+
+    /// SIGSTOP the sealer so it stops stamping block boundaries: the chain
+    /// settles on one final head and stays there. Scenarios that must reason
+    /// about "the current block" without racing it (S2 matches a withdrawal
+    /// to the attested output for its block) freeze the clock first. The
+    /// sealer is suspended, not killed — killing it makes the consumers'
+    /// cluster clients retry forever and wedges shutdown.
+    pub fn freeze_block_clock(&self) {
+        for p in &self.sealer.procs {
+            p.suspend();
+        }
+    }
+
+    /// SIGKILL the executor — an unclean crash, no shutdown hooks, no final
+    /// flush. What survives is exactly what mdbx committed.
+    pub fn crash_executor(&mut self) {
+        self.executor.proc.kill();
+    }
+
+    /// Restart the executor against the SAME state dir and metrics port, so
+    /// it takes the resume-from-persisted-cursor path rather than a genesis
+    /// re-sync (and scenarios keep the address they already hold).
+    pub fn restart_executor(&mut self) -> Result<()> {
+        let repo = services::repo_root();
+        let genesis = self.cfg.genesis.path(&repo);
+        let log_config = self
+            .cfg
+            .archive_durability
+            .then(|| self.root.path().join("channels.toml"));
+        let spec = ServiceSpec {
+            root: self.root.path(),
+            aeron_dir: &self.driver.aeron_dir,
+            cluster_ingress_endpoints: &self.sealer.ingress_endpoints,
+            shards: self.cfg.shards,
+            chain_id: DEV_CHAIN_ID,
+            genesis: &genesis,
+            log_config: log_config.as_deref(),
+        };
+        let port = self.executor.metrics_addr.port();
+        self.executor = services::spawn_executor_at(&spec, Some(port))?;
+        Ok(())
+    }
+
+    /// Tail of the RESTARTED executor's log (the crash-recovery scenario
+    /// asserts on its resume line).
+    pub fn restarted_executor_log(&self) -> Option<String> {
+        std::fs::read_to_string(self.root.path().join("executor-restarted.log")).ok()
+    }
+
+    /// Freeze the executor (SIGSTOP): its genuine BAL/receipt publications
+    /// stop so an injected corrupt frame faces no competition (S7).
+    pub fn suspend_executor(&self) {
+        self.executor.proc.suspend();
+    }
+
+    pub fn resume_executor(&self) {
+        self.executor.proc.resume();
+    }
+
+    /// Wait for the validator process to exit on its own; returns its exit
+    /// code (S7 expects the divergence fail-stop's exit 2).
+    pub fn wait_validator_exit(&mut self, timeout: Duration) -> Option<Option<i32>> {
+        self.validator.as_mut()?.proc.wait_exit(timeout)
+    }
+
+    pub fn validator_log(&self) -> Option<String> {
+        let v = self.validator.as_ref()?;
+        std::fs::read_to_string(&v.proc.log_path).ok()
+    }
+
+    /// Stop the pipeline so both state DBs freeze at the SAME final block,
+    /// then shut the executor + validator down cleanly (mdbx envs closed) for
+    /// offline inspection.
+    ///
+    /// Order matters twice over:
+    /// 1. ingress + sequencers die first, so no new transactions enter;
+    /// 2. the sealer is **SIGSTOPped, not killed** — that halts the boundary
+    ///    clock (otherwise it keeps stamping empty blocks and the two
+    ///    consumers never settle on a common head) while leaving the cluster
+    ///    sessions intact. Killing it instead wedges shutdown: the Rust
+    ///    cluster client treats a vanished sealer as a reconnect-with-backoff
+    ///    case and retries forever, so the reader never sees end-of-stream
+    ///    and the process ignores SIGTERM until the harness SIGKILLs it.
+    /// 3. only then SIGTERM the consumers, which close their mdbx envs.
+    pub async fn shutdown_graceful(&mut self) -> Result<()> {
+        self.ingress.proc.terminate(Duration::from_secs(10));
+        if let Some(w) = &mut self.da_watcher {
+            w.proc.terminate(Duration::from_secs(10));
+        }
+        for s in &mut self.sequencers {
+            s.proc.terminate(Duration::from_secs(10));
+        }
+        for p in &self.sealer.procs {
+            p.suspend();
+        }
+
+        // Drain: executor's block freezes (no more boundaries) and the
+        // validator catches up to the same block.
+        let exec_addr = self.executor.metrics_addr;
+        let val_addr = self.validator.as_ref().map(|v| v.metrics_addr);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut last_exec = -1.0f64;
+        loop {
+            let exec_block = metrics::scrape(exec_addr)
+                .await?
+                .value(crate::scenarios::EXEC_BLOCK_NUMBER)
+                .unwrap_or(0.0);
+            let val_ok = match val_addr {
+                None => true,
+                Some(addr) => {
+                    let committed = metrics::scrape(addr)
+                        .await?
+                        .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                        .unwrap_or(0.0);
+                    committed == exec_block
+                }
+            };
+            if val_ok && exec_block == last_exec {
+                break; // stable across one interval AND validator caught up
+            }
+            last_exec = exec_block;
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "drain: executor/validator did not settle on a common block in 60s"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        // Both consumers are committed through the same block now, so SIGTERM
+        // them and require a CLEAN exit from each. This doubles as the
+        // regression test for the receipts-pump ownership cycle that made the
+        // validator ignore SIGTERM entirely (fixed by
+        // `TxReceiptsSubscriberHandle::into_receiver`): before the fix the
+        // validator sat through 90s+ of SIGTERM, so a 20s bound catches any
+        // return of that deadlock. `terminate` SIGKILLs on overrun, which
+        // keeps the DBs comparable either way (commits are atomic), but the
+        // assertions below make a regression loud rather than silent.
+        let honored = ShutdownReport {
+            executor: self.executor.proc.terminate(Duration::from_secs(20)),
+            validator: self
+                .validator
+                .as_mut()
+                .map(|v| v.proc.terminate(Duration::from_secs(20))),
+        };
+        self.shutdown_report = honored;
+        anyhow::ensure!(
+            self.shutdown_report.executor,
+            "executor did not exit on SIGTERM within 20s"
+        );
+        anyhow::ensure!(
+            self.shutdown_report.validator != Some(false),
+            "validator did not exit on SIGTERM within 20s — the Aeron-runtime \
+             ownership cycle in the receipts pump is back (see \
+             TxReceiptsSubscriberHandle::into_receiver)"
+        );
+        Ok(())
+    }
+
+    /// Which services honored SIGTERM during [`Self::shutdown_graceful`].
+    pub fn shutdown_report(&self) -> &ShutdownReport {
+        &self.shutdown_report
+    }
+
     fn dump_tails(&self) {
         eprintln!("=== stack log tails ({}) ===", self.root.path().display());
         let procs: Vec<&proc::Proc> = std::iter::once(&self.ingress.proc)
             .chain(std::iter::once(&self.executor.proc))
+            .chain(self.validator.as_ref().map(|v| &v.proc))
+            .chain(self.da_watcher.as_ref().map(|w| &w.proc))
             .chain(self.sequencers.iter().map(|s| &s.proc))
             .chain(self.sealer.procs.iter())
             .chain(std::iter::once(&self.driver.proc))

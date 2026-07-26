@@ -30,6 +30,7 @@ pub mod metrics;
 pub mod outbound;
 pub mod partition;
 pub mod pending;
+pub mod resync;
 pub mod sender;
 pub mod sequencer;
 pub mod state;

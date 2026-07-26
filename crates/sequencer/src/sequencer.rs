@@ -129,6 +129,11 @@ pub struct Sequencer<DB: StateDatabase> {
     /// canonical nonce. Subsequent txs from that sender hit the in-memory
     /// path.
     state_db: Arc<DB>,
+    /// Lag detection + receipt-floor resync
+    /// (docs/agents/sequencer-lag-resync-spec.md). `None` when the binary
+    /// did not wire the receipts / egress-watermark feeds (tests, IPC dev
+    /// runs) — behaviour is then identical to pre-resync.
+    resync: Option<crate::resync::ResyncController>,
 }
 
 impl<DB: StateDatabase> Sequencer<DB> {
@@ -139,7 +144,14 @@ impl<DB: StateDatabase> Sequencer<DB> {
             cfg,
             state: PartitionState::new(cap),
             state_db,
+            resync: None,
         }
+    }
+
+    /// Enable lag detection + receipt-floor resync. The controller starts in
+    /// resync mode (startup trigger) and is driven from `run_once`.
+    pub fn enable_resync(&mut self, controller: crate::resync::ResyncController) {
+        self.resync = Some(controller);
     }
 
     pub fn config(&self) -> &SequencerConfig {
@@ -275,6 +287,40 @@ impl<DB: StateDatabase> Sequencer<DB> {
         B: TxOrderingRefPublisher,
         R: TxErrorPublisher,
     {
+        // Resync bookkeeping runs FIRST, every iteration (including idle
+        // ones, so boundary-silence detection keeps ticking): drain receipt
+        // floors, advance the nonce state machine to any raised
+        // executed-truth floor (drops proven-duplicate buffered entries;
+        // newly-contiguous runs surface via `drain_pending` below), then
+        // evaluate the watermark triggers.
+        if let Some(r) = self.resync.as_mut() {
+            let raised = r.drain_floor_updates();
+            for (sender, floor) in raised {
+                if let Some((from, dropped)) = self.state.advance_floor(sender, floor) {
+                    metrics::record_floor_advance(self.cfg.partition_index);
+                    // Every dropped buffered entry is a receipt-PROVEN
+                    // duplicate skipped without any dedup-window reliance —
+                    // the spec's `resync_skipped_executed_total`. (There is
+                    // no separate flush-time filter: floors drain before any
+                    // publish action is computed, so the state machine's
+                    // floor is always current when `process` runs — a
+                    // proven-stale incoming envelope takes the ordinary
+                    // `Past`/DuplicatedTx path below, counted there.)
+                    for _ in 0..dropped {
+                        metrics::record_resync_skip(self.cfg.partition_index);
+                    }
+                    trace!(
+                        sender = ?sender,
+                        from,
+                        floor,
+                        dropped,
+                        "resync: receipt floor advanced nonce state"
+                    );
+                }
+            }
+            r.observe(std::time::Instant::now());
+        }
+
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
             self.flush_drained(b, pending, "drain-pending")?;
@@ -367,9 +413,41 @@ impl<DB: StateDatabase> Sequencer<DB> {
             NonceOutcome::BufferedDisabled => {
                 metrics::record_buffered_future(self.cfg.partition_index);
             }
-            NonceOutcome::Past => metrics::record_past(self.cfg.partition_index),
+            NonceOutcome::Past => {
+                // Two DIFFERENT things surface as `Past`, and conflating
+                // them broke the load harness's seq_clean verdict (CI run
+                // 30166583138: seq_clean=false from 200 tps — the ramp
+                // ceiling collapsed to 100):
+                //
+                // - RECEIPT-PROVEN skip: the receipt floor advanced past
+                //   this nonce because the tx already EXECUTED (the twin
+                //   ordered it and the order→execute→receipt round trip
+                //   outran this replica's inbound processing — routine for
+                //   the marginally-behind twin under load). This is the
+                //   resync mechanism absorbing a duplicate: NOT sequencer
+                //   dirt (`dropped_past` stays flat, seq_clean holds) and
+                //   NOT a client error (the tx succeeded; a DuplicatedTx
+                //   notice would be spurious and could race the receipt at
+                //   ingress).
+                // - ordinary client double-submit / stale nonce: no floor
+                //   proof — counted and reported exactly as before.
+                if self
+                    .resync
+                    .as_ref()
+                    .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
+                {
+                    metrics::record_resync_skip(self.cfg.partition_index);
+                } else {
+                    metrics::record_past(self.cfg.partition_index);
+                }
+            }
         }
 
+        let proven_executed = |n: u64| {
+            self.resync
+                .as_ref()
+                .is_some_and(|r| r.floor(sender).is_some_and(|f| f > n))
+        };
         let mut publishes = Vec::new();
         for action in result.actions {
             match action {
@@ -380,11 +458,15 @@ impl<DB: StateDatabase> Sequencer<DB> {
                     nonce: n,
                     expected_nonce,
                 } => {
-                    rc.publish_error(TxError {
-                        sender,
-                        nonce: n,
-                        reason: TxErrorReason::DuplicatedTx { expected_nonce },
-                    });
+                    // Suppressed for receipt-proven skips (see above): the
+                    // client's tx executed; there is nothing to report.
+                    if !proven_executed(n) {
+                        rc.publish_error(TxError {
+                            sender,
+                            nonce: n,
+                            reason: TxErrorReason::DuplicatedTx { expected_nonce },
+                        });
+                    }
                 }
             }
         }
@@ -420,12 +502,26 @@ impl<DB: StateDatabase> Sequencer<DB> {
                 return Ok(());
             }
             match self.run_once(channel_a, b, rc) {
-                Ok(true) => backoff_us = 1,
+                Ok(true) => {
+                    backoff_us = 1;
+                    if let Some(r) = self.resync.as_mut() {
+                        r.note_publish_ok();
+                    }
+                }
                 Ok(false) => {
+                    if let Some(r) = self.resync.as_mut() {
+                        r.note_publish_ok();
+                    }
                     std::thread::sleep(Duration::from_micros(backoff_us));
                     backoff_us = backoff_us.saturating_mul(2).min(100);
                 }
                 Err(SequencerError::Backpressure) => {
+                    // Sustained backpressure (incl. a not-yet-reconnected
+                    // cluster session, which maps here) is the publish-stall
+                    // resync trigger.
+                    if let Some(r) = self.resync.as_mut() {
+                        r.note_publish_stall(std::time::Instant::now());
+                    }
                     std::thread::sleep(Duration::from_micros(10));
                 }
                 Err(SequencerError::IngressDisconnected) => return Ok(()),

@@ -30,6 +30,12 @@ umask 0000
 # keep the responsive default idle here and only trim the thread COUNT.
 AERON_THREADING_MODE="${AERON_THREADING_MODE:-SHARED}"
 AERON_ARCHIVE_THREADING_MODE="${AERON_ARCHIVE_THREADING_MODE:-SHARED}"
+# Per-segment CRC32 on record AND replay-side validation on read. Without a
+# record-time checksum, `ArchiveTool verify` only validates frame structure —
+# a payload byte-flip in a .rec passes silently (and verify_mirror's length
+# check can't see it either). Crc32 is Aeron's own class, so the persisted
+# values stay comparable with `ArchiveTool checksum io.aeron.archive.checksum.Crc32`.
+AERON_ARCHIVE_CHECKSUM="${AERON_ARCHIVE_CHECKSUM:-io.aeron.archive.checksum.Crc32}"
 
 java \
     --add-opens java.base/sun.nio.ch=ALL-UNNAMED \
@@ -44,6 +50,8 @@ java \
     -Daeron.archive.control.channel=aeron:udp?endpoint=0.0.0.0:8010 \
     -Daeron.archive.control.response.channel=aeron:udp?endpoint=0.0.0.0:8011 \
     -Daeron.archive.replication.channel=aeron:udp?endpoint=0.0.0.0:8021 \
+    -Daeron.archive.record.checksum=${AERON_ARCHIVE_CHECKSUM} \
+    -Daeron.archive.replay.checksum=${AERON_ARCHIVE_CHECKSUM} \
     -cp /opt/aeron/aeron-all.jar \
     ${AERON_ARCHIVE_CLASS} &
 JAVA_PID=$!

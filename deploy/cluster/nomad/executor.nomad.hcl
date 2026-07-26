@@ -121,6 +121,15 @@ job "executor" {
           # from genesis), and write a checkpoint every 20s as the chain advances.
           "--checkpoint-dir", "/opt/kardamom/checkpoints",
           "--checkpoint-interval-secs", "20",
+          # Peer checkpoint exchange (full-resync fallback): each replica serves
+          # its newest checkpoint on 9014 and can fetch one from the others. A
+          # node whose replay cursor (or genesis join) fell below the cluster's
+          # bounded retention floor gets REPLAY_UNAVAILABLE and can only be
+          # repaired with peer state — deterministic replicas make any peer's
+          # checkpoint a valid restore source. Self is harmlessly included in
+          # the peer list (its own checkpoint never satisfies the floor).
+          "--checkpoint-serve-addr", "${meta.node_ip}:9014",
+          "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
           # Bind the Prometheus exporter on ALL interfaces (default is
           # loopback): the chaos suite probes it DIRECTLY over the cluster
           # bridge (http://<node_ip>:9004/metrics), keeping dockerd out of

@@ -447,12 +447,19 @@ pub async fn drain(client: Arc<HttpClient>, tracker: Arc<Tracker>, deadline: Ins
         }
         for (hash, submit_ts) in pending {
             if let Some(status) = receipt_status(&client, hash).await {
-                tracker
+                // Confirm only if WE removed the entry: in subscribe mode the
+                // live feed keeps confirming during the drain, and a tx it
+                // settled between our poll and this remove must not be
+                // double-counted.
+                let removed = tracker
                     .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&hash);
-                tracker.confirm(status, submit_ts.elapsed());
+                    .remove(&hash)
+                    .is_some();
+                if removed {
+                    tracker.confirm(status, submit_ts.elapsed());
+                }
             }
         }
         if Instant::now() >= deadline {

@@ -2203,6 +2203,7 @@ dependencies = [
  "hdrhistogram",
  "hex",
  "jsonrpsee",
+ "kardamom-batcher",
  "kardamom-bench",
  "kardamom-da-watcher",
  "kardamom-deployer",
