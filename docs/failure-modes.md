@@ -66,6 +66,23 @@ with three distinct, tested modes:
   executor's checkpoint is a valid restore source; the chaos case wipes
   executor-0's state, re-replicates executor-1's checkpoint, and asserts
   executor-0 restores from it (not a genesis re-sync) and rejoins.
+- **Replay-window overrun** (`replay-window-resync`) — the cluster retains a
+  *bounded* canonical window (`kardamom.cluster.retention`, default 65,536
+  frames ≈ 5 minutes at 200 tps); a `REPLAY_FROM` below its floor is refused
+  with `REPLAY_UNAVAILABLE`. That refusal is terminal for the local state: a
+  cursor below the floor can never catch up, and a fresh/wiped node cannot
+  "re-sync from genesis" either — genesis aged out of the window with
+  everything else. (The floor also jumps to the head when a member restores
+  from a cluster snapshot, so this is not only an "old node" event.) The
+  executor self-heals with **peer state**: each replica serves its newest
+  checkpoint over `--checkpoint-serve-addr` (:9014) and a node that hits the
+  refusal — or cold-starts with no checkpoint at all — fetches the newest
+  qualifying peer checkpoint (`--checkpoint-peers`), parks the stale DB under
+  `<state_dir>/stale/`, restores, and resumes from the checkpoint's cursor
+  (`kardamom_executor_resync_total` counts these by outcome). If no peer can
+  offer a checkpoint at/above the floor, the node stays down and says so: the
+  remaining paths are an operator-restored checkpoint or rebuild-from-L1
+  (`kardamom-reconstruct`).
 - **Wedged (frozen)** — an executor whose block gauge is flat *while sealer
   boundaries keep advancing* is the load harness's FROZEN verdict; that
   contrast (rather than absolute progress) is what distinguishes a wedged
@@ -130,6 +147,16 @@ divergence — re-executed receipts or BAL disagreeing with the executor's, or
 an MPT state-root mismatch — it stops rather than continuing on bad state,
 and stays stopped until an operator intervenes. A crashed validator costs
 verification coverage, never L2 liveness; nothing on the hot path consumes it.
+
+Exit codes keep the two halt classes distinguishable: **exit 2 is reserved
+for a proven divergence** (the latch records the reason before the engine
+surfaces it) — the page-the-humans signal. Every other engine failure — a
+stream error, or a replay-window overrun (`REPLAY_UNAVAILABLE`, the validator
+cursor aged out of the cluster's bounded retention) — exits 1: an
+availability problem, restartable, never to be confused with an integrity
+one. The validator has no peer to fetch a checkpoint from (it is a singleton
+with a trie-bearing state env), so a resync-required validator is rebuilt
+from L1 (`kardamom-reconstruct`) or from an operator-restored state copy.
 
 Catch-up semantics (#78) make that coverage cost explicit:
 

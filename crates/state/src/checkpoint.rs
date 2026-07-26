@@ -38,11 +38,11 @@ pub struct CheckpointInfo {
 
 /// Checkpoint directory name for `block`, zero-padded so lexical order matches
 /// numeric order (`latest_checkpoint` relies on it).
-fn checkpoint_name(block: u64) -> String {
+pub(crate) fn checkpoint_name(block: u64) -> String {
     format!("checkpoint-{block:018}")
 }
 
-fn parse_checkpoint_block(name: &str) -> Option<u64> {
+pub(crate) fn parse_checkpoint_block(name: &str) -> Option<u64> {
     name.strip_prefix("checkpoint-")
         .and_then(|s| s.parse().ok())
 }
@@ -161,31 +161,34 @@ pub fn restore_checkpoint(checkpoint: &Path, state_dir: &Path) -> Result<u64, St
         )));
     }
 
-    // The checkpoint's mdbx data file is either `<checkpoint>/mdbx.dat` (the
-    // env was copied in subdir mode) or the `<checkpoint>` file itself
-    // (single-file mode). Either way it is a complete mdbx image; dir-mode open
-    // reads it as `<state_dir>/mdbx.dat`.
-    let data_src = if checkpoint.is_dir() {
-        find_mdbx_data(checkpoint)?.ok_or_else(|| {
-            StateError::Recovery(format!(
-                "checkpoint dir {} holds no mdbx data file",
-                checkpoint.display()
-            ))
-        })?
-    } else if checkpoint.is_file() {
-        checkpoint.to_path_buf()
-    } else {
-        return Err(StateError::Recovery(format!(
-            "checkpoint {} not found",
-            checkpoint.display()
-        )));
-    };
-
+    let data_src = checkpoint_data_file(checkpoint)?;
     std::fs::copy(&data_src, state_dir.join("mdbx.dat"))?;
     let env = crate::env::StateEnvBuilder::new(state_dir).open()?;
     let block = read_recovery_point(&env)?.last_committed_block;
     info!(block, src = %data_src.display(), "restored state DB from checkpoint");
     Ok(block)
+}
+
+/// Resolve a checkpoint's mdbx data file: either `<checkpoint>/mdbx.dat` (the
+/// env was copied in subdir mode) or the `<checkpoint>` file itself
+/// (single-file mode). Either way it is a complete mdbx image; dir-mode open
+/// reads it as `<state_dir>/mdbx.dat`.
+pub(crate) fn checkpoint_data_file(checkpoint: &Path) -> Result<PathBuf, StateError> {
+    if checkpoint.is_dir() {
+        find_mdbx_data(checkpoint)?.ok_or_else(|| {
+            StateError::Recovery(format!(
+                "checkpoint dir {} holds no mdbx data file",
+                checkpoint.display()
+            ))
+        })
+    } else if checkpoint.is_file() {
+        Ok(checkpoint.to_path_buf())
+    } else {
+        Err(StateError::Recovery(format!(
+            "checkpoint {} not found",
+            checkpoint.display()
+        )))
+    }
 }
 
 /// Find the mdbx data file inside a subdir-mode checkpoint directory.
@@ -199,6 +202,34 @@ fn find_mdbx_data(dir: &Path) -> Result<Option<PathBuf>, StateError> {
         }
     }
     Ok(None)
+}
+
+/// Move a stale state DB aside into `<state_dir>/stale/`, so the next startup
+/// sees a fresh dir (and restores from a checkpoint) while an operator keeps
+/// one generation of the old DB for inspection. A previous parked copy is
+/// dropped. Returns the parked path, or `None` if there was nothing to park.
+///
+/// Used by the resync fallback: a cursor below the cluster's retention floor
+/// can never catch up, so the DB it lives in is unusable as-is — but deleting
+/// state outright on an automated path is not acceptable.
+pub fn park_state_db(state_dir: &Path) -> Result<Option<PathBuf>, StateError> {
+    if !has_state_db(state_dir)? {
+        return Ok(None);
+    }
+    let parked = state_dir.join("stale");
+    if parked.exists() {
+        std::fs::remove_dir_all(&parked)?;
+    }
+    std::fs::create_dir_all(&parked)?;
+    for entry in std::fs::read_dir(state_dir)? {
+        let entry = entry?;
+        if entry.path() == parked {
+            continue;
+        }
+        std::fs::rename(entry.path(), parked.join(entry.file_name()))?;
+    }
+    info!(parked = %parked.display(), "parked stale state DB");
+    Ok(Some(parked))
 }
 
 /// True if `dir` already contains an mdbx data file (a populated state DB).

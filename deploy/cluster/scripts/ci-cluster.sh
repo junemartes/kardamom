@@ -623,7 +623,9 @@ executor_block() {
 # What the verdict asserts per shard tracks what the DESIGN guarantees:
 #
 # LOAD shard — full sync + bounded lag. The canonical stream is loss-proof
-# (cluster sessions + retention + REPLAY_FROM on every establishment), and
+# WITHIN the retention window (cluster sessions + retention + REPLAY_FROM on
+# every establishment; a cursor below the retention floor gets
+# REPLAY_UNAVAILABLE and takes the peer-checkpoint resync path instead), and
 # under plain load the validator demonstrably keeps up.
 #
 # CHAOS shards — fail-stop safety + forward progress, NOT bounded lag. The
