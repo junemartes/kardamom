@@ -198,14 +198,20 @@ yamllint/contract CI check that already guards channel config drift.
 
 1. **Unit** (`PartitionState` + floor filter): skip-iff-floor-proves; floor monotonicity;
    missed-receipt degradation publishes; sole-survivor publishes all.
-2. **Chaos case `sequencer-lapse`** (mirrors `validator-lapse`; as implemented, in the
-   `chaos-sequencer` CI shard): under shard-pinned load, `docker pause` shard 0's replica A
-   for `SEQ_LAPSE_S` (30 s > the 10 s boundary-silence window), resume. Assert: pipeline
-   progress held throughout (twin covered), `resync_entered_total` INCREMENTED across the
-   pause on the paused replica, the replica keeps exporting, and the standard load +
-   per-replica convergence verdicts pass. (The case exercises detection + the safe response
-   at the default window; actually overrunning the 2^17 horizon at CHAOS_TPS=200 would need
-   a ~11-minute pause or a shrunken `dedupCapacity` — a local/manual variant, not CI.)
+2. **Chaos case `sequencer-lapse`** (as implemented, in the `chaos-sequencer` CI shard;
+   evolved substantially from this draft through five CI iterations): under shard-pinned
+   load, freeze shard 0's replica A via **SIGSTOP/SIGCONT with a mid-freeze verification
+   probe** (`docker pause` silently no-ops in the nested-DinD freezer, and an unverified
+   injector rots into vacuity — validator-lapse shares this pattern, flagged for follow-up).
+   A 30 s freeze exceeds the media driver's client-liveness timeout, so the frozen replica's
+   aeron client is EVICTED and the process correctly fail-stops on thaw → Nomad restarts it
+   → clean rejoin (safe since #99). Detection is therefore asserted on the **twin**: the
+   frozen replica's wedged egress session stalls the sealer's service thread on the offer
+   deadline, a genuine cluster-wide boundary-arrival gap every running replica's feed must
+   flag (`lag_suspected` + resync engagement on the twin, scrape-failure-aware sampling).
+   Safety asserts: pipeline progress, load verdict, per-replica convergence, and the frozen
+   replica exporting again post-restart. (Overrunning the 2^17 horizon itself at
+   CHAOS_TPS=200 would need a ~11-minute freeze — a local/manual variant, not CI.)
 3. **Cold-rejoin regression**: restart a replica mid-stream, assert buffered established
    senders unstick via receipt floors (F02.1 partial-closure behavior) and NO nonce gap is
    ever published (the NonceTooHigh guard the removed fix failed).
