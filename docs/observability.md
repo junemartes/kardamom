@@ -121,6 +121,14 @@ Every service also emits `kardamom_build_info` (gauge, always 1, labeled with
 `version` and `sha`) via `kardamom_obs::init` — set `KARDAMOM_GIT_SHA` at build
 time to populate `sha`.
 
+One low-rate counter deserves a standing alert:
+`kardamom_executor_resync_total` (labeled `outcome=peer-checkpoint |
+unrecoverable`) counts full-resync fallbacks after a cluster replay-window
+overrun (`REPLAY_UNAVAILABLE`). Any non-zero rate means a node fell behind
+the retention window and repaired itself from a peer checkpoint —
+`unrecoverable` means it could not and is waiting for an operator (see
+`docs/failure-modes.md`, "Replay-window overrun").
+
 ## Quick start
 
 Bring up the observability stack:

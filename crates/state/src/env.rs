@@ -44,6 +44,7 @@ pub struct StateEnvBuilder {
     path: PathBuf,
     durability: Durability,
     max_readers: u64,
+    read_only: bool,
 }
 
 impl StateEnvBuilder {
@@ -52,6 +53,7 @@ impl StateEnvBuilder {
             path: path.into(),
             durability: Durability::Durable,
             max_readers: MAX_READERS,
+            read_only: false,
         }
     }
 
@@ -60,12 +62,31 @@ impl StateEnvBuilder {
         self
     }
 
+    /// Open the environment READ-ONLY: no writes, no table creation, and no
+    /// directory creation. Safe to point at a state dir another process is
+    /// actively writing (mdbx is multi-process; a reader takes an MVCC
+    /// snapshot and never blocks the writer), which is how tooling inspects a
+    /// LIVE node — `kardamom-statecheck` and the e2e suite both rely on it.
+    ///
+    /// The env must already exist and be initialised; `Durability` is
+    /// irrelevant in this mode (nothing syncs).
+    pub fn read_only(mut self, yes: bool) -> Self {
+        self.read_only = yes;
+        self
+    }
+
     pub fn open(self) -> Result<StateEnv, StateError> {
-        std::fs::create_dir_all(&self.path)?;
+        if !self.read_only {
+            std::fs::create_dir_all(&self.path)?;
+        }
 
         let flags = EnvironmentFlags {
-            mode: Mode::ReadWrite {
-                sync_mode: self.durability.into_sync_mode(),
+            mode: if self.read_only {
+                Mode::ReadOnly
+            } else {
+                Mode::ReadWrite {
+                    sync_mode: self.durability.into_sync_mode(),
+                }
             },
             no_rdahead: true,
             coalesce: true,
@@ -88,12 +109,16 @@ impl StateEnvBuilder {
         let env = builder.open(&self.path)?;
 
         // Create every named DB once so handles are cached in the environment
-        // and a downstream RO txn does not have to call `create_db`.
-        let txn = env.begin_rw_sync()?;
-        for name in ALL_TABLES {
-            txn.create_db(Some(name), DatabaseFlags::empty())?;
+        // and a downstream RO txn does not have to call `create_db`. Skipped
+        // read-only: the tables already exist (the writing process made them)
+        // and an RW txn is impossible in that mode.
+        if !self.read_only {
+            let txn = env.begin_rw_sync()?;
+            for name in ALL_TABLES {
+                txn.create_db(Some(name), DatabaseFlags::empty())?;
+            }
+            txn.commit()?;
         }
-        txn.commit()?;
 
         Ok(StateEnv {
             env: Arc::new(env),

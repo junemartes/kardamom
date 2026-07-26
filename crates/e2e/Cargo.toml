@@ -15,13 +15,21 @@ full-pipeline-e2e = [
     "kardamom-log/docker-e2e",
     "kardamom-log/testing",
     "dep:alloy-consensus",
+    "dep:alloy-contract",
     "dep:alloy-eips",
     "dep:alloy-network",
+    "dep:alloy-node-bindings",
+    "dep:alloy-provider",
     "dep:alloy-signer-local",
+    "dep:alloy-sol-types",
     "dep:anyhow",
     "dep:hex",
     "dep:jsonrpsee",
+    "dep:kardamom-batcher",
     "dep:kardamom-bench",
+    "dep:kardamom-da-watcher",
+    "dep:kardamom-deployer",
+    "dep:kardamom-state",
     "dep:libc",
     "dep:serde_json",
     "dep:tempfile",
@@ -43,13 +51,21 @@ tracing.workspace = true
 # Chain-semantics harness deps — optional, activated by `full-pipeline-e2e`
 # so the default build stays as light as before.
 alloy-consensus = { workspace = true, optional = true }
+alloy-contract = { workspace = true, optional = true }
 alloy-eips = { workspace = true, optional = true }
 alloy-network = { workspace = true, optional = true }
+alloy-node-bindings = { workspace = true, optional = true }
+alloy-provider = { workspace = true, optional = true }
 alloy-signer-local = { workspace = true, optional = true }
+alloy-sol-types = { workspace = true, optional = true }
+kardamom-da-watcher = { path = "../da_watcher", optional = true }
+kardamom-deployer = { path = "../deployer", optional = true }
 anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
+kardamom-batcher = { path = "../batcher", optional = true }
 kardamom-bench = { path = "../bench", optional = true }
+kardamom-state = { path = "../state", optional = true }
 libc = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }

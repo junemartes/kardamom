@@ -192,6 +192,35 @@ impl<T> PartitionState<T> {
         out
     }
 
+    /// Advance `sender`'s expected nonce to an **executed-truth floor** (a
+    /// receipt proves every nonce `< floor` already executed on the canonical
+    /// chain). Entries buffered below the floor are dropped — they are proven
+    /// duplicates of executed txs, so this can never create a canonical gap.
+    /// Buffered entries at/after the floor become drainable by
+    /// [`Self::drain_pending`] on the next loop iteration.
+    ///
+    /// Returns `Some((previous_next_nonce, dropped_count))` when the floor
+    /// actually advanced, `None` when it was already at/behind `next`.
+    ///
+    /// This is the SOUND replacement for the removed stream-adaptive
+    /// fast-forward (note below): it advances on execution evidence from the
+    /// receipts stream, never on locally-inferred stream gaps — a
+    /// client-abandoned nonce hole produces no receipt and therefore never
+    /// advances the floor. See docs/agents/sequencer-lag-resync-spec.md.
+    pub fn advance_floor(&mut self, sender: Address, floor: u64) -> Option<(u64, usize)> {
+        let cur = self.next_nonce(sender);
+        if floor <= cur {
+            return None;
+        }
+        let dropped = self
+            .pending
+            .get_mut(&sender)
+            .map(|b| b.drop_below(floor))
+            .unwrap_or(0);
+        self.next.insert(sender, floor);
+        Some((cur, dropped))
+    }
+
     // NOTE — `fast_forward_stalled` (the F02.1/F02.2 "stream-adaptive
     // nonce-floor fast-forward") was REMOVED after CI run 29687514869: a
     // sequencer cannot locally distinguish "the twin already ordered the gap"
@@ -380,6 +409,36 @@ mod tests {
         st.reinsert_for_retry(s(1), 0, 100);
         let drained = st.drain_pending();
         assert_eq!(drained, vec![(s(1), 0, 100)]);
+    }
+
+    #[test]
+    fn advance_floor_drops_proven_and_advances() {
+        let mut st: PartitionState<u32> = PartitionState::new(8);
+        // Cold-rejoin shape (F02.1): expected is 0, but the twin already
+        // ordered 0..=4 (executed). The replica buffered 3,4 (stale dupes)
+        // and 5,6 (live traffic it must regain coverage of).
+        for n in [3u64, 4, 5, 6] {
+            st.process(s(1), n, n as u32);
+        }
+        let (from, dropped) = st.advance_floor(s(1), 5).expect("floor must advance");
+        assert_eq!(from, 0);
+        assert_eq!(dropped, 2, "3 and 4 are receipt-proven duplicates");
+        assert_eq!(st.next_nonce(s(1)), 5);
+        // The stuck run unsticks: 5,6 drain as contiguous from the floor.
+        let drained: Vec<u64> = st.drain_pending().iter().map(|(_, n, _)| *n).collect();
+        assert_eq!(drained, vec![5, 6]);
+    }
+
+    #[test]
+    fn advance_floor_never_regresses() {
+        let mut st: PartitionState<u32> = PartitionState::new(4);
+        st.process(s(1), 0, 0);
+        st.process(s(1), 1, 1);
+        assert_eq!(st.next_nonce(s(1)), 2);
+        // A floor at/behind next (late receipt) is a no-op.
+        assert_eq!(st.advance_floor(s(1), 2), None);
+        assert_eq!(st.advance_floor(s(1), 1), None);
+        assert_eq!(st.next_nonce(s(1)), 2);
     }
 
     #[test]

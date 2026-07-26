@@ -147,7 +147,14 @@ impl ArchiveRefetcher {
             )));
         };
         let from_raw = raw_position(&rec, from)?;
-        let (replay_len, replay_endpoint) = self.replay_bounds(&rec, from_raw)?;
+        let (replay_len, replay_endpoint) = match self.replay_bounds(&rec, from_raw) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "refetch: replay bounds failed; rotating endpoint");
+                self.rotate();
+                return Err(e);
+            }
+        };
         if replay_len <= 0 {
             info!(
                 stream_id,
@@ -170,19 +177,39 @@ impl ArchiveRefetcher {
             }
         };
         let session = self.session.as_ref().expect("ensured above");
-        start_bounded_replay(
+        if let Err(e) = start_bounded_replay(
             session,
             &rec,
             stream_id,
             &replay_endpoint,
             from_raw,
             replay_len,
-        )?;
+        ) {
+            warn!(error = %e, "refetch: replay start failed; rotating endpoint");
+            self.rotate();
+            return Err(e);
+        }
         let mut delivered = 0u64;
         drain(rx, |(loc, env)| {
             sink(loc, env);
             delivered += 1;
         });
+        if delivered == 0 {
+            // A non-empty range that yields nothing is the corrupt-recording
+            // signature at this layer: with replay-side CRC validation enabled
+            // (`aeron.archive.replay.checksum`) the archive fails a corrupt
+            // range server-side and no fragments arrive. Rotate so the join
+            // loop's next refetch attempt reads the MIRROR archive instead of
+            // staying pinned to the bad copy.
+            warn!(
+                stream_id,
+                session_id,
+                from_raw,
+                replay_len,
+                "refetch: replay produced no fragments (corrupt recording?); rotating endpoint"
+            );
+            self.rotate();
+        }
         info!(
             stream_id,
             session_id, from_raw, replay_len, delivered, "tx_data refetch drained"
@@ -231,14 +258,18 @@ impl ArchiveRefetcher {
                 }
             };
             let session = self.session.as_ref().expect("ensured above");
-            start_bounded_replay(
+            if let Err(e) = start_bounded_replay(
                 session,
                 &rec,
                 stream_id,
                 &replay_endpoint,
                 from_raw,
                 replay_len,
-            )?;
+            ) {
+                warn!(error = %e, "refetch: deposit replay start failed; rotating endpoint");
+                self.rotate();
+                return Err(e);
+            }
             drain(rx, |(pos, dep)| {
                 sink(pos, dep);
                 delivered += 1;

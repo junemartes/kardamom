@@ -103,7 +103,10 @@ class SealerFanoutTest {
     }
 
     @Test
-    void boundariesFollowTheSameConsumerSet() {
+    void boundariesStayBroadcastToEverySession() {
+        // Unlike relayed records, boundaries reach every session even after
+        // consumers announce: the sequencer's boundary-only lag feed (#93)
+        // consumes them without a SUBSCRIBE announcement.
         subscribe(consumerA);
         service.onTimerEvent(SealerClusteredService.BOUNDARY_TIMER_CORRELATION_ID, 250);
         final long pubBoundaries = publisher.offered.stream()
@@ -112,7 +115,7 @@ class SealerFanoutTest {
         final long consBoundaries = consumerA.offered.stream()
                 .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_BOUNDARY)
                 .count();
-        assertEquals(0, pubBoundaries, "publisher-only session must not receive boundaries");
+        assertEquals(1, pubBoundaries, "boundaries broadcast to publisher-only sessions too");
         assertEquals(1, consBoundaries, "consumer receives the boundary tick");
     }
 

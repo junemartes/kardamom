@@ -21,6 +21,13 @@ pub const BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 pub const SEALER_BLOCK_NUMBER: &str = "kardamom_sealer_block_number";
 pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_total";
 
+// Full-resync fallback (replay window overrun): bumped by the executor binary
+// when the cluster refuses REPLAY_FROM (`REPLAY_UNAVAILABLE`) and the node
+// repairs itself with a peer checkpoint — or fails to. Labelled
+// `outcome=peer-checkpoint|unrecoverable`. Rare by design; any non-zero rate
+// is worth an alert (a node fell behind the retention window).
+pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
+
 pub fn describe() {
     metrics::describe_counter!(TX_APPLIED_TOTAL, "tx executions, labelled by outcome");
     metrics::describe_histogram!(
@@ -39,5 +46,9 @@ pub fn describe() {
     metrics::describe_counter!(
         SEALER_BOUNDARIES_TOTAL,
         "sealer block boundaries observed at cluster egress"
+    );
+    metrics::describe_counter!(
+        RESYNC_TOTAL,
+        "full-resync fallbacks after a cluster replay-window overrun, by outcome"
     );
 }

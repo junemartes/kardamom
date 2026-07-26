@@ -37,9 +37,9 @@ use alloy_primitives::{Address, B256, TxHash, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::sol;
-use kardamom_engine::{ExecutorError, StateWriterQueue};
+use kardamom_engine::{CMessage, ExecutorError, StateWriterQueue, TxReceiptsPublication};
 use kardamom_types::withdrawals;
-use kardamom_types::{BlockBoundary, BlockDelta};
+use kardamom_types::{BlockBoundary, BlockDelta, Receipt};
 
 sol! {
     #[sol(rpc)]
@@ -285,9 +285,17 @@ impl AttesterHandle {
 
 /// Drop-in [`StateWriterQueue`] wrapper that extracts each submitted block's
 /// withdrawal leaves and feeds them to the attester before forwarding the
-/// delta to the inner (validator) writer queue. Lets the binary wire the
-/// attester without touching the engine seams:
-/// `AttestingWriterQueue::new(validator_writer_queue, handle.clone())`.
+/// delta to the inner (validator) writer queue.
+///
+/// ⚠ **Only useful for deltas that actually carry receipts.** The live engine
+/// finalizes every `BlockDelta` with an EMPTY receipts vec (receipts travel
+/// on tx_receipts instead — see `kardamom_engine::delta::PendingDelta::
+/// finalize`), so wiring the attester here collected nothing and every posted
+/// output carried `leaves=0` — i.e. no withdrawal could ever be attested, and
+/// therefore none could ever be finalized on L1. The binary now feeds leaves
+/// from the receipt stream via [`AttestingReceiptSink`]; this wrapper is kept
+/// for delta sources that do populate receipts (offline replay) and for its
+/// unit tests.
 pub struct AttestingWriterQueue<Q: StateWriterQueue> {
     inner: Q,
     handle: AttesterHandle,
@@ -304,6 +312,81 @@ impl<Q: StateWriterQueue> StateWriterQueue for AttestingWriterQueue<Q> {
         self.handle
             .submit_leaves(block.block_number, collect_withdrawal_leaves(&delta));
         self.inner.submit(block, delta)
+    }
+}
+
+/// Collect the withdrawal leaves carried by ONE receipt's logs, in nonce
+/// order. The receipt-stream analogue of [`collect_withdrawal_leaves`].
+pub fn receipt_withdrawal_leaves(receipt: &Receipt) -> Vec<(U256, B256)> {
+    let mut found = Vec::new();
+    for log in &receipt.logs {
+        if log.address != withdrawals::MESSAGE_PASSER {
+            continue;
+        }
+        if let Some((nonce, leaf)) = withdrawals::decode_message_passed(&log.topics, &log.data) {
+            found.push((nonce, leaf));
+        }
+    }
+    found
+}
+
+/// Drop-in [`TxReceiptsPublication`] wrapper that feeds the attester each
+/// block's withdrawal leaves, taken from the RECEIPT STREAM.
+///
+/// This is the seam that actually works in the live pipeline: the engine
+/// hands the state writer a `BlockDelta` whose `receipts` vec is always empty
+/// (receipts travel on tx_receipts), so collecting leaves from the delta —
+/// which is what the binary used to do via [`AttestingWriterQueue`] — always
+/// found zero and left every attested output with `leaves=0`. No withdrawal
+/// could be proven on L1 as a result.
+///
+/// Leaves are buffered per block and flushed on the block boundary, so the
+/// attester still receives them once per block, in nonce order, and always
+/// BEFORE that block's state root (receipts stream at execute time, the root
+/// only after commit).
+pub struct AttestingReceiptSink<P: TxReceiptsPublication> {
+    inner: P,
+    handle: AttesterHandle,
+    /// (block, leaves) accumulated since the last boundary.
+    pending: BTreeMap<u64, Vec<(U256, B256)>>,
+}
+
+impl<P: TxReceiptsPublication> AttestingReceiptSink<P> {
+    pub fn new(inner: P, handle: AttesterHandle) -> Self {
+        Self {
+            inner,
+            handle,
+            pending: BTreeMap::new(),
+        }
+    }
+
+    /// Flush every block up to and including `block` to the attester.
+    fn flush_through(&mut self, block: u64) {
+        let tail = self.pending.split_off(&(block + 1));
+        let flushed = std::mem::replace(&mut self.pending, tail);
+        for (b, mut leaves) in flushed {
+            leaves.sort_by_key(|(nonce, _)| *nonce);
+            self.handle
+                .submit_leaves(b, leaves.into_iter().map(|(_, leaf)| leaf).collect());
+        }
+    }
+}
+
+impl<P: TxReceiptsPublication> TxReceiptsPublication for AttestingReceiptSink<P> {
+    fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+        match &msg {
+            CMessage::Receipt(r) => {
+                let leaves = receipt_withdrawal_leaves(r);
+                if !leaves.is_empty() {
+                    self.pending
+                        .entry(r.block_number)
+                        .or_default()
+                        .extend(leaves);
+                }
+            }
+            CMessage::BlockBoundary(b) => self.flush_through(b.block_number),
+        }
+        self.inner.publish(msg)
     }
 }
 
