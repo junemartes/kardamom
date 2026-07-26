@@ -54,6 +54,7 @@
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
 #        graceful-sequencer hard-sequencer sequencer-replica-kill
+#        sequencer-lapse
 #        sealer-graceful sealer-hard
 #        node-failure-executor archive-driver-loss
 #        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
@@ -71,6 +72,8 @@ RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 # Explicit chain-id (ingress eth_chainId returns a default ≠ the cluster chain).
 CHAIN_ID="${CHAIN_ID:-412346}"
 LOAD_BIN="${LOAD_BIN:-${ROOT}/target/release/kardamom-load}"
+# Archive repair tool (archive-corruption case); built with the service bins.
+REREP_BIN="${REREP_BIN:-${ROOT}/target/release/kardamom-archive-rereplicate}"
 CHAOS_TPS="${CHAOS_TPS:-50}"
 CHAOS_CASE_S="${CHAOS_CASE_S:-45}"
 LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}"
@@ -261,6 +264,165 @@ run_validator_lapse() {
   [ $(( m1 - m0 )) -le 5 ] || fail "validator-lapse: coverage REGRESSED — bal_missing grew ${m0}->${m1} across the pause (the lapse window was not covered by the live term buffer)"
   [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after resume"
   log "validator-lapse PASS: caught up (block ${v1}, lag $(( e_now - v1 ))), kept verifying ${vf0}->${vf1}, bal_missing ${m0}->${m1}, 0 divergences"
+}
+
+# sequencer-lapse case: PAUSE one racing replica of shard 0 (seq-a on
+# kardamom-sequencer-0) for a window under pinned shard-0 load, then resume.
+# The twin (seq-b, other node) keeps ordering — the pipeline must never
+# stall. On resume the paused replica must DETECT the lapse (boundary-silence
+# / watermark-jump on the cluster egress it now consumes) and enter
+# receipt-floor resync (docs/agents/sequencer-lag-resync-spec.md) instead of
+# blindly re-offering its stale backlog: proven-executed refs are dropped on
+# receipt evidence, everything else publishes (the cluster dedup absorbs
+# within-window re-offers exactly as before). Asserts: pipeline progress
+# held, kardamom_sequencer_resync_entered_total INCREMENTED across the pause
+# (the startup enter predates the case), the replica is still exporting
+# after resume, and the standard load + convergence verdicts apply.
+SEQ_LAPSE_S="${SEQ_LAPSE_S:-30}"
+seqa_metric() { # <metric-name> -> integer sum across label lines (empty on scrape failure)
+  # seq-a on node-0: sequencer ip lane starts at .21, seq-a metrics :9001
+  # (mirrors assert_replica_healthy's bridge-first + exec-fallback probe).
+  { curl -fsS --max-time 5 "http://192.168.56.21:9001/metrics" 2>/dev/null \
+    || timeout 8 docker exec kardamom-sequencer-0 curl -fsS --max-time 5 \
+      "http://127.0.0.1:9001/metrics" 2>/dev/null; } \
+  | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { s += $NF } END { printf "%d", s }' \
+  || true
+}
+seqb_twin_metric() { # <metric-name> — shard 0's replica B: seq-b on node-1 (.22:9011)
+  { curl -fsS --max-time 5 "http://192.168.56.22:9011/metrics" 2>/dev/null \
+    || timeout 8 docker exec kardamom-sequencer-1 curl -fsS --max-time 5 \
+      "http://127.0.0.1:9011/metrics" 2>/dev/null; } \
+  | awk -v m="$1" '$0 ~ "^"m"[{ ]" && $0 !~ /^#/ { s += $NF } END { printf "%d", s }' \
+  || true
+}
+# Forensics for sequencer-lapse failures: container identity (was the task
+# REPLACED under us? same container still running?), the full resync metric
+# block, and the current sequencer-a container's recent log lines. The first
+# CI iterations of this case failed with signatures explainable only by
+# process identity confusion — make the next one self-diagnosing.
+seqa_debug() {
+  log "sequencer-lapse DEBUG: inner containers on kardamom-sequencer-0:"
+  docker exec kardamom-sequencer-0 sh -c 'docker ps -a --format "{{.Names}} {{.Status}}" | head -6' 2>/dev/null || true
+  log "sequencer-lapse DEBUG: resync metrics at .21:9001:"
+  { curl -fsS --max-time 5 "http://192.168.56.21:9001/metrics" 2>/dev/null \
+    || timeout 8 docker exec kardamom-sequencer-0 curl -fsS --max-time 5 "http://127.0.0.1:9001/metrics" 2>/dev/null; } \
+    | grep -E "resync|watermark|floor" | head -12 || true
+  log "sequencer-lapse DEBUG: current sequencer-a log tail:"
+  docker exec kardamom-sequencer-0 sh -c \
+    'docker logs --tail 20 "$(docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a")" 2>&1 | grep -E "RESYNC|LAG|resync|panic" | tail -10' 2>/dev/null || true
+}
+
+run_sequencer_lapse() {
+  local inner
+  inner="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
+  [ -n "${inner}" ] || fail "sequencer-lapse: no inner sequencer-a container on kardamom-sequencer-0"
+
+  # DETECTION is asserted on the TWIN (shard 0's replica B, node-1 seq-b):
+  # freezing replica A wedges its egress session, which stalls the sealer's
+  # single service thread on the offer deadline — a genuine cluster-wide
+  # boundary-arrival gap every RUNNING replica's feed must flag. The frozen
+  # replica itself takes the crash-only path instead: a freeze past the
+  # media driver's client-liveness timeout gets the aeron client EVICTED, so
+  # on thaw the process fail-stops and Nomad restarts it — a fresh process
+  # with zeroed counters (observed: run 30180670099 — post-thaw log shows
+  # `RESYNC enter reason=Startup` 10s after SIGCONT; asserting lag counters
+  # on it reads a newborn, not a survivor). With #99 fixed the restart
+  # rejoins cleanly — assert_replica_healthy covers that half.
+  local l0 r0
+  l0="$(seqb_twin_metric kardamom_sequencer_resync_lag_suspected_total)"; l0="${l0:-0}"
+  r0="$(seqb_twin_metric kardamom_sequencer_resync_entered_total)"; r0="${r0:-0}"
+  # SIGSTOP/SIGCONT, NOT `docker pause`: the nested cgroup freezer inside a
+  # privileged DinD node can silently no-op (observed: a "paused" replica
+  # kept serving metrics and never lapsed — the detection asserts failed
+  # because there was no lapse to detect; CI run 30178211248). Signals hit
+  # the task's PID 1 (the sequencer binary) regardless of freezer
+  # delegation. The mid-freeze probe below makes a silent no-op IMPOSSIBLE:
+  # a frozen process cannot answer HTTP, so if metrics still respond the
+  # case fails loudly instead of asserting against a replica that never
+  # lapsed. (validator-lapse shares the docker-pause pattern and never
+  # verifies its freeze — flagged for follow-up, see PR notes.)
+  log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0})"
+  docker exec kardamom-sequencer-0 docker kill -s STOP "${inner}" >/dev/null \
+    || fail "sequencer-lapse: SIGSTOP failed"
+  sleep 3
+  if curl -fsS --max-time 3 "http://192.168.56.21:9001/metrics" >/dev/null 2>&1; then
+    docker exec kardamom-sequencer-0 docker kill -s CONT "${inner}" >/dev/null 2>&1 || true
+    fail "sequencer-lapse: freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
+  fi
+  log "sequencer-lapse: freeze verified (metrics endpoint dark)"
+  sleep $(( SEQ_LAPSE_S - 3 ))
+  docker exec kardamom-sequencer-0 docker kill -s CONT "${inner}" >/dev/null \
+    || fail "sequencer-lapse: SIGCONT failed"
+  log "sequencer-lapse: resumed; twin must have covered (no stall)"
+
+  # The pipeline never depended on the paused replica — the twin raced on.
+  assert_progress
+
+  # DETECTION: the egress feed thread measures the pause as one long
+  # boundary-arrival gap (> the 10s silence window) and bumps
+  # lag_suspected_total within moments of resume. This counter is
+  # starvation-proof — asserted FIRST.
+  #
+  # SCRAPE FAILURE IS NOT ZERO: seqa_metric returns EMPTY when the scrape
+  # fails, and the pause/unpause (on a node whose inner dockerd already
+  # absorbed two docker-kills from earlier cases) can wedge exec-based
+  # fallbacks for minutes (the issue-#76 pattern) — three CI iterations
+  # failed with "0 -> 0" that was actually unreachable-endpoint defaulted
+  # to zero. Require REAL samples: only successful scrapes count toward
+  # the verdict, every sample is logged, and the clock is generous because
+  # it must outlive an exec stall.
+  local t=0 l1 raw good=0
+  while :; do
+    raw="$(seqb_twin_metric kardamom_sequencer_resync_lag_suspected_total)"
+    if [ -n "${raw}" ]; then
+      l1="${raw}"; good=$(( good + 1 ))
+      log "sequencer-lapse: twin sample t=${t}s lag_suspected=${l1} (scrape ok #${good})"
+      [ "${l1}" -gt "${l0}" ] && break
+    else
+      log "sequencer-lapse: sample t=${t}s SCRAPE FAILED (not counted as zero)"
+    fi
+    if [ "${t}" -ge 240 ]; then
+      seqa_debug
+      # RE-ARMED: #99 (predecessor session corpse cycling the restarted
+      # replica's session, starving its egress) is fixed by the
+      # foreign-session event filter — a lapsed replica's feed thread has a
+      # working egress again and MUST detect the pause.
+      if [ "${good}" -eq 0 ]; then
+        fail "sequencer-lapse: TWIN metrics unreachable for 240s after resume (0 successful scrapes) — cannot judge detection"
+      fi
+      fail "sequencer-lapse: TWIN never suspected lag within 240s of resume (lag_suspected ${l0} -> ${l1:-?}, ${good} good scrapes) — the freeze-induced boundary stall went undetected"
+    fi
+    sleep 10; t=$(( t + 10 ))
+  done
+  log "sequencer-lapse: twin detected the boundary stall (lag_suspected ${l0} -> ${l1})"
+
+  # RESPONSE: the controller consumes the sticky flag on the publish loop's
+  # next turn and is then IN resync mode — either freshly entered
+  # (entered_total increments) or still there from an unexited earlier
+  # trigger (mode gauge == 1; entered can't increment when already active).
+  # The loop can legitimately be BLOCKED in a session offer while its closed
+  # session reconnects (the sealer closes a frozen consumer's session within
+  # ~1s of the pause), so this window is WIDE — the flag is sticky and
+  # cannot be missed, only late.
+  local r1 mode
+  t=0
+  while :; do
+    r1="$(seqb_twin_metric kardamom_sequencer_resync_entered_total)"
+    mode="$(seqb_twin_metric kardamom_sequencer_resync_mode)"
+    if [ -n "${r1}" ]; then
+      if [ "${r1}" -gt "${r0}" ] || [ "${mode:-0}" -ge 1 ]; then
+        log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1}, mode ${mode:-0})"
+        break
+      fi
+    fi
+    if [ "${t}" -ge 240 ]; then
+      seqa_debug
+      fail "sequencer-lapse: twin resync never engaged within 240s of resume (entered ${r0} -> ${r1:-scrape-failed}, mode ${mode:-scrape-failed}; lag was suspected ${l0} -> ${l1})"
+    fi
+    sleep 10; t=$(( t + 10 ))
+  done
+  assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
+  log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }
 # Cluster-mode progress probe: the most-recently-committed block number as seen
 # by the executor (kardamom_executor_block_number gauge on :9004). The Java
@@ -591,9 +753,9 @@ run_case() { # <case-name>
 
   # One dedicated fresh funded account per case (single sender, nonces from 0)
   # so cases never collide / leave nonce gaps on the never-reset chain.
-  if [ "${name}" = "sequencer-replica-kill" ]; then
+  if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ]; then
     # PIN this case's load to SHARD 0 — the shard whose replica A is killed
-    # (seq-a on node-0). An arbitrary account lands on shard 0 or 1 by address
+    # (or paused). An arbitrary account lands on shard 0 or 1 by address
     # hash, so ~half of runs would otherwise drive an UNTOUCHED shard and the
     # failover assertions would prove nothing about the kill. Accounts skipped
     # here are burned, never reused (their nonce chains stay untouched at 0).
@@ -614,6 +776,12 @@ run_case() { # <case-name>
   local case_s="${CHAOS_CASE_S}"
   if [ "${name}" = "sequencer-replica-kill" ]; then
     local min_s=$(( INJECT_DELAY + CHAOS_RESTART_SLO_S + 60 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+  fi
+  # sequencer-lapse: load must still be flowing after the pause window so the
+  # resumed replica's resync + the twin-coverage verdicts observe live traffic.
+  if [ "${name}" = "sequencer-lapse" ]; then
+    local min_s=$(( INJECT_DELAY + SEQ_LAPSE_S + 60 ))
     [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
   fi
 
@@ -763,6 +931,65 @@ run_case() { # <case-name>
       log "state-checkpoint-restore: executor-0 restored from peer checkpoint + rejoined (no genesis re-sync)"
       ;;
 
+    replay-window-resync)
+      # FULL-RESYNC drill: WIPE executor-1's state DB and checkpoints, then let
+      # the node repair ITSELF — no harness-side checkpoint copy. A wiped node
+      # cannot re-sync from genesis (the cluster retains a bounded canonical
+      # window; a REPLAY_FROM below its floor is refused with
+      # REPLAY_UNAVAILABLE), so on restart the executor must fetch a checkpoint
+      # from a peer replica over the checkpoint-serve port (9014) BEFORE its
+      # first join, restore it, and resume from there. Expected, in order:
+      #   1. the fleet degrades 3->2 and keeps progressing;
+      #   2. executor-1 restarts, FETCHES a peer checkpoint (asserted via the
+      #      "fetched checkpoint from peer" log line — the line only this new
+      #      self-heal path emits) and restores it ("restored state from
+      #      checkpoint");
+      #   3. executor count returns to 3 and the fleet converges.
+      # (Victim is executor-1, not executor-0, so this case and
+      # state-checkpoint-restore stay independent when they run back-to-back.)
+      local ex1_inner
+      log "replay-window-resync: waiting for a checkpoint on peer executor-0"
+      for _ in $(seq 1 15); do
+        docker exec kardamom-executor-0 bash -lc \
+          'ls /opt/kardamom/checkpoints/checkpoint-* >/dev/null 2>&1' && break
+        sleep 5
+      done
+      docker exec kardamom-executor-0 bash -lc \
+        'ls /opt/kardamom/checkpoints/checkpoint-* >/dev/null 2>&1' \
+        || fail "replay-window-resync: peer executor-0 produced no checkpoint"
+      log "replay-window-resync: killing executor-1 + wiping its state DB and checkpoints"
+      inject_hard kardamom-executor-1 executor
+      docker exec kardamom-executor-1 bash -lc 'rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*' \
+        || fail "replay-window-resync: could not wipe executor-1 state"
+      # The surviving replicas must keep the pipeline progressing on 2.
+      assert_executor_progress 180
+      # executor-1 restarts, self-heals from a peer checkpoint, rejoins to 3.
+      assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
+      # Fetch + restore take real time (a checkpoint image is hundreds of MB
+      # and the node tries every peer that advertises something newer), so
+      # poll for the two log lines instead of grepping once — the first CI run
+      # failed with the restore landing 1.3s after a one-shot grep.
+      local t=0 fetched=0 restored=0
+      while :; do
+        ex1_inner="$(docker exec kardamom-executor-1 bash -lc \
+          'docker ps --format "{{.Names}}" | grep -i executor | head -1' 2>/dev/null || true)"
+        if [ -n "${ex1_inner}" ]; then
+          docker exec kardamom-executor-1 bash -lc \
+            "docker logs ${ex1_inner} 2>&1 | grep -q 'fetched checkpoint from peer'" && fetched=1
+          docker exec kardamom-executor-1 bash -lc \
+            "docker logs ${ex1_inner} 2>&1 | grep -q 'restored state from checkpoint'" && restored=1
+          [ "${fetched}" = 1 ] && [ "${restored}" = 1 ] && break
+        fi
+        sleep 5; t=$((t+5))
+        if [ "${t}" -ge 90 ]; then
+          [ "${fetched}" = 1 ] \
+            || fail "replay-window-resync: executor-1 did NOT fetch a peer checkpoint (self-heal path not taken)"
+          fail "replay-window-resync: executor-1 fetched but did NOT restore the peer checkpoint within 90s"
+        fi
+      done
+      log "replay-window-resync: executor-1 self-healed from a peer checkpoint (fetch + restore + rejoin, ${t}s)"
+      ;;
+
     archive-driver-loss)
       # HARD-kill the Aeron SUBSTRATE (the `aeron` system job's combined
       # ArchivingMediaDriver task) on the ingress-0 node — not the ingress task
@@ -816,8 +1043,17 @@ run_case() { # <case-name>
       # Re-replicate from the surviving peer (ingress-1): stream its archive dir
       # across. This is the transport that kardamom-archive-rereplicate wraps for
       # an operator (peer copy -> mirror_archive -> verify_mirror).
+      #
+      # NEVER transplant archive-mark.dat from a LIVE source: the peer's daemon
+      # heartbeats it, so the copy looks "active" to the victim's restarting
+      # Archive, which then crash-loops on 'active Mark file detected' until the
+      # copied heartbeat ages out — observed blowing the 60s restart SLO (the
+      # recurring 'aeron did not reach >= 8 running (have 7)' flake, on main and
+      # PRs). The victim's own mark file was deliberately preserved by the wipe
+      # above and its heartbeat died with the killed driver, so it is already
+      # stale by restart time and the daemon starts cleanly.
       log "archive-tx-data-wipe: re-replicating archive from kardamom-ingress-1 mirror"
-      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive --exclude='dir/archive-mark.dat' -cf - dir \
         | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
         || fail "archive-tx-data-wipe: re-replication copy failed"
       # The pipeline must have ridden through on ingress-1 the whole time.
@@ -836,6 +1072,169 @@ run_case() { # <case-name>
         fail "archive-tx-data-wipe: restored archive verify reported errors: ${verify_out}"
       fi
       log "archive-tx-data-wipe: restored archive verified OK on ingress-0 (2-copy redundancy recovered)"
+      assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      ;;
+
+    archive-corruption)
+      # DATA-corruption drill (present-but-wrong, not missing): flip bytes
+      # mid-segment in ingress-0's tx_data archive — length preserved, so a
+      # size check can't see it — then DETECT it with a CRC-armed
+      # `ArchiveTool verify` (record-time CRC32 is enabled in the driver) and
+      # HEAL only the corrupt segment from ingress-1's mirror via
+      # `kardamom-archive-rereplicate --diff/--heal`. File-level surgery
+      # requires the victim's archive daemon STOPPED throughout, so the node is
+      # drained for the window (pipeline rides on ingress-1, as the other
+      # archive cases prove). Expected, in order:
+      #   1. pre-heal verify FAILS on the corrupted archive (detection);
+      #   2. the Rust tool's --diff names the corrupted segment and --heal
+      #      repairs exactly it from the mirror;
+      #   3. post-heal CRC verify is clean, the node undrains, and aeron +
+      #      ingress return to strength with the pipeline having progressed.
+      local aeron_base node_id seg seg_name aeron_img tmp_dir verify_pre verify_post diverged
+      [ -x "${REREP_BIN}" ] || fail "archive-corruption: kardamom-archive-rereplicate not at ${REREP_BIN}"
+      aeron_base="$(count_running aeron)"
+      [ -n "${aeron_base}" ] && [ "${aeron_base}" -gt 0 ] \
+        || fail "archive-corruption: aeron baseline unavailable — refusing a vacuous pass"
+      # Hold ingress-0 down for the whole surgery window: drain evicts the
+      # aeron system task (which holds the catalog open) and keeps it down
+      # until we undrain — a hard kill would race nomad's restart.
+      node_id="$(on_control 'nomad node status -verbose 2>/dev/null | awk "/ingress-0/ {print \$1; exit}"')"
+      [ -n "${node_id}" ] || fail "archive-corruption: could not resolve ingress-0 node id"
+      aeron_img="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker ps -a --format '{{.Image}} {{.Names}}' | awk '/archiving/ {print \$1; exit}'")"
+      [ -n "${aeron_img}" ] || fail "archive-corruption: could not resolve the aeron image on ingress-0"
+      log "archive-corruption: draining ingress-0 node (${node_id})"
+      on_control 'nomad node drain -enable -yes -deadline 2m "$1"' "${node_id}" >/dev/null \
+        || fail "archive-corruption: drain enable failed"
+      sleep 5
+      # Pick a victim recording that verifies CLEAN at baseline. The archive's
+      # catalog was restored from the live peer by archive-tx-data-wipe, and
+      # which entries got torn in that copy is a per-run lottery (issue #98) —
+      # this case tests SEGMENT corruption detect/heal, not catalog repair, so
+      # it must start from a provably-clean recording: baseline OK -> corrupt
+      # -> ERR -> heal -> OK is then a closed loop. Every verify/mark-valid is
+      # scoped to that recording (segment name = <recordingId>-<base>.rec).
+      local seg="" seg_name="" rid="" flip_at=-1 cand cand_name cand_rid cand_out cand_flip
+      for cand in $(docker exec kardamom-ingress-0 bash -lc \
+          'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
+        cand_name="$(basename "${cand}")"
+        cand_rid="${cand_name%%-*}"
+        cand_out="$(docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           verify ${cand_rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+        if echo "${cand_out}" | grep -q "recordingId=${cand_rid}) OK" \
+          && ! echo "${cand_out}" | grep -q ') ERR'; then
+          # Segment files are PRE-ALLOCATED (equal apparent size, ls -S order
+          # arbitrary), and a flip landing in a frame HEADER can send verify's
+          # frame-walk out of bounds (observed: JVM SIGSEGV in the CRC32
+          # intrinsic) instead of a clean ERR. Walk the Aeron data-frame
+          # headers and pick a flip offset INSIDE the payload of the largest
+          # real data frame (type 0x01, skipping padding frames); -1 means the
+          # segment has no usable frame — try the next candidate.
+          cand_flip="$(docker exec kardamom-ingress-0 python3 -c "
+b = open('${cand}', 'rb').read()
+pos = 0; best = -1; bestlen = 0
+while pos + 32 <= len(b):
+    ln = int.from_bytes(b[pos:pos+4], 'little', signed=True)
+    if ln <= 0:
+        break  # first zero-length header = start of the unrecorded tail
+    typ = int.from_bytes(b[pos+6:pos+8], 'little')
+    if typ == 1 and ln >= 96 and pos + ln <= len(b) and ln > bestlen:
+        best = pos; bestlen = ln
+    pos += (ln + 31) // 32 * 32
+print(best + 40 if best >= 0 else -1)
+" 2>/dev/null || echo -1)"
+          if [ "${cand_flip:--1}" -ge 0 ]; then
+            seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"; flip_at="${cand_flip}"
+            break
+          fi
+          continue
+        fi
+        # The probe marks a failing entry INVALID — put its state back as found.
+        docker exec kardamom-ingress-0 bash -lc \
+          "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+           --add-opens java.base/java.util.zip=ALL-UNNAMED \
+           -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+           mark-valid ${cand_rid}" >/dev/null 2>&1 || true
+      done
+      [ -n "${seg}" ] \
+        || fail "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad — see issue #98)"
+      # Corrupt 16 bytes inside a data frame's PAYLOAD — length unchanged,
+      # frame structure intact, so verify reports a checksum ERR instead of
+      # chasing a bogus frame length.
+      log "archive-corruption: flipping payload bytes at ${flip_at} in ${seg_name} (recording ${rid})"
+      docker exec kardamom-ingress-0 bash -lc \
+        "printf 'KARDAMOM-CHAOS!!' | dd of=${seg} bs=1 seek=${flip_at} count=16 conv=notrunc status=none" \
+        || fail "archive-corruption: byte flip failed"
+      # DETECTION: CRC-armed verify on the frozen victim must NOT be clean.
+      # (Run via a one-off container on the node — the daemon is down.)
+      verify_pre="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
+         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+         verify ${rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+      if echo "${verify_pre}" | grep -q 'Exception'; then
+        echo "${verify_pre}" | tail -20
+        fail "archive-corruption: verify tool crashed (not a detection)"
+      fi
+      echo "${verify_pre}" | grep -qE "recordingId=${rid}[,)].* ERR" \
+        || { echo "${verify_pre}" | tail -20; \
+             fail "archive-corruption: CRC-armed verify did NOT flag recording ${rid} (detection hole)"; }
+      log "archive-corruption: corruption detected by CRC-armed verify"
+      # HEAL through the Rust tool on the runner: stage both copies, --diff
+      # must name the corrupted segment, --heal repairs exactly it.
+      tmp_dir="$(mktemp -d)"
+      mkdir -p "${tmp_dir}/victim" "${tmp_dir}/mirror"
+      docker exec kardamom-ingress-0 tar -C /opt/kardamom/archive -cf - dir \
+        | tar -C "${tmp_dir}/victim" -xf - || fail "archive-corruption: staging victim copy failed"
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
+        | tar -C "${tmp_dir}/mirror" -xf - || fail "archive-corruption: staging mirror copy failed"
+      diverged="$("${REREP_BIN}" --diff --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" || true)"
+      echo "${diverged}" | grep -q "${seg_name}" \
+        || fail "archive-corruption: --diff did not name the corrupted segment ${seg_name}"
+      "${REREP_BIN}" --heal --segments "${seg_name}" --no-verify \
+        --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" \
+        | grep -q 'healed segments=1' \
+        || fail "archive-corruption: --heal did not repair the segment"
+      # Put ONLY the healed segment back, then re-validate + clear any INVALID
+      # marks the detection verify persisted.
+      tar -C "${tmp_dir}/victim" -cf - "dir/${seg_name}" \
+        | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
+        || fail "archive-corruption: writing healed segment back failed"
+      # The detection verify marked the failing recording INVALID in the
+      # catalog; clear the marks now that the bytes are healed. Recording ids
+      # are harvested on the RUNNER from the pre-heal verify output (one
+      # mark-valid container per id — a shell loop inside the node would run
+      # `java` on the node itself, where it doesn't exist).
+      docker exec kardamom-ingress-0 bash -lc \
+        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
+         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+         mark-valid ${rid}" >/dev/null 2>&1 || true
+      verify_post="$(docker exec kardamom-ingress-0 bash -lc \
+        "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
+         --add-opens java.base/java.util.zip=ALL-UNNAMED \
+         -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
+         verify ${rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
+      if echo "${verify_post}" | grep -q 'Exception'; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify tool crashed"
+      fi
+      if ! echo "${verify_post}" | grep -q "recordingId=${rid}) OK"; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify does not show recording ${rid} OK"
+      fi
+      if echo "${verify_post}" | grep -qE "recordingId=${rid}[,)].* ERR"; then
+        echo "${verify_post}" | tail -20
+        fail "archive-corruption: post-heal verify still reports errors on recording ${rid}"
+      fi
+      rm -rf "${tmp_dir}"
+      log "archive-corruption: healed + CRC verify clean; undraining ingress-0"
+      on_control 'nomad node drain -disable -yes "$1"' "${node_id}" >/dev/null \
+        || fail "archive-corruption: drain disable failed"
+      assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
       assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
       ;;
 
@@ -935,6 +1334,13 @@ run_case() { # <case-name>
       # anything that aged out. All validator-specific asserts live in the
       # helper.
       run_validator_lapse
+      ;;
+
+    sequencer-lapse)
+      # No component killed: pause ONE racing replica of shard 0 and assert
+      # the twin covers (no stall) while the resumed replica detects the
+      # lapse and enters receipt-floor resync. All asserts in the helper.
+      run_sequencer_lapse
       ;;
 
     *) fail "unknown chaos case: ${name}" ;;

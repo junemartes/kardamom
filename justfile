@@ -201,6 +201,8 @@ aeron-driver-up:
         -Daeron.archive.control.channel=aeron:udp?endpoint=127.0.0.1:8010 \
         -Daeron.archive.control.response.channel=aeron:udp?endpoint=127.0.0.1:8011 \
         -Daeron.archive.replication.channel=aeron:udp?endpoint=127.0.0.1:8021 \
+        -Daeron.archive.record.checksum=io.aeron.archive.checksum.Crc32 \
+        -Daeron.archive.replay.checksum=io.aeron.archive.checksum.Crc32 \
         -cp "$JAR" \
         io.aeron.archive.ArchivingMediaDriver \
         > {{AERON_LOCAL_ROOT}}/md.log 2>&1 &
@@ -274,8 +276,9 @@ test-e2e-local: aeron-jar cluster-jar
     set -euo pipefail
     SHIM="$(just java-shim)"
     export PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)"
-    cargo build -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-        --bins --locked
+    cargo build --bins --locked \
+        -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
+        -p kardamom-validator -p kardamom-state -p kardamom-da-watcher
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
         --locked -- --ignored --nocapture --test-threads=2
 

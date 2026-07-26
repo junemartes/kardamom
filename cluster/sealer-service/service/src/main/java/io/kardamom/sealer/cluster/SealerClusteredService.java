@@ -582,8 +582,13 @@ public final class SealerClusteredService implements ClusteredService {
     private void offerBoundary(final Boundary boundary) {
         final int len = frameBoundary(boundary);
         retain(len, true, boundary.blockNumber);
-        // Boundaries reach the same consumer set as relayed records.
-        offerToConsumers(len);
+        // Boundaries stay broadcast to EVERY session (unlike relayed records):
+        // they are <=1 per tick and the sequencer's boundary-only lag feed
+        // (connect_with_egress_kind_filter, #93) consumes them WITHOUT a
+        // SUBSCRIBE announcement — consumer-filtering them would starve it.
+        for (final ClientSession session : cluster.clientSessions()) {
+            offerToSession(session, len);
+        }
     }
 
     /**

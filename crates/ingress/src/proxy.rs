@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
-use alloy_primitives::{B256, Bytes as AlloyBytes};
+use alloy_primitives::{Address, B256, Bytes as AlloyBytes};
 use alloy_rlp::Decodable;
 use tokio::sync::broadcast;
 
@@ -58,6 +58,15 @@ pub fn ingress_id_of(correlation_id: u64) -> u16 {
     (correlation_id >> 48) as u16
 }
 
+/// Output of the shared submit-path head: identity of a decoded, verified
+/// submission plus a receipt-cache hit if this is a resubmission.
+struct ValidatedSubmission {
+    sender: Address,
+    nonce: u64,
+    tx_hash: B256,
+    cached: Option<Receipt>,
+}
+
 /// Handle returned by `IngressProxy::start`. Drop it to shut down listeners
 /// gracefully.
 pub struct IngressHandle {
@@ -102,7 +111,18 @@ where
     /// (still stubbed pending the S6 reader interface). The receipt path is
     /// now served entirely from the in-memory [`ReceiptCache`].
     pub(crate) state_db: Arc<DB>,
+    /// Post-dedup receipt re-broadcast: the tx_receipts watcher forwards each
+    /// *first-seen* receipt here, so `kardamom_subscribeReceipts` sessions see
+    /// exactly one copy per tx rather than the raw N-replica MDS fan-in.
+    pub(crate) receipt_feed: broadcast::Sender<Receipt>,
+    /// Post-dedup tx-error re-broadcast (same pattern as `receipt_feed`).
+    pub(crate) tx_error_feed: broadcast::Sender<TxError>,
 }
+
+/// Capacity of the deduped receipt/error re-broadcast feeds. A subscriber
+/// that lags more than this many items receives a `Lagged` notification and
+/// must fall back to `eth_getTransactionReceipt` for the gap.
+const FEED_CAPACITY: usize = 8192;
 
 impl<P, S, DB> Clone for IngressProxy<P, S, DB>
 where
@@ -124,6 +144,8 @@ where
             correlation_seq: self.correlation_seq.clone(),
             latest_block_number: self.latest_block_number.clone(),
             state_db: self.state_db.clone(),
+            receipt_feed: self.receipt_feed.clone(),
+            tx_error_feed: self.tx_error_feed.clone(),
         }
     }
 }
@@ -160,6 +182,8 @@ where
             correlation_seq: Arc::new(AtomicU64::new(0)),
             latest_block_number: Arc::new(AtomicU64::new(0)),
             state_db,
+            receipt_feed: broadcast::channel(FEED_CAPACITY).0,
+            tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
         };
         me.spawn_tx_receipts_watcher();
         me.spawn_tx_errors_watcher();
@@ -234,14 +258,19 @@ where
         let rx = self.subscription.subscribe_tx_errors();
         let pending = self.pending.clone();
         let dedup = self.tx_error_dedup.clone();
+        let feed = self.tx_error_feed.clone();
         spawn_broadcast_watcher(rx, move |err: TxError| {
             let pending = pending.clone();
             let dedup = dedup.clone();
+            let feed = feed.clone();
             async move {
                 if !dedup.observe_error(err.sender, err.nonce, &err.reason) {
                     metrics::counter!(crate::metrics::TX_ERROR_DUPLICATE_TOTAL).increment(1);
                     return;
                 }
+                // Deduped re-broadcast for subscription-mode clients; `send`
+                // only errors when no subscriber exists, which is fine.
+                let _ = feed.send(err.clone());
                 pending.on_tx_error(err.sender, err.nonce, err.reason).await;
             }
         });
@@ -269,11 +298,13 @@ where
         let cache = self.cache.clone();
         let seen = self.seen_receipts.clone();
         let error_dedup = self.tx_error_dedup.clone();
+        let feed = self.receipt_feed.clone();
         spawn_broadcast_watcher(rx, move |receipt: Receipt| {
             let pending = pending.clone();
             let cache = cache.clone();
             let seen = seen.clone();
             let error_dedup = error_dedup.clone();
+            let feed = feed.clone();
             async move {
                 // First-wins: `insert` returns false if the hash was already
                 // present, i.e. this is a duplicate replica copy → drop it.
@@ -287,6 +318,9 @@ where
                 // racing replica's late DuplicatedTx for this tx is dropped.
                 error_dedup.record_success(sender, nonce);
                 cache.insert(receipt.clone());
+                // Deduped re-broadcast for subscription-mode clients; `send`
+                // only errors when no subscriber exists, which is fine.
+                let _ = feed.send(receipt.clone());
                 pending.on_receipt(sender, nonce, receipt).await;
             }
         });
@@ -318,40 +352,8 @@ where
         client_ip: IpAddr,
         raw_tx: AlloyBytes,
     ) -> Result<ReceiptResponse, IngressError> {
-        metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
-
-        if let Err(e) = self.rate_limiter.check(client_ip) {
-            let _ = e; // unit error
-            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "rate-limited")
-                .increment(1);
-            return Err(IngressError::RateLimited(client_ip.to_string()));
-        }
-
-        let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
-            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "decode-error")
-                .increment(1);
-            IngressError::Decode(e.to_string())
-        })?;
-        let nonce = env.nonce();
-
-        //: the proxy is the *only* place `sender` and
-        // `tx_hash` are computed. Both fields are stamped into the envelope
-        // before any downstream consumer observes the tx, and the sig-verify
-        // failure path returns *before* we publish to Aeron.
-        let (sender, tx_hash) = self.verifier.recover(env, raw_tx.clone()).await.map_err(
-            |e| {
-                if matches!(e, IngressError::SignatureInvalid) {
-                    metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "signature-invalid")
-                        .increment(1);
-                } else {
-                    metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "internal")
-                        .increment(1);
-                }
-                e
-            },
-        )?;
-
-        if let Some(prev) = self.cache.lookup(sender, nonce) {
+        let v = self.validate_submission(client_ip, &raw_tx).await?;
+        if let Some(prev) = v.cached {
             // A resubmission served from the receipt cache succeeds; count it
             // so received == accepted + rejected holds on every path.
             metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
@@ -362,31 +364,9 @@ where
         // channel before we'd otherwise have registered, especially under load.
         // The queue-depth gauge is maintained by the registry itself (every
         // insert/remove path, including a cancelled handler's Drop).
-        let wait = self.pending.register(sender, nonce);
+        let wait = self.pending.register(v.sender, v.nonce);
 
-        // Publish onto tx_data[shard]. The shard is selected by sender-
-        // address hash (`partition_for(sender, K)`) so every tx from a given
-        // sender lands on the same shard's A stream, which lets the P
-        // sequencers per shard nonce-order them consistently. The envelope
-        // carries the canonical `tx_hash` so downstream consumers can dedup
-        // and re-emit it without recomputing (S0).
-        let shard = partition_for(sender, self.cfg.partition_count_m) as usize;
-        let correlation_id = self.next_correlation_id();
-        self.publication
-            .publish_tx_data(
-                shard,
-                TxEnvelope {
-                    correlation_id,
-                    raw_tx: raw_tx.0.clone(),
-                    sender,
-                    tx_hash,
-                },
-            )
-            .await
-            .inspect_err(|_| {
-                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "partition-unavailable")
-                    .increment(1);
-            })?;
+        self.publish_validated(&v, raw_tx).await?;
 
         let result = wait
             .await_with_timeout(self.cfg.pending_receipt_timeout)
@@ -413,6 +393,123 @@ where
         }
 
         result
+    }
+
+    /// Fire-and-observe submission for subscription-mode clients
+    /// (`kardamom_sendRawTransactionAsync`): validates and publishes exactly
+    /// like [`Self::submit_raw`], but acks with the tx hash as soon as the
+    /// envelope is on tx_data instead of parking the caller until the receipt
+    /// arrives. Receipt delivery happens out-of-band — on
+    /// `kardamom_subscribeReceipts` or by polling
+    /// `eth_getTransactionReceipt`. On this path "accepted" in the metrics
+    /// means *published*, not *receipted*; the
+    /// `received == accepted + rejected` invariant is unchanged.
+    pub async fn submit_raw_async(
+        &self,
+        client_ip: IpAddr,
+        raw_tx: AlloyBytes,
+    ) -> Result<B256, IngressError> {
+        let v = self.validate_submission(client_ip, &raw_tx).await?;
+        if let Some(prev) = v.cached {
+            metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+            return Ok(prev.tx_hash);
+        }
+        self.publish_validated(&v, raw_tx).await?;
+        metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
+        Ok(v.tx_hash)
+    }
+
+    /// Shared head of both submit paths: rate-limit, decode, batch
+    /// sig-verify, and receipt-cache lookup. Does not publish.
+    async fn validate_submission(
+        &self,
+        client_ip: IpAddr,
+        raw_tx: &AlloyBytes,
+    ) -> Result<ValidatedSubmission, IngressError> {
+        metrics::counter!(crate::metrics::TX_RECEIVED_TOTAL).increment(1);
+
+        if let Err(e) = self.rate_limiter.check(client_ip) {
+            let _ = e; // unit error
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "rate-limited")
+                .increment(1);
+            return Err(IngressError::RateLimited(client_ip.to_string()));
+        }
+
+        let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref()).map_err(|e| {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "decode-error")
+                .increment(1);
+            IngressError::Decode(e.to_string())
+        })?;
+        let nonce = env.nonce();
+
+        //: the proxy is the *only* place `sender` and
+        // `tx_hash` are computed. Both fields are stamped into the envelope
+        // before any downstream consumer observes the tx, and the sig-verify
+        // failure path returns *before* we publish to Aeron.
+        let (sender, tx_hash) = self
+            .verifier
+            .recover(env, raw_tx.clone())
+            .await
+            .map_err(|e| {
+                if matches!(e, IngressError::SignatureInvalid) {
+                    metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "signature-invalid")
+                        .increment(1);
+                } else {
+                    metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "internal")
+                        .increment(1);
+                }
+                e
+            })?;
+
+        let cached = self.cache.lookup(sender, nonce);
+        Ok(ValidatedSubmission {
+            sender,
+            nonce,
+            tx_hash,
+            cached,
+        })
+    }
+
+    /// Publish a validated envelope onto tx_data[shard]. The shard is
+    /// selected by sender-address hash (`partition_for(sender, K)`) so every
+    /// tx from a given sender lands on the same shard's A stream, which lets
+    /// the P sequencers per shard nonce-order them consistently. The envelope
+    /// carries the canonical `tx_hash` so downstream consumers can dedup and
+    /// re-emit it without recomputing (S0).
+    async fn publish_validated(
+        &self,
+        v: &ValidatedSubmission,
+        raw_tx: AlloyBytes,
+    ) -> Result<(), IngressError> {
+        let shard = partition_for(v.sender, self.cfg.partition_count_m) as usize;
+        let correlation_id = self.next_correlation_id();
+        self.publication
+            .publish_tx_data(
+                shard,
+                TxEnvelope {
+                    correlation_id,
+                    raw_tx: raw_tx.0.clone(),
+                    sender: v.sender,
+                    tx_hash: v.tx_hash,
+                },
+            )
+            .await
+            .inspect_err(|_| {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "partition-unavailable")
+                    .increment(1);
+            })
+    }
+
+    /// Live feed of *deduped* receipts (one copy per tx, post MDS fan-in
+    /// dedup). Backs `kardamom_subscribeReceipts`.
+    pub fn subscribe_receipt_feed(&self) -> broadcast::Receiver<Receipt> {
+        self.receipt_feed.subscribe()
+    }
+
+    /// Live feed of *deduped* sequencer tx rejections. Backs the error
+    /// frames on `kardamom_subscribeReceipts`.
+    pub fn subscribe_tx_error_feed(&self) -> broadcast::Receiver<TxError> {
+        self.tx_error_feed.subscribe()
     }
 
     /// Resolves the partition this proxy would route `sender` to. Used by

@@ -97,6 +97,11 @@ struct RunArgs {
     /// Collapsed-capture length within the soak.
     #[arg(long, default_value_t = 60)]
     profile_secs: u64,
+    /// Drive load via kardamom_sendRawTransactionAsync + a WebSocket
+    /// receipt subscription (in-flight txs hold no connections) instead of
+    /// the parked eth_sendRawTransaction.
+    #[arg(long, default_value_t = false)]
+    subscribe: bool,
     /// Output base directory (a timestamped subdir is created).
     #[arg(long, default_value = "target/perf")]
     out: PathBuf,
@@ -146,6 +151,7 @@ fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
         chaos_mode: false,
         scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
         metrics_via_docker: true,
+        subscribe: a.subscribe,
         executor_nodes: vec![
             "kardamom-executor-0".into(),
             "kardamom-executor-1".into(),

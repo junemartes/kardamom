@@ -36,6 +36,7 @@ metrics.workspace = true
 nonzero_ext = "0.3"
 secp256k1 = { version = "0.31", features = ["recovery", "global-context"] }
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true

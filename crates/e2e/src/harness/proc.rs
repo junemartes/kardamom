@@ -75,6 +75,41 @@ impl Proc {
         false
     }
 
+    /// SIGSTOP — freeze the process without killing it (S7 uses this to
+    /// silence the executor's genuine publications while injecting).
+    pub fn suspend(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.child.id() as i32, libc::SIGSTOP);
+        }
+    }
+
+    /// SIGCONT — resume a suspended process.
+    pub fn resume(&self) {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(self.child.id() as i32, libc::SIGCONT);
+        }
+    }
+
+    /// Wait up to `timeout` for the process to exit on its own; returns its
+    /// exit code (`None` element when killed by signal) or `None` on timeout.
+    pub fn wait_exit(&mut self, timeout: Duration) -> Option<Option<i32>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.child.try_wait() {
+                Ok(Some(status)) => return Some(status.code()),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
     /// Last `n` lines of the process log (best-effort, for failure dumps).
     pub fn log_tail(&self, n: usize) -> String {
         match std::fs::read_to_string(&self.log_path) {

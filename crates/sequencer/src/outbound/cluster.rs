@@ -15,7 +15,9 @@ use crate::outbound::TxOrderingRefPublisher;
 use kardamom_cluster_adapter::gateway::{ClusterIngress, OfferOutcome};
 use kardamom_cluster_adapter::wire;
 
-use kardamom_cluster_adapter::{LiveCluster, LiveClusterConfig, LiveError, LiveIngress, live};
+use kardamom_cluster_adapter::{
+    LiveCluster, LiveClusterConfig, LiveEgress, LiveError, LiveIngress, live,
+};
 
 /// Cloning shares the single underlying cluster session: each clone holds a
 /// clone of the ingress (a `Sender<OfferReq>`), so offers from every clone
@@ -64,6 +66,25 @@ pub fn cluster_ref_publisher(
 ) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>), LiveError> {
     let (cluster, ingress, _egress) = live::connect(rt, cfg)?;
     Ok((cluster, ClusterRefPublisher::new(ingress)))
+}
+
+/// [`cluster_ref_publisher`], but KEEPING the egress receiver. The cluster
+/// broadcasts every relayed record and boundary to publisher sessions too
+/// (load-bearing for the executors' broadcast; previously discarded here) —
+/// the boundary frames carry `end_tx_idx`, the global canonical count the
+/// lag-resync watermark trigger runs on
+/// (docs/agents/sequencer-lag-resync-spec.md). Dropping the returned
+/// `LiveEgress` restores the old discard behaviour.
+pub fn cluster_ref_publisher_with_egress(
+    rt: kardamom_log::aeron_live::AeronRuntime,
+    cfg: LiveClusterConfig,
+) -> Result<(LiveCluster, ClusterRefPublisher<LiveIngress>, LiveEgress), LiveError> {
+    // Boundaries ONLY: line-rate record frames are dropped at the session
+    // thread instead of being allocated + channelled to a receiver that
+    // discards them (the session thread also services the publish offers).
+    let (cluster, ingress, egress) =
+        live::connect_with_egress_kind_filter(rt, cfg, wire::EGRESS_KIND_BOUNDARY)?;
+    Ok((cluster, ClusterRefPublisher::new(ingress), egress))
 }
 
 #[cfg(test)]
