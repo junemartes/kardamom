@@ -13,10 +13,11 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use alloy_primitives::{Address, B256, Bytes, Log, LogData, U256};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionReceipt};
-use jsonrpsee::core::RpcResult;
+use jsonrpsee::core::{RpcResult, SubscriptionResult};
 use jsonrpsee::proc_macros::rpc;
-use jsonrpsee::server::{Server, ServerHandle};
+use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
+use tokio::sync::broadcast;
 
 use kardamom_types::StateDatabase;
 
@@ -48,6 +49,50 @@ pub trait IngressEthApi {
 
     #[method(name = "getTransactionReceipt")]
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>>;
+}
+
+/// Event stream payload for `kardamom_subscribeReceipts`. One subscription
+/// carries three frame kinds: executed-tx receipts, sequencer rejections
+/// (the tx will never receipt), and a lag marker emitted when the subscriber
+/// fell further behind than the feed buffer — the gap must then be recovered
+/// by polling `eth_getTransactionReceipt`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum ReceiptEvent {
+    /// A tx executed; its enriched receipt was observed on tx_receipts.
+    #[serde(rename_all = "camelCase")]
+    Receipt { receipt: Box<TransactionReceipt> },
+    /// The sequencer rejected the tx.
+    #[serde(rename_all = "camelCase")]
+    TxError {
+        sender: Address,
+        nonce: u64,
+        reason: String,
+        expected_nonce: Option<u64>,
+    },
+    /// The subscriber lagged; `skipped` feed items were dropped.
+    #[serde(rename_all = "camelCase")]
+    Lagged { skipped: u64 },
+}
+
+/// Kardamom-native extensions: fast-ack submission + push receipt delivery.
+/// The Eth-compatible `eth_sendRawTransaction` parks the caller until the
+/// receipt arrives, which costs one held connection per in-flight tx; this
+/// namespace decouples the two so any number of txs can be in flight over a
+/// single connection.
+#[rpc(server, namespace = "kardamom")]
+pub trait IngressKardamomApi {
+    /// Fast-ack submission: validates, publishes to tx_data, and returns the
+    /// canonical tx hash immediately. Delivery is observed via
+    /// `kardamom_subscribeReceipts` or `eth_getTransactionReceipt`.
+    #[method(name = "sendRawTransactionAsync")]
+    async fn send_raw_transaction_async(&self, bytes: Bytes) -> RpcResult<B256>;
+
+    /// Push feed of deduped receipts and sequencer rejections (WebSocket
+    /// only). `senders` filters to the given addresses; `None` or `[]`
+    /// streams everything.
+    #[subscription(name = "subscribeReceipts", item = ReceiptEvent)]
+    async fn subscribe_receipts(&self, senders: Option<Vec<Address>>) -> SubscriptionResult;
 }
 
 pub struct IngressHandlers<P, S, DB>
@@ -118,6 +163,96 @@ where
         // libmdbx-backed impl; v0 + tests use `InMemoryStateDb`. Returns
         // `null` per JSON-RPC convention if not yet committed.
         Ok(self.proxy.lookup_receipt_by_hash(hash).map(receipt_to_rpc))
+    }
+}
+
+#[async_trait::async_trait]
+impl<P, S, DB> IngressKardamomApiServer for IngressHandlers<P, S, DB>
+where
+    P: IngressPublication + Clone + 'static,
+    S: IngressSubscription + Clone + 'static,
+    DB: StateDatabase + 'static,
+{
+    async fn send_raw_transaction_async(&self, bytes: Bytes) -> RpcResult<B256> {
+        let client_ip = PEER_ADDR
+            .try_with(|c| c.get())
+            .ok()
+            .flatten()
+            .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        self.proxy
+            .submit_raw_async(client_ip, bytes)
+            .await
+            .map_err(ErrorObjectOwned::from)
+    }
+
+    async fn subscribe_receipts(
+        &self,
+        pending: PendingSubscriptionSink,
+        senders: Option<Vec<Address>>,
+    ) -> SubscriptionResult {
+        // Tap the feeds *before* accepting so nothing published in between
+        // is missed.
+        let mut receipts = self.proxy.subscribe_receipt_feed();
+        let mut errors = self.proxy.subscribe_tx_error_feed();
+        let sink = pending.accept().await?;
+        let filter: Option<std::collections::HashSet<Address>> = senders
+            .filter(|s| !s.is_empty())
+            .map(|s| s.into_iter().collect());
+
+        loop {
+            let event = tokio::select! {
+                () = sink.closed() => break,
+                r = receipts.recv() => match r {
+                    Ok(rcpt) => {
+                        if filter.as_ref().is_some_and(|f| !f.contains(&rcpt.from)) {
+                            continue;
+                        }
+                        ReceiptEvent::Receipt {
+                            receipt: Box::new(receipt_to_rpc(rcpt)),
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        ReceiptEvent::Lagged { skipped: n }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                e = errors.recv() => match e {
+                    Ok(err) => {
+                        if filter.as_ref().is_some_and(|f| !f.contains(&err.sender)) {
+                            continue;
+                        }
+                        let (reason, expected_nonce) = describe_tx_error(&err.reason);
+                        ReceiptEvent::TxError {
+                            sender: err.sender,
+                            nonce: err.nonce,
+                            reason,
+                            expected_nonce,
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        ReceiptEvent::Lagged { skipped: n }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            let msg = serde_json::value::to_raw_value(&event)
+                .map_err(|e| format!("serialize subscription event: {e}"))?;
+            if sink.send(msg).await.is_err() {
+                break; // subscriber went away
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Human/machine-readable description of a sequencer rejection for the
+/// subscription stream. Exhaustive on purpose: a new `TxErrorReason` variant
+/// must decide its wire shape here.
+fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<u64>) {
+    match reason {
+        kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce } => {
+            ("duplicated-tx".to_string(), Some(*expected_nonce))
+        }
     }
 }
 
@@ -207,7 +342,12 @@ where
     let local = server
         .local_addr()
         .map_err(|e| IngressError::Internal(format!("local_addr: {e}")))?;
-    let module = IngressHandlers::new(proxy).into_rpc();
+    let mut module = IngressEthApiServer::into_rpc(IngressHandlers::new(proxy.clone()));
+    module
+        .merge(IngressKardamomApiServer::into_rpc(IngressHandlers::new(
+            proxy,
+        )))
+        .map_err(|e| IngressError::Internal(format!("rpc module merge: {e}")))?;
     Ok((local, server.start(module)))
 }
 

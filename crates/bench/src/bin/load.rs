@@ -78,6 +78,11 @@ struct Args {
     drain_timeout: Duration,
 
     /// Per-submit retry attempts on transient failure.
+    /// Submit via kardamom_sendRawTransactionAsync + a WebSocket receipt
+    /// subscription instead of the parked eth_sendRawTransaction.
+    #[arg(long, default_value_t = false)]
+    subscribe: bool,
+
     #[arg(long = "retry-submit", default_value_t = 2)]
     retry_submit: u32,
 
@@ -194,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
         chaos_mode: args.chaos_mode,
         scrape: csv(&args.scrape),
         metrics_via_docker: args.metrics_via_docker,
+        subscribe: args.subscribe,
         executor_nodes: csv(&args.executor_nodes),
         ingress_node: args.ingress_node,
         sequencer_nodes: csv(&args.sequencer_nodes),
