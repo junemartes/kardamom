@@ -889,7 +889,7 @@ run_case() { # <case-name>
       # it must start from a provably-clean recording: baseline OK -> corrupt
       # -> ERR -> heal -> OK is then a closed loop. Every verify/mark-valid is
       # scoped to that recording (segment name = <recordingId>-<base>.rec).
-      local seg="" seg_name="" rid="" seg_ext=0 cand cand_name cand_rid cand_out cand_ext
+      local seg="" seg_name="" rid="" flip_at=-1 cand cand_name cand_rid cand_out cand_flip
       for cand in $(docker exec kardamom-ingress-0 bash -lc \
           'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
         cand_name="$(basename "${cand}")"
@@ -902,14 +902,27 @@ run_case() { # <case-name>
         if echo "${cand_out}" | grep -q "recordingId=${cand_rid}) OK" \
           && ! echo "${cand_out}" | grep -q ') ERR'; then
           # Segment files are PRE-ALLOCATED (equal apparent size, ls -S order
-          # arbitrary): a flip at a fixed offset can land in unrecorded zero
-          # padding, which verify rightly ignores. Require real recorded data
-          # (last non-zero byte >= 8KB) and remember the extent so the flip
-          # lands mid-recorded-range.
-          cand_ext="$(docker exec kardamom-ingress-0 python3 -c \
-            "import sys; b=open('${cand}','rb').read(); print(len(b.rstrip(b'\x00')))" 2>/dev/null || echo 0)"
-          if [ "${cand_ext:-0}" -ge 8192 ]; then
-            seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"; seg_ext="${cand_ext}"
+          # arbitrary), and a flip landing in a frame HEADER can send verify's
+          # frame-walk out of bounds (observed: JVM SIGSEGV in the CRC32
+          # intrinsic) instead of a clean ERR. Walk the Aeron data-frame
+          # headers and pick a flip offset INSIDE the payload of the largest
+          # real data frame (type 0x01, skipping padding frames); -1 means the
+          # segment has no usable frame — try the next candidate.
+          cand_flip="$(docker exec kardamom-ingress-0 python3 -c "
+b = open('${cand}', 'rb').read()
+pos = 0; best = -1; bestlen = 0
+while pos + 32 <= len(b):
+    ln = int.from_bytes(b[pos:pos+4], 'little', signed=True)
+    if ln <= 0:
+        break  # first zero-length header = start of the unrecorded tail
+    typ = int.from_bytes(b[pos+6:pos+8], 'little')
+    if typ == 1 and ln >= 96 and pos + ln <= len(b) and ln > bestlen:
+        best = pos; bestlen = ln
+    pos += (ln + 31) // 32 * 32
+print(best + 40 if best >= 0 else -1)
+" 2>/dev/null || echo -1)"
+          if [ "${cand_flip:--1}" -ge 0 ]; then
+            seg="${cand}"; seg_name="${cand_name}"; rid="${cand_rid}"; flip_at="${cand_flip}"
             break
           fi
           continue
@@ -923,10 +936,10 @@ run_case() { # <case-name>
       done
       [ -n "${seg}" ] \
         || fail "archive-corruption: no recording verifies clean at baseline (inherited catalog damage too broad — see issue #98)"
-      # Corrupt 16 bytes at HALF the recorded extent — provably inside real
-      # frame data, length unchanged.
-      local flip_at=$(( seg_ext / 2 ))
-      log "archive-corruption: flipping bytes at ${flip_at}/${seg_ext} in ${seg_name} (recording ${rid})"
+      # Corrupt 16 bytes inside a data frame's PAYLOAD — length unchanged,
+      # frame structure intact, so verify reports a checksum ERR instead of
+      # chasing a bogus frame length.
+      log "archive-corruption: flipping payload bytes at ${flip_at} in ${seg_name} (recording ${rid})"
       docker exec kardamom-ingress-0 bash -lc \
         "printf 'KARDAMOM-CHAOS!!' | dd of=${seg} bs=1 seek=${flip_at} count=16 conv=notrunc status=none" \
         || fail "archive-corruption: byte flip failed"
