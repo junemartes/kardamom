@@ -40,6 +40,11 @@ pub const ATTESTER_ADDR: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb
 pub const DEPOSITOR_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 pub const DEPOSITOR_ADDR: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
+/// Anvil dev account #2 — the batcher EOA. It must be a REAL funded key: the
+/// DA path sends genuine EIP-4844 blob transactions, which cannot be
+/// impersonated.
+pub const BATCHER_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
+pub const BATCHER_ADDR: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
 
 /// Short finalization window so a scenario can warp past it quickly (the
 /// production default is 86_400).
@@ -101,6 +106,8 @@ pub struct L1 {
     anvil: alloy_node_bindings::AnvilInstance,
     pub lockbox: Address,
     pub oracle: Address,
+    /// `KardamomL2Settlement` — the DA batch inbox (S8).
+    pub settlement: Address,
 }
 
 impl L1 {
@@ -142,6 +149,14 @@ impl L1 {
             .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
             .await
             .context("impersonate DEV_OWNER")?;
+        // The batcher signs real blob txs, so it needs a real balance.
+        let _: serde_json::Value = deploy_provider
+            .raw_request(
+                "anvil_setBalance".into(),
+                (BATCHER_ADDR, U256::from(1_000_000_000_000_000_000_000u128)),
+            )
+            .await
+            .context("fund the batcher EOA")?;
 
         let deployer = Deployer::new(deploy_provider.clone(), DEV_OWNER);
         deployer
@@ -173,6 +188,13 @@ impl L1 {
                         id: ContractId::EthLockbox,
                         init_args: lockbox_init,
                     },
+                    // The DA batch inbox. `l1Batcher` is the only address
+                    // allowed to post, so it is the key S8 signs blob txs with.
+                    Op::Deploy {
+                        l2_chain_id,
+                        id: ContractId::KardamomL2Settlement,
+                        init_args: kardamom_deployer::encode_address_arg(BATCHER_ADDR),
+                    },
                 ],
                 DEV_OWNER,
             )
@@ -192,6 +214,7 @@ impl L1 {
         };
         let oracle = find(ContractId::WithdrawalOutputOracle)?;
         let lockbox = find(ContractId::EthLockbox)?;
+        let settlement = find(ContractId::KardamomL2Settlement)?;
         anyhow::ensure!(
             oracle == predicted_oracle,
             "predicted oracle {predicted_oracle} != deployed {oracle}"
@@ -201,6 +224,7 @@ impl L1 {
             anvil,
             lockbox,
             oracle,
+            settlement,
         }))
     }
 
