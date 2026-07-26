@@ -26,6 +26,7 @@ full-pipeline-e2e = [
     "dep:hex",
     "dep:clap",
     "dep:jsonrpsee",
+    "dep:kardamom-batcher",
     "dep:kardamom-bench",
     "dep:kardamom-da-watcher",
     "dep:kardamom-deployer",
@@ -71,6 +72,7 @@ anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
 clap = { workspace = true, optional = true }
 jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
+kardamom-batcher = { path = "../batcher", optional = true }
 kardamom-bench = { path = "../bench", optional = true }
 kardamom-state = { path = "../state", optional = true }
 libc = { workspace = true, optional = true }

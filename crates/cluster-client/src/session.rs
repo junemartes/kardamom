@@ -217,19 +217,28 @@ impl SessionDriver {
             Ok(Egress::NewLeader(nl)) => {
                 // Same session continues under a new leadership term; re-point
                 // ingress but do NOT re-connect (the session id is preserved).
+                // Foreign-session filter (#99): the shared egress channel also
+                // carries other sessions' NewLeaderEvents — only OURS may
+                // mutate our term or re-point our ingress.
                 if let SessionState::Connected {
+                    cluster_session_id,
                     leadership_term_id,
                     leader_member_id,
                     ..
                 } = &mut self.state
                 {
+                    if nl.cluster_session_id != *cluster_session_id {
+                        return Vec::new();
+                    }
                     *leadership_term_id = nl.leadership_term_id;
                     *leader_member_id = nl.leader_member_id;
+                    vec![DriverEvent::Reconnect {
+                        leader_member_id: nl.leader_member_id,
+                        ingress_endpoints: nl.ingress_endpoints,
+                    }]
+                } else {
+                    Vec::new()
                 }
-                vec![DriverEvent::Reconnect {
-                    leader_member_id: nl.leader_member_id,
-                    ingress_endpoints: nl.ingress_endpoints,
-                }]
             }
             Ok(Egress::SessionMessage(m)) => {
                 // Only surface messages for our session.
@@ -247,13 +256,38 @@ impl SessionDriver {
     }
 
     fn on_session_event(&mut self, ev: crate::protocol::SessionEvent) -> Vec<DriverEvent> {
-        // Ignore events that do not correspond to our in-flight connect (a
-        // stale response from a previous attempt), except async OK/Close for an
-        // already-open session.
+        // FOREIGN-SESSION FILTER (#99). The egress endpoint is per-node static
+        // config, so this subscription also receives events addressed to OTHER
+        // sessions on the same channel — most damagingly a hard-killed
+        // predecessor process's session corpse: the cluster times it out
+        // ~sessionTimeout after the kill and sends its Closed(TIMEOUT) event
+        // here. Acting on that event failed OUR healthy session, reconnected,
+        // and ABANDONED it — whose own timeout then killed the replacement 90s
+        // later, a perpetual death cycle (observed live: a restarted sequencer
+        // replica cycling open→TIMEOUT every ~90s forever, silently degrading
+        // its shard to P=1). Every arm below must prove the event is OURS —
+        // by cluster_session_id when we hold a session, by connect correlation
+        // id when we are establishing one — and ignore everything else.
         match ev.code {
             EventCode::Ok => {
-                if ev.correlation_id != self.in_flight_correlation_id && !self.is_connected() {
-                    return Vec::new();
+                match self.state {
+                    SessionState::Connected {
+                        cluster_session_id, ..
+                    } => {
+                        // Already connected: accept only an idempotent re-OK
+                        // for OUR session (refreshing term/leader); a foreign
+                        // OK must not overwrite our session state.
+                        if ev.cluster_session_id != cluster_session_id {
+                            return Vec::new();
+                        }
+                    }
+                    _ => {
+                        // Establishing: the OK must answer OUR in-flight
+                        // connect attempt.
+                        if ev.correlation_id != self.in_flight_correlation_id {
+                            return Vec::new();
+                        }
+                    }
                 }
                 self.state = SessionState::Connected {
                     cluster_session_id: ev.cluster_session_id,
@@ -265,8 +299,14 @@ impl SessionDriver {
                 }]
             }
             EventCode::Redirect => {
-                // A follower told us who the leader is; re-point ingress and
-                // queue a fresh connect to the leader.
+                // A follower answering OUR connect attempt with the leader's
+                // endpoints. Redirects are connect-time responses: while
+                // connected, or for a stale correlation id, a redirect is not
+                // ours to act on (a foreign one would force a spurious
+                // reconnect and leak our healthy session).
+                if self.is_connected() || ev.correlation_id != self.in_flight_correlation_id {
+                    return Vec::new();
+                }
                 self.pending_connect = true;
                 vec![DriverEvent::Reconnect {
                     leader_member_id: ev.leader_member_id,
@@ -274,6 +314,16 @@ impl SessionDriver {
                 }]
             }
             EventCode::Error | EventCode::AuthenticationRejected | EventCode::Closed => {
+                let ours = match self.state {
+                    SessionState::Connected {
+                        cluster_session_id, ..
+                    } => ev.cluster_session_id == cluster_session_id,
+                    // Establishing: connect rejections answer our correlation.
+                    _ => ev.correlation_id == self.in_flight_correlation_id,
+                };
+                if !ours {
+                    return Vec::new();
+                }
                 let reason = if ev.detail.is_empty() {
                     format!("{:?}", ev.code)
                 } else {
@@ -354,6 +404,92 @@ mod tests {
             code: EventCode::Ok,
             detail: String::new(),
         })
+    }
+
+    fn event(code: EventCode, correlation_id: i64, session: i64, detail: &str) -> Vec<u8> {
+        encode_session_event(&SessionEvent {
+            cluster_session_id: session,
+            correlation_id,
+            leadership_term_id: 3,
+            leader_member_id: 1,
+            code,
+            detail: detail.to_string(),
+        })
+    }
+
+    /// Drive a fresh driver to Connected state; returns (driver, session_id).
+    fn connected(session: i64) -> SessionDriver {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
+        d.on_egress(&ok_event(corr, session, 3, 1));
+        assert!(d.is_connected());
+        d
+    }
+
+    // ── #99 regression: foreign-session events must be ignored ──────────────
+    //
+    // The egress endpoint is per-node static config, so the subscription also
+    // receives events addressed to OTHER sessions — most damagingly a killed
+    // predecessor process's session corpse timing out ~90s after the kill.
+    // Acting on those tore down a healthy session and set up a perpetual
+    // open→TIMEOUT→reconnect cycle (issue #99).
+
+    #[test]
+    fn foreign_closed_event_ignored_while_connected() {
+        let mut d = connected(77);
+        // The predecessor's session (id 42) times out; its corpse event
+        // arrives on our shared egress channel.
+        let evs = d.on_egress(&event(EventCode::Closed, 999, 42, "TIMEOUT"));
+        assert!(evs.is_empty(), "foreign Closed must produce no events");
+        assert!(d.is_connected(), "our session must survive");
+        // Keep-alives keep flowing for OUR session.
+        let frames = d.poll_outbound(2_000);
+        assert!(!frames.is_empty(), "keep-alive cadence unaffected");
+    }
+
+    #[test]
+    fn own_closed_event_still_fails_session() {
+        let mut d = connected(77);
+        let evs = d.on_egress(&event(EventCode::Closed, 999, 77, "TIMEOUT"));
+        assert_eq!(evs, vec![DriverEvent::Failed("TIMEOUT".into())]);
+        assert!(!d.is_connected());
+    }
+
+    #[test]
+    fn foreign_ok_does_not_hijack_connected_session() {
+        let mut d = connected(77);
+        let evs = d.on_egress(&ok_event(12345, 42, 9, 2));
+        assert!(evs.is_empty(), "foreign OK must not re-connect us");
+        match d.state() {
+            SessionState::Connected {
+                cluster_session_id, ..
+            } => assert_eq!(*cluster_session_id, 77, "session id must not change"),
+            other => panic!("expected Connected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn redirect_ignored_while_connected() {
+        let mut d = connected(77);
+        let evs = d.on_egress(&event(EventCode::Redirect, 999, 0, "1=10.0.0.2:9000"));
+        assert!(evs.is_empty(), "a redirect is a connect-time response");
+        assert!(d.is_connected());
+    }
+
+    #[test]
+    fn stale_correlation_rejection_ignored_while_connecting() {
+        let mut d = SessionDriver::new("ch", 1, 1_000);
+        let corr = decode_session_connect_request(&d.poll_outbound(0)[0])
+            .unwrap()
+            .correlation_id;
+        // A rejection for some OTHER correlation (previous process's attempt).
+        let evs = d.on_egress(&event(EventCode::Error, corr + 555, 0, "nope"));
+        assert!(evs.is_empty(), "stale rejection must not fail our connect");
+        // Our own rejection still lands.
+        let evs = d.on_egress(&event(EventCode::Error, corr, 0, "nope"));
+        assert_eq!(evs, vec![DriverEvent::Failed("nope".into())]);
     }
 
     #[test]

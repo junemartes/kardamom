@@ -6,6 +6,14 @@ chaos suite (`deploy/cluster/scripts/chaos.sh` — case names appear like
 `cluster-leader-kill` throughout; most run in CI via
 `.github/workflows/cluster-e2e.yml`), and the recovery code itself.
 
+Chaos answers "does the pipeline survive faults under load?". Its counterpart,
+the **chain-semantics suite**
+(`docs/agents/chain-semantics-e2e-suite-spec.md`), answers "does the chain mean
+the right thing?" — bridge round-trips, nonce ordering, validator/executor and
+DA parity, state-DB integrity — on both a single-host stack (`just
+test-e2e-local`) and the same DinD cluster (the `semantics` shard). Several
+entries below were found by it, and are marked.
+
 ![Kardamom service architecture](img/architecture.jpg)
 
 The design in one line: everything on the hot path is either **replicated
@@ -66,6 +74,23 @@ with three distinct, tested modes:
   executor's checkpoint is a valid restore source; the chaos case wipes
   executor-0's state, re-replicates executor-1's checkpoint, and asserts
   executor-0 restores from it (not a genesis re-sync) and rejoins.
+- **Replay-window overrun** (`replay-window-resync`) — the cluster retains a
+  *bounded* canonical window (`kardamom.cluster.retention`, default 65,536
+  frames ≈ 5 minutes at 200 tps); a `REPLAY_FROM` below its floor is refused
+  with `REPLAY_UNAVAILABLE`. That refusal is terminal for the local state: a
+  cursor below the floor can never catch up, and a fresh/wiped node cannot
+  "re-sync from genesis" either — genesis aged out of the window with
+  everything else. (The floor also jumps to the head when a member restores
+  from a cluster snapshot, so this is not only an "old node" event.) The
+  executor self-heals with **peer state**: each replica serves its newest
+  checkpoint over `--checkpoint-serve-addr` (:9014) and a node that hits the
+  refusal — or cold-starts with no checkpoint at all — fetches the newest
+  qualifying peer checkpoint (`--checkpoint-peers`), parks the stale DB under
+  `<state_dir>/stale/`, restores, and resumes from the checkpoint's cursor
+  (`kardamom_executor_resync_total` counts these by outcome). If no peer can
+  offer a checkpoint at/above the floor, the node stays down and says so: the
+  remaining paths are an operator-restored checkpoint or rebuild-from-L1
+  (`kardamom-reconstruct`).
 - **Wedged (frozen)** — an executor whose block gauge is flat *while sealer
   boundaries keep advancing* is the load harness's FROZEN verdict; that
   contrast (rather than absolute progress) is what distinguishes a wedged
@@ -104,11 +129,19 @@ first-seen dedup keeps one.
   the restart SLO, and that the restarted replica actually publishes refs
   again. The restarted replica joins live (no archive replay — its twin
   covered the gap, and replay could overshoot the sealer's dedup window);
-  hydrated nonce floors are only a lower bound, and the stream-adaptive
-  fast-forward (`nonce_floor_lag_ms`, default 5 s) advances a stalled floor
-  to the live join point so the replica regains full coverage —
-  `kardamom_sequencer_nonce_floor_fastforward_total` spikes on rejoin (see
-  the replicated-sequencer-shards spec, "Restart / rejoin semantics").
+  hydrated nonce floors are only a lower bound, and **receipt-floor resync**
+  advances a stalled floor on execution evidence from the tx_receipts
+  stream — buffered nonces the twin already got executed drop as proven
+  duplicates and the run unsticks (the stream-adaptive `nonce_floor_lag_ms`
+  fast-forward this replaces was REMOVED for publishing canonical nonce
+  gaps; the config key still parses but is inert — see
+  `docs/agents/sequencer-lag-resync-spec.md`).
+- **Replica lagged/paused** (`sequencer-lapse`) — a replica frozen past the
+  boundary-silence window detects the lapse itself (egress boundary-arrival
+  gap → sticky lag flag → resync mode) and skips only receipt-proven
+  duplicates on resume; everything unproven publishes and the cluster dedup
+  absorbs it. A predecessor session corpse can no longer cycle the restarted
+  replica's session (foreign-session event filter, issue #99).
 - **Sequencer node loss** — cross-placement guarantees every shard keeps one
   replica; redundancy (not availability) degrades until the node returns.
 - **Both replicas of one shard down** — that shard stalls; this is now the
@@ -130,6 +163,16 @@ divergence — re-executed receipts or BAL disagreeing with the executor's, or
 an MPT state-root mismatch — it stops rather than continuing on bad state,
 and stays stopped until an operator intervenes. A crashed validator costs
 verification coverage, never L2 liveness; nothing on the hot path consumes it.
+
+Exit codes keep the two halt classes distinguishable: **exit 2 is reserved
+for a proven divergence** (the latch records the reason before the engine
+surfaces it) — the page-the-humans signal. Every other engine failure — a
+stream error, or a replay-window overrun (`REPLAY_UNAVAILABLE`, the validator
+cursor aged out of the cluster's bounded retention) — exits 1: an
+availability problem, restartable, never to be confused with an integrity
+one. The validator has no peer to fetch a checkpoint from (it is a singleton
+with a trie-bearing state env), so a resync-required validator is rebuilt
+from L1 (`kardamom-reconstruct`) or from an operator-restored state copy.
 
 Catch-up semantics (#78) make that coverage cost explicit:
 
@@ -214,14 +257,43 @@ by construction.
   batcher. `tx_data` is **already 2× node-redundant**: it is a UDP-multicast
   stream, and both ingress replicas run an archive recorder that joins the group,
   so each ingress node's archive captures *every* publisher's shard streams. The
-  two archives are byte-identical (same recording ids + segment checksums), which
-  makes the peer an exact restore source. What was missing — and what
-  `archive-tx-data-wipe` + `kardamom-archive-rereplicate` add — is the path back
-  to full redundancy after a loss: a wiped node's archive is restored by
-  file-mirroring the surviving peer's segments + catalog (rusteron-archive does
-  not expose Aeron's network `replicate()`), and the restored archive passes
-  Aeron's own `ArchiveTool verify`. Without it, losing one copy leaves the *next*
-  loss fatal, and a volume wipe hangs the executor's `resolve_recording`.
+  two archives are byte-identical (same recording ids, verified by content
+  compare), which makes the peer an exact restore source. What was missing —
+  and what `archive-tx-data-wipe` + `kardamom-archive-rereplicate` add — is the
+  path back to full redundancy after a loss: a wiped node's archive is restored
+  by file-mirroring the surviving peer's segments + catalog (rusteron-archive
+  does not expose Aeron's network `replicate()`), and the restored archive
+  passes Aeron's own `ArchiveTool verify`. Without it, losing one copy leaves
+  the *next* loss fatal, and a volume wipe hangs the executor's
+  `resolve_recording`.
+
+  Two files must never be transplanted from a **live** source, and both bit
+  the chaos suite before they were understood: `archive-mark.dat` (the live
+  daemon heartbeats it, so a copy looks *active* to the destination's
+  restarting Archive, which crash-loops on `active Mark file detected` until
+  the copied heartbeat ages out — the recurring "aeron did not reach ≥ 8
+  running" restart-SLO failure), and the catalog's per-entry checksums for
+  actively-recording entries (rewritten mid-copy → torn entries that fail a
+  CRC-armed verify; issue #98). `mirror_archive` therefore never copies the
+  mark file — the destination daemon recreates its own — and the catalog copy
+  from a live source remains a known gap until #98 lands.
+
+  **Corruption** (present-but-wrong bytes) is covered separately
+  (`archive-corruption`): the archive driver records per-data-frame **CRC32s**
+  (`aeron.archive.record.checksum`) and validates them on replay
+  (`aeron.archive.replay.checksum`), so a CRC-armed
+  `ArchiveTool verify -a -checksum` detects a length-preserving byte flip that
+  a size check cannot see. Repair is *targeted*: `kardamom-archive-rereplicate
+  --diff` names exactly the segments that diverge from the mirror,
+  `--heal --segments` copies only those (daemon stopped, as with the full
+  mirror), and the CRC verdict arbitrates which side was corrupt — mirror
+  inequality alone only proves one of them is. On the **live** path the
+  executor's join-miss refetcher rotates to the mirror archive when a replay
+  produces no fragments (the corrupt-recording signature once replay-side CRC
+  validation is on), so a reader never stays pinned to a bad copy. The offline
+  segment reader also fail-stops on structural damage (a zeroed or undersized
+  frame header with data behind it is `Corruption`, no longer a silent
+  truncation that read as a live tail).
 - **The observation path itself** (issue #76, fixed) — `docker kill` of a
   privileged DinD node stalls host-dockerd `docker exec` runner-wide for
   minutes, blacking out every exec-based probe at once; for three days this
@@ -238,10 +310,10 @@ by construction.
 - **Archive *data* loss** — total loss has the rebuild-from-L1 path (above,
   `reconstruct_l1_e2e`); single-node `tx_data` archive loss has the
   re-replicate-from-peer path (`archive-tx-data-wipe` chaos case +
-  `kardamom-archive-rereplicate`). Still open: `tx_ordering` archive re-replication
-  (today it self-heals only via the Java cluster's Raft log replication on
-  rejoin), and executor resume against a partially-missing (not fully wiped)
-  segment set.
+  `kardamom-archive-rereplicate`); single-segment *corruption* has the
+  CRC-verify + targeted-heal path (`archive-corruption` chaos case). Still
+  open: `tx_ordering` archive re-replication (today it self-heals only via the
+  Java cluster's Raft log replication on rejoin).
 - **Deposit interleaving in reconstruction** — rebuild-from-L1 covers L2
   transactions; re-deriving L1 deposits from `DepositInitiated` events and
   interleaving them in canonical order is a follow-up.
@@ -289,6 +361,20 @@ by construction.
   clone, keeps the receiver), applied in the validator and pre-emptively in
   the ingress, which had the same shape masked by `main` returning without a
   join. Regression-tested by the suite's graceful shutdown (20 s bound).
+- **Bridge / injection / DA-parity cases are Target-L only** — the
+  chain-semantics `semantics` shard runs nonce ordering, RPC liveness and
+  validator/executor consistency against the real cluster, but S1/S2
+  (bridge) still need a contract-deploy phase, the message-passer predeploy
+  and attester vars in the shared bring-up path; S7 (corrupt-BAL injection)
+  and S9b (SIGKILL recovery) drive process signals and raw Aeron publications
+  that are unreachable from outside the cluster; and S8 (DA parity) waits on
+  the batcher's live posting being rewired for the cluster topology. Those
+  guarantees are proven on a real pipeline, just not yet on the deployed one.
+- **`archive-tx-data-wipe`'s restart SLO looks too tight** — the case
+  regularly fails with `aeron did not reach >= 8 running ... within 60s
+  (have 7)` after the destructive wipe, on runs that are otherwise green
+  (observed on main both before and after the semantics work, and passing on
+  re-run). While that shard is red, real regressions behind it are invisible.
 - **Load-harness scrapes still ride `docker exec`** — the chaos *probes*
   moved to direct HTTP (issue #76), but `kardamom-load --metrics-via-docker`
   remains the default; a runner-wide exec stall can still degrade its

@@ -201,6 +201,8 @@ aeron-driver-up:
         -Daeron.archive.control.channel=aeron:udp?endpoint=127.0.0.1:8010 \
         -Daeron.archive.control.response.channel=aeron:udp?endpoint=127.0.0.1:8011 \
         -Daeron.archive.replication.channel=aeron:udp?endpoint=127.0.0.1:8021 \
+        -Daeron.archive.record.checksum=io.aeron.archive.checksum.Crc32 \
+        -Daeron.archive.replay.checksum=io.aeron.archive.checksum.Crc32 \
         -cp "$JAR" \
         io.aeron.archive.ArchivingMediaDriver \
         > {{AERON_LOCAL_ROOT}}/md.log 2>&1 &
