@@ -6,6 +6,14 @@ chaos suite (`deploy/cluster/scripts/chaos.sh` — case names appear like
 `cluster-leader-kill` throughout; most run in CI via
 `.github/workflows/cluster-e2e.yml`), and the recovery code itself.
 
+Chaos answers "does the pipeline survive faults under load?". Its counterpart,
+the **chain-semantics suite**
+(`docs/agents/chain-semantics-e2e-suite-spec.md`), answers "does the chain mean
+the right thing?" — bridge round-trips, nonce ordering, validator/executor and
+DA parity, state-DB integrity — on both a single-host stack (`just
+test-e2e-local`) and the same DinD cluster (the `semantics` shard). Several
+entries below were found by it, and are marked.
+
 ![Kardamom service architecture](img/architecture.jpg)
 
 The design in one line: everything on the hot path is either **replicated
@@ -353,6 +361,20 @@ by construction.
   clone, keeps the receiver), applied in the validator and pre-emptively in
   the ingress, which had the same shape masked by `main` returning without a
   join. Regression-tested by the suite's graceful shutdown (20 s bound).
+- **Bridge / injection / DA-parity cases are Target-L only** — the
+  chain-semantics `semantics` shard runs nonce ordering, RPC liveness and
+  validator/executor consistency against the real cluster, but S1/S2
+  (bridge) still need a contract-deploy phase, the message-passer predeploy
+  and attester vars in the shared bring-up path; S7 (corrupt-BAL injection)
+  and S9b (SIGKILL recovery) drive process signals and raw Aeron publications
+  that are unreachable from outside the cluster; and S8 (DA parity) waits on
+  the batcher's live posting being rewired for the cluster topology. Those
+  guarantees are proven on a real pipeline, just not yet on the deployed one.
+- **`archive-tx-data-wipe`'s restart SLO looks too tight** — the case
+  regularly fails with `aeron did not reach >= 8 running ... within 60s
+  (have 7)` after the destructive wipe, on runs that are otherwise green
+  (observed on main both before and after the semantics work, and passing on
+  re-run). While that shard is red, real regressions behind it are invisible.
 - **Load-harness scrapes still ride `docker exec`** — the chaos *probes*
   moved to direct HTTP (issue #76), but `kardamom-load --metrics-via-docker`
   remains the default; a runner-wide exec stall can still degrade its

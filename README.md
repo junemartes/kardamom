@@ -100,6 +100,8 @@ features; launch your editor from a shell where `JAVA_HOME` is set so the
 | `just check`             | `cargo check` the whole workspace with all features. |
 | `just clippy`            | Clippy across all features with `-D warnings` (mirrors CI). |
 | `just test`              | Run the test suite across all features. |
+| `just test-e2e-local`    | Chain-semantics e2e suite against a real local stack (see below). |
+| `just cluster-jar`       | Build the Java Aeron Cluster sealer jar (`:service:shadowJar`). |
 | `just check-aeron`       | Targeted check that just the Aeron bindings compile. |
 | `just aeron-driver-up`   | Start a host-native Aeron Media Driver (jar cached locally). |
 | `just aeron-driver-down` | Stop the Media Driver started by `aeron-driver-up`. |
@@ -113,3 +115,28 @@ All build/test recipes set `JAVA_HOME` to a detected JDK 17+ automatically.
 Solidity sources live in `contracts/` and are built with Foundry (`forge`). See
 `contracts/foundry.toml`. CI compiles, tests, and lints them; the Rust build
 scripts run `forge build` to embed/locate artifacts.
+
+## Testing
+
+Beyond `cargo test`, two suites answer different questions.
+
+**Chain semantics** — *does the chain mean the right thing?* One set of
+scenario drivers (`crates/e2e/src/scenarios/`) covers L1↔L2 bridge round-trips
+against a real anvil, nonce ordering and RPC liveness through
+`eth_sendRawTransaction`, validator↔executor state parity (down to a
+byte-level comparison of the two libmdbx databases), DA parity (blobs posted
+to L1, re-executed, matched against the validator's root), and state-DB
+integrity across normal operation and an unclean crash. They run on two
+targets:
+
+- **Target L** — `just test-e2e-local`: real service binaries, a 1-member Java
+  Aeron Cluster sealer and a per-test media driver on one host. ~45 s; also
+  the per-PR `chain-semantics-e2e` CI job.
+- **Target C** — the `semantics` shard of `cluster-e2e.yml`: the same drivers
+  against the real 12-node DinD cluster, via the `kardamom-semantics` binary.
+
+Spec and current coverage: `docs/agents/chain-semantics-e2e-suite-spec.md`.
+
+**Chaos** — *does the pipeline survive faults under load?*
+`deploy/cluster/scripts/chaos.sh`, run by the other `cluster-e2e.yml` shards.
+Failure modes and where each is verified: `docs/failure-modes.md`.
