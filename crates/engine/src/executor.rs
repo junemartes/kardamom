@@ -159,7 +159,37 @@ pub fn execute_tx<S: StateDatabase>(
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
-    let alloy_env = decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx)?;
+    // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
+    // invalid — undecodable bytes, or a tx revm rejects at validation
+    // (NonceTooLow duplicate past every dedup layer, NonceTooHigh from a
+    // sealed gap, insufficient balance, …) — must NOT halt execution: every
+    // replica, the recovery replay, and the validator all see the same input
+    // and would all halt in lockstep, permanently (a poisoned log wedges
+    // recovery replay on the same record forever). Instead it is SKIPPED with
+    // a receipt: `status=false, gas_used=0` — unreachable by real execution,
+    // since any executed tx (revert or halt included) charges at least
+    // intrinsic gas — so the pair is the wire-visible skip marker
+    // ([`kardamom_types::Receipt::is_invalid_skip`]). The skip is part of the
+    // deterministic state transition (empty write set, no state change,
+    // counters advance), identical across live / replay / validator re-exec.
+    // Non-deterministic failures (Database errors) still fail-stop below.
+    // A skip is LOUD: any occurrence means an upstream guard failed
+    // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
+    let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
+        Ok(env_) => env_,
+        Err(e) => {
+            return Ok(invalid_skip(
+                &format!("undecodable raw_tx: {e}"),
+                tx_position,
+                inbound_envelope,
+                0,
+                None,
+                env.block_number,
+                tx_index_in_block,
+                cumulative_gas_used_before,
+            ));
+        }
+    };
     let signer = inbound_envelope.sender; // trusted from proxy; no recovery
     let nonce = alloy_env.nonce();
     let to = alloy_env.to();
@@ -210,10 +240,43 @@ pub fn execute_tx<S: StateDatabase>(
         .with_cfg(env.cfg_env())
         .build_mainnet();
 
-    let outcome = evm.transact(tx_env).map_err(|e| ExecutorError::Execution {
-        idx: tx_idx,
-        detail: format!("{e:?}"),
-    })?;
+    let outcome = match evm.transact(tx_env) {
+        Ok(o) => o,
+        // Deterministic input-invalidity: every replica computes the same
+        // rejection from the same (state, tx) — skip, never halt (#92).
+        Err(revm::context::result::EVMError::Transaction(reason)) => {
+            return Ok(invalid_skip(
+                &format!("{reason:?}"),
+                tx_position,
+                inbound_envelope,
+                nonce,
+                to,
+                env.block_number,
+                tx_index_in_block,
+                cumulative_gas_used_before,
+            ));
+        }
+        Err(revm::context::result::EVMError::Header(reason)) => {
+            return Ok(invalid_skip(
+                &format!("{reason:?}"),
+                tx_position,
+                inbound_envelope,
+                nonce,
+                to,
+                env.block_number,
+                tx_index_in_block,
+                cumulative_gas_used_before,
+            ));
+        }
+        // Database / custom failures are LOCAL, not derivable from the input:
+        // halting here is correct (crash recovery replays cleanly).
+        Err(e) => {
+            return Err(ExecutorError::Execution {
+                idx: tx_idx,
+                detail: format!("{e:?}"),
+            });
+        }
+    };
 
     let gas_used = outcome.result.gas().tx_gas_used();
     let (status, logs) = match &outcome.result {
@@ -259,6 +322,54 @@ pub fn execute_tx<S: StateDatabase>(
         cumulative_gas_used,
     };
     Ok((receipt, ws))
+}
+
+/// Build the deterministic SKIP receipt for a canonical record that is
+/// invalid at execution (#92): `status=false, gas_used=0` (the wire-visible
+/// marker — real execution always charges intrinsic gas), empty logs, EMPTY
+/// write set (`WriteSet::default().hash()` on both the live and re-exec
+/// sides), gas accounting unchanged. Loud by design: log + counter — a skip
+/// existing at all means an upstream guard (sequencer nonce fence, cluster
+/// dedup, resync floors) let an invalid record reach the canonical log.
+#[allow(clippy::too_many_arguments)]
+fn invalid_skip(
+    reason: &str,
+    tx_position: BPosition,
+    inbound_envelope: &TxEnvelope,
+    nonce: u64,
+    to: Option<Address>,
+    block_number: u64,
+    tx_index_in_block: u64,
+    cumulative_gas_used_before: u64,
+) -> (Receipt, WriteSet) {
+    tracing::error!(
+        tx_hash = ?inbound_envelope.tx_hash,
+        from = ?inbound_envelope.sender,
+        nonce,
+        block = block_number,
+        reason,
+        "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
+    );
+    crate::metrics::record_invalid_tx_skipped();
+    let ws = WriteSet::default();
+    let write_set_hash = ws.hash();
+    let receipt = Receipt {
+        tx_idx: tx_position,
+        tx_hash: inbound_envelope.tx_hash,
+        status: false,
+        gas_used: 0,
+        logs: Vec::new(),
+        write_set_hash,
+        nonce,
+        from: inbound_envelope.sender,
+        to,
+        contract_address: None,
+        effective_gas_price: 0,
+        block_number,
+        transaction_index: tx_index_in_block,
+        cumulative_gas_used: cumulative_gas_used_before,
+    };
+    (receipt, ws)
 }
 
 /// Execute one [`kardamom_types::Deposit`] against a snapshot + the current
@@ -557,6 +668,67 @@ mod tests {
             sender: from.address(),
             tx_hash,
         }
+    }
+
+    // ── #92: deterministically-invalid canonical txs SKIP, never halt ──────
+
+    #[test]
+    fn nonce_too_low_skips_with_marker_receipt_and_chain_continues() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("0000000000000000000000000000000000001234");
+        // Sender's canonical nonce is 5: a nonce-3 tx (a duplicate past every
+        // dedup layer) is deterministically invalid.
+        let snap = MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 5, KECCAK_EMPTY)
+            .build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+
+        let stale = signed_transfer(&signer, to, 1_000, 3);
+        let (receipt, ws) = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &stale, 0, 77)
+            .expect("invalid tx must SKIP, not error");
+        assert!(receipt.is_invalid_skip(), "status=false, gas_used=0 marker");
+        assert_eq!(receipt.tx_hash, stale.tx_hash);
+        assert_eq!(receipt.nonce, 3);
+        assert_eq!(
+            receipt.cumulative_gas_used, 77,
+            "gas accounting unchanged by a skip"
+        );
+        assert_eq!(
+            receipt.write_set_hash,
+            WriteSet::default().hash(),
+            "a skip writes NOTHING (empty-set hash on every re-exec path)"
+        );
+        assert!(ws.accounts.is_empty() && ws.storage.is_empty() && ws.code.is_empty());
+
+        // The chain continues: the sender's REAL next tx (nonce 5) executes.
+        let env2 = ExecEnv::new(1, &boundary(1));
+        let live = signed_transfer(&signer, to, 1_000, 5);
+        let (r2, _) = execute_tx(&snap, &delta, env2, TxIndex(1), pos(64), &live, 1, 77)
+            .expect("valid tx after a skip");
+        assert!(r2.status);
+        assert!(!r2.is_invalid_skip());
+    }
+
+    #[test]
+    fn undecodable_raw_tx_skips_with_marker_receipt() {
+        let signer = PrivateKeySigner::random();
+        let snap = MockStateDatabase::builder().build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+        let garbage = KtTxEnvelope {
+            correlation_id: 9,
+            raw_tx: Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]),
+            sender: signer.address(),
+            tx_hash: keccak256([0xde, 0xad, 0xbe, 0xef]),
+        };
+        let (receipt, ws) = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &garbage, 0, 0)
+            .expect("undecodable bytes must SKIP, not error");
+        assert!(receipt.is_invalid_skip());
+        assert_eq!(receipt.nonce, 0, "nonce unknowable from undecodable bytes");
+        assert_eq!(receipt.write_set_hash, WriteSet::default().hash());
+        assert!(ws.accounts.is_empty());
     }
 
     #[test]
