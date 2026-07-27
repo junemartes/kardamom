@@ -613,7 +613,22 @@ fn run_session(
         let mut sel = crossbeam_channel::Select::new();
         sel.recv(&frame_rx);
         sel.recv(&req_rx);
-        let _ = sel.ready_timeout(Duration::from_millis(1));
+        // A DISCONNECTED channel counts as "ready" to crossbeam's Select —
+        // and consumers legitimately drop their unused LiveIngress seam
+        // (`let (cluster, _ingress, egress) = connect_with_replay(...)`),
+        // which disconnects req_rx forever. Readiness with NOTHING actually
+        // queued is that artifact, and looping on it busy-spins the session
+        // thread at 100% of a core (observed: idle executors/validator at
+        // ~157% container CPU; the compact CI stack starved outright —
+        // chain-semantics S8 timeout). Fall back to the plain duty-cycle
+        // sleep in that case; a frame racing in behind the emptiness checks
+        // waits at most the old 1ms.
+        if sel.ready_timeout(Duration::from_millis(1)).is_ok()
+            && frame_rx.is_empty()
+            && req_rx.is_empty()
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 
