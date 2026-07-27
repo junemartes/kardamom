@@ -27,7 +27,18 @@ impl<Q: StateWriterQueue> BalPublishingWriterQueue<Q> {
 }
 
 impl<Q: StateWriterQueue> StateWriterQueue for BalPublishingWriterQueue<Q> {
-    fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+    fn submit(&mut self, block: BlockBoundary, mut delta: BlockDelta) -> Result<(), ExecutorError> {
+        // The BAL frame carries STATE MUTATIONS ONLY — never the block's
+        // receipts (#109 put them inside the BlockDelta for the writer):
+        // receipts (with their logs) dominate the delta's byte size, and the
+        // tx_bal term buffer is BYTE-bounded, so fat frames collapse the
+        // validator's lapse window — observed live as bal_missing growing
+        // ~+60 per validator-lapse window, 3/3 on PR #113 CI, while the
+        // pre-#109 frames (empty receipts vec) held the <=5 tolerance. The
+        // receipts are taken out for the encode and restored for the writer
+        // — zero copies of the state maps. This also keeps the frame
+        // byte-identical to the validator's own (receipts-free) delta.
+        let receipts = std::mem::take(&mut delta.receipts);
         // Encode on the exec thread (one small encode per block), then fire-and-
         // forget to the publication runtime's Aeron thread — non-blocking.
         match kardamom_log::codec::encode(&delta) {
@@ -36,6 +47,7 @@ impl<Q: StateWriterQueue> StateWriterQueue for BalPublishingWriterQueue<Q> {
                 tracing::warn!(block = block.block_number, error = %e, "BAL encode failed")
             }
         }
+        delta.receipts = receipts;
         self.inner.submit(block, delta)
     }
 }
