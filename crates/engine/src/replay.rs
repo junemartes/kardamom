@@ -182,6 +182,7 @@ where
         };
 
         let mut delta = PendingDelta::new();
+        let mut block_receipts = Vec::with_capacity(block.txs.len());
         let mut cumulative_gas = 0u64;
         for (i, tx) in block.txs.iter().enumerate() {
             let tx_position = BPosition::from_index(counters.global_pos);
@@ -197,12 +198,13 @@ where
             )?;
             delta.apply(ws);
             cumulative_gas += receipt.gas_used;
+            block_receipts.push(receipt);
             counters.tx_idx += 1;
             counters.global_pos += 1;
             counters.txs_applied += 1;
         }
 
-        let block_delta = delta.finalize(block.block_number);
+        let block_delta = delta.finalize(block.block_number, block_receipts);
         let boundary = BlockBoundary {
             block_number: block.block_number,
             end_tx_idx: BPosition::from_index(counters.global_pos),
