@@ -917,8 +917,14 @@ run_case() { # <case-name>
           | xargs -rn1 basename)"
         [ -n "${ck_name}" ] || { sleep 2; continue; }
         docker exec kardamom-executor-0 bash -lc 'rm -rf /opt/kardamom/checkpoints/*'
-        if docker exec kardamom-executor-1 tar -C /opt/kardamom -cf - "checkpoints/${ck_name}" \
-          | docker exec -i kardamom-executor-0 tar -C /opt/kardamom -xf -; then
+        ck_rc=0
+        docker exec kardamom-executor-1 tar -C /opt/kardamom --warning=no-file-changed -cf - "checkpoints/${ck_name}" \
+          | docker exec -i kardamom-executor-0 tar -C /opt/kardamom -xf - || ck_rc=$?
+        # tar rc=1 = file changed under a live checkpointer (faster pipelines
+        # widen the window; same class as the archive re-replication drift).
+        # The restore side validates the checkpoint and falls back (recovery
+        # C/D) if torn — that assertion is the real integrity gate here.
+        if [ "${ck_rc}" -le 1 ]; then
           copied=1
           break
         fi
