@@ -64,6 +64,21 @@ pub fn record_resync_enter(partition: u32) {
     record_resync_mode(partition, true);
 }
 
+/// Unix timestamp of process start. Restart-proof discriminator for the
+/// chaos harness: counters reset across a restart to values identical to a
+/// fresh baseline (entered=1 from the startup resync), but a start time
+/// AFTER a known event proves the process is a newborn — over plain HTTP,
+/// with no docker-exec (which wedges for minutes post-thaw on CI runners).
+pub const START_TIME_SECONDS: &str = "kardamom_sequencer_start_time_seconds";
+
+pub fn record_start_time() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    metrics::gauge!(START_TIME_SECONDS).set(now);
+}
+
 pub fn record_lag_suspected(partition: u32) {
     counter!(RESYNC_LAG_SUSPECTED, "partition" => partition.to_string()).increment(1);
 }

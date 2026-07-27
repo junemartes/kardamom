@@ -348,7 +348,8 @@ run_sequencer_lapse() {
   # case fails loudly instead of asserting against a replica that never
   # lapsed. (validator-lapse shares the docker-pause pattern and never
   # verifies its freeze — flagged for follow-up, see PR notes.)
-  log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0})"
+  freeze_ts="$(date +%s)"
+  log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0} freeze_ts=${freeze_ts})"
   docker exec kardamom-sequencer-0 docker kill -s STOP "${inner}" >/dev/null \
     || fail "sequencer-lapse: SIGSTOP failed"
   sleep 3
@@ -403,10 +404,14 @@ run_sequencer_lapse() {
       # (observed: entered 1 -> 1 with a restarted replica). Detect the
       # restart by inner-container identity instead: a different container
       # with entered >= 1 IS the startup resync engaging.
-      now_inner="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
-      if [ -n "${now_inner}" ] && [ "${now_inner}" != "${inner}" ] \
+      # HTTP-only restart proof: a start_time AFTER the freeze is a newborn
+      # regardless of counter values (docker-exec based identity checks wedge
+      # for minutes post-thaw on shared runners — observed silently no-oping
+      # while the replica had in fact restarted and resynced in 4s).
+      st="$(seqa_metric kardamom_sequencer_start_time_seconds | cut -d. -f1)"
+      if [ -n "${st}" ] && [ "${st}" -gt "${freeze_ts}" ] \
         && [ -n "${r1}" ] && [ "${r1}" -ge 1 ]; then
-        log "sequencer-lapse: replica restarted across the freeze (${inner} -> ${now_inner}, entered=${r1}); startup resync engaged"
+        log "sequencer-lapse: replica restarted across the freeze (start_time=${st} > freeze_ts=${freeze_ts}, entered=${r1}); startup resync engaged"
         break
       fi
     else
