@@ -42,6 +42,21 @@ use crate::error::SequencerError;
 pub trait TxOrderingRefPublisher: Send {
     fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError>;
 
+    /// Publish a run of refs, amortizing per-offer overhead where the
+    /// transport supports it. Returns `(published, error)`: the first
+    /// `published` refs are durably offered; an error applies to the rest.
+    /// The default loops singles (fakes and non-batching transports keep
+    /// exact semantics); the cluster transport packs the whole slice into
+    /// ONE `KIND_BATCH` app message (all-or-nothing per call).
+    fn try_publish_ref_batch(&mut self, refs: &[TxRef]) -> (usize, Option<SequencerError>) {
+        for (i, r) in refs.iter().enumerate() {
+            if let Err(e) = self.try_publish_ref(r) {
+                return (i, Some(e));
+            }
+        }
+        (refs.len(), None)
+    }
+
     /// Publish a [`DepositRef`] for a deposit observed on `tx_deposits`.
     /// Same backpressure semantics as `try_publish_ref` — deposits aren't
     /// nonce-gated and have no pending state to rewind, so on `Backpressure`

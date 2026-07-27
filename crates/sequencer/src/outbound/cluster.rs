@@ -52,6 +52,25 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         self.offer(&bytes)
     }
 
+    fn try_publish_ref_batch(&mut self, refs: &[TxRef]) -> (usize, Option<SequencerError>) {
+        match refs {
+            [] => (0, None),
+            [one] => match self.try_publish_ref(one) {
+                Ok(()) => (1, None),
+                Err(e) => (0, Some(e)),
+            },
+            many => {
+                let entries: Vec<Vec<u8>> =
+                    many.iter().map(wire::encode_ingress_txref).collect();
+                let frame = wire::encode_ingress_batch(&entries);
+                match self.offer(&frame) {
+                    Ok(()) => (many.len(), None),
+                    Err(e) => (0, Some(e)),
+                }
+            }
+        }
+    }
+
     fn try_publish_deposit_ref(&mut self, r: &DepositRef) -> Result<(), SequencerError> {
         let bytes = wire::encode_ingress_depositref(r);
         self.offer(&bytes)

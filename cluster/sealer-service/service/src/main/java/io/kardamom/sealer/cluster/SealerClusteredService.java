@@ -72,6 +72,15 @@ public final class SealerClusteredService implements ClusteredService {
      * the payload client-side anyway.
      */
     public static final byte KIND_SUBSCRIBE = 2;
+    /**
+     * Batch of ingress records:
+     * {@code [kind:3][count:u16 LE][per entry: len:u32 LE + entry bytes]},
+     * each entry a complete single-record frame ({@code [kind:0][id:32][payload…]}).
+     * Entries are processed EXACTLY like individually-offered records (same
+     * dedup, same per-record relay), so determinism and the egress format are
+     * unchanged — the batch only amortizes the ingress offer round trip.
+     */
+    public static final byte KIND_BATCH = 3;
 
     /** Minimum valid replay-request length: kind + from_index + from_block. */
     private static final int MIN_REPLAY_REQUEST_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
@@ -291,29 +300,60 @@ public final class SealerClusteredService implements ClusteredService {
             maybeReviveBoundaryClock();
             return;
         }
+        if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_BATCH) {
+            if (length < 3) {
+                onMalformedFrame("batch-envelope", length);
+                return;
+            }
+            final int count = buffer.getShort(offset + 1, ByteOrder.LITTLE_ENDIAN) & 0xFFFF;
+            int pos = offset + 3;
+            final int limit = offset + length;
+            for (int i = 0; i < count; i++) {
+                if (pos + 4 > limit) {
+                    onMalformedFrame("batch-entry-header", length);
+                    return;
+                }
+                final int entryLen = buffer.getInt(pos, ByteOrder.LITTLE_ENDIAN);
+                pos += 4;
+                if (entryLen < MIN_INGRESS_LEN || pos + entryLen > limit) {
+                    onMalformedFrame("batch-entry", entryLen);
+                    return;
+                }
+                processRecord(buffer, pos, entryLen);
+                pos += entryLen;
+            }
+            maybeReviveBoundaryClock();
+            return;
+        }
         if (length < MIN_INGRESS_LEN) {
             // Malformed / too-short envelope: cannot contain kind + 32-byte id.
             onMalformedFrame("ingress-envelope", length);
             return;
         }
-        // Parse ONLY the 32-byte canonical id at its fixed offset; the payload
-        // is relayed verbatim and never inspected here.
-        buffer.getBytes(offset + CANONICAL_ID_OFFSET, canonicalIdScratch);
+        processRecord(buffer, offset, length);
+        // Records relaying while blocks never seal is the dead-clock signature
+        // (canonical stream advances, boundary cadence gone) — revive here so
+        // sustained ingress load heals the clock without waiting for a
+        // consumer reconnect.
+        maybeReviveBoundaryClock();
+    }
 
+    /**
+     * Process one single-record ingress frame at {@code offset}: parse ONLY
+     * the 32-byte canonical id at its fixed offset (the payload is relayed
+     * verbatim and never inspected), dedup, and relay if first-seen. Shared
+     * by the direct path and each {@link #KIND_BATCH} entry.
+     */
+    private void processRecord(final DirectBuffer buffer, final int offset, final int length) {
+        buffer.getBytes(offset + CANONICAL_ID_OFFSET, canonicalIdScratch);
         final int payloadOffset = offset + RELAY_OFFSET;
         final int payloadLength = length - RELAY_OFFSET;
         final byte[] payload = new byte[payloadLength];
         if (payloadLength > 0) {
             buffer.getBytes(payloadOffset, payload);
         }
-
         final Optional<Relayed> relayed = state.onRecord(canonicalIdScratch, payload);
         relayed.ifPresent(this::offerRelayed);
-        // Records relaying while blocks never seal is the dead-clock signature
-        // (canonical stream advances, boundary cadence gone) — revive here so
-        // sustained ingress load heals the clock without waiting for a
-        // consumer reconnect.
-        maybeReviveBoundaryClock();
     }
 
     @Override
