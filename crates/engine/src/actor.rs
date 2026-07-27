@@ -132,6 +132,14 @@ pub struct ExecutorConfig {
     /// Reader-layer tunables (join buffer timeout, growth warning
     /// threshold). See [`ReaderConfig`].
     pub reader: ReaderConfig,
+    /// Whether to carry per-block receipts into the BlockDelta for durable
+    /// persistence (#109). Executors persist (the RPC read path + restart
+    /// durability live there); the VALIDATOR disables this — its DB serves
+    /// no receipt reads (the withdrawal attester tees off the receipt
+    /// STREAM), and the extra per-block writes measurably widened its
+    /// BAL-lapse rate under load (validator-lapse coverage regression,
+    /// 2/2 on PR #113 CI vs <=5 tolerance on control runs).
+    pub persist_receipts: bool,
 }
 
 impl Default for ExecutorConfig {
@@ -140,6 +148,7 @@ impl Default for ExecutorConfig {
             chain_id: 1,
             receipt_queue_depth: 1024,
             reader: ReaderConfig::default(),
+            persist_receipts: true,
         }
     }
 }
@@ -435,7 +444,9 @@ where
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-                        block_receipts.push(receipt.clone());
+                        if cfg.persist_receipts {
+                            block_receipts.push(receipt.clone());
+                        }
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -482,7 +493,9 @@ where
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
-                        block_receipts.push(receipt.clone());
+                        if cfg.persist_receipts {
+                            block_receipts.push(receipt.clone());
+                        }
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
