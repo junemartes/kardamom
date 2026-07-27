@@ -139,13 +139,15 @@ pub struct Sequencer {
     /// proves canonical commitment (skip receipts count — ordering is the
     /// claim); entries older than `resync.confirm_timeout_ms` are rewound
     /// via `reinsert_for_retry` and re-published — the cluster dedup absorbs
-    /// copies that DID commit, and voided ones get ordered. Keyed
-    /// (sender, nonce) → (meta, published-at).
-    unconfirmed: std::collections::BTreeMap<
-        (alloy_primitives::Address, u64),
-        (RefMetadata, std::time::Instant),
-    >,
+    /// copies that DID commit, and voided ones get ordered.
+    unconfirmed: UnconfirmedLedger,
 }
+
+/// #85 publish-confirmation ledger: (sender, nonce) → (ref metadata,
+/// published-at). BTreeMap so per-sender ranges trim cheaply on confirmation
+/// and the staleness sweep sees ascending nonce order.
+type UnconfirmedLedger =
+    std::collections::BTreeMap<(alloy_primitives::Address, u64), (RefMetadata, std::time::Instant)>;
 
 impl Sequencer {
     pub fn new(cfg: SequencerConfig) -> Self {
