@@ -26,6 +26,12 @@ pub const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skipped_exe
 pub const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
 pub const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
 pub const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
+/// #85: refs published but not yet receipt-confirmed as canonically
+/// committed (gauge), and refs rewound + re-published after the confirm
+/// timeout (counter). A sustained nonzero republish rate means offers are
+/// landing in a void (dead-leader window) or receipts are not flowing.
+pub const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
+pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 
 pub fn record_ingest(partition: u32) {
     counter!(TX_INGESTED, "partition" => partition.to_string()).increment(1);
@@ -97,6 +103,14 @@ pub fn record_floor_advance(partition: u32) {
 
 pub fn record_canonical_watermark(partition: u32, count: u64) {
     gauge!(CANONICAL_WATERMARK, "partition" => partition.to_string()).set(count as f64);
+}
+
+pub fn record_unconfirmed_refs(partition: u32, n: usize) {
+    gauge!(REF_UNCONFIRMED, "partition" => partition.to_string()).set(n as f64);
+}
+
+pub fn record_ref_republished(partition: u32, n: usize) {
+    counter!(REF_REPUBLISHED, "partition" => partition.to_string()).increment(n as u64);
 }
 
 #[cfg(test)]
