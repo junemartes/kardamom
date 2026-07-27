@@ -1096,10 +1096,15 @@ run_case() { # <case-name>
         sleep 1
       done
       [ "${stable}" = 1 ] || fail "archive-tx-data-wipe: mirror catalog never stabilized across 10 attempts"
-      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive \
+      local seg_rc=0
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive --warning=no-file-changed \
         --exclude='dir/archive-mark.dat' --exclude='dir/archive.catalog' -cf - dir \
         | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
-        || fail "archive-tx-data-wipe: re-replication copy failed"
+        || seg_rc=$?
+      # tar rc=1 = segment appended under the live recorder mid-copy; the
+      # torn tail is what the restart-side verify/heal (#94/#95) handles.
+      [ "${seg_rc}" -le 1 ] \
+        || fail "archive-tx-data-wipe: re-replication copy failed (rc=${seg_rc})"
       # The pipeline must have ridden through on ingress-1 the whole time.
       assert_progress
       # aeron restarts (system job) and adopts the restored archive.
