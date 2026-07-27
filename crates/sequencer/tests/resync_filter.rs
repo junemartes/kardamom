@@ -49,12 +49,6 @@ fn signed_tx_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64
     }
 }
 
-fn one_partition_cfg_with(f: impl FnOnce(&mut SequencerConfig)) -> SequencerConfig {
-    let mut c = one_partition_cfg();
-    f(&mut c);
-    c
-}
-
 fn one_partition_cfg() -> SequencerConfig {
     SequencerConfig {
         partition_count: 1,
