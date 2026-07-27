@@ -68,3 +68,43 @@ pub struct Receipt {
     /// including this one.
     pub cumulative_gas_used: u64,
 }
+
+impl Receipt {
+    /// Whether this receipt marks a DETERMINISTICALLY-INVALID canonical tx
+    /// that execution SKIPPED rather than applied (#92: derivation is total —
+    /// an invalid record must never halt the chain, and a halt would also
+    /// wedge recovery replay on the same record forever).
+    ///
+    /// The marker is `status == false && gas_used == 0`: unreachable by real
+    /// execution, because any executed tx — success, revert, or halt —
+    /// charges at least intrinsic gas. INVARIANT: consumers of the receipts
+    /// stream must treat a skip as "this tx did NOT happen" — in particular
+    /// it consumed NO nonce (the sequencer's receipt floors must ignore it)
+    /// and wrote NO state (its `write_set_hash` is the empty-set hash).
+    pub fn is_invalid_skip(&self) -> bool {
+        !self.status && self.gas_used == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_skip_marker_boundaries() {
+        let mut r = Receipt {
+            status: false,
+            gas_used: 0,
+            ..Receipt::default()
+        };
+        assert!(r.is_invalid_skip());
+        // A revert (or any executed tx) charges at least intrinsic gas.
+        r.gas_used = 21_000;
+        assert!(!r.is_invalid_skip());
+        // A zero-gas SUCCESS does not exist either, but the marker requires
+        // status=false regardless.
+        r.gas_used = 0;
+        r.status = true;
+        assert!(!r.is_invalid_skip());
+    }
+}

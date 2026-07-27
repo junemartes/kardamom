@@ -371,7 +371,15 @@ async fn main() -> anyhow::Result<()> {
                             // Only this shard's senders can appear in this
                             // replica's publish stream — keep the floor map
                             // bounded to them.
-                            if receipt.nonce > 0
+                            // Invalid-skip receipts (#92: status=false,
+                            // gas_used=0) mark a tx that did NOT happen — no
+                            // nonce consumed — so they are NOT floor
+                            // evidence: a skipped NonceTooHigh tx's high
+                            // nonce would otherwise advance the floor past
+                            // nonces that never executed (a canonical gap,
+                            // the exact disaster floors exist to prevent).
+                            if !receipt.is_invalid_skip()
+                                && receipt.nonce > 0
                                 && kardamom_sequencer::partition::partition_for(
                                     receipt.from,
                                     partition_count,
