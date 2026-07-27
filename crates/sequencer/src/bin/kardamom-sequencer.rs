@@ -173,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
     cfg.validate().context("validate config")?;
     // Contract line for the CI drift check: this MUST match the cluster JVM's
     // -Dkardamom.cluster.dedupCapacity (see cluster.nomad.hcl).
+    kardamom_sequencer::metrics::record_start_time();
     tracing::info!(
         dedup_capacity = cfg.resync.dedup_capacity,
         enter_percent = cfg.resync.enter_percent,

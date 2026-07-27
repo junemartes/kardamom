@@ -603,7 +603,32 @@ fn run_session(
             }
         }
 
-        thread::sleep(Duration::from_millis(1));
+        // Wait for work instead of sleeping through it: block until an egress
+        // frame or an offer request is READY (not consumed — the drain loops
+        // at the top of the iteration consume), capped at 1ms so the
+        // keep-alive/replay/subscribe duties keep their cadence. The
+        // unconditional 1ms sleep here put up to 1ms of latency under EVERY
+        // sequencer offer (two of these hand-offs per tx), a hard ~1-2k tx/s
+        // cap per shard on the offer path.
+        let mut sel = crossbeam_channel::Select::new();
+        sel.recv(&frame_rx);
+        sel.recv(&req_rx);
+        // A DISCONNECTED channel counts as "ready" to crossbeam's Select —
+        // and consumers legitimately drop their unused LiveIngress seam
+        // (`let (cluster, _ingress, egress) = connect_with_replay(...)`),
+        // which disconnects req_rx forever. Readiness with NOTHING actually
+        // queued is that artifact, and looping on it busy-spins the session
+        // thread at 100% of a core (observed: idle executors/validator at
+        // ~157% container CPU; the compact CI stack starved outright —
+        // chain-semantics S8 timeout). Fall back to the plain duty-cycle
+        // sleep in that case; a frame racing in behind the emptiness checks
+        // waits at most the old 1ms.
+        if sel.ready_timeout(Duration::from_millis(1)).is_ok()
+            && frame_rx.is_empty()
+            && req_rx.is_empty()
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
 

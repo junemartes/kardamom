@@ -528,7 +528,18 @@ fn run_aeron_thread(
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         } else {
-            std::thread::sleep(Duration::from_micros(100));
+            // Keep the 100µs sub-poll/retry cadence, but wake IMMEDIATELY on a
+            // new command instead of sleeping through it: with any sub open
+            // (always, in the services) this branch is the steady state, and a
+            // plain sleep put up to 100µs of latency under every ack-waited
+            // publish — a hard ~10k/s cap on any serialized publisher (the
+            // sequencer's offer path first among them).
+            match cmd_rx.recv_timeout(Duration::from_micros(100)) {
+                Ok(RuntimeCmd::Shutdown) => return Ok(()),
+                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
         }
     }
 }
