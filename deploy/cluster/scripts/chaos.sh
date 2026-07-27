@@ -1043,9 +1043,18 @@ run_case() { # <case-name>
       # above and its heartbeat died with the killed driver, so it is already
       # stale by restart time and the daemon starts cleanly.
       log "archive-tx-data-wipe: re-replicating archive from kardamom-ingress-1 mirror"
-      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive --exclude='dir/archive-mark.dat' -cf - dir \
+      local copy_rc=0
+      docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive --warning=no-file-changed --exclude='dir/archive-mark.dat' -cf - dir \
         | docker exec -i kardamom-ingress-0 tar -C /opt/kardamom/archive -xf - \
-        || fail "archive-tx-data-wipe: re-replication copy failed"
+        || copy_rc=$?
+      # GNU tar exits 1 for "file changed as we read it" — expected against a
+      # LIVE source whose recorder keeps appending mid-copy (faster pipelines
+      # widen the window: 2/2 reproduced on the event-driven-wakeups PR). The
+      # torn tail is exactly what the restart-side verify/heal (#94/#95)
+      # handles, and the case's own post-restart assertions prove integrity.
+      # Only rc>1 is a real transport failure (e.g. a wedged docker exec).
+      [ "${copy_rc}" -le 1 ] \
+        || fail "archive-tx-data-wipe: re-replication copy failed (rc=${copy_rc})"
       # The pipeline must have ridden through on ingress-1 the whole time.
       assert_progress
       # aeron restarts (system job) and adopts the restored archive.
