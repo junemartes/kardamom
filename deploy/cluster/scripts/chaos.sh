@@ -390,11 +390,16 @@ run_sequencer_lapse() {
       if [ -n "${l1}" ] && [ "${l1}" -gt "${l0}" ]; then break; fi
       if [ -n "${r1}" ] && [ "${r1}" -gt "${r0}" ]; then break; fi
       if [ -n "${mode}" ] && [ "${mode}" -ge 1 ]; then break; fi
-      # Newborn path: a counter BELOW its baseline is a restarted process
-      # (counters are monotonic within a lifetime); entered >= 1 on the
-      # fresh process is the startup resync engaging.
-      if [ -n "${r1}" ] && [ "${r1}" -lt "${r0}" ] && [ "${r1}" -ge 1 ]; then
-        log "sequencer-lapse: replica restarted across the freeze (entered ${r0} -> ${r1}); startup resync engaged"
+      # Newborn path: counters RESET on restart, but the baseline is often
+      # exactly 1 (every process's own startup enter) so a newborn's
+      # entered=1 is numerically indistinguishable from "never engaged"
+      # (observed: entered 1 -> 1 with a restarted replica). Detect the
+      # restart by inner-container identity instead: a different container
+      # with entered >= 1 IS the startup resync engaging.
+      now_inner="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
+      if [ -n "${now_inner}" ] && [ "${now_inner}" != "${inner}" ] \
+        && [ -n "${r1}" ] && [ "${r1}" -ge 1 ]; then
+        log "sequencer-lapse: replica restarted across the freeze (${inner} -> ${now_inner}, entered=${r1}); startup resync engaged"
         break
       fi
     else
