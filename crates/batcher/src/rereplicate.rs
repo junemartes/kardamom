@@ -42,10 +42,22 @@ pub struct MirrorReport {
     pub catalog_copied: bool,
 }
 
-/// Mirror the Aeron archive directory `source_dir` into `dest_dir`: every
-/// `*.rec` segment plus `archive.catalog` (never the mark file). Existing files
-/// in `dest_dir` are overwritten. `source_dir` / `dest_dir` are the archive's
-/// `dir/` directory (where the `.rec` files live).
+/// Mirror the Aeron archive directory `source_dir` into `dest_dir`: the
+/// `archive.catalog` first (via a stable read), then every `*.rec` segment
+/// (never the mark file). Existing files in `dest_dir` are overwritten.
+/// `source_dir` / `dest_dir` are the archive's `dir/` directory (where the
+/// `.rec` files live).
+///
+/// The catalog is the tear-prone file: a LIVE source daemon rewrites catalog
+/// entries on recording lifecycle events (start/stop/extend), and the very
+/// incident that motivates a restore — a peer's publishers dying — makes the
+/// mirror stop those recordings and rewrite exactly those entries seconds
+/// later. A plain copy racing such a write captures a torn entry whose stored
+/// checksum no longer matches its descriptor (fails a CRC-armed
+/// `ArchiveTool verify`, issue #98). The stable read (two consecutive
+/// identical snapshots) guarantees a consistent catalog image, and copying it
+/// BEFORE the segments guarantees segment data covers every position the
+/// catalog references.
 ///
 /// The destination archive daemon MUST be stopped first. Errors if the source
 /// holds no `.rec` segments (nothing to replicate — likely a wrong path).
@@ -53,25 +65,22 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
     std::fs::create_dir_all(dest_dir)?;
     let mut report = MirrorReport::default();
 
+    let catalog_src = source_dir.join(CATALOG_FILE);
+    if catalog_src.is_file() {
+        let catalog = read_stable(&catalog_src, STABLE_READ_ATTEMPTS)?;
+        std::fs::write(dest_dir.join(CATALOG_FILE), catalog)?;
+        report.catalog_copied = true;
+    }
+
     for entry in std::fs::read_dir(source_dir)? {
         let entry = entry?;
         let path = entry.path();
-        if !path.is_file() {
+        if !path.is_file() || !path.extension().is_some_and(|x| x == "rec") {
             continue;
         }
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        let is_rec = path.extension().is_some_and(|x| x == "rec");
-        let is_catalog = name_str == CATALOG_FILE;
-        if !(is_rec || is_catalog) {
-            continue;
-        }
-        let bytes = std::fs::copy(&path, dest_dir.join(&name))?;
-        if is_rec {
-            report.segments_copied += 1;
-            report.bytes_copied += bytes;
-        }
-        report.catalog_copied |= is_catalog;
+        let bytes = std::fs::copy(&path, dest_dir.join(entry.file_name()))?;
+        report.segments_copied += 1;
+        report.bytes_copied += bytes;
     }
 
     if report.segments_copied == 0 {
@@ -81,6 +90,43 @@ pub fn mirror_archive(source_dir: &Path, dest_dir: &Path) -> Result<MirrorReport
         )));
     }
     Ok(report)
+}
+
+/// Attempts before giving up on a stable catalog snapshot. Catalog writes are
+/// event-driven bursts (recording start/stop), not a steady stream — two
+/// identical consecutive reads normally happen on the first try.
+const STABLE_READ_ATTEMPTS: usize = 10;
+
+/// Read `path` until two consecutive snapshots are byte-identical, returning
+/// the stable bytes. Errors with `Corruption` if the file never stabilizes —
+/// the caller is copying from something busier than a catalog should ever be.
+fn read_stable(path: &Path, attempts: usize) -> Result<Vec<u8>, BatcherError> {
+    read_stable_with(attempts, || std::fs::read(path).map_err(BatcherError::from)).map_err(|e| {
+        match e {
+            BatcherError::Corruption(_) => BatcherError::Corruption(format!(
+                "{} kept changing across {attempts} reads — is the source daemon quiesced?",
+                path.display()
+            )),
+            other => other,
+        }
+    })
+}
+
+/// Core of [`read_stable`], parameterized over the reader for testability.
+fn read_stable_with<F>(attempts: usize, mut read: F) -> Result<Vec<u8>, BatcherError>
+where
+    F: FnMut() -> Result<Vec<u8>, BatcherError>,
+{
+    let mut prev = read()?;
+    for _ in 1..attempts.max(2) {
+        let next = read()?;
+        if next == prev {
+            return Ok(next);
+        }
+        prev = next;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(BatcherError::Corruption("unstable read".into()))
 }
 
 /// Verify `dest_dir` mirrors `source_dir`: every source `.rec` exists in dest
@@ -234,6 +280,24 @@ mod tests {
         assert!(!dst.path().join("notes.txt").exists());
 
         assert_eq!(verify_mirror(src.path(), dst.path()).unwrap(), 2);
+    }
+
+    #[test]
+    fn stable_read_returns_first_repeated_snapshot() {
+        let mut reads = vec![b"v1".to_vec(), b"v2".to_vec(), b"v2".to_vec()].into_iter();
+        let got = read_stable_with(10, || Ok(reads.next().unwrap())).unwrap();
+        assert_eq!(got, b"v2");
+    }
+
+    #[test]
+    fn stable_read_gives_up_on_a_churning_file() {
+        let mut n = 0u8;
+        let err = read_stable_with(4, || {
+            n += 1;
+            Ok(vec![n])
+        })
+        .unwrap_err();
+        assert!(matches!(err, BatcherError::Corruption(_)));
     }
 
     #[test]

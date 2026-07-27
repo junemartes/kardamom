@@ -275,8 +275,15 @@ by construction.
   running" restart-SLO failure), and the catalog's per-entry checksums for
   actively-recording entries (rewritten mid-copy → torn entries that fail a
   CRC-armed verify; issue #98). `mirror_archive` therefore never copies the
-  mark file — the destination daemon recreates its own — and the catalog copy
-  from a live source remains a known gap until #98 lands.
+  mark file — the destination daemon recreates its own — and copies the
+  catalog via a **stable read** (two consecutive identical snapshots, catalog
+  before segments), as does the chaos restore; the wipe case's post-restore
+  verify is CRC-armed, so a torn transplant can no longer pass silently. If an
+  operator must repair an already-torn catalog, `ArchiveTool checksum
+  io.aeron.archive.checksum.Crc32 -a` recomputes and persists the entry
+  checksums — but it **blesses whatever bytes are present** (verified: it
+  happily blesses a deliberately corrupted descriptor), so run it only after
+  establishing the content is trustworthy, never as an automated step.
 
   **Corruption** (present-but-wrong bytes) is covered separately
   (`archive-corruption`): the archive driver records per-data-frame **CRC32s**
