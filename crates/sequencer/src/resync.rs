@@ -175,6 +175,11 @@ pub struct ResyncController {
 /// cannot starve the publish path.
 const FLOOR_DRAIN_PER_ITER: usize = 1024;
 
+/// One drain of the receipts channel: `(raised_floors, confirmations)` —
+/// both `(sender, nonce-or-floor)` lists; see
+/// [`ResyncController::drain_floor_updates`].
+pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
+
 impl ResyncController {
     pub fn new(
         cfg: ResyncConfig,
@@ -223,7 +228,7 @@ impl ResyncController {
     ///   a same-sender nonce-0 TxRef); a genuine nonce-0 ref is confirmed
     ///   cumulatively by the sender's nonce-1 receipt, or re-offers
     ///   harmlessly until then (dedup absorbs).
-    pub fn drain_floor_updates(&mut self) -> (Vec<(Address, u64)>, Vec<(Address, u64)>) {
+    pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
         let mut raised = Vec::new();
         let mut confirmations = Vec::new();
         for _ in 0..FLOOR_DRAIN_PER_ITER {
