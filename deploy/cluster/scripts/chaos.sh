@@ -310,6 +310,13 @@ seqa_debug() {
   log "sequencer-lapse DEBUG: current sequencer-a log tail:"
   docker exec kardamom-sequencer-0 sh -c \
     'docker logs --tail 20 "$(docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a")" 2>&1 | grep -E "RESYNC|LAG|resync|panic" | tail -10' 2>/dev/null || true
+  # CI-divergence diagnostics (lapse case passes locally, fails on shared
+  # runners with lag 0->0 on a surviving container): full detector timeline.
+  log "=== seqa deep diagnostics ==="
+  docker exec kardamom-sequencer-0 sh -c \
+    'c="$(docker ps -a --format "{{.Names}} {{.Status}} {{.CreatedAt}}" | grep sequencer-a | head -3)"; echo "containers: $c"' 2>/dev/null || true
+  docker exec kardamom-sequencer-0 sh -c \
+    'docker logs --tail 2000 "$(docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a")" 2>&1 | grep -aE "LAG|RESYNC|watermark|session opened|egress silent|panicked|boundary" | tail -40' 2>/dev/null || true
 }
 
 run_sequencer_lapse() {
