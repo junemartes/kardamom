@@ -26,10 +26,10 @@ use alloy_signer_local::PrivateKeySigner;
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::proxy::ingress_id_of;
 use kardamom_ingress::routing::partition_for;
-use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{AckPolicy, BPosition, Receipt};
 
-type Proxy = IngressProxy<MockChannels, MockChannels, InMemoryStateDb>;
+type Proxy = IngressProxy<MockChannels, MockChannels>;
 
 fn nonce_of(raw: &bytes::Bytes) -> u64 {
     use alloy_consensus::TxEnvelope;
@@ -153,12 +153,7 @@ impl Cluster {
                     pending_receipt_timeout: Duration::from_secs(10),
                     ..IngressConfig::default()
                 };
-                Arc::new(IngressProxy::new(
-                    cfg,
-                    mock.clone(),
-                    mock.clone(),
-                    Arc::new(InMemoryStateDb::new()),
-                ))
+                Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()))
             })
             .collect();
 

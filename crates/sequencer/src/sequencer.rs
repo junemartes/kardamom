@@ -14,8 +14,9 @@
 //!
 //!  1. Decode the nonce out of the envelope (the proxy already verified
 //!     the signature and populated `sender` + `tx_hash`).
-//!  2. Hydrate `next_nonce` from the state DB if this is the first time
-//!     we've seen the sender (cache-miss path).
+//!  2. Seed `next_nonce` at 0 the first time we've seen the sender (the
+//!     sequencer holds no state-DB reader; committed floors arrive via the
+//!     receipt-floor resync, not a state read).
 //!  3. Feed `(sender, nonce, RefMetadata)` to [`PartitionState::process`]:
 //!     - match → emit a publish action for this nonce + drain any
 //!       buffered higher nonces that newly become contiguous;
@@ -29,18 +30,19 @@
 //! Warm cache: because every observed envelope advances `next_nonce` on a
 //! match, the in-memory map is naturally populated by the tx_data read
 //! stream itself — no separate prefetch thread needed. Cold senders (no
-//! activity since startup) hit the state-DB cache-miss path the first
-//! time they're observed.
+//! activity since startup) seed at nonce 0.
 //!
-//! Cold-rejoin caveat (F02.1, RE-OPENED): hydration only provides a
+//! Cold-rejoin caveat (F02.1, RE-OPENED): seeding at 0 provides only a
 //! *lower bound* on a sender's next nonce, so a restarted replica that
 //! live-joins mid-stream buffers established senders' traffic against
 //! nonces that will never reappear and does not regain coverage of them
-//! (P=1 for those senders until its twin also restarts). The "stream-
-//! adaptive floor fast-forward" that closed this was REMOVED: it could not
-//! distinguish twin-ordered gaps from client-abandoned ones, and adopting
-//! the latter published canonical nonce gaps that fatally NonceTooHigh'd
-//! every executor (see PartitionState's note + the CI round-4 analysis).
+//! (P=1 for those senders until its twin also restarts). The committed
+//! floor is recovered out of band by the receipt-floor resync
+//! (`crate::resync`), NOT by a state-DB read: an earlier "stream-adaptive
+//! floor fast-forward" was REMOVED because it could not distinguish
+//! twin-ordered gaps from client-abandoned ones, and adopting the latter
+//! published canonical nonce gaps that fatally NonceTooHigh'd every
+//! executor (see PartitionState's note + the CI round-4 analysis).
 //!
 //! See also [`crate::outbound`] for the trait surface and in-memory fakes
 //! used by tests.
@@ -52,7 +54,7 @@ use std::time::Duration;
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
-use kardamom_types::{BPosition, StateDatabase, TxError, TxErrorReason, TxRef};
+use kardamom_types::{BPosition, TxError, TxErrorReason, TxRef};
 use tracing::{trace, warn};
 
 use crate::config::SequencerConfig;
@@ -120,15 +122,9 @@ impl Default for Shutdown {
     }
 }
 
-pub struct Sequencer<DB: StateDatabase> {
+pub struct Sequencer {
     cfg: SequencerConfig,
     state: PartitionState<RefMetadata>,
-    /// Canonical state source for cache-miss hydration. When a tx arrives
-    /// for a sender this sequencer has never seen, we consult `state_db`
-    /// once to seed the in-memory `next_nonce` map with the committed
-    /// canonical nonce. Subsequent txs from that sender hit the in-memory
-    /// path.
-    state_db: Arc<DB>,
     /// Lag detection + receipt-floor resync
     /// (docs/agents/sequencer-lag-resync-spec.md). `None` when the binary
     /// did not wire the receipts / egress-watermark feeds (tests, IPC dev
@@ -136,14 +132,13 @@ pub struct Sequencer<DB: StateDatabase> {
     resync: Option<crate::resync::ResyncController>,
 }
 
-impl<DB: StateDatabase> Sequencer<DB> {
-    pub fn new(cfg: SequencerConfig, state_db: Arc<DB>) -> Self {
+impl Sequencer {
+    pub fn new(cfg: SequencerConfig) -> Self {
         cfg.validate().expect("validated config");
         let cap = cfg.max_pending_per_sender;
         Self {
             cfg,
             state: PartitionState::new(cap),
-            state_db,
             resync: None,
         }
     }
@@ -156,34 +151,6 @@ impl<DB: StateDatabase> Sequencer<DB> {
 
     pub fn config(&self) -> &SequencerConfig {
         &self.cfg
-    }
-
-    /// Cache-miss hydration: if the sender's next-nonce is unknown locally,
-    /// fetch the canonical nonce from the state DB and seed the partition
-    /// state. New senders (no on-chain account) hydrate at nonce 0; senders
-    /// that already have on-chain activity hydrate at their committed nonce
-    /// so the executor accepts the next tx without a future-nonce rejection.
-    fn hydrate_if_unknown(&mut self, sender: alloy_primitives::Address) {
-        if self.state.next_nonce_known(sender).is_some() {
-            return;
-        }
-        let n = match self.state_db.basic(sender) {
-            Ok(Some((nonce, _, _))) => nonce,
-            Ok(None) => 0,
-            Err(e) => {
-                // State DB query failed (transient I/O, etc.). Fall back to
-                // nonce 0; if the tx is from an established sender it'll
-                // get rejected by the executor and the client will retry.
-                // Better than dropping or stalling on a soft failure here.
-                warn!(
-                    sender = ?sender,
-                    error = %e,
-                    "state DB cache-miss lookup failed; hydrating with nonce 0"
-                );
-                0
-            }
-        };
-        self.state.seed_next_nonce(sender, n);
     }
 
     /// Publish a `TxRef` for `meta` to tx_ordering. The `tx_data_position` was
@@ -359,12 +326,15 @@ impl<DB: StateDatabase> Sequencer<DB> {
         // is read. We never call `recover_signer()` on it.
         let nonce = decode_nonce(&envelope.raw_tx)?;
 
-        // Cache-miss hydration: first time we see this sender, fetch the
-        // canonical nonce from the state DB and seed the in-memory map.
-        // Cheap on cold senders; no-op (one HashMap::contains_key) on warm.
-        // Steady-state: every observed envelope advances next_nonce on a
-        // match, so the warm cache is intrinsic — no separate prefetch.
-        self.hydrate_if_unknown(sender);
+        // Cold senders seed at nonce 0 — the sequencer holds no committed-state
+        // reader (it is a pure reorderer). Committed-nonce truth arrives out of
+        // band via the receipt-floor resync (`crate::resync`), which advances
+        // per-sender floors from the tx_receipts stream. Steady-state: every
+        // observed envelope advances next_nonce on a match, so the warm cache is
+        // intrinsic — no separate prefetch.
+        if self.state.next_nonce_known(sender).is_none() {
+            self.state.seed_next_nonce(sender, 0);
+        }
 
         let meta = RefMetadata {
             correlation_id: envelope.correlation_id,

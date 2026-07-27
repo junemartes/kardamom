@@ -13,7 +13,7 @@ use alloy_signer_local::PrivateKeySigner;
 
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::routing::partition_for;
-use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -25,8 +25,7 @@ async fn each_tx_lands_on_keccak_partition() {
             ..IngressConfig::default()
         };
         let (mock, mut rx_vec) = MockChannels::new(m as usize);
-        let state_db = Arc::new(InMemoryStateDb::new());
-        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
         // Fake executor — one task per partition, satisfies receipt +
         // watermark immediately.

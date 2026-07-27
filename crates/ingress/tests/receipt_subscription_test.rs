@@ -11,7 +11,6 @@
 mod common;
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
@@ -21,7 +20,7 @@ use jsonrpsee::rpc_params;
 use jsonrpsee::ws_client::WsClientBuilder;
 use serde_json::Value;
 
-use kardamom_ingress::channels::{InMemoryStateDb, MockChannels};
+use kardamom_ingress::channels::MockChannels;
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::json_rpc::start_jsonrpc_server;
 use kardamom_ingress::proxy::IngressProxy;
@@ -42,8 +41,7 @@ async fn start_stack() -> (
         ..IngressConfig::default()
     };
     let (mock, rx) = MockChannels::new(SHARDS);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db);
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone());
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (local, handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
     (mock, rx, local, handle)
@@ -75,8 +73,7 @@ async fn overloaded_ingress_sheds_submissions_with_a_clear_error() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockChannels::new(SHARDS);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db);
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock.clone());
     let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let (local, _handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
     let client = HttpClientBuilder::default()

@@ -78,16 +78,13 @@ fn bench_in_order(c: &mut Criterion) {
         b.iter_batched(
             || {
                 (
-                    Sequencer::new(
-                        SequencerConfig {
-                            partition_count: 1,
-                            partition_index: 0,
-                            sequencer_id: 0,
-                            max_pending_per_sender: 16,
-                            ..Default::default()
-                        },
-                        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-                    ),
+                    Sequencer::new(SequencerConfig {
+                        partition_count: 1,
+                        partition_index: 0,
+                        sequencer_id: 0,
+                        max_pending_per_sender: 16,
+                        ..Default::default()
+                    }),
                     DequeTxData(batch.clone().into_iter().collect()),
                     InMemoryTxOrderingRefPublisher::default(),
                     InMemoryTxErrorPublisher::default(),

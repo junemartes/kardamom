@@ -1,9 +1,11 @@
 //! S2 sequencer subsystem for the kardamom rollup.
 //!
 //! Stateless sequencer: in-memory `next_nonce` map is treated as a cache,
-//! reconstructable from canonical sources (state DB for cold senders, plus
-//! tx_data tail for warm steady-state visibility — the latter is a
-//! follow-up; today the sequencer falls back to state DB on cache miss).
+//! reconstructable from canonical sources. Cold senders seed at nonce 0;
+//! warm steady-state visibility comes from the tx_data tail (every matched
+//! envelope advances the sender's nonce), and committed floors are recovered
+//! out of band by the receipt-floor resync (`crate::resync`). The sequencer
+//! holds no state-DB reader.
 //!
 //! Topology:
 //!   - Proxy shards senders by address (`keccak(sender) % M`).
@@ -34,9 +36,6 @@ pub mod resync;
 pub mod sender;
 pub mod sequencer;
 pub mod state;
-
-#[cfg(any(test, feature = "testing"))]
-pub mod testing;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
 pub use deposit::{DepositSubscriber, process_deposit};

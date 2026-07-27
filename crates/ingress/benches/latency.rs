@@ -11,7 +11,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use k256::ecdsa::{RecoveryId, signature::hazmat::PrehashSigner};
 
 use kardamom_ingress::config::IngressConfig;
-use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 
 fn sign(s: &PrivateKeySigner, nonce: u64) -> Bytes {
@@ -55,8 +55,7 @@ fn bench_e2e_latency(c: &mut Criterion) {
             ..IngressConfig::default()
         };
         let (mock, mut rx_vec) = MockChannels::new(8);
-        let state_db = Arc::new(InMemoryStateDb::new());
-        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+        let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
         for (i, mut rx) in rx_vec.drain(..).enumerate() {
             let receipt_bus = mock.receipt_bus.clone();
             let watermark_bus = mock.watermark_bus.clone();

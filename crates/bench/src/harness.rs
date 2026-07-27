@@ -38,7 +38,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use kardamom_ingress::{InMemoryStateDb, IngressConfig, IngressHandle, IngressProxy, MockChannels};
+use kardamom_ingress::{IngressConfig, IngressHandle, IngressProxy, MockChannels};
 use kardamom_types::{AckPolicy, BPosition, Receipt};
 
 use crate::Benchmark;
@@ -365,8 +365,7 @@ pub async fn spawn_inprocess_ingress(
         ack_policy: AckPolicy::OnOffer,
         ..IngressConfig::default()
     };
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
     let handle = proxy.start().await?;
 
     let url = format!("http://{}", handle.jsonrpc_addr);

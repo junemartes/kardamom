@@ -10,15 +10,11 @@
 //! Wire types come exclusively from [`types`]; this
 //! module defines **no new wire types**.
 
-use std::collections::HashMap;
-use std::sync::Arc;
-
-use alloy_primitives::B256;
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 
 use kardamom_types::{
-    BPosition, BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
+    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
 
 use crate::error::IngressError;
@@ -141,91 +137,11 @@ impl IngressSubscription for MockChannels {
     }
 }
 
-// ============================================================================
-// InMemoryStateDb — implements `kardamom_types::StateDatabase` for tests.
-//
-// Real production proxy gets the libmdbx-backed impl shipped by S6 once that
-// crate lands. The proxy only uses the receipt + tx_hash_index read paths
-//, but the trait demands the full `basic`/`storage`/`code_by_hash`
-// surface — we stub those out with a sane default.
-// ============================================================================
-
-/// In-memory `StateDatabase` for tests, benches, and the v0 default proxy
-/// configuration until S6 lands. Only `get_tx_position` and `get_receipt`
-/// carry real semantics; account/storage queries return empty values.
-#[derive(Default, Clone)]
-pub struct InMemoryStateDb {
-    inner: Arc<std::sync::RwLock<StateDbInner>>,
-}
-
-#[derive(Default)]
-struct StateDbInner {
-    tx_hash_index: HashMap<B256, BPosition>,
-    receipts: HashMap<BPosition, Receipt>,
-}
-
-impl InMemoryStateDb {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Test helper: record both index and receipt for an executed tx.
-    pub fn record(&self, tx_hash: B256, position: BPosition, receipt: Receipt) {
-        let mut g = self.inner.write().unwrap();
-        g.tx_hash_index.insert(tx_hash, position);
-        g.receipts.insert(position, receipt);
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("in-memory state db error")]
-pub struct InMemoryStateError;
-
-impl kardamom_types::StateError for InMemoryStateError {}
-
-impl kardamom_types::StateDatabase for InMemoryStateDb {
-    type Error = InMemoryStateError;
-
-    fn basic(
-        &self,
-        _address: alloy_primitives::Address,
-    ) -> Result<Option<(u64, alloy_primitives::U256, B256)>, Self::Error> {
-        Ok(None)
-    }
-
-    fn storage(
-        &self,
-        _address: alloy_primitives::Address,
-        _key: B256,
-    ) -> Result<alloy_primitives::U256, Self::Error> {
-        Ok(alloy_primitives::U256::ZERO)
-    }
-
-    fn code_by_hash(&self, _code_hash: B256) -> Result<bytes::Bytes, Self::Error> {
-        Ok(bytes::Bytes::new())
-    }
-
-    fn get_receipt(&self, pos: BPosition) -> Result<Option<Receipt>, Self::Error> {
-        Ok(self.inner.read().unwrap().receipts.get(&pos).cloned())
-    }
-
-    fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error> {
-        Ok(self
-            .inner
-            .read()
-            .unwrap()
-            .tx_hash_index
-            .get(&tx_hash)
-            .copied())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::Address;
+    use alloy_primitives::{Address, B256};
     use bytes::Bytes;
-    use kardamom_types::StateDatabase;
 
     #[tokio::test]
     async fn mock_routes_to_shard() {
@@ -241,27 +157,5 @@ mod tests {
         assert_eq!(received.correlation_id, 1);
         // Other shards stay empty.
         assert!(rx[0].try_recv().is_err());
-    }
-
-    #[test]
-    fn in_memory_state_db_round_trip() {
-        let db = InMemoryStateDb::new();
-        let tx_hash = B256::repeat_byte(0xAB);
-        let pos = BPosition {
-            term_id: 1,
-            term_offset: 99,
-        };
-        let receipt = Receipt {
-            tx_idx: pos,
-            tx_hash,
-            status: true,
-            gas_used: 21_000,
-            logs: Vec::new(),
-            write_set_hash: B256::ZERO,
-            ..Default::default()
-        };
-        db.record(tx_hash, pos, receipt.clone());
-        assert_eq!(db.get_tx_position(tx_hash).unwrap(), Some(pos));
-        assert_eq!(db.get_receipt(pos).unwrap(), Some(receipt));
     }
 }

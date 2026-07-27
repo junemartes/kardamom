@@ -22,8 +22,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::task::JoinHandle;
 
-use kardamom_types::StateDatabase;
-
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::proxy::IngressProxy;
@@ -38,14 +36,13 @@ pub const STATUS_INTERNAL: u8 = 9;
 
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-pub fn spawn_tcp_listener<P, S, DB>(
-    proxy: IngressProxy<P, S, DB>,
+pub fn spawn_tcp_listener<P, S>(
+    proxy: IngressProxy<P, S>,
     addr: SocketAddr,
 ) -> JoinHandle<std::io::Result<()>>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
     tokio::spawn(async move {
         let listener = TcpListener::bind(addr).await?;
@@ -59,14 +56,13 @@ where
     })
 }
 
-pub fn spawn_uds_listener<P, S, DB>(
-    proxy: IngressProxy<P, S, DB>,
+pub fn spawn_uds_listener<P, S>(
+    proxy: IngressProxy<P, S>,
     path: &Path,
 ) -> std::io::Result<JoinHandle<std::io::Result<()>>>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
     // Bind eagerly so binding errors surface immediately.
     let listener = UnixListener::bind(path)?;
@@ -82,16 +78,15 @@ where
     }))
 }
 
-pub async fn handle_connection<W, P, S, DB>(
+pub async fn handle_connection<W, P, S>(
     mut sock: W,
     client_ip: IpAddr,
-    proxy: IngressProxy<P, S, DB>,
+    proxy: IngressProxy<P, S>,
 ) -> std::io::Result<()>
 where
     W: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
     loop {
         let mut len_buf = [0u8; 4];
@@ -145,16 +140,14 @@ fn map_err(e: &IngressError) -> (u8, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::{InMemoryStateDb, MockChannels};
+    use crate::channels::MockChannels;
     use crate::config::IngressConfig;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn empty_rlp_returns_decode_error() {
         let cfg = IngressConfig::default();
         let (mock, _rx) = MockChannels::new(8);
-        let state_db = Arc::new(InMemoryStateDb::new());
-        let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
+        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let listener = TcpListener::bind(bind).await.unwrap();
         let addr = listener.local_addr().unwrap();

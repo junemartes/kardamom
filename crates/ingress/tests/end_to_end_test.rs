@@ -12,7 +12,7 @@ use alloy_signer_local::PrivateKeySigner;
 
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::routing::partition_for;
-use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::{IngressProxy, MockChannels};
 use kardamom_types::{BPosition, QuorumWatermark, Receipt};
 
 fn nonce_of(raw: &bytes::Bytes) -> u64 {
@@ -31,13 +31,7 @@ async fn one_hundred_txs_route_and_receive_receipts() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockChannels::new(m as usize);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = Arc::new(IngressProxy::new(
-        cfg.clone(),
-        mock.clone(),
-        mock.clone(),
-        state_db,
-    ));
+    let proxy = Arc::new(IngressProxy::new(cfg.clone(), mock.clone(), mock.clone()));
 
     // Fake executor — drains each partition, immediately satisfies
     // receipt + watermark.
@@ -120,8 +114,7 @@ async fn proxy_parks_until_watermark_advances() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockChannels::new(2);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     // Fake executor for partition 0 that publishes the receipt-cache
     // immediately but holds off advancing the watermark for ~200ms.
@@ -193,8 +186,7 @@ async fn mds_duplicate_receipts_dedup_resolves_submit_once() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockChannels::new(2);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     // Three "executor replicas" all emit the IDENTICAL receipt for the same tx
     // (same tx_hash / sender / nonce / position) — exactly what N MDS sources
@@ -280,8 +272,7 @@ async fn racing_replica_rejection_is_overridden_by_twin_success() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockChannels::new(2);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let receipt_bus = mock.receipt_bus.clone();
     let error_bus = mock.tx_error_bus.clone();
@@ -352,8 +343,7 @@ async fn genuine_rejection_from_both_replicas_reaches_the_client_once() {
         ..IngressConfig::default()
     };
     let (mock, mut partition_rx) = MockChannels::new(2);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone(), state_db));
+    let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
     let error_bus = mock.tx_error_bus.clone();
     let rx0 = partition_rx.remove(0);
