@@ -341,7 +341,16 @@ run_sequencer_lapse() {
   # case fails loudly instead of asserting against a replica that never
   # lapsed. (validator-lapse shares the docker-pause pattern and never
   # verifies its freeze — flagged for follow-up, see PR notes.)
-  log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0})"
+  # Container identity BEFORE the freeze: the newborn-vs-survivor decision
+  # below cannot ride counter values alone — the typical pre-freeze baseline
+  # is entered=1 (one startup enter, exited), and a restarted process ALSO
+  # reads entered=1: equal values satisfy neither "incremented" nor "below
+  # baseline", which timed this case out on main (run 30227283947:
+  # "lag 0 -> 0, entered 1 -> 1, mode 0"). A Nomad in-place restart creates
+  # a NEW container generation, so StartedAt is the unambiguous signal.
+  local started0
+  started0="$(docker exec kardamom-sequencer-0 docker inspect -f '{{.State.StartedAt}}' "${inner}" 2>/dev/null)"
+  log "sequencer-lapse: freezing ${inner} (SIGSTOP) for ${SEQ_LAPSE_S}s (lag_suspected=${l0} resync_entered=${r0} started=${started0:-?})"
   docker exec kardamom-sequencer-0 docker kill -s STOP "${inner}" >/dev/null \
     || fail "sequencer-lapse: SIGSTOP failed"
   sleep 3
@@ -390,9 +399,26 @@ run_sequencer_lapse() {
       if [ -n "${l1}" ] && [ "${l1}" -gt "${l0}" ]; then break; fi
       if [ -n "${r1}" ] && [ "${r1}" -gt "${r0}" ]; then break; fi
       if [ -n "${mode}" ] && [ "${mode}" -ge 1 ]; then break; fi
-      # Newborn path: a counter BELOW its baseline is a restarted process
-      # (counters are monotonic within a lifetime); entered >= 1 on the
-      # fresh process is the startup resync engaging.
+      # Newborn path, IDENTITY-based: a counter below its baseline implies a
+      # restart, but the converse fails when the baseline equals the fresh
+      # process's value (entered 1 -> restart -> entered 1 satisfies nothing
+      # value-shaped — the exact miss that timed this case out on main). The
+      # container generation is unambiguous: StartedAt changed ⇒ Nomad
+      # restarted the task across the freeze (crash-only path: the aeron
+      # client was evicted at ~10s of freeze, the process fail-stopped on
+      # thaw) ⇒ entered >= 1 on the FRESH process is its startup resync
+      # engaging — the lapse contract holds.
+      local cur started1
+      cur="$(docker exec kardamom-sequencer-0 sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^sequencer-a"' 2>/dev/null)"
+      started1=""
+      [ -n "${cur}" ] && started1="$(docker exec kardamom-sequencer-0 docker inspect -f '{{.State.StartedAt}}' "${cur}" 2>/dev/null)"
+      if [ -n "${started0}" ] && [ -n "${started1}" ] && [ "${started1}" != "${started0}" ] \
+         && [ -n "${r1}" ] && [ "${r1}" -ge 1 ]; then
+        log "sequencer-lapse: replica RESTARTED across the freeze (container ${started0} -> ${started1}); fresh process entered startup resync (entered=${r1})"
+        break
+      fi
+      # Value-shaped newborn fallback (kept for the started0-unknown case —
+      # docker exec can wedge post-thaw, #76 pattern).
       if [ -n "${r1}" ] && [ "${r1}" -lt "${r0}" ] && [ "${r1}" -ge 1 ]; then
         log "sequencer-lapse: replica restarted across the freeze (entered ${r0} -> ${r1}); startup resync engaged"
         break
