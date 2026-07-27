@@ -27,6 +27,15 @@ pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_to
 // `outcome=peer-checkpoint|unrecoverable`. Rare by design; any non-zero rate
 // is worth an alert (a node fell behind the retention window).
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
+/// Deterministically-invalid canonical txs skipped with a marker receipt
+/// (#92). ANY nonzero value means an upstream guard (sequencer nonce fence,
+/// cluster dedup, resync floors) let an invalid record into the canonical
+/// log — standing-alert material, like `RESYNC_TOTAL`.
+pub const INVALID_TX_SKIPPED_TOTAL: &str = "kardamom_executor_invalid_tx_skipped_total";
+
+pub fn record_invalid_tx_skipped() {
+    metrics::counter!(INVALID_TX_SKIPPED_TOTAL).increment(1);
+}
 
 pub fn describe() {
     metrics::describe_counter!(TX_APPLIED_TOTAL, "tx executions, labelled by outcome");
@@ -46,6 +55,10 @@ pub fn describe() {
     metrics::describe_counter!(
         SEALER_BOUNDARIES_TOTAL,
         "sealer block boundaries observed at cluster egress"
+    );
+    metrics::describe_counter!(
+        INVALID_TX_SKIPPED_TOTAL,
+        "deterministically-invalid canonical txs skipped with a marker receipt (#92); any nonzero value means an upstream guard failed"
     );
     metrics::describe_counter!(
         RESYNC_TOTAL,
