@@ -192,7 +192,6 @@ pub fn connect_with_egress_kind_filter(
     // (see SealerClusteredService.offerBoundary), so a boundary-only feed
     // needs no consumer registration and stays out of the per-record fan-out.
     connect_inner(rt, cfg, None, false, Some(kind))
-
 }
 
 /// Append a small term-length to a cluster control channel unless the URI

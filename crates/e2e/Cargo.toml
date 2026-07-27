@@ -24,6 +24,7 @@ full-pipeline-e2e = [
     "dep:alloy-sol-types",
     "dep:anyhow",
     "dep:hex",
+    "dep:clap",
     "dep:jsonrpsee",
     "dep:kardamom-batcher",
     "dep:kardamom-bench",
@@ -37,6 +38,13 @@ full-pipeline-e2e = [
 
 [lib]
 path = "src/lib.rs"
+
+# Target-C runner: the same scenario drivers the Target-L tests use, pointed
+# at a live cluster. Needs the scenarios, hence the feature.
+[[bin]]
+name = "kardamom-semantics"
+path = "src/bin/kardamom-semantics.rs"
+required-features = ["full-pipeline-e2e"]
 
 [dependencies]
 kardamom-log.workspace = true
@@ -62,6 +70,7 @@ kardamom-da-watcher = { path = "../da_watcher", optional = true }
 kardamom-deployer = { path = "../deployer", optional = true }
 anyhow = { workspace = true, optional = true }
 hex = { version = "0.4", optional = true }
+clap = { workspace = true, optional = true }
 jsonrpsee = { workspace = true, features = ["http-client"], optional = true }
 kardamom-batcher = { path = "../batcher", optional = true }
 kardamom-bench = { path = "../bench", optional = true }

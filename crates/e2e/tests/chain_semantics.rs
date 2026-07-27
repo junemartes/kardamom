@@ -303,6 +303,70 @@ async fn s9_executor_crash_recovery_is_consistent() {
     consistency::verify_state_dirs(&exec_dir, &val_dir).expect("post-crash state comparison");
 }
 
+/// The Target-C RUNNER, exercised at Target L: launch a local stack and drive
+/// it through the real `kardamom-semantics` binary — the same binary the
+/// cluster-e2e `semantics` shard invokes, with the same argument shape.
+///
+/// This is the pre-flight for Target C. The cluster shard costs ~40 minutes
+/// per attempt and only reports a log dump, so proving the CLI's wiring
+/// (argument parsing → `Target` construction → case dispatch → exit code)
+/// here means a shard failure points at the cluster environment rather than
+/// at the runner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn target_c_runner_drives_the_stack() {
+    let park = Duration::from_secs(4);
+    let stack = LocalStack::launch(StackConfig {
+        validator: true,
+        ingress: IngressOptions {
+            pending_receipt_timeout: park,
+            ..IngressOptions::default()
+        },
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack");
+    let t = stack.target(client_timeout(park)).expect("target");
+
+    let bin = e2e::harness::services::bin("kardamom-semantics").expect("semantics bin");
+    let out = std::process::Command::new(bin)
+        .args(["--rpc", &t.rpc.url])
+        .args(["--chain-id", &e2e::harness::DEV_CHAIN_ID.to_string()])
+        .args(["--executor-metrics", &t.executor_metrics.to_string()])
+        .args([
+            "--sequencer-metrics",
+            &t.sequencer_metrics
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        ])
+        .args([
+            "--validator-metrics",
+            &t.validator_metrics.expect("validator").to_string(),
+        ])
+        .args([
+            "--pending-receipt-timeout-ms",
+            &park.as_millis().to_string(),
+        ])
+        // A representative slice: one nonce case and the consistency case.
+        // The full set runs on the cluster shard; this proves the plumbing.
+        .args(["--cases", "nonce-unordered,consistency"])
+        .output()
+        .expect("run kardamom-semantics");
+    assert!(
+        out.status.success(),
+        "kardamom-semantics failed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("semantics verdict PASS"),
+        "no verdict line in:\n{stdout}"
+    );
+}
+
 /// S8: what the batcher posts to L1, re-executed from L1 alone, must equal
 /// the state root the validator independently computed — the "batcher's state
 /// matches the validator's" guarantee. Posts REAL EIP-4844 blobs to anvil and

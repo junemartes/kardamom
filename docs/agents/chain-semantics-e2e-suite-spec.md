@@ -1,7 +1,12 @@
 # Chain-Semantics E2E Test Suite — Spec
 
 - **Date:** 2026-07-25
-- **Status:** Approved. PR-1 (Target-L harness + S3/S4/S5 + CI workflow) **merged** (#90, with the #81 pending-registry fix it found). PR-2 (S6/S7 + `kardamom_state::integrity` + S9a/c, with the validator SIGTERM fix) open as #96. PR-3 (S1/S2 bridge round-trip, with the withdrawal-attestation fix) and S9b crash recovery implemented on `test/chain-semantics-s6-s9`.
+- **Status:** **DELIVERED.** All five requested semantics have end-to-end coverage on both targets.
+  - PR-1 #90 — Target-L harness + S3/S4/S5 + the `chain-semantics-e2e` workflow, with the #81 pending-registry fix it found.
+  - PR-2/PR-3 #96 — S6/S7, `kardamom_state::integrity`, S9a/c, S1/S2 bridge round-trip, S9b crash recovery, plus the validator SIGTERM and withdrawal-attestation fixes.
+  - PR-5 #100 — S8 DA parity, plus `docs/agents/l1-origin-deposit-derivation-spec.md`.
+  - PR-4 #105 — Target C: the `semantics` shard in `cluster-e2e.yml`.
+- **Where it runs:** `just test-e2e-local` and the per-PR `chain-semantics-e2e` job (Target L, ~45 s for 12 scenarios); the `semantics` shard of `cluster-e2e.yml` (Target C, ~19 min on a fresh 12-node cluster).
 - **Goal (definition of done):** an e2e suite proving the rollup's **chain semantics** end-to-end — bridge round-trips against a real anvil L1, nonce-ordering guarantees over real JSON-RPC, validator↔executor state parity, batcher/DA↔validator root parity, and state-DB integrity — with each scenario written once and run on **two targets**: a fast deterministic single-host harness (`crates/e2e/tests/`, green in a dedicated CI job well under the cluster-e2e budget, plus a revived `just test-e2e-local`) and the **real CI cluster** (a new `semantics` shard in `cluster-e2e.yml` on the standard `ci-cluster.sh` DinD bring-up).
 
 ## Background / current state
@@ -162,8 +167,21 @@ Each PR lands with its scenarios green in the relevant workflow, gated on the fu
 ## Open questions
 
 1. ~~**S5 leak canary**~~ — resolved: shipped env-gated in PR-1, reproduced the leak, the fix landed as PR #91 (Weak-indexed pending registry), and the gate was removed — it now runs unconditionally.
-2. **Sequencer cold-floor (F02.1)** — a sequencer restarted mid-run hydrates every sender at nonce 0 (`EmptyStateDatabase`) and wedges established senders. Worth a pinned `#[ignore]` scenario here, or leave it to the recovery roadmap where the fix will land?
-3. **Target C shard cost** — a sixth DinD shard adds ~1 runner-hour per PR. Run on every PR like the other shards, or `workflow_dispatch` + main-only until it proves stable?
-4. **Cluster genesis change** — adding the message-passer predeploy to `deploy/cluster/config/genesis/dev.toml` changes the genesis digest for every future cluster bring-up (fresh clusters only; existing DBs would refuse via `GenesisMismatch`). Fine to fold into PR-4, or stage separately?
+2. **Sequencer cold-floor (F02.1)** — a sequencer restarted mid-run hydrates every sender at nonce 0 (`EmptyStateDatabase`) and wedges established senders. Worth a pinned `#[ignore]` scenario here, or leave it to the recovery roadmap where the fix will land? **Still open.**
+3. ~~**Target C shard cost**~~ — the shard runs on every PR like the others. It is the cheapest of the six (~19 min vs 27–40 min) because it runs no load and no chaos. Revisit if PR latency becomes the binding constraint; the gate is one line (`RUN_SEMANTICS`).
+4. ~~**Cluster genesis change**~~ — deferred with the bridge cases. Target C ships without any deployed-job, genesis or contract-deploy change, so it has no blast radius on the other five shards; S1/S2 on Target C need that wiring and will carry the genesis-digest change (fresh clusters only) when they land.
 
 (Resolved by the two-target design: the local sealer stays 1-member — Target C exercises the real 3-member quorum.)
+
+## What Target C covers today, and what it does not
+
+Runs on the cluster: `nonce-unordered`, `nonce-gap`, `rpc-liveness`, `consistency` — via `kardamom-semantics`, a thin CLI over the same drivers, invoked by a `RUN_SEMANTICS=1` block in `ci-cluster.sh`.
+
+Deliberately Target-L only:
+
+- **S1/S2 (bridge)** — need the contract-deploy phase, the message-passer predeploy and attester vars in the *shared* bring-up path (see open question 4).
+- **S7 (divergence injection)** and **S9b (crash recovery)** — drive process signals and raw Aeron publications from the test process, which is not reachable from outside the cluster. Fault injection on the cluster is chaos's domain.
+- **S8 (DA parity)** — blocked on the batcher's live posting being rewired for the cluster topology; its binary still expects pre-#67 archive segment files.
+- **S6's offline phase** and the **queue-depth probe** — the former needs the state dirs (`docker cp` from stopped allocs), the latter needs ingress metrics, which bind loopback-only in the deployed job.
+
+A simplification worth recording: executor, sequencer and validator all bind `/metrics` on `0.0.0.0`, so the runner scrapes them directly and the `SocketAddr`-based `Target` needed no changes. The docker-exec transport this spec originally assumed was never necessary.

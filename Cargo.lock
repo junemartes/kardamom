@@ -2198,6 +2198,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "clap",
  "criterion 0.5.1",
  "crossbeam-channel",
  "hdrhistogram",

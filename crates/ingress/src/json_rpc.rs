@@ -253,6 +253,9 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
         kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce } => {
             ("duplicated-tx".to_string(), Some(*expected_nonce))
         }
+        kardamom_types::TxErrorReason::Evicted { expected_nonce } => {
+            ("evicted".to_string(), Some(*expected_nonce))
+        }
     }
 }
 

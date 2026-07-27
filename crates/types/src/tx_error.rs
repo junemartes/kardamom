@@ -34,4 +34,12 @@ pub enum TxErrorReason {
     /// The sender's nonce is below the next expected nonce — the tx has
     /// already been canonicalised (or is a replay of a prior one).
     DuplicatedTx { expected_nonce: u64 },
+    /// The tx was shed by the sequencer's overload protection: either it was
+    /// the furthest-future buffered nonce evicted to make room, or it arrived
+    /// too far past the sender's next expected nonce while the reorder buffer
+    /// was full. It will NEVER be sequenced — the client must resubmit once
+    /// its nonce is back within the window (previously this drop was silent:
+    /// the parked submit waited for a receipt that could never arrive, the
+    /// root of the permanent-nonce-gap wedge).
+    Evicted { expected_nonce: u64 },
 }

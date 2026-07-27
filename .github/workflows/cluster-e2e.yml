@@ -57,7 +57,8 @@ jobs:
         # 3-member Raft sealer (leader-kill / follower-kill / quorum-loss-recover);
         # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
         # now the deploy uses the clustered sealer — see "Configure shard").
-        shard: [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster]
+        shard:
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, semantics]
     steps:
       - uses: actions/checkout@v4
 
@@ -119,6 +120,10 @@ jobs:
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
+          # Target-C runner for the chain-semantics shard. Feature-gated
+          # because it links the scenario drivers.
+          cargo build --release -p e2e --features full-pipeline-e2e \
+            --bin kardamom-semantics
 
       - name: Install Nomad CLI
         run: |
@@ -152,6 +157,14 @@ jobs:
             # kill SPOF (issue #58, sealer-hard) no longer exists — the Raft quorum
             # survives the loss of any one member, so chaos-sealer is DROPPED.
             chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover"; } ;;
+            # The chain-semantics suite (Target C): the SAME scenario drivers
+            # the per-PR Target-L job runs, against the real cluster — nonce
+            # ordering, gap non-processing, RPC liveness and validator/executor
+            # consistency. Runs NO load and NO chaos, so the funded-account
+            # ledger leaves #1..#15 free for it, and a failure here cannot be
+            # confused with a resilience regression. See
+            # docs/agents/chain-semantics-e2e-suite-spec.md.
+            semantics)       { echo "RUN_LOAD=0"; echo "RUN_CHAOS=0"; echo "RUN_SEMANTICS=1"; } ;;
             *) echo "unknown shard ${{ matrix.shard }}" >&2; exit 1 ;;
           esac >> "$GITHUB_ENV"
           # Chaos knobs shared by all chaos shards (no-op on the load shard).
