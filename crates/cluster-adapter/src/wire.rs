@@ -28,6 +28,10 @@ use thiserror::Error;
 
 /// Ingress app-message kind (the leading tag byte).
 pub const KIND_INGRESS_RECORD: u8 = 0;
+/// Ingress kind: egress-subscribe announcement `[kind:u8 = 2]` — the sending
+/// session wants the canonical egress broadcast (relayed records +
+/// boundaries). Matches Java `KIND_SUBSCRIBE`.
+pub const KIND_SUBSCRIBE: u8 = 2;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >= from_index`
 /// or `boundary.block_number >= from_block` to the REQUESTING session only (not
@@ -154,6 +158,15 @@ pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
         }),
         other => Err(WireError::BadEgressKind(other)),
     }
+}
+
+/// Encode an egress-subscribe announcement (ingress): `[kind:u8 = 2]`. A
+/// session that sends this is a canonical-stream consumer — the service
+/// includes it in the per-record/per-boundary egress fan-out. Publisher-only
+/// sessions (sequencers) never send it and stop receiving the canonical
+/// broadcast they were dropping client-side anyway.
+pub fn encode_subscribe() -> Vec<u8> {
+    vec![KIND_SUBSCRIBE]
 }
 
 /// Encode a replay request (ingress). The service re-offers retained frames

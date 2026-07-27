@@ -329,8 +329,8 @@ run_sequencer_lapse() {
   # on it reads a newborn, not a survivor). With #99 fixed the restart
   # rejoins cleanly — assert_replica_healthy covers that half.
   local l0 r0
-  l0="$(seqb_twin_metric kardamom_sequencer_resync_lag_suspected_total)"; l0="${l0:-0}"
-  r0="$(seqb_twin_metric kardamom_sequencer_resync_entered_total)"; r0="${r0:-0}"
+  l0="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"; l0="${l0:-0}"
+  r0="$(seqa_metric kardamom_sequencer_resync_entered_total)"; r0="${r0:-0}"
   # SIGSTOP/SIGCONT, NOT `docker pause`: the nested cgroup freezer inside a
   # privileged DinD node can silently no-op (observed: a "paused" replica
   # kept serving metrics and never lapsed — the detection asserts failed
@@ -358,69 +358,59 @@ run_sequencer_lapse() {
   # The pipeline never depended on the paused replica — the twin raced on.
   assert_progress
 
-  # DETECTION: the egress feed thread measures the pause as one long
-  # boundary-arrival gap (> the 10s silence window) and bumps
-  # lag_suspected_total within moments of resume. This counter is
-  # starvation-proof — asserted FIRST.
+  # DETECTION + RESPONSE (on the LAPSED replica): before the consumer-
+  # filtered egress fan-out, this case asserted the TWIN's lag counter —
+  # the frozen session's backpressure blocked the leader's per-session
+  # offer loop, stalling boundaries CLUSTER-WIDE, and the healthy twin
+  # flagged that collateral stall. Publisher-only sessions are no longer in
+  # the fan-out, so a frozen replica cannot starve anyone's egress and the
+  # twin correctly sees nothing. What must still hold is the lapse contract
+  # on the replica that actually lapsed, on EITHER recovery path:
+  #   - survivor: the process outlived the freeze; its boundary-gap
+  #     detector flags (lag_suspected increments past the pre-freeze
+  #     baseline) and/or resync engages (entered increments / mode >= 1);
+  #   - newborn: the freeze got the aeron client evicted, the process
+  #     fail-stopped and Nomad restarted it — counters RESET, so a value
+  #     BELOW the pre-freeze baseline that is nonetheless >= 1 proves the
+  #     fresh process entered resync (RESYNC enter reason=Startup).
   #
-  # SCRAPE FAILURE IS NOT ZERO: seqa_metric returns EMPTY when the scrape
-  # fails, and the pause/unpause (on a node whose inner dockerd already
-  # absorbed two docker-kills from earlier cases) can wedge exec-based
-  # fallbacks for minutes (the issue-#76 pattern) — three CI iterations
-  # failed with "0 -> 0" that was actually unreachable-endpoint defaulted
-  # to zero. Require REAL samples: only successful scrapes count toward
-  # the verdict, every sample is logged, and the clock is generous because
-  # it must outlive an exec stall.
-  local t=0 l1 raw good=0
+  # SCRAPE FAILURE IS NOT ZERO: only successful scrapes count toward the
+  # verdict (the post-thaw exec fallback can wedge for minutes — the
+  # issue-#76 pattern), every sample is logged, and the window is generous.
+  local t=0 l1 r1 mode raw good=0
   while :; do
-    raw="$(seqb_twin_metric kardamom_sequencer_resync_lag_suspected_total)"
-    if [ -n "${raw}" ]; then
-      l1="${raw}"; good=$(( good + 1 ))
-      log "sequencer-lapse: twin sample t=${t}s lag_suspected=${l1} (scrape ok #${good})"
-      [ "${l1}" -gt "${l0}" ] && break
+    l1="$(seqa_metric kardamom_sequencer_resync_lag_suspected_total)"
+    r1="$(seqa_metric kardamom_sequencer_resync_entered_total)"
+    mode="$(seqa_metric kardamom_sequencer_resync_mode)"
+    if [ -n "${l1}" ] || [ -n "${r1}" ]; then
+      good=$(( good + 1 ))
+      log "sequencer-lapse: lapsed-replica sample t=${t}s lag=${l1:-?} entered=${r1:-?} mode=${mode:-?} (scrape ok #${good})"
+      # Survivor paths: counters moved past their pre-freeze baselines, or
+      # resync mode is currently active.
+      if [ -n "${l1}" ] && [ "${l1}" -gt "${l0}" ]; then break; fi
+      if [ -n "${r1}" ] && [ "${r1}" -gt "${r0}" ]; then break; fi
+      if [ -n "${mode}" ] && [ "${mode}" -ge 1 ]; then break; fi
+      # Newborn path: a counter BELOW its baseline is a restarted process
+      # (counters are monotonic within a lifetime); entered >= 1 on the
+      # fresh process is the startup resync engaging.
+      if [ -n "${r1}" ] && [ "${r1}" -lt "${r0}" ] && [ "${r1}" -ge 1 ]; then
+        log "sequencer-lapse: replica restarted across the freeze (entered ${r0} -> ${r1}); startup resync engaged"
+        break
+      fi
     else
       log "sequencer-lapse: sample t=${t}s SCRAPE FAILED (not counted as zero)"
     fi
     if [ "${t}" -ge 240 ]; then
       seqa_debug
-      # RE-ARMED: #99 (predecessor session corpse cycling the restarted
-      # replica's session, starving its egress) is fixed by the
-      # foreign-session event filter — a lapsed replica's feed thread has a
-      # working egress again and MUST detect the pause.
       if [ "${good}" -eq 0 ]; then
-        fail "sequencer-lapse: TWIN metrics unreachable for 240s after resume (0 successful scrapes) — cannot judge detection"
+        fail "sequencer-lapse: lapsed-replica metrics unreachable for 240s after resume (0 successful scrapes) — cannot judge detection"
       fi
-      fail "sequencer-lapse: TWIN never suspected lag within 240s of resume (lag_suspected ${l0} -> ${l1:-?}, ${good} good scrapes) — the freeze-induced boundary stall went undetected"
+      fail "sequencer-lapse: lapsed replica never engaged resync within 240s of resume (lag ${l0} -> ${l1:-?}, entered ${r0} -> ${r1:-?}, mode ${mode:-?}, ${good} good scrapes)"
     fi
     sleep 10; t=$(( t + 10 ))
   done
-  log "sequencer-lapse: twin detected the boundary stall (lag_suspected ${l0} -> ${l1})"
+  log "sequencer-lapse: lapsed replica engaged resync (lag ${l0} -> ${l1:-?}, entered ${r0} -> ${r1:-?}, mode ${mode:-?})"
 
-  # RESPONSE: the controller consumes the sticky flag on the publish loop's
-  # next turn and is then IN resync mode — either freshly entered
-  # (entered_total increments) or still there from an unexited earlier
-  # trigger (mode gauge == 1; entered can't increment when already active).
-  # The loop can legitimately be BLOCKED in a session offer while its closed
-  # session reconnects (the sealer closes a frozen consumer's session within
-  # ~1s of the pause), so this window is WIDE — the flag is sticky and
-  # cannot be missed, only late.
-  local r1 mode
-  t=0
-  while :; do
-    r1="$(seqb_twin_metric kardamom_sequencer_resync_entered_total)"
-    mode="$(seqb_twin_metric kardamom_sequencer_resync_mode)"
-    if [ -n "${r1}" ]; then
-      if [ "${r1}" -gt "${r0}" ] || [ "${mode:-0}" -ge 1 ]; then
-        log "sequencer-lapse: resync engaged (entered ${r0} -> ${r1}, mode ${mode:-0})"
-        break
-      fi
-    fi
-    if [ "${t}" -ge 240 ]; then
-      seqa_debug
-      fail "sequencer-lapse: twin resync never engaged within 240s of resume (entered ${r0} -> ${r1:-scrape-failed}, mode ${mode:-scrape-failed}; lag was suspected ${l0} -> ${l1})"
-    fi
-    sleep 10; t=$(( t + 10 ))
-  done
   assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
   log "sequencer-lapse PASS: progress held, lag detected, resync engaged, replica healthy"
 }

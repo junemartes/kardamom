@@ -83,7 +83,7 @@ pub fn cluster_watermark_observer(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
 ) -> Result<(LiveCluster, ClusterWatermarkObserver<LiveEgress>), LiveError> {
-    let (cluster, _ingress, egress) = live::connect(rt, cfg)?;
+    let (cluster, _ingress, egress) = live::connect_subscribed(rt, cfg)?;
     Ok((cluster, ClusterWatermarkObserver::new(egress)))
 }
 
