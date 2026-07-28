@@ -338,15 +338,34 @@ impl Sequencer {
             }
             r.observe(std::time::Instant::now());
 
-            // #85 fix B: the sealer REJECTED a known sender's ref because its
-            // nonce was not the expected next one — refs for
-            // expected..nonce-1 vanished (voided offers). They are all in the
-            // unconfirmed ledger; rewind them NOW instead of waiting out the
-            // confirm timeout. Same descending-nonce discipline as the sweep
-            // below. (A reject with nonce < expected means the ref already
-            // committed once and its dedup entry aged out — the range below
-            // is empty and this is a no-op; receipts confirm it normally.)
-            for (sender, expected) in r.drain_contiguity_rejects() {
+            // #85 fix B: the sealer REJECTED our ref because its nonce was
+            // not the sender's expected next one. Two cases (split in the
+            // drain):
+            //
+            // - committed-proof (nonce < expected): the ref sealed long ago
+            //   — the guard's expected advanced past it — and its dedup
+            //   entry aged out of the window. Drop the ledger entry exactly
+            //   like a receipt confirmation. Without this, an entry with no
+            //   confirming receipt (a sender whose ONLY tx is nonce 0:
+            //   nonce-0 receipts are deposit-indistinguishable and never
+            //   confirm) republishes every confirm-timeout FOREVER once the
+            //   dedup horizon rolls past it (observed live: the smoke-gate
+            //   accounts, 128+ rejects/run).
+            let (drops, rewinds) = r.drain_contiguity_rejects();
+            for (sender, n) in drops {
+                if self.unconfirmed.remove(&(sender, n)).is_some() {
+                    trace!(
+                        sender = ?sender,
+                        nonce = n,
+                        "contiguity reject proves commitment; dropping unconfirmed entry (#85)"
+                    );
+                }
+            }
+            // - gap (nonce >= expected): refs for expected..nonce-1 vanished
+            //   (voided offers). They are all in the unconfirmed ledger;
+            //   rewind them NOW instead of waiting out the confirm timeout.
+            //   Same descending-nonce discipline as the sweep below.
+            for (sender, expected) in rewinds {
                 let keys: Vec<_> = self
                     .unconfirmed
                     .range((sender, expected)..=(sender, u64::MAX))

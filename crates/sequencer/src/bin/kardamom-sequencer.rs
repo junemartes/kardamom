@@ -313,7 +313,7 @@ async fn main() -> anyhow::Result<()> {
                                         expected,
                                         "sealer contiguity reject received"
                                     );
-                                    let _ = reject_tx.send((sender, expected));
+                                    let _ = reject_tx.send((sender, nonce, expected));
                                 }
                                 continue;
                             }

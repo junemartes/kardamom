@@ -162,11 +162,14 @@ pub struct ResyncController {
     active: bool,
     floors: HashMap<Address, u64>,
     floor_rx: Receiver<FloorUpdate>,
-    /// #85 fix B: `(sender, expected_nonce)` contiguity rejects forwarded by
-    /// the egress-watermark thread — the sealer refused a ref that would have
-    /// sealed a nonce gap; the publish loop rewinds the sender's unconfirmed
-    /// ledger from `expected_nonce` immediately.
-    reject_rx: Receiver<(Address, u64)>,
+    /// #85 fix B: `(sender, nonce, expected)` contiguity rejects forwarded
+    /// by the egress-watermark thread — the sealer refused a ref whose nonce
+    /// was not the sender's expected next one. `nonce >= expected` means a
+    /// gap: rewind the unconfirmed ledger from `expected` and republish.
+    /// `nonce < expected` means the ref already COMMITTED (the guard's
+    /// expected nonce advanced past it) and its dedup entry aged out —
+    /// confirm-by-reject, dropping the ledger entry.
+    reject_rx: Receiver<(Address, u64, u64)>,
     watermark: SharedWatermark,
     last_watermark: u64,
     /// Set once the first boundary has been observed — a jump before the
@@ -190,7 +193,7 @@ impl ResyncController {
         cfg: ResyncConfig,
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
-        reject_rx: Receiver<(Address, u64)>,
+        reject_rx: Receiver<(Address, u64, u64)>,
         watermark: SharedWatermark,
     ) -> Self {
         let mut c = Self {
@@ -264,24 +267,48 @@ impl ResyncController {
         (raised, confirmations)
     }
 
-    /// Drain pending contiguity rejects (#85 fix B), deduplicated per sender
-    /// to the LOWEST expected nonce (a rejected batch produces one reject per
-    /// entry; one rewind to the lowest expected covers them all). Bounded per
-    /// iteration like the floor drain.
-    pub fn drain_contiguity_rejects(&mut self) -> Vec<(Address, u64)> {
+    /// Drain pending contiguity rejects (#85 fix B) into
+    /// `(committed_drops, gap_rewinds)`:
+    ///
+    /// - `committed_drops` — `(sender, nonce)` rejects with
+    ///   `nonce < expected`: the guard's expected nonce is already past this
+    ///   ref, which proves it committed (per-sender contiguity means the
+    ///   guard accepted it on the way up) — its dedup entry merely aged out.
+    ///   The ledger entry is dropped like a receipt confirmation would; NOT
+    ///   dropping it re-offers the ref every confirm-timeout forever (the
+    ///   nonce-0 case has no confirming receipt at all: nonce-0 receipts are
+    ///   deposit-indistinguishable and never confirm). Caveat: if the sealer
+    ///   evicted + re-seeded this sender ABOVE a genuinely-voided ref, this
+    ///   drops a ref that never sealed — but republishing can never seal it
+    ///   either (the guard rejects it forever), so the drop only trades an
+    ///   infinite reject loop for an honest, bounded degradation, in the
+    ///   same eviction-floor class the guard itself documents.
+    /// - `gap_rewinds` — `(sender, expected)` rejects with
+    ///   `nonce >= expected`, deduplicated per sender to the LOWEST expected
+    ///   (a rejected batch produces one reject per entry; one rewind to the
+    ///   lowest covers them all): refs for `expected..nonce` vanished —
+    ///   rewind the unconfirmed ledger and republish.
+    ///
+    /// Bounded per iteration like the floor drain.
+    pub fn drain_contiguity_rejects(&mut self) -> (Vec<(Address, u64)>, Vec<(Address, u64)>) {
+        let mut drops: Vec<(Address, u64)> = Vec::new();
         let mut lowest: HashMap<Address, u64> = HashMap::new();
         for _ in 0..FLOOR_DRAIN_PER_ITER {
             match self.reject_rx.try_recv() {
-                Ok((sender, expected)) => {
-                    lowest
-                        .entry(sender)
-                        .and_modify(|e| *e = (*e).min(expected))
-                        .or_insert(expected);
+                Ok((sender, nonce, expected)) => {
+                    if nonce < expected {
+                        drops.push((sender, nonce));
+                    } else {
+                        lowest
+                            .entry(sender)
+                            .and_modify(|e| *e = (*e).min(expected))
+                            .or_insert(expected);
+                    }
                 }
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
         }
-        lowest.into_iter().collect()
+        (drops, lowest.into_iter().collect())
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
@@ -383,7 +410,7 @@ pub fn resync_channel(
 ) -> (
     ResyncController,
     Sender<FloorUpdate>,
-    Sender<(Address, u64)>,
+    Sender<(Address, u64, u64)>,
     SharedWatermark,
 ) {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -548,19 +575,24 @@ mod tests {
     }
 
     #[test]
-    fn contiguity_rejects_dedup_to_lowest_expected() {
-        // A rejected batch produces one reject per entry, each carrying the
-        // same (or a rising) expected nonce; the drain must collapse them to
-        // ONE rewind per sender at the lowest expected.
+    fn contiguity_rejects_split_drops_from_rewinds() {
         let (mut c, _tx, reject_tx, _w) = resync_channel(ResyncConfig::default(), 0);
-        reject_tx.send((s(1), 7)).unwrap();
-        reject_tx.send((s(1), 5)).unwrap();
-        reject_tx.send((s(1), 9)).unwrap();
-        reject_tx.send((s(2), 3)).unwrap();
-        let mut drained = c.drain_contiguity_rejects();
-        drained.sort();
-        assert_eq!(drained, vec![(s(1), 5), (s(2), 3)]);
-        assert!(c.drain_contiguity_rejects().is_empty());
+        // Gap rejects (nonce >= expected): a rejected batch produces one per
+        // entry; the drain collapses them to ONE rewind per sender at the
+        // lowest expected.
+        reject_tx.send((s(1), 9, 7)).unwrap();
+        reject_tx.send((s(1), 8, 5)).unwrap();
+        reject_tx.send((s(1), 12, 9)).unwrap();
+        reject_tx.send((s(2), 3, 3)).unwrap();
+        // Committed-proof reject (nonce < expected): the ref sealed long ago
+        // and its dedup entry aged out — confirm-by-reject, drop the entry.
+        reject_tx.send((s(3), 0, 1)).unwrap();
+        let (drops, mut rewinds) = c.drain_contiguity_rejects();
+        rewinds.sort();
+        assert_eq!(rewinds, vec![(s(1), 5), (s(2), 3)]);
+        assert_eq!(drops, vec![(s(3), 0)]);
+        let (drops, rewinds) = c.drain_contiguity_rejects();
+        assert!(drops.is_empty() && rewinds.is_empty());
     }
 
     #[test]

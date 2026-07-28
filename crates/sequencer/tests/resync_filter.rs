@@ -68,10 +68,21 @@ fn pos(offset: i32) -> BPosition {
 /// A sequencer with resync enabled; returns the floor-update sender. The
 /// controller starts in resync mode (startup trigger), which is exactly the
 /// state these tests exercise.
-fn resync_sequencer() -> (Sequencer, std::sync::mpsc::Sender<FloorUpdate>) {
+type ResyncTestRig = (
+    Sequencer,
+    std::sync::mpsc::Sender<FloorUpdate>,
+    std::sync::mpsc::Sender<(alloy_primitives::Address, u64, u64)>,
+);
+
+fn resync_sequencer_with_rejects() -> ResyncTestRig {
     let mut seq = Sequencer::new(one_partition_cfg());
-    let (controller, floor_tx, _reject_tx, _watermark) = resync_channel(ResyncConfig::default(), 0);
+    let (controller, floor_tx, reject_tx, _watermark) = resync_channel(ResyncConfig::default(), 0);
     seq.enable_resync(controller);
+    (seq, floor_tx, reject_tx)
+}
+
+fn resync_sequencer() -> (Sequencer, std::sync::mpsc::Sender<FloorUpdate>) {
+    let (seq, floor_tx, _reject_tx) = resync_sequencer_with_rejects();
     (seq, floor_tx)
 }
 
@@ -243,4 +254,46 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     let stable = b.refs.lock().unwrap().len();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     assert_eq!(b.refs.lock().unwrap().len(), stable);
+}
+
+/// #85 fix B: a contiguity reject with `nonce < expected` proves the ref
+/// already committed (the sealer's per-sender expected nonce is past it) —
+/// the unconfirmed entry is dropped like a receipt confirmation. Without the
+/// drop, a ref with no confirming receipt (nonce-0: deposit-indistinguishable
+/// receipts never confirm) republishes every confirm-timeout FOREVER once
+/// its dedup entry ages out (observed live: smoke-gate accounts).
+#[test]
+fn committed_proof_reject_retires_unconfirmed_entry() {
+    let s = signer(5);
+    let mut channel_a = ScriptedTxData::default();
+    channel_a
+        .queue
+        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 60)));
+    let mut b = InMemoryTxOrderingRefPublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
+    let (mut seq, _floor_tx, reject_tx) = resync_sequencer_with_rejects();
+
+    // Publish the sender's ONLY tx (nonce 0). No receipt will ever confirm
+    // it (nonce-0 receipts are excluded), so with timeout 0 it republishes
+    // on every iteration — the infinite loop this fix closes.
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert_eq!(b.refs.lock().unwrap().len(), 1);
+    seq.set_confirm_timeout_ms(0);
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert!(
+        b.refs.lock().unwrap().len() >= 2,
+        "unconfirmed nonce-0 churns"
+    );
+
+    // The sealer answers a republish with a committed-proof reject
+    // (nonce 0 < expected 1): the entry retires permanently.
+    reject_tx.send((s.address(), 0, 1)).unwrap();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    let stable = b.refs.lock().unwrap().len();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert_eq!(
+        b.refs.lock().unwrap().len(),
+        stable,
+        "committed-proof reject must stop the republish loop"
+    );
 }

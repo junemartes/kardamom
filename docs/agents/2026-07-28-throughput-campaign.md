@@ -39,6 +39,14 @@ report artifact + `target/perf/` run dirs per PR body.
   an empty map; evicted/unknown senders seed at any nonce — degrades toward
   accept, never a false reject). Dedup runs BEFORE the guard so #114's
   republished committed copies absorb as duplicates.
+- Confirm-by-reject: a reject with `nonce < expected` proves the ref already
+  committed (its dedup entry aged out) — the sequencer drops the unconfirmed
+  entry like a receipt confirmation. Found live on day one: a sender whose
+  ONLY tx is nonce 0 (smoke-gate accounts) never gets a confirming receipt
+  (nonce-0 receipts are deposit-indistinguishable), so its ledger entry
+  republished every 15s forever; once the dedup window rolled past 131k
+  records those re-offers would have DOUBLE-ORDERED without the guard
+  (observed: 128+ rejects/run, all `nonce=0 expected=1`).
 - Boundaries broadcast to EVERY session (the sequencer's boundary-only lag
   feed consumes without SUBSCRIBE); relayed records go to consumers only.
 
