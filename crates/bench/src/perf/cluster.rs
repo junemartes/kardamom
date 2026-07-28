@@ -92,7 +92,13 @@ done"#
 pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     let root = repo_root.to_str().context("repo root not utf-8")?;
     if !skip_build {
-        println!("==> building service binaries + orchestrator image");
+        println!("==> building sealer jar");
+    let jar_dir = repo_root.join("cluster/sealer-service");
+    sh(
+        "bash",
+        &["-c", &format!("cd {} && ./gradlew :service:shadowJar -q", jar_dir.display())],
+    )?;
+    println!("==> building service binaries + orchestrator image");
         sh(
             "bash",
             &[

@@ -83,6 +83,47 @@ class SealerFanoutTest {
     }
 
     @Test
+    void batchEntriesProcessLikeIndividualRecords() {
+        subscribe(consumerA);
+        // Batch of 3: two fresh records + a duplicate of the first — the
+        // consumer must receive exactly 2 relays (intra-batch dedup holds).
+        final byte[][] entries = new byte[3][];
+        entries[0] = recordFrame(10);
+        entries[1] = recordFrame(11);
+        entries[2] = recordFrame(10); // duplicate
+        int total = 3;
+        for (final byte[] e : entries) total += 4 + e.length;
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        int pos = 0;
+        buf.putByte(pos, SealerClusteredService.KIND_BATCH);
+        pos += Byte.BYTES;
+        buf.putShort(pos, (short) entries.length, ByteOrder.LITTLE_ENDIAN);
+        pos += Short.BYTES;
+        for (final byte[] e : entries) {
+            buf.putInt(pos, e.length, ByteOrder.LITTLE_ENDIAN);
+            pos += Integer.BYTES;
+            buf.putBytes(pos, e);
+            pos += e.length;
+        }
+        service.onSessionMessage(publisher, 0, buf, 0, pos, null);
+        assertEquals(2, relayedCount(consumerA),
+                "batch: two fresh entries relay, the duplicate is deduped");
+        assertEquals(0, relayedCount(publisher),
+                "publisher-only session stays out of the fan-out");
+    }
+
+    /** A complete single-record ingress frame for batch embedding. */
+    private static byte[] recordFrame(final int n) {
+        final byte[] out =
+                new byte[1 + CanonicalSealerState.CANONICAL_ID_LEN + 1];
+        out[0] = SealerClusteredService.KIND_INGRESS_RECORD;
+        out[1] = (byte) n;
+        out[32] = 0x5A;
+        out[out.length - 1] = (byte) n;
+        return out;
+    }
+
+    @Test
     void broadcastsToAllWhileNoConsumerAnnounced() {
         record(publisher, 0);
         assertEquals(1, relayedCount(publisher), "fallback: publisher receives");

@@ -32,6 +32,16 @@ pub const KIND_INGRESS_RECORD: u8 = 0;
 /// session wants the canonical egress broadcast (relayed records +
 /// boundaries). Matches Java `KIND_SUBSCRIBE`.
 pub const KIND_SUBSCRIBE: u8 = 2;
+/// Ingress kind: a batch of ingress records
+/// `[kind:u8 = 3][count:u16 LE][per entry: len:u32 LE + entry bytes]`, where
+/// each entry is a complete single-record ingress frame
+/// (`[kind:u8 = 0][canonical_id:32][payload…]`). One cluster offer carries
+/// the whole batch; the service unpacks and processes entries exactly like
+/// individually-offered records, so consensus determinism, dedup, and the
+/// egress format are all unchanged — batching is purely an ingress-transport
+/// amortization (~51-byte refs each previously paid a full offer round trip).
+/// Matches Java `KIND_BATCH`.
+pub const KIND_BATCH: u8 = 3;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >= from_index`
 /// or `boundary.block_number >= from_block` to the REQUESTING session only (not
@@ -167,6 +177,51 @@ pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
 /// broadcast they were dropping client-side anyway.
 pub fn encode_subscribe() -> Vec<u8> {
     vec![KIND_SUBSCRIBE]
+}
+
+/// Encode a batch of already-encoded single-record ingress frames.
+pub fn encode_ingress_batch(entries: &[Vec<u8>]) -> Vec<u8> {
+    let payload: usize = entries.iter().map(|e| 4 + e.len()).sum();
+    let mut b = Vec::with_capacity(1 + 2 + payload);
+    b.push(KIND_BATCH);
+    b.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for e in entries {
+        b.extend_from_slice(&(e.len() as u32).to_le_bytes());
+        b.extend_from_slice(e);
+    }
+    b
+}
+
+/// Decode a batch frame — used by tests / a Rust service mock (the real
+/// service-side decode lives in the Java `SealerClusteredService`).
+pub fn decode_ingress_batch(buf: &[u8]) -> Result<Vec<&[u8]>, WireError> {
+    if buf.first() != Some(&KIND_BATCH) {
+        return Err(WireError::BadEgressKind(*buf.first().unwrap_or(&255)));
+    }
+    let hdr = buf.get(1..3).ok_or(WireError::TooShort {
+        at: 1,
+        need: 2,
+        have: buf.len().saturating_sub(1),
+    })?;
+    let count = u16::from_le_bytes([hdr[0], hdr[1]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut pos = 3usize;
+    for _ in 0..count {
+        let len_bytes = buf.get(pos..pos + 4).ok_or(WireError::TooShort {
+            at: pos,
+            need: 4,
+            have: buf.len().saturating_sub(pos),
+        })?;
+        let len = u32::from_le_bytes(len_bytes.try_into().unwrap()) as usize;
+        pos += 4;
+        out.push(buf.get(pos..pos + len).ok_or(WireError::TooShort {
+            at: pos,
+            need: len,
+            have: buf.len().saturating_sub(pos),
+        })?);
+        pos += len;
+    }
+    Ok(out)
 }
 
 /// Encode a replay request (ingress). The service re-offers retained frames

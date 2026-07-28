@@ -158,6 +158,18 @@ impl Sequencer {
     /// envelope write — so this is a single B write, not a dual write.
     /// On B-backpressure the caller reinserts the metadata so the retry
     /// republishes the same `(tx_hash, shard, tx_data_position)` triple.
+    /// Build the wire `TxRef` for a drained meta (shared by the single and
+    /// batch publish paths).
+    fn make_txref(&self, meta: &RefMetadata) -> kardamom_types::TxRef {
+        kardamom_types::TxRef::new(
+            meta.tx_hash,
+            self.cfg.sequencer_id,
+            meta.tx_data_position,
+            meta.tx_data_session_id,
+        )
+    }
+
+    #[allow(dead_code)]
     fn publish_ref<B>(&self, b: &mut B, meta: &RefMetadata) -> Result<(), SequencerError>
     where
         B: TxOrderingRefPublisher,
@@ -206,25 +218,46 @@ impl Sequencer {
     where
         B: TxOrderingRefPublisher,
     {
-        let mut iter = drained.into_iter();
-        while let Some((sender, n, meta)) = iter.next() {
-            match self.publish_ref(b, &meta) {
-                Ok(()) => {
-                    trace!(
-                        nonce = n,
-                        correlation_id = meta.correlation_id,
-                        ctx,
-                        "published ref"
-                    );
-                }
-                Err(SequencerError::Backpressure) => {
-                    let mut rest: Vec<_> = std::iter::once((sender, n, meta)).chain(iter).collect();
-                    while let Some((s, n2, m)) = rest.pop() {
-                        self.state.reinsert_for_retry(s, n2, m);
+        // Chunked batch publish: each chunk rides ONE cluster app message
+        // (KIND_BATCH), amortizing the per-offer session round trip that
+        // dominated the sequencer's per-tx cost. The chunk MUST stay under
+        // one Aeron MTU (~1408B): the hand-rolled cluster ingress path does
+        // not survive fragmented session messages (validated empirically —
+        // 128-ref ~7KB chunks lost every fragmented batch: ramp died at
+        // 750tps and 96k accepted refs never receipted; 20 refs ≈ 1.1KB
+        // passes). 20:1 still amortizes away the dominant per-offer cost.
+        const BATCH_MAX: usize = 20;
+        let mut idx = 0usize;
+        while idx < drained.len() {
+            let end = (idx + BATCH_MAX).min(drained.len());
+            let refs: Vec<kardamom_types::TxRef> = drained[idx..end]
+                .iter()
+                .map(|(_, _, m)| self.make_txref(m))
+                .collect();
+            let (published, err) = b.try_publish_ref_batch(&refs);
+            for (_, n, meta) in &drained[idx..idx + published] {
+                metrics::record_publish(self.cfg.partition_index);
+                trace!(
+                    nonce = n,
+                    correlation_id = meta.correlation_id,
+                    ctx,
+                    "published ref"
+                );
+            }
+            idx += published;
+            match err {
+                None => {}
+                Some(SequencerError::Backpressure) => {
+                    metrics::record_backpressure(self.cfg.partition_index);
+                    // Rebuffer the failed chunk AND everything after it, in
+                    // reverse, so each sender's floor ends rewound to its
+                    // lowest unpublished nonce.
+                    for (s, n2, m) in drained[idx..].iter().rev() {
+                        self.state.reinsert_for_retry(*s, *n2, m.clone());
                     }
                     return Err(SequencerError::Backpressure);
                 }
-                Err(e) => return Err(e),
+                Some(e) => return Err(e),
             }
         }
         Ok(())
