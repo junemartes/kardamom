@@ -4,8 +4,6 @@
 //! (sole-survivor safety); receipt floors unstick a cold-rejoined replica's
 //! buffered run without ever publishing a canonical gap.
 
-use std::sync::Arc;
-
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, U256};
@@ -21,7 +19,6 @@ use kardamom_sequencer::outbound::fakes::{
 };
 use kardamom_sequencer::resync::{FloorUpdate, ResyncConfig, resync_channel};
 use kardamom_sequencer::sequencer::Sequencer;
-use kardamom_sequencer::testing::FakeStateDatabase;
 
 fn signer(seed: u64) -> PrivateKeySigner {
     let mut k = [0u8; 32];
@@ -71,11 +68,8 @@ fn pos(offset: i32) -> BPosition {
 /// A sequencer with resync enabled; returns the floor-update sender. The
 /// controller starts in resync mode (startup trigger), which is exactly the
 /// state these tests exercise.
-fn resync_sequencer() -> (
-    Sequencer<FakeStateDatabase>,
-    std::sync::mpsc::Sender<FloorUpdate>,
-) {
-    let mut seq = Sequencer::new(one_partition_cfg(), Arc::new(FakeStateDatabase::new()));
+fn resync_sequencer() -> (Sequencer, std::sync::mpsc::Sender<FloorUpdate>) {
+    let mut seq = Sequencer::new(one_partition_cfg());
     let (controller, floor_tx, _watermark) = resync_channel(ResyncConfig::default(), 0);
     seq.enable_resync(controller);
     (seq, floor_tx)

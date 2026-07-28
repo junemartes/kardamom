@@ -74,10 +74,7 @@ fn match_publishes_ref() {
     channel_a.queue.push_back((TxDataLoc::new(0, pos(0)), env));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(one_partition_cfg());
 
     assert!(seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
     let refs = b.refs.lock().unwrap();
@@ -99,10 +96,7 @@ fn past_nonce_emits_duplicate_notification() {
         .push_back((TxDataLoc::new(0, pos(64)), env0_dup));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(one_partition_cfg());
 
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
@@ -135,10 +129,7 @@ fn future_nonce_buffered_then_drained() {
         .push_back((TxDataLoc::new(0, pos(64)), env0));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(one_partition_cfg());
 
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     assert_eq!(b.refs.lock().unwrap().len(), 0, "nonce 1 buffered");
@@ -160,10 +151,7 @@ fn b_backpressure_rewinds_state_and_retry_succeeds() {
     let mut b = InMemoryTxOrderingRefPublisher::default();
     *b.fail_with_backpressure.lock().unwrap() = true;
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(one_partition_cfg());
 
     let r = seq.run_once(&mut channel_a, &mut b, &mut rc);
     assert!(matches!(
@@ -185,10 +173,7 @@ fn run_once_returns_false_when_empty() {
     let mut channel_a = ScriptedTxData::default();
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(one_partition_cfg());
     assert!(!seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap());
 }
 
@@ -200,10 +185,7 @@ fn wrong_shard_message_skipped() {
         sequencer_id: 0,
         ..Default::default()
     };
-    let mut seq = Sequencer::new(
-        cfg.clone(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(cfg.clone());
 
     // Find a signer whose address routes to a shard != 0.
     let mut seed = 1u64;
@@ -231,10 +213,7 @@ fn wrong_shard_message_skipped() {
 #[test]
 fn run_loops_until_shutdown_signaled() {
     let cfg = one_partition_cfg();
-    let mut seq = Sequencer::new(
-        cfg,
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(cfg);
     let mut channel_a = ScriptedTxData::default();
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
@@ -246,10 +225,7 @@ fn run_loops_until_shutdown_signaled() {
 #[test]
 fn run_returns_when_channel_a_disconnected() {
     let cfg = one_partition_cfg();
-    let mut seq = Sequencer::new(
-        cfg,
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(cfg);
     let mut channel_a = ScriptedTxData {
         disconnected: true,
         ..Default::default()
@@ -275,10 +251,7 @@ fn single_tx_after_idle_survives_repeated_backpressure_without_new_ingress() {
     let mut b = InMemoryTxOrderingRefPublisher::default();
     *b.fail_with_backpressure.lock().unwrap() = true;
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(
-        one_partition_cfg(),
-        Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(one_partition_cfg());
 
     // Ingress pass hits backpressure; then several ingress-EMPTY passes keep
     // hitting backpressure — each must rewind and keep the ref pending.

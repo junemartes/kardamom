@@ -12,7 +12,7 @@ use alloy_primitives::{Address, B256, Bytes as AlloyBytes};
 use alloy_rlp::Decodable;
 use tokio::sync::broadcast;
 
-use kardamom_types::{BlockBoundary, Receipt, StateDatabase, TxEnvelope, TxError};
+use kardamom_types::{BlockBoundary, Receipt, TxEnvelope, TxError};
 
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::config::IngressConfig;
@@ -78,11 +78,10 @@ pub struct IngressHandle {
 
 /// Composed orchestrator. Cheaply clonable (everything inside is `Arc` or a
 /// trait object behind an `Arc`).
-pub struct IngressProxy<P, S, DB>
+pub struct IngressProxy<P, S>
 where
     P: IngressPublication + Clone,
     S: IngressSubscription + Clone,
-    DB: StateDatabase + 'static,
 {
     pub(crate) cfg: IngressConfig,
     pub(crate) rate_limiter: Arc<PerIpLimiter>,
@@ -107,10 +106,6 @@ where
     /// tx_receipts. Read by `eth_blockNumber`. `AtomicU64` is plenty —
     /// monotonic, single-writer (the BlockBoundary watcher), many readers.
     pub(crate) latest_block_number: Arc<AtomicU64>,
-    /// State-DB handle reserved for `eth_getBalance` / `eth_getTransactionCount`
-    /// (still stubbed pending the S6 reader interface). The receipt path is
-    /// now served entirely from the in-memory [`ReceiptCache`].
-    pub(crate) state_db: Arc<DB>,
     /// Post-dedup receipt re-broadcast: the tx_receipts watcher forwards each
     /// *first-seen* receipt here, so `kardamom_subscribeReceipts` sessions see
     /// exactly one copy per tx rather than the raw N-replica MDS fan-in.
@@ -124,11 +119,10 @@ where
 /// must fall back to `eth_getTransactionReceipt` for the gap.
 const FEED_CAPACITY: usize = 8192;
 
-impl<P, S, DB> Clone for IngressProxy<P, S, DB>
+impl<P, S> Clone for IngressProxy<P, S>
 where
     P: IngressPublication + Clone,
     S: IngressSubscription + Clone,
-    DB: StateDatabase + 'static,
 {
     fn clone(&self) -> Self {
         Self {
@@ -143,20 +137,18 @@ where
             subscription: self.subscription.clone(),
             correlation_seq: self.correlation_seq.clone(),
             latest_block_number: self.latest_block_number.clone(),
-            state_db: self.state_db.clone(),
             receipt_feed: self.receipt_feed.clone(),
             tx_error_feed: self.tx_error_feed.clone(),
         }
     }
 }
 
-impl<P, S, DB> IngressProxy<P, S, DB>
+impl<P, S> IngressProxy<P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
-    pub fn new(cfg: IngressConfig, publication: P, subscription: S, state_db: Arc<DB>) -> Self {
+    pub fn new(cfg: IngressConfig, publication: P, subscription: S) -> Self {
         let rate_limiter = Arc::new(PerIpLimiter::new(
             cfg.rate_limit_per_ip_per_sec,
             cfg.rate_limit_burst,
@@ -181,7 +173,6 @@ where
             subscription,
             correlation_seq: Arc::new(AtomicU64::new(0)),
             latest_block_number: Arc::new(AtomicU64::new(0)),
-            state_db,
             receipt_feed: broadcast::channel(FEED_CAPACITY).0,
             tx_error_feed: broadcast::channel(FEED_CAPACITY).0,
         };
@@ -544,7 +535,6 @@ where
     where
         P: 'static,
         S: 'static,
-        DB: 'static,
     {
         let (jsonrpc_addr, jsonrpc_handle) =
             crate::json_rpc::start_jsonrpc_server(self.clone(), self.cfg.jsonrpc_bind).await?;

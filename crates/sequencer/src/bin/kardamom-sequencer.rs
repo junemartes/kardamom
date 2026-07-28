@@ -6,12 +6,9 @@
 //! blocking thread until SIGTERM / Ctrl-C.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
-use alloy_primitives::{Address, B256, U256};
 use anyhow::{Context, Result};
-use bytes::Bytes;
 use clap::Parser;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
@@ -23,9 +20,7 @@ use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
-use kardamom_types::{
-    BPosition, Deposit, Receipt, StateDatabase, StateError, TxDataLoc, TxEnvelope, TxError,
-};
+use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope, TxError};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -207,12 +202,12 @@ async fn main() -> anyhow::Result<()> {
     let shutdown_for_main = shutdown.clone();
     let shutdown_for_deposits = shutdown.clone();
 
-    let state_db = Arc::new(EmptyStateDatabase);
     tracing::info!(
-        "nonce floors: no committed-state reader wired (EmptyStateDatabase); \
-         cold senders seed at 0. NOTE: a restarted replica does NOT regain \
-         coverage of established senders (F02.1 re-opened — the floor \
-         fast-forward was removed for publishing canonical nonce gaps)"
+        "nonce floors: sequencer holds no state-DB reader; cold senders seed at \
+         0 and committed floors are recovered from the tx_receipts stream via \
+         the receipt-floor resync. NOTE: a restarted replica does NOT regain \
+         coverage of established senders until resync floors catch up (F02.1 \
+         re-opened)"
     );
     let cfg_clone = cfg.clone();
 
@@ -413,7 +408,6 @@ async fn main() -> anyhow::Result<()> {
     // `TxRef` loop and the `DepositRef` pump.
     let (join_main, join_deposits) = spawn_publish_loops(
         cfg_clone,
-        state_db,
         LiveTxDataSub::new(tx_data_sub),
         cluster_pub.clone(),
         cluster_pub,
@@ -489,7 +483,6 @@ type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 #[allow(clippy::too_many_arguments)]
 fn spawn_publish_loops<P>(
     cfg: SequencerConfig,
-    state_db: Arc<EmptyStateDatabase>,
     mut tx_data: LiveTxDataSub,
     main_pub: P,
     deposit_pub: P,
@@ -507,7 +500,7 @@ where
     // responsive for shutdown handling.
     let mut main_pub = main_pub;
     let join_main = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
-        let mut sequencer = Sequencer::new(cfg, state_db);
+        let mut sequencer = Sequencer::new(cfg);
         if let Some(controller) = resync {
             sequencer.enable_resync(controller);
         }
@@ -606,52 +599,6 @@ impl TxErrorPublisher for LiveTxErrorPub {
         if let Err(err) = self.handle.publish(&e) {
             tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Empty StateDatabase: cache-miss hydration always seeds at nonce 0, i.e. a
-// floor that can only LAG the true next nonce (never lead it — so no valid tx
-// is ever spuriously rejected). KNOWN LIMITATION (F02.1, re-opened): a
-// restarted replica buffers established senders' traffic against the stale
-// floor and does not regain coverage of them; the floor fast-forward that
-// closed this was removed for adopting client-abandoned gaps into the
-// canonical stream (fatal to executors). Wiring a real committed-state
-// reader here is the sound fix. Lives in the bin because it's a deployment
-// choice.
-// ---------------------------------------------------------------------------
-
-struct EmptyStateDatabase;
-
-#[derive(Debug)]
-struct EmptyStateError;
-
-impl std::fmt::Display for EmptyStateError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "EmptyStateDatabase: no state available")
-    }
-}
-
-impl std::error::Error for EmptyStateError {}
-impl StateError for EmptyStateError {}
-
-impl StateDatabase for EmptyStateDatabase {
-    type Error = EmptyStateError;
-
-    fn basic(&self, _: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
-        Ok(None)
-    }
-    fn storage(&self, _: Address, _: B256) -> Result<U256, Self::Error> {
-        Ok(U256::ZERO)
-    }
-    fn code_by_hash(&self, _: B256) -> Result<Bytes, Self::Error> {
-        Ok(Bytes::new())
-    }
-    fn get_receipt(&self, _: BPosition) -> Result<Option<Receipt>, Self::Error> {
-        Ok(None)
-    }
-    fn get_tx_position(&self, _: B256) -> Result<Option<BPosition>, Self::Error> {
-        Ok(None)
     }
 }
 

@@ -2,7 +2,6 @@
 //! point with garbage bytes and asserts that `IngressError::RateLimited`
 //! surfaces after the burst is exhausted.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use alloy_primitives::Bytes;
@@ -10,7 +9,7 @@ use nonzero_ext::nonzero;
 
 use kardamom_ingress::config::IngressConfig;
 use kardamom_ingress::error::IngressError;
-use kardamom_ingress::{InMemoryStateDb, IngressProxy, MockChannels};
+use kardamom_ingress::{IngressProxy, MockChannels};
 
 #[tokio::test]
 async fn third_call_from_same_ip_is_rate_limited() {
@@ -20,8 +19,7 @@ async fn third_call_from_same_ip_is_rate_limited() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockChannels::new(8);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
 
     let ip = "10.0.0.7".parse().unwrap();
     let garbage = Bytes::from(vec![0xc0u8]);
@@ -48,8 +46,7 @@ async fn other_ips_unaffected_by_first_ips_throttle() {
         ..IngressConfig::default()
     };
     let (mock, _rx) = MockChannels::new(8);
-    let state_db = Arc::new(InMemoryStateDb::new());
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
+    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
     let garbage = Bytes::from(vec![0xc0u8]);
     let ip_a = "10.0.0.1".parse().unwrap();
     let ip_b = "10.0.0.2".parse().unwrap();

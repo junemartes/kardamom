@@ -86,8 +86,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
     // share one `InMemoryTxOrderingRefPublisher` (cloning shares the
     // underlying Vec — same canonical B stream).
     let b = InMemoryTxOrderingRefPublisher::default();
-    let mut sequencers: Vec<Sequencer<kardamom_sequencer::testing::FakeStateDatabase>> =
-        Vec::with_capacity(M as usize);
+    let mut sequencers: Vec<Sequencer> = Vec::with_capacity(M as usize);
     let mut b_pubs: Vec<InMemoryTxOrderingRefPublisher> = Vec::with_capacity(M as usize);
     let mut rcs: Vec<InMemoryTxErrorPublisher> = Vec::with_capacity(M as usize);
     let mut channels_a: Vec<ScriptedTxData> = (0..M).map(|_| ScriptedTxData::default()).collect();
@@ -103,10 +102,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
             max_pending_per_sender: TX_PER_SENDER as usize * 2,
             ..Default::default()
         };
-        sequencers.push(Sequencer::new(
-            cfg,
-            std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-        ));
+        sequencers.push(Sequencer::new(cfg));
         b_pubs.push(b.clone());
         rcs.push(InMemoryTxErrorPublisher::default());
     }

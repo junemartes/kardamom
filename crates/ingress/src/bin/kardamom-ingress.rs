@@ -14,7 +14,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use clap::Parser;
-use kardamom_ingress::channels::{InMemoryStateDb, IngressPublication, IngressSubscription};
+use kardamom_ingress::channels::{IngressPublication, IngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
 use kardamom_ingress::error::IngressError;
@@ -253,7 +253,6 @@ async fn main() -> Result<()> {
     let subscription =
         LiveIngressSubscription::open(&rt, &channels, args.recorder_id, executor_count)
             .context("open IngressSubscription")?;
-    let state_db = Arc::new(InMemoryStateDb::new());
 
     // Cluster watermark → on-quorum ack gate. In the cluster-only topology there
     // is no standalone sealer publishing the durable watermark; the ingress
@@ -293,7 +292,7 @@ async fn main() -> Result<()> {
         None
     };
 
-    let proxy = IngressProxy::new(cfg, publication, subscription, state_db);
+    let proxy = IngressProxy::new(cfg, publication, subscription);
     let handle = proxy.start().await.context("IngressProxy::start")?;
     tracing::info!(jsonrpc_addr = %handle.jsonrpc_addr, "JSON-RPC listening");
 

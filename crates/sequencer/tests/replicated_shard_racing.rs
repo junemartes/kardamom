@@ -23,7 +23,6 @@
 //!    exactly its twin's suffix instead of zombie-buffering forever.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -42,7 +41,6 @@ use kardamom_sequencer::outbound::fakes::{
 };
 use kardamom_sequencer::partition::partition_for;
 use kardamom_sequencer::sequencer::Sequencer;
-use kardamom_sequencer::testing::FakeStateDatabase;
 
 const SENDERS: usize = 3;
 const TX_PER_SENDER: u64 = 20;
@@ -118,22 +116,18 @@ fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
 }
 
 /// Run one replica over `stream`, returning its published refs.
-fn run_replica(stream: &[(TxDataLoc, TxEnvelope)], db: Arc<FakeStateDatabase>) -> Vec<TxRef> {
-    run_replica_with(shard0_cfg(), stream, db)
+fn run_replica(stream: &[(TxDataLoc, TxEnvelope)]) -> Vec<TxRef> {
+    run_replica_with(shard0_cfg(), stream)
 }
 
-fn run_replica_with(
-    cfg: SequencerConfig,
-    stream: &[(TxDataLoc, TxEnvelope)],
-    db: Arc<FakeStateDatabase>,
-) -> Vec<TxRef> {
+fn run_replica_with(cfg: SequencerConfig, stream: &[(TxDataLoc, TxEnvelope)]) -> Vec<TxRef> {
     let mut inbound = ScriptedTxData::default();
     for (loc, env) in stream {
         inbound.queue.push_back((*loc, env.clone()));
     }
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
-    let mut seq = Sequencer::new(cfg, db);
+    let mut seq = Sequencer::new(cfg);
     while seq.run_once(&mut inbound, &mut b, &mut rc).unwrap() {}
     b.refs.lock().unwrap().clone()
 }
@@ -156,8 +150,8 @@ fn encoded(refs: &[TxRef]) -> Vec<Vec<u8>> {
 #[test]
 fn racing_replicas_emit_identical_ref_streams() {
     let stream = shard_stream();
-    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
-    let b = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+    let a = run_replica(&stream);
+    let b = run_replica(&stream);
 
     assert_eq!(a.len(), stream.len(), "replica A must ref every input tx");
     // Byte-identical wire encoding: whichever replica's copy wins the race,
@@ -168,8 +162,8 @@ fn racing_replicas_emit_identical_ref_streams() {
 #[test]
 fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
     let stream = shard_stream();
-    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
-    let b = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+    let a = run_replica(&stream);
+    let b = run_replica(&stream);
 
     // Session order is preserved per publisher; the cluster may interleave
     // the two sessions arbitrarily BETWEEN records. Model a handful of
@@ -219,48 +213,25 @@ fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
     }
 }
 
-#[test]
-fn cold_rejoining_replica_emits_a_suffix_and_changes_nothing() {
-    let stream = shard_stream();
-    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
-
-    // Replica B (re)starts after the first half was already ordered and
-    // committed: it joins the live stream at the midpoint and hydrates each
-    // sender's nonce floor from committed state (cache-miss path).
-    let half = stream.len() / 2; // round-robin ⇒ every sender at TX_PER_SENDER/2
-    let db = FakeStateDatabase::new();
-    for s in (1..=SENDERS as u64).map(signer) {
-        db.set_nonce(s.address(), TX_PER_SENDER / 2);
-    }
-    let b = run_replica(&stream[half..], Arc::new(db));
-
-    // B's output is exactly A's suffix…
-    assert_eq!(encoded(&b), encoded(&a[half..]));
-    // …so merging it into the canonical stream (A first — its records were
-    // ordered while B was down) adds nothing.
-    let mut interleaved = a.clone();
-    interleaved.extend(b);
-    assert_eq!(encoded(&first_seen_merge(&interleaved)), encoded(&a));
-}
-
 /// F02.1 status pin (RE-OPENED, deliberate): the floor fast-forward was
 /// REMOVED after it published canonical nonce GAPS (CI run 29687514869: all
 /// three executors fatally NonceTooHigh'd in every shard — a sequencer
-/// cannot locally tell a twin-ordered gap from a client-abandoned one). A
-/// replica that rejoins mid-stream with an EMPTY state DB therefore buffers
-/// established senders and emits NOTHING for them — degraded P=1 coverage,
-/// but never canonical corruption. This test pins BOTH properties so a
-/// future fix must consciously flip the first assertion, and can never
-/// regress the second.
+/// cannot locally tell a twin-ordered gap from a client-abandoned one). The
+/// sequencer holds no committed-state reader, so a replica that rejoins
+/// mid-stream seeds established senders at 0, buffers their traffic, and
+/// emits NOTHING for them until the receipt-floor resync (`crate::resync`,
+/// not wired in this harness) advances their floors from the tx_receipts
+/// stream — degraded P=1 coverage, but never canonical corruption. This test
+/// pins the never-corrupts invariant.
 #[test]
 fn rejoining_replica_with_empty_db_stalls_but_never_corrupts() {
     let stream = shard_stream();
-    let a = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+    let a = run_replica(&stream);
 
-    // Replica B restarts and joins at the midpoint with an empty state DB
-    // (production wiring: every floor hydrates at 0).
+    // Replica B restarts and joins at the midpoint: with no state reader every
+    // floor seeds at 0, so it buffers established senders as future nonces.
     let half = stream.len() / 2;
-    let b = run_replica(&stream[half..], Arc::new(FakeStateDatabase::new()));
+    let b = run_replica(&stream[half..]);
 
     // Re-opened limitation: B emits nothing (all traffic buffers as future).
     assert!(
@@ -299,7 +270,7 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
         })
         .collect();
 
-    let refs = run_replica(&stream, Arc::new(FakeStateDatabase::new()));
+    let refs = run_replica(&stream);
 
     // The victim's published nonces are exactly the dense prefix 0..=2 —
     // nothing at or past the hole — and every sender's run is gapless.

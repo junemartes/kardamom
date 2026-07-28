@@ -32,7 +32,7 @@ pub mod seen_receipts;
 pub mod sig_verify;
 pub mod tx_error_dedup;
 
-pub use channels::{InMemoryStateDb, IngressPublication, IngressSubscription, MockChannels};
+pub use channels::{IngressPublication, IngressSubscription, MockChannels};
 pub use config::IngressConfig;
 pub use error::IngressError;
 pub use proxy::{IngressHandle, IngressProxy};

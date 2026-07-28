@@ -19,8 +19,6 @@ use jsonrpsee::server::{PendingSubscriptionSink, Server, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use tokio::sync::broadcast;
 
-use kardamom_types::StateDatabase;
-
 use crate::channels::{IngressPublication, IngressSubscription};
 use crate::error::IngressError;
 use crate::proxy::IngressProxy;
@@ -95,32 +93,29 @@ pub trait IngressKardamomApi {
     async fn subscribe_receipts(&self, senders: Option<Vec<Address>>) -> SubscriptionResult;
 }
 
-pub struct IngressHandlers<P, S, DB>
+pub struct IngressHandlers<P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
-    proxy: IngressProxy<P, S, DB>,
+    proxy: IngressProxy<P, S>,
 }
 
-impl<P, S, DB> IngressHandlers<P, S, DB>
+impl<P, S> IngressHandlers<P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
-    pub fn new(proxy: IngressProxy<P, S, DB>) -> Self {
+    pub fn new(proxy: IngressProxy<P, S>) -> Self {
         Self { proxy }
     }
 }
 
 #[async_trait::async_trait]
-impl<P, S, DB> IngressEthApiServer for IngressHandlers<P, S, DB>
+impl<P, S> IngressEthApiServer for IngressHandlers<P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
     async fn chain_id(&self) -> RpcResult<U256> {
         Ok(U256::from(self.proxy.config().chain_id))
@@ -159,19 +154,18 @@ where
     }
 
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
-        //state-DB `tx_hash_index` lookup. S6 will own the
-        // libmdbx-backed impl; v0 + tests use `InMemoryStateDb`. Returns
+        // Served from the in-memory `ReceiptCache` (populated off the
+        // tx_receipts stream) — the ingress holds no state DB. Returns
         // `null` per JSON-RPC convention if not yet committed.
         Ok(self.proxy.lookup_receipt_by_hash(hash).map(receipt_to_rpc))
     }
 }
 
 #[async_trait::async_trait]
-impl<P, S, DB> IngressKardamomApiServer for IngressHandlers<P, S, DB>
+impl<P, S> IngressKardamomApiServer for IngressHandlers<P, S>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
     async fn send_raw_transaction_async(&self, bytes: Bytes) -> RpcResult<B256> {
         let client_ip = PEER_ADDR
@@ -319,14 +313,13 @@ fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
 /// `ServerHandle` whose drop shuts the server down. An HTTP middleware
 /// extracts the peer IP and stores it in the `PEER_ADDR` task-local for the
 /// duration of each request.
-pub async fn start_jsonrpc_server<P, S, DB>(
-    proxy: IngressProxy<P, S, DB>,
+pub async fn start_jsonrpc_server<P, S>(
+    proxy: IngressProxy<P, S>,
     addr: SocketAddr,
 ) -> Result<(SocketAddr, ServerHandle), IngressError>
 where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
-    DB: StateDatabase + 'static,
 {
     // A parked submit_raw holds its connection until the receipt arrives, so
     // the connection cap — not the handler — becomes the throughput limit the
@@ -420,13 +413,12 @@ mod peer_addr_layer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::channels::{InMemoryStateDb, MockChannels};
+    use crate::channels::MockChannels;
     use crate::config::IngressConfig;
     use crate::proxy::IngressProxy;
     use jsonrpsee::core::client::ClientT;
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::rpc_params;
-    use std::sync::Arc;
 
     #[tokio::test]
     async fn chain_id_round_trips() {
@@ -435,8 +427,7 @@ mod tests {
             ..IngressConfig::default()
         };
         let (mock, _rx) = MockChannels::new(8);
-        let state_db = Arc::new(InMemoryStateDb::new());
-        let proxy = IngressProxy::new(cfg, mock.clone(), mock, state_db);
+        let proxy = IngressProxy::new(cfg, mock.clone(), mock);
         let bind: SocketAddr = "127.0.0.1:0".parse().unwrap();
         let (local, handle) = start_jsonrpc_server(proxy, bind).await.unwrap();
         let client = HttpClientBuilder::default()

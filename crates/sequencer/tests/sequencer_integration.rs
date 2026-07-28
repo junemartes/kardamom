@@ -74,10 +74,7 @@ fn integration_1000_txs_100_senders_with_chaos() {
         max_pending_per_sender: 16,
         ..Default::default()
     };
-    let mut seq = Sequencer::new(
-        cfg.clone(),
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(cfg.clone());
 
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xDEAD_BEEF);
     let signers: Vec<_> = (1..=100u64).map(signer).collect();
@@ -164,10 +161,7 @@ fn integration_duplicates_are_reported() {
         max_pending_per_sender: 4,
         ..Default::default()
     };
-    let mut seq = Sequencer::new(
-        cfg,
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(cfg);
     let s = signer(7);
     let mut channel_a = ScriptedTxData::default();
     channel_a
@@ -221,10 +215,7 @@ fn integration_bounded_buffer_evicts_oldest() {
         max_pending_per_sender: 4,
         ..Default::default()
     };
-    let mut seq = Sequencer::new(
-        cfg,
-        std::sync::Arc::new(kardamom_sequencer::testing::FakeStateDatabase::new()),
-    );
+    let mut seq = Sequencer::new(cfg);
     let s = signer(42);
     let mut channel_a = ScriptedTxData::default();
     for n in 100..110u64 {
