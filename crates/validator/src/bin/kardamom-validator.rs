@@ -417,10 +417,6 @@ async fn main() -> Result<()> {
     }
 
     let mut cfg = ExecutorConfig {
-        // #109/#113: the validator does NOT persist receipts — no reads hit
-        // its DB, and the per-block writes widened its BAL-lapse rate at the
-        // keep-up margin.
-        persist_receipts: false,
         chain_id,
         ..ExecutorConfig::default()
     };

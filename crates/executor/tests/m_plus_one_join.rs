@@ -281,7 +281,6 @@ fn m4_canonical_b_order_drives_receipts() {
 
     let (c_tx, c_rx) = bounded::<CMessage>(512);
     let cfg = ExecutorConfig {
-        persist_receipts: true,
         chain_id: 1,
         receipt_queue_depth: 512,
         ..Default::default()
@@ -452,7 +451,6 @@ fn tx_ref_arriving_before_envelope_still_joins() {
 
     // Give the tx_ordering reader's join wait enough headroom even on slow CI.
     let cfg = ExecutorConfig {
-        persist_receipts: true,
         chain_id: 1,
         receipt_queue_depth: 8,
         reader: ReaderConfig {
