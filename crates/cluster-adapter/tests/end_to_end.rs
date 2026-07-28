@@ -11,7 +11,7 @@
 
 use std::collections::{HashSet, VecDeque};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use kardamom_cluster_adapter::gateway::fakes::{FakeEgress, FakeIngress};
 use kardamom_cluster_adapter::wire::{encode_egress_boundary, encode_egress_record, split_ingress};
 use kardamom_executor::reader::TxOrderingSubscription;
@@ -91,10 +91,11 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
     let ingress = FakeIngress::new();
     let mut publisher = ClusterRefPublisher::new(ingress.clone());
     let (a, b, c) = (txref(0xA1), txref(0xB2), txref(0xC3));
-    publisher.try_publish_ref(&a).unwrap();
-    publisher.try_publish_ref(&b).unwrap();
-    publisher.try_publish_ref(&a).unwrap(); // duplicate
-    publisher.try_publish_ref(&c).unwrap();
+    let sender = Address::repeat_byte(0x5A);
+    publisher.try_publish_ref(&a, sender, 0).unwrap();
+    publisher.try_publish_ref(&b, sender, 1).unwrap();
+    publisher.try_publish_ref(&a, sender, 0).unwrap(); // duplicate (republish)
+    publisher.try_publish_ref(&c, sender, 2).unwrap();
 
     // Run the service mock over the ingress, then stamp a boundary.
     let mut service = MockService::new(1024);

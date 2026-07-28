@@ -240,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
     //  2. receipts thread: tx_receipts → per-sender executed-truth floors
     //     (only this shard's senders).
     //  3. the controller itself, handed to the Sequencer via enable_resync.
-    let (resync_controller, floor_tx, watermark) =
+    let (resync_controller, floor_tx, reject_tx, watermark) =
         kardamom_sequencer::resync::resync_channel(cfg.resync.clone(), cfg.partition_index);
 
     // The FEED thread is the silence authority: it measures BOUNDARY-ARRIVAL
@@ -293,6 +293,30 @@ async fn main() -> anyhow::Result<()> {
                 loop {
                     match egress.recv_timeout(Duration::from_millis(500)) {
                         EgressPoll::Frame(frame) => {
+                            // #85 fix B: the sealer rejected one of OUR refs
+                            // because a known sender's nonce was not the
+                            // expected next one — forward (sender, expected)
+                            // to the publish loop, which rewinds the
+                            // unconfirmed ledger and republishes immediately
+                            // instead of waiting out the confirm timeout.
+                            if frame.first() == Some(&wire::EGRESS_KIND_CONTIGUITY_REJECT) {
+                                if let Ok(EgressItem::ContiguityReject {
+                                    sender,
+                                    nonce,
+                                    expected,
+                                }) = decode_egress(&frame)
+                                {
+                                    tracing::warn!(
+                                        partition,
+                                        ?sender,
+                                        nonce,
+                                        expected,
+                                        "sealer contiguity reject received"
+                                    );
+                                    let _ = reject_tx.send((sender, nonce, expected));
+                                }
+                                continue;
+                            }
                             // Cheap kind check FIRST: relayed records arrive
                             // at full line rate on every replica, and fully
                             // decoding them here just to discard them is

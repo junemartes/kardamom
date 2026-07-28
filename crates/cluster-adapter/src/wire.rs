@@ -5,14 +5,19 @@
 //!
 //! **Ingress** (Rust sequencer → cluster), one app message per record:
 //! ```text
-//!   [kind:u8 = 0][canonical_id:32][record_type:u8][fields…]
+//!   [kind:u8 = 0][sender:20][nonce:u64 LE][canonical_id:32][record_type:u8][fields…]
 //!     TxRef       fields = [shard_id:u8][tx_data_position.term_id:i32][.term_offset:i32][tx_data_session_id:i32]
 //!     DepositRef  fields = [deposit_position.term_id:i32][.term_offset:i32]
 //! ```
-//! The Java service parses ONLY `canonical_id` (at the fixed offset) for dedup
-//! and relays everything from `canonical_id` onward verbatim — it never inspects
-//! `record_type`/`fields`. So the **relayed payload** is
-//! `[canonical_id:32][record_type:u8][fields…]`.
+//! The Java service parses `sender`/`nonce` for the per-sender contiguity
+//! guard (#85 fix B: a known sender's ref whose nonce is not the expected
+//! next one is REJECTED with [`EGRESS_KIND_CONTIGUITY_REJECT`] instead of
+//! silently sealing a canonical nonce gap) and `canonical_id` (at its fixed
+//! offset) for dedup, then relays everything from `canonical_id` onward
+//! verbatim — it never inspects `record_type`/`fields`. The guard header
+//! sits BEFORE the canonical id precisely so the **relayed payload** stays
+//! `[canonical_id:32][record_type:u8][fields…]` — executors are untouched.
+//! An all-zero sender is guard-exempt (deposits carry no sender nonce).
 //!
 //! **Egress** (cluster → Rust executor):
 //! ```text
@@ -22,7 +27,7 @@
 //! `index` is the 0-based canonical record index assigned by the leader's
 //! replicated state machine; the executor maps it to `BPosition::from_index`.
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef};
 use thiserror::Error;
 
@@ -35,12 +40,13 @@ pub const KIND_SUBSCRIBE: u8 = 2;
 /// Ingress kind: a batch of ingress records
 /// `[kind:u8 = 3][count:u16 LE][per entry: len:u32 LE + entry bytes]`, where
 /// each entry is a complete single-record ingress frame
-/// (`[kind:u8 = 0][canonical_id:32][payload…]`). One cluster offer carries
-/// the whole batch; the service unpacks and processes entries exactly like
-/// individually-offered records, so consensus determinism, dedup, and the
-/// egress format are all unchanged — batching is purely an ingress-transport
-/// amortization (~51-byte refs each previously paid a full offer round trip).
-/// Matches Java `KIND_BATCH`.
+/// (`[kind:u8 = 0][sender:20][nonce:u64][canonical_id:32][payload…]`). One
+/// cluster offer carries the whole batch; the service unpacks and processes
+/// entries exactly like individually-offered records, so consensus
+/// determinism, dedup, the contiguity guard and the egress format are all
+/// unchanged — batching is purely an ingress-transport amortization
+/// (~75-byte refs each previously paid a full offer round trip). Matches
+/// Java `KIND_BATCH`.
 pub const KIND_BATCH: u8 = 3;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >= from_index`
@@ -61,6 +67,14 @@ pub const EGRESS_KIND_REPLAY_UNAVAILABLE: u8 = 3;
 /// (exclusive: the NEXT live record index / boundary block at completion time).
 /// The consumer exits catch-up ordering mode. Matches Java `EGRESS_KIND_REPLAY_DONE`.
 pub const EGRESS_KIND_REPLAY_DONE: u8 = 4;
+/// Egress kind: contiguity reject (#85 fix B) — a known sender's ingress
+/// record carried a nonce other than the expected next one, so sealing it
+/// would commit a canonical nonce gap:
+/// `[kind:u8 = 5][sender:20][nonce:u64][expected:u64]`. Sent to the OFFERING
+/// session only; the sequencer rewinds its unconfirmed ledger to `expected`
+/// and republishes (#114's machinery), converting a silent gap into a
+/// recoverable signal. Matches Java `EGRESS_KIND_CONTIGUITY_REJECT`.
+pub const EGRESS_KIND_CONTIGUITY_REJECT: u8 = 5;
 
 /// Record discriminant inside the relayed payload.
 pub const RT_TXREF: u8 = 0;
@@ -68,6 +82,14 @@ pub const RT_DEPOSITREF: u8 = 1;
 
 /// Canonical id length (a 32-byte hash). Matches Java `CANONICAL_ID_LEN`.
 pub const CANONICAL_ID_LEN: usize = 32;
+
+/// Sender address length in the ingress guard header. Matches Java `SENDER_LEN`.
+pub const SENDER_LEN: usize = 20;
+/// Ingress record layout offsets. Matches Java `SENDER_OFFSET` /
+/// `NONCE_OFFSET` / `CANONICAL_ID_OFFSET` in `SealerClusteredService`.
+pub const INGRESS_SENDER_OFFSET: usize = 1;
+pub const INGRESS_NONCE_OFFSET: usize = INGRESS_SENDER_OFFSET + SENDER_LEN;
+pub const INGRESS_CANONICAL_ID_OFFSET: usize = INGRESS_NONCE_OFFSET + 8;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum WireError {
@@ -83,10 +105,14 @@ pub enum WireError {
 
 // ── encode (ingress: Rust → cluster) ────────────────────────────────────────
 
-/// Encode a `TxRef` as an ingress app message.
-pub fn encode_ingress_txref(r: &TxRef) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 1 + 1 + 8 + 4);
+/// Encode a `TxRef` as an ingress app message. `sender`/`nonce` feed the
+/// service's per-sender contiguity guard (#85 fix B) and are NOT part of the
+/// relayed payload — executors never see them.
+pub fn encode_ingress_txref(r: &TxRef, sender: Address, nonce: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 1 + 8 + 4);
     b.push(KIND_INGRESS_RECORD);
+    b.extend_from_slice(sender.as_slice()); // sender (20)
+    b.extend_from_slice(&nonce.to_le_bytes());
     b.extend_from_slice(r.tx_hash.as_slice()); // canonical_id (32)
     b.push(RT_TXREF);
     b.push(r.shard_id);
@@ -97,10 +123,13 @@ pub fn encode_ingress_txref(r: &TxRef) -> Vec<u8> {
     b
 }
 
-/// Encode a `DepositRef` as an ingress app message.
+/// Encode a `DepositRef` as an ingress app message. Deposits carry no sender
+/// nonce; the all-zero sender marks the record guard-exempt.
 pub fn encode_ingress_depositref(r: &DepositRef) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 1 + 8);
+    let mut b = Vec::with_capacity(INGRESS_CANONICAL_ID_OFFSET + CANONICAL_ID_LEN + 1 + 8);
     b.push(KIND_INGRESS_RECORD);
+    b.extend_from_slice(Address::ZERO.as_slice()); // guard-exempt sender
+    b.extend_from_slice(&0u64.to_le_bytes());
     b.extend_from_slice(r.source_hash.as_slice()); // canonical_id (32)
     b.push(RT_DEPOSITREF);
     b.extend_from_slice(&r.deposit_position.term_id.to_le_bytes());
@@ -124,6 +153,14 @@ pub enum EgressItem {
     },
     /// Replay complete up to (exclusive) the given live cursor.
     ReplayDone { up_to_index: u64, up_to_block: u64 },
+    /// Contiguity reject (#85 fix B): the service refused to seal `sender`'s
+    /// ref at `nonce` because it expected `expected` — republish from
+    /// `expected` (the unconfirmed ledger holds the missing refs).
+    ContiguityReject {
+        sender: Address,
+        nonce: u64,
+        expected: u64,
+    },
 }
 
 pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
@@ -166,6 +203,18 @@ pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
             up_to_index: rd_u64(buf, 1)?,
             up_to_block: rd_u64(buf, 9)?,
         }),
+        EGRESS_KIND_CONTIGUITY_REJECT => {
+            let sender = buf.get(1..1 + SENDER_LEN).ok_or(WireError::TooShort {
+                at: 1,
+                need: SENDER_LEN,
+                have: buf.len().saturating_sub(1),
+            })?;
+            Ok(EgressItem::ContiguityReject {
+                sender: Address::from_slice(sender),
+                nonce: rd_u64(buf, 1 + SENDER_LEN)?,
+                expected: rd_u64(buf, 1 + SENDER_LEN + 8)?,
+            })
+        }
         other => Err(WireError::BadEgressKind(other)),
     }
 }
@@ -261,6 +310,16 @@ pub fn encode_replay_done(up_to_index: u64, up_to_block: u64) -> Vec<u8> {
     b
 }
 
+/// Frame a contiguity reject exactly as the Java service does.
+pub fn encode_contiguity_reject(sender: Address, nonce: u64, expected: u64) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + SENDER_LEN + 8 + 8);
+    b.push(EGRESS_KIND_CONTIGUITY_REJECT);
+    b.extend_from_slice(sender.as_slice());
+    b.extend_from_slice(&nonce.to_le_bytes());
+    b.extend_from_slice(&expected.to_le_bytes());
+    b
+}
+
 /// Decode a relayed payload `[canonical_id:32][record_type:u8][fields…]` into a
 /// `TxOrderingMessage` (the original `tx_data`/`deposit` position is recovered;
 /// the canonical L2 position is assigned by the caller from `index`).
@@ -337,14 +396,17 @@ pub fn encode_egress_boundary(block_number: u64, end_tx_idx: u64, l2_timestamp: 
 
 /// The `(canonical_id, relayed_payload)` a cluster service extracts from an
 /// ingress message — `relayed_payload` is everything from `canonical_id`
-/// onward (what the Java service forwards to egress). Used by the in-Rust
-/// service mock in tests.
+/// onward (what the Java service forwards to egress); the guard header
+/// (`sender`/`nonce`) before it is consumed by the service and never
+/// relayed. Used by the in-Rust service mock in tests.
 pub fn split_ingress(buf: &[u8]) -> Result<([u8; 32], &[u8]), WireError> {
-    let payload = buf.get(1..).ok_or(WireError::TooShort {
-        at: 1,
-        need: 0,
-        have: 0,
-    })?;
+    let payload = buf
+        .get(INGRESS_CANONICAL_ID_OFFSET..)
+        .ok_or(WireError::TooShort {
+            at: INGRESS_CANONICAL_ID_OFFSET,
+            need: 0,
+            have: buf.len(),
+        })?;
     let cid: [u8; 32] = payload
         .get(0..CANONICAL_ID_LEN)
         .ok_or(WireError::TooShort {
@@ -355,6 +417,23 @@ pub fn split_ingress(buf: &[u8]) -> Result<([u8; 32], &[u8]), WireError> {
         .try_into()
         .unwrap();
     Ok((cid, payload))
+}
+
+/// The `(sender, nonce)` guard header of an ingress record frame — what the
+/// Java service feeds the per-sender contiguity guard. Used by tests and the
+/// in-Rust service mock.
+pub fn ingress_sender_nonce(buf: &[u8]) -> Result<(Address, u64), WireError> {
+    let sender = buf
+        .get(INGRESS_SENDER_OFFSET..INGRESS_SENDER_OFFSET + SENDER_LEN)
+        .ok_or(WireError::TooShort {
+            at: INGRESS_SENDER_OFFSET,
+            need: SENDER_LEN,
+            have: buf.len().saturating_sub(INGRESS_SENDER_OFFSET),
+        })?;
+    Ok((
+        Address::from_slice(sender),
+        rd_u64(buf, INGRESS_NONCE_OFFSET)?,
+    ))
 }
 
 // ── byte helpers ────────────────────────────────────────────────────────────
@@ -409,12 +488,15 @@ mod tests {
         )
     }
 
-    /// Ingress → (service relays from offset 1) → egress → decode reproduces the TxRef.
+    /// Ingress → (service relays from the canonical id) → egress → decode
+    /// reproduces the TxRef; the guard header is consumed, not relayed.
     #[test]
     fn txref_ingress_relay_egress_roundtrip() {
         let r = txref();
-        let ingress = encode_ingress_txref(&r);
-        // Mirror the Java service: parse the id, relay the payload (offset 1..).
+        let sender = Address::repeat_byte(0x42);
+        let ingress = encode_ingress_txref(&r, sender, 7);
+        assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (sender, 7));
+        // Mirror the Java service: parse the id, relay from the canonical id.
         let (cid, relayed) = split_ingress(&ingress).unwrap();
         assert_eq!(cid, r.tx_hash.0);
         let egress = encode_egress_record(5, relayed);
@@ -431,6 +513,8 @@ mod tests {
     fn depositref_ingress_relay_egress_roundtrip() {
         let r = depositref();
         let ingress = encode_ingress_depositref(&r);
+        // Deposits carry the guard-exempt zero sender.
+        assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (Address::ZERO, 0));
         let (cid, relayed) = split_ingress(&ingress).unwrap();
         assert_eq!(cid, r.source_hash.0);
         let egress = encode_egress_record(8, relayed);
@@ -457,16 +541,42 @@ mod tests {
     }
 
     #[test]
-    fn ingress_layout_is_kind_then_id_then_fields() {
+    fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
         let r = txref();
-        let b = encode_ingress_txref(&r);
+        let sender = Address::repeat_byte(0x42);
+        let b = encode_ingress_txref(&r, sender, 0x0102_0304_0506_0708);
         assert_eq!(b[0], KIND_INGRESS_RECORD);
-        assert_eq!(&b[1..33], r.tx_hash.as_slice());
-        assert_eq!(b[33], RT_TXREF);
-        assert_eq!(b[34], 3); // shard_id
-        // The relayed payload (offset 1..) begins with the canonical id.
+        assert_eq!(&b[1..21], sender.as_slice());
+        assert_eq!(
+            b[21..29],
+            0x0102_0304_0506_0708u64.to_le_bytes(),
+            "nonce is little-endian at offset 21 (Java NONCE_OFFSET)"
+        );
+        assert_eq!(&b[29..61], r.tx_hash.as_slice());
+        assert_eq!(b[61], RT_TXREF);
+        assert_eq!(b[62], 3); // shard_id
+        // The relayed payload begins with the canonical id — the guard
+        // header never reaches the executors.
         let (_cid, relayed) = split_ingress(&b).unwrap();
         assert_eq!(&relayed[0..32], r.tx_hash.as_slice());
+    }
+
+    #[test]
+    fn contiguity_reject_roundtrip() {
+        let sender = Address::repeat_byte(0x99);
+        let b = encode_contiguity_reject(sender, 12, 8);
+        match decode_egress(&b).unwrap() {
+            EgressItem::ContiguityReject {
+                sender: s,
+                nonce,
+                expected,
+            } => {
+                assert_eq!(s, sender);
+                assert_eq!(nonce, 12);
+                assert_eq!(expected, 8);
+            }
+            other => panic!("expected ContiguityReject, got {other:?}"),
+        }
     }
 
     #[test]
@@ -475,7 +585,7 @@ mod tests {
         assert_eq!(b[0], KIND_REPLAY_REQUEST);
         assert_eq!(decode_replay_request(&b).unwrap(), (1234, 56));
         // A record ingress message is NOT a replay request.
-        assert!(decode_replay_request(&encode_ingress_txref(&txref())).is_err());
+        assert!(decode_replay_request(&encode_ingress_txref(&txref(), Address::ZERO, 0)).is_err());
     }
 
     #[test]

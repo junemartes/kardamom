@@ -3,7 +3,9 @@ package io.kardamom.sealer;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -21,9 +23,15 @@ import java.util.Optional;
  *   <li><b>Dedup</b> — a bounded, FIFO-evicted first-seen window over 32-byte
  *       canonical ids ({@link #firstSeen(byte[])}), mirroring Rust
  *       {@code DedupWindow}/{@code CanonicalDedup}.</li>
- *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[])} relays each
- *       first-seen record with its 0-based index and bumps {@code canonicalCount};
- *       duplicates are dropped and never counted.</li>
+ *   <li><b>Canonical count</b> — {@link #onRecord(byte[], byte[], long, byte[])}
+ *       relays each first-seen record with its 0-based index and bumps
+ *       {@code canonicalCount}; duplicates are dropped and never counted.</li>
+ *   <li><b>Contiguity guard</b> (#85 fix B) — a bounded per-sender
+ *       expected-nonce map. A known sender's first-seen record whose nonce is
+ *       not the expected next one is REJECTED (never counted, never deduped)
+ *       so a voided-offer gap surfaces as a recoverable signal instead of a
+ *       silently sealed canonical nonce gap. Unknown senders seed at any
+ *       nonce; the all-zero sender (deposits) is exempt.</li>
  *   <li><b>Boundaries</b> — {@link #onTick(long)} stamps a {@link Boundary} with
  *       the current count and a 250 ms-floored timestamp, then advances the
  *       block number.</li>
@@ -39,11 +47,15 @@ public final class CanonicalSealerState {
     /** Length, in bytes, of a canonical id (a 32-byte hash). */
     public static final int CANONICAL_ID_LEN = 32;
 
+    /** Length, in bytes, of a sender address in the contiguity guard. */
+    public static final int SENDER_LEN = 20;
+
     /** Default genesis block number. */
     public static final long GENESIS_BLOCK_NUMBER = 1L;
 
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
-    private static final int SNAPSHOT_VERSION = 1;
+    /** v2 appends the contiguity-guard sender map; v1 snapshots still load. */
+    private static final int SNAPSHOT_VERSION = 2;
 
     /**
      * FIFO first-seen window. Insertion-ordered, so the oldest inserted id is
@@ -53,6 +65,20 @@ public final class CanonicalSealerState {
      */
     private final LinkedHashSet<ByteBuffer> dedup;
     private final int dedupCapacity;
+
+    /**
+     * Per-sender expected next nonce (#85 fix B), LRU-bounded at the dedup
+     * capacity (one shared knob all members already must agree on; ~5MB at
+     * the 1&lt;&lt;17 default). DETERMINISM: access-ordered, mutated only by
+     * the replicated record sequence, and snapshotted in iteration order, so
+     * every member holds the identical map AND identical eviction order. The
+     * eviction floor is honest degradation: an evicted sender that reappears
+     * is treated as unknown and re-seeds at whatever nonce arrives (its gap
+     * protection restarts there) — the same trust-on-first-sight as a brand
+     * new sender, never a false reject. Keys are 20-byte senders wrapped in
+     * read-only {@link ByteBuffer}s for value-based equality.
+     */
+    private final LinkedHashMap<ByteBuffer, Long> expectedNonce;
 
     /** Cumulative count of canonical (first-seen) records relayed. */
     private long canonicalCount;
@@ -71,6 +97,12 @@ public final class CanonicalSealerState {
         }
         this.dedupCapacity = dedupCapacity;
         this.dedup = new LinkedHashSet<>();
+        this.expectedNonce = new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(final Map.Entry<ByteBuffer, Long> eldest) {
+                return size() > dedupCapacity;
+            }
+        };
         this.canonicalCount = 0L;
         this.blockNumber = initialBlockNumber;
     }
@@ -86,39 +118,121 @@ public final class CanonicalSealerState {
      * @param id32 a 32-byte canonical id (defensively copied)
      */
     public boolean firstSeen(byte[] id32) {
+        checkId(id32);
+        // Defensive copy so the caller's array can't mutate a stored key.
+        ByteBuffer key = ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
+        if (dedup.contains(key)) {
+            return false; // already present
+        }
+        insertFresh(key);
+        return true;
+    }
+
+    private static void checkId(byte[] id32) {
         if (id32 == null || id32.length != CANONICAL_ID_LEN) {
             throw new IllegalArgumentException(
                     "canonical id must be " + CANONICAL_ID_LEN + " bytes, got "
                             + (id32 == null ? "null" : id32.length));
         }
-        // Defensive copy so the caller's array can't mutate a stored key.
-        ByteBuffer key = ByteBuffer.wrap(id32.clone()).asReadOnlyBuffer();
-        if (!dedup.add(key)) {
-            return false; // already present
-        }
+    }
+
+    /** Insert a NOT-present key into the dedup window, FIFO-evicting. */
+    private void insertFresh(ByteBuffer key) {
+        dedup.add(key);
         if (dedup.size() > dedupCapacity) {
             Iterator<ByteBuffer> it = dedup.iterator();
             it.next(); // oldest inserted (FIFO front)
             it.remove();
         }
-        return true;
     }
 
     /**
-     * Process one application record. If {@code canonicalId32} is a duplicate the
-     * record is dropped and nothing is counted ({@link Optional#empty()}).
-     * Otherwise it is relayed: the returned {@link Relayed} carries the current
-     * 0-based {@code canonicalCount} as its index, after which the count is bumped.
+     * Outcome of {@link #onRecord(byte[], byte[], long, byte[])}: exactly one
+     * of dropped-duplicate ({@code relayed} empty, not rejected), relayed
+     * ({@code relayed} present), or contiguity-rejected ({@code rejected}
+     * true, {@code expectedNonce} carries the nonce the guard wanted).
+     */
+    public static final class RecordOutcome {
+        public final Optional<Relayed> relayed;
+        public final boolean rejected;
+        public final long expectedNonce;
+
+        private RecordOutcome(Optional<Relayed> relayed, boolean rejected, long expectedNonce) {
+            this.relayed = relayed;
+            this.rejected = rejected;
+            this.expectedNonce = expectedNonce;
+        }
+
+        static RecordOutcome duplicate() {
+            return new RecordOutcome(Optional.empty(), false, 0L);
+        }
+
+        static RecordOutcome relayed(Relayed r) {
+            return new RecordOutcome(Optional.of(r), false, 0L);
+        }
+
+        static RecordOutcome rejected(long expectedNonce) {
+            return new RecordOutcome(Optional.empty(), true, expectedNonce);
+        }
+    }
+
+    /**
+     * Process one application record.
+     *
+     * <p>Order matters (#85 fix B interplay with the #114 republish ledger):
+     * the dedup check runs FIRST, so a re-offered copy of a record that
+     * already committed is absorbed as a duplicate BEFORE the contiguity
+     * guard sees its (by then stale) nonce. Then, for a non-zero sender, the
+     * guard: a known sender whose nonce is not the expected next one is
+     * REJECTED — no dedup insert (the sequencer republishes the same
+     * canonical id after recovering the gap, and it must then be accepted as
+     * fresh), no count, no relay. Unknown senders (first sight, or evicted
+     * from the bounded map) seed at whatever nonce arrives.</p>
      *
      * <p>{@code payload} is relayed VERBATIM and is never parsed.</p>
      */
-    public Optional<Relayed> onRecord(byte[] canonicalId32, byte[] payload) {
-        if (!firstSeen(canonicalId32)) {
-            return Optional.empty();
+    public RecordOutcome onRecord(byte[] canonicalId32, byte[] sender20, long nonce, byte[] payload) {
+        checkId(canonicalId32);
+        if (sender20 == null || sender20.length != SENDER_LEN) {
+            throw new IllegalArgumentException(
+                    "sender must be " + SENDER_LEN + " bytes, got "
+                            + (sender20 == null ? "null" : sender20.length));
         }
+        ByteBuffer key = ByteBuffer.wrap(canonicalId32.clone()).asReadOnlyBuffer();
+        if (dedup.contains(key)) {
+            return RecordOutcome.duplicate();
+        }
+        if (!isZeroSender(sender20)) {
+            ByteBuffer senderKey = ByteBuffer.wrap(sender20.clone()).asReadOnlyBuffer();
+            Long expected = expectedNonce.get(senderKey);
+            if (expected != null && expected.longValue() != nonce) {
+                return RecordOutcome.rejected(expected.longValue());
+            }
+            expectedNonce.put(senderKey, nonce + 1);
+        }
+        insertFresh(key);
         long index = canonicalCount;
         canonicalCount++;
-        return Optional.of(new Relayed(index, payload));
+        return RecordOutcome.relayed(new Relayed(index, payload));
+    }
+
+    /**
+     * Guard-exempt record processing (no sender identity — the pre-guard
+     * contract, kept for deposits-only callers and the existing tests).
+     * Equivalent to {@link #onRecord(byte[], byte[], long, byte[])} with the
+     * all-zero sender.
+     */
+    public Optional<Relayed> onRecord(byte[] canonicalId32, byte[] payload) {
+        return onRecord(canonicalId32, new byte[SENDER_LEN], 0L, payload).relayed;
+    }
+
+    private static boolean isZeroSender(byte[] sender20) {
+        for (byte b : sender20) {
+            if (b != 0) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /**
@@ -156,18 +270,45 @@ public final class CanonicalSealerState {
         return dedup.size();
     }
 
+    /** Current number of senders tracked by the contiguity guard. */
+    public int trackedSenders() {
+        return expectedNonce.size();
+    }
+
+    /**
+     * The guard's expected next nonce for {@code sender20}, or empty if
+     * untracked. Iteration-based on purpose: a {@code get} on the
+     * access-ordered map would reorder the LRU — this accessor is for tests
+     * and member-local observability, which must NOT perturb the replicated
+     * eviction order.
+     */
+    public Optional<Long> expectedNonceOf(byte[] sender20) {
+        ByteBuffer key = ByteBuffer.wrap(sender20).asReadOnlyBuffer();
+        for (Map.Entry<ByteBuffer, Long> e : expectedNonce.entrySet()) {
+            if (e.getKey().equals(key)) {
+                return Optional.of(e.getValue());
+            }
+        }
+        return Optional.empty();
+    }
+
     /**
      * Serialise the full state: dedup ids (32 bytes each, in FIFO/insertion
-     * order), {@code canonicalCount} and {@code blockNumber}. The capacity is NOT
-     * encoded — it is supplied at {@link #load(byte[], int)} time (matching the
-     * cluster's configured window).
+     * order), {@code canonicalCount}, {@code blockNumber} and (v2) the
+     * contiguity-guard sender map in LRU iteration order (eldest first, so a
+     * restore rebuilds the identical eviction order). The capacity is NOT
+     * encoded — it is supplied at {@link #load(byte[], int)} time (matching
+     * the cluster's configured window).
      *
      * <p>Layout (big-endian): magic(4) | version(4) | canonicalCount(8) |
-     * blockNumber(8) | idCount(4) | idCount * 32 bytes.</p>
+     * blockNumber(8) | idCount(4) | idCount * 32 | senderCount(4) |
+     * senderCount * (sender 20 + expectedNonce 8).</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
-        int size = 4 + 4 + 8 + 8 + 4 + idCount * CANONICAL_ID_LEN;
+        int senderCount = expectedNonce.size();
+        int size = 4 + 4 + 8 + 8 + 4 + idCount * CANONICAL_ID_LEN
+                + 4 + senderCount * (SENDER_LEN + 8);
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -180,6 +321,15 @@ public final class CanonicalSealerState {
             byte[] raw = new byte[CANONICAL_ID_LEN];
             dup.get(raw);
             buf.put(raw);
+        }
+        buf.putInt(senderCount);
+        for (Map.Entry<ByteBuffer, Long> e : expectedNonce.entrySet()) {
+            ByteBuffer dup = e.getKey().duplicate();
+            dup.rewind();
+            byte[] raw = new byte[SENDER_LEN];
+            dup.get(raw);
+            buf.put(raw);
+            buf.putLong(e.getValue());
         }
         return buf.array();
     }
@@ -198,7 +348,7 @@ public final class CanonicalSealerState {
                     "bad snapshot magic: 0x" + Integer.toHexString(magic));
         }
         int version = buf.getInt();
-        if (version != SNAPSHOT_VERSION) {
+        if (version != 1 && version != SNAPSHOT_VERSION) {
             throw new IllegalArgumentException("unsupported snapshot version: " + version);
         }
         long canonicalCount = buf.getLong();
@@ -231,6 +381,31 @@ public final class CanonicalSealerState {
             // snapshot already reflects a window within capacity.
             state.dedup.add(ByteBuffer.wrap(raw).asReadOnlyBuffer());
         }
+        if (version >= 2) {
+            int senderCount = buf.getInt();
+            if (senderCount < 0 || senderCount > dedupCapacity) {
+                throw new IllegalArgumentException(
+                        "snapshot senderCount " + senderCount + " outside [0, capacity="
+                                + dedupCapacity + "] — members must agree on the configured window");
+            }
+            if ((long) senderCount * (SENDER_LEN + 8) > buf.remaining()) {
+                throw new IllegalArgumentException(
+                        "truncated snapshot: senderCount " + senderCount + " needs "
+                                + ((long) senderCount * (SENDER_LEN + 8)) + " bytes, only "
+                                + buf.remaining() + " remaining");
+            }
+            for (int i = 0; i < senderCount; i++) {
+                byte[] raw = new byte[SENDER_LEN];
+                buf.get(raw);
+                long expected = buf.getLong();
+                // put() into the fresh access-ordered map in snapshot order
+                // (eldest first) rebuilds the identical LRU order.
+                state.expectedNonce.put(ByteBuffer.wrap(raw).asReadOnlyBuffer(), expected);
+            }
+        }
+        // A v1 snapshot (pre-guard deploy) restores an EMPTY guard map: every
+        // sender re-seeds on its next record — trust-on-first-sight, honest
+        // degradation, no false rejects.
         state.canonicalCount = canonicalCount;
         return state;
     }
