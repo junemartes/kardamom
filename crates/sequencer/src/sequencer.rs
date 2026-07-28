@@ -253,9 +253,13 @@ impl<DB: StateDatabase> Sequencer<DB> {
     {
         // Chunked batch publish: each chunk rides ONE cluster app message
         // (KIND_BATCH), amortizing the per-offer session round trip that
-        // dominated the sequencer's per-tx cost. 128 refs ≈ 7KB — well under
-        // the app-message bound, fragmented transparently by Aeron.
-        const BATCH_MAX: usize = 128;
+        // dominated the sequencer's per-tx cost. The chunk MUST stay under
+        // one Aeron MTU (~1408B): the hand-rolled cluster ingress path does
+        // not survive fragmented session messages (validated empirically —
+        // 128-ref ~7KB chunks lost every fragmented batch: ramp died at
+        // 750tps and 96k accepted refs never receipted; 20 refs ≈ 1.1KB
+        // passes). 20:1 still amortizes away the dominant per-offer cost.
+        const BATCH_MAX: usize = 20;
         let mut idx = 0usize;
         while idx < drained.len() {
             let end = (idx + BATCH_MAX).min(drained.len());

@@ -46,8 +46,18 @@ job "rpc-proxy" {
       template {
         destination = "local/haproxy.cfg"
         data        = <<EOF
+global
+  maxconn 16384
+  nbthread 4
+
 defaults
   mode http
+  # Reuse backend connections across requests: at thousands of rps the
+  # per-request connect cost was the proxy's own admission ceiling
+  # (measured: accept ratio degraded at 3,000 tx/s while the pipeline
+  # behind it sustains 4,750 direct).
+  http-reuse always
+  maxconn 16384
   timeout connect 5s
   timeout client  120s
   timeout server  120s
@@ -69,8 +79,8 @@ EOF
       }
 
       resources {
-        cpu    = 500
-        memory = 128
+        cpu    = 2000
+        memory = 256
       }
     }
   }
