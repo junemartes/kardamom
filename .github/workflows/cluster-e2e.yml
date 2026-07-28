@@ -118,6 +118,7 @@ jobs:
           cargo build --release \
             -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-reconstruct \
             --bins
           cargo build --release -p kardamom-bench --bin kardamom-load
           # Target-C runner for the chain-semantics shard. Feature-gated
