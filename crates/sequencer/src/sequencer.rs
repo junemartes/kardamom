@@ -130,7 +130,24 @@ pub struct Sequencer {
     /// did not wire the receipts / egress-watermark feeds (tests, IPC dev
     /// runs) — behaviour is then identical to pre-resync.
     resync: Option<crate::resync::ResyncController>,
+    /// Published-but-UNCONFIRMED refs (#85): an `Accepted` offer only proves
+    /// the bytes landed on the Aeron publication buffer, NOT that the Raft
+    /// cluster committed them — a leader kill voids the dead-leader window
+    /// and the uncommitted tail, and continuing from the optimistically
+    /// advanced nonce state seals a canonical GAP. Every published ref is
+    /// retained here until a receipt for its sender at/above its nonce
+    /// proves canonical commitment (skip receipts count — ordering is the
+    /// claim); entries older than `resync.confirm_timeout_ms` are rewound
+    /// via `reinsert_for_retry` and re-published — the cluster dedup absorbs
+    /// copies that DID commit, and voided ones get ordered.
+    unconfirmed: UnconfirmedLedger,
 }
+
+/// #85 publish-confirmation ledger: (sender, nonce) → (ref metadata,
+/// published-at). BTreeMap so per-sender ranges trim cheaply on confirmation
+/// and the staleness sweep sees ascending nonce order.
+type UnconfirmedLedger =
+    std::collections::BTreeMap<(alloy_primitives::Address, u64), (RefMetadata, std::time::Instant)>;
 
 impl Sequencer {
     pub fn new(cfg: SequencerConfig) -> Self {
@@ -140,6 +157,7 @@ impl Sequencer {
             cfg,
             state: PartitionState::new(cap),
             resync: None,
+            unconfirmed: std::collections::BTreeMap::new(),
         }
     }
 
@@ -147,6 +165,14 @@ impl Sequencer {
     /// resync mode (startup trigger) and is driven from `run_once`.
     pub fn enable_resync(&mut self, controller: crate::resync::ResyncController) {
         self.resync = Some(controller);
+    }
+
+    /// Test-only: adjust the #85 confirm timeout mid-run (the republish
+    /// sweep is wall-clock driven; tests flip it to 0 to force an immediate
+    /// rewind without sleeping).
+    #[cfg(any(test, feature = "testing"))]
+    pub fn set_confirm_timeout_ms(&mut self, ms: u64) {
+        self.cfg.resync.confirm_timeout_ms = ms;
     }
 
     pub fn config(&self) -> &SequencerConfig {
@@ -227,15 +253,16 @@ impl Sequencer {
         // 750tps and 96k accepted refs never receipted; 20 refs ≈ 1.1KB
         // passes). 20:1 still amortizes away the dominant per-offer cost.
         const BATCH_MAX: usize = 20;
-        let mut idx = 0usize;
-        while idx < drained.len() {
-            let end = (idx + BATCH_MAX).min(drained.len());
-            let refs: Vec<kardamom_types::TxRef> = drained[idx..end]
+        let mut rest = std::collections::VecDeque::from(drained);
+        while !rest.is_empty() {
+            let chunk = BATCH_MAX.min(rest.len());
+            let refs: Vec<kardamom_types::TxRef> = rest
                 .iter()
+                .take(chunk)
                 .map(|(_, _, m)| self.make_txref(m))
                 .collect();
             let (published, err) = b.try_publish_ref_batch(&refs);
-            for (_, n, meta) in &drained[idx..idx + published] {
+            for (sender, n, meta) in rest.drain(..published) {
                 metrics::record_publish(self.cfg.partition_index);
                 trace!(
                     nonce = n,
@@ -243,8 +270,17 @@ impl Sequencer {
                     ctx,
                     "published ref"
                 );
+                // #85: retain until a receipt proves canonical commitment.
+                // A batch acceptance is still only an OFFER — one KIND_BATCH
+                // app message on the publication buffer — NOT a Raft commit;
+                // the whole batch can vanish in a dead-leader window exactly
+                // like a single offer, so every ref in the accepted prefix
+                // enters the unconfirmed ledger individually.
+                if self.resync.is_some() {
+                    self.unconfirmed
+                        .insert((sender, n), (meta, std::time::Instant::now()));
+                }
             }
-            idx += published;
             match err {
                 None => {}
                 Some(SequencerError::Backpressure) => {
@@ -252,8 +288,8 @@ impl Sequencer {
                     // Rebuffer the failed chunk AND everything after it, in
                     // reverse, so each sender's floor ends rewound to its
                     // lowest unpublished nonce.
-                    for (s, n2, m) in drained[idx..].iter().rev() {
-                        self.state.reinsert_for_retry(*s, *n2, m.clone());
+                    while let Some((s, n2, m)) = rest.pop_back() {
+                        self.state.reinsert_for_retry(s, n2, m);
                     }
                     return Err(SequencerError::Backpressure);
                 }
@@ -294,7 +330,21 @@ impl Sequencer {
         // newly-contiguous runs surface via `drain_pending` below), then
         // evaluate the watermark triggers.
         if let Some(r) = self.resync.as_mut() {
-            let raised = r.drain_floor_updates();
+            let (raised, confirmations) = r.drain_floor_updates();
+            // #85: a receipt at nonce N proves every one of OUR published
+            // refs for that sender at nonce <= N survived into the committed
+            // canonical stream (per-sender order is preserved end to end) —
+            // drop them from the unconfirmed ledger.
+            for (sender, confirmed) in confirmations {
+                let keys: Vec<_> = self
+                    .unconfirmed
+                    .range((sender, 0)..=(sender, confirmed))
+                    .map(|(k, _)| *k)
+                    .collect();
+                for k in keys {
+                    self.unconfirmed.remove(&k);
+                }
+            }
             for (sender, floor) in raised {
                 if let Some((from, dropped)) = self.state.advance_floor(sender, floor) {
                     metrics::record_floor_advance(self.cfg.partition_index);
@@ -319,6 +369,43 @@ impl Sequencer {
                 }
             }
             r.observe(std::time::Instant::now());
+
+            // #85: republish refs whose confirmation has not arrived within
+            // the timeout — the offer may have landed in a dead leader's
+            // void. reinsert_for_retry rewinds the nonce state so the next
+            // drain_pending re-publishes them; the cluster's first-seen
+            // dedup absorbs every copy that DID commit, and voided ones get
+            // ordered — no gap, no loss (this also un-wedges a sender whose
+            // refs vanished entirely: the ledger keeps re-offering until a
+            // receipt confirms). Bounded per iteration.
+            let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
+            let now = std::time::Instant::now();
+            let stale: Vec<_> = self
+                .unconfirmed
+                .iter()
+                .filter(|(_, (_, at))| now.duration_since(*at) >= timeout)
+                .take(256)
+                .map(|(k, _)| *k)
+                .collect();
+            if !stale.is_empty() {
+                metrics::record_ref_republished(self.cfg.partition_index, stale.len());
+                warn!(
+                    count = stale.len(),
+                    oldest_nonce = stale.first().map(|(_, n)| *n),
+                    "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
+                );
+            }
+            // DESCENDING nonce order: reinsert_for_retry sets the sender's
+            // rewind floor on every call, so the LAST call per sender must
+            // carry the LOWEST nonce (same discipline as flush_drained's
+            // backpressure rebuffer) — ascending order would strand the
+            // lower nonces beneath the floor forever.
+            for (sender, n) in stale.into_iter().rev() {
+                if let Some((meta, _)) = self.unconfirmed.remove(&(sender, n)) {
+                    self.state.reinsert_for_retry(sender, n, meta);
+                }
+            }
+            metrics::record_unconfirmed_refs(self.cfg.partition_index, self.unconfirmed.len());
         }
 
         let pending = self.state.drain_pending();

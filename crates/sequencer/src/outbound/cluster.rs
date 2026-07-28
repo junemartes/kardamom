@@ -60,8 +60,7 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
                 Err(e) => (0, Some(e)),
             },
             many => {
-                let entries: Vec<Vec<u8>> =
-                    many.iter().map(wire::encode_ingress_txref).collect();
+                let entries: Vec<Vec<u8>> = many.iter().map(wire::encode_ingress_txref).collect();
                 let frame = wire::encode_ingress_batch(&entries);
                 match self.offer(&frame) {
                     Ok(()) => (many.len(), None),

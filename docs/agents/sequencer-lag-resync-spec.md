@@ -166,6 +166,24 @@ Explicitly NOT closed: the cold-start sole survivor (twin dead + no receipts flo
 sender since subscribe). Full closure needs a committed-state reader (executor nonce
 endpoint) — out of scope here.
 
+### Publish-confirmation ledger (#85, added post-merge)
+
+An `Accepted` cluster offer only proves the bytes landed on the Aeron publication buffer —
+NOT that Raft committed them. A leader kill voids both the dead-leader window (offers into a
+dead member's buffer) and the uncommitted tail; the optimistically advanced nonce state then
+seals a canonical GAP on reconnect (all executors skip-receipt the post-gap txs since #92 —
+live, but the gapped txs are lost). The same receipts feed closes this: every published ref
+is retained in an **unconfirmed ledger** `(sender, nonce) → meta` until a receipt for the
+sender at/above its nonce — skip receipts included, ordering is the claim; nonce-0 receipts
+excluded (deposit ambiguity; a nonce-0 ref is confirmed cumulatively by the sender's next
+receipt, or re-offers harmlessly) — proves canonical commitment. Entries past
+`confirm_timeout_ms` (default 15 s) are rewound via `reinsert_for_retry` (descending nonce
+per sender — the rewind-floor discipline) and re-published: the cluster's first-seen dedup
+absorbs committed copies, voided ones get ordered — no gap, no loss, and a fully-voided
+sender un-wedges by construction. Metrics: `ref_unconfirmed` gauge,
+`ref_republished_total` counter (sustained nonzero republish = offers landing in a void or
+receipts not flowing).
+
 ## Config
 
 | Knob | Default | Notes |
@@ -175,6 +193,7 @@ endpoint) — out of scope here.
 | `--resync-boundary-silence-ms` | `10000` | `[resync] boundary_silence_ms` — 5 × the 2000 ms deploy tick |
 | `[resync] publish_stall_ms` | `10000` | publish-stall secondary trigger (TOML only) |
 | `[resync] exit_hold_ms` | `2000` | exit hysteresis (TOML only) |
+| `[resync] confirm_timeout_ms` | `15000` | #85 publish-confirmation timeout before rewind + republish (TOML only) |
 | `--executor-count` | from channels config | tx_receipts MDS parity with the validator; unused on the multicast deploy |
 
 The capacity knob introduces a new must-agree pair with the JVM sysprop. Add it to the

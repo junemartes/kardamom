@@ -81,24 +81,27 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     let mut channel_a = ScriptedTxData::default();
     channel_a
         .queue
-        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 10)));
+        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 1, 10)));
     channel_a
         .queue
-        .push_back((TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 1, 11)));
+        .push_back((TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 2, 11)));
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
     let (mut seq, floor_tx) = resync_sequencer();
 
-    // A receipt for nonce 0 exists (twin covered it) → floor 1. The floor
-    // advances the state machine BEFORE the stale envelope is processed, so
-    // the envelope lands on the `Past` path — but as a receipt-PROVEN skip:
-    // no publish, and NO DuplicatedTx notice (the tx executed; reporting it
-    // as a duplicate to ingress would be spurious — and growing
-    // dropped_past here broke the load harness's seq_clean verdict).
+    // A receipt for nonce 1 exists (twin covered it) → floor 2. (Nonce-0
+    // receipts are never evidence — deposit-indistinguishable — so the
+    // scenario starts at nonce 1.) The floor advances the state machine
+    // BEFORE the stale envelope is processed, so the envelope lands on the
+    // `Past` path — but as a receipt-PROVEN skip: no publish, and NO
+    // DuplicatedTx notice (the tx executed; reporting it as a duplicate to
+    // ingress would be spurious — and growing dropped_past here broke the
+    // load harness's seq_clean verdict).
     floor_tx
         .send(FloorUpdate {
             sender: s.address(),
-            executed_nonce: 0,
+            executed_nonce: 1,
+            invalid_skip: false,
         })
         .unwrap();
 
@@ -106,7 +109,7 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
 
     let refs = b.refs.lock().unwrap();
-    assert_eq!(refs.len(), 1, "nonce 0 skipped (proven), nonce 1 published");
+    assert_eq!(refs.len(), 1, "nonce 1 skipped (proven), nonce 2 published");
     assert_eq!(refs[0].tx_data_position, pos(64));
     assert!(
         rc.errors.lock().unwrap().is_empty(),
@@ -164,6 +167,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
         .send(FloorUpdate {
             sender: s.address(),
             executed_nonce: 4,
+            invalid_skip: false,
         })
         .unwrap();
 
@@ -173,4 +177,70 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 2, "buffered run drained after floor advance");
+}
+
+/// #85: an `Accepted` offer is NOT a commit — published refs stay in the
+/// unconfirmed ledger and are rewound + re-published when no receipt
+/// confirms them within the timeout; a receipt at/above the nonce
+/// (cumulative per sender) retires them permanently.
+#[test]
+fn unconfirmed_refs_republish_until_receipt_confirms() {
+    let s = signer(4);
+    let mut channel_a = ScriptedTxData::default();
+    channel_a
+        .queue
+        .push_back((TxDataLoc::new(0, pos(0)), signed_tx_envelope(&s, 0, 40)));
+    channel_a
+        .queue
+        .push_back((TxDataLoc::new(0, pos(64)), signed_tx_envelope(&s, 1, 41)));
+    let mut b = InMemoryTxOrderingRefPublisher::default();
+    let mut rc = InMemoryTxErrorPublisher::default();
+    let (mut seq, floor_tx) = resync_sequencer();
+
+    // Publish both refs at the default (15s) timeout — no republish churn.
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert_eq!(b.refs.lock().unwrap().len(), 2);
+
+    // Confirm nonce 1: cumulative per sender, retires BOTH (0 and 1).
+    floor_tx
+        .send(FloorUpdate {
+            sender: s.address(),
+            executed_nonce: 1,
+            invalid_skip: false,
+        })
+        .unwrap();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+
+    // Timeout 0: were anything still unconfirmed it would republish NOW.
+    seq.set_confirm_timeout_ms(0);
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert_eq!(
+        b.refs.lock().unwrap().len(),
+        2,
+        "confirmed refs must never re-publish"
+    );
+
+    // A third, never-confirmed ref: with timeout 0 every iteration rewinds
+    // and re-publishes it — offer-is-not-commit made recoverable.
+    channel_a
+        .queue
+        .push_back((TxDataLoc::new(0, pos(128)), signed_tx_envelope(&s, 2, 42)));
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap(); // publish #3
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap(); // republish #3
+    let n = b.refs.lock().unwrap().len();
+    assert!(n >= 4, "unconfirmed ref must re-publish (got {n})");
+
+    // Confirming it stops the churn.
+    floor_tx
+        .send(FloorUpdate {
+            sender: s.address(),
+            executed_nonce: 2,
+            invalid_skip: false,
+        })
+        .unwrap();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    let stable = b.refs.lock().unwrap().len();
+    seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
+    assert_eq!(b.refs.lock().unwrap().len(), stable);
 }

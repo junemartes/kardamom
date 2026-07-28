@@ -43,6 +43,10 @@ use crate::metrics;
 pub struct FloorUpdate {
     pub sender: Address,
     pub executed_nonce: u64,
+    /// #92 marker receipt: the tx was ORDERED (canonical-log commitment is
+    /// proven — it confirms publishes) but consumed no nonce (it is NOT
+    /// floor evidence).
+    pub invalid_skip: bool,
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
@@ -111,6 +115,12 @@ pub struct ResyncConfig {
     pub publish_stall_ms: u64,
     /// How long conditions must stay calm before exiting resync (hysteresis).
     pub exit_hold_ms: u64,
+    /// #85: how long a published ref may remain unconfirmed (no receipt at
+    /// or above its nonce) before it is rewound and re-published. Must
+    /// comfortably exceed the order→execute→receipt round trip under load;
+    /// re-publishing early is harmless (dedup absorbs), late leaves voided
+    /// refs unrecovered longer.
+    pub confirm_timeout_ms: u64,
 }
 
 impl Default for ResyncConfig {
@@ -121,6 +131,7 @@ impl Default for ResyncConfig {
             boundary_silence_ms: 10_000,
             publish_stall_ms: 10_000,
             exit_hold_ms: 2_000,
+            confirm_timeout_ms: 15_000,
         }
     }
 }
@@ -164,6 +175,11 @@ pub struct ResyncController {
 /// cannot starve the publish path.
 const FLOOR_DRAIN_PER_ITER: usize = 1024;
 
+/// One drain of the receipts channel: `(raised_floors, confirmations)` —
+/// both `(sender, nonce-or-floor)` lists; see
+/// [`ResyncController::drain_floor_updates`].
+pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
+
 impl ResyncController {
     pub fn new(
         cfg: ResyncConfig,
@@ -197,14 +213,34 @@ impl ResyncController {
         self.floors.get(&sender).copied()
     }
 
-    /// Drain pending floor updates (bounded per iteration). Returns the
-    /// senders whose floor ROSE this drain, for the caller to apply
-    /// [`crate::state::PartitionState::advance_floor`].
-    pub fn drain_floor_updates(&mut self) -> Vec<(Address, u64)> {
+    /// Drain pending receipt updates (bounded per iteration). Returns
+    /// `(raised_floors, confirmations)`:
+    ///
+    /// - `raised_floors` — senders whose executed-truth floor ROSE, for
+    ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts (#92)
+    ///   and nonce-0 receipts (deposit-indistinguishable) are NOT floor
+    ///   evidence.
+    /// - `confirmations` — `(sender, nonce)` per receipt, INCLUDING skip
+    ///   receipts (ordering in the canonical log is exactly what a publish
+    ///   confirmation needs — #85: an Aeron offer is NOT a commit; only a
+    ///   receipt proves the ref survived into the committed stream). Nonce-0
+    ///   receipts are excluded here too (a deposit receipt must not confirm
+    ///   a same-sender nonce-0 TxRef); a genuine nonce-0 ref is confirmed
+    ///   cumulatively by the sender's nonce-1 receipt, or re-offers
+    ///   harmlessly until then (dedup absorbs).
+    pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
         let mut raised = Vec::new();
+        let mut confirmations = Vec::new();
         for _ in 0..FLOOR_DRAIN_PER_ITER {
             match self.floor_rx.try_recv() {
                 Ok(u) => {
+                    if u.executed_nonce == 0 {
+                        continue;
+                    }
+                    confirmations.push((u.sender, u.executed_nonce));
+                    if u.invalid_skip {
+                        continue;
+                    }
                     let floor = u.executed_nonce.saturating_add(1);
                     let e = self.floors.entry(u.sender).or_insert(0);
                     if floor > *e {
@@ -218,7 +254,7 @@ impl ResyncController {
         if !raised.is_empty() {
             metrics::record_floor_senders(self.partition, self.floors.len());
         }
-        raised
+        (raised, confirmations)
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
@@ -430,14 +466,50 @@ mod tests {
         tx.send(FloorUpdate {
             sender: s(1),
             executed_nonce: 4,
+            invalid_skip: false,
         })
         .unwrap();
-        let raised = c.drain_floor_updates();
+        let (raised, confirmations) = c.drain_floor_updates();
         assert_eq!(raised, vec![(s(1), 5)]);
+        assert_eq!(confirmations, vec![(s(1), 4)], "every receipt confirms");
         assert_eq!(c.floor(s(1)), Some(5), "nonces 0..=4 proven executed");
         assert_eq!(c.floor(s(2)), None, "unknown sender has no proof");
         // Re-draining with nothing pending raises nothing.
-        assert!(c.drain_floor_updates().is_empty());
+        let (raised, confirmations) = c.drain_floor_updates();
+        assert!(raised.is_empty() && confirmations.is_empty());
+    }
+
+    #[test]
+    fn skip_receipts_confirm_but_never_raise_floors() {
+        // #85 + #92: a skip receipt proves the ref was ORDERED (a valid
+        // publish confirmation) while proving no nonce was consumed (NOT
+        // floor evidence).
+        let (mut c, tx, _w) = mk(ResyncConfig::default());
+        tx.send(FloorUpdate {
+            sender: s(1),
+            executed_nonce: 7,
+            invalid_skip: true,
+        })
+        .unwrap();
+        let (raised, confirmations) = c.drain_floor_updates();
+        assert!(raised.is_empty(), "skip is not floor evidence");
+        assert_eq!(c.floor(s(1)), None);
+        assert_eq!(confirmations, vec![(s(1), 7)], "skip IS a confirmation");
+    }
+
+    #[test]
+    fn nonce_zero_receipts_neither_confirm_nor_raise() {
+        // Deposit receipts stamp a filler nonce 0 and are indistinguishable
+        // on the wire — they must not confirm a same-sender nonce-0 TxRef.
+        let (mut c, tx, _w) = mk(ResyncConfig::default());
+        tx.send(FloorUpdate {
+            sender: s(1),
+            executed_nonce: 0,
+            invalid_skip: false,
+        })
+        .unwrap();
+        let (raised, confirmations) = c.drain_floor_updates();
+        assert!(raised.is_empty() && confirmations.is_empty());
     }
 
     #[test]
@@ -446,6 +518,7 @@ mod tests {
         tx.send(FloorUpdate {
             sender: s(1),
             executed_nonce: 9,
+            invalid_skip: false,
         })
         .unwrap();
         // A LOWER receipt later (late-arriving multicast frame) must not
@@ -453,9 +526,10 @@ mod tests {
         tx.send(FloorUpdate {
             sender: s(1),
             executed_nonce: 3,
+            invalid_skip: false,
         })
         .unwrap();
-        let raised = c.drain_floor_updates();
+        let (raised, _) = c.drain_floor_updates();
         assert_eq!(raised, vec![(s(1), 10)]);
         assert_eq!(c.floor(s(1)), Some(10));
     }
