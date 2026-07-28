@@ -1,0 +1,41 @@
+[package]
+name = "kardamom-reconstruct"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+kardamom-types.workspace = true
+# The reconstruction path drives DA-recovered blocks (decoded by the batcher's
+# `recon` module) through the shared engine into a trie-aware state DB — the
+# inverse of the live executor. This crate is the only non-executor/validator
+# consumer of the state DB, kept out of the batcher so the batcher stays
+# state-free.
+kardamom-batcher = { path = "../batcher" }
+kardamom-engine = { path = "../engine" }
+kardamom-state = { path = "../state" }
+
+alloy-primitives.workspace = true
+alloy-provider.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+kardamom-deployer = { path = "../deployer" }
+alloy-consensus.workspace = true
+alloy-eips = { workspace = true, features = ["kzg"] }
+alloy-network.workspace = true
+alloy-signer-local.workspace = true
+alloy-node-bindings.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+
+[[bin]]
+name = "kardamom-reconstruct"
+path = "src/bin/kardamom-reconstruct.rs"

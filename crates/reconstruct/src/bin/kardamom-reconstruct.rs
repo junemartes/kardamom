@@ -19,7 +19,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use kardamom_batcher::da_store::FsBlobStore;
 use kardamom_batcher::l1::{read_posted_batches, recover_blocks};
-use kardamom_batcher::reexec::reconstruct_state;
+use kardamom_reconstruct::reconstruct_state;
 use tracing::info;
 
 #[derive(Parser, Debug)]

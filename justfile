@@ -278,7 +278,8 @@ test-e2e-local: aeron-jar cluster-jar
     export PATH="$SHIM:$PATH" JAVA_HOME="$(just java-home)"
     cargo build --bins --locked \
         -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
-        -p kardamom-validator -p kardamom-state -p kardamom-da-watcher
+        -p kardamom-validator -p kardamom-state -p kardamom-da-watcher \
+        -p kardamom-reconstruct
     cargo test -p e2e --features full-pipeline-e2e --test chain_semantics \
         --locked -- --ignored --nocapture --test-threads=2
 

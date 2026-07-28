@@ -3674,10 +3674,8 @@ dependencies = [
  "clap",
  "criterion 0.7.0",
  "kardamom-deployer",
- "kardamom-engine",
  "kardamom-log",
  "kardamom-obs",
- "kardamom-state",
  "kardamom-types",
  "metrics",
  "proptest",
@@ -3930,6 +3928,34 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "kardamom-reconstruct"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-node-bindings",
+ "alloy-primitives",
+ "alloy-provider",
+ "alloy-signer-local",
+ "anyhow",
+ "bytes",
+ "clap",
+ "kardamom-batcher",
+ "kardamom-deployer",
+ "kardamom-engine",
+ "kardamom-state",
+ "kardamom-types",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

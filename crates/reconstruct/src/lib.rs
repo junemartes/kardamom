@@ -1,12 +1,16 @@
 //! Rebuild-from-L1: re-execute DA-recovered blocks into a fresh state DB.
 //!
-//! [`crate::recon::reconstruct`] turns the blobs the batcher posted back into
-//! `Vec<BlockFrame>`; this module drives those blocks through the shared
-//! execution engine ([`kardamom_engine::replay_blocks`]) into a trie-aware
-//! libMDBX state DB, yielding the reconstructed head + canonical state root.
-//! That root can be compared against the chain's canonical root (the
-//! validator's) to prove the L2 state is fully recoverable from L1 data alone —
-//! the bottom-of-stack data-availability backstop.
+//! [`kardamom_batcher::recon::reconstruct`] turns the blobs the batcher posted
+//! back into `Vec<BlockFrame>`; this crate drives those blocks through the
+//! shared execution engine ([`kardamom_engine::replay_blocks`]) into a
+//! trie-aware libMDBX state DB, yielding the reconstructed head + canonical
+//! state root. That root can be compared against the chain's canonical root
+//! (the validator's) to prove the L2 state is fully recoverable from L1 data
+//! alone — the bottom-of-stack data-availability backstop.
+//!
+//! This is the only consumer of the state DB outside the executor and the
+//! validator; it lives in its own crate (rather than the batcher) so the
+//! batcher itself stays state-free — it only produces and decodes DA blobs.
 //!
 //! Deposits are out of scope here for the same reason they are absent from the
 //! DA payload (the batcher's `MultiArchiveReader` skips `DepositRef`s); see
@@ -14,12 +18,16 @@
 
 use std::path::Path;
 
+use kardamom_batcher::BlockFrame;
 use kardamom_engine::{ReplayBlock, ReplayOutcome, replay_blocks};
 use kardamom_state::{Durability, StateEnvBuilder};
 use kardamom_types::{AccountChange, CodeEntry, TxEnvelope};
 
-use crate::error::BatcherError;
-use crate::frame::BlockFrame;
+/// Error from the rebuild-from-L1 reconstruction path (opening the state env or
+/// replaying blocks through the engine).
+#[derive(Debug, thiserror::Error)]
+#[error("reconstruct: {0}")]
+pub struct ReconstructError(pub String);
 
 /// Convert a DA-recovered [`BlockFrame`] into an engine [`ReplayBlock`].
 ///
@@ -53,29 +61,29 @@ pub fn reconstruct_state(
     genesis_accounts: &[AccountChange],
     genesis_code: &[CodeEntry],
     blocks: &[BlockFrame],
-) -> Result<ReplayOutcome, BatcherError> {
+) -> Result<ReplayOutcome, ReconstructError> {
     let env = StateEnvBuilder::new(state_dir)
         .durability(Durability::Durable)
         .open()
-        .map_err(|e| BatcherError::Reconstruct(format!("open state env: {e}")))?;
+        .map_err(|e| ReconstructError(format!("open state env: {e}")))?;
 
     let replay = blocks.iter().map(block_frame_to_replay).collect::<Vec<_>>();
     replay_blocks(env, chain_id, genesis_accounts, genesis_code, replay)
-        .map_err(|e| BatcherError::Reconstruct(e.to_string()))
+        .map_err(|e| ReconstructError(e.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch::{ClosedBlock, RecordedTx};
-    use crate::batcher::{BatcherConfig, pack_blocks};
-    use crate::recon::reconstruct;
     use alloy_consensus::{SignableTransaction, TxLegacy};
     use alloy_eips::eip2718::Encodable2718;
     use alloy_network::TxSignerSync;
     use alloy_primitives::{Address, Bytes as AlloyBytes, TxKind, U256, address, keccak256};
     use alloy_signer_local::PrivateKeySigner;
     use bytes::Bytes;
+    use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
+    use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
+    use kardamom_batcher::recon::reconstruct;
     use kardamom_engine::replay_blocks as engine_replay;
     use kardamom_types::{BPosition, TxEnvelope};
 

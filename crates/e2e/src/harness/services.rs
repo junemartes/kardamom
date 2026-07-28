@@ -37,7 +37,8 @@ pub fn bin(name: &str) -> Result<PathBuf> {
         "{} not found — build the service binaries first: \
          `cargo build --bins -p kardamom-ingress -p kardamom-sequencer \
          -p kardamom-executor -p kardamom-validator -p kardamom-state \
-         -p kardamom-da-watcher` (or just `just test-e2e-local`)",
+         -p kardamom-da-watcher -p kardamom-reconstruct` \
+         (or just `just test-e2e-local`)",
         p.display()
     );
     Ok(p)

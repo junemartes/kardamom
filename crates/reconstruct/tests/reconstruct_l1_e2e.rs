@@ -21,10 +21,10 @@ use kardamom_batcher::batch::{ClosedBlock, RecordedTx};
 use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
 use kardamom_batcher::da_store::FsBlobStore;
 use kardamom_batcher::l1::{post_batch, read_posted_batches, recover_blocks};
-use kardamom_batcher::reexec::reconstruct_state;
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_arg};
 use kardamom_engine::{ReplayBlock, replay_blocks};
+use kardamom_reconstruct::reconstruct_state;
 use kardamom_state::{Durability, StateEnvBuilder};
 use kardamom_types::{BPosition, TxEnvelope};
 
