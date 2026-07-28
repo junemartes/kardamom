@@ -119,9 +119,12 @@ impl PendingDelta {
     }
 
     /// Finalize: produce a wire-shape `BlockDelta` ready for the state
-    /// writer. Receipts are filled in by the actor (it has the per-tx
-    /// receipts in arrival order); this only carries the state mutations.
-    pub fn finalize(self, block_number: u64) -> BlockDelta {
+    /// writer. `receipts` are the block's per-tx receipts in arrival order —
+    /// supplied by the caller (the actor / replayer holds them), persisted by
+    /// the writer into the `receipts` + `tx_hash_index` tables so
+    /// `eth_getTransactionReceipt` answers from durable state after a restart
+    /// (#109: this was hardcoded empty and the read path was dead).
+    pub fn finalize(self, block_number: u64, receipts: Vec<kardamom_types::Receipt>) -> BlockDelta {
         let accounts = self
             .accounts
             .into_iter()
@@ -151,7 +154,7 @@ impl PendingDelta {
             accounts,
             storage,
             code,
-            receipts: Vec::new(),
+            receipts,
         }
     }
 }
@@ -272,11 +275,18 @@ mod tests {
         delta.accounts.insert(a2, sample_account(20, 0));
         delta.accounts.insert(a1, sample_account(10, 1));
 
-        let bd = delta.finalize(7);
+        let receipts = vec![kardamom_types::Receipt {
+            block_number: 7,
+            ..Default::default()
+        }];
+        let bd = delta.finalize(7, receipts);
         assert_eq!(bd.block_number, 7);
         assert_eq!(bd.accounts.len(), 2);
         // BTreeMap iteration order = ascending; verify deterministic order.
         assert_eq!(bd.accounts[0].address, a1);
         assert_eq!(bd.accounts[1].address, a2);
+        // #109: the block's receipts ride INSIDE the delta so the writer
+        // persists them (receipts + tx_hash_index tables) — no longer empty.
+        assert_eq!(bd.receipts.len(), 1);
     }
 }

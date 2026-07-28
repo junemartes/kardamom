@@ -339,6 +339,12 @@ where
             // persisted `resume.block` on a resume, 0 on a fresh start).
             let mut snapshot = snapshots.snapshot_after(initial_block);
             let mut delta = PendingDelta::new();
+            // Per-block receipts in arrival order, drained into the
+            // BlockDelta at each boundary so the writer persists them
+            // (receipts + tx_hash_index tables; #109). The clone per tx is
+            // the price of feeding both this and the streaming tx_receipts
+            // publisher — flagged for saturation validation.
+            let mut block_receipts: Vec<kardamom_types::Receipt> = Vec::new();
             // Block-number bookkeeping. We treat blocks 1-indexed (genesis
             // is block 0). The exec thread assumes every block boundary it
             // sees is for the *current* in-flight block; it doesn't try to
@@ -429,6 +435,7 @@ where
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
+                        block_receipts.push(receipt.clone());
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -475,6 +482,7 @@ where
                         tx_index_in_block += 1;
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
+                        block_receipts.push(receipt.clone());
                         if tx.send(ExecToCommit::Receipt(receipt)).is_err() {
                             return Ok(());
                         }
@@ -528,12 +536,13 @@ where
                         };
 
                         // Drain the delta. We swap it out so the writer
-                        // owns it. The PendingDelta becomes a BlockDelta
-                        // here; receipts are carried separately on
-                        // tx_receipts, so the BlockDelta the writer
-                        // receives has an empty receipts vec.
+                        // owns it. The block's receipts ride INSIDE the
+                        // BlockDelta (arrival order) so the writer persists
+                        // them durably (#109); they also streamed out on
+                        // tx_receipts at execute time, above.
                         let pending = std::mem::take(&mut delta);
-                        let bd: BlockDelta = pending.finalize(block_number);
+                        let bd: BlockDelta =
+                            pending.finalize(block_number, std::mem::take(&mut block_receipts));
 
                         // Time the state-commit: submit to writer queue +
                         // wait for durable ack from the writer signal.
@@ -771,6 +780,13 @@ mod exec_tests {
             .find(|a| a.address == to)
             .expect("recipient");
         assert_eq!(to_acc.balance, U256::from(150u64));
+        // #109: the block's receipts ride inside the BlockDelta, in arrival
+        // order, so the writer persists them (receipts + tx_hash_index) and
+        // eth_getTransactionReceipt answers from durable state post-restart.
+        assert_eq!(delta.receipts.len(), 2, "both txs' receipts persisted");
+        assert!(delta.receipts.iter().all(|r| r.block_number == 1));
+        assert_eq!(delta.receipts[0].nonce, 0);
+        assert_eq!(delta.receipts[1].nonce, 1);
         // S0 regression guard: destructure to enforce the 3-field
         // shape of BlockBoundary at compile time.
         let BlockBoundary {
