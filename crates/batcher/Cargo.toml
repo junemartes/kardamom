@@ -14,10 +14,10 @@ docker-e2e = ["kardamom-log/docker-e2e", "kardamom-log/testing"]
 [dependencies]
 kardamom-types.workspace = true
 kardamom-log.workspace = true
-# Reconstruction (rebuild-from-L1) re-executes the decoded DA blocks through the
-# shared engine into a trie-aware state DB — the inverse of the live executor.
-kardamom-engine = { path = "../engine" }
-kardamom-state = { path = "../state" }
+# NOTE: the batcher is state-free — it produces and decodes DA blobs but never
+# opens a state DB. Rebuild-from-L1 (which re-executes decoded blobs through the
+# engine into a trie-aware state DB) lives in the separate `kardamom-reconstruct`
+# crate, keeping the state DB confined to the executor, validator, and that tool.
 # Pulled in as a regular dependency (not just dev-dep) primarily to force
 # build-order: kardamom-deployer's build.rs runs forge install + forge build,
 # populating `contracts/out/`. Our `sol!` macro in `settlement.rs` loads
@@ -51,7 +51,7 @@ metrics.workspace = true
 kardamom-obs = { path = "../obs" }
 
 clap.workspace = true
-# Live L1 posting + the `kardamom-reconstruct` binary are async; genesis is TOML.
+# Live L1 posting is async; genesis is TOML.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 toml.workspace = true
 
@@ -71,10 +71,6 @@ reqwest = { workspace = true }
 [[bin]]
 name = "kardamom-batcher"
 path = "src/bin/kardamom-batcher.rs"
-
-[[bin]]
-name = "kardamom-reconstruct"
-path = "src/bin/kardamom-reconstruct.rs"
 
 [[bin]]
 name = "kardamom-archive-rereplicate"

@@ -16,7 +16,7 @@
 //! Two honest limits, both inherent to today's code rather than to the test:
 //!
 //! - **Deposit-free by construction.** Deposits are deliberately absent from
-//!   the DA payload (`batcher::reexec` documents it), so a workload with
+//!   the DA payload (the `kardamom-reconstruct` crate documents it), so a workload with
 //!   deposits could never reconstruct — the minted ETH would simply be
 //!   missing and every later balance would diverge. Lifting this needs a
 //!   protocol change, not test plumbing: see
