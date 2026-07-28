@@ -13,7 +13,6 @@ import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
-import java.util.Optional;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.LongHashSet;
 import org.agrona.ExpandableArrayBuffer;
@@ -31,14 +30,16 @@ import org.agrona.concurrent.UnsafeBuffer;
  * no Aeron jars on the classpath (see the {@code core} subproject).</p>
  *
  * <p><b>App envelope framing.</b> The Rust side defines the application envelope
- * as {@code { kind: u8, canonical_id: 32B, payload }} — the 32-byte canonical id
- * sits at a FIXED offset immediately after the 1-byte {@code kind} tag, and the
- * opaque {@code payload} follows. We match that exact layout: id at offset
- * {@link #CANONICAL_ID_OFFSET}, payload at {@link #PAYLOAD_OFFSET}.</p>
+ * as {@code { kind: u8, sender: 20B, nonce: u64 LE, canonical_id: 32B, payload }}
+ * — the guard header ({@code sender}/{@code nonce}, #85 fix B) and the 32-byte
+ * canonical id sit at FIXED offsets after the 1-byte {@code kind} tag, and the
+ * opaque {@code payload} follows. We match that exact layout: sender at
+ * {@link #SENDER_OFFSET}, nonce at {@link #NONCE_OFFSET}, id at
+ * {@link #CANONICAL_ID_OFFSET}, relay from {@link #RELAY_OFFSET}.</p>
  *
  * <p>TODO(envelope): keep this byte framing in lockstep with the Rust app
- * envelope {@code { kind:u8, canonical_id:32B, payload }} (the canonical id is at
- * a fixed offset; do not invent a different layout). If the Rust {@code kind}
+ * envelope in {@code crates/cluster-adapter/src/wire.rs} (every field is at a
+ * fixed offset; do not invent a different layout). If the Rust {@code kind}
  * discriminant gains variants, branch on {@code buffer.getByte(offset + KIND_OFFSET)}
  * here.</p>
  */
@@ -46,8 +47,12 @@ public final class SealerClusteredService implements ClusteredService {
 
     /** Offset of the 1-byte {@code kind} tag within the app envelope. */
     public static final int KIND_OFFSET = 0;
+    /** Offset of the 20-byte sender in the guard header (#85 fix B). */
+    public static final int SENDER_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 LE nonce in the guard header. */
+    public static final int NONCE_OFFSET = SENDER_OFFSET + CanonicalSealerState.SENDER_LEN;
     /** Offset of the 32-byte canonical id within the app envelope. */
-    public static final int CANONICAL_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
+    public static final int CANONICAL_ID_OFFSET = NONCE_OFFSET + Long.BYTES;
     /**
      * Offset from which the relayed payload is forwarded to egress. It starts at
      * the canonical id (NOT after it) so the relayed payload is
@@ -92,6 +97,14 @@ public final class SealerClusteredService implements ClusteredService {
     public static final byte EGRESS_KIND_REPLAY_UNAVAILABLE = 3;
     /** Replay complete: {@code [kind:4][up_to_index:u64][up_to_block:u64]}. */
     public static final byte EGRESS_KIND_REPLAY_DONE = 4;
+    /**
+     * Contiguity reject (#85 fix B):
+     * {@code [kind:5][sender:20][nonce:u64][expected:u64]}, offered to the
+     * OFFERING session only — the sequencer whose ref would have sealed a
+     * canonical nonce gap rewinds its unconfirmed ledger to {@code expected}
+     * and republishes the missing refs.
+     */
+    public static final byte EGRESS_KIND_CONTIGUITY_REJECT = 5;
 
     /** Bounded in-memory retention of framed egress bytes for client replay. */
     private static final int DEFAULT_RETENTION = 65536;
@@ -184,9 +197,14 @@ public final class SealerClusteredService implements ClusteredService {
      */
     private long lastBoundaryClockMs = 0L;
 
-    // Scratch buffers for ingress id extraction and egress framing. Reused to
-    // avoid per-message allocation on the single cluster service thread.
+    /** Contiguity rejects emitted (logged at power-of-two counts). */
+    private long rejectedFrameCount = 0;
+
+    // Scratch buffers for ingress id/sender extraction and egress framing.
+    // Reused to avoid per-message allocation on the single cluster service
+    // thread.
     private final byte[] canonicalIdScratch = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+    private final byte[] senderScratch = new byte[CanonicalSealerState.SENDER_LEN];
     private final ExpandableArrayBuffer egressBuffer = new ExpandableArrayBuffer();
 
     public SealerClusteredService(int dedupCapacity, long tickIntervalMs, int memberId) {
@@ -319,7 +337,7 @@ public final class SealerClusteredService implements ClusteredService {
                     onMalformedFrame("batch-entry", entryLen);
                     return;
                 }
-                processRecord(buffer, pos, entryLen);
+                processRecord(session, buffer, pos, entryLen);
                 pos += entryLen;
             }
             maybeReviveBoundaryClock();
@@ -330,7 +348,7 @@ public final class SealerClusteredService implements ClusteredService {
             onMalformedFrame("ingress-envelope", length);
             return;
         }
-        processRecord(buffer, offset, length);
+        processRecord(session, buffer, offset, length);
         // Records relaying while blocks never seal is the dead-clock signature
         // (canonical stream advances, boundary cadence gone) — revive here so
         // sustained ingress load heals the clock without waiting for a
@@ -339,21 +357,61 @@ public final class SealerClusteredService implements ClusteredService {
     }
 
     /**
-     * Process one single-record ingress frame at {@code offset}: parse ONLY
-     * the 32-byte canonical id at its fixed offset (the payload is relayed
-     * verbatim and never inspected), dedup, and relay if first-seen. Shared
-     * by the direct path and each {@link #KIND_BATCH} entry.
+     * Process one single-record ingress frame at {@code offset}: parse the
+     * guard header (sender + nonce, #85 fix B) and the 32-byte canonical id
+     * at their fixed offsets (the payload is relayed verbatim and never
+     * inspected), dedup, contiguity-check, and relay if accepted. A
+     * contiguity reject answers the OFFERING session with an
+     * {@link #EGRESS_KIND_CONTIGUITY_REJECT} frame. Shared by the direct
+     * path and each {@link #KIND_BATCH} entry.
      */
-    private void processRecord(final DirectBuffer buffer, final int offset, final int length) {
+    private void processRecord(
+            final ClientSession session, final DirectBuffer buffer, final int offset, final int length) {
         buffer.getBytes(offset + CANONICAL_ID_OFFSET, canonicalIdScratch);
+        buffer.getBytes(offset + SENDER_OFFSET, senderScratch);
+        final long nonce = buffer.getLong(offset + NONCE_OFFSET, ByteOrder.LITTLE_ENDIAN);
         final int payloadOffset = offset + RELAY_OFFSET;
         final int payloadLength = length - RELAY_OFFSET;
         final byte[] payload = new byte[payloadLength];
         if (payloadLength > 0) {
             buffer.getBytes(payloadOffset, payload);
         }
-        final Optional<Relayed> relayed = state.onRecord(canonicalIdScratch, payload);
-        relayed.ifPresent(this::offerRelayed);
+        final CanonicalSealerState.RecordOutcome outcome =
+            state.onRecord(canonicalIdScratch, senderScratch, nonce, payload);
+        if (outcome.rejected) {
+            onContiguityReject(session, nonce, outcome.expectedNonce);
+            return;
+        }
+        outcome.relayed.ifPresent(this::offerRelayed);
+    }
+
+    /**
+     * Answer a contiguity reject to the offering session. Emitting is
+     * member-local egress IO (only the leader's offer reaches the client),
+     * exactly like record relaying; the REJECTION itself — no dedup insert,
+     * no count — is part of the deterministic state machine and identical on
+     * every member.
+     */
+    private void onContiguityReject(final ClientSession session, final long nonce, final long expected) {
+        rejectedFrameCount++;
+        if (Long.bitCount(rejectedFrameCount) == 1) {
+            // stdout like the other operational signals — grep-able by the
+            // chaos suite; power-of-two counted so a gap storm cannot flood.
+            System.out.println("cluster CONTIGUITY-REJECT memberId=" + memberId
+                + " nonce=" + nonce + " expected=" + expected
+                + " totalRejected=" + rejectedFrameCount);
+        }
+        final MutableDirectBuffer buf = egressBuffer;
+        int pos = 0;
+        buf.putByte(pos, EGRESS_KIND_CONTIGUITY_REJECT);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, senderScratch);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, nonce, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, expected, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        offerToSession(session, pos);
     }
 
     @Override

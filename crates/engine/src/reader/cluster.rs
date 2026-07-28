@@ -197,6 +197,10 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             EgressItem::ReplayDone { .. } => {
                 self.catching_up = false;
             }
+            // Contiguity rejects (#85 fix B) are offered to the offering
+            // sequencer session only; an executor session cannot receive one
+            // — ignore defensively.
+            EgressItem::ContiguityReject { .. } => {}
             EgressItem::ReplayUnavailable {
                 oldest_index,
                 oldest_block,
@@ -294,7 +298,7 @@ mod tests {
             },
             0,
         );
-        let ingress = encode_ingress_txref(&r);
+        let ingress = encode_ingress_txref(&r, alloy_primitives::Address::ZERO, 0);
         let (_cid, relayed) = split_ingress(&ingress).unwrap();
         relayed.to_vec()
     }

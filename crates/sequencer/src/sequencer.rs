@@ -54,7 +54,7 @@ use std::time::Duration;
 use alloy_consensus::TxEnvelope as ConsensusEnvelope;
 use alloy_consensus::transaction::Transaction;
 use alloy_rlp::Decodable;
-use kardamom_types::{BPosition, TxError, TxErrorReason, TxRef};
+use kardamom_types::{BPosition, TxError, TxErrorReason};
 use tracing::{trace, warn};
 
 use crate::config::SequencerConfig;
@@ -195,41 +195,6 @@ impl Sequencer {
         )
     }
 
-    #[allow(dead_code)]
-    fn publish_ref<B>(&self, b: &mut B, meta: &RefMetadata) -> Result<(), SequencerError>
-    where
-        B: TxOrderingRefPublisher,
-    {
-        // shard_id under the MDS topology is the address-shard index. The
-        // default deployment of K=M, one shard per sequencer pool, lets
-        // `cfg.sequencer_id` double as the shard id; production
-        // configurations with multiple sequencer pools per shard can set
-        // these independently and `sequencer_id` here MUST be the shard.
-        let txref = TxRef::new(
-            meta.tx_hash,
-            self.cfg.sequencer_id,
-            meta.tx_data_position,
-            meta.tx_data_session_id,
-        );
-        match b.try_publish_ref(&txref) {
-            Ok(()) => {
-                metrics::record_publish(self.cfg.partition_index);
-                Ok(())
-            }
-            Err(SequencerError::Backpressure) => {
-                metrics::record_backpressure(self.cfg.partition_index);
-                warn!(
-                    sequencer_id = self.cfg.sequencer_id,
-                    correlation_id = meta.correlation_id,
-                    tx_data_position = ?meta.tx_data_position,
-                    "B back-pressure; rewinding state machine for retry"
-                );
-                Err(SequencerError::Backpressure)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
     /// Publish a batch of drained `(sender, nonce, meta)` refs in order. On
     /// B-backpressure the failed item AND every item not yet published are
     /// rebuffered (in reverse, so each sender's floor ends rewound to its
@@ -250,16 +215,19 @@ impl Sequencer {
         // one Aeron MTU (~1408B): the hand-rolled cluster ingress path does
         // not survive fragmented session messages (validated empirically —
         // 128-ref ~7KB chunks lost every fragmented batch: ramp died at
-        // 750tps and 96k accepted refs never receipted; 20 refs ≈ 1.1KB
-        // passes). 20:1 still amortizes away the dominant per-offer cost.
-        const BATCH_MAX: usize = 20;
+        // 750tps and 96k accepted refs never receipted). With the #85 guard
+        // header (sender 20B + nonce 8B) each entry is 75B + 4B length
+        // prefix; 16 × 79 + 3 ≈ 1.27KB stays under the MTU with margin
+        // (20 × 79 + 3 ≈ 1.58KB would NOT). 16:1 still amortizes away the
+        // dominant per-offer cost.
+        const BATCH_MAX: usize = 16;
         let mut rest = std::collections::VecDeque::from(drained);
         while !rest.is_empty() {
             let chunk = BATCH_MAX.min(rest.len());
-            let refs: Vec<kardamom_types::TxRef> = rest
+            let refs: Vec<(kardamom_types::TxRef, alloy_primitives::Address, u64)> = rest
                 .iter()
                 .take(chunk)
-                .map(|(_, _, m)| self.make_txref(m))
+                .map(|(s, n, m)| (self.make_txref(m), *s, *n))
                 .collect();
             let (published, err) = b.try_publish_ref_batch(&refs);
             for (sender, n, meta) in rest.drain(..published) {
@@ -369,6 +337,37 @@ impl Sequencer {
                 }
             }
             r.observe(std::time::Instant::now());
+
+            // #85 fix B: the sealer REJECTED a known sender's ref because its
+            // nonce was not the expected next one — refs for
+            // expected..nonce-1 vanished (voided offers). They are all in the
+            // unconfirmed ledger; rewind them NOW instead of waiting out the
+            // confirm timeout. Same descending-nonce discipline as the sweep
+            // below. (A reject with nonce < expected means the ref already
+            // committed once and its dedup entry aged out — the range below
+            // is empty and this is a no-op; receipts confirm it normally.)
+            for (sender, expected) in r.drain_contiguity_rejects() {
+                let keys: Vec<_> = self
+                    .unconfirmed
+                    .range((sender, expected)..=(sender, u64::MAX))
+                    .map(|(k, _)| *k)
+                    .collect();
+                if keys.is_empty() {
+                    continue;
+                }
+                metrics::record_ref_republished(self.cfg.partition_index, keys.len());
+                warn!(
+                    sender = ?sender,
+                    expected,
+                    count = keys.len(),
+                    "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
+                );
+                for (s, n) in keys.into_iter().rev() {
+                    if let Some((meta, _)) = self.unconfirmed.remove(&(s, n)) {
+                        self.state.reinsert_for_retry(s, n, meta);
+                    }
+                }
+            }
 
             // #85: republish refs whose confirmation has not arrived within
             // the timeout — the offer may have landed in a dead leader's

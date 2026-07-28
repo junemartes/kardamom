@@ -27,6 +27,7 @@
 
 pub mod cluster;
 
+use alloy_primitives::Address;
 use kardamom_types::{DepositRef, TxError, TxRef};
 
 use crate::error::SequencerError;
@@ -40,7 +41,15 @@ use crate::error::SequencerError;
 /// A blocked transport must surface as `Err(SequencerError::Backpressure)`
 /// so the state machine can rewind.
 pub trait TxOrderingRefPublisher: Send {
-    fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError>;
+    /// `sender`/`nonce` ride the ingress frame's guard header for the
+    /// sealer's per-sender contiguity guard (#85 fix B); they are not part
+    /// of the relayed record.
+    fn try_publish_ref(
+        &mut self,
+        r: &TxRef,
+        sender: Address,
+        nonce: u64,
+    ) -> Result<(), SequencerError>;
 
     /// Publish a run of refs, amortizing per-offer overhead where the
     /// transport supports it. Returns `(published, error)`: the first
@@ -48,9 +57,12 @@ pub trait TxOrderingRefPublisher: Send {
     /// The default loops singles (fakes and non-batching transports keep
     /// exact semantics); the cluster transport packs the whole slice into
     /// ONE `KIND_BATCH` app message (all-or-nothing per call).
-    fn try_publish_ref_batch(&mut self, refs: &[TxRef]) -> (usize, Option<SequencerError>) {
-        for (i, r) in refs.iter().enumerate() {
-            if let Err(e) = self.try_publish_ref(r) {
+    fn try_publish_ref_batch(
+        &mut self,
+        refs: &[(TxRef, Address, u64)],
+    ) -> (usize, Option<SequencerError>) {
+        for (i, (r, sender, nonce)) in refs.iter().enumerate() {
+            if let Err(e) = self.try_publish_ref(r, *sender, *nonce) {
                 return (i, Some(e));
             }
         }
@@ -95,7 +107,12 @@ pub mod fakes {
     }
 
     impl TxOrderingRefPublisher for InMemoryTxOrderingRefPublisher {
-        fn try_publish_ref(&mut self, r: &TxRef) -> Result<(), SequencerError> {
+        fn try_publish_ref(
+            &mut self,
+            r: &TxRef,
+            _sender: alloy_primitives::Address,
+            _nonce: u64,
+        ) -> Result<(), SequencerError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
@@ -134,10 +151,18 @@ mod tests {
     #[test]
     fn fake_b_records_refs() {
         let mut p = InMemoryTxOrderingRefPublisher::default();
-        p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default(), 0))
-            .unwrap();
-        p.try_publish_ref(&TxRef::new(B256::ZERO, 1, BPosition::default(), 0))
-            .unwrap();
+        p.try_publish_ref(
+            &TxRef::new(B256::ZERO, 0, BPosition::default(), 0),
+            Address::ZERO,
+            0,
+        )
+        .unwrap();
+        p.try_publish_ref(
+            &TxRef::new(B256::ZERO, 1, BPosition::default(), 0),
+            Address::ZERO,
+            1,
+        )
+        .unwrap();
         assert_eq!(p.refs.lock().unwrap().len(), 2);
     }
 
@@ -146,7 +171,11 @@ mod tests {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            p.try_publish_ref(&TxRef::new(B256::ZERO, 0, BPosition::default(), 0)),
+            p.try_publish_ref(
+                &TxRef::new(B256::ZERO, 0, BPosition::default(), 0),
+                Address::ZERO,
+                0
+            ),
             Err(SequencerError::Backpressure)
         ));
     }

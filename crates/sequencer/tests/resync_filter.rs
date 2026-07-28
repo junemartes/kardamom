@@ -70,7 +70,7 @@ fn pos(offset: i32) -> BPosition {
 /// state these tests exercise.
 fn resync_sequencer() -> (Sequencer, std::sync::mpsc::Sender<FloorUpdate>) {
     let mut seq = Sequencer::new(one_partition_cfg());
-    let (controller, floor_tx, _watermark) = resync_channel(ResyncConfig::default(), 0);
+    let (controller, floor_tx, _reject_tx, _watermark) = resync_channel(ResyncConfig::default(), 0);
     seq.enable_resync(controller);
     (seq, floor_tx)
 }

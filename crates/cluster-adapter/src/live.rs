@@ -177,21 +177,23 @@ pub fn connect_with_replay(
 }
 
 /// [`connect`], but the session thread forwards ONLY egress app frames whose
-/// leading kind byte equals `kind` to the [`LiveEgress`] — everything else is
+/// leading kind byte is in `kinds` to the [`LiveEgress`] — everything else is
 /// dropped at the source. For publisher-side consumers that want boundaries
-/// only (the sequencer's lag-detection feed): relayed records arrive at full
-/// line rate, and allocating + channelling each one to a receiver that
-/// discards it measurably taxes the session thread, which also services the
-/// publish offers (observed as a collapsed load ceiling, CI run 30164871699).
+/// (+ the odd control frame) only, like the sequencer's lag-detection feed:
+/// relayed records arrive at full line rate, and allocating + channelling
+/// each one to a receiver that discards it measurably taxes the session
+/// thread, which also services the publish offers (observed as a collapsed
+/// load ceiling, CI run 30164871699).
 pub fn connect_with_egress_kind_filter(
     rt: AeronRuntime,
     cfg: LiveClusterConfig,
-    kind: u8,
+    kinds: &[u8],
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
     // No SUBSCRIBE announcement: boundaries are broadcast to every session
-    // (see SealerClusteredService.offerBoundary), so a boundary-only feed
-    // needs no consumer registration and stays out of the per-record fan-out.
-    connect_inner(rt, cfg, None, false, Some(kind))
+    // (see SealerClusteredService.offerBoundary) and contiguity rejects are
+    // offered directly to the offering session, so this feed needs no
+    // consumer registration and stays out of the per-record fan-out.
+    connect_inner(rt, cfg, None, false, Some(kinds.to_vec()))
 }
 
 /// Append a small term-length to a cluster control channel unless the URI
@@ -237,7 +239,7 @@ fn connect_inner(
     mut cfg: LiveClusterConfig,
     replay: Option<ReplayOnConnect>,
     subscribe: bool,
-    egress_kind_filter: Option<u8>,
+    egress_kind_filter: Option<Vec<u8>>,
 ) -> Result<(LiveCluster, LiveIngress, LiveEgress), LiveError> {
     validate_config(&cfg)?;
     cfg.egress_channel = with_control_term_length(&cfg.egress_channel);
@@ -320,7 +322,7 @@ fn run_session(
     initial: (i32, PubHandle),
     replay: Option<ReplayOnConnect>,
     subscribe: bool,
-    egress_kind_filter: Option<u8>,
+    egress_kind_filter: Option<Vec<u8>>,
     frame_rx: Receiver<Vec<u8>>,
     req_rx: Receiver<OfferReq>,
     out_tx: Sender<Vec<u8>>,
@@ -412,8 +414,9 @@ fn run_session(
                         match ev {
                             DriverEvent::AppMessage(payload) => {
                                 subscribe_confirmed = true;
-                                let wanted =
-                                    egress_kind_filter.is_none_or(|k| payload.first() == Some(&k));
+                                let wanted = egress_kind_filter.as_ref().is_none_or(|ks| {
+                                    payload.first().is_some_and(|k| ks.contains(k))
+                                });
                                 if wanted && egress_alive && out_tx.send(payload).is_err() {
                                     egress_alive = false; // consumer dropped
                                 }

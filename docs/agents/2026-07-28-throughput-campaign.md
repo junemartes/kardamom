@@ -19,11 +19,26 @@ report artifact + `target/perf/` run dirs per PR body.
   will never sequence; resubmit when the nonce is within the reorder window.
   Overloaded ingress rejects with a retryable error past `pending_shed_depth`.
 
-## Cluster wire (PRs #104, #118)
+## Cluster wire (PRs #104, #118, #85 fix B)
+- Ingress record frame: `[kind:0][sender:20][nonce:u64 LE][canonical_id:32]
+  [record_type][fields…]`. The guard header (sender/nonce) feeds the sealer's
+  per-sender contiguity guard and is NEVER relayed — executors see
+  `[canonical_id:32][record_type][fields…]` unchanged. Zero sender
+  (deposits) is guard-exempt.
 - Ingress kinds: 0 record · 1 replay · 2 SUBSCRIBE (egress consumers announce
   on every session establishment; replay implies it; empty consumer set ⇒
-  broadcast-to-all fallback) · 3 BATCH (`[count:u16][len:u32 + entry]*`, ≤20
-  entries ≈ one MTU; entries process exactly like single records).
+  broadcast-to-all fallback) · 3 BATCH (`[count:u16][len:u32 + entry]*`, ≤16
+  entries ≈ one MTU with the guard header — 20 × 79B would fragment; entries
+  process exactly like single records).
+- Egress kind 5 CONTIGUITY_REJECT `[sender:20][nonce:u64][expected:u64]`, to
+  the OFFERING session only: a known sender's first-seen ref whose nonce ≠
+  expected next would seal a canonical nonce gap (the #85 failure); the
+  sequencer rewinds its unconfirmed ledger (#114) from `expected` and
+  republishes immediately instead of waiting out the 15s confirm timeout.
+- Guard state: LRU map bounded at dedupCapacity, snapshot v2 (v1 loads with
+  an empty map; evicted/unknown senders seed at any nonce — degrades toward
+  accept, never a false reject). Dedup runs BEFORE the guard so #114's
+  republished committed copies absorb as duplicates.
 - Boundaries broadcast to EVERY session (the sequencer's boundary-only lag
   feed consumes without SUBSCRIBE); relayed records go to consumers only.
 
@@ -48,4 +63,8 @@ report artifact + `target/perf/` run dirs per PR body.
 - Leader still blocks on back-pressured CONSUMER sessions (frozen executor =
   cluster-wide egress stall) — needs non-blocking offer + drop policy.
 - Fragmented cluster ingress messages untested (KIND_BATCH capped ≤ MTU).
-- Retire the #86 conn pin only after the real #85 fix.
+- ~~Retire the #86 conn pin only after the real #85 fix~~ DONE: #114
+  (offer-until-confirmed) + fix B (contiguity guard) shipped; ingress
+  `--rpc-max-connections` raised 100 → 8192.
+- Subscribe-mode leader-kill chaos variant (validate the guard + ledger
+  under failover with fast-acks in flight).

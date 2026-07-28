@@ -53,19 +53,30 @@ class SealerFanoutTest {
                 .count();
     }
 
+    /** Non-zero test sender for the contiguity guard (0 = guard-exempt). */
+    private static byte[] sender(final int tag) {
+        final byte[] s = new byte[CanonicalSealerState.SENDER_LEN];
+        java.util.Arrays.fill(s, (byte) 0xAA);
+        s[0] = (byte) tag;
+        return s;
+    }
+
+    /**
+     * One record from the shared test sender with nonce == {@code n}: tests
+     * that emit records 0, 1, … stay guard-contiguous.
+     */
     private void record(final StubSession from, final int n) {
+        final byte[] frame = recordFrame(n, sender(1), n);
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_INGRESS_RECORD);
-        pos += Byte.BYTES;
-        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
-        id[0] = (byte) n;
-        id[31] = 0x5A;
-        buf.putBytes(pos, id);
-        pos += id.length;
-        buf.putByte(pos, (byte) n);
-        pos += Byte.BYTES;
-        service.onSessionMessage(from, 0, buf, 0, pos, null);
+        buf.putBytes(0, frame);
+        service.onSessionMessage(from, 0, buf, 0, frame.length, null);
+    }
+
+    private void rawRecord(final StubSession from, final int idTag, final byte[] sender20, final long nonce) {
+        final byte[] frame = recordFrame(idTag, sender20, nonce);
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        buf.putBytes(0, frame);
+        service.onSessionMessage(from, 0, buf, 0, frame.length, null);
     }
 
     private void subscribe(final StubSession s) {
@@ -112,15 +123,74 @@ class SealerFanoutTest {
                 "publisher-only session stays out of the fan-out");
     }
 
-    /** A complete single-record ingress frame for batch embedding. */
-    private static byte[] recordFrame(final int n) {
-        final byte[] out =
-                new byte[1 + CanonicalSealerState.CANONICAL_ID_LEN + 1];
-        out[0] = SealerClusteredService.KIND_INGRESS_RECORD;
-        out[1] = (byte) n;
-        out[32] = 0x5A;
-        out[out.length - 1] = (byte) n;
+    /** A complete single-record ingress frame (batch-embeddable). */
+    private static byte[] recordFrame(final int idTag, final byte[] sender20, final long nonce) {
+        final byte[] out = new byte[SealerClusteredService.CANONICAL_ID_OFFSET
+                + CanonicalSealerState.CANONICAL_ID_LEN + 1];
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(out.length);
+        buf.putByte(SealerClusteredService.KIND_OFFSET, SealerClusteredService.KIND_INGRESS_RECORD);
+        buf.putBytes(SealerClusteredService.SENDER_OFFSET, sender20);
+        buf.putLong(SealerClusteredService.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
+        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        id[0] = (byte) idTag;
+        id[31] = 0x5A;
+        buf.putBytes(SealerClusteredService.CANONICAL_ID_OFFSET, id);
+        buf.putByte(out.length - 1, (byte) idTag);
+        buf.getBytes(0, out);
         return out;
+    }
+
+    /** Batch-test entries keep the shared sender, nonce == idTag - 10. */
+    private static byte[] recordFrame(final int n) {
+        return recordFrame(n, sender(1), n - 10);
+    }
+
+    @Test
+    void contiguityGapRejectsToOfferingSessionOnly() {
+        subscribe(consumerA);
+        final byte[] s = sender(7);
+        rawRecord(publisher, 20, s, 0); // seeds, accepted
+        assertEquals(1, relayedCount(consumerA));
+
+        // Nonce 2 while 1 is expected: the refs for nonce 1 vanished — the
+        // service must NOT seal the gap. Reject goes to the OFFERING session.
+        rawRecord(publisher, 21, s, 2);
+        assertEquals(1, relayedCount(consumerA), "gap record must not relay");
+        final List<byte[]> rejects = publisher.offered.stream()
+                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_CONTIGUITY_REJECT)
+                .toList();
+        assertEquals(1, rejects.size(), "offering session receives the reject");
+        assertEquals(0, consumerA.offered.stream()
+                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_CONTIGUITY_REJECT)
+                .count(), "consumers never see rejects");
+        // Frame layout: [kind:1][sender:20][nonce:u64 LE][expected:u64 LE].
+        final ExpandableArrayBuffer reject = new ExpandableArrayBuffer(rejects.get(0).length);
+        reject.putBytes(0, rejects.get(0));
+        final byte[] rejectedSender = new byte[CanonicalSealerState.SENDER_LEN];
+        reject.getBytes(1, rejectedSender);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(s, rejectedSender);
+        assertEquals(2, reject.getLong(1 + CanonicalSealerState.SENDER_LEN, ByteOrder.LITTLE_ENDIAN));
+        assertEquals(1, reject.getLong(1 + CanonicalSealerState.SENDER_LEN + Long.BYTES,
+                ByteOrder.LITTLE_ENDIAN));
+
+        // Recovery: the gap ref (nonce 1) arrives, then the SAME previously
+        // rejected id republishes at nonce 2 — it must be accepted as fresh
+        // (a reject leaves no dedup entry behind).
+        rawRecord(publisher, 22, s, 1);
+        rawRecord(publisher, 21, s, 2);
+        assertEquals(3, relayedCount(consumerA), "gap fill + republished reject both relay");
+    }
+
+    @Test
+    void zeroSenderIsGuardExempt() {
+        subscribe(consumerA);
+        final byte[] zero = new byte[CanonicalSealerState.SENDER_LEN];
+        // Deposits carry the zero sender and a filler nonce — any order, any
+        // repetition of nonce values must pass (only the id dedups).
+        rawRecord(publisher, 30, zero, 0);
+        rawRecord(publisher, 31, zero, 0);
+        rawRecord(publisher, 32, zero, 5);
+        assertEquals(3, relayedCount(consumerA), "zero sender never contiguity-rejects");
     }
 
     @Test

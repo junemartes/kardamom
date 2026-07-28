@@ -174,8 +174,14 @@ class SealerClusterFailoverTest {
     private void offerIngress(final AeronCluster client, final byte[] canonicalId32) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, (byte) 0xA1); // kind tag (any value; service does not branch on it)
+        buf.putByte(pos, SealerClusteredService.KIND_INGRESS_RECORD);
         pos += Byte.BYTES;
+        // Zero sender + nonce 0: guard-exempt (this test exercises failover,
+        // not the contiguity guard).
+        buf.putBytes(pos, new byte[CanonicalSealerState.SENDER_LEN]);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, 0L, java.nio.ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
         buf.putBytes(pos, canonicalId32);
         pos += canonicalId32.length;
         // payload == the id again (opaque, relayed verbatim).

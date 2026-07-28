@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import io.aeron.Image;
 import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
+import io.kardamom.sealer.CanonicalSealerState;
 import io.aeron.cluster.client.EgressListener;
 import io.aeron.cluster.codecs.CloseReason;
 import io.aeron.cluster.service.ClientSession;
@@ -216,6 +217,12 @@ class SealerReplayTest {
         int pos = 0;
         buf.putByte(pos, SealerClusteredService.KIND_INGRESS_RECORD);
         pos += Byte.BYTES;
+        // Zero sender + nonce 0: guard-exempt (this test exercises replay,
+        // not the contiguity guard).
+        buf.putBytes(pos, new byte[CanonicalSealerState.SENDER_LEN]);
+        pos += CanonicalSealerState.SENDER_LEN;
+        buf.putLong(pos, 0L, java.nio.ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
         buf.putBytes(pos, canonicalId32);
         pos += canonicalId32.length;
         buf.putBytes(pos, canonicalId32); // opaque payload, relayed verbatim

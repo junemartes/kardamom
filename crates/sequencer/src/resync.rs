@@ -162,6 +162,11 @@ pub struct ResyncController {
     active: bool,
     floors: HashMap<Address, u64>,
     floor_rx: Receiver<FloorUpdate>,
+    /// #85 fix B: `(sender, expected_nonce)` contiguity rejects forwarded by
+    /// the egress-watermark thread — the sealer refused a ref that would have
+    /// sealed a nonce gap; the publish loop rewinds the sender's unconfirmed
+    /// ledger from `expected_nonce` immediately.
+    reject_rx: Receiver<(Address, u64)>,
     watermark: SharedWatermark,
     last_watermark: u64,
     /// Set once the first boundary has been observed — a jump before the
@@ -185,6 +190,7 @@ impl ResyncController {
         cfg: ResyncConfig,
         partition: u32,
         floor_rx: Receiver<FloorUpdate>,
+        reject_rx: Receiver<(Address, u64)>,
         watermark: SharedWatermark,
     ) -> Self {
         let mut c = Self {
@@ -193,6 +199,7 @@ impl ResyncController {
             active: false,
             floors: HashMap::new(),
             floor_rx,
+            reject_rx,
             watermark,
             last_watermark: 0,
             watermark_seen: false,
@@ -255,6 +262,26 @@ impl ResyncController {
             metrics::record_floor_senders(self.partition, self.floors.len());
         }
         (raised, confirmations)
+    }
+
+    /// Drain pending contiguity rejects (#85 fix B), deduplicated per sender
+    /// to the LOWEST expected nonce (a rejected batch produces one reject per
+    /// entry; one rewind to the lowest expected covers them all). Bounded per
+    /// iteration like the floor drain.
+    pub fn drain_contiguity_rejects(&mut self) -> Vec<(Address, u64)> {
+        let mut lowest: HashMap<Address, u64> = HashMap::new();
+        for _ in 0..FLOOR_DRAIN_PER_ITER {
+            match self.reject_rx.try_recv() {
+                Ok((sender, expected)) => {
+                    lowest
+                        .entry(sender)
+                        .and_modify(|e| *e = (*e).min(expected))
+                        .or_insert(expected);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+        lowest.into_iter().collect()
     }
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
@@ -346,17 +373,24 @@ impl ResyncController {
     }
 }
 
-/// Build the controller plus the sender half of the floor-update channel
-/// (handed to the receipts thread) and the shared watermark (handed to the
-/// egress-watermark thread).
+/// Build the controller plus the sender halves of the floor-update channel
+/// (handed to the receipts thread) and the contiguity-reject channel (#85
+/// fix B, handed to the egress-watermark thread alongside the shared
+/// watermark).
 pub fn resync_channel(
     cfg: ResyncConfig,
     partition: u32,
-) -> (ResyncController, Sender<FloorUpdate>, SharedWatermark) {
+) -> (
+    ResyncController,
+    Sender<FloorUpdate>,
+    Sender<(Address, u64)>,
+    SharedWatermark,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let (reject_tx, reject_rx) = std::sync::mpsc::channel();
     let watermark = SharedWatermark::new();
-    let controller = ResyncController::new(cfg, partition, rx, watermark.clone());
-    (controller, tx, watermark)
+    let controller = ResyncController::new(cfg, partition, rx, reject_rx, watermark.clone());
+    (controller, tx, reject_tx, watermark)
 }
 
 #[cfg(test)]
@@ -369,7 +403,8 @@ mod tests {
     }
 
     fn mk(cfg: ResyncConfig) -> (ResyncController, Sender<FloorUpdate>, SharedWatermark) {
-        resync_channel(cfg, 0)
+        let (c, tx, _reject_tx, w) = resync_channel(cfg, 0);
+        (c, tx, w)
     }
 
     fn calm_down(c: &mut ResyncController, w: &SharedWatermark, t: &mut Instant) {
@@ -510,6 +545,22 @@ mod tests {
         .unwrap();
         let (raised, confirmations) = c.drain_floor_updates();
         assert!(raised.is_empty() && confirmations.is_empty());
+    }
+
+    #[test]
+    fn contiguity_rejects_dedup_to_lowest_expected() {
+        // A rejected batch produces one reject per entry, each carrying the
+        // same (or a rising) expected nonce; the drain must collapse them to
+        // ONE rewind per sender at the lowest expected.
+        let (mut c, _tx, reject_tx, _w) = resync_channel(ResyncConfig::default(), 0);
+        reject_tx.send((s(1), 7)).unwrap();
+        reject_tx.send((s(1), 5)).unwrap();
+        reject_tx.send((s(1), 9)).unwrap();
+        reject_tx.send((s(2), 3)).unwrap();
+        let mut drained = c.drain_contiguity_rejects();
+        drained.sort();
+        assert_eq!(drained, vec![(s(1), 5), (s(2), 3)]);
+        assert!(c.drain_contiguity_rejects().is_empty());
     }
 
     #[test]
