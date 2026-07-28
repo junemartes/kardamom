@@ -129,7 +129,15 @@ CLUSTER_TASK="cluster"
 
 LOAD_PID=""
 log()  { echo "==> $*"; }
-fail() { echo "CHAOS FAIL: $*" >&2; exit 1; }
+fail() {
+  # BOTH streams: stderr for the exit path, stdout so the message lands
+  # in-order in the CI log next to the case's own lines (a fail seen only
+  # on a reordered/dropped stderr reads as a silent death — observed on
+  # run 30281 series: a case aborted with no visible CHAOS FAIL line).
+  echo "CHAOS FAIL: $*"
+  echo "CHAOS FAIL: $*" >&2
+  exit 1
+}
 
 cleanup() {
   [ -n "${LOAD_PID}" ] && kill "${LOAD_PID}" 2>/dev/null || true
@@ -254,8 +262,23 @@ run_validator_lapse() {
   fi
   log "validator-lapse: freeze verified (metrics endpoint dark)"
   sleep $(( LAPSE_S - 3 ))
-  docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null \
-    || fail "validator-lapse: SIGCONT failed"
+  if ! docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1; then
+    # A failed CONT is NOT a case error by itself: the frozen task can be
+    # REPLACED under us mid-freeze (supervisor action) — which IS the
+    # newborn path — or the node exec can be transiently wedged. The
+    # sampling loop below owns the verdict (end state: verifying live,
+    # caught up, zero divergences); the thaw mechanics must never abort
+    # the case.
+    local cur0
+    cur0="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
+    if [ -n "${cur0}" ] && [ "${cur0}" != "${inner}" ]; then
+      log "validator-lapse: SIGCONT target gone — container replaced during freeze (${inner} -> ${cur0}); newborn path"
+    else
+      sleep 5
+      docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1 \
+        || log "validator-lapse: SIGCONT failed twice (state unknown); relying on supervisor + sampling asserts"
+    fi
+  fi
 
   # POST-THAW, identity decides the contract. A ${LAPSE_S}s freeze exceeds
   # the media driver's client-liveness timeout: the validator's aeron client
