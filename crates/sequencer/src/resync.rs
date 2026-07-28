@@ -188,6 +188,11 @@ const FLOOR_DRAIN_PER_ITER: usize = 1024;
 /// [`ResyncController::drain_floor_updates`].
 pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
 
+/// One drain of the contiguity-reject channel:
+/// `(committed_drops, gap_rewinds)`; see
+/// [`ResyncController::drain_contiguity_rejects`].
+pub type RejectDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
+
 impl ResyncController {
     pub fn new(
         cfg: ResyncConfig,
@@ -290,7 +295,7 @@ impl ResyncController {
     ///   rewind the unconfirmed ledger and republish.
     ///
     /// Bounded per iteration like the floor drain.
-    pub fn drain_contiguity_rejects(&mut self) -> (Vec<(Address, u64)>, Vec<(Address, u64)>) {
+    pub fn drain_contiguity_rejects(&mut self) -> RejectDrain {
         let mut drops: Vec<(Address, u64)> = Vec::new();
         let mut lowest: HashMap<Address, u64> = HashMap::new();
         for _ in 0..FLOOR_DRAIN_PER_ITER {
@@ -400,19 +405,22 @@ impl ResyncController {
     }
 }
 
-/// Build the controller plus the sender halves of the floor-update channel
-/// (handed to the receipts thread) and the contiguity-reject channel (#85
-/// fix B, handed to the egress-watermark thread alongside the shared
-/// watermark).
-pub fn resync_channel(
-    cfg: ResyncConfig,
-    partition: u32,
-) -> (
+/// What [`resync_channel`] hands back: the controller (publish loop), the
+/// floor-update sender (receipts thread), the `(sender, nonce, expected)`
+/// contiguity-reject sender (#85 fix B, egress-watermark thread) and the
+/// shared watermark (egress-watermark thread).
+pub type ResyncChannel = (
     ResyncController,
     Sender<FloorUpdate>,
     Sender<(Address, u64, u64)>,
     SharedWatermark,
-) {
+);
+
+/// Build the controller plus the sender halves of the floor-update channel
+/// (handed to the receipts thread) and the contiguity-reject channel (#85
+/// fix B, handed to the egress-watermark thread alongside the shared
+/// watermark).
+pub fn resync_channel(cfg: ResyncConfig, partition: u32) -> ResyncChannel {
     let (tx, rx) = std::sync::mpsc::channel();
     let (reject_tx, reject_rx) = std::sync::mpsc::channel();
     let watermark = SharedWatermark::new();
