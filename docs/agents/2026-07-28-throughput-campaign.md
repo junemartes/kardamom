@@ -85,6 +85,11 @@ report artifact + `target/perf/` run dirs per PR body.
 - Leader still blocks on back-pressured CONSUMER sessions (frozen executor =
   cluster-wide egress stall) — needs non-blocking offer + drop policy.
 - Fragmented cluster ingress messages untested (KIND_BATCH capped ≤ MTU).
+- `aeron_live` subscriptions now REASSEMBLE fragments (AeronFragmentAssembler
+  — found live: >MTU `Vec<Receipt>` batches decode-failed at every consumer,
+  parked submits hung 60s, edge collapsed to 500). The `subscriber.rs` /
+  `replay.rs` poll paths (archive replay, batcher) still deliver RAW
+  fragments — a >MTU archived tx would break refetch there; same fix applies.
 - ~~Retire the #86 conn pin only after the real #85 fix~~ DONE: #114
   (offer-until-confirmed) + fix B (contiguity guard) shipped; ingress
   `--rpc-max-connections` raised 100 → 8192.

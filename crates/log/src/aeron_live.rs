@@ -144,10 +144,46 @@ enum RuntimeCmd {
     Shutdown,
 }
 
+/// Adapter between rusteron's fragment-handler callback and a [`DeliverFn`],
+/// sitting BEHIND an [`rusteron_client::AeronFragmentAssembler`]: it is
+/// invoked once per complete MESSAGE, with multi-fragment messages (any
+/// frame larger than one Aeron MTU, ~1.4KB) already reassembled. Without the
+/// assembler, `aeron_subscription_poll` hands over raw fragments and every
+/// oversized frame decode-fails at the consumer — observed live when
+/// `Vec<Receipt>` batch frames crossed the MTU: ingress/sequencer/validator
+/// all logged decode failures, the lost receipts left parked submits
+/// hanging to their 60s timeout, and the load edge collapsed to 500 tx/s.
+/// The header passed through is the final fragment's; both ends of a
+/// position-keyed stream (the tx_data join) go through this same path, so
+/// position derivation stays consistent.
+struct AssembledDeliver {
+    deliver: DeliverFn,
+}
+
+impl rusteron_client::AeronFragmentHandlerCallback for AssembledDeliver {
+    fn handle_aeron_fragment_handler(&mut self, buffer: &[u8], header: Header) {
+        if let Some((pos, session)) = header_loc(&header) {
+            (self.deliver)(buffer, pos, session);
+        }
+    }
+}
+
 /// One row in the Aeron thread's subscription table.
 struct SubEntry {
     sub: Sub,
-    deliver: DeliverFn,
+    /// Assembler-wrapped handler passed to `poll` (owns per-session assembly
+    /// buffers); delegates complete messages to `inner`.
+    assembler: rusteron_client::Handler<rusteron_client::AeronFragmentAssembler>,
+    /// The leaked delegate the assembler forwards to — retained so it can be
+    /// released when the subscription row is dropped.
+    inner: rusteron_client::Handler<AssembledDeliver>,
+}
+
+impl Drop for SubEntry {
+    fn drop(&mut self) {
+        self.assembler.release();
+        self.inner.release();
+    }
 }
 
 /// Escalating idle wait — the Rust analogue of Aeron's `BackoffIdleStrategy`,
@@ -569,14 +605,7 @@ fn run_aeron_thread(
         //    publish can never starve a subscription's image. This is the fix
         //    for the cluster `tx_ordering` freeze.
         for entry in subs.iter_mut() {
-            let fragments = entry.sub.poll_once(
-                |bytes: &[u8], header: Header| {
-                    if let Some((pos, session)) = header_loc(&header) {
-                        (entry.deliver)(bytes, pos, session);
-                    }
-                },
-                64,
-            );
+            let fragments = entry.sub.poll(Some(&entry.assembler), 64);
             worked |= fragments.unwrap_or(0) > 0;
         }
 
@@ -667,9 +696,18 @@ fn handle_cmd(
             deliver,
             ack,
         } => {
-            let res = open_sub(aeron, &uri, stream_id).map(|sub| {
-                subs.push(SubEntry { sub, deliver });
-                (subs.len() - 1) as u32
+            let res = open_sub(aeron, &uri, stream_id).and_then(|sub| {
+                let (assembler, inner) =
+                    rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver {
+                        deliver,
+                    })
+                    .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
+                subs.push(SubEntry {
+                    sub,
+                    assembler,
+                    inner,
+                });
+                Ok((subs.len() - 1) as u32)
             });
             let _ = ack.send(res);
         }
