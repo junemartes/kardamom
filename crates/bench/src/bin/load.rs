@@ -83,6 +83,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     subscribe: bool,
 
+    /// Blocking mode: confirm receipts via the WebSocket feed instead of a
+    /// per-tx eth_getTransactionReceipt re-fetch (halves HTTP request load).
+    #[arg(long, default_value_t = false)]
+    feed_confirm: bool,
+
     #[arg(long = "retry-submit", default_value_t = 2)]
     retry_submit: u32,
 
@@ -200,6 +205,7 @@ async fn main() -> anyhow::Result<()> {
         scrape: csv(&args.scrape),
         metrics_via_docker: args.metrics_via_docker,
         subscribe: args.subscribe,
+        feed_confirm: args.feed_confirm,
         executor_nodes: csv(&args.executor_nodes),
         ingress_node: args.ingress_node,
         sequencer_nodes: csv(&args.sequencer_nodes),

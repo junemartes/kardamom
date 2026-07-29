@@ -1101,8 +1101,22 @@ impl TxReceiptsPublisherHandle {
         })
     }
 
+    /// Publish a BATCH of receipts as one wire frame (`Vec<Receipt>`,
+    /// rkyv-encoded). One encode + one offer + one ack round trip per batch:
+    /// the previous receipt-per-frame path paid a blocking cross-thread ack
+    /// round trip PER RECEIPT on the executor's commit thread — at thousands
+    /// of receipts/s that serialization was the dominant per-tx publish
+    /// cost. The subscriber fans batches back out into individual
+    /// `(BPosition, Receipt)` deliveries, so consumers are unchanged; every
+    /// receipt in a batch shares the frame's stream position (consumers key
+    /// on `Receipt.tx_idx`, not the stream position). All receipt frames are
+    /// batch frames — a single receipt rides a batch of one.
+    pub fn publish_receipts(&self, batch: &Vec<Receipt>) -> Result<BPosition, LogError> {
+        self.inner.publish(batch)
+    }
+
     pub fn publish_receipt(&self, r: &Receipt) -> Result<BPosition, LogError> {
-        self.inner.publish(r)
+        self.publish_receipts(&vec![r.clone()])
     }
 
     pub fn publish_boundary(&self, b: &BlockBoundary) -> Result<BPosition, LogError> {
@@ -1140,11 +1154,37 @@ pub struct TxReceiptsSubscriberHandle {
 }
 
 impl TxReceiptsSubscriberHandle {
+    /// Fan a `Vec<Receipt>` batch frame (the only receipt wire format — see
+    /// [`TxReceiptsPublisherHandle::publish_receipts`]) back out into
+    /// per-receipt deliveries, preserving in-frame order. Consumers keep the
+    /// exact `(BPosition, Receipt)` stream they always had.
+    fn batch_fanout_deliver(
+        msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, Receipt)>,
+    ) -> DeliverFn {
+        Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+            match codec::materialize::<Vec<Receipt>>(bytes) {
+                Ok(batch) => {
+                    for r in batch {
+                        let _ = msg_tx.send((pos, r));
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on tx_receipts batch delivery");
+                }
+            }
+        })
+    }
+
     /// Legacy single-shared-channel subscriber (IPC default).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let (msg_tx, rx) = unbounded_channel();
+        rt.open_subscription_with_deliver(
+            &ch.tx_receipts_channel,
+            ch.tx_receipts_stream_id,
+            Self::batch_fanout_deliver(msg_tx),
+        )?;
         Ok(Self {
-            rx: rt
-                .open_subscription::<Receipt>(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?,
+            rx,
             sub_id: None,
             rt: rt.clone(),
         })
@@ -1159,9 +1199,11 @@ impl TxReceiptsSubscriberHandle {
                 "open_mds: tx_receipts MDS not configured (empty control channel)".into(),
             ));
         }
-        let (sub_id, rx) = rt.open_subscription_with_id::<Receipt>(
+        let (msg_tx, rx) = unbounded_channel();
+        let sub_id = rt.open_subscription_with_deliver(
             &ch.tx_receipts_control_channel,
             ch.tx_receipts_stream_id,
+            Self::batch_fanout_deliver(msg_tx),
         )?;
         Ok(Self {
             rx,

@@ -266,6 +266,7 @@ async fn submit_task(
     retry: u32,
     verify_receipts: bool,
     mode: SubmitMode,
+    feed_confirm: bool,
 ) {
     let method = match mode {
         SubmitMode::Blocking => "eth_sendRawTransaction",
@@ -298,6 +299,15 @@ async fn submit_task(
             // The ack only means *published* — the receipt arrives on the
             // subscription feed (or the drain's polling settles it). No
             // chaos-mode ack-trust here: delivery is verified for real.
+            tracker.await_feed(tx.hash, t0);
+            return;
+        }
+        // Feed-confirm: skip the per-tx re-fetch — the WebSocket feed (or a
+        // frame it already delivered: `await_feed` checks the early map)
+        // confirms with real status, and the drain re-polls any straggler,
+        // so every accepted tx still ends confirmed or counted `missing`.
+        // One HTTP call per tx instead of two.
+        if feed_confirm {
             tracker.await_feed(tx.hash, t0);
             return;
         }
@@ -370,6 +380,7 @@ pub async fn pacer(
     retry: u32,
     verify_receipts: bool,
     mode: SubmitMode,
+    feed_confirm: bool,
 ) {
     if rate == 0 {
         return;
@@ -377,7 +388,13 @@ pub async fn pacer(
     let tick = Duration::from_millis(10);
     let mut ticker = tokio::time::interval(tick);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let cap = (f64::from(rate) * 0.5).max(1.0);
+    // Credit cap = 40ms of traffic. The old half-second cap released a
+    // rate/2 burst at step start (5,000 txs at a 10k step) — enough to blow
+    // straight through every sender's sequencer reorder window
+    // (max_pending_per_sender) before pacing even began, tripping evictions
+    // that read as a pipeline edge but are pure harness artifact. 4 ticks of
+    // catch-up still absorbs scheduler hiccups without the flood.
+    let cap = (f64::from(rate) * 0.04).max(1.0);
     let mut credit = 0.0_f64;
     let start = Instant::now();
     loop {
@@ -404,6 +421,7 @@ pub async fn pacer(
                 retry,
                 verify_receipts,
                 mode,
+                feed_confirm,
             ));
         }
     }
@@ -577,6 +595,7 @@ mod tests {
             0,
             true, // verify_receipts (non-chaos soak)
             SubmitMode::Blocking,
+            false,
         )
         .await;
 
@@ -626,6 +645,7 @@ mod tests {
             0,
             false,
             SubmitMode::Blocking,
+            false,
         )
         .await;
         let c = tracker.counts();
@@ -649,6 +669,7 @@ mod tests {
             3,
             true,
             SubmitMode::Blocking,
+            false,
         )
         .await;
         assert_eq!(
