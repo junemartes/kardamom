@@ -244,7 +244,7 @@ run_validator_lapse() {
   local m0 vf0 started0
   m0="$(val_metric validator_bal_missing_total)"; m0="${m0:-0}"
   vf0="$(val_metric validator_blocks_verified_total)"; vf0="${vf0:-0}"
-  started0="$(docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${inner}" 2>/dev/null)"
+  started0="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${inner}" 2>/dev/null || true)"
 
   # SIGSTOP + VERIFIED freeze (#108): `docker pause` silently no-ops in the
   # nested-DinD freezer, so every prior run of this case asserted against a
@@ -262,7 +262,7 @@ run_validator_lapse() {
   fi
   log "validator-lapse: freeze verified (metrics endpoint dark)"
   sleep $(( LAPSE_S - 3 ))
-  if ! docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1; then
+  if ! timeout 20 docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1; then
     # A failed CONT is NOT a case error by itself: the frozen task can be
     # REPLACED under us mid-freeze (supervisor action) — which IS the
     # newborn path — or the node exec can be transiently wedged. The
@@ -270,12 +270,12 @@ run_validator_lapse() {
     # caught up, zero divergences); the thaw mechanics must never abort
     # the case.
     local cur0
-    cur0="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
+    cur0="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
     if [ -n "${cur0}" ] && [ "${cur0}" != "${inner}" ]; then
       log "validator-lapse: SIGCONT target gone — container replaced during freeze (${inner} -> ${cur0}); newborn path"
     else
       sleep 5
-      docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1 \
+      timeout 20 docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1 \
         || log "validator-lapse: SIGCONT failed twice (state unknown); relying on supervisor + sampling asserts"
     fi
   fi
@@ -297,9 +297,11 @@ run_validator_lapse() {
   local t=0 ok=0 path="" cur started1 vf1 v1 e_now d1
   while [ "${t}" -lt 240 ]; do
     sleep 10; t=$(( t + 10 ))
-    cur="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
+    cur="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
     started1=""
-    [ -n "${cur}" ] && started1="$(docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${cur}" 2>/dev/null)"
+    if [ -n "${cur}" ]; then
+      started1="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${cur}" 2>/dev/null || true)"
+    fi
     vf1="$(val_metric validator_blocks_verified_total)"
     v1="$(val_metric validator_committed_block)"
     e_now="$(executor_progress || echo 0)"
