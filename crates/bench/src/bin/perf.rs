@@ -152,6 +152,10 @@ fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
         scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
         metrics_via_docker: true,
         subscribe: a.subscribe,
+        // Blocking runs confirm via the WebSocket feed: one HTTP call per tx
+        // instead of two (the per-tx receipt re-fetch alone was another
+        // full-rate request stream through the proxy + ingress).
+        feed_confirm: true,
         executor_nodes: vec![
             "kardamom-executor-0".into(),
             "kardamom-executor-1".into(),
@@ -171,11 +175,17 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
     println!("==> output dir: {}", out.0.display());
 
     // Phase 1 — edge discovery: ramp with a token soak (the profiled soak is
-    // phase 2, on its own accounts). Accounts #1..#6.
+    // phase 2, on its own accounts). Accounts #1..#15: per-sender in-flight
+    // depth ≈ (rate / senders) × latency must stay inside the sequencer's
+    // max_pending_per_sender=16 reorder window, or the harness's own nonce
+    // reordering trips evictions that read as the pipeline's edge. 15
+    // senders keep a 10k tx/s ramp step at ~7 in flight per sender; the old
+    // 6 crossed the window at ~2.4k/step. (#16/#17 are the deploy gates'
+    // re-smoke accounts — never touch them here.)
     println!("==> phase 1: ramp to the edge (ceiling {} tx/s)", a.ceiling);
     let mut cfg = load_cfg(&a, out.path("discovery-report.json"));
     cfg.target_tps = a.ceiling;
-    cfg.senders = 6;
+    cfg.senders = 15;
     cfg.sender_offset = 1;
     cfg.duration = Duration::from_secs(1);
     // Discovery probes past the edge on purpose — retried submits whose first
@@ -193,12 +203,14 @@ async fn run(a: RunArgs) -> anyhow::Result<()> {
         discovery.discovered_max_tps, soak_rate
     );
 
-    // Phase 2 — steady soak (chaos-mode = fixed rate, no ramp) on accounts
-    // #7..#15, with the profiler attached once the rate is established.
+    // Phase 2 — steady soak (chaos-mode = fixed rate, no ramp) on the
+    // dedicated genesis block #18..#33 (16 fresh senders — same per-sender
+    // in-flight arithmetic as the ramp, sized for an 8k tx/s soak), with the
+    // profiler attached once the rate is established.
     let mut cfg = load_cfg(&a, out.path("load-report.json"));
     cfg.target_tps = soak_rate;
-    cfg.senders = 9;
-    cfg.sender_offset = 7;
+    cfg.senders = 16;
+    cfg.sender_offset = 18;
     cfg.chaos_mode = true;
     cfg.duration = Duration::from_secs(a.soak_secs);
     let load_task = tokio::spawn(load::run(cfg));

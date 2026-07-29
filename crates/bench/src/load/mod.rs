@@ -99,6 +99,14 @@ pub struct LoadConfig {
     /// `kardamom_subscribeReceipts` WebSocket feed, instead of the parked
     /// `eth_sendRawTransaction`. In-flight txs then hold no connections.
     pub subscribe: bool,
+    /// Blocking mode only: confirm receipts via the WebSocket feed instead
+    /// of a per-tx `eth_getTransactionReceipt` re-fetch after each accepted
+    /// submit. Halves the harness's HTTP request load (2 → 1 calls per tx —
+    /// at a 10k tx/s target the re-fetches alone are another 10k rps through
+    /// the proxy + ingress) with identical verification integrity: every
+    /// accepted tx still ends confirmed (feed), re-polled (drain), or
+    /// counted `missing`. No effect in subscribe mode (already feed-driven).
+    pub feed_confirm: bool,
     /// Executor node-container names.
     pub executor_nodes: Vec<String>,
     /// Ingress node-container name.
@@ -313,10 +321,13 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         SubmitMode::Blocking
     };
 
-    // Subscribe mode: receipts arrive on one multiplexed WebSocket feed
-    // (filtered to this run's senders) instead of on each submit's parked
-    // connection. Runs for the whole ramp + soak; aborted after the drain.
-    let feed = if cfg.subscribe {
+    // Receipts arrive on one multiplexed WebSocket feed (filtered to this
+    // run's senders): in subscribe mode instead of on each submit's parked
+    // connection, and in blocking mode (feed_confirm) instead of a per-tx
+    // re-fetch after each accepted submit. Runs for the whole ramp + soak;
+    // aborted after the drain.
+    let feed_confirm = cfg.feed_confirm && !cfg.subscribe;
+    let feed = if cfg.subscribe || feed_confirm {
         let ws_url = cfg.rpc.replacen("http", "ws", 1);
         let addrs: Vec<Address> = signers.iter().map(|s| s.address).collect();
         Some(tokio::spawn(receipt_feed_task(
@@ -372,6 +383,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         cfg.retry_submit,
         verify_receipts,
         mode,
+        feed_confirm,
     )
     .await;
 
@@ -480,6 +492,7 @@ async fn ramp_to_max(
             cfg.retry_submit,
             !cfg.chaos_mode,
             mode,
+            cfg.feed_confirm && !cfg.subscribe,
         )
         .await;
         let after = tracker.counts();

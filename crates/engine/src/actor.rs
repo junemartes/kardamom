@@ -45,7 +45,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender, bounded};
 use tracing::{debug, warn};
 
-use kardamom_types::{BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, SnapshotSource};
+use kardamom_types::{
+    BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Receipt, SnapshotSource,
+};
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
@@ -62,6 +64,24 @@ use crate::reader::{
 /// Publication handle for tx_receipts.
 pub trait TxReceiptsPublication: Send {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError>;
+
+    /// Publish a RUN of receipts, amortizing per-publish overhead where the
+    /// transport supports it. Returns `(published, error)`: the first
+    /// `published` receipts are handed off; an error applies to the rest, so
+    /// the caller's must-deliver retry resumes at the failed suffix. The
+    /// default loops singles — the validator's verifying sink keeps its
+    /// exact per-receipt divergence semantics — while the live transport
+    /// packs the whole slice into ONE `Vec<Receipt>` wire frame: one encode
+    /// and one blocking ack instead of one per receipt (the per-receipt ack
+    /// round trip was the executor commit thread's dominant cost).
+    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+        for (i, r) in receipts.iter().enumerate() {
+            if let Err(e) = self.publish(CMessage::Receipt(r.clone())) {
+                return (i, Some(e));
+            }
+        }
+        (receipts.len(), None)
+    }
 }
 
 /// Signal from the state writer (S6): "block N is durable in mdbx; you may
@@ -92,6 +112,10 @@ impl StateWriterQueue for Box<dyn StateWriterQueue> {
 impl TxReceiptsPublication for Box<dyn TxReceiptsPublication> {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         (**self).publish(msg)
+    }
+
+    fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+        (**self).publish_receipts(receipts)
     }
 }
 
@@ -598,6 +622,13 @@ where
         .expect("spawn exec")
 }
 
+/// Max receipts per published batch. Bounds the wire frame (receipts with
+/// logs vary in size; 64 keeps worst-case frames well inside the term-buffer
+/// message limit) — NOT a latency knob: the batch is whatever accumulated in
+/// the exec→commit channel while the previous publish was in flight, so at
+/// low rates batches are size 1 and nothing waits.
+const RECEIPT_BATCH_MAX: usize = 64;
+
 fn spawn_commit<C>(
     mut c_pub: C,
     rx: Receiver<ExecToCommit>,
@@ -609,14 +640,32 @@ where
         .name("executor-commit".into())
         .spawn(move || -> Result<(), ExecutorError> {
             loop {
-                let msg = match rx.recv() {
-                    Ok(m) => m,
+                // Block for the next message, then opportunistically drain
+                // whatever else is already queued into ONE receipt batch
+                // (adaptive batching: batch size ≈ arrivals during the
+                // previous publish — 1 at low rate, larger under load, no
+                // added latency in either regime). A boundary flushes the
+                // receipts gathered so far first, preserving stream order.
+                let mut receipts: Vec<Receipt> = Vec::new();
+                let mut boundary = None;
+                match rx.recv() {
+                    Ok(ExecToCommit::Receipt(r)) => receipts.push(r),
+                    Ok(ExecToCommit::Boundary(b)) => boundary = Some(b),
                     Err(_) => return Ok(()),
-                };
-                let c_msg = match msg {
-                    ExecToCommit::Receipt(r) => CMessage::Receipt(r),
-                    ExecToCommit::Boundary(b) => CMessage::BlockBoundary(b),
-                };
+                }
+                let mut closed = false;
+                while boundary.is_none() && receipts.len() < RECEIPT_BATCH_MAX {
+                    match rx.try_recv() {
+                        Ok(ExecToCommit::Receipt(r)) => receipts.push(r),
+                        Ok(ExecToCommit::Boundary(b)) => boundary = Some(b),
+                        Err(crossbeam_channel::TryRecvError::Empty) => break,
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            closed = true;
+                            break;
+                        }
+                    }
+                }
+
                 // tx_receipts is MUST-DELIVER: a transaction's receipt has to make
                 // it back to the ingress that is parking the client. A transient
                 // publish failure — NOT_CONNECTED while the ingress's subscription
@@ -624,28 +673,54 @@ where
                 // receipt or kill this thread. Killing it would close the bounded
                 // exec→commit channel, back-pressure the exec thread, stop
                 // tx_ordering consumption, and freeze ALL state progress. So retry
-                // until it lands; the offer itself waits out a single connect race,
-                // and this outer loop covers a connect window longer than one offer
-                // timeout. (Deploy order brings the ingress up first, so this
-                // normally succeeds on the first attempt.)
+                // until it lands, resuming at the unpublished SUFFIX of the batch
+                // (re-publishing a delivered prefix is only harmless-duplicate on
+                // the wire, but the validator's verifying sink consumes its buffer
+                // per receipt — the suffix resume keeps its semantics identical to
+                // the old one-publish-per-receipt loop). (Deploy order brings the
+                // ingress up first, so this normally succeeds on the first
+                // attempt.)
                 let mut attempts: u32 = 0;
-                while let Err(e) = c_pub.publish(c_msg.clone()) {
-                    // A PROVEN divergence from the sink (the validator's
-                    // receipt cross-check) is fatal, not transient. Retrying
-                    // would silently defeat the fail-stop: the first failing
-                    // publish already consumed the buffered receipt, so a
-                    // retry finds nothing, waits out the receipt window, lands
-                    // in the "unverified" arm and the pipeline keeps
-                    // committing past a proven mismatch. Propagate instead so
-                    // `Executor::run` returns the error and the process halts.
-                    if matches!(e, ExecutorError::Divergence(_)) {
-                        return Err(e);
+                let mut from = 0usize;
+                while from < receipts.len() {
+                    let (published, err) = c_pub.publish_receipts(&receipts[from..]);
+                    from += published;
+                    match err {
+                        None => {}
+                        // A PROVEN divergence from the sink (the validator's
+                        // receipt cross-check) is fatal, not transient.
+                        // Retrying would silently defeat the fail-stop: the
+                        // first failing publish already consumed the buffered
+                        // receipt, so a retry finds nothing, waits out the
+                        // receipt window, lands in the "unverified" arm and
+                        // the pipeline keeps committing past a proven
+                        // mismatch. Propagate instead so `Executor::run`
+                        // returns the error and the process halts.
+                        Some(e) if matches!(e, ExecutorError::Divergence(_)) => return Err(e),
+                        Some(e) => {
+                            attempts += 1;
+                            if attempts == 1 || attempts.is_multiple_of(20) {
+                                warn!(error = %e, attempts, "tx_receipts publish failed; retrying (must-deliver)");
+                            }
+                            thread::sleep(Duration::from_millis(50));
+                        }
                     }
-                    attempts += 1;
-                    if attempts == 1 || attempts.is_multiple_of(20) {
-                        warn!(error = %e, attempts, "tx_receipts publish failed; retrying (must-deliver)");
+                }
+                if let Some(b) = boundary {
+                    let mut attempts: u32 = 0;
+                    while let Err(e) = c_pub.publish(CMessage::BlockBoundary(b.clone())) {
+                        if matches!(e, ExecutorError::Divergence(_)) {
+                            return Err(e);
+                        }
+                        attempts += 1;
+                        if attempts == 1 || attempts.is_multiple_of(20) {
+                            warn!(error = %e, attempts, "tx_receipts boundary publish failed; retrying");
+                        }
+                        thread::sleep(Duration::from_millis(50));
                     }
-                    thread::sleep(Duration::from_millis(50));
+                }
+                if closed {
+                    return Ok(());
                 }
             }
         })
@@ -1220,6 +1295,141 @@ mod commit_tests {
         let l = log.lock().unwrap();
         assert_eq!(l.len(), 1, "the receipt must be delivered, not dropped");
         assert!(matches!(&l[0], CMessage::Receipt(r) if r.tx_idx == pos0));
+    }
+
+    fn receipt(tag: u8, offset: i32) -> Receipt {
+        Receipt {
+            tx_idx: BPosition {
+                term_id: 0,
+                term_offset: offset,
+            },
+            tx_hash: B256::repeat_byte(tag),
+            status: true,
+            gas_used: 21_000,
+            logs: Vec::new(),
+            write_set_hash: B256::ZERO,
+            ..Default::default()
+        }
+    }
+
+    /// Records each `publish_receipts` call's batch (the live transport's
+    /// one-frame-per-batch shape) plus boundaries via `publish`.
+    struct BatchRecordPub {
+        batches: Arc<Mutex<Vec<Vec<Receipt>>>>,
+        boundaries: Arc<Mutex<Vec<BlockBoundary>>>,
+    }
+    impl TxReceiptsPublication for BatchRecordPub {
+        fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
+            match msg {
+                CMessage::Receipt(r) => self.batches.lock().unwrap().push(vec![r]),
+                CMessage::BlockBoundary(b) => self.boundaries.lock().unwrap().push(b),
+            }
+            Ok(())
+        }
+        fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+            self.batches.lock().unwrap().push(receipts.to_vec());
+            (receipts.len(), None)
+        }
+    }
+
+    // Queued receipts drain into ONE batch publish (adaptive batching), and a
+    // boundary flushes the receipts gathered before it — order preserved.
+    #[test]
+    fn commit_thread_batches_queued_receipts_and_flushes_on_boundary() {
+        let (tx, rx) = bounded::<ExecToCommit>(16);
+        for i in 0..5 {
+            tx.send(ExecToCommit::Receipt(receipt(i as u8, i * 64)))
+                .unwrap();
+        }
+        tx.send(ExecToCommit::Boundary(BlockBoundary {
+            block_number: 1,
+            end_tx_idx: BPosition {
+                term_id: 0,
+                term_offset: 4 * 64,
+            },
+            l2_timestamp: 100,
+        }))
+        .unwrap();
+        drop(tx);
+
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let boundaries = Arc::new(Mutex::new(Vec::new()));
+        let h = spawn_commit(
+            BatchRecordPub {
+                batches: batches.clone(),
+                boundaries: boundaries.clone(),
+            },
+            rx,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let b = batches.lock().unwrap();
+        assert_eq!(b.len(), 1, "already-queued receipts ride one batch");
+        assert_eq!(b[0].len(), 5);
+        let hashes: Vec<u8> = b[0].iter().map(|r| r.tx_hash.0[0]).collect();
+        assert_eq!(hashes, vec![0, 1, 2, 3, 4], "in-batch order preserved");
+        assert_eq!(
+            boundaries.lock().unwrap().len(),
+            1,
+            "boundary after the flush"
+        );
+    }
+
+    /// Publishes `accept` receipts of each batch then fails transiently once,
+    /// recording everything accepted — exercises the suffix resume.
+    struct PartialPub {
+        accept: usize,
+        fail_once: bool,
+        delivered: Arc<Mutex<Vec<Receipt>>>,
+    }
+    impl TxReceiptsPublication for PartialPub {
+        fn publish(&mut self, _msg: CMessage) -> Result<(), ExecutorError> {
+            Ok(())
+        }
+        fn publish_receipts(&mut self, receipts: &[Receipt]) -> (usize, Option<ExecutorError>) {
+            if self.fail_once {
+                self.fail_once = false;
+                let n = self.accept.min(receipts.len());
+                self.delivered
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&receipts[..n]);
+                return (n, Some(ExecutorError::TxReceiptsClosed));
+            }
+            self.delivered.lock().unwrap().extend_from_slice(receipts);
+            (receipts.len(), None)
+        }
+    }
+
+    // A partial batch failure resumes at the unpublished SUFFIX: every receipt
+    // is delivered exactly once, in order.
+    #[test]
+    fn commit_thread_resumes_batch_at_failed_suffix() {
+        let (tx, rx) = bounded::<ExecToCommit>(16);
+        for i in 0..6 {
+            tx.send(ExecToCommit::Receipt(receipt(i as u8, i * 64)))
+                .unwrap();
+        }
+        drop(tx);
+
+        let delivered = Arc::new(Mutex::new(Vec::new()));
+        let h = spawn_commit(
+            PartialPub {
+                accept: 2,
+                fail_once: true,
+                delivered: delivered.clone(),
+            },
+            rx,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let d = delivered.lock().unwrap();
+        let hashes: Vec<u8> = d.iter().map(|r| r.tx_hash.0[0]).collect();
+        assert_eq!(
+            hashes,
+            vec![0, 1, 2, 3, 4, 5],
+            "each receipt delivered exactly once, in order, across the resume"
+        );
     }
 
     /// A sink that reports a PROVEN divergence (the validator's receipt
