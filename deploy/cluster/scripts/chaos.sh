@@ -212,6 +212,21 @@ val_metric() { # <metric-name> -> integer (empty on scrape failure)
 # is untouched (the validator is off the hot path), so the standard load +
 # progress verdicts still apply.
 LAPSE_S="${LAPSE_S:-30}"
+# Forensics for validator-lapse failures: the validator lives alone on the
+# aux tier and the generic failure dump does not cover it — capture the
+# nomad view, the node's container states, and the validator's own log tail
+# so a dark-endpoint verdict is attributable (process dead vs exec wedge vs
+# supervisor not restarting).
+val_debug() {
+  log "validator-lapse DEBUG: nomad validator job status:"
+  on_control 'nomad job status validator 2>/dev/null | tail -12' 2>/dev/null || true
+  log "validator-lapse DEBUG: containers on ${VALIDATOR_NODE}:"
+  timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps -a --format "{{.Names}} {{.Status}}" | head -6' 2>/dev/null || true
+  log "validator-lapse DEBUG: validator container log tail:"
+  timeout 20 docker exec "${VALIDATOR_NODE}" sh -c \
+    'docker logs --tail 25 "$(docker ps -a --format "{{.Names}}" | grep -m1 "^validator")" 2>&1 | tail -20' 2>/dev/null || true
+}
+
 run_validator_lapse() {
   local inner
   inner="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
@@ -319,8 +334,10 @@ run_validator_lapse() {
       if [ "${vf1}" -gt "${vf0}" ] && [ $(( e_now - v1 )) -le 25 ]; then ok=1; break; fi
     fi
   done
-  [ "${ok}" -eq 1 ] \
-    || fail "validator-lapse: validator not verifying live + caught up within ${t}s of thaw (path=${path:-unknown}, verified=${vf1:-?}, block=${v1:-?}, exec=${e_now:-?})"
+  if [ "${ok}" -ne 1 ]; then
+    val_debug
+    fail "validator-lapse: validator not verifying live + caught up within ${t}s of thaw (path=${path:-unknown}, verified=${vf1:-?}, block=${v1:-?}, exec=${e_now:-?})"
+  fi
   d1="$(val_metric validator_divergence_total)"; d1="${d1:-0}"
   [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after recovery"
   if [ "${path}" = "survivor" ]; then
