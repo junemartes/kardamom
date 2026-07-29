@@ -295,6 +295,31 @@ run_validator_lapse() {
     fi
   fi
 
+  # VERIFIED THAW (mirror of the verified freeze): a CONT that silently
+  # misses leaves a FROZEN ORPHAN squatting the metrics port — every
+  # supervisor replacement then dies instantly on EADDRINUSE (fatal in
+  # kardamom_obs::init), burns the restart budget, and mode=fail strands
+  # the validator permanently (reproduced locally; the 240s dark-endpoint
+  # run). Within a grace window the endpoint must answer OR the container
+  # must have been replaced; otherwise KILL the frozen container so the
+  # port frees and the supervisor restarts into clean air.
+  local thaw_ok=0 tw=0 curX
+  while [ "${tw}" -lt 30 ]; do
+    sleep 5; tw=$(( tw + 5 ))
+    if timeout 8 docker exec "${VALIDATOR_NODE}" curl -fsS --max-time 3 \
+        "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
+      thaw_ok=1; break
+    fi
+    curX="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
+    if [ -n "${curX}" ] && [ "${curX}" != "${inner}" ]; then
+      thaw_ok=1; log "validator-lapse: container replaced during/after freeze (${inner} -> ${curX})"; break
+    fi
+  done
+  if [ "${thaw_ok}" -ne 1 ]; then
+    log "validator-lapse: thaw NOT confirmed after ${tw}s — killing the frozen orphan (releases the metrics port for the supervisor's replacement)"
+    timeout 20 docker exec "${VALIDATOR_NODE}" docker kill "${inner}" >/dev/null 2>&1 || true
+  fi
+
   # POST-THAW, identity decides the contract. A ${LAPSE_S}s freeze exceeds
   # the media driver's client-liveness timeout: the validator's aeron client
   # is EVICTED and the process fail-stops on thaw → Nomad restarts it → the
