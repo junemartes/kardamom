@@ -150,6 +150,56 @@ struct SubEntry {
     deliver: DeliverFn,
 }
 
+/// Escalating idle wait — the Rust analogue of Aeron's `BackoffIdleStrategy`,
+/// which is what keeps the Java sealer stack's duty-cycle threads cheap.
+///
+/// Poll loops here wait on a channel with a SHORT timeout (the data-plane
+/// poll cadence), and profiling showed that cadence dominating the
+/// sequencer's CPU: three Aeron runtimes per process waking every 100µs cost
+/// ~66% of the process's cycles at 2k tx/s — nearly all of it crossbeam's
+/// pre-park spin (`sched_yield` storms), not work. The fix mirrors the
+/// sealer's: stay at the base cadence while the loop is DOING something, and
+/// once it has observed `grace` consecutive empty iterations, double the
+/// wait per iteration up to `cap`; any work snaps it back to base.
+///
+/// Latency safety: senders wake the channel wait IMMEDIATELY regardless of
+/// the timeout, so command/publish latency is untouched. Only the first
+/// inbound data-plane fragment after a quiet spell can wait up to `cap`;
+/// under steady traffic every poll finds fragments and the cadence never
+/// leaves base.
+pub struct IdleBackoff {
+    base: Duration,
+    cap: Duration,
+    grace: u32,
+    streak: u32,
+}
+
+impl IdleBackoff {
+    pub fn new(base: Duration, cap: Duration, grace: u32) -> Self {
+        Self {
+            base,
+            cap,
+            grace,
+            streak: 0,
+        }
+    }
+
+    /// The loop did work this iteration — snap back to the base cadence.
+    pub fn reset(&mut self) {
+        self.streak = 0;
+    }
+
+    /// Record an empty iteration and return the wait to use for it.
+    pub fn idle_wait(&mut self) -> Duration {
+        self.streak = self.streak.saturating_add(1);
+        if self.streak <= self.grace {
+            return self.base;
+        }
+        let doublings = (self.streak - self.grace).min(10);
+        self.base.saturating_mul(1u32 << doublings).min(self.cap)
+    }
+}
+
 /// A publish awaiting delivery on the Aeron thread.
 ///
 /// Why this queue exists: the Aeron thread is **single-threaded** and shared by
@@ -484,15 +534,27 @@ fn run_aeron_thread(
     // destination when dropped, so we must retain each one for as long as the
     // attachment should stay active; keyed by (sub_id, uri) for removal.
     let mut dests: Vec<(u32, String, rusteron_client::AeronAsyncDestination)> = Vec::new();
+    // Escalating idle wait for the busy branch: base 100µs (the established
+    // sub-poll/retry cadence), cap 1ms (the empty-branch cadence), grace 10
+    // (~1ms of consecutive emptiness before the first escalation).
+    let mut backoff = IdleBackoff::new(Duration::from_micros(100), Duration::from_millis(1), 10);
 
     loop {
+        // Whether THIS iteration did anything: handled a command, or polled
+        // at least one fragment. Drives the idle backoff — an empty streak
+        // escalates the wait, any work snaps it back to base.
+        let mut worked = false;
+
         // 1. Drain all queued commands (non-blocking). Publishes are *enqueued*
         //    onto `pending`, never offered inline, so a back-pressured offer can
         //    never block this loop (see `PendingPublish`).
         loop {
             match cmd_rx.try_recv() {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
+                Ok(cmd) => {
+                    worked = true;
+                    handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?;
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Ok(()),
             }
@@ -507,7 +569,7 @@ fn run_aeron_thread(
         //    publish can never starve a subscription's image. This is the fix
         //    for the cluster `tx_ordering` freeze.
         for entry in subs.iter_mut() {
-            let _ = entry.sub.poll_once(
+            let fragments = entry.sub.poll_once(
                 |bytes: &[u8], header: Header| {
                     if let Some((pos, session)) = header_loc(&header) {
                         (entry.deliver)(bytes, pos, session);
@@ -515,11 +577,12 @@ fn run_aeron_thread(
                 },
                 64,
             );
+            worked |= fragments.unwrap_or(0) > 0;
         }
 
         // 4. Idle. Block only when there is genuinely nothing to do — nothing to
-        //    poll and nothing pending; otherwise a short sleep keeps the
-        //    poll/retry cadence tight without busy-spinning a core.
+        //    poll and nothing pending; otherwise wait at the poll/retry cadence
+        //    without busy-spinning a core.
         if subs.is_empty() && pending.is_empty() {
             match cmd_rx.recv_timeout(Duration::from_millis(1)) {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
@@ -528,15 +591,31 @@ fn run_aeron_thread(
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
             }
         } else {
-            // Keep the 100µs sub-poll/retry cadence, but wake IMMEDIATELY on a
-            // new command instead of sleeping through it: with any sub open
-            // (always, in the services) this branch is the steady state, and a
-            // plain sleep put up to 100µs of latency under every ack-waited
-            // publish — a hard ~10k/s cap on any serialized publisher (the
-            // sequencer's offer path first among them).
-            match cmd_rx.recv_timeout(Duration::from_micros(100)) {
+            // Keep the 100µs sub-poll/retry cadence WHILE TRAFFIC FLOWS, but
+            // wake IMMEDIATELY on a new command instead of sleeping through
+            // it: with any sub open (always, in the services) this branch is
+            // the steady state, and a plain sleep put up to 100µs of latency
+            // under every ack-waited publish — a hard ~10k/s cap on any
+            // serialized publisher (the sequencer's offer path first among
+            // them). When quiet, the wait escalates toward 1ms (IdleBackoff):
+            // waking every 100µs regardless of traffic measured as ~66% of
+            // the sequencer's CPU, almost all of it crossbeam's pre-park
+            // spin. A non-empty `pending` pins the base cadence — the retry
+            // timing of a back-pressured offer must not degrade.
+            if worked || !pending.is_empty() {
+                backoff.reset();
+            }
+            let wait = if worked || !pending.is_empty() {
+                Duration::from_micros(100)
+            } else {
+                backoff.idle_wait()
+            };
+            match cmd_rx.recv_timeout(wait) {
                 Ok(RuntimeCmd::Shutdown) => return Ok(()),
-                Ok(cmd) => handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?,
+                Ok(cmd) => {
+                    backoff.reset();
+                    handle_cmd(&aeron, &mut pubs, &mut subs, &mut pending, &mut dests, cmd)?;
+                }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
             }
@@ -1622,5 +1701,29 @@ mod drain_pending_tests {
             Ok(Err(LogError::Aeron(m))) => assert!(m.contains("unknown pub_id")),
             other => panic!("expected unknown-pub error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn idle_backoff_escalates_after_grace_and_resets_on_work() {
+        let base = Duration::from_micros(100);
+        let cap = Duration::from_millis(1);
+        let mut b = IdleBackoff::new(base, cap, 3);
+        // Within grace: base cadence.
+        assert_eq!(b.idle_wait(), base);
+        assert_eq!(b.idle_wait(), base);
+        assert_eq!(b.idle_wait(), base);
+        // Past grace: doubles per idle iteration…
+        assert_eq!(b.idle_wait(), Duration::from_micros(200));
+        assert_eq!(b.idle_wait(), Duration::from_micros(400));
+        assert_eq!(b.idle_wait(), Duration::from_micros(800));
+        // …and clamps at the cap, staying there.
+        assert_eq!(b.idle_wait(), cap);
+        for _ in 0..100 {
+            assert_eq!(b.idle_wait(), cap);
+        }
+        // Any work snaps back to base for a full new grace window.
+        b.reset();
+        assert_eq!(b.idle_wait(), base);
+        assert_eq!(b.idle_wait(), base);
     }
 }

@@ -65,6 +65,20 @@ report artifact + `target/perf/` run dirs per PR body.
   for chaos assertions — counters reset to values identical to fresh
   baselines; a start time after a known event is unambiguous.
 
+## Idle backoff (sequencer profile follow-up)
+- perf @2,000 tx/s legacy: 66% of sequencer CPU in the three AeronRuntime
+  cmd loops' fixed 100µs recv_timeout (crossbeam pre-park sched_yield
+  storm), 8% in the session thread's fixed 1ms select; REAL sequencing work
+  <2% of a core. `IdleBackoff` (kardamom-log) ports the sealer stack's
+  BackoffIdleStrategy concept: base cadence while working, double per empty
+  iteration to a cap (100µs→1ms aeron loop, 1ms→5ms session thread), reset
+  on any work; pending publishes pin base (retry timing unchanged).
+- Validated: idle aeron threads 12.3%→1.7% each, sequencer containers
+  ~100%→~41% idle (~1.2 cores returned); legacy ramp edge 2,500→3,250 tx/s
+  (+30% — less scheduler churn on the shared 12-core host speeds the whole
+  blocking round trip), clean soak 2,600 tx/s ×240s zero-loss p50 11ms.
+  Loaded sequencer CPU 139%@2,000 → ~111%@2,600.
+
 ## Known follow-ups
 - Executor receipt/BAL batching (per-receipt blocking publish w/ clone,
   `crates/engine/src/actor.rs` commit thread) + mdbx boundary-fsync overlap.
