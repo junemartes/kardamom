@@ -401,11 +401,29 @@ fn run_session(
     // (set when the owning `LiveCluster` is dropped).
     let mut egress_alive = true;
 
+    // Escalating idle wait: base 1ms (the established duty-cycle cadence),
+    // cap 5ms, grace 5 (~5ms of consecutive emptiness before escalating).
+    // Egress frames and offer requests wake the Select immediately whatever
+    // the timeout, so only the TIME-based duties (keep-alive emission,
+    // reconnect backoff, the egress-silence watchdog) see the coarser tick —
+    // all of them run on 100ms+ scales. Profiling showed the fixed 1ms wake
+    // costing ~8% of the sequencer's CPU while quiet.
+    let mut backoff = kardamom_log::aeron_live::IdleBackoff::new(
+        Duration::from_millis(1),
+        Duration::from_millis(5),
+        5,
+    );
+
     while !stop.load(Ordering::SeqCst) {
+        // Whether THIS iteration moved anything (egress frames, offers, or
+        // driver outbound frames) — drives the idle backoff.
+        let mut worked = false;
+
         // 1. Drain egress fragments through the driver.
         loop {
             match frame_rx.try_recv() {
                 Ok(frame) => {
+                    worked = true;
                     egress_alive_at_ms = now_ms();
                     // Real egress: the path works again — reset the watchdog
                     // backoff so a FUTURE outage gets the fast first retry.
@@ -571,6 +589,7 @@ fn run_session(
         // gone, and any live member redirects us to the leader.
         let now = now_ms();
         let frames = driver.poll_outbound(now);
+        worked |= !frames.is_empty();
         if driver.take_rotate_hint()
             && let Some((next_member, p)) =
                 open_next_member_pub(&rt, &endpoints, target_member, cfg.ingress_stream_id)
@@ -590,6 +609,7 @@ fn run_session(
         loop {
             match req_rx.try_recv() {
                 Ok(OfferReq { payload, reply }) => {
+                    worked = true;
                     let outcome = match driver.wrap_app(&payload, now as i64) {
                         Some(framed) => match ingress.publish_bytes(to_aligned(&framed)) {
                             Ok(_) => OfferOutcome::Accepted,
@@ -608,11 +628,21 @@ fn run_session(
 
         // Wait for work instead of sleeping through it: block until an egress
         // frame or an offer request is READY (not consumed — the drain loops
-        // at the top of the iteration consume), capped at 1ms so the
+        // at the top of the iteration consume), capped so the
         // keep-alive/replay/subscribe duties keep their cadence. The
         // unconditional 1ms sleep here put up to 1ms of latency under EVERY
         // sequencer offer (two of these hand-offs per tx), a hard ~1-2k tx/s
-        // cap per shard on the offer path.
+        // cap per shard on the offer path. The cap ESCALATES 1ms → 5ms while
+        // consecutive iterations find nothing (IdleBackoff — the fixed 1ms
+        // wake was ~8% of sequencer CPU); any activity snaps it back.
+        if worked {
+            backoff.reset();
+        }
+        let wait = if worked {
+            Duration::from_millis(1)
+        } else {
+            backoff.idle_wait()
+        };
         let mut sel = crossbeam_channel::Select::new();
         sel.recv(&frame_rx);
         sel.recv(&req_rx);
@@ -625,12 +655,9 @@ fn run_session(
         // ~157% container CPU; the compact CI stack starved outright —
         // chain-semantics S8 timeout). Fall back to the plain duty-cycle
         // sleep in that case; a frame racing in behind the emptiness checks
-        // waits at most the old 1ms.
-        if sel.ready_timeout(Duration::from_millis(1)).is_ok()
-            && frame_rx.is_empty()
-            && req_rx.is_empty()
-        {
-            thread::sleep(Duration::from_millis(1));
+        // waits at most `wait`.
+        if sel.ready_timeout(wait).is_ok() && frame_rx.is_empty() && req_rx.is_empty() {
+            thread::sleep(wait);
         }
     }
 }
