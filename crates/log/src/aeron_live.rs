@@ -144,10 +144,46 @@ enum RuntimeCmd {
     Shutdown,
 }
 
+/// Adapter between rusteron's fragment-handler callback and a [`DeliverFn`],
+/// sitting BEHIND an [`rusteron_client::AeronFragmentAssembler`]: it is
+/// invoked once per complete MESSAGE, with multi-fragment messages (any
+/// frame larger than one Aeron MTU, ~1.4KB) already reassembled. Without the
+/// assembler, `aeron_subscription_poll` hands over raw fragments and every
+/// oversized frame decode-fails at the consumer — observed live when
+/// `Vec<Receipt>` batch frames crossed the MTU: ingress/sequencer/validator
+/// all logged decode failures, the lost receipts left parked submits
+/// hanging to their 60s timeout, and the load edge collapsed to 500 tx/s.
+/// The header passed through is the final fragment's; both ends of a
+/// position-keyed stream (the tx_data join) go through this same path, so
+/// position derivation stays consistent.
+struct AssembledDeliver {
+    deliver: DeliverFn,
+}
+
+impl rusteron_client::AeronFragmentHandlerCallback for AssembledDeliver {
+    fn handle_aeron_fragment_handler(&mut self, buffer: &[u8], header: Header) {
+        if let Some((pos, session)) = header_loc(&header) {
+            (self.deliver)(buffer, pos, session);
+        }
+    }
+}
+
 /// One row in the Aeron thread's subscription table.
 struct SubEntry {
     sub: Sub,
-    deliver: DeliverFn,
+    /// Assembler-wrapped handler passed to `poll` (owns per-session assembly
+    /// buffers); delegates complete messages to `inner`.
+    assembler: rusteron_client::Handler<rusteron_client::AeronFragmentAssembler>,
+    /// The leaked delegate the assembler forwards to — retained so it can be
+    /// released when the subscription row is dropped.
+    inner: rusteron_client::Handler<AssembledDeliver>,
+}
+
+impl Drop for SubEntry {
+    fn drop(&mut self) {
+        self.assembler.release();
+        self.inner.release();
+    }
 }
 
 /// Escalating idle wait — the Rust analogue of Aeron's `BackoffIdleStrategy`,
@@ -569,14 +605,7 @@ fn run_aeron_thread(
         //    publish can never starve a subscription's image. This is the fix
         //    for the cluster `tx_ordering` freeze.
         for entry in subs.iter_mut() {
-            let fragments = entry.sub.poll_once(
-                |bytes: &[u8], header: Header| {
-                    if let Some((pos, session)) = header_loc(&header) {
-                        (entry.deliver)(bytes, pos, session);
-                    }
-                },
-                64,
-            );
+            let fragments = entry.sub.poll(Some(&entry.assembler), 64);
             worked |= fragments.unwrap_or(0) > 0;
         }
 
@@ -667,9 +696,18 @@ fn handle_cmd(
             deliver,
             ack,
         } => {
-            let res = open_sub(aeron, &uri, stream_id).map(|sub| {
-                subs.push(SubEntry { sub, deliver });
-                (subs.len() - 1) as u32
+            let res = open_sub(aeron, &uri, stream_id).and_then(|sub| {
+                let (assembler, inner) =
+                    rusteron_client::Handler::leak_with_fragment_assembler(AssembledDeliver {
+                        deliver,
+                    })
+                    .map_err(|e| LogError::Aeron(format!("fragment assembler: {e:?}")))?;
+                subs.push(SubEntry {
+                    sub,
+                    assembler,
+                    inner,
+                });
+                Ok((subs.len() - 1) as u32)
             });
             let _ = ack.send(res);
         }
@@ -1101,8 +1139,22 @@ impl TxReceiptsPublisherHandle {
         })
     }
 
+    /// Publish a BATCH of receipts as one wire frame (`Vec<Receipt>`,
+    /// rkyv-encoded). One encode + one offer + one ack round trip per batch:
+    /// the previous receipt-per-frame path paid a blocking cross-thread ack
+    /// round trip PER RECEIPT on the executor's commit thread — at thousands
+    /// of receipts/s that serialization was the dominant per-tx publish
+    /// cost. The subscriber fans batches back out into individual
+    /// `(BPosition, Receipt)` deliveries, so consumers are unchanged; every
+    /// receipt in a batch shares the frame's stream position (consumers key
+    /// on `Receipt.tx_idx`, not the stream position). All receipt frames are
+    /// batch frames — a single receipt rides a batch of one.
+    pub fn publish_receipts(&self, batch: &Vec<Receipt>) -> Result<BPosition, LogError> {
+        self.inner.publish(batch)
+    }
+
     pub fn publish_receipt(&self, r: &Receipt) -> Result<BPosition, LogError> {
-        self.inner.publish(r)
+        self.publish_receipts(&vec![r.clone()])
     }
 
     pub fn publish_boundary(&self, b: &BlockBoundary) -> Result<BPosition, LogError> {
@@ -1140,11 +1192,37 @@ pub struct TxReceiptsSubscriberHandle {
 }
 
 impl TxReceiptsSubscriberHandle {
+    /// Fan a `Vec<Receipt>` batch frame (the only receipt wire format — see
+    /// [`TxReceiptsPublisherHandle::publish_receipts`]) back out into
+    /// per-receipt deliveries, preserving in-frame order. Consumers keep the
+    /// exact `(BPosition, Receipt)` stream they always had.
+    fn batch_fanout_deliver(
+        msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, Receipt)>,
+    ) -> DeliverFn {
+        Box::new(move |bytes: &[u8], pos: BPosition, _session: i32| {
+            match codec::materialize::<Vec<Receipt>>(bytes) {
+                Ok(batch) => {
+                    for r in batch {
+                        let _ = msg_tx.send((pos, r));
+                    }
+                }
+                Err(e) => {
+                    error!(error = %e, "decode failed on tx_receipts batch delivery");
+                }
+            }
+        })
+    }
+
     /// Legacy single-shared-channel subscriber (IPC default).
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
+        let (msg_tx, rx) = unbounded_channel();
+        rt.open_subscription_with_deliver(
+            &ch.tx_receipts_channel,
+            ch.tx_receipts_stream_id,
+            Self::batch_fanout_deliver(msg_tx),
+        )?;
         Ok(Self {
-            rx: rt
-                .open_subscription::<Receipt>(&ch.tx_receipts_channel, ch.tx_receipts_stream_id)?,
+            rx,
             sub_id: None,
             rt: rt.clone(),
         })
@@ -1159,9 +1237,11 @@ impl TxReceiptsSubscriberHandle {
                 "open_mds: tx_receipts MDS not configured (empty control channel)".into(),
             ));
         }
-        let (sub_id, rx) = rt.open_subscription_with_id::<Receipt>(
+        let (msg_tx, rx) = unbounded_channel();
+        let sub_id = rt.open_subscription_with_deliver(
             &ch.tx_receipts_control_channel,
             ch.tx_receipts_stream_id,
+            Self::batch_fanout_deliver(msg_tx),
         )?;
         Ok(Self {
             rx,

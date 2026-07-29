@@ -596,6 +596,25 @@ struct LiveTxReceiptsPub {
 }
 
 impl TxReceiptsPublication for LiveTxReceiptsPub {
+    /// One `Vec<Receipt>` wire frame per batch: one encode + one blocking
+    /// ack round trip through the Aeron thread instead of one per receipt.
+    /// All-or-nothing per frame, so a transient failure reports 0 published
+    /// and the commit thread's must-deliver loop retries the whole batch
+    /// (harmless duplicates — tx_receipts is AT-LEAST-ONCE, consumers dedup
+    /// on `tx_idx`).
+    fn publish_receipts(
+        &mut self,
+        receipts: &[kardamom_types::Receipt],
+    ) -> (usize, Option<ExecutorError>) {
+        match self.handle.publish_receipts(&receipts.to_vec()) {
+            Ok(_) => (receipts.len(), None),
+            Err(e) => (
+                0,
+                Some(ExecutorError::State(format!("publish_receipts: {e}"))),
+            ),
+        }
+    }
+
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         match msg {
             CMessage::Receipt(r) => self
