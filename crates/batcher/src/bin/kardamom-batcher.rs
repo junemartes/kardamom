@@ -75,7 +75,18 @@ struct Cli {
 
     /// Skip L1 broadcast; only inspect the archive. Live posting requires
     /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, `--da-store`.
-    #[arg(long, default_value_t = true)]
+    ///
+    /// A real boolean VALUE flag, not `SetTrue`: with clap's default bool
+    /// action `--dry-run=false` is rejected outright ("unexpected value"), so
+    /// the documented live invocation was unusable. Bare `--dry-run` still
+    /// means true.
+    #[arg(
+        long,
+        default_value_t = true,
+        num_args(0..=1),
+        default_missing_value = "true",
+        action = clap::ArgAction::Set
+    )]
     dry_run: bool,
 
     /// L1 JSON-RPC endpoint for live blob posting.
