@@ -141,11 +141,13 @@ impl Scraper {
         }
         if self.wants("ingress") {
             let body = self.fetch(&self.ingress_node, PORT_INGRESS).await;
+            // Absent-counter-on-a-scraped-body means ZERO (metrics-rs emits a
+            // counter only after its first increment); `None` means the
+            // scrape itself failed — same distinction as the sequencer block.
             let g = |m: &str| {
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 body.as_deref()
-                    .and_then(|b| sum_metric(b, m))
-                    .map(|v| v as u64)
+                    .map(|b| sum_metric(b, m).unwrap_or(0.0) as u64)
             };
             snap.ingress_received = g(M_INGRESS_RECEIVED);
             snap.ingress_accepted = g(M_INGRESS_ACCEPTED);
@@ -173,20 +175,20 @@ impl Scraper {
                     snap.service_up.push((format!("sequencer@{node}"), Some(0)));
                 }
                 if let Some(body) = body {
+                    // A SUCCESSFULLY scraped body with an ABSENT counter means
+                    // ZERO events, not "unknown": metrics-rs counters only
+                    // appear in the exposition after their first increment, so
+                    // requiring the sample line made every clean run report
+                    // `None` and the drop-accounting row was permanently
+                    // uninformative. `None` now means "no sequencer scraped".
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     {
-                        if let Some(v) = sum_metric(&body, M_SEQ_DROPPED) {
-                            d += v as u64;
-                            any_d = true;
-                        }
-                        if let Some(v) = sum_metric(&body, M_SEQ_EVICTIONS) {
-                            e += v as u64;
-                            any_e = true;
-                        }
-                        if let Some(v) = sum_metric(&body, M_SEQ_BACKPRESSURE) {
-                            b += v as u64;
-                            any_b = true;
-                        }
+                        d += sum_metric(&body, M_SEQ_DROPPED).unwrap_or(0.0) as u64;
+                        e += sum_metric(&body, M_SEQ_EVICTIONS).unwrap_or(0.0) as u64;
+                        b += sum_metric(&body, M_SEQ_BACKPRESSURE).unwrap_or(0.0) as u64;
+                        any_d = true;
+                        any_e = true;
+                        any_b = true;
                     }
                     let up = sum_metric(&body, M_SERVICE_UP).map(|v| {
                         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

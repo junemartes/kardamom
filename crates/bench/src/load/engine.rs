@@ -111,6 +111,10 @@ pub struct Tracker {
     receipted: AtomicU64,
     bad_status: AtomicU64,
     lat_us: Mutex<Histogram<u64>>,
+    /// Per-ramp-step latency histogram, reset by [`Tracker::take_step_latencies`]
+    /// — per-step percentiles localize WHERE in the ramp the tail degrades
+    /// (the cumulative histogram smears early clean steps over late ones).
+    step_lat_us: Mutex<Histogram<u64>>,
     pending: Mutex<HashMap<B256, Pending>>,
     /// Subscribe mode only: receipts whose feed notification arrived before
     /// their submit task registered in `pending` (feed vs ack race).
@@ -129,6 +133,11 @@ impl Tracker {
             receipted: AtomicU64::new(0),
             bad_status: AtomicU64::new(0),
             lat_us: Mutex::new(Histogram::new_with_bounds(
+                HIST_LOW_US,
+                HIST_HIGH_US,
+                HIST_SIGFIGS,
+            )?),
+            step_lat_us: Mutex::new(Histogram::new_with_bounds(
                 HIST_LOW_US,
                 HIST_HIGH_US,
                 HIST_SIGFIGS,
@@ -220,18 +229,37 @@ impl Tracker {
         (missing, unlanded)
     }
 
-    /// Latency percentiles in microseconds over the confirmed set.
+    /// Latency percentiles `(p50, p95, p99, max)` in microseconds over the
+    /// confirmed set.
     #[must_use]
-    pub fn latency_us(&self) -> (u64, u64, u64) {
+    pub fn latency_us(&self) -> (u64, u64, u64, u64) {
         let h = self
             .lat_us
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             h.value_at_quantile(0.50),
+            h.value_at_quantile(0.95),
             h.value_at_quantile(0.99),
             h.max(),
         )
+    }
+
+    /// Drain the per-step latency histogram: `(p50, p95, p99)` in µs for
+    /// everything confirmed since the previous call, then reset it.
+    #[must_use]
+    pub fn take_step_latency_us(&self) -> (u64, u64, u64) {
+        let mut h = self
+            .step_lat_us
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let out = (
+            h.value_at_quantile(0.50),
+            h.value_at_quantile(0.95),
+            h.value_at_quantile(0.99),
+        );
+        h.reset();
+        out
     }
 
     fn confirm(&self, status: u64, latency: Duration) {
@@ -239,8 +267,11 @@ impl Tracker {
         if status != 1 {
             self.bad_status.fetch_add(1, Ordering::Relaxed);
         }
+        let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         if let Ok(mut h) = self.lat_us.lock() {
-            let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+            let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
+        }
+        if let Ok(mut h) = self.step_lat_us.lock() {
             let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
         }
     }
