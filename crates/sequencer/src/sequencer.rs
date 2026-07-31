@@ -141,19 +141,25 @@ pub struct Sequencer {
     /// via `reinsert_for_retry` and re-published — the cluster dedup absorbs
     /// copies that DID commit, and voided ones get ordered.
     unconfirmed: UnconfirmedLedger,
-    /// Last run of the confirm-timeout sweep. The sweep scans the WHOLE
-    /// unconfirmed ledger (O(rate × receipt-latency) entries) and used to
-    /// run on EVERY publish-loop iteration — a rate-proportional tax on the
-    /// hot path serving a 15s timeout. Throttled to ~1Hz (except in tests
-    /// that zero the timeout for immediate-rewind assertions).
-    last_confirm_sweep: std::time::Instant,
+    /// Publish-order expiry queue over `unconfirmed`, with LAZY deletion:
+    /// confirmations remove from the map only; a popped queue entry counts
+    /// as stale unless the map still holds the key WITH THE SAME
+    /// published-at instant (a key can be re-queued by a reject-path rewind
+    /// while its old queue entry is still buffered — timestamp equality
+    /// disambiguates). Front-peek makes the confirm-timeout sweep O(1) when
+    /// nothing has expired — the steady state — and amortized O(1) per
+    /// entry overall; the previous full-map scan was O(rate ×
+    /// receipt-latency) per iteration on the publish hot path, and worst
+    /// exactly when the system was already in failover recovery.
+    unconfirmed_expiry: std::collections::VecDeque<(std::time::Instant, UnconfirmedKey)>,
 }
 
 /// #85 publish-confirmation ledger: (sender, nonce) → (ref metadata,
 /// published-at). BTreeMap so per-sender ranges trim cheaply on confirmation
-/// and the staleness sweep sees ascending nonce order.
+/// and rewinds see ascending nonce order.
+type UnconfirmedKey = (alloy_primitives::Address, u64);
 type UnconfirmedLedger =
-    std::collections::BTreeMap<(alloy_primitives::Address, u64), (RefMetadata, std::time::Instant)>;
+    std::collections::BTreeMap<UnconfirmedKey, (RefMetadata, std::time::Instant)>;
 
 impl Sequencer {
     pub fn new(cfg: SequencerConfig) -> Self {
@@ -164,7 +170,7 @@ impl Sequencer {
             state: PartitionState::new(cap),
             resync: None,
             unconfirmed: std::collections::BTreeMap::new(),
-            last_confirm_sweep: std::time::Instant::now(),
+            unconfirmed_expiry: std::collections::VecDeque::new(),
         }
     }
 
@@ -252,8 +258,9 @@ impl Sequencer {
                 // like a single offer, so every ref in the accepted prefix
                 // enters the unconfirmed ledger individually.
                 if self.resync.is_some() {
-                    self.unconfirmed
-                        .insert((sender, n), (meta, std::time::Instant::now()));
+                    let at = std::time::Instant::now();
+                    self.unconfirmed.insert((sender, n), (meta, at));
+                    self.unconfirmed_expiry.push_back((at, (sender, n)));
                 }
             }
             match err {
@@ -405,30 +412,35 @@ impl Sequencer {
             // receipt confirms). Bounded per iteration.
             let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
             let now = std::time::Instant::now();
-            // Throttle the full-ledger scan to ~1Hz — a 15s timeout gains
-            // nothing from per-iteration scans, and the scan cost is
-            // O(unconfirmed) = O(rate × receipt-latency) entries on the
-            // publish hot path. Timeout 0 is the test hook for immediate
-            // rewinds: keep per-iteration behavior there.
-            let sweep_due = self.cfg.resync.confirm_timeout_ms == 0
-                || now.duration_since(self.last_confirm_sweep) >= std::time::Duration::from_secs(1);
-            if sweep_due {
-                self.last_confirm_sweep = now;
-                let stale: Vec<_> = self
-                    .unconfirmed
-                    .iter()
-                    .filter(|(_, (_, at))| now.duration_since(*at) >= timeout)
-                    .take(256)
-                    .map(|(k, _)| *k)
-                    .collect();
-                if !stale.is_empty() {
-                    metrics::record_ref_republished(self.cfg.partition_index, stale.len());
-                    warn!(
-                        count = stale.len(),
-                        oldest_nonce = stale.first().map(|(_, n)| *n),
-                        "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
-                    );
+            // Expiry-queue sweep: O(1) front-peek when nothing has expired
+            // (the steady state), amortized O(1) per entry overall. Entries
+            // whose map slot was confirmed away — or re-queued by a
+            // reject-path rewind with a NEWER published-at — are stale and
+            // skipped (lazy deletion). Bounded per iteration like before.
+            let mut stale: Vec<UnconfirmedKey> = Vec::new();
+            while stale.len() < 256 {
+                let Some((queued_at, key)) = self.unconfirmed_expiry.front().copied() else {
+                    break;
+                };
+                if now.duration_since(queued_at) < timeout {
+                    break;
                 }
+                self.unconfirmed_expiry.pop_front();
+                if self
+                    .unconfirmed
+                    .get(&key)
+                    .is_some_and(|(_, at)| *at == queued_at)
+                {
+                    stale.push(key);
+                }
+            }
+            if !stale.is_empty() {
+                metrics::record_ref_republished(self.cfg.partition_index, stale.len());
+                warn!(
+                    count = stale.len(),
+                    oldest_nonce = stale.first().map(|(_, n)| *n),
+                    "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
+                );
                 // DESCENDING nonce order: reinsert_for_retry sets the sender's
                 // rewind floor on every call, so the LAST call per sender must
                 // carry the LOWEST nonce (same discipline as flush_drained's
