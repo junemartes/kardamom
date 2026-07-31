@@ -151,6 +151,7 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
 // the noise around without reducing it.
 pub fn execute_tx<S: StateDatabase>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     delta: &PendingDelta,
     env: ExecEnv,
     tx_idx: TxIndex,
@@ -205,32 +206,38 @@ pub fn execute_tx<S: StateDatabase>(
     let snap_ref = SnapshotRef { inner: snapshot };
     let mut cache: CacheDB<SnapshotRef<'_, S>> = CacheDB::new(snap_ref);
 
-    for (addr, (nonce, balance, code_hash)) in &delta.accounts {
-        let code = delta
-            .code
-            .get(code_hash)
-            .cloned()
-            .filter(|b| !b.is_empty())
-            .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
-        cache.insert_account_info(
-            *addr,
-            AccountInfo {
-                balance: *balance,
-                nonce: *nonce,
-                code_hash: *code_hash,
-                account_id: None,
-                code,
-            },
-        );
-    }
-    for ((addr, key), value) in &delta.storage {
-        let u_key = U256::from_be_bytes::<32>(key.0);
-        cache
-            .insert_account_storage(*addr, u_key, *value)
-            .map_err(|e| ExecutorError::Execution {
-                idx: tx_idx,
-                detail: format!("seed storage: {e:?}"),
-            })?;
+    // Seed layers in order — the PARENT (the previous block's writes while
+    // its commit is still fsyncing, pipelined-commit) first, then the live
+    // delta, so later inserts overwrite and the view equals
+    // snapshot ∘ parent ∘ delta.
+    for layer in parent.into_iter().chain(std::iter::once(delta)) {
+        for (addr, (nonce, balance, code_hash)) in &layer.accounts {
+            let code = layer
+                .code
+                .get(code_hash)
+                .cloned()
+                .filter(|b| !b.is_empty())
+                .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
+            cache.insert_account_info(
+                *addr,
+                AccountInfo {
+                    balance: *balance,
+                    nonce: *nonce,
+                    code_hash: *code_hash,
+                    account_id: None,
+                    code,
+                },
+            );
+        }
+        for ((addr, key), value) in &layer.storage {
+            let u_key = U256::from_be_bytes::<32>(key.0);
+            cache
+                .insert_account_storage(*addr, u_key, *value)
+                .map_err(|e| ExecutorError::Execution {
+                    idx: tx_idx,
+                    detail: format!("seed storage: {e:?}"),
+                })?;
+        }
     }
 
     let tx_env = tx_env_from_alloy(&alloy_env, signer);
@@ -389,6 +396,7 @@ fn invalid_skip(
 // equivalent allow on execute_tx for the rationale.
 pub fn execute_deposit_tx<S: StateDatabase>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     delta: &PendingDelta,
     env: ExecEnv,
     tx_idx: TxIndex,
@@ -401,32 +409,38 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // sees writes from earlier txs in the same block. Mirrors execute_tx.
     let snap_ref = SnapshotRef { inner: snapshot };
     let mut cache: CacheDB<SnapshotRef<'_, S>> = CacheDB::new(snap_ref);
-    for (addr, (nonce, balance, code_hash)) in &delta.accounts {
-        let code = delta
-            .code
-            .get(code_hash)
-            .cloned()
-            .filter(|b| !b.is_empty())
-            .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
-        cache.insert_account_info(
-            *addr,
-            AccountInfo {
-                balance: *balance,
-                nonce: *nonce,
-                code_hash: *code_hash,
-                account_id: None,
-                code,
-            },
-        );
-    }
-    for ((addr, key), value) in &delta.storage {
-        let u_key = U256::from_be_bytes::<32>(key.0);
-        cache
-            .insert_account_storage(*addr, u_key, *value)
-            .map_err(|e| ExecutorError::Execution {
-                idx: tx_idx,
-                detail: format!("seed storage: {e:?}"),
-            })?;
+    // Seed layers in order — the PARENT (the previous block's writes while
+    // its commit is still fsyncing, pipelined-commit) first, then the live
+    // delta, so later inserts overwrite and the view equals
+    // snapshot ∘ parent ∘ delta.
+    for layer in parent.into_iter().chain(std::iter::once(delta)) {
+        for (addr, (nonce, balance, code_hash)) in &layer.accounts {
+            let code = layer
+                .code
+                .get(code_hash)
+                .cloned()
+                .filter(|b| !b.is_empty())
+                .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
+            cache.insert_account_info(
+                *addr,
+                AccountInfo {
+                    balance: *balance,
+                    nonce: *nonce,
+                    code_hash: *code_hash,
+                    account_id: None,
+                    code,
+                },
+            );
+        }
+        for ((addr, key), value) in &layer.storage {
+            let u_key = U256::from_be_bytes::<32>(key.0);
+            cache
+                .insert_account_storage(*addr, u_key, *value)
+                .map_err(|e| ExecutorError::Execution {
+                    idx: tx_idx,
+                    detail: format!("seed storage: {e:?}"),
+                })?;
+        }
     }
 
     // (1) Mint pre-credit. `dep.mint` is u128; widen to U256 for balance
@@ -686,7 +700,7 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let stale = signed_transfer(&signer, to, 1_000, 3);
-        let (receipt, ws) = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &stale, 0, 77)
+        let (receipt, ws) = execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &stale, 0, 77)
             .expect("invalid tx must SKIP, not error");
         assert!(receipt.is_invalid_skip(), "status=false, gas_used=0 marker");
         assert_eq!(receipt.tx_hash, stale.tx_hash);
@@ -705,7 +719,7 @@ mod tests {
         // The chain continues: the sender's REAL next tx (nonce 5) executes.
         let env2 = ExecEnv::new(1, &boundary(1));
         let live = signed_transfer(&signer, to, 1_000, 5);
-        let (r2, _) = execute_tx(&snap, &delta, env2, TxIndex(1), pos(64), &live, 1, 77)
+        let (r2, _) = execute_tx(&snap, None, &delta, env2, TxIndex(1), pos(64), &live, 1, 77)
             .expect("valid tx after a skip");
         assert!(r2.status);
         assert!(!r2.is_invalid_skip());
@@ -723,8 +737,9 @@ mod tests {
             sender: signer.address(),
             tx_hash: keccak256([0xde, 0xad, 0xbe, 0xef]),
         };
-        let (receipt, ws) = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &garbage, 0, 0)
-            .expect("undecodable bytes must SKIP, not error");
+        let (receipt, ws) =
+            execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &garbage, 0, 0)
+                .expect("undecodable bytes must SKIP, not error");
         assert!(receipt.is_invalid_skip());
         assert_eq!(receipt.nonce, 0, "nonce unknowable from undecodable bytes");
         assert_eq!(receipt.write_set_hash, WriteSet::default().hash());
@@ -744,8 +759,8 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let env_tx = signed_transfer(&signer, to, 1_000, 0);
-        let (receipt, ws) =
-            execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0).expect("execute");
+        let (receipt, ws) = execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0)
+            .expect("execute");
 
         //the receipt's tx_hash MUST equal the inbound envelope's
         // tx_hash byte-for-byte. No recomputation in the executor.
@@ -785,8 +800,8 @@ mod tests {
         let mut delta = PendingDelta::new();
         // First transfer.
         let tx1 = signed_transfer(&signer, to, 100, 0);
-        let (r1, ws1) =
-            execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &tx1, 0, 0).expect("execute 1");
+        let (r1, ws1) = execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &tx1, 0, 0)
+            .expect("execute 1");
         assert!(r1.status);
         assert_eq!(r1.tx_hash, tx1.tx_hash); // copied, not recomputed
         assert_eq!(r1.nonce, 0);
@@ -799,6 +814,7 @@ mod tests {
         let tx2 = signed_transfer(&signer, to, 50, 1);
         let (r2, ws2) = execute_tx(
             &snap,
+            None,
             &delta,
             env,
             TxIndex(1),
@@ -849,7 +865,8 @@ mod tests {
 
         let d = dep(from, Some(to), 1_000, 400, Bytes::new());
         let (receipt, ws) =
-            execute_deposit_tx(&snap, &delta, env, TxIndex(0), pos(0), &d, 0, 0).expect("execute");
+            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0)
+                .expect("execute");
 
         // Mint = 1000, value forwarded = 400, so:
         // - sender ends at 1000 - 400 = 600
@@ -891,8 +908,9 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let d = dep(from, Some(revert_addr), 1_000, 200, Bytes::new());
-        let (receipt, ws) = execute_deposit_tx(&snap, &delta, env, TxIndex(0), pos(0), &d, 0, 0)
-            .expect("execute (revert is OK at the executor layer)");
+        let (receipt, ws) =
+            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0)
+                .expect("execute (revert is OK at the executor layer)");
 
         // Mint pre-credit is OUTSIDE the EVM call: from keeps the full mint.
         assert_eq!(
@@ -922,7 +940,8 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let d = dep(from, Some(Address::from([0x22u8; 20])), 1, 0, Bytes::new());
-        let err = execute_deposit_tx(&snap, &delta, env, TxIndex(0), pos(0), &d, 0, 0).unwrap_err();
+        let err =
+            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0).unwrap_err();
         assert!(
             matches!(err, ExecutorError::Execution { ref detail, .. } if detail.contains("mint overflow")),
             "got {err:?}"

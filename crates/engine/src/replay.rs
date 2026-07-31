@@ -186,8 +186,11 @@ where
         let mut cumulative_gas = 0u64;
         for (i, tx) in block.txs.iter().enumerate() {
             let tx_position = BPosition::from_index(counters.global_pos);
+            // Replay executes one durably-committed block at a time against
+            // its own committed snapshot — no pipelined parent layer.
             let (receipt, ws) = execute_tx(
                 &snapshot,
+                None,
                 &delta,
                 exec_env,
                 TxIndex(counters.tx_idx),

@@ -112,7 +112,8 @@ fn bench_transfer_step(c: &mut Criterion) {
         b.iter(|| {
             let delta = PendingDelta::new();
             let env_tx = signed_transfer(&signer, to, 0);
-            let _ = execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0).unwrap();
+            let _ =
+                execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0).unwrap();
         })
     });
     group.finish();
@@ -142,7 +143,7 @@ fn bench_sstore_step(c: &mut Criterion) {
             let delta = PendingDelta::new();
             let env_tx = signed_sstore_call(&signer, contract, 0);
             let (_r, _ws) =
-                execute_tx(&snap, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0).unwrap();
+                execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0).unwrap();
         })
     });
     group.finish();

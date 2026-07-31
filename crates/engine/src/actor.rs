@@ -363,6 +363,21 @@ where
             // persisted `resume.block` on a resume, 0 on a fresh start).
             let mut snapshot = snapshots.snapshot_after(initial_block);
             let mut delta = PendingDelta::new();
+            // Pipelined commit (depth 1): at each boundary the finalized
+            // delta is SUBMITTED to the writer but not awaited — the next
+            // block executes against snapshot ∘ parent ∘ delta while the
+            // writer fsyncs, and the commit is settled (awaited + boundary
+            // forwarded + snapshot swapped) at the NEXT boundary. The fsync
+            // gets the whole block interval to complete off the critical
+            // path: blocking here was the receipt tail's dominant source
+            // (commit p50 ~25ms even for empty blocks, p99 ~100ms, worst
+            // 1-2.5s — every tx arriving in that window ate the full stall).
+            // Durability semantics unchanged: the BOUNDARY still reaches
+            // tx_receipts only after its block is durable, and receipts
+            // already streamed pre-durability (AT-LEAST-ONCE, re-published
+            // byte-identical on crash replay).
+            let mut parent: Option<PendingDelta> = None;
+            let mut inflight: Option<BlockBoundary> = None;
             // Per-block receipts in arrival order, drained into the
             // BlockDelta at each boundary so the writer persists them
             // (receipts + tx_hash_index tables; #109). The clone per tx is
@@ -414,7 +429,15 @@ where
             loop {
                 let msg = match rx.recv() {
                     Ok(m) => m,
-                    Err(_) => return Ok(()),
+                    Err(_) => {
+                        // Clean end of stream: settle any in-flight commit so
+                        // the final boundary isn't silently dropped.
+                        if let Some(prev) = inflight.take() {
+                            let _ = sw_signal.wait_committed(prev.block_number);
+                            let _ = tx.send(ExecToCommit::Boundary(prev));
+                        }
+                        return Ok(());
+                    }
                 };
                 match msg {
                     ReaderToExec::Tx {
@@ -438,6 +461,7 @@ where
                         let apply_start = Instant::now();
                         let result = execute_tx(
                             &snapshot,
+                            parent.as_ref(),
                             &delta,
                             env,
                             tx_idx,
@@ -485,6 +509,7 @@ where
                         let apply_start = Instant::now();
                         let result = execute_deposit_tx(
                             &snapshot,
+                            parent.as_ref(),
                             &delta,
                             env,
                             tx_idx,
@@ -516,6 +541,36 @@ where
                         end_tx_idx,
                         l2_timestamp,
                     }) => {
+                        // Settle the PREVIOUS block's pipelined commit first:
+                        // its fsync had this whole block's interval to finish,
+                        // so this wait is ~0 in the steady state (the recorded
+                        // histogram now measures the RESIDUAL stall — the only
+                        // part the pipeline actually pays; sustained non-zero
+                        // residuals mean the writer can't keep up with the
+                        // block interval and this back-pressure is correct).
+                        if let Some(prev) = inflight.take() {
+                            let commit_wait = Instant::now();
+                            let committed = sw_signal.wait_committed(prev.block_number)?;
+                            metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
+                                .record(commit_wait.elapsed().as_secs_f64());
+                            metrics::gauge!(crate::metrics::BLOCK_NUMBER)
+                                .set(prev.block_number as f64);
+                            // Boundary forwards only now — downstream never
+                            // observes a boundary a crash could un-commit.
+                            if tx.send(ExecToCommit::Boundary(prev.clone())).is_err() {
+                                return Ok(());
+                            }
+                            debug!(
+                                target: "executor",
+                                committed,
+                                block_number = prev.block_number,
+                                "pipelined commit settled; snapshot swapped"
+                            );
+                            // The old parent layer's writes are in the new
+                            // snapshot now; `parent` is replaced below by
+                            // THIS block's delta before any tx reads it.
+                            snapshot = snapshots.snapshot_after(prev.block_number);
+                        }
                         // Alignment: BlockBoundaryStart.end_tx_idx carries the
                         // sealer's cumulative COUNT of canonical records
                         // (TxRef + DepositRef) republished through the end of
@@ -559,51 +614,29 @@ where
                             l2_timestamp,
                         };
 
-                        // Drain the delta. We swap it out so the writer
-                        // owns it. The block's receipts ride INSIDE the
-                        // BlockDelta (arrival order) so the writer persists
-                        // them durably (#109); they also streamed out on
-                        // tx_receipts at execute time, above.
+                        // Drain the delta. We swap it out so the writer owns
+                        // it — but RETAIN a clone as the next block's parent
+                        // read layer (pipelined commit: the clone of the
+                        // block's write maps costs a few ms; the fsync it
+                        // takes off the critical path costs 25ms-2.5s). The
+                        // block's receipts ride INSIDE the BlockDelta
+                        // (arrival order) so the writer persists them durably
+                        // (#109); they also streamed out on tx_receipts at
+                        // execute time, above, ahead of durability — a crash
+                        // in that window re-executes the block on recovery
+                        // and re-publishes byte-identical receipts, so
+                        // tx_receipts is AT-LEAST-ONCE and every consumer
+                        // must dedup on `tx_idx` (ingress does).
                         let pending = std::mem::take(&mut delta);
+                        parent = Some(pending.clone());
                         let bd: BlockDelta =
                             pending.finalize(block_number, std::mem::take(&mut block_receipts));
 
-                        // Time the state-commit: submit to writer queue +
-                        // wait for durable ack from the writer signal.
-                        let commit_start = Instant::now();
+                        // Submit WITHOUT waiting: the commit settles at the
+                        // next boundary (or at end of stream), where the
+                        // boundary is forwarded and the snapshot swapped.
                         sw_queue.submit(boundary.clone(), bd)?;
-
-                        // Wait for the writer to durably commit BEFORE
-                        // forwarding the sealed Boundary to the tx_receipts
-                        // publisher: downstream must never observe a boundary
-                        // for state a crash could still un-commit. The per-tx
-                        // receipts DO stream out at execute time (above),
-                        // ahead of durability — a crash in that window
-                        // re-executes the block on recovery and re-publishes
-                        // byte-identical receipts, so tx_receipts is
-                        // AT-LEAST-ONCE and every consumer must dedup on
-                        // `tx_idx` (ingress does). Holding whole receipt
-                        // batches until the fsync would stall client acks a
-                        // full commit cycle for no correctness gain.
-                        let committed = sw_signal.wait_committed(block_number)?;
-
-                        if tx.send(ExecToCommit::Boundary(boundary)).is_err() {
-                            return Ok(());
-                        }
-                        metrics::histogram!(crate::metrics::STATE_COMMIT_DURATION_SECONDS)
-                            .record(commit_start.elapsed().as_secs_f64());
-                        metrics::gauge!(crate::metrics::BLOCK_NUMBER).set(block_number as f64);
-
-                        debug!(
-                            target: "executor",
-                            committed,
-                            block_number,
-                            "snapshot-swap: writer caught up"
-                        );
-
-                        // Snapshot swap: open the new snapshot, drop the
-                        // old. The trait returns an owned value.
-                        snapshot = snapshots.snapshot_after(block_number);
+                        inflight = Some(boundary);
                         current_block = block_number + 1;
                         // New block opens with empty per-block counters.
                         tx_index_in_block = 0;
@@ -869,6 +902,107 @@ mod exec_tests {
             end_tx_idx: _,
             l2_timestamp: _,
         } = boundary;
+    }
+
+    /// Pipelined commit: block N+1 executes against snapshot ∘ parent(N)
+    /// while N's commit is unsettled, and boundaries still forward in order
+    /// after their block is durable. The StaticSnapshotSource NEVER advances
+    /// — cross-block visibility can only come through the parent layer, so a
+    /// broken layer makes the block-2 spend fail (status 0) and this test
+    /// red.
+    #[test]
+    fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
+        let signer_a = PrivateKeySigner::random();
+        let signer_b = PrivateKeySigner::random();
+        let a = signer_a.address();
+        let b = signer_b.address();
+        let c = address!("00000000000000000000000000000000000ABCDE");
+
+        // Only A is funded at genesis; B's balance exists ONLY in block 1's
+        // delta until that block's commit lands (which the static source
+        // never exposes).
+        let snap = MockStateDatabase::builder()
+            .account(a, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+
+        // Block 1: A → B, a fat transfer so B can pay gas in block 2.
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(0),
+                envelope: legacy(&signer_a, b, 0, 100_000_000_000_000_000),
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(1),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        // Block 2: B → C spends funds B only has via block 1's writes.
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(1),
+                envelope: legacy(&signer_b, c, 0, 60),
+                position: pos(1),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 2,
+                end_tx_idx: pos(2),
+                l2_timestamp: 1_700_000_002,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let cfg = ExecutorConfig::default();
+        let h = spawn_exec(
+            cfg,
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        // e2c ordering proves the pipeline shape: block 2's receipt streams
+        // BEFORE boundary 1 forwards (boundary 1 settles at boundary 2's
+        // entry; boundary 2 settles at end of stream).
+        let mut kinds = Vec::new();
+        while let Ok(m) = rx_e2c.try_recv() {
+            kinds.push(match m {
+                ExecToCommit::Receipt(r) => {
+                    assert!(r.status, "every tx must succeed (parent layer visible)");
+                    format!("R{}", r.block_number)
+                }
+                ExecToCommit::Boundary(bd) => format!("B{}", bd.block_number),
+            });
+        }
+        assert_eq!(
+            kinds,
+            vec!["R1", "R2", "B1", "B2"],
+            "receipts stream ahead; boundaries settle in order at the next boundary / stream end"
+        );
+
+        // Block 2's delta must show the spend: C received 60.
+        let log = writer_log.lock().unwrap();
+        assert_eq!(log.len(), 2);
+        let (_, d2) = &log[1];
+        let c_acc = d2
+            .accounts
+            .iter()
+            .find(|x| x.address == c)
+            .expect("C credited in block 2");
+        assert_eq!(c_acc.balance, U256::from(60u64));
     }
 
     #[test]
