@@ -7,6 +7,17 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, anyhow};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
+/// Whether an exporter build failure is a TCP bind `AddrInUse` (the ONLY
+/// retryable class — #122). Checked structurally through the error chain,
+/// with a string fallback in case the exporter crate stringifies the io
+/// error instead of sourcing it.
+fn is_addr_in_use(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+    }) || format!("{e:#}").contains("Address already in use")
+}
+
 /// Shared histogram buckets (seconds). 100 µs → 5 s, exponential.
 /// Promoted out of `crates/node/src/metrics.rs` so every service histogram
 /// uses the same boundaries.
@@ -58,6 +69,26 @@ pub fn init(
     // init_port_in_use integration test — if a dependency upgrade moves the
     // bind into the exporter future's first poll, that test fails and the
     // bind must be made eager here (e.g. pre-bind a std TcpListener).
+    // #122: EADDRINUSE gets a BOUNDED retry; every other bind/build error
+    // stays fail-fast. A port squatter is usually a wedged or frozen
+    // predecessor seconds away from being reaped by its supervisor — dying
+    // instantly burns one restart attempt per squat, and under a
+    // `mode = "fail"` restart policy (the validator: 5 attempts, then stay
+    // down) that converts a transient squat into a PERMANENT outage
+    // (reproduced end-to-end in #122: frozen validator holds :9006, every
+    // replacement dies at bind, alloc stranded). The default budget
+    // (24 × 5 s = 2 min) outlives a supervisor reap cycle; tests shrink it
+    // via the env knobs.
+    let bind_retries: u32 = std::env::var("KARDAMOM_OBS_BIND_RETRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+    let bind_retry_delay = std::time::Duration::from_millis(
+        std::env::var("KARDAMOM_OBS_BIND_RETRY_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000),
+    );
     let host_id_owned = host_id.to_string();
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<()>>(1);
     std::thread::Builder::new()
@@ -75,16 +106,31 @@ pub fn init(
                 }
             };
             let _guard = rt.enter();
-            let built = PrometheusBuilder::new()
-                .with_http_listener(metrics_addr)
-                .set_buckets(DURATION_BUCKETS)
-                .context("set_buckets")
-                .and_then(|b| {
-                    b.add_global_label("service", service)
-                        .add_global_label("host_id", &host_id_owned)
-                        .build()
-                        .context("PrometheusBuilder::build")
-                });
+            let build_once = || {
+                PrometheusBuilder::new()
+                    .with_http_listener(metrics_addr)
+                    .set_buckets(DURATION_BUCKETS)
+                    .context("set_buckets")
+                    .and_then(|b| {
+                        b.add_global_label("service", service)
+                            .add_global_label("host_id", &host_id_owned)
+                            .build()
+                            .context("PrometheusBuilder::build")
+                    })
+            };
+            let mut built = build_once();
+            let mut attempt: u32 = 0;
+            while attempt < bind_retries && built.as_ref().err().is_some_and(is_addr_in_use) {
+                attempt += 1;
+                tracing::warn!(
+                    %metrics_addr,
+                    attempt,
+                    max = bind_retries,
+                    "metrics port in use (squatter not yet reaped?); retrying bind (#122)"
+                );
+                std::thread::sleep(bind_retry_delay);
+                built = build_once();
+            }
             let exporter = match built {
                 Ok((recorder, exporter)) => {
                     if let Err(e) = metrics::set_global_recorder(recorder) {
