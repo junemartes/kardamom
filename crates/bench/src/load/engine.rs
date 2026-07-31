@@ -208,6 +208,23 @@ impl Tracker {
         }
     }
 
+    /// Sample up to `n` still-pending entries `(hash, accepted, age)` — the
+    /// concrete identities behind `missing`/`unlanded`, for post-run
+    /// forensics (query each hash against each ingress replica directly to
+    /// distinguish per-replica stream loss from cache eviction from harness
+    /// accounting bugs).
+    #[must_use]
+    pub fn sample_pending(&self, n: usize) -> Vec<(B256, bool, Duration)> {
+        let p = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.iter()
+            .take(n)
+            .map(|(h, v)| (*h, v.accepted, v.submit_ts.elapsed()))
+            .collect()
+    }
+
     /// `(missing_accepted, unlanded)` — leftover pending txs after the drain:
     /// accepted-but-never-receipted (a durability failure) vs offered whose
     /// submit failed and never landed.
@@ -694,6 +711,7 @@ mod tests {
             recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
+            ack_proves_receipt: false,
             chaos_mode: false,
         });
         assert!(!v.pass);

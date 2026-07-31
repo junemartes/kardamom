@@ -439,6 +439,16 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     // --- verdict ---------------------------------------------------------
     let counts = tracker.counts();
     let (missing, unlanded) = tracker.remaining_pending();
+    if missing + unlanded > 0 {
+        for (hash, accepted, age) in tracker.sample_pending(32) {
+            tracing::warn!(
+                %hash,
+                accepted,
+                age_secs = age.as_secs(),
+                "UNRESOLVED pending tx (forensics: query per replica)"
+            );
+        }
+    }
     // In `Offered` mode an unlanded (offered-but-never-receipted) tx is also a
     // must-deliver violation; fold it into `missing` for the gate.
     let missing_gate = if cfg.completeness == Completeness::Offered {
@@ -455,6 +465,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         recheck: recheck.as_ref(),
         max_gap: cfg.max_gap,
         assert_all_delivered: cfg.assert_all_delivered,
+        ack_proves_receipt: !cfg.subscribe,
         chaos_mode: cfg.chaos_mode,
     });
     let (p50, p95, p99, max) = tracker.latency_us();
