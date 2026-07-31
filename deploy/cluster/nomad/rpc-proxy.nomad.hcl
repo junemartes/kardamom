@@ -69,7 +69,12 @@ frontend rpc
   default_backend ingress
 
 backend ingress
-  balance roundrobin
+  # leastconn, not roundrobin: with http-reuse + long-lived client pools,
+  # roundrobin assigns a backend per frontend CONNECTION and reuse then pins
+  # it — measured 78/22 request imbalance (and 132% vs 9% CPU instants)
+  # across the two replicas under a single pooled client. leastconn tracks
+  # live load continuously and rebalances as connections churn.
+  balance leastconn
   # No HTTP health endpoint in v0 ingress: `check` alone does TCP-connect
   # liveness, which is exactly right (a replica that accepts connections
   # serves traffic; the conn-cap wedge class is gone with subscribe mode).
