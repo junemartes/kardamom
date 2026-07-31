@@ -481,41 +481,80 @@ pub async fn join_submit_tasks(tasks: &mut tokio::task::JoinSet<()>, deadline: I
     }
 }
 
+/// One sweep over outstanding (un-confirmed) txs at least `min_age` old:
+/// re-fetch each receipt and settle the entry if found. Returns how many
+/// entries remained pending after the sweep. Confirm only if WE removed the
+/// entry: the live feed keeps confirming concurrently, and a tx it settled
+/// between our poll and this remove must not be double-counted.
+pub async fn sweep_pending_once(
+    client: &Arc<HttpClient>,
+    tracker: &Arc<Tracker>,
+    min_age: Duration,
+) -> usize {
+    let pending: Vec<(B256, Instant)> = {
+        let p = tracker
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.iter()
+            .filter(|(_, v)| v.submit_ts.elapsed() >= min_age)
+            .map(|(h, v)| (*h, v.submit_ts))
+            .collect()
+    };
+    for (hash, submit_ts) in pending {
+        if let Some(status) = receipt_status(client, hash).await {
+            let removed = tracker
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&hash)
+                .is_some();
+            if removed {
+                tracker.confirm(status, submit_ts.elapsed());
+            }
+        }
+    }
+    tracker
+        .pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
 /// Poll outstanding (un-confirmed) txs until they receipt or `deadline`.
 pub async fn drain(client: Arc<HttpClient>, tracker: Arc<Tracker>, deadline: Instant) {
     loop {
-        let pending: Vec<(B256, Instant)> = {
-            let p = tracker
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.iter().map(|(h, v)| (*h, v.submit_ts)).collect()
-        };
-        if pending.is_empty() {
+        if sweep_pending_once(&client, &tracker, Duration::ZERO).await == 0 {
             break;
-        }
-        for (hash, submit_ts) in pending {
-            if let Some(status) = receipt_status(&client, hash).await {
-                // Confirm only if WE removed the entry: in subscribe mode the
-                // live feed keeps confirming during the drain, and a tx it
-                // settled between our poll and this remove must not be
-                // double-counted.
-                let removed = tracker
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&hash)
-                    .is_some();
-                if removed {
-                    tracker.confirm(status, submit_ts.elapsed());
-                }
-            }
         }
         if Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Background sweeper for feed-confirmed runs: every `interval`, re-fetch
+/// entries whose feed confirmation hasn't arrived within `min_age`. The
+/// ~0.1% of confirmations the WebSocket feed misses would otherwise sit
+/// pending until the END-OF-RUN drain — by which time a long soak has pushed
+/// them past the ingress's bounded receipt cache and they read as `missing`
+/// (observed: 584-1,620 phantom must-deliver violations on runs whose
+/// honest drop counters were all ZERO). Sweeping while the run is live keeps
+/// every entry inside the cache window at ~no request cost (the pending set
+/// is tiny in steady state).
+pub fn spawn_pending_sweeper(
+    client: Arc<HttpClient>,
+    tracker: Arc<Tracker>,
+    interval: Duration,
+    min_age: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let _ = sweep_pending_once(&client, &tracker, min_age).await;
+        }
+    })
 }
 
 #[cfg(test)]

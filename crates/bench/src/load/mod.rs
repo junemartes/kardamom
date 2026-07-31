@@ -349,6 +349,17 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     } else {
         None
     };
+    // Backstop the feed with a live sweeper: entries the feed misses are
+    // re-fetched within ~20s instead of at the end-of-run drain, which a
+    // long soak can push past the ingress's bounded receipt cache.
+    let sweeper = feed.as_ref().map(|_| {
+        engine::spawn_pending_sweeper(
+            Arc::clone(&client),
+            Arc::clone(&tracker),
+            Duration::from_secs(20),
+            Duration::from_secs(10),
+        )
+    });
 
     // --- ramp (soak mode only) -------------------------------------------
     let mut ramp = Vec::new();
@@ -406,6 +417,9 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     drain(Arc::clone(&client), Arc::clone(&tracker), deadline).await;
     if let Some(feed) = feed {
         feed.abort();
+    }
+    if let Some(sweeper) = sweeper {
+        sweeper.abort();
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     let fin = scraper.snapshot().await;
