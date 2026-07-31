@@ -35,7 +35,7 @@ ROOT_DIR="$(cd "${CLUSTER_DIR}/../.." && pwd)"
 DEPLOY_BIN="${DEPLOY_BIN:-${ROOT_DIR}/target/release/kardamom-deploy}"
 # anvil dev account #0: factory owner + deploy gas payer (well-known dev key).
 L1_OWNER="${L1_OWNER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
-L1_OWNER_KEY="${L1_OWNER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d796b4b7abf}"
+L1_OWNER_KEY="${L1_OWNER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80}"
 # anvil dev account #2: the batcher EOA (`l1Batcher`; must match the job's
 # batcher_key — see nomad/batcher.nomad.hcl).
 BATCHER_EOA="${BATCHER_EOA:-0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC}"
@@ -130,12 +130,18 @@ if [[ -z "${SETTLEMENT_ADDRESS}" ]]; then
   if [[ -x "${DEPLOY_BIN}" ]]; then
     echo
     echo "### Phase 2b: KardamomL2Settlement deploy (${L1_RPC})"
+    # Fresh anvil has no ERC-7955 CREATE2 factory; install its runtime via
+    # anvil_setCode (dev-chain-only bootstrap; idempotent).
+    "${DEPLOY_BIN}" --rpc-url "${L1_RPC}" --owner "${L1_OWNER}" bootstrap-7955-anvil
     "${DEPLOY_BIN}" --rpc-url "${L1_RPC}" --owner "${L1_OWNER}" \
       deploy --private-key "${L1_OWNER_KEY}" \
       KardamomL2Settlement --l2-chain-id "${L2_CHAIN_ID}" --l2-minter "${BATCHER_EOA}"
+    # `addresses` prints registry ids as hashes, not names; the settlement is
+    # the ONLY contract this deploy registers for the chain id, so the first
+    # proxy line is it.
     SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url "${L1_RPC}" --owner "${L1_OWNER}" \
       addresses --l2-chain-id "${L2_CHAIN_ID}" \
-      | awk '/id +KardamomL2Settlement/{f=1;next} f&&/proxy/{print $2;exit}')"
+      | awk '/proxy/ && !found {print $2; found=1}')"
     if [[ -z "${SETTLEMENT_ADDRESS}" ]]; then
       echo "ERROR: could not resolve the KardamomL2Settlement proxy address" >&2
       exit 1

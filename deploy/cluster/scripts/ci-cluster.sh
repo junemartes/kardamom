@@ -526,10 +526,13 @@ if [[ -x "${LOAD_BIN}" ]]; then
       SETTLEMENT_ADDRESS="${SETTLEMENT_ADDRESS:-}"
       DEPLOY_BIN="${ROOT}/target/release/kardamom-deploy"
       if [[ -z "${SETTLEMENT_ADDRESS}" && -x "${DEPLOY_BIN}" ]]; then
+        # Registry ids print as hashes; the settlement is the only contract
+        # registered for this chain id (deploy.sh Phase 2b), so first proxy
+        # line wins.
         SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url http://192.168.56.10:8546 \
           --owner 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
           addresses --l2-chain-id 412346 2>/dev/null \
-          | awk '/id +KardamomL2Settlement/{f=1;next} f&&/proxy/{print $2;exit}' || true)"
+          | awk '/proxy/ && !found {print $2; found=1}' || true)"
       fi
       if [[ -z "${SETTLEMENT_ADDRESS}" ]]; then
         log "ERROR: could not resolve the settlement address for the l1-batch case"
