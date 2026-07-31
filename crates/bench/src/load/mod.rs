@@ -350,14 +350,16 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         None
     };
     // Backstop the feed with a live sweeper: entries the feed misses are
-    // re-fetched within ~20s instead of at the end-of-run drain, which a
-    // long soak can push past the ingress's bounded receipt cache.
+    // re-fetched within 2-7s instead of at the end-of-run drain. The
+    // cadence must sit WELL inside the ingress receipt cache's query
+    // horizon (capacity / rate — ~27s at 4,800 tx/s with the 128k default,
+    // and eviction is arbitrary, so late polls miss even younger entries).
     let sweeper = feed.as_ref().map(|_| {
         engine::spawn_pending_sweeper(
             Arc::clone(&client),
             Arc::clone(&tracker),
-            Duration::from_secs(20),
-            Duration::from_secs(10),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
         )
     });
 
