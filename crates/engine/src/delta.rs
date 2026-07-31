@@ -118,6 +118,23 @@ impl PendingDelta {
         }
     }
 
+    /// Merge ANOTHER block's delta over this one (the other's writes win) —
+    /// maintains the pipelined commit's single merged read layer over
+    /// multiple unsettled blocks, so per-tx cache seeding stays O(one
+    /// layer) at any pipeline depth. `code` entries are `Bytes` (ref-counted
+    /// — cheap clones).
+    pub fn merge_from(&mut self, other: &PendingDelta) {
+        for (addr, v) in &other.accounts {
+            self.accounts.insert(*addr, *v);
+        }
+        for (k, v) in &other.storage {
+            self.storage.insert(*k, *v);
+        }
+        for (h, b) in &other.code {
+            self.code.insert(*h, b.clone());
+        }
+    }
+
     /// Finalize: produce a wire-shape `BlockDelta` ready for the state
     /// writer. `receipts` are the block's per-tx receipts in arrival order —
     /// supplied by the caller (the actor / replayer holds them), persisted by

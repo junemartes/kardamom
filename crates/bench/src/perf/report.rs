@@ -129,8 +129,9 @@ pub fn write_summary(
     )?;
     writeln!(
         md,
-        "- receipt latency (soak): p50 {} ms · p99 {} ms · max {} ms",
+        "- receipt latency (soak): p50 {} ms · p95 {} ms · p99 {} ms · max {} ms",
         soak.lat_p50_us / 1000,
+        soak.lat_p95_us / 1000,
         soak.lat_p99_us / 1000,
         soak.lat_max_us / 1000
     )?;
@@ -142,15 +143,18 @@ pub fn write_summary(
     writeln!(md, "## Ramp (discovery run)\n")?;
     writeln!(
         md,
-        "| rate (tx/s) | accept | keep-pace | seq clean | verdict |"
+        "| rate (tx/s) | accept | p50 ms | p95 ms | p99 ms | keep-pace | seq clean | verdict |"
     )?;
-    writeln!(md, "|---:|---:|:--|:--|:--|")?;
+    writeln!(md, "|---:|---:|---:|---:|---:|:--|:--|:--|")?;
     for s in &discovery.ramp {
         writeln!(
             md,
-            "| {} | {:.3} | {} | {} | {} |",
+            "| {} | {:.3} | {} | {} | {} | {} | {} | {} |",
             s.rate,
             s.accept_ratio,
+            s.lat_p50_us / 1000,
+            s.lat_p95_us / 1000,
+            s.lat_p99_us / 1000,
             s.gap_ok,
             s.seq_clean,
             if s.sustainable {

@@ -127,6 +127,9 @@ impl TxReceiptsPublication for ChanCPub {
 
 struct Imm;
 impl StateWriterSignal for Imm {
+    fn committed(&mut self) -> Result<u64, ExecutorError> {
+        Ok(u64::MAX)
+    }
     fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
         Ok(b)
     }

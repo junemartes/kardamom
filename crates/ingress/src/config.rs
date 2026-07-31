@@ -74,7 +74,16 @@ impl Default for IngressConfig {
             sig_verify_flush_window: Duration::from_micros(50),
             pending_receipt_timeout: Duration::from_secs(30),
             chain_id: 1,
-            receipt_cache_capacity: 64 * 1024,
+            // 128k ≈ a 27s query horizon at 4,800 tx/s (~77MB across both
+            // indexes at bench-receipt sizes). 64k gave 13.7s — SHORTER than
+            // any refetch fallback's reaction time at that rate, so the
+            // ~0.1% of confirmations the WS feed misses became permanently
+            // unqueryable and read as phantom must-deliver violations
+            // (observed: 584-1,963 "missing" on soaks whose drop counters
+            // were all zero). Eviction is arbitrary (DashMap), so the
+            // horizon is a lower bound only for a fraction of entries —
+            // fallbacks must poll well inside it.
+            receipt_cache_capacity: 128 * 1024,
             ack_policy: AckPolicy::default(),
             rpc_max_connections: 8192,
             pending_shed_depth: 16_384,

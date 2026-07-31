@@ -116,8 +116,11 @@ where
 
 /// Capacity of the deduped receipt/error re-broadcast feeds. A subscriber
 /// that lags more than this many items receives a `Lagged` notification and
-/// must fall back to `eth_getTransactionReceipt` for the gap.
-const FEED_CAPACITY: usize = 8192;
+/// must fall back to `eth_getTransactionReceipt` for the gap. 32k: at 8192
+/// a subscriber stalled ~1.7s at 4,800 tx/s overflowed the ring — the
+/// leading suspect for the ~0.1% silent feed misses under sustained load;
+/// 32k tolerates ~7s at that rate for ~10MB of buffered receipts.
+const FEED_CAPACITY: usize = 32 * 1024;
 
 impl<P, S> Clone for IngressProxy<P, S>
 where

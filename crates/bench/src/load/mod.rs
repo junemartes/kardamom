@@ -130,6 +130,14 @@ pub struct RampStep {
     pub seq_clean: bool,
     /// All three signals held.
     pub sustainable: bool,
+    /// Receipt latency over THIS step only (µs) — localizes where in the
+    /// ramp the tail degrades.
+    #[serde(default)]
+    pub lat_p50_us: u64,
+    #[serde(default)]
+    pub lat_p95_us: u64,
+    #[serde(default)]
+    pub lat_p99_us: u64,
 }
 
 /// Serialized harness report.
@@ -149,6 +157,9 @@ pub struct LoadReport {
     pub ramp: Vec<RampStep>,
     /// Receipt latency p50 (µs).
     pub lat_p50_us: u64,
+    /// Receipt latency p95 (µs).
+    #[serde(default)]
+    pub lat_p95_us: u64,
     /// Receipt latency p99 (µs).
     pub lat_p99_us: u64,
     /// Receipt latency max (µs).
@@ -338,6 +349,19 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     } else {
         None
     };
+    // Backstop the feed with a live sweeper: entries the feed misses are
+    // re-fetched within 2-7s instead of at the end-of-run drain. The
+    // cadence must sit WELL inside the ingress receipt cache's query
+    // horizon (capacity / rate — ~27s at 4,800 tx/s with the 128k default,
+    // and eviction is arbitrary, so late polls miss even younger entries).
+    let sweeper = feed.as_ref().map(|_| {
+        engine::spawn_pending_sweeper(
+            Arc::clone(&client),
+            Arc::clone(&tracker),
+            Duration::from_secs(5),
+            Duration::from_secs(2),
+        )
+    });
 
     // --- ramp (soak mode only) -------------------------------------------
     let mut ramp = Vec::new();
@@ -396,6 +420,9 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     if let Some(feed) = feed {
         feed.abort();
     }
+    if let Some(sweeper) = sweeper {
+        sweeper.abort();
+    }
     tokio::time::sleep(Duration::from_secs(3)).await;
     let fin = scraper.snapshot().await;
     // A chaos-restarted executor's block gauge resets to 0, so `final − base`
@@ -412,6 +439,16 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     // --- verdict ---------------------------------------------------------
     let counts = tracker.counts();
     let (missing, unlanded) = tracker.remaining_pending();
+    if missing + unlanded > 0 {
+        for (hash, accepted, age) in tracker.sample_pending(32) {
+            tracing::warn!(
+                %hash,
+                accepted,
+                age_secs = age.as_secs(),
+                "UNRESOLVED pending tx (forensics: query per replica)"
+            );
+        }
+    }
     // In `Offered` mode an unlanded (offered-but-never-receipted) tx is also a
     // must-deliver violation; fold it into `missing` for the gate.
     let missing_gate = if cfg.completeness == Completeness::Offered {
@@ -428,9 +465,10 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         recheck: recheck.as_ref(),
         max_gap: cfg.max_gap,
         assert_all_delivered: cfg.assert_all_delivered,
+        ack_proves_receipt: !cfg.subscribe,
         chaos_mode: cfg.chaos_mode,
     });
-    let (p50, p99, max) = tracker.latency_us();
+    let (p50, p95, p99, max) = tracker.latency_us();
 
     let report = LoadReport {
         mode: if cfg.chaos_mode { "chaos" } else { "soak" }.to_string(),
@@ -440,6 +478,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         duration_secs: cfg.duration.as_secs_f64(),
         ramp,
         lat_p50_us: p50,
+        lat_p95_us: p95,
         lat_p99_us: p99,
         lat_max_us: max,
         verdict,
@@ -521,11 +560,15 @@ async fn ramp_to_max(
         let gap_ok = step_gap_ok(&s0, &s1, cfg.max_gap);
         let seq_clean = step_seq_clean(&s0, &s1);
         let sustainable = accept_ratio >= 0.99 && recv_ok && gap_ok && seq_clean;
+        let (lat_p50_us, lat_p95_us, lat_p99_us) = tracker.take_step_latency_us();
         tracing::info!(
             rate,
             offered,
             accepted,
             accept_ratio = format!("{accept_ratio:.3}"),
+            p50_ms = lat_p50_us / 1000,
+            p95_ms = lat_p95_us / 1000,
+            p99_ms = lat_p99_us / 1000,
             gap_ok,
             seq_clean,
             sustainable,
@@ -537,6 +580,9 @@ async fn ramp_to_max(
             gap_ok,
             seq_clean,
             sustainable,
+            lat_p50_us,
+            lat_p95_us,
+            lat_p99_us,
         });
         if sustainable {
             discovered = rate;
@@ -591,9 +637,12 @@ fn print_report(r: &LoadReport) {
         println!("---- ramp ----");
         for s in &r.ramp {
             println!(
-                "  rate={:<6} accept={:.3} gap_ok={:<5} seq_clean={:<5} {}",
+                "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms gap_ok={:<5} seq_clean={:<5} {}",
                 s.rate,
                 s.accept_ratio,
+                s.lat_p50_us / 1000,
+                s.lat_p95_us / 1000,
+                s.lat_p99_us / 1000,
                 s.gap_ok,
                 s.seq_clean,
                 if s.sustainable {
@@ -614,8 +663,9 @@ fn print_report(r: &LoadReport) {
         v.inferred_ingress_drop, v.seq_dropped, v.seq_evicted, v.seq_backpressure
     );
     println!(
-        "receipt-latency p50={}ms p99={}ms max={}ms",
+        "receipt-latency p50={}ms p95={}ms p99={}ms max={}ms",
         r.lat_p50_us / 1000,
+        r.lat_p95_us / 1000,
         r.lat_p99_us / 1000,
         r.lat_max_us / 1000
     );

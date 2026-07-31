@@ -79,6 +79,41 @@ report artifact + `target/perf/` run dirs per PR body.
   blocking round trip), clean soak 2,600 tx/s ×240s zero-loss p50 11ms.
   Loaded sequencer CPU 139%@2,000 → ~111%@2,600.
 
+## Tail-latency + drops campaign (2026-07-31)
+- Root cause of the receipt tail (p99 600-900ms, p95 breaking 20ms at
+  ~1,500-2,000 tx/s): the exec thread blocked on the mdbx fsync at every
+  boundary (`wait_committed`) — commit p50 ~25ms even for EMPTY blocks,
+  p99 ~100ms, 300-770ms/block under 4.8k soak; commit duration and the
+  latency tail were the same number at every phase. Fix: **pipelined
+  boundary commit, depth 4** (matches state geometry HORIZON_BLOCKS):
+  submit without waiting; non-blocking `StateWriterSignal::committed()`
+  probe settles finished commits at each boundary; block N+1..N+4 execute
+  against snapshot ∘ merged-unsettled-writes ∘ live delta; exec parks only
+  at depth K. Result: **p95 12-16ms through 3,000 tx/s** (was 220ms @3k),
+  p99 ≤23ms there; edge = the 6,000 ceiling; residual commit wait 0.0ms
+  at every sample. Boundary marker ships ≤K blocks later (sole consumer:
+  eth_blockNumber).
+- Sequencer confirm sweep: was an O(ledger) scan per publish-loop
+  iteration; now a publish-order expiry queue with lazy deletion
+  (timestamp-matched against reject-path re-queues) — O(1) steady state.
+- p95 growth ABOVE ~3,500: whole-distribution rise tracking PSI cpu
+  pressure 1:1 (flat ≤39% PSI, knee at ~55%, p95 112ms at 80%);
+  accidental causal confirmation: concurrent cargo builds on the host
+  collapsed the edge to 2,500 with the same signature. Subtraction A/B
+  (validator stopped) is the confirmatory experiment.
+- "Missing" receipts at high rate: **zero product loss** — forensics
+  (per-replica queries + mdbx byte-search) proved every sampled missing
+  hash EXECUTED with a durable receipt, null in BOTH ingress caches: the
+  bounded receipt cache (arbitrary DashMap eviction ⇒ EXPONENTIAL
+  retention, not FIFO — ~31% of entries gone by 10s of age at 4.8k)
+  outran feed misses (~0.15%) before any refetch. Mitigations: cache 64k
+  →128k, feed ring 8k→32k, harness sweeper 2-7s cadence, and the verdict
+  now downgrades accepted-but-unserved to a warning IFF all drop counters
+  scraped exactly zero (blocking ack proves the receipt existed).
+  PRODUCT follow-up: durable receipt serving needs an executor-side query
+  RPC or an external indexer contract — the stateless-ingress design
+  (#115/#117) rules out a state-DB reader in ingress.
+
 ## Known follow-ups
 - Executor receipt/BAL batching (per-receipt blocking publish w/ clone,
   `crates/engine/src/actor.rs` commit thread) + mdbx boundary-fsync overlap.

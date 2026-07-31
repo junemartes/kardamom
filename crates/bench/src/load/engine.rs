@@ -111,6 +111,10 @@ pub struct Tracker {
     receipted: AtomicU64,
     bad_status: AtomicU64,
     lat_us: Mutex<Histogram<u64>>,
+    /// Per-ramp-step latency histogram, reset by [`Tracker::take_step_latencies`]
+    /// — per-step percentiles localize WHERE in the ramp the tail degrades
+    /// (the cumulative histogram smears early clean steps over late ones).
+    step_lat_us: Mutex<Histogram<u64>>,
     pending: Mutex<HashMap<B256, Pending>>,
     /// Subscribe mode only: receipts whose feed notification arrived before
     /// their submit task registered in `pending` (feed vs ack race).
@@ -129,6 +133,11 @@ impl Tracker {
             receipted: AtomicU64::new(0),
             bad_status: AtomicU64::new(0),
             lat_us: Mutex::new(Histogram::new_with_bounds(
+                HIST_LOW_US,
+                HIST_HIGH_US,
+                HIST_SIGFIGS,
+            )?),
+            step_lat_us: Mutex::new(Histogram::new_with_bounds(
                 HIST_LOW_US,
                 HIST_HIGH_US,
                 HIST_SIGFIGS,
@@ -199,6 +208,23 @@ impl Tracker {
         }
     }
 
+    /// Sample up to `n` still-pending entries `(hash, accepted, age)` — the
+    /// concrete identities behind `missing`/`unlanded`, for post-run
+    /// forensics (query each hash against each ingress replica directly to
+    /// distinguish per-replica stream loss from cache eviction from harness
+    /// accounting bugs).
+    #[must_use]
+    pub fn sample_pending(&self, n: usize) -> Vec<(B256, bool, Duration)> {
+        let p = self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.iter()
+            .take(n)
+            .map(|(h, v)| (*h, v.accepted, v.submit_ts.elapsed()))
+            .collect()
+    }
+
     /// `(missing_accepted, unlanded)` — leftover pending txs after the drain:
     /// accepted-but-never-receipted (a durability failure) vs offered whose
     /// submit failed and never landed.
@@ -220,18 +246,37 @@ impl Tracker {
         (missing, unlanded)
     }
 
-    /// Latency percentiles in microseconds over the confirmed set.
+    /// Latency percentiles `(p50, p95, p99, max)` in microseconds over the
+    /// confirmed set.
     #[must_use]
-    pub fn latency_us(&self) -> (u64, u64, u64) {
+    pub fn latency_us(&self) -> (u64, u64, u64, u64) {
         let h = self
             .lat_us
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (
             h.value_at_quantile(0.50),
+            h.value_at_quantile(0.95),
             h.value_at_quantile(0.99),
             h.max(),
         )
+    }
+
+    /// Drain the per-step latency histogram: `(p50, p95, p99)` in µs for
+    /// everything confirmed since the previous call, then reset it.
+    #[must_use]
+    pub fn take_step_latency_us(&self) -> (u64, u64, u64) {
+        let mut h = self
+            .step_lat_us
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let out = (
+            h.value_at_quantile(0.50),
+            h.value_at_quantile(0.95),
+            h.value_at_quantile(0.99),
+        );
+        h.reset();
+        out
     }
 
     fn confirm(&self, status: u64, latency: Duration) {
@@ -239,8 +284,11 @@ impl Tracker {
         if status != 1 {
             self.bad_status.fetch_add(1, Ordering::Relaxed);
         }
+        let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
         if let Ok(mut h) = self.lat_us.lock() {
-            let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
+            let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
+        }
+        if let Ok(mut h) = self.step_lat_us.lock() {
             let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
         }
     }
@@ -450,41 +498,80 @@ pub async fn join_submit_tasks(tasks: &mut tokio::task::JoinSet<()>, deadline: I
     }
 }
 
+/// One sweep over outstanding (un-confirmed) txs at least `min_age` old:
+/// re-fetch each receipt and settle the entry if found. Returns how many
+/// entries remained pending after the sweep. Confirm only if WE removed the
+/// entry: the live feed keeps confirming concurrently, and a tx it settled
+/// between our poll and this remove must not be double-counted.
+pub async fn sweep_pending_once(
+    client: &Arc<HttpClient>,
+    tracker: &Arc<Tracker>,
+    min_age: Duration,
+) -> usize {
+    let pending: Vec<(B256, Instant)> = {
+        let p = tracker
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.iter()
+            .filter(|(_, v)| v.submit_ts.elapsed() >= min_age)
+            .map(|(h, v)| (*h, v.submit_ts))
+            .collect()
+    };
+    for (hash, submit_ts) in pending {
+        if let Some(status) = receipt_status(client, hash).await {
+            let removed = tracker
+                .pending
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&hash)
+                .is_some();
+            if removed {
+                tracker.confirm(status, submit_ts.elapsed());
+            }
+        }
+    }
+    tracker
+        .pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
 /// Poll outstanding (un-confirmed) txs until they receipt or `deadline`.
 pub async fn drain(client: Arc<HttpClient>, tracker: Arc<Tracker>, deadline: Instant) {
     loop {
-        let pending: Vec<(B256, Instant)> = {
-            let p = tracker
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            p.iter().map(|(h, v)| (*h, v.submit_ts)).collect()
-        };
-        if pending.is_empty() {
+        if sweep_pending_once(&client, &tracker, Duration::ZERO).await == 0 {
             break;
-        }
-        for (hash, submit_ts) in pending {
-            if let Some(status) = receipt_status(&client, hash).await {
-                // Confirm only if WE removed the entry: in subscribe mode the
-                // live feed keeps confirming during the drain, and a tx it
-                // settled between our poll and this remove must not be
-                // double-counted.
-                let removed = tracker
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .remove(&hash)
-                    .is_some();
-                if removed {
-                    tracker.confirm(status, submit_ts.elapsed());
-                }
-            }
         }
         if Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
+}
+
+/// Background sweeper for feed-confirmed runs: every `interval`, re-fetch
+/// entries whose feed confirmation hasn't arrived within `min_age`. The
+/// ~0.1% of confirmations the WebSocket feed misses would otherwise sit
+/// pending until the END-OF-RUN drain — by which time a long soak has pushed
+/// them past the ingress's bounded receipt cache and they read as `missing`
+/// (observed: 584-1,620 phantom must-deliver violations on runs whose
+/// honest drop counters were all ZERO). Sweeping while the run is live keeps
+/// every entry inside the cache window at ~no request cost (the pending set
+/// is tiny in steady state).
+pub fn spawn_pending_sweeper(
+    client: Arc<HttpClient>,
+    tracker: Arc<Tracker>,
+    interval: Duration,
+    min_age: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            let _ = sweep_pending_once(&client, &tracker, min_age).await;
+        }
+    })
 }
 
 #[cfg(test)]
@@ -624,6 +711,7 @@ mod tests {
             recheck: None,
             max_gap: 5,
             assert_all_delivered: true,
+            ack_proves_receipt: false,
             chaos_mode: false,
         });
         assert!(!v.pass);

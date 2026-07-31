@@ -90,6 +90,10 @@ impl MdbxWriterSignal {
 }
 
 impl StateWriterSignal for MdbxWriterSignal {
+    fn committed(&mut self) -> Result<u64, ExecutorError> {
+        Ok(self.rx.current().map(|s| s.block_number()).unwrap_or(0))
+    }
+
     fn wait_committed(&mut self, await_at_least: u64) -> Result<u64, ExecutorError> {
         loop {
             // Peek first: the target block may already be published (and its
