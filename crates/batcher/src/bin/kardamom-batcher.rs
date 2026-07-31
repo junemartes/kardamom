@@ -392,11 +392,20 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
     }
     reader_handles.push(spawn_tx_deposits_reader(dep_sub, deposit_buffer.clone()));
     let (feed_tx, feed_rx) = crossbeam_channel::bounded(1 << 14);
+    // The default 100 ms join timeout is an IPC-locality assumption; on the
+    // cluster's UDP multicast a transient frame drop takes the archive
+    // refetch (which only engages after `join_refetch_after` = 10 s) to
+    // repair. The executor/validator learned this in #84/#89 — same bounded
+    // budget here, else the batcher dies before refetch can ever fire.
+    let reader_cfg = ReaderConfig {
+        join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
+        ..ReaderConfig::default()
+    };
     let ordering_handle = spawn_tx_ordering_reader(
         b_sub,
         join_buffer,
         deposit_buffer,
-        ReaderConfig::default(),
+        reader_cfg,
         feed_tx,
         kardamom_engine::TxIndex(cursor.next_index),
         join_recovery,
