@@ -29,7 +29,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use e2e::harness::l2::L2Client;
-use e2e::scenarios::{Target, consistency, nonce_gap, nonce_unordered, rpc_liveness};
+use e2e::scenarios::{Target, consistency, l1_batch, nonce_gap, nonce_unordered, rpc_liveness};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -75,6 +75,16 @@ struct Args {
     /// each check; the semantics shard owns its own block.
     #[arg(long, default_value_t = 1)]
     account_base: usize,
+
+    /// In-cluster anvil L1 JSON-RPC endpoint. Required for the `l1-batch`
+    /// case (the live batcher's L2 → L1 round trip, #39).
+    #[arg(long)]
+    l1_rpc: Option<String>,
+
+    /// `KardamomL2Settlement` proxy address on that L1. Required for
+    /// `l1-batch`.
+    #[arg(long)]
+    settlement: Option<alloy_primitives::Address>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
@@ -114,7 +124,11 @@ async fn main() -> Result<()> {
     for case in &args.cases {
         println!("==> ===== SEMANTICS CASE: {case} =====");
         let started = std::time::Instant::now();
-        let result = run_case(case, &target, base, args.ingress_metrics.is_some()).await;
+        let l1 = match (&args.l1_rpc, args.settlement) {
+            (Some(r), Some(s)) => Some((r.as_str(), s)),
+            _ => None,
+        };
+        let result = run_case(case, &target, base, args.ingress_metrics.is_some(), l1).await;
         match result {
             Ok(()) => println!("==> SEMANTICS CASE {case}: PASS ({:?})", started.elapsed()),
             Err(e) => {
@@ -127,7 +141,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_case(case: &str, t: &Target, base: usize, have_ingress_metrics: bool) -> Result<()> {
+async fn run_case(
+    case: &str,
+    t: &Target,
+    base: usize,
+    have_ingress_metrics: bool,
+    l1: Option<(&str, alloy_primitives::Address)>,
+) -> Result<()> {
     match case {
         "nonce-unordered" => {
             nonce_unordered::run(
@@ -191,6 +211,13 @@ async fn run_case(case: &str, t: &Target, base: usize, have_ingress_metrics: boo
                 },
             )
             .await
+        }
+        "l1-batch" => {
+            let (rpc, settlement) = match l1 {
+                Some(pair) => pair,
+                None => anyhow::bail!("the l1-batch case needs --l1-rpc and --settlement"),
+            };
+            l1_batch::l1_batch(t, rpc, settlement).await
         }
         other => anyhow::bail!("unknown case {other}"),
     }

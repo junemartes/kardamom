@@ -102,6 +102,25 @@ pub trait DepositSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError>;
 }
 
+// Boxed trait objects are subscriptions too, so callers holding
+// `Box<dyn ...>` (the `bin_support` open_* helpers' return type) can hand
+// them straight to the spawn_* functions.
+impl TxDataSubscription for Box<dyn TxDataSubscription> {
+    fn sequencer_id(&self) -> u8 {
+        (**self).sequencer_id()
+    }
+
+    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
+        (**self).next()
+    }
+}
+
+impl DepositSubscription for Box<dyn DepositSubscription> {
+    fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError> {
+        (**self).next()
+    }
+}
+
 /// Lookup-and-remove join buffer keyed by
 /// `(sequencer_id, session_id, tx_data_position)`.
 ///

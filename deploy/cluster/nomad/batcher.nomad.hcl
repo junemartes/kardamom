@@ -1,42 +1,46 @@
-# kardamom-batcher — OFFLINE / dry-run today. Modeled as a Nomad *periodic*
-# (batch) job, NOT an always-on service.
+# kardamom-batcher — LIVE service (#39): tails the canonical ordering from the
+# Aeron Cluster egress (joining tx_data, exactly like the validator's front
+# end), packs KAR1 → zstd → blob batches as boundaries arrive, and posts each
+# to the in-cluster anvil L1 (`KardamomL2Settlement.postBatch`, EIP-4844 blob
+# txs), recording blob bytes in the DA store for `kardamom-reconstruct`.
 #
-# The batcher currently only inspects Aeron Archive segment files in --dry-run
-# (the binary defaults dry_run=true and warns "live L1 broadcast path not yet
-# wired; falling back to dry-run" — see crates/batcher/src/bin/kardamom-batcher.rs
-# and README "Required service changes" item 2). The live L1-broadcast path is
-# UNWIRED; wiring it is a follow-up.
+# Durability: L1's `lastBatchIndex` + `BatchPosted` events are the record of
+# what has been posted; the cursor file under /opt/kardamom/batcher is the
+# ordering-stream position matching that record, written only after a
+# confirmed post. A restart replays from the cursor and skips blocks L1
+# already covers — see docs/agents/batcher-live-l1-spec.md.
 #
-# Invocation (offline, from the spec):
-#   kardamom-batcher --channel-b-segment <path> \
-#       --channel-a-archive "0=<path>,1=<path>" --dry-run
+# Placement: the AUX node, next to validator + da-watcher (outside the chaos
+# suite's blast radius). Ports on the aux node: cluster egress 40231, refetch
+# 40133/40143, metrics 9002 (validator holds 40230/40131/40141/9006).
 #
-# Flag spelling: the binary uses clap `#[arg(long)]` on fields
-# channel_b_segment / channel_a_archive, which clap renders as the kebab-case
-# flags --channel-b-segment / --channel-a-archive (channel_b_segment also
-# accepts the alias --segment). The archive segments live under
-# paths.archive_dir (/opt/kardamom/archive) on the recorder nodes; this job is
-# pinned to a recorder (r1) and mounts that archive dir read-only.
+# The settlement address is deployed by scripts/deploy.sh (kardamom-deploy
+# against anvil) and injected at submit time:
+#   nomad run -var 'settlement_address=0x<addr>' batcher.nomad.hcl
+# The batcher EOA is anvil dev account #2 (pre-funded); its key below is the
+# public anvil dev mnemonic key — real deployments must inject a real secret
+# instead (this is the first key plumbing in deploy/cluster; flagged in the
+# spec).
 #
-# ASSUMPTION / RISK: the exact .rec segment filenames under the archive dir are
-# produced at runtime by the Aeron Archive and are not known statically. The
-# paths below are PLACEHOLDERS pointing at the archive root; a real run must
-# resolve the actual tx_ordering (channel B) and per-sequencer tx_data
-# (channel A) segment files. Since the job is --dry-run only, this is inert
-# today.
+# NOTE: this job uses file() for its templates, so submit it from the
+# deploy/cluster/ directory (scripts/deploy.sh does this).
+
+variable "settlement_address" {
+  type = string
+  # PLACEHOLDER — replace via `-var settlement_address=0x...` at submit time.
+  default = "0x0000000000000000000000000000000000000000"
+}
+
+variable "batcher_key" {
+  type = string
+  # anvil dev account #2 (public dev key, matches crates/e2e BATCHER_KEY).
+  default = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
+}
 
 job "batcher" {
   datacenters = ["dc1"]
-  type        = "batch"
+  type        = "service"
 
-  # Run hourly. The batcher is dry-run/offline, so this is just a periodic
-  # archive inspection until the live L1 broadcast path is wired.
-  periodic {
-    crons            = ["0 * * * *"]
-    prohibit_overlap = true
-  }
-
-  # Pin to recorder r1, which holds the Aeron Archive segment files.
   constraint {
     attribute = "${meta.role}"
     value     = "aux"
@@ -44,6 +48,33 @@ job "batcher" {
 
   group "batcher" {
     count = 1
+
+    # Restarts are the recovery loop: the cursor file + L1 reconcile make a
+    # restart resume exactly where the last confirmed post left off. Unlike
+    # the validator there is no divergence signal to preserve — keep
+    # restarting (mode=delay); a wedged L1 or an aged-out cluster replay
+    # fail-stops repeatedly and surfaces via the semantics shard's l1-batch
+    # assertion instead.
+    restart {
+      attempts = 3
+      interval = "1m"
+      delay    = "5s"
+      mode     = "delay"
+    }
+
+    reschedule {
+      delay          = "10s"
+      delay_function = "exponential"
+      max_delay      = "1m"
+      unlimited      = true
+    }
+
+    update {
+      max_parallel     = 1
+      health_check     = "task_states"
+      min_healthy_time = "10s"
+      healthy_deadline = "2m"
+    }
 
     network {
       mode = "host"
@@ -54,26 +85,61 @@ job "batcher" {
 
       config {
         image        = "192.168.56.10:5000/kardamom-batcher:dev"
-        # Always pull the freshly-built image: the mutable :dev tag would otherwise
-        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
-        # crash-retry storm that stalled the deploy).
-        force_pull    = true
+        # Always pull the freshly-built image (mutable :dev tag; see executor job).
+        force_pull   = true
         network_mode = "host"
-        # Archive segments (read-only); the batcher only reads them.
         volumes = [
-          "/opt/kardamom/archive:/opt/kardamom/archive:ro",
+          "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
+          # Cursor file + DA blob store live under the persistent mount.
+          "/opt/kardamom/batcher:/opt/kardamom/batcher",
         ]
         args = [
-          # PLACEHOLDER segment paths under the archive dir — see header note.
-          "--channel-b-segment", "/opt/kardamom/archive/dir/tx-ordering.rec",
-          "--channel-a-archive", "0=/opt/kardamom/archive/dir/tx-data-0.rec,1=/opt/kardamom/archive/dir/tx-data-1.rec",
-          "--dry-run",
+          "--live",
+          "--dry-run=false",
+          "--config", "/local/batcher.toml",
+          "--log-config", "/local/channels.toml",
+          "--aeron-dir", "/opt/kardamom/aeron-mount/dir",
+          # This node's cluster-egress (response) endpoint for the batcher's
+          # OWN cluster client session — 40231, distinct from the validator's
+          # 40230 on the same node.
+          "--cluster-egress-endpoint", "${meta.node_ip}:40231",
+          "--shards", "2",
+          # Join-miss archive refetch (tx_data / tx_deposits), same contract
+          # as the validator's flags; distinct ports on the shared aux node.
+          "--replay-destination-endpoint", "${meta.node_ip}:40133",
+          "--archive-control-response-endpoint", "${meta.node_ip}:40143",
+          "--l1-rpc", "http://192.168.56.10:8546",
+          "--settlement", "${var.settlement_address}",
+          "--da-store", "/opt/kardamom/batcher/da",
+          "--cursor-file", "/opt/kardamom/batcher/cursor.json",
+          # Group a few blocks per batch: the sealer emits ~1 boundary/s even
+          # when idle, and dense DA coverage means empty blocks are posted
+          # too — grouping keeps idle L1 traffic at ~1 tx / 5 s.
+          "--blocks-per-batch", "5",
+          "--flush-ms", "3000",
         ]
       }
 
+      env {
+        KARDAMOM_METRICS_ADDR = "0.0.0.0:9002"
+        KARDAMOM_L1_KEY       = "${var.batcher_key}"
+      }
+
+      # Cluster LogConfig (UDP multicast channels), consumed via --log-config.
+      template {
+        destination = "local/channels.toml"
+        data        = file("config/channels.toml.tpl")
+      }
+
+      # [cluster] ingress endpoints (same contract as the executor's config).
+      template {
+        destination = "local/batcher.toml"
+        data        = file("config/executor.toml")
+      }
+
       resources {
-        cpu    = 300
-        memory = 256
+        cpu    = 500
+        memory = 512
       }
     }
   }

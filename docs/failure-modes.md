@@ -195,20 +195,28 @@ Catch-up semantics (#78) make that coverage cost explicit:
   deliberately discarded because a co-located recorder + follow-live replay
   starves the validator's live poll path (see PR #78's discussion).
 
-## Batcher (offline, archive-driven)
+## Batcher (live service, cluster-egress-driven)
 
 A crash costs **DA freshness only** — L2 keeps sequencing and executing.
-Because it reads the canonical stream from the durable Aeron archives rather
-than live channels, it can restart late and catch up; the failure mode is a
-growing L1-posting lag, not data loss. Its real dependencies are archive
-availability and L1 gas/RPC health.
+Since #39 the batcher is a long-lived service and the third cluster-egress
+consumer (next to the executor and validator): it tails the canonical
+ordering from the Aeron Cluster egress, joins tx_data through the same
+engine reader stack (join-miss archive refetch included), and posts each
+packed batch to L1 as it closes. A restart replays the canonical stream from
+its durable cursor — written only after a confirmed post — and skips blocks
+L1 already covers, so the failure mode is a growing L1-posting lag, not data
+loss and never a double post (the contract CAS rejects those loudly). Its
+real dependencies are cluster replay retention (an aged-out cursor is a
+fail-stop: unpostable ordering is a permanent DA gap and must be loud) and
+L1 gas/RPC health. See `docs/agents/batcher-live-l1-spec.md`.
 
-When live posting is enabled (`--dry-run=false` with `--l1-rpc`, `--l1-key`,
-`--settlement`, `--da-store`) it broadcasts each batch as a real EIP-4844 blob
-transaction to `KardamomL2Settlement`: L1 records the ordering + KZG versioned
-hashes, and the blob **bytes** are written to the DA store keyed by versioned
-hash (mirroring the EL-holds-commitments / DA-layer-holds-bytes split, since
-blob sidecars are pruned by the consensus layer after ~18 days).
+Each batch is a real EIP-4844 blob transaction to `KardamomL2Settlement`: L1
+records the ordering + KZG versioned hashes, and the blob **bytes** are
+written to the DA store keyed by versioned hash (mirroring the
+EL-holds-commitments / DA-layer-holds-bytes split, since blob sidecars are
+pruned by the consensus layer after ~18 days). The offline segment-file mode
+(`--channel-b-segment`, dry-run by default) remains for archive inspection
+and the corruption-heal tooling.
 
 ## Data-availability recovery (rebuild-from-L1)
 

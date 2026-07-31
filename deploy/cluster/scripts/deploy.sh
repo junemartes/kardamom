@@ -26,6 +26,20 @@ cd "${CLUSTER_DIR}"
 
 export NOMAD_ADDR="${NOMAD_ADDR:-http://192.168.56.10:4646}"
 LOCKBOX_ADDRESS="${LOCKBOX_ADDRESS:-}"
+# The live batcher's DA batch inbox (KardamomL2Settlement). Deployed in Phase
+# 2b via kardamom-deploy unless supplied; without either, the batcher job gets
+# its PLACEHOLDER address and cannot post.
+SETTLEMENT_ADDRESS="${SETTLEMENT_ADDRESS:-}"
+L1_RPC="${L1_RPC:-http://192.168.56.10:8546}"
+ROOT_DIR="$(cd "${CLUSTER_DIR}/../.." && pwd)"
+DEPLOY_BIN="${DEPLOY_BIN:-${ROOT_DIR}/target/release/kardamom-deploy}"
+# anvil dev account #0: factory owner + deploy gas payer (well-known dev key).
+L1_OWNER="${L1_OWNER:-0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266}"
+L1_OWNER_KEY="${L1_OWNER_KEY:-0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d796b4b7abf}"
+# anvil dev account #2: the batcher EOA (`l1Batcher`; must match the job's
+# batcher_key — see nomad/batcher.nomad.hcl).
+BATCHER_EOA="${BATCHER_EOA:-0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC}"
+L2_CHAIN_ID="${L2_CHAIN_ID:-412346}"
 
 echo "==> Nomad endpoint: ${NOMAD_ADDR}"
 echo "==> Job specs:      ${NOMAD_DIR}"
@@ -109,6 +123,30 @@ echo "### Phase 2: anvil L1"
 run_job "anvil.nomad.hcl"
 wait_running "anvil" 240
 
+# --- 2b. Settlement contract (the live batcher's DA batch inbox) ------------
+# Deployed with kardamom-deploy (embedded bytecode; deterministic proxy
+# address). anvil's dev accounts are pre-funded, so no funding step is needed.
+if [[ -z "${SETTLEMENT_ADDRESS}" ]]; then
+  if [[ -x "${DEPLOY_BIN}" ]]; then
+    echo
+    echo "### Phase 2b: KardamomL2Settlement deploy (${L1_RPC})"
+    "${DEPLOY_BIN}" --rpc-url "${L1_RPC}" --owner "${L1_OWNER}" \
+      deploy --private-key "${L1_OWNER_KEY}" \
+      KardamomL2Settlement --l2-chain-id "${L2_CHAIN_ID}" --l2-minter "${BATCHER_EOA}"
+    SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url "${L1_RPC}" --owner "${L1_OWNER}" \
+      addresses --l2-chain-id "${L2_CHAIN_ID}" \
+      | awk '/id +KardamomL2Settlement/{f=1;next} f&&/proxy/{print $2;exit}')"
+    if [[ -z "${SETTLEMENT_ADDRESS}" ]]; then
+      echo "ERROR: could not resolve the KardamomL2Settlement proxy address" >&2
+      exit 1
+    fi
+    echo "    settlement proxy: ${SETTLEMENT_ADDRESS}"
+  else
+    echo "WARNING: ${DEPLOY_BIN} not found and SETTLEMENT_ADDRESS unset;" >&2
+    echo "         batcher will use its PLACEHOLDER address and cannot post." >&2
+  fi
+fi
+
 # --- 3. Service pipeline ----------------------------------------------------
 # The 3-member Aeron Cluster (Raft) sealer is launched FIRST: it owns BOTH
 # ordering and durability (durability folds into the Raft log + per-member
@@ -159,11 +197,22 @@ wait_running "executor" 240
 wait_running "validator" 240
 wait_running "da-watcher" 240
 
-# --- 4. Batcher periodic job (offline/dry-run) ------------------------------
+# --- 4. Batcher (live L1 service, #39) --------------------------------------
 echo
-echo "### Phase 4: batcher (periodic, dry-run)"
-run_job "batcher.nomad.hcl"
-echo "    batcher registered as a periodic job (next run on its cron schedule)."
+echo "### Phase 4: batcher (live L1 service)"
+BATCHER_ARGS=()
+if [[ -n "${SETTLEMENT_ADDRESS}" ]]; then
+  BATCHER_ARGS=(-var "settlement_address=${SETTLEMENT_ADDRESS}")
+fi
+run_job "batcher.nomad.hcl" ${BATCHER_ARGS[@]+"${BATCHER_ARGS[@]}"}
+if [[ -n "${SETTLEMENT_ADDRESS}" ]]; then
+  wait_running "batcher" 240
+else
+  # Placeholder settlement address: the batcher cannot read/post and will
+  # crash-loop until redeployed with a real address — register it but don't
+  # gate the deploy on it converging.
+  echo "    batcher registered (placeholder settlement address; posting disabled)."
+fi
 
 echo
 echo "==> Deploy complete. Run scripts/smoke.sh to exercise the pipeline."

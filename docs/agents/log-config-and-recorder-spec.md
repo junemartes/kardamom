@@ -30,8 +30,11 @@ exercised end-to-end in CI.
 
 ## Non-Goals
 
-- **Batcher live L1 broadcast (#39).** The batcher opens no Aeron channels;
-  it keeps its offline/dry-run shape and does not grow `--log-config`.
+- ~~**Batcher live L1 broadcast (#39).** The batcher opens no Aeron channels;
+  it keeps its offline/dry-run shape and does not grow `--log-config`.~~
+  *Reversed by #39*: the live batcher is now a cluster-egress consumer with
+  `--log-config` and the full reader stack — see
+  `docs/agents/batcher-live-l1-spec.md`. The offline segment-file mode remains.
 - **tx_data (A-channel) quorum.** Per the existing design comments, tx_data is
   single-host durability; only `tx_ordering` (B) is quorum-recorded. The
   recorder binary *can* record A (`--kind tx-data`), but no A-watermark

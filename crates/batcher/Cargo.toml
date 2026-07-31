@@ -50,6 +50,14 @@ tracing-subscriber.workspace = true
 metrics.workspace = true
 kardamom-obs = { path = "../obs" }
 
+# Live mode (#39): the batcher is a third cluster-egress consumer, reusing the
+# executor/validator reader stack (cluster tx_ordering subscription + tx_data
+# join + archive refetch) verbatim.
+kardamom-engine.workspace = true
+crossbeam-channel.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
 clap.workspace = true
 # Live L1 posting is async; genesis is TOML.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
