@@ -129,7 +129,15 @@ CLUSTER_TASK="cluster"
 
 LOAD_PID=""
 log()  { echo "==> $*"; }
-fail() { echo "CHAOS FAIL: $*" >&2; exit 1; }
+fail() {
+  # BOTH streams: stderr for the exit path, stdout so the message lands
+  # in-order in the CI log next to the case's own lines (a fail seen only
+  # on a reordered/dropped stderr reads as a silent death — observed on
+  # run 30281 series: a case aborted with no visible CHAOS FAIL line).
+  echo "CHAOS FAIL: $*"
+  echo "CHAOS FAIL: $*" >&2
+  exit 1
+}
 
 cleanup() {
   [ -n "${LOAD_PID}" ] && kill "${LOAD_PID}" 2>/dev/null || true
@@ -204,6 +212,21 @@ val_metric() { # <metric-name> -> integer (empty on scrape failure)
 # is untouched (the validator is off the hot path), so the standard load +
 # progress verdicts still apply.
 LAPSE_S="${LAPSE_S:-30}"
+# Forensics for validator-lapse failures: the validator lives alone on the
+# aux tier and the generic failure dump does not cover it — capture the
+# nomad view, the node's container states, and the validator's own log tail
+# so a dark-endpoint verdict is attributable (process dead vs exec wedge vs
+# supervisor not restarting).
+val_debug() {
+  log "validator-lapse DEBUG: nomad validator job status:"
+  on_control 'nomad job status validator 2>/dev/null | tail -12' 2>/dev/null || true
+  log "validator-lapse DEBUG: containers on ${VALIDATOR_NODE}:"
+  timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps -a --format "{{.Names}} {{.Status}}" | head -6' 2>/dev/null || true
+  log "validator-lapse DEBUG: validator container log tail:"
+  timeout 20 docker exec "${VALIDATOR_NODE}" sh -c \
+    'docker logs --tail 25 "$(docker ps -a --format "{{.Names}}" | grep -m1 "^validator")" 2>&1 | tail -20' 2>/dev/null || true
+}
+
 run_validator_lapse() {
   local inner
   inner="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
@@ -233,39 +256,125 @@ run_validator_lapse() {
     || fail "validator-lapse: never warmed up within ${t}s (verified=${verified} block=${v_now} exec=${e_now}) — not verifying live BEFORE the pause"
   log "validator-lapse: warmed up (verified=${verified} block=${v_now} exec=${e_now}) after ${t}s"
 
-  local m0 vf0
+  local m0 vf0 started0
   m0="$(val_metric validator_bal_missing_total)"; m0="${m0:-0}"
   vf0="$(val_metric validator_blocks_verified_total)"; vf0="${vf0:-0}"
-  log "validator-lapse: pausing ${inner} for ${LAPSE_S}s (verified=${vf0} bal_missing=${m0})"
-  docker exec "${VALIDATOR_NODE}" docker pause "${inner}" >/dev/null || fail "validator-lapse: docker pause failed"
-  sleep "${LAPSE_S}"
-  docker exec "${VALIDATOR_NODE}" docker unpause "${inner}" >/dev/null || fail "validator-lapse: docker unpause failed"
-  log "validator-lapse: resumed; awaiting catch-up + continued verification"
+  started0="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${inner}" 2>/dev/null || true)"
 
-  # After resume the validator drains the tx_bal it missed (held in the live
-  # multicast term buffer while it was paused) and VERIFIES it. Assert: it
-  # catches back up, KEEPS verifying (blocks_verified advances past the
-  # pre-pause value — the lapse window was covered, not silently skipped),
-  # coverage did not materially regress, and there is no divergence.
-  local ok=0 v1 vf1
-  t=0
-  while [ "${t}" -lt 120 ]; do
-    sleep 6; t=$(( t + 6 ))
-    v1="$(val_metric validator_committed_block)"; v1="${v1:-0}"
-    vf1="$(val_metric validator_blocks_verified_total)"; vf1="${vf1:-0}"
-    e_now="$(executor_progress || echo "${e_now}")"
-    if [ "${vf1}" -gt "${vf0}" ] && [ $(( e_now - v1 )) -le 25 ]; then ok=1; break; fi
+  # SIGSTOP + VERIFIED freeze (#108): `docker pause` silently no-ops in the
+  # nested-DinD freezer, so every prior run of this case asserted against a
+  # validator that never lapsed — the asserts pass identically with no
+  # actual pause. Signals hit the task's PID 1 regardless of freezer
+  # delegation, and the mid-freeze probe makes a silent no-op IMPOSSIBLE.
+  log "validator-lapse: freezing ${inner} (SIGSTOP) for ${LAPSE_S}s (verified=${vf0} bal_missing=${m0} started=${started0:-?})"
+  docker exec "${VALIDATOR_NODE}" docker kill -s STOP "${inner}" >/dev/null \
+    || fail "validator-lapse: SIGSTOP failed"
+  sleep 3
+  if timeout 8 docker exec "${VALIDATOR_NODE}" curl -fsS --max-time 3 \
+      "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
+    docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1 || true
+    fail "validator-lapse: freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
+  fi
+  log "validator-lapse: freeze verified (metrics endpoint dark)"
+  sleep $(( LAPSE_S - 3 ))
+  if ! timeout 20 docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1; then
+    # A failed CONT is NOT a case error by itself: the frozen task can be
+    # REPLACED under us mid-freeze (supervisor action) — which IS the
+    # newborn path — or the node exec can be transiently wedged. The
+    # sampling loop below owns the verdict (end state: verifying live,
+    # caught up, zero divergences); the thaw mechanics must never abort
+    # the case.
+    local cur0
+    cur0="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
+    if [ -n "${cur0}" ] && [ "${cur0}" != "${inner}" ]; then
+      log "validator-lapse: SIGCONT target gone — container replaced during freeze (${inner} -> ${cur0}); newborn path"
+    else
+      sleep 5
+      timeout 20 docker exec "${VALIDATOR_NODE}" docker kill -s CONT "${inner}" >/dev/null 2>&1 \
+        || log "validator-lapse: SIGCONT failed twice (state unknown); relying on supervisor + sampling asserts"
+    fi
+  fi
+
+  # VERIFIED THAW (mirror of the verified freeze): a CONT that silently
+  # misses leaves a FROZEN ORPHAN squatting the metrics port — every
+  # supervisor replacement then dies instantly on EADDRINUSE (fatal in
+  # kardamom_obs::init), burns the restart budget, and mode=fail strands
+  # the validator permanently (reproduced locally; the 240s dark-endpoint
+  # run). Within a grace window the endpoint must answer OR the container
+  # must have been replaced; otherwise KILL the frozen container so the
+  # port frees and the supervisor restarts into clean air.
+  local thaw_ok=0 tw=0 curX
+  while [ "${tw}" -lt 30 ]; do
+    sleep 5; tw=$(( tw + 5 ))
+    if timeout 8 docker exec "${VALIDATOR_NODE}" curl -fsS --max-time 3 \
+        "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
+      thaw_ok=1; break
+    fi
+    curX="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
+    if [ -n "${curX}" ] && [ "${curX}" != "${inner}" ]; then
+      thaw_ok=1; log "validator-lapse: container replaced during/after freeze (${inner} -> ${curX})"; break
+    fi
   done
-  local m1 d1
-  m1="$(val_metric validator_bal_missing_total)"; m1="${m1:-0}"
-  d1="$(val_metric validator_divergence_total)"; d1="${d1:-0}"
-  [ "${ok}" -eq 1 ] || fail "validator-lapse: did not resume verifying + catch up in ${t}s (verified ${vf0}->${vf1}, block ${v1}, exec ${e_now})"
-  [ "${vf1}" -gt "${vf0}" ] || fail "validator-lapse: stopped verifying after the pause (${vf0}->${vf1})"
-  [ $(( m1 - m0 )) -le 5 ] || fail "validator-lapse: coverage REGRESSED — bal_missing grew ${m0}->${m1} across the pause (the lapse window was not covered by the live term buffer)"
-  [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after resume"
-  log "validator-lapse PASS: caught up (block ${v1}, lag $(( e_now - v1 ))), kept verifying ${vf0}->${vf1}, bal_missing ${m0}->${m1}, 0 divergences"
-}
+  if [ "${thaw_ok}" -ne 1 ]; then
+    log "validator-lapse: thaw NOT confirmed after ${tw}s — killing the frozen orphan (releases the metrics port for the supervisor's replacement)"
+    timeout 20 docker exec "${VALIDATOR_NODE}" docker kill "${inner}" >/dev/null 2>&1 || true
+  fi
 
+  # POST-THAW, identity decides the contract. A ${LAPSE_S}s freeze exceeds
+  # the media driver's client-liveness timeout: the validator's aeron client
+  # is EVICTED and the process fail-stops on thaw → Nomad restarts it → the
+  # DESIGNED recovery loop (persisted-cursor resume + archive replay-merge +
+  # catch-up mode) — the crash-only path production actually takes, never
+  # end-to-end asserted before this case. Either path must END the same way:
+  # verifying LIVE again, caught up, zero divergences.
+  #   - SURVIVOR (container StartedAt unchanged; sub-eviction freeze): the
+  #     original term-buffer contract — verified advances past the
+  #     pre-freeze count and bal_missing growth stays within tolerance.
+  #   - NEWBORN (StartedAt changed): counters RESET; catch-up commits the
+  #     freeze-window backlog unverified BY DESIGN (#78), so bal_missing is
+  #     not comparable across the restart — assert it verifies live from
+  #     the fresh counter, catches up, and reports zero divergences.
+  local t=0 ok=0 path="" cur started1 vf1 v1 e_now d1
+  while [ "${t}" -lt 240 ]; do
+    sleep 10; t=$(( t + 10 ))
+    cur="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
+    started1=""
+    if [ -n "${cur}" ]; then
+      started1="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${cur}" 2>/dev/null || true)"
+    fi
+    vf1="$(val_metric validator_blocks_verified_total)"
+    v1="$(val_metric validator_committed_block)"
+    e_now="$(executor_progress || echo 0)"
+    if [ -z "${vf1}" ] || [ -z "${v1}" ]; then
+      log "validator-lapse: sample t=${t}s SCRAPE FAILED (not counted)"
+      continue
+    fi
+    if [ -n "${started1}" ] && [ -n "${started0}" ] && [ "${started1}" != "${started0}" ]; then
+      path="newborn"
+      log "validator-lapse: sample t=${t}s path=newborn verified=${vf1} block=${v1} exec=${e_now}"
+      if [ "${vf1}" -gt 0 ] && [ "${v1}" -gt 0 ] && [ $(( e_now - v1 )) -le 25 ]; then ok=1; break; fi
+    else
+      path="survivor"
+      log "validator-lapse: sample t=${t}s path=survivor verified=${vf1} block=${v1} exec=${e_now}"
+      if [ "${vf1}" -gt "${vf0}" ] && [ $(( e_now - v1 )) -le 25 ]; then ok=1; break; fi
+    fi
+  done
+  if [ "${ok}" -ne 1 ]; then
+    val_debug
+    fail "validator-lapse: validator not verifying live + caught up within ${t}s of thaw (path=${path:-unknown}, verified=${vf1:-?}, block=${v1:-?}, exec=${e_now:-?})"
+  fi
+  d1="$(val_metric validator_divergence_total)"; d1="${d1:-0}"
+  [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after recovery"
+  if [ "${path}" = "survivor" ]; then
+    local m1
+    m1="$(val_metric validator_bal_missing_total)"; m1="${m1:-0}"
+    [ $(( m1 - m0 )) -le 5 ] \
+      || fail "validator-lapse: coverage REGRESSED on the survivor path — bal_missing grew ${m0}->${m1} (lapse window not covered by the live term buffer)"
+    log "validator-lapse PASS (survivor): kept verifying ${vf0}->${vf1}, bal_missing ${m0}->${m1}, 0 divergences"
+  else
+    log "validator-lapse PASS (newborn): crash-only recovery verified — fresh process verifying live (verified=${vf1}, lag $(( e_now - v1 ))), 0 divergences (bal_missing not comparable across restart; catch-up commits the freeze backlog unverified by design, #78)"
+  fi
+}
 # sequencer-lapse case: PAUSE one racing replica of shard 0 (seq-a on
 # kardamom-sequencer-0) for a window under pinned shard-0 load, then resume.
 # The twin (seq-b, other node) keeps ordering — the pipeline must never
