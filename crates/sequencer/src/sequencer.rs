@@ -141,6 +141,12 @@ pub struct Sequencer {
     /// via `reinsert_for_retry` and re-published — the cluster dedup absorbs
     /// copies that DID commit, and voided ones get ordered.
     unconfirmed: UnconfirmedLedger,
+    /// Last run of the confirm-timeout sweep. The sweep scans the WHOLE
+    /// unconfirmed ledger (O(rate × receipt-latency) entries) and used to
+    /// run on EVERY publish-loop iteration — a rate-proportional tax on the
+    /// hot path serving a 15s timeout. Throttled to ~1Hz (except in tests
+    /// that zero the timeout for immediate-rewind assertions).
+    last_confirm_sweep: std::time::Instant,
 }
 
 /// #85 publish-confirmation ledger: (sender, nonce) → (ref metadata,
@@ -158,6 +164,7 @@ impl Sequencer {
             state: PartitionState::new(cap),
             resync: None,
             unconfirmed: std::collections::BTreeMap::new(),
+            last_confirm_sweep: std::time::Instant::now(),
         }
     }
 
@@ -398,32 +405,42 @@ impl Sequencer {
             // receipt confirms). Bounded per iteration.
             let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
             let now = std::time::Instant::now();
-            let stale: Vec<_> = self
-                .unconfirmed
-                .iter()
-                .filter(|(_, (_, at))| now.duration_since(*at) >= timeout)
-                .take(256)
-                .map(|(k, _)| *k)
-                .collect();
-            if !stale.is_empty() {
-                metrics::record_ref_republished(self.cfg.partition_index, stale.len());
-                warn!(
-                    count = stale.len(),
-                    oldest_nonce = stale.first().map(|(_, n)| *n),
-                    "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
-                );
-            }
-            // DESCENDING nonce order: reinsert_for_retry sets the sender's
-            // rewind floor on every call, so the LAST call per sender must
-            // carry the LOWEST nonce (same discipline as flush_drained's
-            // backpressure rebuffer) — ascending order would strand the
-            // lower nonces beneath the floor forever.
-            for (sender, n) in stale.into_iter().rev() {
-                if let Some((meta, _)) = self.unconfirmed.remove(&(sender, n)) {
-                    self.state.reinsert_for_retry(sender, n, meta);
+            // Throttle the full-ledger scan to ~1Hz — a 15s timeout gains
+            // nothing from per-iteration scans, and the scan cost is
+            // O(unconfirmed) = O(rate × receipt-latency) entries on the
+            // publish hot path. Timeout 0 is the test hook for immediate
+            // rewinds: keep per-iteration behavior there.
+            let sweep_due = self.cfg.resync.confirm_timeout_ms == 0
+                || now.duration_since(self.last_confirm_sweep) >= std::time::Duration::from_secs(1);
+            if sweep_due {
+                self.last_confirm_sweep = now;
+                let stale: Vec<_> = self
+                    .unconfirmed
+                    .iter()
+                    .filter(|(_, (_, at))| now.duration_since(*at) >= timeout)
+                    .take(256)
+                    .map(|(k, _)| *k)
+                    .collect();
+                if !stale.is_empty() {
+                    metrics::record_ref_republished(self.cfg.partition_index, stale.len());
+                    warn!(
+                        count = stale.len(),
+                        oldest_nonce = stale.first().map(|(_, n)| *n),
+                        "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
+                    );
                 }
+                // DESCENDING nonce order: reinsert_for_retry sets the sender's
+                // rewind floor on every call, so the LAST call per sender must
+                // carry the LOWEST nonce (same discipline as flush_drained's
+                // backpressure rebuffer) — ascending order would strand the
+                // lower nonces beneath the floor forever.
+                for (sender, n) in stale.into_iter().rev() {
+                    if let Some((meta, _)) = self.unconfirmed.remove(&(sender, n)) {
+                        self.state.reinsert_for_retry(sender, n, meta);
+                    }
+                }
+                metrics::record_unconfirmed_refs(self.cfg.partition_index, self.unconfirmed.len());
             }
-            metrics::record_unconfirmed_refs(self.cfg.partition_index, self.unconfirmed.len());
         }
 
         let pending = self.state.drain_pending();
