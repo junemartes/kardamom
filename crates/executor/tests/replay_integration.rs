@@ -191,6 +191,8 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             0,
             None,
             None,
+            // Whole-block exec strategy (validator parallel path).
+            None,
             None,
         )
     });

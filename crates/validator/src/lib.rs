@@ -249,11 +249,11 @@ impl BalBuffer {
     /// validator asks for blocks at/near the head (lag < this), so it always
     /// waits and verifies; only a validator catching up from a cold start (or
     /// a long lapse whose gap exceeds the term buffer) skips.
-    const BACKLOG_LOOKBEHIND: u64 = 16;
+    pub(crate) const BACKLOG_LOOKBEHIND: u64 = 16;
     /// Bound on buffered BALs (whole `BlockDelta`s — the heavyweight buffer).
     /// ~17-35 min of chain at the 250ms-2s block cadence; far beyond the
     /// verify window, so eviction only fires if the consumer stalls outright.
-    const MAX_BUFFERED: usize = 1024;
+    pub(crate) const MAX_BUFFERED: usize = 1024;
 
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -418,6 +418,42 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
 // ---------------------------------------------------------------------------
 // ValidatorReceiptSink: tx_receipts cross-check; never publishes.
 // ---------------------------------------------------------------------------
+
+/// Per-block EIP-7928 claim index (parallel validation). Separate from
+/// [`BalBuffer`] so the merged-delta cross-check path is untouched: a
+/// missing claim index degrades to sequential re-execution, never to a
+/// verification gap.
+pub struct ClaimBuffer {
+    core: KeyedBuffer<u64, std::sync::Arc<crate::parallel::ClaimIndex>>,
+}
+
+impl Default for ClaimBuffer {
+    fn default() -> Self {
+        Self {
+            core: KeyedBuffer::new(BalBuffer::MAX_BUFFERED, BalBuffer::BACKLOG_LOOKBEHIND),
+        }
+    }
+}
+
+impl ClaimBuffer {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn insert(&self, block: u64, claims: crate::parallel::ClaimIndex) {
+        self.core.insert(block, std::sync::Arc::new(claims));
+    }
+
+    /// Take `block`'s claims, waiting up to `timeout`. `None` ⇒ the caller
+    /// re-executes sequentially for this block.
+    pub fn take(
+        &self,
+        block: u64,
+        timeout: Duration,
+    ) -> Option<std::sync::Arc<crate::parallel::ClaimIndex>> {
+        self.core.take(block, timeout)
+    }
+}
 
 /// Implements [`TxReceiptsPublication`] but verifies instead of publishing: each
 /// locally-recomputed receipt is checked against the executor's published

@@ -67,6 +67,9 @@ job "validator" {
           "/opt/kardamom/state:/opt/kardamom/state",
         ]
         args = [
+          # Seeded parallel batch re-execution from the EIP-7928 BAL
+          # (falls back to sequential per block when claims are absent).
+          "--parallel-validation",
           "--config", "/local/validator.toml",
           "--log-config", "/local/channels.toml",
           "--aeron-dir", "/opt/kardamom/aeron-mount/dir",

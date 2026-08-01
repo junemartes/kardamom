@@ -41,8 +41,12 @@ fn configured_granularity() -> u16 {
 
 /// Per-frame publish deadline. A frame that cannot be delivered live within
 /// this window is still RETAINED (replay-serving is the durability path);
-/// the deadline only bounds how long one frame occupies the publisher.
-const PUBLISH_DEADLINE: Duration = Duration::from_secs(2);
+/// the deadline only bounds how long one frame occupies the publisher. It
+/// must be WELL UNDER the block interval: at 2s (== the tick) a
+/// NOT_CONNECTED window drained exactly at the arrival rate, so the bounded
+/// handoff channel hovered at capacity and any jitter back-pressured the
+/// exec thread. 500ms keeps drain 4x arrival during subscriber outages.
+const PUBLISH_DEADLINE: Duration = Duration::from_millis(500);
 
 /// Retained encoded frames for validator catch-up. 256 blocks ≈ 8.5 min at
 /// the 2s tick.

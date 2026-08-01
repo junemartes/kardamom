@@ -208,6 +208,11 @@ impl ClaimSlice {
                 return format!("balance {a:?}: unclaimed write {v}");
             }
         }
+        for (a, v) in &other.nonce {
+            if !self.nonce.contains_key(a) {
+                return format!("nonce {a:?}: unclaimed write {v}");
+            }
+        }
         "sets differ".to_string()
     }
 }
@@ -424,6 +429,15 @@ pub fn execute_batch<S: StateDatabase>(
     for (i, tx) in txs.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
+        // Recompute this tx's claims through the executor's EXACT capture
+        // path (execute_tx feeds revm's Bal, which records per-FIELD
+        // changes: a transfer's recipient claims a balance change but NO
+        // nonce change). Comparing a WriteSet projection instead diverged
+        // on every live transfer — the WriteSet carries the full
+        // (nonce, balance) triple for every touched account, so the
+        // recipient's UNCHANGED nonce showed up computed-but-not-claimed.
+        // Symmetric construction is the only drift-proof comparison.
+        let mut tx_bal = revm::state::bal::Bal::new();
         let (receipt, ws) = execute_tx(
             snapshot,
             Some(seed),
@@ -434,7 +448,7 @@ pub fn execute_batch<S: StateDatabase>(
             &tx.envelope,
             global_index_in_block,
             cumulative,
-            None, // the validator recomputes claims; it never publishes a BAL
+            Some((&mut tx_bal, bal_index)),
         )?;
         // Verify the claim WHERE IT IS PRODUCED — per tx, not per batch.
         // Batch-final comparison alone would leave intra-batch claims
@@ -443,7 +457,8 @@ pub fn execute_batch<S: StateDatabase>(
         // attribution would ship unnoticed while the final state matched.
         // EIP-7928 attributes per tx, so it is verified per tx.
         let claimed = claims.claims_in_range(bal_index, bal_index);
-        let computed = ClaimSlice::from_write_set(&ws);
+        let computed =
+            ClaimIndex::from_alloy(&tx_bal.into_alloy_bal()).claims_in_range(bal_index, bal_index);
         if claimed != computed {
             return Err(ExecutorError::Divergence(format!(
                 "tx {bal_index}: {}",
@@ -602,10 +617,15 @@ mod engine_tests {
         )
     }
 
-    /// Build a claim index by SEQUENTIALLY executing the block — i.e. the
-    /// claims an honest executor would publish.
+    /// Build a claim index by SEQUENTIALLY executing the block through the
+    /// executor's REAL capture path (`execute_tx` → revm `Bal`), exactly as
+    /// the live executor produces claims. The first version of this fixture
+    /// hand-rolled claims from WriteSets — symmetric with a verification bug
+    /// (per-field vs whole-triple attribution), so both passed while live
+    /// traffic diverged on every transfer. The fixture and the producer must
+    /// share code, not shape.
     fn honest_claims<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> ClaimIndex {
-        let mut idx = ClaimIndex::default();
+        let mut bal = revm::state::bal::Bal::new();
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
         for (i, t) in txs.iter().enumerate() {
@@ -619,21 +639,13 @@ mod engine_tests {
                 &t.envelope,
                 i as u64,
                 cumulative,
-                None,
+                Some((&mut bal, (i + 1) as u64)),
             )
             .expect("seq execute");
             cumulative = r.cumulative_gas_used;
-            let bal_index = (i + 1) as u64;
-            for (addr, (n, b, _)) in &ws.accounts {
-                idx.balance.entry(*addr).or_default().push((bal_index, *b));
-                idx.nonce.entry(*addr).or_default().push((bal_index, *n));
-            }
-            for (k, v) in &ws.storage {
-                idx.storage.entry(*k).or_default().push((bal_index, *v));
-            }
             delta.apply(ws);
         }
-        idx
+        ClaimIndex::from_alloy(&bal.into_alloy_bal())
     }
 
     fn seq_delta<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> PendingDelta {
@@ -744,4 +756,117 @@ mod engine_tests {
         let out = execute_block_parallel(&snap, &[], &ClaimIndex::default(), env(), 5).unwrap();
         assert!(out.receipts.is_empty() && out.batches == 0);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Engine strategy: what the validator hands to the exec loop
+// ---------------------------------------------------------------------------
+
+use kardamom_engine::actor::{BlockExec, BlockExecOutput, BufferedRecord};
+use kardamom_engine::executor::execute_deposit_tx;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// How long a block waits for its BAL claims before falling back to
+/// sequential re-execution. Short: liveness never depends on the BAL.
+const CLAIM_WAIT: Duration = Duration::from_millis(250);
+
+/// Sequential re-execution of a whole block — the always-available fallback
+/// (no claims yet, or the block contains deposits, which carry no
+/// attribution). Identical semantics to the engine's streaming path.
+pub fn execute_block_sequential<S: StateDatabase>(
+    snapshot: &S,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+) -> Result<BlockExecOutput, ExecutorError> {
+    let mut delta = PendingDelta::new();
+    let mut receipts = Vec::with_capacity(records.len());
+    let mut cumulative = 0u64;
+    for (i, rec) in records.iter().enumerate() {
+        let idx_in_block = i as u64;
+        let (receipt, ws) = match rec {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => execute_tx(
+                snapshot,
+                None,
+                &delta,
+                env,
+                *tx_idx,
+                *position,
+                envelope,
+                idx_in_block,
+                cumulative,
+                None,
+            )?,
+            BufferedRecord::Deposit {
+                tx_idx,
+                deposit,
+                position,
+            } => execute_deposit_tx(
+                snapshot,
+                None,
+                &delta,
+                env,
+                *tx_idx,
+                *position,
+                deposit,
+                idx_in_block,
+                cumulative,
+                None,
+            )?,
+        };
+        cumulative = receipt.cumulative_gas_used;
+        delta.apply(ws);
+        receipts.push(receipt);
+    }
+    Ok(BlockExecOutput { receipts, delta })
+}
+
+/// Build the validator's whole-block execution strategy: seeded parallel
+/// batches when this block's BAL claims are available and it contains only
+/// transactions; sequential otherwise. Deposits fall back because EIP-7928
+/// attribution covers transaction execution, not L1-derived credits.
+pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
+    claims: Arc<crate::ClaimBuffer>,
+    batch_size: usize,
+) -> BlockExec<D> {
+    Box::new(
+        move |snapshot: &D, records: &[BufferedRecord], env: ExecEnv, block: u64| {
+            let tx_only = records
+                .iter()
+                .all(|r| matches!(r, BufferedRecord::Tx { .. }));
+            if !tx_only || records.is_empty() {
+                return execute_block_sequential(snapshot, records, env);
+            }
+            let Some(idx) = claims.take(block, CLAIM_WAIT) else {
+                crate::metrics::counter_parallel_fallback();
+                tracing::debug!(block, "no BAL claims in time; sequential re-execution");
+                return execute_block_sequential(snapshot, records, env);
+            };
+            let txs: Vec<BlockTx> = records
+                .iter()
+                .map(|r| match r {
+                    BufferedRecord::Tx {
+                        tx_idx,
+                        envelope,
+                        position,
+                    } => BlockTx {
+                        tx_idx: *tx_idx,
+                        position: *position,
+                        envelope: envelope.clone(),
+                    },
+                    BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
+                })
+                .collect();
+            let out = execute_block_parallel(snapshot, &txs, &idx, env, batch_size)?;
+            crate::metrics::counter_parallel_block(out.batches);
+            Ok(BlockExecOutput {
+                receipts: out.receipts,
+                delta: out.delta,
+            })
+        },
+    )
 }

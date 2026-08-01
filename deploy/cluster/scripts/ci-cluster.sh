@@ -634,13 +634,20 @@ scrape_metric() { # <node> <port> <metric-name> -> value or ""
     | awk -v m="$3" '$0 ~ "^"m"([{ ])" {v=$NF} END {if (v != "") print v}'
 }
 
+# Retry window: a single-shot probe here raced slow container starts (fresh
+# image pull on the aux node) and failed an otherwise-healthy deploy — the
+# exporter installs on the validator's FIRST log line, so patience is all
+# that's needed to tell "starting" from "fail-stopped".
 VALIDATOR_NODE=""
-for n in "${VALIDATOR_NODES[@]}"; do
-  if timeout 8 docker exec "$n" curl -fsS --max-time 5 "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
-    VALIDATOR_NODE="$n"; break
-  fi
+for _ in $(seq 1 24); do
+  for n in "${VALIDATOR_NODES[@]}"; do
+    if timeout 8 docker exec "$n" curl -fsS --max-time 5 "http://127.0.0.1:${VALIDATOR_PORT}/metrics" >/dev/null 2>&1; then
+      VALIDATOR_NODE="$n"; break 2
+    fi
+  done
+  sleep 5
 done
-[[ -n "${VALIDATOR_NODE}" ]] || { echo "FAIL: no validator /metrics on :${VALIDATOR_PORT} (fail-stopped — divergence or session death?)" >&2; exit 1; }
+[[ -n "${VALIDATOR_NODE}" ]] || { echo "FAIL: no validator /metrics on :${VALIDATOR_PORT} after 120s (fail-stopped — divergence or session death?)" >&2; exit 1; }
 log "validator found on ${VALIDATOR_NODE}"
 
 # Executor progress reference: any responding executor (state-machine replicas).
