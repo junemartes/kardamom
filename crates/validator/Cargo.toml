@@ -39,6 +39,9 @@ name = "kardamom-validator"
 path = "src/bin/kardamom-validator.rs"
 
 [dev-dependencies]
+alloy-consensus.workspace = true
+alloy-eips.workspace = true
+alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true
 alloy-contract.workspace = true

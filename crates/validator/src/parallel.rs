@@ -319,3 +319,429 @@ mod tests {
         assert!(a.diff_summary(&c).contains("unclaimed write"));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Seeded parallel execution engine
+// ---------------------------------------------------------------------------
+
+use kardamom_engine::block_env::ExecEnv;
+use kardamom_engine::delta::PendingDelta;
+use kardamom_engine::error::ExecutorError;
+use kardamom_engine::exec_types::TxIndex;
+use kardamom_engine::executor::execute_tx;
+use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
+
+impl ClaimSlice {
+    /// Project a batch's merged [`PendingDelta`] into claim shape.
+    pub fn from_pending(delta: &PendingDelta) -> Self {
+        let mut balance = BTreeMap::new();
+        let mut nonce = BTreeMap::new();
+        for (addr, (n, bal, _code)) in &delta.accounts {
+            balance.insert(*addr, *bal);
+            nonce.insert(*addr, *n);
+        }
+        Self {
+            storage: delta.storage.clone(),
+            balance,
+            nonce,
+        }
+    }
+}
+
+/// One transaction as the validator receives it from the canonical stream.
+pub struct BlockTx {
+    pub tx_idx: TxIndex,
+    pub position: BPosition,
+    pub envelope: TxEnvelope,
+}
+
+/// A batch's result: its receipts (with LOCAL cumulative gas — the caller
+/// fixes up block-cumulative in order) and its merged writes.
+pub struct BatchOutcome {
+    pub first_index: u64,
+    pub receipts: Vec<Receipt>,
+    pub delta: PendingDelta,
+}
+
+/// Build the input layer a batch starting at `before` must observe:
+/// snapshot state overlaid with the latest claim STRICTLY BEFORE the batch
+/// (i.e. the previous batch's end state). Account fields are claimed
+/// independently in EIP-7928, so each triple is assembled from whichever
+/// components have earlier claims, falling back to the snapshot.
+pub fn build_seed<S: StateDatabase>(
+    snapshot: &S,
+    claims: &ClaimIndex,
+    before: u64,
+) -> Result<PendingDelta, ExecutorError> {
+    let mut seed = PendingDelta::new();
+
+    let mut addrs: Vec<Address> = claims.balance.keys().copied().collect();
+    addrs.extend(claims.nonce.keys().copied());
+    addrs.sort_unstable();
+    addrs.dedup();
+    for addr in addrs {
+        let claimed_bal = claims.balance_seed(addr, before);
+        let claimed_nonce = claims.nonce_seed(addr, before);
+        if claimed_bal.is_none() && claimed_nonce.is_none() {
+            continue; // nothing claimed before this batch — snapshot stands
+        }
+        let base = snapshot
+            .basic(addr)
+            .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
+            .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY));
+        seed.accounts.insert(
+            addr,
+            (
+                claimed_nonce.unwrap_or(base.0),
+                claimed_bal.unwrap_or(base.1),
+                base.2,
+            ),
+        );
+    }
+
+    for (addr, slot) in claims.storage.keys() {
+        if let Some(v) = claims.storage_seed(*addr, *slot, before) {
+            seed.storage.insert((*addr, *slot), v);
+        }
+    }
+    Ok(seed)
+}
+
+/// Execute one batch sequentially over `snapshot ∘ seed`. `first_index` is
+/// the batch's first bal index (1-based); receipts carry LOCAL cumulative
+/// gas.
+pub fn execute_batch<S: StateDatabase>(
+    snapshot: &S,
+    seed: &PendingDelta,
+    txs: &[BlockTx],
+    claims: &ClaimIndex,
+    env: ExecEnv,
+    first_index: u64,
+) -> Result<BatchOutcome, ExecutorError> {
+    let mut delta = PendingDelta::new();
+    let mut receipts = Vec::with_capacity(txs.len());
+    let mut cumulative = 0u64;
+    for (i, tx) in txs.iter().enumerate() {
+        let bal_index = first_index + i as u64;
+        let global_index_in_block = bal_index - 1;
+        let (receipt, ws) = execute_tx(
+            snapshot,
+            Some(seed),
+            &delta,
+            env,
+            tx.tx_idx,
+            tx.position,
+            &tx.envelope,
+            global_index_in_block,
+            cumulative,
+            None, // the validator recomputes claims; it never publishes a BAL
+        )?;
+        // Verify the claim WHERE IT IS PRODUCED — per tx, not per batch.
+        // Batch-final comparison alone would leave intra-batch claims
+        // unchecked: they are neither seeds (a later batch seeds from the
+        // last claim before it) nor outputs, so a wrong intermediate
+        // attribution would ship unnoticed while the final state matched.
+        // EIP-7928 attributes per tx, so it is verified per tx.
+        let claimed = claims.claims_in_range(bal_index, bal_index);
+        let computed = ClaimSlice::from_write_set(&ws);
+        if claimed != computed {
+            return Err(ExecutorError::Divergence(format!(
+                "tx {bal_index}: {}",
+                claimed.diff_summary(&computed)
+            )));
+        }
+        cumulative = receipt.cumulative_gas_used;
+        delta.apply(ws);
+        receipts.push(receipt);
+    }
+    Ok(BatchOutcome {
+        first_index,
+        receipts,
+        delta,
+    })
+}
+
+/// Verified result of a whole block.
+#[derive(Debug)]
+pub struct BlockOutcome {
+    /// Receipts in block order, with block-cumulative gas fixed up.
+    pub receipts: Vec<Receipt>,
+    /// The block's merged writes (fold of every batch, in block order).
+    pub delta: PendingDelta,
+    /// Batches executed (for telemetry).
+    pub batches: usize,
+}
+
+/// Re-execute a block's transactions as FULLY PARALLEL batches, each seeded
+/// from the BAL's claims, verifying every batch's claims where they are
+/// produced.
+///
+/// Returns `Err(ExecutorError::Divergence)` on the first batch whose
+/// recomputed writes differ from what the executor claimed — the claim was
+/// checked at its producing batch, so a false claim cannot be laundered by
+/// later batches that merely consume it.
+pub fn execute_block_parallel<S: StateDatabase + Sync>(
+    snapshot: &S,
+    txs: &[BlockTx],
+    claims: &ClaimIndex,
+    env: ExecEnv,
+    batch_size: usize,
+) -> Result<BlockOutcome, ExecutorError> {
+    if txs.is_empty() {
+        return Ok(BlockOutcome {
+            receipts: Vec::new(),
+            delta: PendingDelta::new(),
+            batches: 0,
+        });
+    }
+    let ranges = batch_ranges(txs.len(), batch_size);
+
+    // Every batch runs concurrently: its inputs come from the claims, so no
+    // batch waits on another.
+    let results: Vec<Result<BatchOutcome, ExecutorError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|(from, to)| {
+                let slice = &txs[(*from as usize - 1)..(*to as usize)];
+                let from = *from;
+                scope.spawn(move || {
+                    let seed = build_seed(snapshot, claims, from)?;
+                    execute_batch(snapshot, &seed, slice, claims, env, from)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(ExecutorError::State("batch worker panicked".into())))
+            })
+            .collect()
+    });
+
+    // Verify each batch's claims, then fold in block order.
+    let mut outcomes = Vec::with_capacity(results.len());
+    for r in results {
+        outcomes.push(r?);
+    }
+    outcomes.sort_by_key(|o| o.first_index);
+
+    let mut delta = PendingDelta::new();
+    let mut receipts = Vec::with_capacity(txs.len());
+    let mut cumulative = 0u64;
+    for o in outcomes.iter() {
+        // Claims were verified per tx inside each batch (strictly stronger
+        // than a batch-final comparison, which cannot see intra-batch
+        // attribution).
+        // Fold: later batches overwrite earlier ones (block order).
+        delta.merge_from(&o.delta);
+        // Block-cumulative gas: batches computed locally from 0.
+        for r in &o.receipts {
+            let mut r = r.clone();
+            cumulative += r.gas_used;
+            r.cumulative_gas_used = cumulative;
+            receipts.push(r);
+        }
+    }
+
+    Ok(BlockOutcome {
+        receipts,
+        delta,
+        batches: ranges.len(),
+    })
+}
+
+#[cfg(test)]
+mod engine_tests {
+    use super::*;
+    use alloy_consensus::{SignableTransaction, TxLegacy};
+    use alloy_network::TxSignerSync;
+    use alloy_primitives::{TxKind, address};
+    use alloy_signer_local::PrivateKeySigner;
+    use kardamom_engine::state::MockStateDatabase;
+    use kardamom_types::BlockBoundaryStart;
+
+    fn tx(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64, i: u64) -> BlockTx {
+        let inner = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1_000_000_000,
+            gas_limit: 100_000,
+            to: TxKind::Call(to),
+            value: U256::from(value),
+            input: Default::default(),
+        };
+        let mut m = inner;
+        let sig = signer.sign_transaction_sync(&mut m).unwrap();
+        let env: alloy_consensus::TxEnvelope = m.into_signed(sig).into();
+        let mut raw = Vec::new();
+        alloy_eips::eip2718::Encodable2718::encode_2718(&env, &mut raw);
+        BlockTx {
+            tx_idx: TxIndex(i),
+            position: BPosition {
+                term_id: 0,
+                term_offset: (i * 64) as i32,
+            },
+            envelope: TxEnvelope {
+                correlation_id: i,
+                raw_tx: raw.into(),
+                sender: signer.address(),
+                tx_hash: alloy_primitives::B256::repeat_byte(i as u8 + 1),
+            },
+        }
+    }
+
+    fn env() -> ExecEnv {
+        ExecEnv::new(
+            1,
+            &BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: BPosition::from_index(0),
+                l2_timestamp: 1_700_000_000,
+            },
+        )
+    }
+
+    /// Build a claim index by SEQUENTIALLY executing the block — i.e. the
+    /// claims an honest executor would publish.
+    fn honest_claims<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> ClaimIndex {
+        let mut idx = ClaimIndex::default();
+        let mut delta = PendingDelta::new();
+        let mut cumulative = 0u64;
+        for (i, t) in txs.iter().enumerate() {
+            let (r, ws) = execute_tx(
+                snap,
+                None,
+                &delta,
+                env(),
+                t.tx_idx,
+                t.position,
+                &t.envelope,
+                i as u64,
+                cumulative,
+                None,
+            )
+            .expect("seq execute");
+            cumulative = r.cumulative_gas_used;
+            let bal_index = (i + 1) as u64;
+            for (addr, (n, b, _)) in &ws.accounts {
+                idx.balance.entry(*addr).or_default().push((bal_index, *b));
+                idx.nonce.entry(*addr).or_default().push((bal_index, *n));
+            }
+            for (k, v) in &ws.storage {
+                idx.storage.entry(*k).or_default().push((bal_index, *v));
+            }
+            delta.apply(ws);
+        }
+        idx
+    }
+
+    fn seq_delta<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> PendingDelta {
+        let mut delta = PendingDelta::new();
+        let mut cumulative = 0u64;
+        for (i, t) in txs.iter().enumerate() {
+            let (r, ws) = execute_tx(
+                snap,
+                None,
+                &delta,
+                env(),
+                t.tx_idx,
+                t.position,
+                &t.envelope,
+                i as u64,
+                cumulative,
+                None,
+            )
+            .expect("seq execute");
+            cumulative = r.cumulative_gas_used;
+            delta.apply(ws);
+        }
+        delta
+    }
+
+    /// THE parity property: parallel seeded batches must produce byte-identical
+    /// state to sequential execution — including for a CONFLICTING workload
+    /// (one sender, dependent nonces, shared recipient) where every tx depends
+    /// on its predecessor. Seeding, not ordering, is what makes that safe.
+    #[test]
+    fn parallel_batches_equal_sequential_on_a_fully_dependent_chain() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000AA");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        // 12 txs from ONE sender: maximal conflict (each reads the balance and
+        // nonce the previous tx wrote).
+        let txs: Vec<BlockTx> = (0..12).map(|i| tx(&signer, to, i, 1_000 + i, i)).collect();
+
+        let claims = honest_claims(&snap, &txs);
+        let expected = seq_delta(&snap, &txs);
+
+        for batch_size in [1usize, 5, 10] {
+            let out = execute_block_parallel(&snap, &txs, &claims, env(), batch_size)
+                .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
+            assert_eq!(
+                out.delta.accounts, expected.accounts,
+                "batch_size {batch_size}: account state must equal sequential"
+            );
+            assert_eq!(out.delta.storage, expected.storage);
+            assert_eq!(out.receipts.len(), txs.len());
+            // Block-cumulative gas must be monotonic and match the total.
+            let total: u64 = out.receipts.iter().map(|r| r.gas_used).sum();
+            assert_eq!(out.receipts.last().unwrap().cumulative_gas_used, total);
+            for w in out.receipts.windows(2) {
+                assert!(w[0].cumulative_gas_used < w[1].cumulative_gas_used);
+            }
+        }
+    }
+
+    /// A FORGED claim must fail-stop at the batch that produces it — this is
+    /// what makes seeding from unverified claims sound.
+    #[test]
+    fn a_forged_claim_fails_stop_at_its_producing_batch() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000BB");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        let txs: Vec<BlockTx> = (0..8).map(|i| tx(&signer, to, i, 500, i)).collect();
+
+        let mut claims = honest_claims(&snap, &txs);
+        // Tamper: inflate the recipient's claimed balance at tx 6 (batch 2 of
+        // 5-tx batches) — the executor claiming a state it did not compute.
+        let bogus = claims.balance.get_mut(&to).expect("recipient claims");
+        if let Some(entry) = bogus.iter_mut().find(|(i, _)| *i == 6) {
+            entry.1 += U256::from(1_000_000u64);
+        }
+
+        let err = execute_block_parallel(&snap, &txs, &claims, env(), 5)
+            .expect_err("a forged claim must be caught");
+        match err {
+            ExecutorError::Divergence(msg) => {
+                assert!(msg.contains("tx 6"), "must name the producing tx: {msg}");
+                assert!(
+                    msg.contains("balance"),
+                    "must name the mismatching item: {msg}"
+                );
+            }
+            other => panic!("expected Divergence, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_block_is_a_no_op() {
+        let snap = MockStateDatabase::builder().build();
+        let out = execute_block_parallel(&snap, &[], &ClaimIndex::default(), env(), 5).unwrap();
+        assert!(out.receipts.is_empty() && out.batches == 0);
+    }
+}
