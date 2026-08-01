@@ -1,6 +1,6 @@
 # BAL access attribution + parallel validator re-execution (spec)
 
-Status: DESIGN v2 — not implemented. Companion to the throughput campaign
+Status: DESIGN v3 — not implemented. Companion to the throughput campaign
 notes (`2026-07-28-throughput-campaign.md`).
 
 v2 supersedes the custom dictionary encoding of v1: **revm 38 ships native
@@ -9,10 +9,14 @@ EIP-7928 support** (`revm_state::bal` — per-account, per-slot
 `into_alloy_bal()` exporting the standard `alloy_eip7928::BlockAccessList`),
 so capture, wire shape, and even the verification comparison come from the
 library and the Ethereum standard instead of bespoke code. v2 also
-incorporates two review decisions: **scheduling granularity is decoupled
+incorporates three review decisions: **scheduling granularity is decoupled
 from attribution granularity** (execute in 5-10-tx work units; attribute
-per tx), and oversized frames degrade down a **granularity ladder** instead
-of falling off a cliff.
+per tx), oversized frames degrade down a **granularity ladder** instead
+of falling off a cliff, and — v3, the load-bearing one — the validator
+executes batches **fully in parallel by seeding each batch's inputs from
+the BAL's own claimed write values** (execute-from-claims + verify-claims
+by induction), which supersedes the wave-DAG model entirely and makes the
+ladder's batch-deduped rung cost nothing in parallelism.
 
 ## Goal
 
@@ -97,12 +101,14 @@ a ladder instead of dropping attribution outright:
 
 1. `granularity = 1` — full per-tx attribution (default).
 2. `granularity = K` (5, then 10) — quantize BalIndex to tx chunks:
-   adjacent same-chunk writes to a slot collapse to one entry. The
-   validator's DAG then operates on chunks: cheaper wire, but merged
-   chunk sets create FALSE conflicts — with pairwise tx-conflict density
-   p, two K-chunks conflict with probability ≈ 1-(1-p)^(K²) (63% at
-   p=1%, K=10), so chunked granularity buys size at real parallelism
-   cost and is a fallback, not the default.
+   within-chunk writes to a slot collapse to the chunk-final value.
+   Under the seeded execution model (see the validator engine) this
+   costs NO parallelism — batches execute from claimed values, not in
+   conflict order — it only coarsens the artifact itself (claims are
+   verifiable at chunk granularity rather than per tx; the per-tx
+   receipt cross-check still covers per-tx outcomes). Kept as a
+   fallback rather than the default to preserve the standard per-tx
+   EIP-7928 artifact when it fits.
 3. `V1` — no attribution; sequential validation for that block. Liveness
    never depends on attribution fitting.
 
@@ -172,37 +178,41 @@ this repo):
    fundamentally broken and back-pressure is the correct behavior (same
    philosophy as the depth-K writer bound).
 
-## Validator-side parallel engine
+## Validator-side parallel engine — seeded full parallelism
+
+The BAL carries write VALUES, not just locations. That upgrades batch
+parallelism from "ordered waves" to "fully independent execution":
 
 1. Decode; `V1` → today's sequential path (always kept).
 2. **Prefetch**: the BAL's account/slot key set IS the block's touched
-   set — one batched mdbx read pass warms everything (valuable even for
-   the sequential path).
-3. **DAG** (at wire granularity g): unit `j` depends on unit `i < j` iff
-   some slot has a write by `i` and any access (read or write) by `j` —
-   derived directly from the per-slot `(tx_index, value)` lists and
-   `storage_reads`. Waves = topological levels.
-4. **Scheduling is decoupled from attribution**: work units are 5-10 txs
-   regardless of `granularity` — same-wave txs packed together, and short
-   dependency CHAINS fused into one sequential unit (a chain has no
-   parallelism to lose, and a single transfer at ~30-60µs is far too fine
-   a task to dispatch alone). Per-tx attribution + batched scheduling
-   captures both benefits; attribution chunking (granularity > 1) is only
-   the wire-size fallback.
-5. Execute waves in parallel over snapshot ∘ accumulated-prior-wave
-   deltas. Each worker builds its OWN `Bal` via the same
-   `update_account` calls.
-6. **Verification = structural equality**: the validator's recomputed
-   BlockAccessList must equal the published one exactly (at matching
-   granularity). This subsumes v1's per-tx set arithmetic: any access the
-   executor didn't declare, any declared access that didn't happen, any
-   value or ordering mismatch — all surface as BAL inequality →
-   divergence fail-stop. The existing per-tx receipt comparison and
-   merged write-set-hash check run unchanged.
-7. **Determinism**: every conflict pair is edge-ordered, so any wave
-   schedule folds to the identical final state; a property test drives
-   random conflict-density blocks through both engines and asserts
-   byte-identical state, receipts, and BALs.
+   set — one batched mdbx read pass warms everything.
+3. **Partition** the block into batches of 5-10 txs in block order
+   (scheduling granularity — independent of wire granularity).
+4. **Seed each batch independently**: for every slot the batch accesses,
+   its input value is (a) the latest BAL-claimed write by any tx BEFORE
+   the batch, else (b) the pre-block snapshot. Both are locally
+   available; deriving the per-batch seed view from the per-tx frame is
+   one pass (this is where "batch-level dedup" lives — as a derived
+   view, not a wire obligation).
+5. **Execute ALL batches concurrently** — no DAG, no wave barriers, no
+   cross-batch waiting. Sequential inside a batch; embarrassingly
+   parallel across batches. Conflicts are resolved by VALUE-PASSING
+   (the seed), not by ordering — which is why chunk-merged access sets
+   no longer cost parallelism (v2's false-conflict analysis applied to
+   the ordering model only).
+6. **Verify claims where they are produced**: each batch's computed
+   writes must equal the BAL's claimed writes for its txs, and computed
+   receipts must match the published receipts (existing check). Soundness
+   is an induction anchored at the snapshot: batch 1 executes from pure
+   ground truth, so its verified claims are true; batch 2's seeds are
+   then verified-true inputs; EVM determinism forces every verified
+   batch's claims to equal sequential execution. A wrong claim is caught
+   at its producing batch — mutually-consistent-but-wrong chains cannot
+   form. Any mismatch → divergence fail-stop. The merged write-set-hash
+   check runs unchanged.
+7. **Why the validator gets this free lunch**: it VERIFIES claims rather
+   than discovering truth. The executor has no claims to seed from —
+   executor-side parallelism remains a Block-STM problem, out of scope.
 
 ## Rollout
 
