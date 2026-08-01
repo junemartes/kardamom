@@ -37,7 +37,6 @@ use kardamom_engine::{
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsSubscriberHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_state::{StateEnvBuilder, StateWriter, TrieMode, read_recovery_point, seed_genesis};
-use kardamom_types::BlockDelta;
 use kardamom_validator::attester::{self, AttesterConfig};
 use kardamom_validator::{
     BalBuffer, Divergence, ReceiptBuffer, ValidatorReceiptSink, ValidatorWriterQueue, metrics,
