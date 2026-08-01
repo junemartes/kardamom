@@ -208,6 +208,11 @@ impl ClaimSlice {
                 return format!("balance {a:?}: unclaimed write {v}");
             }
         }
+        for (a, v) in &other.nonce {
+            if !self.nonce.contains_key(a) {
+                return format!("nonce {a:?}: unclaimed write {v}");
+            }
+        }
         "sets differ".to_string()
     }
 }
@@ -424,6 +429,15 @@ pub fn execute_batch<S: StateDatabase>(
     for (i, tx) in txs.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
+        // Recompute this tx's claims through the executor's EXACT capture
+        // path (execute_tx feeds revm's Bal, which records per-FIELD
+        // changes: a transfer's recipient claims a balance change but NO
+        // nonce change). Comparing a WriteSet projection instead diverged
+        // on every live transfer — the WriteSet carries the full
+        // (nonce, balance) triple for every touched account, so the
+        // recipient's UNCHANGED nonce showed up computed-but-not-claimed.
+        // Symmetric construction is the only drift-proof comparison.
+        let mut tx_bal = revm::state::bal::Bal::new();
         let (receipt, ws) = execute_tx(
             snapshot,
             Some(seed),
@@ -434,7 +448,7 @@ pub fn execute_batch<S: StateDatabase>(
             &tx.envelope,
             global_index_in_block,
             cumulative,
-            None, // the validator recomputes claims; it never publishes a BAL
+            Some((&mut tx_bal, bal_index)),
         )?;
         // Verify the claim WHERE IT IS PRODUCED — per tx, not per batch.
         // Batch-final comparison alone would leave intra-batch claims
@@ -443,7 +457,8 @@ pub fn execute_batch<S: StateDatabase>(
         // attribution would ship unnoticed while the final state matched.
         // EIP-7928 attributes per tx, so it is verified per tx.
         let claimed = claims.claims_in_range(bal_index, bal_index);
-        let computed = ClaimSlice::from_write_set(&ws);
+        let computed =
+            ClaimIndex::from_alloy(&tx_bal.into_alloy_bal()).claims_in_range(bal_index, bal_index);
         if claimed != computed {
             return Err(ExecutorError::Divergence(format!(
                 "tx {bal_index}: {}",
@@ -602,10 +617,15 @@ mod engine_tests {
         )
     }
 
-    /// Build a claim index by SEQUENTIALLY executing the block — i.e. the
-    /// claims an honest executor would publish.
+    /// Build a claim index by SEQUENTIALLY executing the block through the
+    /// executor's REAL capture path (`execute_tx` → revm `Bal`), exactly as
+    /// the live executor produces claims. The first version of this fixture
+    /// hand-rolled claims from WriteSets — symmetric with a verification bug
+    /// (per-field vs whole-triple attribution), so both passed while live
+    /// traffic diverged on every transfer. The fixture and the producer must
+    /// share code, not shape.
     fn honest_claims<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> ClaimIndex {
-        let mut idx = ClaimIndex::default();
+        let mut bal = revm::state::bal::Bal::new();
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
         for (i, t) in txs.iter().enumerate() {
@@ -619,21 +639,13 @@ mod engine_tests {
                 &t.envelope,
                 i as u64,
                 cumulative,
-                None,
+                Some((&mut bal, (i + 1) as u64)),
             )
             .expect("seq execute");
             cumulative = r.cumulative_gas_used;
-            let bal_index = (i + 1) as u64;
-            for (addr, (n, b, _)) in &ws.accounts {
-                idx.balance.entry(*addr).or_default().push((bal_index, *b));
-                idx.nonce.entry(*addr).or_default().push((bal_index, *n));
-            }
-            for (k, v) in &ws.storage {
-                idx.storage.entry(*k).or_default().push((bal_index, *v));
-            }
             delta.apply(ws);
         }
-        idx
+        ClaimIndex::from_alloy(&bal.into_alloy_bal())
     }
 
     fn seq_delta<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> PendingDelta {

@@ -4051,6 +4051,7 @@ dependencies = [
  "kardamom-state",
  "kardamom-types",
  "metrics",
+ "revm",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

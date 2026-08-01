@@ -309,12 +309,23 @@ async fn main() -> Result<()> {
                     match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
                         &mut slice,
                     ) {
-                        Ok(bal) => {
+                        // Empty lists are skipped: empty blocks never take
+                        // claims (the parallel path short-circuits before
+                        // its take), so inserting them would grow the
+                        // buffer for the whole idle period — the cursor
+                        // only advances on takes. Quantized frames
+                        // (granularity > 1) are also skipped: per-tx
+                        // verification against chunk-collapsed claims
+                        // would false-diverge; those blocks validate
+                        // sequentially until ladder-aware verification
+                        // lands.
+                        Ok(bal) if !bal.is_empty() && *granularity == 1 => {
                             claims_sub.insert(
                                 delta.block_number,
                                 kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
                             );
                         }
+                        Ok(_) => {}
                         Err(e) => tracing::warn!(
                             block = delta.block_number,
                             error = %e,
