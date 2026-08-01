@@ -478,6 +478,8 @@ async fn main() -> Result<()> {
             // EIP-7928 capture handoff.
             Some(bal_tx),
             // Join-miss archive refetch (None on single-host/IPC runs).
+            // Whole-block exec strategy (validator parallel path).
+            None,
             join_recovery,
         )
     });

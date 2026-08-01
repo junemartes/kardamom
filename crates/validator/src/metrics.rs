@@ -40,6 +40,17 @@ pub fn counter_divergence() {
     metrics::counter!(DIVERGENCE_TOTAL).increment(1);
 }
 
+/// Blocks re-executed as seeded parallel batches (label: batch count).
+pub fn counter_parallel_block(batches: usize) {
+    metrics::counter!("kardamom_validator_parallel_blocks_total").increment(1);
+    metrics::histogram!("kardamom_validator_parallel_batches").record(batches as f64);
+}
+
+/// Blocks that fell back to sequential re-execution (claims absent/deposits).
+pub fn counter_parallel_fallback() {
+    metrics::counter!("kardamom_validator_parallel_fallback_total").increment(1);
+}
+
 pub fn counter_block_verified() {
     metrics::counter!(BLOCKS_VERIFIED_TOTAL).increment(1);
 }

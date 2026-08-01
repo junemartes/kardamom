@@ -745,3 +745,116 @@ mod engine_tests {
         assert!(out.receipts.is_empty() && out.batches == 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Engine strategy: what the validator hands to the exec loop
+// ---------------------------------------------------------------------------
+
+use kardamom_engine::actor::{BlockExec, BlockExecOutput, BufferedRecord};
+use kardamom_engine::executor::execute_deposit_tx;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// How long a block waits for its BAL claims before falling back to
+/// sequential re-execution. Short: liveness never depends on the BAL.
+const CLAIM_WAIT: Duration = Duration::from_millis(250);
+
+/// Sequential re-execution of a whole block — the always-available fallback
+/// (no claims yet, or the block contains deposits, which carry no
+/// attribution). Identical semantics to the engine's streaming path.
+pub fn execute_block_sequential<S: StateDatabase>(
+    snapshot: &S,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+) -> Result<BlockExecOutput, ExecutorError> {
+    let mut delta = PendingDelta::new();
+    let mut receipts = Vec::with_capacity(records.len());
+    let mut cumulative = 0u64;
+    for (i, rec) in records.iter().enumerate() {
+        let idx_in_block = i as u64;
+        let (receipt, ws) = match rec {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => execute_tx(
+                snapshot,
+                None,
+                &delta,
+                env,
+                *tx_idx,
+                *position,
+                envelope,
+                idx_in_block,
+                cumulative,
+                None,
+            )?,
+            BufferedRecord::Deposit {
+                tx_idx,
+                deposit,
+                position,
+            } => execute_deposit_tx(
+                snapshot,
+                None,
+                &delta,
+                env,
+                *tx_idx,
+                *position,
+                deposit,
+                idx_in_block,
+                cumulative,
+                None,
+            )?,
+        };
+        cumulative = receipt.cumulative_gas_used;
+        delta.apply(ws);
+        receipts.push(receipt);
+    }
+    Ok(BlockExecOutput { receipts, delta })
+}
+
+/// Build the validator's whole-block execution strategy: seeded parallel
+/// batches when this block's BAL claims are available and it contains only
+/// transactions; sequential otherwise. Deposits fall back because EIP-7928
+/// attribution covers transaction execution, not L1-derived credits.
+pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
+    claims: Arc<crate::ClaimBuffer>,
+    batch_size: usize,
+) -> BlockExec<D> {
+    Box::new(
+        move |snapshot: &D, records: &[BufferedRecord], env: ExecEnv, block: u64| {
+            let tx_only = records
+                .iter()
+                .all(|r| matches!(r, BufferedRecord::Tx { .. }));
+            if !tx_only || records.is_empty() {
+                return execute_block_sequential(snapshot, records, env);
+            }
+            let Some(idx) = claims.take(block, CLAIM_WAIT) else {
+                crate::metrics::counter_parallel_fallback();
+                tracing::debug!(block, "no BAL claims in time; sequential re-execution");
+                return execute_block_sequential(snapshot, records, env);
+            };
+            let txs: Vec<BlockTx> = records
+                .iter()
+                .map(|r| match r {
+                    BufferedRecord::Tx {
+                        tx_idx,
+                        envelope,
+                        position,
+                    } => BlockTx {
+                        tx_idx: *tx_idx,
+                        position: *position,
+                        envelope: envelope.clone(),
+                    },
+                    BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
+                })
+                .collect();
+            let out = execute_block_parallel(snapshot, &txs, &idx, env, batch_size)?;
+            crate::metrics::counter_parallel_block(out.batches);
+            Ok(BlockExecOutput {
+                receipts: out.receipts,
+                delta: out.delta,
+            })
+        },
+    )
+}

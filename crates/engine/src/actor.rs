@@ -183,6 +183,37 @@ pub type BalHandoff = (
     revm::state::bal::Bal,
 );
 
+/// One canonical record buffered for whole-block execution (validator
+/// parallel path). Mirrors [`crate::reader::ReaderToExec`]'s payload arms.
+pub enum BufferedRecord {
+    Tx {
+        tx_idx: TxIndex,
+        envelope: kardamom_types::TxEnvelope,
+        position: BPosition,
+    },
+    Deposit {
+        tx_idx: TxIndex,
+        deposit: kardamom_types::Deposit,
+        position: BPosition,
+    },
+}
+
+/// What a block-execution strategy returns: the block's receipts in block
+/// order (block-cumulative gas already correct) and its merged writes.
+pub struct BlockExecOutput {
+    pub receipts: Vec<Receipt>,
+    pub delta: PendingDelta,
+}
+
+/// Optional whole-block execution strategy. `None` (the executor) keeps the
+/// per-tx streaming path untouched. `Some` (the validator's parallel
+/// verifier) makes the exec thread BUFFER a block's records and execute
+/// them together at the boundary — which is what allows batches to run
+/// concurrently, seeded from BAL claims.
+pub type BlockExec<D> = Box<
+    dyn Fn(&D, &[BufferedRecord], ExecEnv, u64) -> Result<BlockExecOutput, ExecutorError> + Send,
+>;
+
 /// Internal envelope routed from exec → commit thread.
 enum ExecToCommit {
     Receipt(kardamom_types::Receipt),
@@ -226,6 +257,7 @@ impl Executor {
         initial_block: u64,
         resume: Option<ResumePoint>,
         bal_tx: Option<Sender<BalHandoff>>,
+        block_exec: Option<BlockExec<S::Db>>,
         recovery: Option<crate::reader::JoinRecoveryFactory>,
     ) -> Result<(), ExecutorError>
     where
@@ -274,6 +306,7 @@ impl Executor {
             initial_block,
             resume,
             bal_tx,
+            block_exec,
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
@@ -359,6 +392,7 @@ fn spawn_exec<S, Q, P>(
     initial_block: u64,
     resume: Option<ResumePoint>,
     bal_tx: Option<Sender<BalHandoff>>,
+    block_exec: Option<BlockExec<S::Db>>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     S: SnapshotSource + 'static,
@@ -402,6 +436,9 @@ where
             // EIP-7928 capture: per-block Bal, reset at each boundary; only
             // maintained when a publisher is attached (executor role).
             let mut block_bal = revm::state::bal::Bal::new();
+            // Whole-block buffer, used only when a block-exec strategy is
+            // supplied (validator parallel path).
+            let mut buffered: Vec<BufferedRecord> = Vec::new();
             let mut parent: Option<PendingDelta> = None;
             let mut inflight: std::collections::VecDeque<(BlockBoundary, PendingDelta)> =
                 std::collections::VecDeque::new();
@@ -488,6 +525,16 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        if block_exec.is_some() {
+                            // Whole-block strategy: defer to the boundary so
+                            // batches can execute concurrently.
+                            buffered.push(BufferedRecord::Tx {
+                                tx_idx,
+                                envelope,
+                                position,
+                            });
+                            continue;
+                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
@@ -548,6 +595,14 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        if block_exec.is_some() {
+                            buffered.push(BufferedRecord::Deposit {
+                                tx_idx,
+                                deposit,
+                                position,
+                            });
+                            continue;
+                        }
                         let env = ExecEnv {
                             chain_id: cfg.chain_id,
                             block_number: current_block,
@@ -671,6 +726,32 @@ where
                                 end: end_tx_idx,
                                 last_seen: BPosition::from_index(have),
                             });
+                        }
+
+                        // Whole-block strategy: execute everything buffered
+                        // for this block now (the validator's batches run
+                        // concurrently inside), then feed its receipts and
+                        // delta into the SAME boundary path the streaming
+                        // executor uses — commit ordering, durability gating
+                        // and the write-set cross-check are unchanged.
+                        if let Some(exec_block) = block_exec.as_ref() {
+                            let env = ExecEnv {
+                                chain_id: cfg.chain_id,
+                                block_number,
+                                l2_timestamp: current_l2_ts,
+                            };
+                            let apply_start = Instant::now();
+                            let out = exec_block(&snapshot, &buffered, env, block_number)?;
+                            *block_apply_elapsed.get_or_insert(Duration::ZERO) +=
+                                apply_start.elapsed();
+                            buffered.clear();
+                            delta = out.delta;
+                            for r in out.receipts {
+                                block_receipts.push(r.clone());
+                                if tx.send(ExecToCommit::Receipt(r)).is_err() {
+                                    return Ok(());
+                                }
+                            }
                         }
 
                         // Record the block's accumulated execution time.
@@ -985,6 +1066,7 @@ mod exec_tests {
             0,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
         drop(rx_e2c);
@@ -1087,6 +1169,7 @@ mod exec_tests {
             0,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1159,6 +1242,7 @@ mod exec_tests {
             0,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1228,6 +1312,7 @@ mod exec_tests {
             0,
             None,
             Some(bal_tx),
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1289,6 +1374,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log),
             0,
+            None,
             None,
             None,
         );
@@ -1375,6 +1461,7 @@ mod exec_tests {
                 l2_timestamp: 1_700_000_000,
             }),
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1444,6 +1531,7 @@ mod exec_tests {
                 l2_timestamp: 1_700_000_003,
             }),
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1508,6 +1596,7 @@ mod exec_tests {
                 l2_timestamp: 1_700_000_000,
             }),
             None,
+            None,
         );
         let res = h.join().expect("no panic");
         assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -1554,6 +1643,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
             None,
         );

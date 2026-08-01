@@ -137,6 +137,17 @@ struct Args {
     #[arg(long, env = "KARDAMOM_ATTESTER_KEY")]
     attester_key: Option<String>,
     /// Post one L1 output per this many L2 blocks.
+    /// Re-execute each block as seeded PARALLEL batches driven by the
+    /// EIP-7928 BAL (spec: bal-attribution-parallel-validation). Falls back
+    /// to sequential per block when claims are unavailable or the block
+    /// contains deposits, so liveness never depends on the BAL.
+    #[arg(long, env = "KARDAMOM_PARALLEL_VALIDATION", default_value_t = false)]
+    parallel_validation: bool,
+    /// Transactions per parallel batch (scheduling granularity — independent
+    /// of the BAL's attribution granularity).
+    #[arg(long, env = "KARDAMOM_VALIDATION_BATCH_SIZE", default_value_t = 8)]
+    validation_batch_size: usize,
+
     #[arg(long, env = "KARDAMOM_ATTESTER_POST_INTERVAL", default_value_t = 1)]
     attester_post_interval: u64,
 }
@@ -265,6 +276,7 @@ async fn main() -> Result<()> {
     // --- Verification streams: tx_bal (BAL) + tx_receipts. ---
     let divergence = Divergence::new();
     let bals = BalBuffer::new();
+    let claims = kardamom_validator::ClaimBuffer::new();
     let receipts = ReceiptBuffer::new();
 
     // tx_bal: per-block BlockDelta (BAL). Simple (multicast/IPC) subscription.
@@ -280,19 +292,36 @@ async fn main() -> Result<()> {
             )
             .context("open tx_bal subscription")?;
         let bals = bals.clone();
+        let claims_sub = claims.clone();
         tokio::spawn(async move {
             while let Some((_pos, frame)) = bal_rx.recv().await {
                 if let kardamom_types::BalFrame::V2 {
                     bal_rlp,
                     granularity,
-                    ..
+                    delta,
                 } = &frame
                 {
-                    tracing::debug!(
-                        bal_bytes = bal_rlp.len(),
-                        granularity,
-                        "BAL frame with access attribution"
-                    );
+                    // Decode the access list into seed-lookup form for the
+                    // parallel engine. A decode failure degrades to
+                    // sequential re-execution (the merged cross-check below
+                    // is unaffected), never to a verification gap.
+                    let mut slice: &[u8] = bal_rlp;
+                    match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
+                        &mut slice,
+                    ) {
+                        Ok(bal) => {
+                            claims_sub.insert(
+                                delta.block_number,
+                                kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
+                            );
+                        }
+                        Err(e) => tracing::warn!(
+                            block = delta.block_number,
+                            error = %e,
+                            granularity,
+                            "BAL access-list decode failed; block validates sequentially"
+                        ),
+                    }
                 }
                 bals.insert(frame.delta().clone());
             }
@@ -446,6 +475,21 @@ async fn main() -> Result<()> {
     cfg.reader.join_timeout = bin_support::bounded_join_timeout(resume.is_some());
     let initial_block = recovery.last_committed_block;
 
+    // Parallel validation strategy (opt-in): seeded batches driven by the
+    // BAL. `None` keeps the engine's streaming per-tx path byte-for-byte.
+    let block_exec = if args.parallel_validation {
+        tracing::info!(
+            batch_size = args.validation_batch_size,
+            "parallel validation ENABLED (seeded BAL batches)"
+        );
+        Some(kardamom_validator::parallel::parallel_block_exec(
+            claims.clone(),
+            args.validation_batch_size,
+        ))
+    } else {
+        None
+    };
+
     let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run(
             cfg,
@@ -461,6 +505,8 @@ async fn main() -> Result<()> {
             // No BAL capture: the validator VERIFIES BALs, never publishes them.
             None,
             // Join-miss archive refetch (None on single-host/IPC runs).
+            // Whole-block exec strategy (validator parallel path).
+            block_exec,
             join_recovery,
         )
     });
