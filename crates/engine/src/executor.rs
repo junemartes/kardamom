@@ -1083,4 +1083,112 @@ mod tests {
             "got {err:?}"
         );
     }
+    /// Regression: EIP-7928 capture must actually populate the block Bal
+    /// when a Bal handle is supplied to `execute_tx` (spec phase 1). An
+    /// empty BAL means the validator has nothing to verify or seed from.
+    #[test]
+    fn execute_tx_captures_into_the_block_bal() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("0000000000000000000000000000000000005678");
+        let snap = MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+        let tx = signed_transfer(&signer, to, 1_000, 0);
+
+        let mut bal = revm::state::bal::Bal::new();
+        let (_receipt, ws) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            &tx,
+            0,
+            0,
+            Some((&mut bal, 1)),
+        )
+        .expect("execute");
+        assert!(!ws.accounts.is_empty(), "the tx wrote accounts");
+
+        let alloy = bal.into_alloy_bal();
+        assert!(
+            !alloy.is_empty(),
+            "capture produced an EMPTY BAL for a tx that wrote {} accounts",
+            ws.accounts.len()
+        );
+        // Sender and recipient must both appear with balance/nonce claims.
+        let has_sender = alloy.iter().any(|a| {
+            a.address == from && (!a.balance_changes.is_empty() || !a.nonce_changes.is_empty())
+        });
+        assert!(
+            has_sender,
+            "sender's balance/nonce change must be claimed: {alloy:?}"
+        );
+    }
+
+    /// Production shape: the SECOND tx in a block executes against a
+    /// non-empty `delta` (seeded into the CacheDB). Capture must still
+    /// record it — the first live measurement produced empty BALs while
+    /// deltas were 76KB/block, and empty-delta tests passed.
+    #[test]
+    fn execute_tx_captures_with_a_seeded_delta() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("0000000000000000000000000000000000009999");
+        let snap = MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .build();
+        let mut delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+
+        // tx1 populates the delta (as in a real block).
+        let tx1 = signed_transfer(&signer, to, 1_000, 0);
+        let mut bal = revm::state::bal::Bal::new();
+        let (_r1, ws1) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            &tx1,
+            0,
+            0,
+            Some((&mut bal, 1)),
+        )
+        .expect("execute 1");
+        delta.apply(ws1);
+        let after_tx1 = bal.clone().into_alloy_bal().len();
+
+        // tx2 runs with the seeded delta — the production path.
+        let tx2 = signed_transfer(&signer, to, 500, 1);
+        let (_r2, ws2) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(1),
+            pos(64),
+            &tx2,
+            1,
+            21_000,
+            Some((&mut bal, 2)),
+        )
+        .expect("execute 2");
+        assert!(!ws2.accounts.is_empty(), "tx2 wrote accounts");
+
+        let alloy = bal.into_alloy_bal();
+        assert!(after_tx1 > 0, "tx1 must be captured");
+        assert!(!alloy.is_empty(), "capture must survive a seeded delta");
+        // tx2's claims must be present: some account carries a bal_index 2 change.
+        let has_tx2 = alloy.iter().any(|a| {
+            a.balance_changes.iter().any(|c| c.block_access_index == 2)
+                || a.nonce_changes.iter().any(|c| c.block_access_index == 2)
+        });
+        assert!(has_tx2, "tx2's claims missing from BAL: {alloy:?}");
+    }
 }
