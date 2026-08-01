@@ -74,6 +74,15 @@ job "executor" {
     task "executor" {
       driver = "docker"
 
+      # BAL granularity measurement (spec phase 1): logs per-block
+      # encoded sizes at each K so the batch size can be chosen from data.
+      # Unset in normal operation; harmless (log-only) when set.
+      env {
+        # Set to a K list (e.g. "1,5,10,20") to log per-granularity encoded
+        # sizes per block; unset in normal operation.
+        # KARDAMOM_BAL_MEASURE = "1,5,10,20"
+      }
+
       config {
         image        = "192.168.56.10:5000/kardamom-executor:dev"
         # Always pull the freshly-built image: the mutable :dev tag would otherwise

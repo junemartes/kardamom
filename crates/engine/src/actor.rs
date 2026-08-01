@@ -174,6 +174,15 @@ impl Default for ExecutorConfig {
     }
 }
 
+/// Per-block EIP-7928 handoff to the executor's BAL publisher thread:
+/// (boundary, receipts-free merged delta for the frame's V1 section, the
+/// captured Bal). Sent at each boundary when capture is enabled.
+pub type BalHandoff = (
+    BlockBoundary,
+    kardamom_types::BlockDelta,
+    revm::state::bal::Bal,
+);
+
 /// Internal envelope routed from exec → commit thread.
 enum ExecToCommit {
     Receipt(kardamom_types::Receipt),
@@ -216,6 +225,7 @@ impl Executor {
         sw_queue: P,
         initial_block: u64,
         resume: Option<ResumePoint>,
+        bal_tx: Option<Sender<BalHandoff>>,
         recovery: Option<crate::reader::JoinRecoveryFactory>,
     ) -> Result<(), ExecutorError>
     where
@@ -263,6 +273,7 @@ impl Executor {
             sw_queue,
             initial_block,
             resume,
+            bal_tx,
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
@@ -347,6 +358,7 @@ fn spawn_exec<S, Q, P>(
     mut sw_queue: P,
     initial_block: u64,
     resume: Option<ResumePoint>,
+    bal_tx: Option<Sender<BalHandoff>>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     S: SnapshotSource + 'static,
@@ -387,6 +399,9 @@ where
             // (later blocks win) — one layer regardless of depth, so per-tx
             // cache seeding stays O(one map); it is rebuilt from the
             // survivors when commits settle.
+            // EIP-7928 capture: per-block Bal, reset at each boundary; only
+            // maintained when a publisher is attached (executor role).
+            let mut block_bal = revm::state::bal::Bal::new();
             let mut parent: Option<PendingDelta> = None;
             let mut inflight: std::collections::VecDeque<(BlockBoundary, PendingDelta)> =
                 std::collections::VecDeque::new();
@@ -489,6 +504,9 @@ where
                             &envelope,
                             tx_index_in_block,
                             cumulative_gas_used,
+                            bal_tx
+                                .as_ref()
+                                .map(|_| (&mut block_bal, tx_index_in_block + 1)),
                         );
                         if result.is_ok() {
                             tx_applied_ok.increment(1);
@@ -499,6 +517,15 @@ where
                             tracing::error!(block = current_block, ?position, error = ?e, "exec ERROR: execute_tx failed");
                         }
                         let (receipt, ws) = result?;
+                        if bal_tx.is_some() && tx_index_in_block.is_multiple_of(512) {
+                            tracing::debug!(
+                                block = current_block,
+                                tx_index_in_block,
+                                bal_accounts = block_bal.accounts.len(),
+                                ws_accounts = ws.accounts.len(),
+                                "BAL capture progress"
+                            );
+                        }
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
                         delta.apply(ws);
@@ -537,6 +564,9 @@ where
                             &deposit,
                             tx_index_in_block,
                             cumulative_gas_used,
+                            bal_tx
+                                .as_ref()
+                                .map(|_| (&mut block_bal, tx_index_in_block + 1)),
                         );
                         if result.is_ok() {
                             tx_applied_ok.increment(1);
@@ -674,6 +704,19 @@ where
                         // tx_receipts is AT-LEAST-ONCE and every consumer
                         // must dedup on `tx_idx` (ingress does).
                         let pending = std::mem::take(&mut delta);
+                        // EIP-7928 handoff: move the block's Bal + a
+                        // receipts-free copy of the merged delta to the
+                        // publisher thread (encode + reliable delivery live
+                        // entirely off this thread). A dropped send means
+                        // the publisher is gone mid-shutdown — not fatal.
+                        if let Some(btx) = bal_tx.as_ref() {
+                            let bal_delta = pending.clone().finalize(block_number, Vec::new());
+                            let _ = btx.send((
+                                boundary.clone(),
+                                bal_delta,
+                                std::mem::take(&mut block_bal),
+                            ));
+                        }
                         match parent.as_mut() {
                             Some(m) => m.merge_from(&pending),
                             None => parent = Some(pending.clone()),
@@ -941,6 +984,7 @@ mod exec_tests {
             RecordingQueue(writer_log.clone()),
             0,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
         drop(rx_e2c);
@@ -1042,6 +1086,7 @@ mod exec_tests {
             RecordingQueue(writer_log.clone()),
             0,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1113,6 +1158,7 @@ mod exec_tests {
             RecordingQueue(writer_log.clone()),
             0,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1136,6 +1182,66 @@ mod exec_tests {
             "settled in order, none lost"
         );
         assert_eq!(writer_log.lock().unwrap().len(), 6, "all deltas submitted");
+    }
+
+    /// End-to-end through the ACTOR: with a BAL channel attached, the
+    /// handoff at each boundary must carry a POPULATED Bal. Live phase-1
+    /// measurement produced 1-byte (empty) BALs while deltas were 76KB —
+    /// direct `execute_tx` tests passed, so the gap is in this wiring.
+    #[test]
+    fn exec_handoff_carries_a_populated_bal() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("00000000000000000000000000000000000ABCDE");
+        let snap = MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, _rx_e2c) = bounded::<ExecToCommit>(64);
+        let (bal_tx, bal_rx) = bounded::<BalHandoff>(8);
+
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(0),
+                envelope: legacy(&signer, to, 0, 100),
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(1),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+            Some(bal_tx),
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        let (_boundary, delta, bal) = bal_rx.try_recv().expect("a BAL handoff");
+        assert!(
+            !delta.accounts.is_empty(),
+            "delta carries the block's writes"
+        );
+        let alloy = bal.into_alloy_bal();
+        assert!(
+            !alloy.is_empty(),
+            "handoff Bal is EMPTY while the delta has {} accounts",
+            delta.accounts.len()
+        );
     }
 
     #[test]
@@ -1183,6 +1289,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log),
             0,
+            None,
             None,
         );
         let res = h.join().expect("no panic");
@@ -1267,6 +1374,7 @@ mod exec_tests {
                 record_count: 2,
                 l2_timestamp: 1_700_000_000,
             }),
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1335,6 +1443,7 @@ mod exec_tests {
                 record_count: 0,
                 l2_timestamp: 1_700_000_003,
             }),
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1398,6 +1507,7 @@ mod exec_tests {
                 record_count: 5,
                 l2_timestamp: 1_700_000_000,
             }),
+            None,
         );
         let res = h.join().expect("no panic");
         assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -1444,6 +1554,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
         );
         h.join().expect("no panic").expect("exec ok");

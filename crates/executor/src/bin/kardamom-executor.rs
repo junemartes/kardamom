@@ -22,9 +22,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_executor::{
-    BalPublishingWriterQueue, CMessage, DepositSubscription, Executor, ExecutorConfig,
-    ExecutorError, ExecutorFileConfig, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
-    ResumePoint, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
+    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig,
+    MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription,
+    TxOrderingSubscription, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
@@ -425,8 +425,21 @@ async fn main() -> Result<()> {
     let bal_pub = rt_pub
         .open_publication(&channels.tx_bal_channel, channels.tx_bal_stream_id)
         .context("open tx_bal publication")?;
-    let sw_queue =
-        BalPublishingWriterQueue::new(MdbxWriterQueue::new(writer.delta_tx.clone()), bal_pub);
+    // EIP-7928 BAL publisher (spec:
+    // docs/agents/bal-attribution-parallel-validation-spec.md): the exec
+    // thread hands off each block's captured Bal + receipts-free delta; this
+    // thread encodes and delivers with ack + bounded retry, retaining recent
+    // frames for validator catch-up. Emission is NOT best-effort — parallel
+    // validation makes BAL availability a validator liveness property.
+    // Bounded depth: a wedged publisher back-pressures exec rather than
+    // dropping state transitions.
+    let (bal_tx, bal_rx) = crossbeam_channel::bounded(8);
+    let _bal_publisher = std::thread::Builder::new()
+        .name("bal-publisher".into())
+        .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
+        .context("spawn BAL publisher")?;
+    // The legacy writer-queue tee is superseded by the publisher thread.
+    let sw_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
 
     let mut cfg = ExecutorConfig {
         chain_id,
@@ -462,6 +475,8 @@ async fn main() -> Result<()> {
             // cluster source replays from it and the reader/exec counters seed
             // from it. `None` on a fresh start.
             resume,
+            // EIP-7928 capture handoff.
+            Some(bal_tx),
             // Join-miss archive refetch (None on single-host/IPC runs).
             join_recovery,
         )

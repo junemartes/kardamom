@@ -26,6 +26,12 @@ pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_to
 // repairs itself with a peer checkpoint — or fails to. Labelled
 // `outcome=peer-checkpoint|unrecoverable`. Rare by design; any non-zero rate
 // is worth an alert (a node fell behind the retention window).
+/// EIP-7928 BAL publication (spec: bal-attribution-parallel-validation).
+pub const BAL_FRAME_BYTES: &str = "kardamom_executor_bal_frame_bytes";
+pub const BAL_ENCODE_SECONDS: &str = "kardamom_executor_bal_encode_seconds";
+pub const BAL_PUBLISH_TOTAL: &str = "kardamom_executor_bal_publish_total";
+pub const BAL_RETAINED_BLOCKS: &str = "kardamom_executor_bal_retained_blocks";
+
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
 /// Deterministically-invalid canonical txs skipped with a marker receipt
 /// (#92). ANY nonzero value means an upstream guard (sequencer nonce fence,

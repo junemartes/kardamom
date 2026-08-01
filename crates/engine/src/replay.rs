@@ -198,6 +198,7 @@ where
                 tx,
                 i as u64,
                 cumulative_gas,
+                None,
             )?;
             delta.apply(ws);
             cumulative_gas += receipt.gas_used;
