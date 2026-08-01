@@ -45,6 +45,38 @@ pub struct CodeEntry {
     pub code: Bytes,
 }
 
+/// Versioned `tx_bal` wire frame (spec:
+/// docs/agents/bal-attribution-parallel-validation-spec.md).
+///
+/// `V1` is exactly the pre-attribution payload (receipts-stripped
+/// [`BlockDelta`]); `V2` adds the EIP-7928 Block Access List — canonical
+/// alloy RLP bytes — carrying per-slot `(tx_index, value)` write lists and
+/// per-account storage reads. The merged `delta` section is unchanged so
+/// V1-only consumers (prefetch, the write-set-hash cross-check) read it
+/// identically. `granularity` = 1 for per-tx attribution; K > 1 means
+/// BalIndex was quantized to ceil(idx/K) chunks (the size-degradation
+/// ladder).
+#[derive(Clone, Debug, Archive, Serialize, Deserialize)]
+#[rkyv(derive(Debug))]
+pub enum BalFrame {
+    V1(BlockDelta),
+    V2 {
+        delta: BlockDelta,
+        bal_rlp: Vec<u8>,
+        granularity: u16,
+    },
+}
+
+impl BalFrame {
+    /// The merged final-value section, whichever version.
+    pub fn delta(&self) -> &BlockDelta {
+        match self {
+            BalFrame::V1(d) => d,
+            BalFrame::V2 { delta, .. } => delta,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct BlockDelta {

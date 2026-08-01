@@ -9,6 +9,8 @@ edition.workspace = true
 # Shared by the sequencer-side `kardamom-executor` and the `kardamom-validator`.
 
 [dependencies]
+alloy-eip7928.workspace = true
+alloy-rlp.workspace = true
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 # Cluster (Raft) transport adapter (`reader::cluster`). tx_ordering ALWAYS comes

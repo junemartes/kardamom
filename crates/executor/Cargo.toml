@@ -5,6 +5,9 @@ edition.workspace = true
 
 
 [dependencies]
+rkyv.workspace = true
+alloy-eip7928.workspace = true
+alloy-rlp.workspace = true
 # Execution core (reader/join topology, revm execution, delta accumulation,
 # reader→exec→commit orchestration) lives in the shared engine crate.
 kardamom-engine = { workspace = true }

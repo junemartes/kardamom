@@ -270,13 +270,32 @@ async fn main() -> Result<()> {
 
     // tx_bal: per-block BlockDelta (BAL). Simple (multicast/IPC) subscription.
     {
+        // BalFrame (spec: bal-attribution-parallel-validation): V1 carries
+        // the merged delta alone; V2 adds the EIP-7928 access list. The
+        // write-set cross-check consumes the merged section either way —
+        // attribution drives the parallel engine in phase 3.
         let mut bal_rx = rt
-            .open_subscription::<BlockDelta>(&channels.tx_bal_channel, channels.tx_bal_stream_id)
+            .open_subscription::<kardamom_types::BalFrame>(
+                &channels.tx_bal_channel,
+                channels.tx_bal_stream_id,
+            )
             .context("open tx_bal subscription")?;
         let bals = bals.clone();
         tokio::spawn(async move {
-            while let Some((_pos, delta)) = bal_rx.recv().await {
-                bals.insert(delta);
+            while let Some((_pos, frame)) = bal_rx.recv().await {
+                if let kardamom_types::BalFrame::V2 {
+                    bal_rlp,
+                    granularity,
+                    ..
+                } = &frame
+                {
+                    tracing::debug!(
+                        bal_bytes = bal_rlp.len(),
+                        granularity,
+                        "BAL frame with access attribution"
+                    );
+                }
+                bals.insert(frame.delta().clone());
             }
         });
     }
@@ -440,6 +459,8 @@ async fn main() -> Result<()> {
             sw_queue,
             initial_block,
             resume,
+            // No BAL capture: the validator VERIFIES BALs, never publishes them.
+            None,
             // Join-miss archive refetch (None on single-host/IPC runs).
             join_recovery,
         )

@@ -3798,9 +3798,11 @@ name = "kardamom-engine"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-signer-local",
  "anyhow",
  "bytes",
@@ -3827,9 +3829,11 @@ name = "kardamom-executor"
 version = "0.1.0"
 dependencies = [
  "alloy-consensus",
+ "alloy-eip7928",
  "alloy-eips 2.0.5",
  "alloy-network",
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-signer-local",
  "anyhow",
  "bytes",
@@ -3848,6 +3852,7 @@ dependencies = [
  "rand_chacha 0.9.0",
  "reqwest 0.13.4",
  "revm",
+ "rkyv",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -4026,10 +4031,12 @@ name = "kardamom-validator"
 version = "0.1.0"
 dependencies = [
  "alloy-contract",
+ "alloy-eip7928",
  "alloy-network",
  "alloy-node-bindings",
  "alloy-primitives",
  "alloy-provider",
+ "alloy-rlp",
  "alloy-rpc-types-eth",
  "alloy-signer-local",
  "alloy-sol-types",

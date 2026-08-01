@@ -159,6 +159,12 @@ pub fn execute_tx<S: StateDatabase>(
     inbound_envelope: &TxEnvelope,
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
+    // EIP-7928 capture (spec: bal-attribution-parallel-validation): when
+    // set, every account/slot this tx touched is recorded into the block's
+    // Bal under `bal_index` (1-based tx position per revm's convention) —
+    // writes as (index, value), read-only accesses into storage_reads.
+    // revm classifies from original-vs-present in `outcome.state`.
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
     // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
     // invalid — undecodable bytes, or a tx revm rejects at validation
@@ -297,6 +303,11 @@ pub fn execute_tx<S: StateDatabase>(
     // across replicas (revm's iteration is over an AddressMap; we re-sort
     // into BTreeMap inside WriteSet via insert).
     let ws = write_set_from_evm_state(&outcome.state);
+    if let Some((bal, bal_index)) = bal {
+        for (addr, account) in outcome.state.iter() {
+            bal.update_account(bal_index, *addr, account);
+        }
+    }
 
     let write_set_hash = ws.hash();
     let wire_logs = logs.iter().map(wire_log).collect();
@@ -404,6 +415,12 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     deposit: &Deposit,
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
+    // See `execute_tx`. Deposits capture WRITES ONLY (their WriteSet keys)
+    // via constructed accounts — the commit-cache shape loses original
+    // values, so read attribution is unavailable here; executor and
+    // validator both build deposit claims through this same path, keeping
+    // claims symmetric.
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
     // Layer the running delta on top of the snapshot via CacheDB so revm
     // sees writes from earlier txs in the same block. Mirrors execute_tx.
@@ -496,6 +513,9 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // Build the write set from revm's final-state cache. Both the mint
     // pre-credit and any inner-call writes contribute touched accounts.
     let ws = write_set_from_cache(&cache.cache);
+    if let Some((bal, bal_index)) = bal {
+        record_writeset_into_bal(bal, bal_index, &ws);
+    }
 
     let write_set_hash = ws.hash();
     let wire_logs: Vec<WireLog> = logs.iter().map(wire_log).collect();
@@ -548,6 +568,67 @@ fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
 /// commit cycle is complete, so the resulting WriteSet covers BOTH the
 /// mint pre-credit and any inner-call writes. Accounts in state `None`
 /// (loaded but unchanged) and `NotExisting` (never observed) are skipped.
+/// Record a deposit's WriteSet into the block Bal as WRITES (constructed
+/// accounts — the commit-cache shape loses original values, so
+/// `original_value` is fabricated to differ from present, forcing write
+/// classification; only present values are ever serialized). Both executor
+/// and validator build deposit claims through this same path, keeping the
+/// claims symmetric. Reads are not attributed for deposits.
+pub fn record_writeset_into_bal(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {
+    use revm::state::{Account, AccountInfo, AccountStatus, EvmStorageSlot};
+    let mut by_addr: std::collections::BTreeMap<Address, Account> =
+        std::collections::BTreeMap::new();
+    for (addr, (nonce, balance, code_hash)) in &ws.accounts {
+        let info = AccountInfo {
+            nonce: *nonce,
+            balance: *balance,
+            code_hash: *code_hash,
+            code: None,
+            account_id: None,
+        };
+        let mut original = info.clone();
+        // Force change-classification: fabricate a differing original.
+        original.nonce = original.nonce.wrapping_add(1);
+        by_addr.insert(
+            *addr,
+            Account {
+                info,
+                original_info: Box::new(original),
+                transaction_id: 0,
+                storage: Default::default(),
+                status: AccountStatus::Touched,
+            },
+        );
+    }
+    for ((addr, key), value) in &ws.storage {
+        let entry = by_addr.entry(*addr).or_insert_with(|| {
+            let info = AccountInfo::default();
+            let mut original = info.clone();
+            original.nonce = original.nonce.wrapping_add(1);
+            Account {
+                info,
+                original_info: Box::new(original),
+                transaction_id: 0,
+                storage: Default::default(),
+                status: AccountStatus::Touched,
+            }
+        });
+        let slot_key = U256::from_be_bytes::<32>(key.0);
+        entry.storage.insert(
+            slot_key,
+            EvmStorageSlot {
+                original_value: !*value, // != present ⇒ classified as write
+                present_value: *value,
+                transaction_id: 0,
+                is_cold: false,
+            },
+        );
+    }
+    for (addr, account) in &by_addr {
+        bal.update_account(bal_index, *addr, account);
+    }
+}
+
 fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state.accounts.iter() {
@@ -700,8 +781,19 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let stale = signed_transfer(&signer, to, 1_000, 3);
-        let (receipt, ws) = execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &stale, 0, 77)
-            .expect("invalid tx must SKIP, not error");
+        let (receipt, ws) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            &stale,
+            0,
+            77,
+            None,
+        )
+        .expect("invalid tx must SKIP, not error");
         assert!(receipt.is_invalid_skip(), "status=false, gas_used=0 marker");
         assert_eq!(receipt.tx_hash, stale.tx_hash);
         assert_eq!(receipt.nonce, 3);
@@ -719,8 +811,19 @@ mod tests {
         // The chain continues: the sender's REAL next tx (nonce 5) executes.
         let env2 = ExecEnv::new(1, &boundary(1));
         let live = signed_transfer(&signer, to, 1_000, 5);
-        let (r2, _) = execute_tx(&snap, None, &delta, env2, TxIndex(1), pos(64), &live, 1, 77)
-            .expect("valid tx after a skip");
+        let (r2, _) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env2,
+            TxIndex(1),
+            pos(64),
+            &live,
+            1,
+            77,
+            None,
+        )
+        .expect("valid tx after a skip");
         assert!(r2.status);
         assert!(!r2.is_invalid_skip());
     }
@@ -737,9 +840,19 @@ mod tests {
             sender: signer.address(),
             tx_hash: keccak256([0xde, 0xad, 0xbe, 0xef]),
         };
-        let (receipt, ws) =
-            execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &garbage, 0, 0)
-                .expect("undecodable bytes must SKIP, not error");
+        let (receipt, ws) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            &garbage,
+            0,
+            0,
+            None,
+        )
+        .expect("undecodable bytes must SKIP, not error");
         assert!(receipt.is_invalid_skip());
         assert_eq!(receipt.nonce, 0, "nonce unknowable from undecodable bytes");
         assert_eq!(receipt.write_set_hash, WriteSet::default().hash());
@@ -759,8 +872,19 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let env_tx = signed_transfer(&signer, to, 1_000, 0);
-        let (receipt, ws) = execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &env_tx, 0, 0)
-            .expect("execute");
+        let (receipt, ws) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            &env_tx,
+            0,
+            0,
+            None,
+        )
+        .expect("execute");
 
         //the receipt's tx_hash MUST equal the inbound envelope's
         // tx_hash byte-for-byte. No recomputation in the executor.
@@ -800,8 +924,19 @@ mod tests {
         let mut delta = PendingDelta::new();
         // First transfer.
         let tx1 = signed_transfer(&signer, to, 100, 0);
-        let (r1, ws1) = execute_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &tx1, 0, 0)
-            .expect("execute 1");
+        let (r1, ws1) = execute_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            &tx1,
+            0,
+            0,
+            None,
+        )
+        .expect("execute 1");
         assert!(r1.status);
         assert_eq!(r1.tx_hash, tx1.tx_hash); // copied, not recomputed
         assert_eq!(r1.nonce, 0);
@@ -822,6 +957,7 @@ mod tests {
             &tx2,
             1,
             gas_after_tx1,
+            None,
         )
         .expect("execute 2");
         assert!(r2.status);
@@ -865,7 +1001,7 @@ mod tests {
 
         let d = dep(from, Some(to), 1_000, 400, Bytes::new());
         let (receipt, ws) =
-            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0)
+            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0, None)
                 .expect("execute");
 
         // Mint = 1000, value forwarded = 400, so:
@@ -909,7 +1045,7 @@ mod tests {
 
         let d = dep(from, Some(revert_addr), 1_000, 200, Bytes::new());
         let (receipt, ws) =
-            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0)
+            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0, None)
                 .expect("execute (revert is OK at the executor layer)");
 
         // Mint pre-credit is OUTSIDE the EVM call: from keeps the full mint.
@@ -940,8 +1076,8 @@ mod tests {
         let env = ExecEnv::new(1, &boundary(1));
 
         let d = dep(from, Some(Address::from([0x22u8; 20])), 1, 0, Bytes::new());
-        let err =
-            execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0).unwrap_err();
+        let err = execute_deposit_tx(&snap, None, &delta, env, TxIndex(0), pos(0), &d, 0, 0, None)
+            .unwrap_err();
         assert!(
             matches!(err, ExecutorError::Execution { ref detail, .. } if detail.contains("mint overflow")),
             "got {err:?}"
