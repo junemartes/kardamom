@@ -8,6 +8,7 @@ edition = "2024"
 
 [workspace.dependencies]
 revm = "38"
+smallvec = "1"
 alloy-eip7928 = { version = "0.3", features = ["rlp"] }
 alloy-primitives = "1.6"
 alloy-consensus = { version = "2.0", features = ["secp256k1"] }

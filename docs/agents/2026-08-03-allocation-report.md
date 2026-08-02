@@ -14,20 +14,27 @@ Two rounds of squashing, measured at the mix:
 |:--|--:|--:|--:|--:|
 | pre-ExecScope | 88.0 | 421,452 | 276 us | 161 |
 | ExecScope (block-scoped EVM+cache) | 22.2 | 9,356 | 75 us | 597 |
-| + streamed hash + created-only code | **18.2** | **5,398** | **63.5 us** | **~702** |
+| + streamed hash + created-only code | 18.2 | 5,398 | 63.5 us | ~702 |
+| + WriteSet SmallVec (round 3) | **16.5** | **3,672** | **55.3 us** | **~806** |
 
-Total: **-98.7% bytes/tx, 4.3x single-core execution throughput.**
+Total: **-99.1% bytes/tx, 5.0x single-core execution throughput.**
+
+Round 3: `WriteSet`'s three `BTreeMap`s (a 1KB-class leaf NODE per map
+per tx) became sorted `SmallVec`s with inline capacity 3/8/1 — the
+typical tx's write set now allocates NOTHING. Canonical order (the hash
+contract) moved from tree order to sort-on-build (`WriteSet::finish`,
+debug-asserted in `hash()`).
 
 ## Per-family (after all fixes)
 
 | family | allocs/tx | bytes/tx | wall/tx | gas/tx |
 |:--|--:|--:|--:|--:|
-| transfer | 6.1 | 2,660 | 20.3 us | 21,000 |
-| vault_deposit | 19.1 | 4,952 | 63.2 us | 39,113 |
-| clob_cancel | 16.3 | 5,475 | 57.4 us | 54,294 |
-| mix | 18.2 | 5,398 | 63.5 us | 44,569 |
-| swap | 20.1 | 5,969 | 67.5 us | 44,773 |
-| clob_place | 27.9 | 7,940 | 103.6 us | 90,341 |
+| transfer | 5.1 | 1,636 | 17.6 us | 21,000 |
+| vault_deposit | 17.1 | 2,992 | 57.9 us | 39,113 |
+| clob_cancel | 14.8 | 3,925 | 52.7 us | 54,294 |
+| mix | 16.5 | 3,672 | 55.3 us | 44,569 |
+| swap | 18.1 | 4,009 | 61.9 us | 44,773 |
+| clob_place | 25.9 | 5,980 | 92.4 us | 90,341 |
 
 The suspicion that contract execution hid unmeasured allocations was
 right: a CLOB place allocated 4.5x a transfer (now 3x). The engine fixed
@@ -53,15 +60,15 @@ cost is the transfer row; everything above it is contract-proportional
 
 | owner | ~bytes/tx | site | squash path |
 |:--|--:|:--|:--|
-| kardamom `WriteSet` | ~2,700 | three `BTreeMap`s allocate 1KB-class leaf NODES for a handful of entries each (accounts 1,024B + storage 936B + code 720B) | replace with sorted `SmallVec`s — determinism via sort-on-build; the biggest remaining win, touches WriteSet consumers |
+| ~~kardamom `WriteSet`~~ | ~~2,700~~ | DONE round 3 (SmallVec) | — |
 | revm journal | ~1,400 (2 allocs) | per-touched-account storage `HashMap` inside `JournaledAccount`, rebuilt per tx (`sload` path) | upstream: journal map pooling across `transact` calls on a kept EVM; worth an issue/PR to revm |
 | revm state | ~724 | `outcome.state` HashMap (journal finalize) | inherent to the transact API; pooling upstream |
 | revm boxes | ~500 | `Box<AccountInfo>` x3, `Box<CallInputs>` per call frame | upstream small-box arena; low priority |
 | logs | ~320 (swap) | `Vec<Log>` + topic/data bytes per emitted event | inherent (receipts carry them); could pool |
 
-Engine-side the floor is now roughly the `WriteSet` BTree nodes; after a
-SmallVec conversion the path would be ~2.5KB/tx mix, dominated by revm
-internals — at which point further gains belong upstream.
+The engine-side floor is reached: of the remaining ~3.7KB/tx (mix),
+essentially all belongs to revm internals. Further allocation gains go
+upstream; further THROUGHPUT gains go to parallel execution.
 
 ## Reproduction
 

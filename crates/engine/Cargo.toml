@@ -9,6 +9,7 @@ edition.workspace = true
 # Shared by the sequencer-side `kardamom-executor` and the `kardamom-validator`.
 
 [dependencies]
+smallvec.workspace = true
 alloy-eip7928.workspace = true
 alloy-rlp.workspace = true
 kardamom-types = { workspace = true }
