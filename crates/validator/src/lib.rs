@@ -365,6 +365,13 @@ pub struct ValidatorWriterQueue<Q: StateWriterQueue> {
     bals: Arc<BalBuffer>,
     divergence: Arc<Divergence>,
     wait: Duration,
+    /// Highest block already submitted THIS process lifetime. A cluster
+    /// SESSION replay (lapse + reconnect, no restart) re-delivers blocks
+    /// the validator already executed; re-execution against
+    /// already-applied state yields empty deltas that cannot match the
+    /// BAL — same false-divergence class as the restart cascade, session
+    /// flavor.
+    high_water: u64,
     /// Blocks at or below this were DURABLY VERIFIED before a restart.
     /// Crash-recovery replays them for state reconstruction, but
     /// re-execution against already-applied state yields EMPTY deltas
@@ -383,6 +390,7 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
             divergence,
             wait: BAL_WAIT,
             verify_floor: 0,
+            high_water: 0,
         }
     }
 
@@ -405,14 +413,16 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
 
 impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
-        if block.block_number <= self.verify_floor {
+        if block.block_number <= self.verify_floor || block.block_number <= self.high_water {
             tracing::debug!(
                 block = block.block_number,
                 floor = self.verify_floor,
-                "recovery replay overlap; BAL verification skipped (verified pre-restart)"
+                high_water = self.high_water,
+                "replay overlap; BAL verification skipped (already verified)"
             );
             return self.inner.submit(block, delta);
         }
+        self.high_water = block.block_number;
         match self.bals.take(block.block_number, self.wait) {
             Some(bal) => {
                 if write_set_eq(&delta, &bal) {

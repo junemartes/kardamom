@@ -1013,6 +1013,61 @@ pub fn execute_block_sequential<S: StateDatabase>(
     Ok(BlockExecOutput { receipts, delta })
 }
 
+/// Serialize a diverging block's inputs for offline replay. Best-effort:
+/// failures only log. Format: JSON envelope with hex payloads — small
+/// (one block), self-contained, versioned by field presence.
+fn dump_divergence_inputs(
+    block: u64,
+    txs: &[BlockTx],
+    claims: &ClaimIndex,
+    parent: Option<&PendingDelta>,
+    granularity: u16,
+    err: &ExecutorError,
+) {
+    let dir = std::path::Path::new("/opt/kardamom/state");
+    let path = dir.join(format!("divergence-{block}.json"));
+    let payload = serde_json::json!({
+        "block": block,
+        "granularity": granularity,
+        "error": format!("{err:?}"),
+        "txs": txs.iter().map(|t| serde_json::json!({
+            "raw": alloy_primitives::hex::encode(&t.envelope.raw_tx),
+            "sender": format!("{:?}", t.envelope.sender),
+            "hash": format!("{:?}", t.envelope.tx_hash),
+            "correlation_id": t.envelope.correlation_id,
+            "idx": t.tx_idx.0,
+            "pos": t.position.as_index(),
+        })).collect::<Vec<_>>(),
+        "claims_storage": claims.storage.iter().map(|((a, k), w)| serde_json::json!({
+            "addr": format!("{a:?}"), "slot": format!("{k:?}"),
+            "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "claims_balance": claims.balance.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "claims_nonce": claims.nonce.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.clone(),
+        })).collect::<Vec<_>>(),
+        "parent_accounts": parent.map(|p| p.accounts.iter().map(|(a, (n, b, c))| serde_json::json!({
+            "addr": format!("{a:?}"), "nonce": n, "balance": b.to_string(), "code_hash": format!("{c:?}"),
+        })).collect::<Vec<_>>()),
+        "parent_storage": parent.map(|p| p.storage.iter().map(|((a, k), v)| serde_json::json!({
+            "addr": format!("{a:?}"), "slot": format!("{k:?}"), "value": v.to_string(),
+        })).collect::<Vec<_>>()),
+    });
+    match std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            tracing::error!(block, path = %path.display(), "divergence inputs dumped for offline replay")
+        }
+        Err(e) => tracing::warn!(block, error = %e, "divergence dump failed"),
+    }
+}
+
 /// Build the validator's whole-block execution strategy: seeded parallel
 /// batches when this block's BAL claims are available and it contains only
 /// transactions; sequential otherwise. Deposits fall back because EIP-7928
@@ -1053,8 +1108,25 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                     BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
                 })
                 .collect();
-            let out =
-                execute_block_parallel(snapshot, parent, &txs, &idx, env, batch_size, granularity)?;
+            let out = match execute_block_parallel(
+                snapshot,
+                parent,
+                &txs,
+                &idx,
+                env,
+                batch_size,
+                granularity,
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    // FLIGHT RECORDER: the live K=20 DeFi divergence is
+                    // deterministic but has resisted offline modelling
+                    // (the composition sweep passes). Dump the exact
+                    // inputs so the failing block replays as a unit test.
+                    dump_divergence_inputs(block, &txs, &idx, parent, granularity, &e);
+                    return Err(e);
+                }
+            };
             crate::metrics::counter_parallel_block(out.batches);
             Ok(BlockExecOutput {
                 receipts: out.receipts,

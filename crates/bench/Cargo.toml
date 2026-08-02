@@ -54,6 +54,8 @@ jsonrpsee = { workspace = true }
 pprof = { version = "0.14", features = ["flamegraph", "frame-pointer"] }
 
 [dev-dependencies]
+revm.workspace = true
+kardamom-validator.workspace = true
 dhat = "0.3"
 kardamom-engine.workspace = true
 kardamom-types.workspace = true
