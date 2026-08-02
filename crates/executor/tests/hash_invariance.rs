@@ -17,11 +17,14 @@ fn build(
 ) -> WriteSet {
     let mut ws = WriteSet::default();
     for (a, c) in accounts {
-        ws.accounts.insert(*a, *c);
+        ws.accounts.push((*a, *c));
     }
     for (k, v) in storage {
-        ws.storage.insert(*k, *v);
+        ws.storage.push((*k, *v));
     }
+    // Sort-on-build IS the invariance mechanism now (was BTreeMap order):
+    // this property test proves shuffled insertion still hashes identically.
+    ws.finish();
     ws
 }
 

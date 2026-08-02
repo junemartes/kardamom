@@ -54,6 +54,14 @@ impl WriteSet {
         debug_assert!(self.storage.windows(2).all(|w| w[0].0 < w[1].0));
     }
 
+    /// Keyed account lookup (linear — the set is tiny; safe pre-finish).
+    pub fn account(&self, addr: &Address) -> Option<&(u64, U256, B256)> {
+        self.accounts
+            .iter()
+            .find(|(a, _)| a == addr)
+            .map(|(_, v)| v)
+    }
+
     /// Deterministic keccak256 hash of the write set.
     ///
     /// Layout (concatenated, then hashed):
@@ -223,21 +231,23 @@ mod tests {
         let a2 = Address::from([0x22u8; 20]);
 
         let mut ws_a = WriteSet::default();
-        ws_a.accounts.insert(a1, sample_account(10, 1));
-        ws_a.accounts.insert(a2, sample_account(20, 2));
+        ws_a.accounts.push((a1, sample_account(10, 1)));
+        ws_a.accounts.push((a2, sample_account(20, 2)));
         ws_a.storage
-            .insert((a1, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((a1, B256::from(U256::from(1u64))), U256::from(100u64)));
         ws_a.storage
-            .insert((a2, B256::from(U256::from(2u64))), U256::from(200u64));
+            .push(((a2, B256::from(U256::from(2u64))), U256::from(200u64)));
 
         let mut ws_b = WriteSet::default();
-        ws_b.accounts.insert(a2, sample_account(20, 2));
-        ws_b.accounts.insert(a1, sample_account(10, 1));
+        ws_b.accounts.push((a2, sample_account(20, 2)));
+        ws_b.accounts.push((a1, sample_account(10, 1)));
         ws_b.storage
-            .insert((a2, B256::from(U256::from(2u64))), U256::from(200u64));
+            .push(((a2, B256::from(U256::from(2u64))), U256::from(200u64)));
         ws_b.storage
-            .insert((a1, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((a1, B256::from(U256::from(1u64))), U256::from(100u64)));
 
+        ws_a.finish();
+        ws_b.finish();
         assert_eq!(ws_a.hash(), ws_b.hash());
     }
 
@@ -247,11 +257,11 @@ mod tests {
 
         let mut ws_a = WriteSet::default();
         ws_a.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(100u64)));
 
         let mut ws_b = WriteSet::default();
         ws_b.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(101u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(101u64)));
 
         assert_ne!(ws_a.hash(), ws_b.hash());
     }
@@ -260,9 +270,9 @@ mod tests {
     fn hash_differs_on_nonce_change() {
         let addr = Address::from([0x11u8; 20]);
         let mut ws_a = WriteSet::default();
-        ws_a.accounts.insert(addr, sample_account(0, 0));
+        ws_a.accounts.push((addr, sample_account(0, 0)));
         let mut ws_b = WriteSet::default();
-        ws_b.accounts.insert(addr, sample_account(0, 1));
+        ws_b.accounts.push((addr, sample_account(0, 1)));
         assert_ne!(ws_a.hash(), ws_b.hash());
     }
 
@@ -270,9 +280,9 @@ mod tests {
     fn hash_covers_code_bytes() {
         let h = B256::repeat_byte(0xAA);
         let mut ws_a = WriteSet::default();
-        ws_a.code.insert(h, Bytes::from_static(&[0x60, 0x00]));
+        ws_a.code.push((h, Bytes::from_static(&[0x60, 0x00])));
         let mut ws_b = WriteSet::default();
-        ws_b.code.insert(h, Bytes::from_static(&[0x60, 0x01]));
+        ws_b.code.push((h, Bytes::from_static(&[0x60, 0x01])));
         assert_ne!(ws_a.hash(), ws_b.hash());
     }
 
@@ -282,15 +292,15 @@ mod tests {
         let mut delta = PendingDelta::default();
 
         let mut ws1 = WriteSet::default();
-        ws1.accounts.insert(addr, sample_account(10, 1));
+        ws1.accounts.push((addr, sample_account(10, 1)));
         ws1.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(100u64)));
         delta.apply(ws1);
 
         let mut ws2 = WriteSet::default();
-        ws2.accounts.insert(addr, sample_account(15, 2));
+        ws2.accounts.push((addr, sample_account(15, 2)));
         ws2.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(200u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(200u64)));
         delta.apply(ws2);
 
         let (nonce, balance, _ch) = delta.accounts[&addr];

@@ -992,9 +992,9 @@ mod tests {
         assert!(receipt.status); // success = bool true (kardamom_types::Receipt)
         assert!(receipt.gas_used >= 21_000);
         // Both accounts touched: sender (balance + nonce) and recipient (balance).
-        assert!(ws.accounts.contains_key(&from));
-        assert!(ws.accounts.contains_key(&to));
-        assert_eq!(ws.accounts[&to].1, U256::from(1_000u64));
+        assert!(ws.account(&from).is_some());
+        assert!(ws.account(&to).is_some());
+        assert_eq!(ws.account(&to).unwrap().1, U256::from(1_000u64));
         // No storage or code writes for a plain transfer.
         assert!(ws.storage.is_empty());
         assert!(ws.code.is_empty());
@@ -1062,8 +1062,8 @@ mod tests {
         .expect("execute 2");
         assert!(r2.status);
         assert_eq!(r2.tx_hash, tx2.tx_hash);
-        assert_eq!(ws2.accounts[&to].1, U256::from(150u64));
-        assert_eq!(ws2.accounts[&from].0, 2); // nonce
+        assert_eq!(ws2.account(&to).unwrap().1, U256::from(150u64));
+        assert_eq!(ws2.account(&from).unwrap().0, 2); // nonce
         // RPC enrichment: tx2 sees a higher nonce + transaction_index;
         // cumulative_gas_used accumulates across both txs in the block.
         assert_eq!(r2.nonce, 1);
@@ -1108,8 +1108,8 @@ mod tests {
         // - sender ends at 1000 - 400 = 600
         // - recipient ends at 400
         // (Gas price is 0 — no fee deduction.)
-        assert_eq!(ws.accounts[&from].1, U256::from(600u64));
-        assert_eq!(ws.accounts[&to].1, U256::from(400u64));
+        assert_eq!(ws.account(&from).unwrap().1, U256::from(600u64));
+        assert_eq!(ws.account(&to).unwrap().1, U256::from(400u64));
 
         // Receipt fields specific to deposits.
         assert_eq!(receipt.tx_hash, d.source_hash);
@@ -1150,7 +1150,7 @@ mod tests {
 
         // Mint pre-credit is OUTSIDE the EVM call: from keeps the full mint.
         assert_eq!(
-            ws.accounts[&from].1,
+            ws.account(&from).unwrap().1,
             U256::from(1_000u64),
             "from must keep full mint after inner revert"
         );
@@ -1158,9 +1158,7 @@ mod tests {
         assert!(!receipt.status, "inner-revert deposit yields status=false");
         // Recipient observed no transferred value.
         assert!(
-            ws.accounts
-                .get(&revert_addr)
-                .is_none_or(|a| a.1 == U256::ZERO),
+            ws.account(&revert_addr).is_none_or(|a| a.1 == U256::ZERO),
             "revert target must not retain value"
         );
     }
