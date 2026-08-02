@@ -13,6 +13,7 @@ pub mod consistency;
 pub mod crash_recovery;
 pub mod da_parity;
 pub mod divergence;
+pub mod l1_batch;
 pub mod nonce_gap;
 pub mod nonce_unordered;
 pub mod rpc_liveness;

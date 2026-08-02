@@ -149,3 +149,154 @@ async fn deploy_settlement_and_post_batch_emits_event() {
         assert!(!r.status(), "stale prev_index must revert");
     }
 }
+
+/// Live-sender loop (#39) against real anvil: a confirmed post advances the
+/// CAS and persists the cursor; a foreign advance of `lastBatchIndex` is a
+/// fail-stop, not a silent retry.
+#[tokio::test]
+async fn live_sender_confirms_and_rejects_foreign_writer() {
+    use alloy_network::EthereumWallet;
+    use kardamom_batcher::batch::ClosedBlock;
+    use kardamom_batcher::batcher::{BatcherConfig, pack_blocks};
+    use kardamom_batcher::da_store::FsBlobStore;
+    use kardamom_batcher::live::{BatchCursor, LiveSender};
+    use kardamom_types::BPosition;
+
+    let anvil = match Anvil::new().try_spawn() {
+        Ok(a) => a,
+        Err(_) => {
+            eprintln!("SKIP: anvil unavailable");
+            return;
+        }
+    };
+    // Blob txs need a real signer; use a funded anvil dev account as the
+    // batcher EOA and make it the settlement's `l1Batcher`.
+    let batcher_signer: alloy_signer_local::PrivateKeySigner = anvil.keys()[2].clone().into();
+    let batcher_addr = batcher_signer.address();
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(batcher_signer))
+        .connect_http(anvil.endpoint_url());
+
+    // Factory + settlement deploy via a PLAIN provider — the wallet-filled
+    // one would try to locally sign the impersonated DEV_OWNER txs.
+    let deploy_provider = ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .connect_http(anvil.endpoint_url());
+    let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
+    let _: serde_json::Value = deploy_provider
+        .raw_request("anvil_setCode".into(), (ERC7955_FACTORY, bytes_hex))
+        .await
+        .unwrap();
+    let _: serde_json::Value = deploy_provider
+        .raw_request(
+            "anvil_setBalance".into(),
+            (DEV_OWNER, U256::from(1_000_000_000_000_000_000_000u128)),
+        )
+        .await
+        .unwrap();
+    let _: serde_json::Value = deploy_provider
+        .raw_request("anvil_impersonateAccount".into(), (DEV_OWNER,))
+        .await
+        .unwrap();
+    let deployer = Deployer::new(deploy_provider.clone(), DEV_OWNER);
+    deployer.ensure_factory(DEV_OWNER).await.unwrap();
+    deployer
+        .apply(
+            &[Op::Deploy {
+                l2_chain_id: L2_CHAIN_ID,
+                id: ContractId::KardamomL2Settlement,
+                init_args: encode_address_arg(batcher_addr),
+            }],
+            DEV_OWNER,
+        )
+        .await
+        .unwrap();
+    let settlement_addr = deployer.addresses(Some(L2_CHAIN_ID)).await.unwrap()[0].proxy;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cursor_path = dir.path().join("cursor.json");
+    let da_store = FsBlobStore::open(dir.path().join("da")).unwrap();
+
+    // One empty block — the smallest legal batch (dense coverage posts empty
+    // blocks too).
+    let block1 = ClosedBlock {
+        block_number: 1,
+        l2_timestamp: 7,
+        end_tx_idx: BPosition::from_index(0),
+        txs: vec![],
+    };
+    let batch1 = pack_blocks(&BatcherConfig::default(), &[block1]).unwrap();
+
+    let mut sender = LiveSender::new(
+        tokio::runtime::Handle::current(),
+        provider.clone(),
+        settlement_addr,
+        da_store,
+        0,
+        2,
+        cursor_path.clone(),
+    );
+    // post_confirmed blocks on the runtime handle — run it off-runtime, as
+    // the production feed thread does.
+    let cursor1 = BatchCursor {
+        next_index: 0,
+        next_block: 2,
+        last_batch_index: 0,
+    };
+    let (mut sender, first) = tokio::task::spawn_blocking(move || {
+        let r = sender.post_confirmed(&batch1, cursor1);
+        (sender, r)
+    })
+    .await
+    .unwrap();
+    first.expect("first post must confirm");
+
+    let settlement = IKardamomL2Settlement::new(settlement_addr, provider.clone());
+    assert_eq!(settlement.lastBatchIndex().call().await.unwrap(), 1);
+    let stored = BatchCursor::load(&cursor_path)
+        .unwrap()
+        .expect("cursor written");
+    assert_eq!(
+        stored,
+        BatchCursor {
+            next_index: 0,
+            next_block: 2,
+            last_batch_index: 1,
+        }
+    );
+
+    // A foreign writer advances the CAS behind the sender's back...
+    let receipt = settlement
+        .postBatch(1, vec![B256::repeat_byte(0xEE)], 2, 9)
+        .send()
+        .await
+        .expect("foreign post sends")
+        .get_receipt()
+        .await
+        .unwrap();
+    assert!(receipt.status());
+
+    // ...so the sender's next post must fail-stop (reconcile sees index 2
+    // covering block 9, which is not our batch), not retry into a fork.
+    let block2 = ClosedBlock {
+        block_number: 2,
+        l2_timestamp: 8,
+        end_tx_idx: BPosition::from_index(0),
+        txs: vec![],
+    };
+    let batch2 = pack_blocks(&BatcherConfig::default(), &[block2]).unwrap();
+    let cursor2 = BatchCursor {
+        next_index: 0,
+        next_block: 3,
+        last_batch_index: 0,
+    };
+    let err = tokio::task::spawn_blocking(move || sender.post_confirmed(&batch2, cursor2))
+        .await
+        .unwrap()
+        .expect_err("foreign CAS advance must fail-stop");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("second batcher"),
+        "unexpected error chain: {msg}"
+    );
+}

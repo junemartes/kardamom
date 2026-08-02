@@ -519,7 +519,26 @@ if [[ -x "${LOAD_BIN}" ]]; then
   if [[ "${RUN_SEMANTICS:-0}" == "1" ]]; then
     SEMANTICS_BIN="${ROOT}/target/release/kardamom-semantics"
     if [[ -x "${SEMANTICS_BIN}" ]]; then
-      log "chain-semantics suite (Target C): ${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency}"
+      # The l1-batch case (#39) asserts the live batcher's L2 → L1 round trip
+      # against the in-cluster anvil. The settlement proxy address is
+      # deterministic on-chain state — re-resolve it the same way deploy.sh's
+      # Phase 2b did rather than plumbing it through a file.
+      SETTLEMENT_ADDRESS="${SETTLEMENT_ADDRESS:-}"
+      DEPLOY_BIN="${ROOT}/target/release/kardamom-deploy"
+      if [[ -z "${SETTLEMENT_ADDRESS}" && -x "${DEPLOY_BIN}" ]]; then
+        # Registry ids print as hashes; the settlement is the only contract
+        # registered for this chain id (deploy.sh Phase 2b), so first proxy
+        # line wins.
+        SETTLEMENT_ADDRESS="$("${DEPLOY_BIN}" --rpc-url http://192.168.56.10:8546 \
+          --owner 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 \
+          addresses --l2-chain-id 412346 2>/dev/null \
+          | awk '/proxy/ && !found {print $2; found=1}' || true)"
+      fi
+      if [[ -z "${SETTLEMENT_ADDRESS}" ]]; then
+        log "ERROR: could not resolve the settlement address for the l1-batch case"
+        exit 1
+      fi
+      log "chain-semantics suite (Target C): ${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency,l1-batch} (settlement ${SETTLEMENT_ADDRESS})"
       "${SEMANTICS_BIN}" \
         --rpc http://192.168.56.31:8545 --chain-id 412346 \
         --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
@@ -527,7 +546,9 @@ if [[ -x "${LOAD_BIN}" ]]; then
         --validator-metrics 192.168.56.61:9006 \
         --pending-receipt-timeout-ms "${SEMANTICS_PARK_MS:-30000}" \
         --account-base "${SEMANTICS_ACCOUNT_BASE:-1}" \
-        --cases "${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency}"
+        --l1-rpc http://192.168.56.10:8546 \
+        --settlement "${SETTLEMENT_ADDRESS}" \
+        --cases "${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency,l1-batch}"
     else
       log "ERROR: RUN_SEMANTICS=1 but ${SEMANTICS_BIN} is not staged"
       exit 1

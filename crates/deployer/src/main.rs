@@ -21,7 +21,13 @@ struct Cli {
     rpc_url: String,
 
     /// Canonical owner address (Safe or EOA). Same owner ⇒ same factory address.
-    #[arg(long, global = true, required = true)]
+    ///
+    /// NOT `global`: clap forbids required global args (debug builds panic on
+    /// the assert; release builds skip it and land in broken parsing where no
+    /// pre-subcommand `--owner` ever satisfies the requirement — found the
+    /// first time CI actually invoked the `deploy` subcommand, #39). Pass it
+    /// before the subcommand.
+    #[arg(long, required = true)]
     owner: Address,
 
     #[command(subcommand)]
@@ -91,6 +97,12 @@ enum Command {
         #[arg(long = "l2-chain-id", required = true)]
         l2_chain_ids: Vec<u64>,
     },
+
+    /// Install the ERC-7955 CREATE2 factory runtime via `anvil_setCode` —
+    /// DEV chains only (a real chain uses ERC-7955's presigned bootstrap tx).
+    /// Idempotent; run before the first `deploy` against a fresh anvil.
+    #[command(name = "bootstrap-7955-anvil")]
+    Bootstrap7955Anvil,
 
     /// Print registered ids and their proxy/impl/version. Optionally filter by L2.
     Addresses {
@@ -169,6 +181,20 @@ async fn main() -> Result<()> {
                 l2_chain_ids,
             )
             .await
+        }
+        Command::Bootstrap7955Anvil => {
+            use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
+            let provider = ProviderBuilder::new().connect_http(cli.rpc_url.parse()?);
+            let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
+            let _: serde_json::Value = alloy_provider::Provider::raw_request(
+                &provider,
+                "anvil_setCode".into(),
+                (ERC7955_FACTORY, bytes_hex),
+            )
+            .await
+            .context("anvil_setCode (is this a dev anvil chain?)")?;
+            println!("ERC-7955 factory runtime installed at {ERC7955_FACTORY}");
+            Ok(())
         }
         Command::Addresses { l2_chain_id } => {
             run_addresses(cli.rpc_url, cli.owner, l2_chain_id).await

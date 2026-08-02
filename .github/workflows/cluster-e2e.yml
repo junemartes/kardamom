@@ -120,6 +120,8 @@ jobs:
             -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
             -p kardamom-reconstruct \
             --bins
+          # Settlement-contract deploy for the live batcher (deploy.sh Phase 2b).
+          cargo build --release -p kardamom-deployer --bin kardamom-deploy
           cargo build --release -p kardamom-bench --bin kardamom-load
           # Target-C runner for the chain-semantics shard. Feature-gated
           # because it links the scenario drivers.

@@ -1,0 +1,443 @@
+//! Live batcher (#39): tail the canonical ordering from the Aeron Cluster
+//! egress, join tx_data, pack and post batches to L1 as a long-lived service.
+//!
+//! The batcher is a third cluster-egress consumer next to the executor and
+//! validator, reusing the `kardamom-engine` reader stack (cluster tx_ordering
+//! subscription + tx_data join buffer + archive refetch) verbatim; only the
+//! sink differs — `ReaderToExec` records feed a [`BatchAccumulator`] instead
+//! of an execution pipeline, and `Deposit` records are skipped (deposits are
+//! absent from DA by design; they are re-derivable from L1 — see
+//! `docs/agents/l1-origin-deposit-derivation-spec.md`).
+//!
+//! Durability model (see `docs/agents/batcher-live-l1-spec.md`):
+//! - L1 (`lastBatchIndex` + the `BatchPosted` event) is the authoritative
+//!   record of what has been posted.
+//! - The cursor file is the ordering-stream position matching that truth,
+//!   written ONLY after a confirmed post (at-least-once, like the
+//!   da-watcher's L1 cursor). A stale or lost cursor causes re-observation;
+//!   the feed loop drops re-observed blocks (`block_number <=
+//!   skip_through_block`) without posting, and the contract CAS makes any
+//!   double post revert loudly instead of landing.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use alloy_primitives::Address;
+use alloy_provider::Provider;
+use anyhow::{Context, Result, bail};
+use crossbeam_channel::{Receiver, RecvTimeoutError};
+use metrics::{counter, gauge};
+use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
+
+use kardamom_engine::reader::ReaderToExec;
+
+use crate::batch::{BatchAccumulator, ClosedBlock};
+use crate::batcher::{BatcherConfig, PostedBatch, metric_names, pack_blocks};
+use crate::da_store::FsBlobStore;
+use crate::l1::{post_batch, read_posted_batches};
+use crate::settlement::IKardamomL2Settlement;
+
+/// Live-mode metric names, alongside [`metric_names`]. In live mode
+/// `kardamom_batcher_batches_posted_total` / `_blobs_posted_total` count
+/// CONFIRMED L1 posts (receipt observed or reconciled on-chain), not packed
+/// batches.
+pub mod live_metric_names {
+    /// L1 post attempts that failed and were retried (transient transport /
+    /// CAS races that reconciled as not-ours).
+    pub const L1_POST_RETRIES: &str = "kardamom_batcher_l1_post_retries_total";
+    /// Highest L2 block confirmed on L1 by this batcher.
+    pub const LAST_POSTED_BLOCK: &str = "kardamom_batcher_last_posted_block";
+    /// The contract's `lastBatchIndex` after our latest confirmed post.
+    pub const LAST_BATCH_INDEX: &str = "kardamom_batcher_last_batch_index";
+    /// Closed blocks buffered, waiting for the group to fill or flush.
+    pub const PENDING_BLOCKS: &str = "kardamom_batcher_pending_blocks";
+    /// Re-observed blocks dropped because L1 already covers them (stale
+    /// cursor replay after a crash between post and cursor write).
+    pub const SKIPPED_POSTED_BLOCKS: &str = "kardamom_batcher_skipped_posted_blocks_total";
+}
+
+/// Durable cursor: the ordering-stream position matching the last confirmed
+/// L1 post. `next_index`/`next_block` seed the cluster replay request;
+/// `last_batch_index` ties the position to the contract's CAS counter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BatchCursor {
+    pub next_index: u64,
+    pub next_block: u64,
+    pub last_batch_index: u64,
+}
+
+impl BatchCursor {
+    /// Fresh consumer: no records seen, first boundary is block 1, nothing
+    /// posted (`lastBatchIndex` starts at 0 on-chain; batch indices are
+    /// 1-based).
+    pub fn genesis() -> Self {
+        Self {
+            next_index: 0,
+            next_block: 1,
+            last_batch_index: 0,
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Option<Self>> {
+        match std::fs::read_to_string(path) {
+            Ok(raw) => Ok(Some(serde_json::from_str(&raw).with_context(|| {
+                format!("parse batcher cursor file {}", path.display())
+            })?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e).with_context(|| format!("read cursor file {}", path.display())),
+        }
+    }
+
+    /// Atomic write (tmp + rename in the same directory).
+    pub fn store(&self, path: &Path) -> Result<()> {
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, serde_json::to_vec(self).expect("cursor serializes"))
+            .with_context(|| format!("write cursor tmp {}", tmp.display()))?;
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("rename cursor into place {}", path.display()))?;
+        Ok(())
+    }
+}
+
+/// What L1 says has been posted: the CAS counter and the block the chain is
+/// covered through (the latest `BatchPosted.l2BlockEnd`; 0 when nothing has
+/// been posted — L2 blocks are 1-based).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct L1Truth {
+    pub last_batch_index: u64,
+    pub covered_through_block: u64,
+}
+
+/// Read the settlement contract's view. The event scan runs from L1 block 0 —
+/// fine against the dev-cluster anvil; a long-lived L1 wants a deployment
+/// block hint here.
+pub async fn read_l1_truth<P: Provider>(provider: &P, settlement: Address) -> Result<L1Truth> {
+    let contract = IKardamomL2Settlement::new(settlement, provider);
+    let last = contract
+        .lastBatchIndex()
+        .call()
+        .await
+        .context("read lastBatchIndex")?;
+    if last == 0 {
+        return Ok(L1Truth {
+            last_batch_index: 0,
+            covered_through_block: 0,
+        });
+    }
+    let posted = read_posted_batches(provider, settlement, 0)
+        .await
+        .context("read BatchPosted events")?;
+    let head = posted
+        .iter()
+        .find(|d| d.index == last)
+        .with_context(|| format!("lastBatchIndex={last} but no BatchPosted event with it"))?;
+    Ok(L1Truth {
+        last_batch_index: last,
+        covered_through_block: head.l2_block_end,
+    })
+}
+
+/// Reconcile the cursor file against L1 at startup. Returns the cursor to
+/// replay from and the block to skip through (drop without posting).
+///
+/// - No cursor file: genesis replay; L1 coverage is skipped, not re-posted.
+/// - Cursor behind L1 (crash between post and cursor write): replay from the
+///   cursor, skip through L1's covered block.
+/// - Cursor AHEAD of L1: the chain regressed under us (e.g. anvil reset while
+///   `/opt/kardamom` survived) — fail-stop; the operator decides which side
+///   is real. Silently re-posting would fork the DA history.
+pub fn reconcile(cursor: Option<BatchCursor>, l1: L1Truth) -> Result<(BatchCursor, u64)> {
+    match cursor {
+        None => {
+            if l1.last_batch_index > 0 {
+                warn!(
+                    covered_through_block = l1.covered_through_block,
+                    "no cursor file but L1 has batches; genesis replay will skip re-posting \
+                     (requires cluster retention back to genesis)"
+                );
+            }
+            Ok((BatchCursor::genesis(), l1.covered_through_block))
+        }
+        Some(c) if c.last_batch_index > l1.last_batch_index => bail!(
+            "cursor file says batch {} was posted but L1 lastBatchIndex is {} — the L1 chain \
+             regressed under a surviving cursor (anvil reset?); refusing to guess. Delete the \
+             cursor file to re-derive from this L1, or restore the L1 state",
+            c.last_batch_index,
+            l1.last_batch_index,
+        ),
+        Some(c) => Ok((c, l1.covered_through_block)),
+    }
+}
+
+/// Streaming L1 sender: posts one packed group at a time, strictly
+/// serialized by the contract CAS, persisting the cursor only after a
+/// confirmed post.
+pub struct LiveSender<P> {
+    handle: tokio::runtime::Handle,
+    provider: P,
+    settlement: Address,
+    da_store: FsBlobStore,
+    prev_index: u64,
+    max_retries: u32,
+    cursor_path: PathBuf,
+}
+
+impl<P: Provider> LiveSender<P> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        handle: tokio::runtime::Handle,
+        provider: P,
+        settlement: Address,
+        da_store: FsBlobStore,
+        prev_index: u64,
+        max_retries: u32,
+        cursor_path: PathBuf,
+    ) -> Self {
+        Self {
+            handle,
+            provider,
+            settlement,
+            da_store,
+            prev_index,
+            max_retries,
+            cursor_path,
+        }
+    }
+
+    /// Post `batch` and persist `cursor` once the post is confirmed. Retries
+    /// transient failures with bounded backoff; a failure that reconciles
+    /// on-chain as OUR batch having landed (duplicate send after a receipt
+    /// timeout, CAS revert of the duplicate) counts as success. Any foreign
+    /// advance of `lastBatchIndex` is fatal — the batcher is single-instance
+    /// and the CAS exists to make that race loud.
+    pub fn post_confirmed(&mut self, batch: &PostedBatch, mut cursor: BatchCursor) -> Result<()> {
+        cursor.last_batch_index = self.prev_index + 1;
+        let mut attempt: u32 = 0;
+        loop {
+            let res = self.handle.block_on(post_batch(
+                &self.provider,
+                self.settlement,
+                self.prev_index,
+                batch,
+                &self.da_store,
+            ));
+            match res {
+                Ok(next) => {
+                    self.prev_index = next;
+                    break;
+                }
+                Err(e) => {
+                    // Before retrying, ask the chain whether our tx actually
+                    // landed (receipt timeout / StaleBatchIndex revert of a
+                    // duplicate send both look like errors locally).
+                    let truth = self
+                        .handle
+                        .block_on(read_l1_truth(&self.provider, self.settlement));
+                    match truth {
+                        Ok(t) if t.last_batch_index == self.prev_index + 1 => {
+                            if t.covered_through_block == batch.l2_block_end {
+                                info!(
+                                    batch_index = t.last_batch_index,
+                                    "post reconciled on-chain as ours after send error"
+                                );
+                                self.prev_index += 1;
+                                break;
+                            }
+                            bail!(
+                                "lastBatchIndex advanced to {} covering block {} but our batch \
+                                 ends at {} — a second batcher is writing; refusing to continue \
+                                 (send error was: {e})",
+                                t.last_batch_index,
+                                t.covered_through_block,
+                                batch.l2_block_end,
+                            );
+                        }
+                        Ok(t) if t.last_batch_index > self.prev_index + 1 => bail!(
+                            "lastBatchIndex jumped from {} to {} — a second batcher is writing; \
+                             refusing to continue (send error was: {e})",
+                            self.prev_index,
+                            t.last_batch_index,
+                        ),
+                        Ok(_) => { /* not landed — genuinely transient */ }
+                        Err(re) => warn!(error = %format!("{re:#}"), "reconcile read failed"),
+                    }
+                    attempt += 1;
+                    if attempt > self.max_retries {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "post batch (prev_index {}) after {attempt} attempts",
+                                self.prev_index
+                            )
+                        });
+                    }
+                    counter!(live_metric_names::L1_POST_RETRIES).increment(1);
+                    let backoff = Duration::from_secs(1 << attempt.min(4));
+                    warn!(
+                        attempt,
+                        backoff_s = backoff.as_secs(),
+                        error = %format!("{e:#}"),
+                        "L1 post failed; retrying"
+                    );
+                    std::thread::sleep(backoff);
+                }
+            }
+        }
+        cursor
+            .store(&self.cursor_path)
+            .context("persist cursor after confirmed post")?;
+        counter!(metric_names::BATCHES_POSTED).increment(1);
+        counter!(metric_names::BLOBS_POSTED).increment(batch.blobs.len() as u64);
+        gauge!(live_metric_names::LAST_POSTED_BLOCK).set(batch.l2_block_end as f64);
+        gauge!(live_metric_names::LAST_BATCH_INDEX).set(self.prev_index as f64);
+        info!(
+            batch_index = self.prev_index,
+            l2_block_start = batch.l2_block_start,
+            l2_block_end = batch.l2_block_end,
+            blobs = batch.blobs.len(),
+            "batch confirmed on L1"
+        );
+        Ok(())
+    }
+}
+
+/// Feed-loop tunables.
+#[derive(Clone, Debug)]
+pub struct FeedConfig {
+    pub blocks_per_batch: usize,
+    pub compress: bool,
+    /// Post a partial group if the oldest pending block has waited this long.
+    pub flush: Duration,
+    /// Drop closed blocks at or below this number without posting — L1
+    /// already covers them (startup reconcile).
+    pub skip_through_block: u64,
+}
+
+/// The live feed loop: `ReaderToExec` records → accumulator → close policy →
+/// [`LiveSender`]. Runs on a dedicated (blocking) thread until the reader
+/// channel closes or a post fail-stops. Crash-only: no graceful drain — the
+/// cursor is at-least-once and restart re-observes.
+pub fn run_feed<P: Provider>(
+    rx: Receiver<ReaderToExec>,
+    mut sender: LiveSender<P>,
+    cfg: FeedConfig,
+) -> Result<()> {
+    let pack_cfg = BatcherConfig {
+        blocks_per_batch: cfg.blocks_per_batch,
+        compress: cfg.compress,
+        ..Default::default()
+    };
+    let mut acc = BatchAccumulator::new();
+    let mut pending: Vec<ClosedBlock> = Vec::new();
+    let mut oldest_pending: Option<Instant> = None;
+
+    let post_group = |pending: &mut Vec<ClosedBlock>,
+                      oldest: &mut Option<Instant>,
+                      sender: &mut LiveSender<P>|
+     -> Result<()> {
+        let group = std::mem::take(pending);
+        *oldest = None;
+        gauge!(live_metric_names::PENDING_BLOCKS).set(0.0);
+        let last = group.last().expect("post_group called with pending blocks");
+        let cursor = BatchCursor {
+            next_index: last.end_tx_idx.as_index(),
+            next_block: last.block_number + 1,
+            // post_confirmed stamps last_batch_index.
+            last_batch_index: 0,
+        };
+        let batch = pack_blocks(&pack_cfg, &group)?;
+        sender.post_confirmed(&batch, cursor)
+    };
+
+    loop {
+        match rx.recv_timeout(cfg.flush) {
+            Ok(ReaderToExec::Tx {
+                envelope, position, ..
+            }) => acc.observe_tx(envelope, position),
+            // Deposits are absent from DA by design: re-derivable from L1
+            // (mirrors MultiArchiveReader skipping DepositRefs offline).
+            Ok(ReaderToExec::Deposit { .. }) => {}
+            Ok(ReaderToExec::Boundary(b)) => {
+                let closed = acc.observe_boundary(b);
+                counter!(metric_names::BLOCKS_OBSERVED).increment(1);
+                if closed.block_number <= cfg.skip_through_block {
+                    counter!(live_metric_names::SKIPPED_POSTED_BLOCKS).increment(1);
+                    continue;
+                }
+                pending.push(closed);
+                oldest_pending.get_or_insert_with(Instant::now);
+                gauge!(live_metric_names::PENDING_BLOCKS).set(pending.len() as f64);
+                if pending.len() >= cfg.blocks_per_batch {
+                    post_group(&mut pending, &mut oldest_pending, &mut sender)?;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !pending.is_empty() && oldest_pending.is_some_and(|t| t.elapsed() >= cfg.flush) {
+                    post_group(&mut pending, &mut oldest_pending, &mut sender)?;
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                bail!("tx_ordering reader channel closed; see reader thread error")
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_roundtrip_and_missing() {
+        let dir = std::env::temp_dir().join(format!("batcher-cursor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cursor.json");
+        assert_eq!(BatchCursor::load(&path).unwrap(), None);
+        let c = BatchCursor {
+            next_index: 42,
+            next_block: 7,
+            last_batch_index: 3,
+        };
+        c.store(&path).unwrap();
+        assert_eq!(BatchCursor::load(&path).unwrap(), Some(c));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_matrix() {
+        let l1_empty = L1Truth {
+            last_batch_index: 0,
+            covered_through_block: 0,
+        };
+        let l1_posted = L1Truth {
+            last_batch_index: 5,
+            covered_through_block: 120,
+        };
+        // Fresh start, empty chain: genesis, nothing skipped.
+        assert_eq!(
+            reconcile(None, l1_empty).unwrap(),
+            (BatchCursor::genesis(), 0)
+        );
+        // Lost cursor on a posted chain: genesis replay, skip L1 coverage.
+        assert_eq!(
+            reconcile(None, l1_posted).unwrap(),
+            (BatchCursor::genesis(), 120)
+        );
+        // Stale cursor (crash between post and cursor write): replay from
+        // the cursor, skip through L1's covered block.
+        let stale = BatchCursor {
+            next_index: 900,
+            next_block: 100,
+            last_batch_index: 4,
+        };
+        assert_eq!(reconcile(Some(stale), l1_posted).unwrap(), (stale, 120));
+        // Cursor ahead of L1 (chain regressed): fail-stop.
+        let ahead = BatchCursor {
+            next_index: 2000,
+            next_block: 200,
+            last_batch_index: 9,
+        };
+        let err = reconcile(Some(ahead), l1_posted).unwrap_err().to_string();
+        assert!(err.contains("regressed"), "unexpected error: {err}");
+    }
+}

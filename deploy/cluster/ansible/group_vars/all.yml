@@ -49,6 +49,7 @@ paths:
   archive_dir: /opt/kardamom/archive       # recorder Archive segments (persistent)
   state_dir: /opt/kardamom/state           # executor StateWriter (libmdbx) data
   checkpoints_dir: /opt/kardamom/checkpoints # executor state checkpoints (fast recovery)
+  batcher_dir: /opt/kardamom/batcher       # live batcher cursor file + DA blob store (#39)
   config_dir: /opt/kardamom/config         # rendered service configs + genesis
 
 # tmpfs size for the Aeron media-driver shared-memory dir.

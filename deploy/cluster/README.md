@@ -83,9 +83,10 @@ make down      # stop jobs + vagrant destroy
 3. `make images` — build the service + Aeron + cluster images on the host and
    push them to the in-cluster registry.
 4. `make deploy` — `scripts/deploy.sh` submits the jobs in dependency order:
-   `aeron` (system) + `anvil`, then `cluster` (the Raft sealer), then
-   `sequencer` / `ingress` / `executor` / `validator` / `da-watcher`, then
-   the periodic `batcher`.
+   `aeron` (system) + `anvil` (+ the `KardamomL2Settlement` deploy against
+   it), then `cluster` (the Raft sealer), then `sequencer` / `ingress` /
+   `executor` / `validator` / `da-watcher`, then the live `batcher` service
+   (#39).
 
 The container path is one command: `deploy/cluster/scripts/ci-cluster.sh`
 (`KEEP=1` leaves the node containers up; `scripts/local-cluster.sh` wraps it

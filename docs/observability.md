@@ -137,6 +137,14 @@ Two low-rate counters deserve standing alerts:
   dedup, receipt-floor resync) let an invalid record into the canonical log:
   investigate the source, the chain itself is fine.
 
+The live batcher (#39) adds a settlement-health group on port 9002: in live
+mode `kardamom_batcher_batches_posted_total` / `_blobs_posted_total` count
+**confirmed L1 posts** (not packed batches), `kardamom_batcher_last_posted_block`
+vs `kardamom_executor_block_number` is the DA-freshness lag to watch,
+`_l1_post_retries_total` flags a flaky L1, and `_skipped_posted_blocks_total`
+counts stale-cursor re-observations after a restart (bounded and expected —
+sustained growth means the cursor file is not being persisted).
+
 ## Quick start
 
 Bring up the observability stack:
