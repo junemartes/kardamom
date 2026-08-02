@@ -21,18 +21,39 @@ use bytes::Bytes;
 use kardamom_types::delta::CodeEntry;
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 
-/// One transaction's write effects. `BTreeMap` so iteration is canonical.
+/// One transaction's write effects, as SORTED small-vectors.
+///
+/// Was three `BTreeMap`s — but a B-tree allocates a 1KB-class leaf node
+/// per map even for a handful of entries, which DHAT measured at ~2.7KB
+/// of the ~5.4KB/tx execution-path total. A typical tx writes 2-4
+/// accounts, 0-10 slots and 0-1 code entries: inline `SmallVec`s make
+/// the common case ZERO-allocation. Canonical iteration (the hash
+/// contract) comes from sort-on-build instead of tree order: builders
+/// push then call [`WriteSet::finish`]; [`WriteSet::hash`] debug-asserts
+/// sortedness.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WriteSet {
-    /// address → (nonce, balance, code_hash).
-    pub accounts: BTreeMap<Address, (u64, U256, B256)>,
-    /// (address, slot_key) → value.
-    pub storage: BTreeMap<(Address, B256), U256>,
-    /// code_hash → bytecode.
-    pub code: BTreeMap<B256, Bytes>,
+    /// (address, (nonce, balance, code_hash)), sorted by address.
+    pub accounts: smallvec::SmallVec<[(Address, (u64, U256, B256)); 3]>,
+    /// ((address, slot_key), value), sorted by key.
+    pub storage: smallvec::SmallVec<[((Address, B256), U256); 8]>,
+    /// (code_hash, bytecode), sorted by hash.
+    pub code: smallvec::SmallVec<[(B256, Bytes); 1]>,
 }
 
 impl WriteSet {
+    /// Sort into canonical order. Builders push in revm's (nondeterministic
+    /// HashMap) iteration order and MUST call this before the set is
+    /// hashed, applied or compared. Keys are unique by construction (one
+    /// entry per account/slot per tx), so unstable sort is safe.
+    pub fn finish(&mut self) {
+        self.accounts.sort_unstable_by_key(|(a, _)| *a);
+        self.storage.sort_unstable_by_key(|(k, _)| *k);
+        self.code.sort_unstable_by_key(|(h, _)| *h);
+        debug_assert!(self.accounts.windows(2).all(|w| w[0].0 < w[1].0));
+        debug_assert!(self.storage.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
     /// Deterministic keccak256 hash of the write set.
     ///
     /// Layout (concatenated, then hashed):
@@ -52,6 +73,11 @@ impl WriteSet {
         // contract BYTECODE via the code section: 3.1KB/tx on CLOB
         // workloads, the single largest allocation site post-ExecScope).
         // The byte SEQUENCE is identical, so the hash is unchanged.
+        debug_assert!(
+            self.accounts.windows(2).all(|w| w[0].0 < w[1].0)
+                && self.storage.windows(2).all(|w| w[0].0 < w[1].0),
+            "WriteSet::finish() not called before hash()"
+        );
         let mut h = alloy_primitives::Keccak256::new();
         h.update(b"ACC");
         h.update((self.accounts.len() as u32).to_be_bytes());

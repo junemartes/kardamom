@@ -734,7 +734,7 @@ fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
         }
         let info = &account.info;
         ws.accounts
-            .insert(*addr, (info.nonce, info.balance, info.code_hash));
+            .push((*addr, (info.nonce, info.balance, info.code_hash)));
 
         // CacheDB stores bytecode separately by code_hash; resolve via the
         // `contracts` map. KECCAK_EMPTY (canonical empty-code) and empty
@@ -743,17 +743,18 @@ fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
             && let Some(code) = state.contracts.get(&info.code_hash)
             && !code.is_empty()
         {
-            ws.code.insert(
+            ws.code.push((
                 info.code_hash,
                 Bytes::copy_from_slice(code.original_bytes().as_ref()),
-            );
+            ));
         }
 
         for (key, value) in &account.storage {
             let b_key = B256::from(key.to_be_bytes::<32>());
-            ws.storage.insert((*addr, b_key), *value);
+            ws.storage.push(((*addr, b_key), *value));
         }
     }
+    ws.finish();
     ws
 }
 
@@ -767,7 +768,7 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
         }
         let info = &account.info;
         ws.accounts
-            .insert(*addr, (info.nonce, info.balance, info.code_hash));
+            .push((*addr, (info.nonce, info.balance, info.code_hash)));
 
         // Code bytes: ONLY for accounts CREATED this tx. revm also loads
         // the bytecode of every contract merely CALLED (`info.code` is
@@ -781,10 +782,10 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
             && info.code_hash != KECCAK_EMPTY
             && !code.is_empty()
         {
-            ws.code.insert(
+            ws.code.push((
                 info.code_hash,
                 Bytes::copy_from_slice(code.original_bytes().as_ref()),
-            );
+            ));
         }
 
         for (key, slot) in account.storage.iter() {
@@ -792,10 +793,11 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
             // original_value. revm tracks both on `EvmStorageSlot`.
             if slot.original_value != slot.present_value {
                 let b_key = B256::from(key.to_be_bytes::<32>());
-                ws.storage.insert((*addr, b_key), slot.present_value);
+                ws.storage.push(((*addr, b_key), slot.present_value));
             }
         }
     }
+    ws.finish();
     ws
 }
 
