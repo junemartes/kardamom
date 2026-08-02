@@ -4001,6 +4001,7 @@ dependencies = [
  "clap",
  "core_affinity",
  "criterion 0.5.1",
+ "dhat",
  "kardamom-cluster-adapter",
  "kardamom-log",
  "kardamom-obs",
