@@ -1,0 +1,10 @@
+# VENDORED Uniswap v2-periphery Router02 (+deps), canonical solc 0.6.6.
+[profile.default]
+src = "src"
+out = "out"
+libs = []
+solc = "0.6.6"
+optimizer = true
+optimizer_runs = 999999
+bytecode_hash = "none"
+evm_version = "istanbul"

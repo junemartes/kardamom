@@ -210,8 +210,21 @@ pub struct BlockExecOutput {
 /// verifier) makes the exec thread BUFFER a block's records and execute
 /// them together at the boundary — which is what allows batches to run
 /// concurrently, seeded from BAL claims.
+/// (snapshot, PARENT LAYER, records, env, block_number). The parent layer
+/// is the actor's merged not-yet-durable writes — the depth-K commit
+/// pipeline lets execution run up to K blocks ahead of fsync, so the
+/// snapshot alone can be K blocks STALE. Ignoring it executes against old
+/// state: under load the validator skipped txs (nonce mismatch) the
+/// executor had executed, a proven divergence in the first DeFi gate.
 pub type BlockExec<D> = Box<
-    dyn Fn(&D, &[BufferedRecord], ExecEnv, u64) -> Result<BlockExecOutput, ExecutorError> + Send,
+    dyn Fn(
+            &D,
+            Option<&PendingDelta>,
+            &[BufferedRecord],
+            ExecEnv,
+            u64,
+        ) -> Result<BlockExecOutput, ExecutorError>
+        + Send,
 >;
 
 /// Internal envelope routed from exec → commit thread.
@@ -741,7 +754,13 @@ where
                                 l2_timestamp: current_l2_ts,
                             };
                             let apply_start = Instant::now();
-                            let out = exec_block(&snapshot, &buffered, env, block_number)?;
+                            let out = exec_block(
+                                &snapshot,
+                                parent.as_ref(),
+                                &buffered,
+                                env,
+                                block_number,
+                            )?;
                             *block_apply_elapsed.get_or_insert(Duration::ZERO) +=
                                 apply_start.elapsed();
                             buffered.clear();

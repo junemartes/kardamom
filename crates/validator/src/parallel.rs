@@ -375,10 +375,15 @@ pub struct BatchOutcome {
 /// components have earlier claims, falling back to the snapshot.
 pub fn build_seed<S: StateDatabase>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     claims: &ClaimIndex,
     before: u64,
 ) -> Result<PendingDelta, ExecutorError> {
-    let mut seed = PendingDelta::new();
+    // Base = the parent layer (merged not-yet-durable writes of earlier
+    // blocks): the snapshot alone can be K blocks stale under the depth-K
+    // commit pipeline. Claim seeds overlay ON TOP — intra-block claims are
+    // newer than any parent state.
+    let mut seed = parent.cloned().unwrap_or_default();
 
     let mut addrs: Vec<Address> = claims.balance.keys().copied().collect();
     addrs.extend(claims.nonce.keys().copied());
@@ -390,10 +395,13 @@ pub fn build_seed<S: StateDatabase>(
         if claimed_bal.is_none() && claimed_nonce.is_none() {
             continue; // nothing claimed before this batch — snapshot stands
         }
-        let base = snapshot
-            .basic(addr)
-            .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
-            .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY));
+        let base = match seed.accounts.get(&addr) {
+            Some(v) => *v, // parent layer already has the freshest base
+            None => snapshot
+                .basic(addr)
+                .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
+                .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY)),
+        };
         seed.accounts.insert(
             addr,
             (
@@ -522,6 +530,7 @@ pub struct BlockOutcome {
 /// later batches that merely consume it.
 pub fn execute_block_parallel<S: StateDatabase + Sync>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     txs: &[BlockTx],
     claims: &ClaimIndex,
     env: ExecEnv,
@@ -566,7 +575,7 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
                     } else {
                         from
                     };
-                    let seed = build_seed(snapshot, claims, before)?;
+                    let seed = build_seed(snapshot, parent, claims, before)?;
                     execute_batch(snapshot, &seed, slice, claims, env, from, granularity)
                 })
             })
@@ -741,7 +750,7 @@ mod engine_tests {
         let expected = seq_delta(&snap, &txs);
 
         for batch_size in [1usize, 5, 10] {
-            let out = execute_block_parallel(&snap, &txs, &claims, env(), batch_size, 1)
+            let out = execute_block_parallel(&snap, None, &txs, &claims, env(), batch_size, 1)
                 .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
             assert_eq!(
                 out.delta.accounts, expected.accounts,
@@ -782,7 +791,7 @@ mod engine_tests {
             entry.1 += U256::from(1_000_000u64);
         }
 
-        let err = execute_block_parallel(&snap, &txs, &claims, env(), 5, 1)
+        let err = execute_block_parallel(&snap, None, &txs, &claims, env(), 5, 1)
             .expect_err("a forged claim must be caught");
         match err {
             ExecutorError::Divergence(msg) => {
@@ -842,7 +851,7 @@ mod engine_tests {
         let claims = ClaimIndex::from_alloy(&quantized);
 
         let out =
-            execute_block_parallel(&snap, &txs, &claims, env(), 8, 20).expect("quantized parity");
+            execute_block_parallel(&snap, None, &txs, &claims, env(), 8, 20).expect("quantized parity");
         assert_eq!(out.delta.accounts, expected.accounts);
         assert_eq!(out.batches, 3, "47 txs at K=20 -> 3 aligned chunks");
 
@@ -853,7 +862,7 @@ mod engine_tests {
                 e.1 += U256::from(999u64);
             }
         }
-        let err = execute_block_parallel(&snap, &txs, &forged, env(), 8, 20)
+        let err = execute_block_parallel(&snap, None, &txs, &forged, env(), 8, 20)
             .expect_err("forged chunk claim must be caught");
         match err {
             ExecutorError::Divergence(msg) => {
@@ -863,10 +872,70 @@ mod engine_tests {
         }
     }
 
+/// THE depth-K regression: under the pipelined commit the snapshot can
+    /// be K blocks stale — block 2's txs must observe block 1's writes via
+    /// the PARENT layer. The first DeFi gate diverged exactly here: the
+    /// hook dropped the parent, the validator saw stale nonces, and skipped
+    /// txs the executor had executed.
+    #[test]
+    fn parent_layer_bridges_the_uncommitted_gap() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000DD");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+
+        // Block 1: nonces 0..3, executed and folded into a parent layer —
+        // but NEVER committed to the snapshot (StaticSnapshotSource
+        // semantics: the mock snapshot still says nonce 0).
+        let b1: Vec<BlockTx> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
+        let claims1 = honest_claims(&snap, &b1);
+        let out1 = execute_block_parallel(&snap, None, &b1, &claims1, env(), 2, 1)
+            .expect("block 1");
+        let parent = out1.delta.clone();
+
+        // Block 2: nonces 4..7. Against the bare snapshot every tx is a
+        // nonce-mismatch skip; with the parent layer they execute.
+        let b2: Vec<BlockTx> = (4..8).map(|i| tx(&signer, to, i, 100, i)).collect();
+        // Build block-2 claims through the same capture path, WITH parent.
+        let mut bal = revm::state::bal::Bal::new();
+        let mut delta = PendingDelta::new();
+        let mut cumulative = 0u64;
+        for (i, t) in b2.iter().enumerate() {
+            let (r, ws) = execute_tx(
+                &snap, Some(&parent), &delta, env(), t.tx_idx, t.position, &t.envelope,
+                i as u64, cumulative, Some((&mut bal, (i + 1) as u64)),
+            )
+            .expect("seq block 2");
+            assert!(r.status, "block-2 txs must execute given the parent");
+            cumulative = r.cumulative_gas_used;
+            delta.apply(ws);
+        }
+        let claims2 = ClaimIndex::from_alloy(&bal.into_alloy_bal());
+
+        // WITHOUT parent: the stale-state bug — every tx skips.
+        let stale = execute_block_parallel(&snap, None, &b2, &claims2, env(), 2, 1);
+        assert!(
+            stale.is_err(),
+            "without the parent layer the block must diverge (skips vs claims)"
+        );
+
+        // WITH parent: byte-identical to the sequential-with-parent run.
+        let out2 = execute_block_parallel(&snap, Some(&parent), &b2, &claims2, env(), 2, 1)
+            .expect("block 2 with parent");
+        assert_eq!(out2.delta.accounts, delta.accounts);
+        assert!(out2.receipts.iter().all(|r| r.status));
+    }
+
     #[test]
     fn empty_block_is_a_no_op() {
         let snap = MockStateDatabase::builder().build();
-        let out = execute_block_parallel(&snap, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
+        let out = execute_block_parallel(&snap, None, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
         assert!(out.receipts.is_empty() && out.batches == 0);
     }
 }
@@ -889,6 +958,7 @@ const CLAIM_WAIT: Duration = Duration::from_millis(250);
 /// attribution). Identical semantics to the engine's streaming path.
 pub fn execute_block_sequential<S: StateDatabase>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<BlockExecOutput, ExecutorError> {
@@ -904,7 +974,7 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 position,
             } => execute_tx(
                 snapshot,
-                None,
+                parent,
                 &delta,
                 env,
                 *tx_idx,
@@ -920,7 +990,7 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 position,
             } => execute_deposit_tx(
                 snapshot,
-                None,
+                parent,
                 &delta,
                 env,
                 *tx_idx,
@@ -947,17 +1017,21 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
     batch_size: usize,
 ) -> BlockExec<D> {
     Box::new(
-        move |snapshot: &D, records: &[BufferedRecord], env: ExecEnv, block: u64| {
+        move |snapshot: &D,
+              parent: Option<&PendingDelta>,
+              records: &[BufferedRecord],
+              env: ExecEnv,
+              block: u64| {
             let tx_only = records
                 .iter()
                 .all(|r| matches!(r, BufferedRecord::Tx { .. }));
             if !tx_only || records.is_empty() {
-                return execute_block_sequential(snapshot, records, env);
+                return execute_block_sequential(snapshot, parent, records, env);
             }
             let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
                 crate::metrics::counter_parallel_fallback();
                 tracing::debug!(block, "no BAL claims in time; sequential re-execution");
-                return execute_block_sequential(snapshot, records, env);
+                return execute_block_sequential(snapshot, parent, records, env);
             };
             let txs: Vec<BlockTx> = records
                 .iter()
@@ -974,7 +1048,8 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                     BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
                 })
                 .collect();
-            let out = execute_block_parallel(snapshot, &txs, &idx, env, batch_size, granularity)?;
+            let out =
+                execute_block_parallel(snapshot, parent, &txs, &idx, env, batch_size, granularity)?;
             crate::metrics::counter_parallel_block(out.batches);
             Ok(BlockExecOutput {
                 receipts: out.receipts,
