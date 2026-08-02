@@ -1,0 +1,12 @@
+# VENDORED Uniswap v2-core (github.com/Uniswap/v2-core @ master, unmodified)
+# for the real-Uniswap bench workload. Own project: pinned solc 0.5.16, the
+# canonical compiler for these contracts.
+[profile.default]
+src = "src"
+out = "out"
+libs = []
+solc = "0.5.16"
+optimizer = true
+optimizer_runs = 999999
+bytecode_hash = "none"
+evm_version = "istanbul"

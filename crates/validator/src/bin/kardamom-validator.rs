@@ -313,15 +313,14 @@ async fn main() -> Result<()> {
                         // claims (the parallel path short-circuits before
                         // its take), so inserting them would grow the
                         // buffer for the whole idle period — the cursor
-                        // only advances on takes. Quantized frames
-                        // (granularity > 1) are also skipped: per-tx
-                        // verification against chunk-collapsed claims
-                        // would false-diverge; those blocks validate
-                        // sequentially until ladder-aware verification
-                        // lands.
-                        Ok(bal) if !bal.is_empty() && *granularity == 1 => {
+                        // only advances on takes. Quantized frames carry
+                        // their granularity so verification coarsens to
+                        // the chunk with batches aligned to it — the
+                        // validator's ladder view always follows the wire.
+                        Ok(bal) if !bal.is_empty() => {
                             claims_sub.insert(
                                 delta.block_number,
+                                *granularity,
                                 kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
                             );
                         }

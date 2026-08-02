@@ -14,6 +14,7 @@
 //! `TxOrderingSubscription` interfaces.
 
 pub mod actor;
+pub mod bal_ladder;
 pub mod bin_support;
 pub mod block_env;
 pub mod delta;

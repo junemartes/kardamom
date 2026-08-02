@@ -110,6 +110,11 @@ pub struct Tracker {
     accepted: AtomicU64,
     receipted: AtomicU64,
     bad_status: AtomicU64,
+    /// Total gas consumed by receipted txs (the gas/s numerator — workload-
+    /// independent throughput, unlike tx/s).
+    gas_used: AtomicU64,
+    /// Per-ramp-step gas, reset by `take_step_gas`.
+    step_gas: AtomicU64,
     lat_us: Mutex<Histogram<u64>>,
     /// Per-ramp-step latency histogram, reset by [`Tracker::take_step_latencies`]
     /// — per-step percentiles localize WHERE in the ramp the tail degrades
@@ -132,6 +137,8 @@ impl Tracker {
             accepted: AtomicU64::new(0),
             receipted: AtomicU64::new(0),
             bad_status: AtomicU64::new(0),
+            gas_used: AtomicU64::new(0),
+            step_gas: AtomicU64::new(0),
             lat_us: Mutex::new(Histogram::new_with_bounds(
                 HIST_LOW_US,
                 HIST_HIGH_US,
@@ -149,7 +156,9 @@ impl Tracker {
 
     /// Feed-side confirmation (subscribe mode): settle the pending entry for
     /// `hash`, or stash the status if the submit task hasn't registered yet.
-    pub fn confirm_from_feed(&self, hash: B256, status: u64) {
+    pub fn confirm_from_feed(&self, hash: B256, status: u64, gas: u64) {
+        self.gas_used.fetch_add(gas, Ordering::Relaxed);
+        self.step_gas.fetch_add(gas, Ordering::Relaxed);
         let settled = self
             .pending
             .lock()
@@ -249,6 +258,16 @@ impl Tracker {
     /// Latency percentiles `(p50, p95, p99, max)` in microseconds over the
     /// confirmed set.
     #[must_use]
+    /// Drain the per-step gas counter (for per-step Mgas/s).
+    pub fn take_step_gas(&self) -> u64 {
+        self.step_gas.swap(0, Ordering::Relaxed)
+    }
+
+    /// Total gas consumed by receipted txs.
+    pub fn total_gas(&self) -> u64 {
+        self.gas_used.load(Ordering::Relaxed)
+    }
+
     pub fn latency_us(&self) -> (u64, u64, u64, u64) {
         let h = self
             .lat_us
@@ -280,6 +299,13 @@ impl Tracker {
     }
 
     fn confirm(&self, status: u64, latency: Duration) {
+        self.confirm_with_gas(status, latency, 0);
+    }
+
+    /// Confirm with the receipt's gasUsed (the HTTP-refetch path).
+    fn confirm_with_gas(&self, status: u64, latency: Duration, gas: u64) {
+        self.gas_used.fetch_add(gas, Ordering::Relaxed);
+        self.step_gas.fetch_add(gas, Ordering::Relaxed);
         self.receipted.fetch_add(1, Ordering::Relaxed);
         if status != 1 {
             self.bad_status.fetch_add(1, Ordering::Relaxed);
@@ -294,15 +320,21 @@ impl Tracker {
     }
 }
 
-/// Look up a receipt's status (`1`/`0`), or `None` if not mined yet.
-async fn receipt_status(client: &HttpClient, hash: B256) -> Option<u64> {
+/// Look up a receipt's `(status, gasUsed)`, or `None` if not mined yet.
+async fn receipt_status(client: &HttpClient, hash: B256) -> Option<(u64, u64)> {
     let v: Option<serde_json::Value> = client
         .request("eth_getTransactionReceipt", rpc_params![hash])
         .await
         .ok()?;
     let v = v?;
-    let s = v.get("status")?.as_str()?;
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
+    let status =
+        u64::from_str_radix(v.get("status")?.as_str()?.trim_start_matches("0x"), 16).ok()?;
+    let gas = v
+        .get("gasUsed")
+        .and_then(|g| g.as_str())
+        .and_then(|g| u64::from_str_radix(g.trim_start_matches("0x"), 16).ok())
+        .unwrap_or(0);
+    Some((status, gas))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -334,8 +366,8 @@ async fn submit_task(
             // died after ingress forwarded the tx). Resubmitting a landed tx
             // registers as a past-nonce drop at the sequencer, so check for a
             // receipt first and stop retrying if it's already there.
-            if let Some(status) = receipt_status(&client, tx.hash).await {
-                tracker.confirm(status, t0.elapsed());
+            if let Some((status, gas)) = receipt_status(&client, tx.hash).await {
+                tracker.confirm_with_gas(status, t0.elapsed(), gas);
                 return;
             }
             tokio::time::sleep(Duration::from_millis(200 * (u64::from(attempt) + 1))).await;
@@ -362,7 +394,7 @@ async fn submit_task(
         // on-offer: a successful submit means the receipt already arrived (the
         // tx was executed + receipted). Re-fetch it to check status/latency.
         match receipt_status(&client, tx.hash).await {
-            Some(status) => tracker.confirm(status, t0.elapsed()),
+            Some((status, gas)) => tracker.confirm_with_gas(status, t0.elapsed(), gas),
             None if verify_receipts => {
                 // Non-chaos soak: independently verify the on-offer contract.
                 // No receipt for an accepted tx → keep it pending; the drain
@@ -394,7 +426,7 @@ async fn submit_task(
         // re-check; a never-confirmed leftover is counted `unlanded`, not
         // `missing` (it was never accepted).
         match receipt_status(&client, tx.hash).await {
-            Some(status) => tracker.confirm(status, t0.elapsed()),
+            Some((status, gas)) => tracker.confirm_with_gas(status, t0.elapsed(), gas),
             None => {
                 tracker
                     .pending
@@ -519,7 +551,7 @@ pub async fn sweep_pending_once(
             .collect()
     };
     for (hash, submit_ts) in pending {
-        if let Some(status) = receipt_status(client, hash).await {
+        if let Some((status, gas)) = receipt_status(client, hash).await {
             let removed = tracker
                 .pending
                 .lock()
@@ -527,7 +559,7 @@ pub async fn sweep_pending_once(
                 .remove(&hash)
                 .is_some();
             if removed {
-                tracker.confirm(status, submit_ts.elapsed());
+                tracker.confirm_with_gas(status, submit_ts.elapsed(), gas);
             }
         }
     }

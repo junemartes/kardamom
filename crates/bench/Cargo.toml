@@ -52,3 +52,8 @@ jsonrpsee = { workspace = true }
 # Apple Silicon enables frame pointers by default, so no extra rustflags
 # are needed here.
 pprof = { version = "0.14", features = ["flamegraph", "frame-pointer"] }
+
+[dev-dependencies]
+dhat = "0.3"
+kardamom-engine.workspace = true
+kardamom-types.workspace = true

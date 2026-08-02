@@ -78,9 +78,11 @@ job "executor" {
       # encoded sizes at each K so the batch size can be chosen from data.
       # Unset in normal operation; harmless (log-only) when set.
       env {
-        # Set to a K list (e.g. "1,5,10,20") to log per-granularity encoded
-        # sizes per block; unset in normal operation.
-        # KARDAMOM_BAL_MEASURE = "1,5,10,20"
+        # BAL attribution granularity for the DeFi/K-ladder experiment:
+        # frames carry K so the validator's view follows the wire.
+        KARDAMOM_BAL_GRANULARITY = "20"
+        # Log per-granularity encoded sizes per block (size-ladder data).
+        KARDAMOM_BAL_MEASURE = "1,5,10,20"
       }
 
       config {
