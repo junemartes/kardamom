@@ -109,6 +109,15 @@ pub struct PendingReceipts {
     latest: Arc<Mutex<Watermarks>>,
     /// See [`DEFAULT_TX_ERROR_GRACE`]; overridable for tests.
     error_grace: Duration,
+    /// Watermark-ORDERED index of parked entries: `(tx_idx, seq) → Weak`.
+    /// A watermark tick used to snapshot and walk the ENTIRE registry
+    /// (O(parked) allocations per tick — the ingress profile's top
+    /// allocation site); draining the satisfied PREFIX of this index makes
+    /// a tick O(released + log parked) with zero steady-state allocation.
+    /// Entries are inserted only when a receipt arrives still-gated; a
+    /// dropped waiter's Weak simply fails to upgrade at drain.
+    parked: std::sync::Mutex<std::collections::BTreeMap<(BPosition, u64), Weak<Mutex<Entry>>>>,
+    park_seq: std::sync::atomic::AtomicU64,
 }
 
 impl Default for PendingReceipts {
@@ -131,6 +140,8 @@ impl PendingReceipts {
             map: Arc::new(DashMap::new()),
             latest: Arc::new(Mutex::new(Watermarks::default())),
             error_grace,
+            parked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            park_seq: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -173,11 +184,21 @@ impl PendingReceipts {
         let mut e = entry.lock().await;
         e.receipt = Some(receipt.clone());
         let latest = *self.latest.lock().await;
-        if self.gate_satisfied(&latest, receipt.tx_idx)
-            && let Some(resp) = e.responder.take()
-        {
-            // Release only; the woken waiter's Drop removes the slot.
-            let _ = resp.send(Ok(ReceiptResponse { receipt }));
+        if self.gate_satisfied(&latest, receipt.tx_idx) {
+            if let Some(resp) = e.responder.take() {
+                // Release only; the woken waiter's Drop removes the slot.
+                let _ = resp.send(Ok(ReceiptResponse { receipt }));
+            }
+        } else {
+            // Still gated: index by position so the watermark tick drains
+            // exactly the satisfied prefix.
+            let seq = self
+                .park_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert((receipt.tx_idx, seq), Arc::downgrade(&entry));
         }
     }
 
@@ -251,20 +272,46 @@ impl PendingReceipts {
     /// leaves slot removal to the woken waiter's Drop.
     async fn release_satisfied(&self) {
         let latest = *self.latest.lock().await;
-        let snapshot: Vec<Weak<Mutex<Entry>>> =
-            self.map.iter().map(|r| r.value().clone()).collect();
-        for weak in snapshot {
+        // Effective release watermark: the MIN over the watermark kinds the
+        // policy requires. Absent required watermark ⇒ nothing releases.
+        let mut effective: Option<BPosition> = None;
+        if self.policy.requires_local_fsync() {
+            match latest.local {
+                Some(p) => effective = Some(p),
+                None => return,
+            }
+        }
+        if self.policy.requires_quorum() {
+            match latest.quorum {
+                Some(p) => {
+                    effective = Some(match effective {
+                        Some(e) if e <= p => e,
+                        _ => p,
+                    })
+                }
+                None => return,
+            }
+        }
+        let Some(eff) = effective else {
+            return; // OnOffer never parks
+        };
+        // Drain the satisfied prefix: keys with tx_idx <= eff (seq never
+        // reaches u64::MAX, so this bound is exact).
+        let drained: Vec<Weak<Mutex<Entry>>> = {
+            let mut parked = self
+                .parked
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let suffix = parked.split_off(&(eff, u64::MAX));
+            let prefix = std::mem::replace(&mut *parked, suffix);
+            prefix.into_values().collect()
+        };
+        for weak in drained {
             let Some(entry) = weak.upgrade() else {
-                continue; // waiter gone since the snapshot
+                continue; // waiter gone
             };
             let mut e = entry.lock().await;
-            let release = e
-                .receipt
-                .as_ref()
-                .map(|r| self.gate_satisfied(&latest, r.tx_idx))
-                .unwrap_or(false);
-            if release && let Some(resp) = e.responder.take() {
-                let receipt = e.receipt.clone().expect("checked is_some above");
+            if let (Some(receipt), Some(resp)) = (e.receipt.clone(), e.responder.take()) {
                 let _ = resp.send(Ok(ReceiptResponse { receipt }));
             }
         }

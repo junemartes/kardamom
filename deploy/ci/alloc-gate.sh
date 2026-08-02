@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# CI allocation-regression gate: runs the three DHAT harnesses and fails if
+# allocs/op or bytes/op exceed the committed ceilings (perf/alloc-baselines.env).
+# Wall time is printed for the record but NEVER gated (machine-dependent).
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+source perf/alloc-baselines.env
+
+run() { # <name> <dir> <test> <env...>
+  local name=$1 dir=$2 test=$3; shift 3
+  local out
+  out=$(cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture 2>/dev/null \
+        | grep -E "allocs/(tx|op)|bytes/(tx|op)|wall/(tx|op)")
+  echo "== $name"; echo "$out"
+  local allocs bytes
+  allocs=$(echo "$out" | grep -E "allocs" | grep -oE "[0-9]+\.?[0-9]*" | head -1)
+  bytes=$(echo "$out" | grep -E "bytes" | grep -oE "[0-9]+" | head -1)
+  local max_a_var="${name^^}_MAX_ALLOCS" max_b_var="${name^^}_MAX_BYTES"
+  local max_a=${!max_a_var} max_b=${!max_b_var}
+  awk -v a="$allocs" -v ma="$max_a" -v b="$bytes" -v mb="$max_b" -v n="$name" 'BEGIN {
+    bad = 0
+    if (a+0 > ma+0) { printf "ALLOC REGRESSION: %s %.2f allocs/op > ceiling %.2f\n", n, a, ma; bad = 1 }
+    if (b+0 > mb+0) { printf "ALLOC REGRESSION: %s %d bytes/op > ceiling %d\n", n, b, mb; bad = 1 }
+    exit bad
+  }'
+}
+
+run engine    crates/bench     alloc_profile         KARDAMOM_PROFILE_OPS=mix
+run sequencer crates/sequencer alloc_profile
+run ingress   crates/bench     alloc_profile_ingress
+echo "alloc gate: PASS (ceilings: perf/alloc-baselines.env)"

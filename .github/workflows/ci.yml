@@ -252,3 +252,13 @@ jobs:
           slither-config: contracts/slither.config.json
           fail-on: medium
 
+
+  alloc-gate:
+    name: allocation regression gate
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: DHAT allocation ceilings (perf/alloc-baselines.env)
+        run: bash deploy/ci/alloc-gate.sh

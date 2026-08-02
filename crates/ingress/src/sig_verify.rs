@@ -73,6 +73,7 @@ impl BatchVerifier {
         let inner_for_task = inner.clone();
         let notify_for_task = notify.clone();
         let flush = tokio::spawn(async move {
+            let mut scratch: Vec<VerifyRequest> = Vec::new();
             loop {
                 // Wait until at least one request is queued (or the verifier is
                 // dropped; in that case nothing notifies and the task just
@@ -83,11 +84,15 @@ impl BatchVerifier {
                 // so this sleep just resolves remaining stragglers.
                 let deadline = Instant::now() + flush_window;
                 tokio::time::sleep_until(deadline).await;
-                let drained: Vec<VerifyRequest> = {
+                // Swap with a reusable scratch: the old drain().collect()
+                // allocated a fresh Vec per flush window (the ring grows
+                // once to steady-state capacity and is then reused).
+                scratch.clear();
+                {
                     let mut g = inner_for_task.lock().await;
-                    g.drain(..).collect()
-                };
-                Self::process_batch(drained);
+                    std::mem::swap(&mut *g, &mut scratch);
+                }
+                Self::process_batch(&mut scratch);
             }
         });
         Self {
@@ -98,8 +103,8 @@ impl BatchVerifier {
         }
     }
 
-    fn process_batch(batch: Vec<VerifyRequest>) {
-        for req in batch {
+    fn process_batch(batch: &mut Vec<VerifyRequest>) {
+        for req in batch.drain(..) {
             // Per-tx recovery + keccak; the "batch" amortizes wakeups, not
             // math.
             let res = recover_single(&req.env, &req.raw_tx);
@@ -126,11 +131,11 @@ impl BatchVerifier {
         };
         if should_flush_now {
             // Drain and process synchronously to avoid waiting for the timer.
-            let drained: Vec<VerifyRequest> = {
+            let mut drained: Vec<VerifyRequest> = {
                 let mut g = self.inner.lock().await;
                 g.drain(..).collect()
             };
-            Self::process_batch(drained);
+            Self::process_batch(&mut drained);
         } else {
             self.notify.notify_one();
         }

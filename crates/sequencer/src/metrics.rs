@@ -33,6 +33,39 @@ pub const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
 pub const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
 pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 
+/// Pre-registered per-partition metric HANDLES for the hot loop.
+///
+/// Every `counter!(NAME, "partition" => p.to_string())` call boxes a fresh
+/// metrics `Key` and allocates the label `String` — the service allocation
+/// profile measured that as 6 of the sequencer's 10 allocations per
+/// transaction. Handles are registered ONCE at construction; recording
+/// through them is allocation-free.
+pub struct HotMetrics {
+    pub ingest: metrics::Counter,
+    pub publish: metrics::Counter,
+    pub buffered_future: metrics::Counter,
+    pub dropped_past: metrics::Counter,
+    pub evictions: metrics::Counter,
+    pub backpressure: metrics::Counter,
+    pub nonce_check_seconds: metrics::Histogram,
+}
+
+impl HotMetrics {
+    #[must_use]
+    pub fn new(partition: u32) -> Self {
+        let p = partition.to_string();
+        Self {
+            ingest: counter!(TX_INGESTED, "partition" => p.clone()),
+            publish: counter!(TX_PUBLISHED_TO_B, "partition" => p.clone()),
+            buffered_future: counter!(TX_BUFFERED_FUTURE, "partition" => p.clone()),
+            dropped_past: counter!(TX_DROPPED_PAST, "partition" => p.clone()),
+            evictions: counter!(PENDING_BUFFER_EVICTIONS, "partition" => p.clone()),
+            backpressure: counter!(BACKPRESSURE_EVENTS, "partition" => p.clone()),
+            nonce_check_seconds: histogram!(NONCE_CHECK_DURATION_SECONDS, "partition" => p),
+        }
+    }
+}
+
 pub fn record_ingest(partition: u32) {
     counter!(TX_INGESTED, "partition" => partition.to_string()).increment(1);
 }
