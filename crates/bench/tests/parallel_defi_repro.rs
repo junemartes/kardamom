@@ -206,3 +206,85 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
         parent.merge_from(&seq_delta);
     }
 }
+
+/// The burst-block case that produced the live divergence: a stall makes
+/// the sealer pack the WHOLE backlog into one giant block, so the contract
+/// DEPLOYMENTS land in chunk 1 and the calls in later chunks — CREATE then
+/// CALL across a chunk boundary within one block. The original spec
+/// excluded code from attribution ("the account-entry dependency orders
+/// it") — correct for the wave-DAG model, WRONG for the seeded model:
+/// batch 2 never waits for batch 1, so without code claims its seed has
+/// account entries but EMPTY bytecode, every contract call no-ops, and
+/// verification reports "recomputed absent".
+#[test]
+fn create_then_call_across_chunks_in_one_block() {
+    let signers = mnemonic::derive_signers(ANVIL_PHRASE, SENDERS).unwrap();
+    let mut b = MockStateDatabase::builder();
+    for s in &signers {
+        b = b.account(
+            s.signer.address(),
+            U256::from(10u128.pow(21)),
+            0,
+            alloy_primitives::KECCAK256_EMPTY,
+        );
+    }
+    let snap = b.build();
+    let (deploys, contracts) = deployment_txs(&signers, CHAIN_ID, 0, 1_000_000_000).unwrap();
+    let queues = pregenerate_defi(&signers, CHAIN_ID, &contracts, 8, 0, 1_000_000_000).unwrap();
+
+    // ONE block: deploys (bal 1-3), all seeds, then two rounds of ops —
+    // spans multiple K=20 chunks with the CREATEs in chunk 1.
+    let mut txs: Vec<(usize, &PlannedTx)> = deploys.iter().map(|d| (0usize, d)).collect();
+    for (si, q) in queues.iter().enumerate() {
+        txs.push((si, &q[0])); // seed()
+    }
+    for round in 1..3 {
+        for (si, q) in queues.iter().enumerate() {
+            txs.push((si, &q[round]));
+        }
+    }
+    assert!(txs.len() > 40, "must span >2 chunks at K=20: {}", txs.len());
+
+    let env = env_for(2);
+    let mut seq_delta = PendingDelta::new();
+    let mut bal = revm::state::bal::Bal::new();
+    let mut cum = 0u64;
+    for (i, (si, t)) in txs.iter().enumerate() {
+        let (r, ws) = execute_tx(
+            &snap,
+            None,
+            &seq_delta,
+            env,
+            TxIndex(i as u64),
+            BPosition::from_index(i as u64),
+            &envelope(t, signers[*si].signer.address(), i as u64),
+            i as u64,
+            cum,
+            Some((&mut bal, (i + 1) as u64)),
+        )
+        .expect("seq");
+        assert!(r.status, "tx {i} must execute sequentially");
+        cum = r.cumulative_gas_used;
+        seq_delta.apply(ws);
+    }
+    let alloy_bal = bal.into_alloy_bal();
+
+    let block_txs: Vec<BlockTx> = txs
+        .iter()
+        .enumerate()
+        .map(|(i, (_si, t))| BlockTx {
+            tx_idx: TxIndex(i as u64),
+            position: BPosition::from_index(i as u64),
+            envelope: envelope(t, signers[txs[i].0].signer.address(), i as u64),
+        })
+        .collect();
+
+    for k in [20u16, 1] {
+        let q = kardamom_engine::bal_ladder::quantize(alloy_bal.clone(), k);
+        let claims = ClaimIndex::from_alloy(&q);
+        let out = execute_block_parallel(&snap, None, &block_txs, &claims, env, 8, k)
+            .unwrap_or_else(|e| panic!("K={k} create-then-call diverged: {e:?}"));
+        assert_eq!(out.delta.storage, seq_delta.storage, "K={k}: storage");
+        assert_eq!(out.delta.accounts, seq_delta.accounts, "K={k}: accounts");
+    }
+}

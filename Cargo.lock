@@ -4066,6 +4066,7 @@ dependencies = [
  "alloy-signer-local",
  "alloy-sol-types",
  "anyhow",
+ "bytes",
  "clap",
  "kardamom-deployer",
  "kardamom-engine",

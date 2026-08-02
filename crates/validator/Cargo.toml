@@ -10,6 +10,7 @@ edition.workspace = true
 # BAL (tx_bal). Fail-stop on divergence. Off the hot path; no HA.
 
 [dependencies]
+bytes.workspace = true
 serde_json.workspace = true
 revm.workspace = true
 alloy-eip7928.workspace = true

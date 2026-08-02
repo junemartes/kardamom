@@ -250,9 +250,15 @@ parallelism from "ordered waves" to "fully independent execution":
   false conflicts (gas-payment balance writes serialize same-sender txs
   anyway, which per-sender nonce ordering already forces) — likely not
   worth it in v2.
-- Whether `code` reads (by hash) need attribution at all: code is
-  append-only content-addressed — reads can never conflict with same-block
-  writes except CREATE-then-CALL in one block, which the account-entry
-  dependency already orders. v2 says: exclude code from attribution.
+- ~~Whether `code` reads (by hash) need attribution at all~~ **ANSWERED
+  IN BLOOD**: the "account-entry dependency already orders it" argument
+  was correct for the wave-DAG model and WRONG for the seeded model —
+  batches never wait, so a CREATE in chunk i + CALL in chunk j>i (one
+  block: the stall-then-burst block shape) left chunk j executing against
+  an account entry with EMPTY bytecode; every call no-op'd and
+  verification reported "recomputed absent" (the deterministic live
+  divergence, reproduced by `create_then_call_across_chunks_in_one_block`).
+  Code IS attributed (EIP-7928 `code_changes`), seeds carry the bytecode,
+  and unit verification compares code hashes.
 - Compression (lz4 over the rkyv frame) if truncation telemetry says
   contract workloads routinely exceed 2MB.

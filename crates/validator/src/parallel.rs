@@ -43,6 +43,14 @@ pub struct ClaimIndex {
     pub nonce: BTreeMap<Address, Vec<(u64, u64)>>,
     /// Read-only slots per account (attribution only; not seeds).
     pub reads: BTreeMap<Address, Vec<B256>>,
+    /// address → ordered (bal_index, deployed code). CODE IS A SEED: a
+    /// CREATE in chunk i followed by a CALL in chunk j > i (one block)
+    /// must seed chunk j with the BYTECODE, not just the account entry —
+    /// the original spec excluded code from attribution reasoning from
+    /// the wave-DAG model (ordering), which the seeded model does not
+    /// have. Without this every cross-chunk call to a same-block contract
+    /// no-ops against empty code (the burst-block divergence).
+    pub code: BTreeMap<Address, Vec<(u64, bytes::Bytes)>>,
 }
 
 impl ClaimIndex {
@@ -86,6 +94,20 @@ impl ClaimIndex {
                 v.sort_by_key(|(i, _)| *i);
                 out.nonce.insert(addr, v);
             }
+            if !acct.code_changes.is_empty() {
+                let mut v: Vec<(u64, bytes::Bytes)> = acct
+                    .code_changes
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.block_access_index,
+                            bytes::Bytes::copy_from_slice(c.new_code.as_ref()),
+                        )
+                    })
+                    .collect();
+                v.sort_by_key(|(i, _)| *i);
+                out.code.insert(addr, v);
+            }
         }
         out
     }
@@ -104,6 +126,13 @@ impl ClaimIndex {
         self.balance
             .get(&addr)
             .and_then(|w| w.iter().rev().find(|(i, _)| *i < before).map(|(_, v)| *v))
+    }
+
+    /// Latest claimed CODE strictly before `bal_index`.
+    pub fn code_seed(&self, addr: Address, before: u64) -> Option<&bytes::Bytes> {
+        self.code
+            .get(&addr)
+            .and_then(|w| w.iter().rev().find(|(i, _)| *i < before).map(|(_, c)| c))
     }
 
     /// Latest claimed nonce strictly before `bal_index`.
@@ -135,10 +164,17 @@ impl ClaimIndex {
                 nonce.insert(*addr, *v);
             }
         }
+        let mut code = BTreeMap::new();
+        for (addr, writes) in &self.code {
+            if let Some((_, c)) = writes.iter().rev().find(|(i, _)| *i >= from && *i <= to) {
+                code.insert(*addr, alloy_primitives::keccak256(c));
+            }
+        }
         ClaimSlice {
             storage,
             balance,
             nonce,
+            code,
         }
     }
 }
@@ -149,25 +185,12 @@ pub struct ClaimSlice {
     pub storage: BTreeMap<(Address, B256), U256>,
     pub balance: BTreeMap<Address, U256>,
     pub nonce: BTreeMap<Address, u64>,
+    /// keccak of the unit-final claimed code (bytes stay out of the
+    /// comparison struct; the hash pins them).
+    pub code: BTreeMap<Address, B256>,
 }
 
 impl ClaimSlice {
-    /// Project a re-executed batch's merged `WriteSet` into the same shape,
-    /// so verification is a structural equality.
-    pub fn from_write_set(ws: &WriteSet) -> Self {
-        let mut balance = BTreeMap::new();
-        let mut nonce = BTreeMap::new();
-        for (addr, (n, bal, _code)) in &ws.accounts {
-            balance.insert(*addr, *bal);
-            nonce.insert(*addr, *n);
-        }
-        Self {
-            storage: ws.storage.clone(),
-            balance,
-            nonce,
-        }
-    }
-
     /// Human-readable first difference, for the divergence reason.
     pub fn diff_summary(&self, other: &Self) -> String {
         for (k, v) in &self.storage {
@@ -211,6 +234,18 @@ impl ClaimSlice {
         for (a, v) in &other.nonce {
             if !self.nonce.contains_key(a) {
                 return format!("nonce {a:?}: unclaimed write {v}");
+            }
+        }
+        for (a, v) in &self.code {
+            match other.code.get(a) {
+                Some(o) if o == v => {}
+                Some(o) => return format!("code {a:?}: claimed {v}, recomputed {o}"),
+                None => return format!("code {a:?}: claimed {v}, recomputed absent"),
+            }
+        }
+        for (a, v) in &other.code {
+            if !self.code.contains_key(a) {
+                return format!("code {a:?}: unclaimed deploy {v}");
             }
         }
         "sets differ".to_string()
@@ -336,23 +371,6 @@ use kardamom_engine::exec_types::TxIndex;
 use kardamom_engine::executor::execute_tx;
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 
-impl ClaimSlice {
-    /// Project a batch's merged [`PendingDelta`] into claim shape.
-    pub fn from_pending(delta: &PendingDelta) -> Self {
-        let mut balance = BTreeMap::new();
-        let mut nonce = BTreeMap::new();
-        for (addr, (n, bal, _code)) in &delta.accounts {
-            balance.insert(*addr, *bal);
-            nonce.insert(*addr, *n);
-        }
-        Self {
-            storage: delta.storage.clone(),
-            balance,
-            nonce,
-        }
-    }
-}
-
 /// One transaction as the validator receives it from the canonical stream.
 pub struct BlockTx {
     pub tx_idx: TxIndex,
@@ -387,12 +405,14 @@ pub fn build_seed<S: StateDatabase>(
 
     let mut addrs: Vec<Address> = claims.balance.keys().copied().collect();
     addrs.extend(claims.nonce.keys().copied());
+    addrs.extend(claims.code.keys().copied());
     addrs.sort_unstable();
     addrs.dedup();
     for addr in addrs {
         let claimed_bal = claims.balance_seed(addr, before);
         let claimed_nonce = claims.nonce_seed(addr, before);
-        if claimed_bal.is_none() && claimed_nonce.is_none() {
+        let claimed_code = claims.code_seed(addr, before);
+        if claimed_bal.is_none() && claimed_nonce.is_none() && claimed_code.is_none() {
             continue; // nothing claimed before this batch — snapshot stands
         }
         let base = match seed.accounts.get(&addr) {
@@ -402,12 +422,20 @@ pub fn build_seed<S: StateDatabase>(
                 .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
                 .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY)),
         };
+        let code_hash = match claimed_code {
+            Some(code) => {
+                let h = alloy_primitives::keccak256(code);
+                seed.code.insert(h, code.clone());
+                h
+            }
+            None => base.2,
+        };
         seed.accounts.insert(
             addr,
             (
                 claimed_nonce.unwrap_or(base.0),
                 claimed_bal.unwrap_or(base.1),
-                base.2,
+                code_hash,
             ),
         );
     }
