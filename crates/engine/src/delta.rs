@@ -21,18 +21,47 @@ use bytes::Bytes;
 use kardamom_types::delta::CodeEntry;
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 
-/// One transaction's write effects. `BTreeMap` so iteration is canonical.
+/// One transaction's write effects, as SORTED small-vectors.
+///
+/// Was three `BTreeMap`s — but a B-tree allocates a 1KB-class leaf node
+/// per map even for a handful of entries, which DHAT measured at ~2.7KB
+/// of the ~5.4KB/tx execution-path total. A typical tx writes 2-4
+/// accounts, 0-10 slots and 0-1 code entries: inline `SmallVec`s make
+/// the common case ZERO-allocation. Canonical iteration (the hash
+/// contract) comes from sort-on-build instead of tree order: builders
+/// push then call [`WriteSet::finish`]; [`WriteSet::hash`] debug-asserts
+/// sortedness.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct WriteSet {
-    /// address → (nonce, balance, code_hash).
-    pub accounts: BTreeMap<Address, (u64, U256, B256)>,
-    /// (address, slot_key) → value.
-    pub storage: BTreeMap<(Address, B256), U256>,
-    /// code_hash → bytecode.
-    pub code: BTreeMap<B256, Bytes>,
+    /// (address, (nonce, balance, code_hash)), sorted by address.
+    pub accounts: smallvec::SmallVec<[(Address, (u64, U256, B256)); 3]>,
+    /// ((address, slot_key), value), sorted by key.
+    pub storage: smallvec::SmallVec<[((Address, B256), U256); 8]>,
+    /// (code_hash, bytecode), sorted by hash.
+    pub code: smallvec::SmallVec<[(B256, Bytes); 1]>,
 }
 
 impl WriteSet {
+    /// Sort into canonical order. Builders push in revm's (nondeterministic
+    /// HashMap) iteration order and MUST call this before the set is
+    /// hashed, applied or compared. Keys are unique by construction (one
+    /// entry per account/slot per tx), so unstable sort is safe.
+    pub fn finish(&mut self) {
+        self.accounts.sort_unstable_by_key(|(a, _)| *a);
+        self.storage.sort_unstable_by_key(|(k, _)| *k);
+        self.code.sort_unstable_by_key(|(h, _)| *h);
+        debug_assert!(self.accounts.windows(2).all(|w| w[0].0 < w[1].0));
+        debug_assert!(self.storage.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    /// Keyed account lookup (linear — the set is tiny; safe pre-finish).
+    pub fn account(&self, addr: &Address) -> Option<&(u64, U256, B256)> {
+        self.accounts
+            .iter()
+            .find(|(a, _)| a == addr)
+            .map(|(_, v)| v)
+    }
+
     /// Deterministic keccak256 hash of the write set.
     ///
     /// Layout (concatenated, then hashed):
@@ -47,43 +76,40 @@ impl WriteSet {
     /// width + endianness so two replicas on different architectures produce
     /// identical bytes.
     pub fn hash(&self) -> B256 {
-        let mut buf: Vec<u8> = Vec::with_capacity(
-            3 + 4
-                + self.accounts.len() * (20 + 8 + 32 + 32)
-                + 3
-                + 4
-                + self.storage.len() * (20 + 32 + 32)
-                + 3
-                + 4
-                + self.code.len() * (32 + 8),
+        // STREAMED into the hasher — the old buffer-then-hash allocated a
+        // per-tx Vec sized to the whole serialization (including full
+        // contract BYTECODE via the code section: 3.1KB/tx on CLOB
+        // workloads, the single largest allocation site post-ExecScope).
+        // The byte SEQUENCE is identical, so the hash is unchanged.
+        debug_assert!(
+            self.accounts.windows(2).all(|w| w[0].0 < w[1].0)
+                && self.storage.windows(2).all(|w| w[0].0 < w[1].0),
+            "WriteSet::finish() not called before hash()"
         );
-
-        buf.extend_from_slice(b"ACC");
-        buf.extend_from_slice(&(self.accounts.len() as u32).to_be_bytes());
+        let mut h = alloy_primitives::Keccak256::new();
+        h.update(b"ACC");
+        h.update((self.accounts.len() as u32).to_be_bytes());
         for (addr, (nonce, balance, code_hash)) in &self.accounts {
-            buf.extend_from_slice(addr.as_slice());
-            buf.extend_from_slice(&nonce.to_le_bytes());
-            buf.extend_from_slice(&balance.to_be_bytes::<32>());
-            buf.extend_from_slice(code_hash.as_slice());
+            h.update(addr.as_slice());
+            h.update(nonce.to_le_bytes());
+            h.update(balance.to_be_bytes::<32>());
+            h.update(code_hash.as_slice());
         }
-
-        buf.extend_from_slice(b"STO");
-        buf.extend_from_slice(&(self.storage.len() as u32).to_be_bytes());
+        h.update(b"STO");
+        h.update((self.storage.len() as u32).to_be_bytes());
         for ((addr, key), value) in &self.storage {
-            buf.extend_from_slice(addr.as_slice());
-            buf.extend_from_slice(key.as_slice());
-            buf.extend_from_slice(&value.to_be_bytes::<32>());
+            h.update(addr.as_slice());
+            h.update(key.as_slice());
+            h.update(value.to_be_bytes::<32>());
         }
-
-        buf.extend_from_slice(b"COD");
-        buf.extend_from_slice(&(self.code.len() as u32).to_be_bytes());
+        h.update(b"COD");
+        h.update((self.code.len() as u32).to_be_bytes());
         for (code_hash, bytes) in &self.code {
-            buf.extend_from_slice(code_hash.as_slice());
-            buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            buf.extend_from_slice(bytes);
+            h.update(code_hash.as_slice());
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes.as_ref());
         }
-
-        keccak256(&buf)
+        h.finalize()
     }
 }
 
@@ -205,21 +231,23 @@ mod tests {
         let a2 = Address::from([0x22u8; 20]);
 
         let mut ws_a = WriteSet::default();
-        ws_a.accounts.insert(a1, sample_account(10, 1));
-        ws_a.accounts.insert(a2, sample_account(20, 2));
+        ws_a.accounts.push((a1, sample_account(10, 1)));
+        ws_a.accounts.push((a2, sample_account(20, 2)));
         ws_a.storage
-            .insert((a1, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((a1, B256::from(U256::from(1u64))), U256::from(100u64)));
         ws_a.storage
-            .insert((a2, B256::from(U256::from(2u64))), U256::from(200u64));
+            .push(((a2, B256::from(U256::from(2u64))), U256::from(200u64)));
 
         let mut ws_b = WriteSet::default();
-        ws_b.accounts.insert(a2, sample_account(20, 2));
-        ws_b.accounts.insert(a1, sample_account(10, 1));
+        ws_b.accounts.push((a2, sample_account(20, 2)));
+        ws_b.accounts.push((a1, sample_account(10, 1)));
         ws_b.storage
-            .insert((a2, B256::from(U256::from(2u64))), U256::from(200u64));
+            .push(((a2, B256::from(U256::from(2u64))), U256::from(200u64)));
         ws_b.storage
-            .insert((a1, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((a1, B256::from(U256::from(1u64))), U256::from(100u64)));
 
+        ws_a.finish();
+        ws_b.finish();
         assert_eq!(ws_a.hash(), ws_b.hash());
     }
 
@@ -229,11 +257,11 @@ mod tests {
 
         let mut ws_a = WriteSet::default();
         ws_a.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(100u64)));
 
         let mut ws_b = WriteSet::default();
         ws_b.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(101u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(101u64)));
 
         assert_ne!(ws_a.hash(), ws_b.hash());
     }
@@ -242,9 +270,9 @@ mod tests {
     fn hash_differs_on_nonce_change() {
         let addr = Address::from([0x11u8; 20]);
         let mut ws_a = WriteSet::default();
-        ws_a.accounts.insert(addr, sample_account(0, 0));
+        ws_a.accounts.push((addr, sample_account(0, 0)));
         let mut ws_b = WriteSet::default();
-        ws_b.accounts.insert(addr, sample_account(0, 1));
+        ws_b.accounts.push((addr, sample_account(0, 1)));
         assert_ne!(ws_a.hash(), ws_b.hash());
     }
 
@@ -252,9 +280,9 @@ mod tests {
     fn hash_covers_code_bytes() {
         let h = B256::repeat_byte(0xAA);
         let mut ws_a = WriteSet::default();
-        ws_a.code.insert(h, Bytes::from_static(&[0x60, 0x00]));
+        ws_a.code.push((h, Bytes::from_static(&[0x60, 0x00])));
         let mut ws_b = WriteSet::default();
-        ws_b.code.insert(h, Bytes::from_static(&[0x60, 0x01]));
+        ws_b.code.push((h, Bytes::from_static(&[0x60, 0x01])));
         assert_ne!(ws_a.hash(), ws_b.hash());
     }
 
@@ -264,15 +292,15 @@ mod tests {
         let mut delta = PendingDelta::default();
 
         let mut ws1 = WriteSet::default();
-        ws1.accounts.insert(addr, sample_account(10, 1));
+        ws1.accounts.push((addr, sample_account(10, 1)));
         ws1.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(100u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(100u64)));
         delta.apply(ws1);
 
         let mut ws2 = WriteSet::default();
-        ws2.accounts.insert(addr, sample_account(15, 2));
+        ws2.accounts.push((addr, sample_account(15, 2)));
         ws2.storage
-            .insert((addr, B256::from(U256::from(1u64))), U256::from(200u64));
+            .push(((addr, B256::from(U256::from(1u64))), U256::from(200u64)));
         delta.apply(ws2);
 
         let (nonce, balance, _ch) = delta.accounts[&addr];

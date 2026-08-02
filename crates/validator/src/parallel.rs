@@ -43,6 +43,14 @@ pub struct ClaimIndex {
     pub nonce: BTreeMap<Address, Vec<(u64, u64)>>,
     /// Read-only slots per account (attribution only; not seeds).
     pub reads: BTreeMap<Address, Vec<B256>>,
+    /// address → ordered (bal_index, deployed code). CODE IS A SEED: a
+    /// CREATE in chunk i followed by a CALL in chunk j > i (one block)
+    /// must seed chunk j with the BYTECODE, not just the account entry —
+    /// the original spec excluded code from attribution reasoning from
+    /// the wave-DAG model (ordering), which the seeded model does not
+    /// have. Without this every cross-chunk call to a same-block contract
+    /// no-ops against empty code (the burst-block divergence).
+    pub code: BTreeMap<Address, Vec<(u64, bytes::Bytes)>>,
 }
 
 impl ClaimIndex {
@@ -86,6 +94,20 @@ impl ClaimIndex {
                 v.sort_by_key(|(i, _)| *i);
                 out.nonce.insert(addr, v);
             }
+            if !acct.code_changes.is_empty() {
+                let mut v: Vec<(u64, bytes::Bytes)> = acct
+                    .code_changes
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.block_access_index,
+                            bytes::Bytes::copy_from_slice(c.new_code.as_ref()),
+                        )
+                    })
+                    .collect();
+                v.sort_by_key(|(i, _)| *i);
+                out.code.insert(addr, v);
+            }
         }
         out
     }
@@ -104,6 +126,13 @@ impl ClaimIndex {
         self.balance
             .get(&addr)
             .and_then(|w| w.iter().rev().find(|(i, _)| *i < before).map(|(_, v)| *v))
+    }
+
+    /// Latest claimed CODE strictly before `bal_index`.
+    pub fn code_seed(&self, addr: Address, before: u64) -> Option<&bytes::Bytes> {
+        self.code
+            .get(&addr)
+            .and_then(|w| w.iter().rev().find(|(i, _)| *i < before).map(|(_, c)| c))
     }
 
     /// Latest claimed nonce strictly before `bal_index`.
@@ -135,10 +164,17 @@ impl ClaimIndex {
                 nonce.insert(*addr, *v);
             }
         }
+        let mut code = BTreeMap::new();
+        for (addr, writes) in &self.code {
+            if let Some((_, c)) = writes.iter().rev().find(|(i, _)| *i >= from && *i <= to) {
+                code.insert(*addr, alloy_primitives::keccak256(c));
+            }
+        }
         ClaimSlice {
             storage,
             balance,
             nonce,
+            code,
         }
     }
 }
@@ -149,25 +185,12 @@ pub struct ClaimSlice {
     pub storage: BTreeMap<(Address, B256), U256>,
     pub balance: BTreeMap<Address, U256>,
     pub nonce: BTreeMap<Address, u64>,
+    /// keccak of the unit-final claimed code (bytes stay out of the
+    /// comparison struct; the hash pins them).
+    pub code: BTreeMap<Address, B256>,
 }
 
 impl ClaimSlice {
-    /// Project a re-executed batch's merged `WriteSet` into the same shape,
-    /// so verification is a structural equality.
-    pub fn from_write_set(ws: &WriteSet) -> Self {
-        let mut balance = BTreeMap::new();
-        let mut nonce = BTreeMap::new();
-        for (addr, (n, bal, _code)) in &ws.accounts {
-            balance.insert(*addr, *bal);
-            nonce.insert(*addr, *n);
-        }
-        Self {
-            storage: ws.storage.clone(),
-            balance,
-            nonce,
-        }
-    }
-
     /// Human-readable first difference, for the divergence reason.
     pub fn diff_summary(&self, other: &Self) -> String {
         for (k, v) in &self.storage {
@@ -211,6 +234,18 @@ impl ClaimSlice {
         for (a, v) in &other.nonce {
             if !self.nonce.contains_key(a) {
                 return format!("nonce {a:?}: unclaimed write {v}");
+            }
+        }
+        for (a, v) in &self.code {
+            match other.code.get(a) {
+                Some(o) if o == v => {}
+                Some(o) => return format!("code {a:?}: claimed {v}, recomputed {o}"),
+                None => return format!("code {a:?}: claimed {v}, recomputed absent"),
+            }
+        }
+        for (a, v) in &other.code {
+            if !self.code.contains_key(a) {
+                return format!("code {a:?}: unclaimed deploy {v}");
             }
         }
         "sets differ".to_string()
@@ -336,23 +371,6 @@ use kardamom_engine::exec_types::TxIndex;
 use kardamom_engine::executor::execute_tx;
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 
-impl ClaimSlice {
-    /// Project a batch's merged [`PendingDelta`] into claim shape.
-    pub fn from_pending(delta: &PendingDelta) -> Self {
-        let mut balance = BTreeMap::new();
-        let mut nonce = BTreeMap::new();
-        for (addr, (n, bal, _code)) in &delta.accounts {
-            balance.insert(*addr, *bal);
-            nonce.insert(*addr, *n);
-        }
-        Self {
-            storage: delta.storage.clone(),
-            balance,
-            nonce,
-        }
-    }
-}
-
 /// One transaction as the validator receives it from the canonical stream.
 pub struct BlockTx {
     pub tx_idx: TxIndex,
@@ -375,31 +393,49 @@ pub struct BatchOutcome {
 /// components have earlier claims, falling back to the snapshot.
 pub fn build_seed<S: StateDatabase>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     claims: &ClaimIndex,
     before: u64,
 ) -> Result<PendingDelta, ExecutorError> {
-    let mut seed = PendingDelta::new();
+    // Base = the parent layer (merged not-yet-durable writes of earlier
+    // blocks): the snapshot alone can be K blocks stale under the depth-K
+    // commit pipeline. Claim seeds overlay ON TOP — intra-block claims are
+    // newer than any parent state.
+    let mut seed = parent.cloned().unwrap_or_default();
 
     let mut addrs: Vec<Address> = claims.balance.keys().copied().collect();
     addrs.extend(claims.nonce.keys().copied());
+    addrs.extend(claims.code.keys().copied());
     addrs.sort_unstable();
     addrs.dedup();
     for addr in addrs {
         let claimed_bal = claims.balance_seed(addr, before);
         let claimed_nonce = claims.nonce_seed(addr, before);
-        if claimed_bal.is_none() && claimed_nonce.is_none() {
+        let claimed_code = claims.code_seed(addr, before);
+        if claimed_bal.is_none() && claimed_nonce.is_none() && claimed_code.is_none() {
             continue; // nothing claimed before this batch — snapshot stands
         }
-        let base = snapshot
-            .basic(addr)
-            .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
-            .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY));
+        let base = match seed.accounts.get(&addr) {
+            Some(v) => *v, // parent layer already has the freshest base
+            None => snapshot
+                .basic(addr)
+                .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
+                .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY)),
+        };
+        let code_hash = match claimed_code {
+            Some(code) => {
+                let h = alloy_primitives::keccak256(code);
+                seed.code.insert(h, code.clone());
+                h
+            }
+            None => base.2,
+        };
         seed.accounts.insert(
             addr,
             (
                 claimed_nonce.unwrap_or(base.0),
                 claimed_bal.unwrap_or(base.1),
-                base.2,
+                code_hash,
             ),
         );
     }
@@ -422,52 +458,75 @@ pub fn execute_batch<S: StateDatabase>(
     claims: &ClaimIndex,
     env: ExecEnv,
     first_index: u64,
+    granularity: u16,
 ) -> Result<BatchOutcome, ExecutorError> {
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(txs.len());
     let mut cumulative = 0u64;
+    // At granularity K > 1 the wire claims are chunk-collapsed, so per-tx
+    // comparison is impossible: verification coarsens to the CHUNK — the
+    // batch is chunk-ALIGNED (batch_size == K, enforced by the caller),
+    // its captured Bal is quantized through the SAME shared code the
+    // executor used, and compared once at the end.
+    let mut batch_bal = revm::state::bal::Bal::new();
+    // ONE execution scope per batch (EVM + commit-into cache reused across
+    // the batch's txs — the per-tx construction was ~90% of execution-path
+    // allocation). The seed layer plays the parent role.
+    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, Some(seed), env)?;
     for (i, tx) in txs.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
         // Recompute this tx's claims through the executor's EXACT capture
-        // path (execute_tx feeds revm's Bal, which records per-FIELD
+        // path (the scope feeds revm's Bal, which records per-FIELD
         // changes: a transfer's recipient claims a balance change but NO
         // nonce change). Comparing a WriteSet projection instead diverged
-        // on every live transfer — the WriteSet carries the full
-        // (nonce, balance) triple for every touched account, so the
-        // recipient's UNCHANGED nonce showed up computed-but-not-claimed.
-        // Symmetric construction is the only drift-proof comparison.
-        let mut tx_bal = revm::state::bal::Bal::new();
-        let (receipt, ws) = execute_tx(
-            snapshot,
-            Some(seed),
-            &delta,
-            env,
+        // on every live transfer — symmetric construction is the only
+        // drift-proof comparison.
+        let (receipt, ws) = scope.execute_tx(
             tx.tx_idx,
             tx.position,
             &tx.envelope,
             global_index_in_block,
             cumulative,
-            Some((&mut tx_bal, bal_index)),
+            Some((&mut batch_bal, bal_index)),
         )?;
-        // Verify the claim WHERE IT IS PRODUCED — per tx, not per batch.
-        // Batch-final comparison alone would leave intra-batch claims
-        // unchecked: they are neither seeds (a later batch seeds from the
-        // last claim before it) nor outputs, so a wrong intermediate
-        // attribution would ship unnoticed while the final state matched.
-        // EIP-7928 attributes per tx, so it is verified per tx.
-        let claimed = claims.claims_in_range(bal_index, bal_index);
-        let computed =
-            ClaimIndex::from_alloy(&tx_bal.into_alloy_bal()).claims_in_range(bal_index, bal_index);
-        if claimed != computed {
-            return Err(ExecutorError::Divergence(format!(
-                "tx {bal_index}: {}",
-                claimed.diff_summary(&computed)
-            )));
-        }
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
+    }
+    // Verify claims WHERE THEY ARE PRODUCED. At granularity 1 that is per
+    // tx (batch-final comparison alone would leave intra-batch claims
+    // unchecked — neither seeds nor outputs — so a wrong intermediate
+    // attribution would ship while the final state matched); at K > 1 the
+    // finest producible unit IS the chunk, and the aligned batch is one
+    // chunk. Both sides of the comparison pass through the shared
+    // capture/quantize path, so shape drift is impossible by construction.
+    let computed_alloy =
+        kardamom_engine::bal_ladder::quantize(batch_bal.into_alloy_bal(), granularity);
+    let computed_idx = ClaimIndex::from_alloy(&computed_alloy);
+    let k = u64::from(granularity.max(1));
+    let last_index = first_index + txs.len() as u64 - 1;
+    if granularity <= 1 {
+        for unit in first_index..=last_index {
+            let claimed = claims.claims_in_range(unit, unit);
+            let computed = computed_idx.claims_in_range(unit, unit);
+            if claimed != computed {
+                return Err(ExecutorError::Divergence(format!(
+                    "tx {unit}: {}",
+                    claimed.diff_summary(&computed)
+                )));
+            }
+        }
+    } else {
+        let chunk = kardamom_engine::bal_ladder::chunk_of(first_index, k);
+        let claimed = claims.claims_in_range(chunk, chunk);
+        let computed = computed_idx.claims_in_range(chunk, chunk);
+        if claimed != computed {
+            return Err(ExecutorError::Divergence(format!(
+                "chunk {chunk} (txs {first_index}..={last_index}): {}",
+                claimed.diff_summary(&computed)
+            )));
+        }
     }
     Ok(BatchOutcome {
         first_index,
@@ -497,10 +556,12 @@ pub struct BlockOutcome {
 /// later batches that merely consume it.
 pub fn execute_block_parallel<S: StateDatabase + Sync>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     txs: &[BlockTx],
     claims: &ClaimIndex,
     env: ExecEnv,
     batch_size: usize,
+    granularity: u16,
 ) -> Result<BlockOutcome, ExecutorError> {
     if txs.is_empty() {
         return Ok(BlockOutcome {
@@ -509,7 +570,19 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
             batches: 0,
         });
     }
-    let ranges = batch_ranges(txs.len(), batch_size);
+    // SAME-VIEW INVARIANT: the attribution granularity comes from the FRAME
+    // (what the executor actually produced), never from local config. At
+    // K > 1, execution batches must be chunk-ALIGNED — batch size == K and
+    // ranges tile from index 1 — so the chunk a batch verifies is exactly
+    // the chunk the executor collapsed. Claims (and therefore seeds) are
+    // chunk-indexed at K > 1.
+    let k = u64::from(granularity.max(1));
+    let effective_batch = if granularity > 1 {
+        granularity as usize
+    } else {
+        batch_size
+    };
+    let ranges = batch_ranges(txs.len(), effective_batch);
 
     // Every batch runs concurrently: its inputs come from the claims, so no
     // batch waits on another.
@@ -520,8 +593,16 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
                 let slice = &txs[(*from as usize - 1)..(*to as usize)];
                 let from = *from;
                 scope.spawn(move || {
-                    let seed = build_seed(snapshot, claims, from)?;
-                    execute_batch(snapshot, &seed, slice, claims, env, from)
+                    // Seeds look up "latest claim strictly before this
+                    // batch" in the CLAIM index space: tx indices at K = 1,
+                    // chunk ordinals at K > 1.
+                    let before = if k > 1 {
+                        kardamom_engine::bal_ladder::chunk_of(from, k)
+                    } else {
+                        from
+                    };
+                    let seed = build_seed(snapshot, parent, claims, before)?;
+                    execute_batch(snapshot, &seed, slice, claims, env, from, granularity)
                 })
             })
             .collect();
@@ -695,7 +776,7 @@ mod engine_tests {
         let expected = seq_delta(&snap, &txs);
 
         for batch_size in [1usize, 5, 10] {
-            let out = execute_block_parallel(&snap, &txs, &claims, env(), batch_size)
+            let out = execute_block_parallel(&snap, None, &txs, &claims, env(), batch_size, 1)
                 .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
             assert_eq!(
                 out.delta.accounts, expected.accounts,
@@ -736,7 +817,7 @@ mod engine_tests {
             entry.1 += U256::from(1_000_000u64);
         }
 
-        let err = execute_block_parallel(&snap, &txs, &claims, env(), 5)
+        let err = execute_block_parallel(&snap, None, &txs, &claims, env(), 5, 1)
             .expect_err("a forged claim must be caught");
         match err {
             ExecutorError::Divergence(msg) => {
@@ -750,10 +831,146 @@ mod engine_tests {
         }
     }
 
+    /// K = 20 end-to-end: quantized wire claims + chunk-aligned batches
+    /// must be parity-identical to sequential, and a forged CHUNK claim
+    /// must fail-stop naming the chunk. Exercises the same-view invariant:
+    /// both sides pass through the shared quantize().
+    #[test]
+    fn quantized_claims_verify_with_aligned_batches() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000CC");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        let txs: Vec<BlockTx> = (0..47).map(|i| tx(&signer, to, i, 100 + i, i)).collect();
+
+        // The executor's view: per-tx capture, then the SHARED quantize.
+        let per_tx = honest_claims(&snap, &txs);
+        let _ = &per_tx;
+        let mut bal = revm::state::bal::Bal::new();
+        let mut delta = PendingDelta::new();
+        let mut cumulative = 0u64;
+        for (i, t) in txs.iter().enumerate() {
+            let (r, ws) = execute_tx(
+                &snap,
+                None,
+                &delta,
+                env(),
+                t.tx_idx,
+                t.position,
+                &t.envelope,
+                i as u64,
+                cumulative,
+                Some((&mut bal, (i + 1) as u64)),
+            )
+            .expect("seq");
+            cumulative = r.cumulative_gas_used;
+            delta.apply(ws);
+        }
+        let expected = delta;
+        let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 20);
+        let claims = ClaimIndex::from_alloy(&quantized);
+
+        let out = execute_block_parallel(&snap, None, &txs, &claims, env(), 8, 20)
+            .expect("quantized parity");
+        assert_eq!(out.delta.accounts, expected.accounts);
+        assert_eq!(out.batches, 3, "47 txs at K=20 -> 3 aligned chunks");
+
+        // Forge a chunk-2 claim: must fail-stop naming the chunk.
+        let mut forged = claims.clone();
+        if let Some(w) = forged.balance.get_mut(&to) {
+            if let Some(e) = w.iter_mut().find(|(i, _)| *i == 2) {
+                e.1 += U256::from(999u64);
+            }
+        }
+        let err = execute_block_parallel(&snap, None, &txs, &forged, env(), 8, 20)
+            .expect_err("forged chunk claim must be caught");
+        match err {
+            ExecutorError::Divergence(msg) => {
+                assert!(msg.contains("chunk 2"), "must name the chunk: {msg}")
+            }
+            other => panic!("expected Divergence, got {other:?}"),
+        }
+    }
+
+    /// THE depth-K regression: under the pipelined commit the snapshot can
+    /// be K blocks stale — block 2's txs must observe block 1's writes via
+    /// the PARENT layer. The first DeFi gate diverged exactly here: the
+    /// hook dropped the parent, the validator saw stale nonces, and skipped
+    /// txs the executor had executed.
+    #[test]
+    fn parent_layer_bridges_the_uncommitted_gap() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000DD");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+
+        // Block 1: nonces 0..3, executed and folded into a parent layer —
+        // but NEVER committed to the snapshot (StaticSnapshotSource
+        // semantics: the mock snapshot still says nonce 0).
+        let b1: Vec<BlockTx> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
+        let claims1 = honest_claims(&snap, &b1);
+        let out1 =
+            execute_block_parallel(&snap, None, &b1, &claims1, env(), 2, 1).expect("block 1");
+        let parent = out1.delta.clone();
+
+        // Block 2: nonces 4..7. Against the bare snapshot every tx is a
+        // nonce-mismatch skip; with the parent layer they execute.
+        let b2: Vec<BlockTx> = (4..8).map(|i| tx(&signer, to, i, 100, i)).collect();
+        // Build block-2 claims through the same capture path, WITH parent.
+        let mut bal = revm::state::bal::Bal::new();
+        let mut delta = PendingDelta::new();
+        let mut cumulative = 0u64;
+        for (i, t) in b2.iter().enumerate() {
+            let (r, ws) = execute_tx(
+                &snap,
+                Some(&parent),
+                &delta,
+                env(),
+                t.tx_idx,
+                t.position,
+                &t.envelope,
+                i as u64,
+                cumulative,
+                Some((&mut bal, (i + 1) as u64)),
+            )
+            .expect("seq block 2");
+            assert!(r.status, "block-2 txs must execute given the parent");
+            cumulative = r.cumulative_gas_used;
+            delta.apply(ws);
+        }
+        let claims2 = ClaimIndex::from_alloy(&bal.into_alloy_bal());
+
+        // WITHOUT parent: the stale-state bug — every tx skips.
+        let stale = execute_block_parallel(&snap, None, &b2, &claims2, env(), 2, 1);
+        assert!(
+            stale.is_err(),
+            "without the parent layer the block must diverge (skips vs claims)"
+        );
+
+        // WITH parent: byte-identical to the sequential-with-parent run.
+        let out2 = execute_block_parallel(&snap, Some(&parent), &b2, &claims2, env(), 2, 1)
+            .expect("block 2 with parent");
+        assert_eq!(out2.delta.accounts, delta.accounts);
+        assert!(out2.receipts.iter().all(|r| r.status));
+    }
+
     #[test]
     fn empty_block_is_a_no_op() {
         let snap = MockStateDatabase::builder().build();
-        let out = execute_block_parallel(&snap, &[], &ClaimIndex::default(), env(), 5).unwrap();
+        let out =
+            execute_block_parallel(&snap, None, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
         assert!(out.receipts.is_empty() && out.batches == 0);
     }
 }
@@ -776,12 +993,14 @@ const CLAIM_WAIT: Duration = Duration::from_millis(250);
 /// attribution). Identical semantics to the engine's streaming path.
 pub fn execute_block_sequential<S: StateDatabase>(
     snapshot: &S,
+    parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<BlockExecOutput, ExecutorError> {
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
+    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
         let (receipt, ws) = match rec {
@@ -789,40 +1008,92 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 tx_idx,
                 envelope,
                 position,
-            } => execute_tx(
-                snapshot,
-                None,
-                &delta,
-                env,
-                *tx_idx,
-                *position,
-                envelope,
-                idx_in_block,
-                cumulative,
-                None,
-            )?,
+            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
                 position,
-            } => execute_deposit_tx(
-                snapshot,
-                None,
-                &delta,
-                env,
-                *tx_idx,
-                *position,
-                deposit,
-                idx_in_block,
-                cumulative,
-                None,
-            )?,
+            } => {
+                let out = execute_deposit_tx(
+                    snapshot,
+                    parent,
+                    &delta,
+                    env,
+                    *tx_idx,
+                    *position,
+                    deposit,
+                    idx_in_block,
+                    cumulative,
+                    None,
+                )?;
+                // Fold deposit writes into the scope cache (mirrors the
+                // actor's streaming path) so later txs observe them.
+                let mut layer = PendingDelta::new();
+                layer.apply(out.1.clone());
+                scope.seed_layer(&layer)?;
+                out
+            }
         };
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
     }
     Ok(BlockExecOutput { receipts, delta })
+}
+
+/// Serialize a diverging block's inputs for offline replay. Best-effort:
+/// failures only log. Format: JSON envelope with hex payloads — small
+/// (one block), self-contained, versioned by field presence.
+fn dump_divergence_inputs(
+    block: u64,
+    txs: &[BlockTx],
+    claims: &ClaimIndex,
+    parent: Option<&PendingDelta>,
+    granularity: u16,
+    err: &ExecutorError,
+) {
+    let dir = std::path::Path::new("/opt/kardamom/state");
+    let path = dir.join(format!("divergence-{block}.json"));
+    let payload = serde_json::json!({
+        "block": block,
+        "granularity": granularity,
+        "error": format!("{err:?}"),
+        "txs": txs.iter().map(|t| serde_json::json!({
+            "raw": alloy_primitives::hex::encode(&t.envelope.raw_tx),
+            "sender": format!("{:?}", t.envelope.sender),
+            "hash": format!("{:?}", t.envelope.tx_hash),
+            "correlation_id": t.envelope.correlation_id,
+            "idx": t.tx_idx.0,
+            "pos": t.position.as_index(),
+        })).collect::<Vec<_>>(),
+        "claims_storage": claims.storage.iter().map(|((a, k), w)| serde_json::json!({
+            "addr": format!("{a:?}"), "slot": format!("{k:?}"),
+            "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "claims_balance": claims.balance.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "claims_nonce": claims.nonce.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.clone(),
+        })).collect::<Vec<_>>(),
+        "parent_accounts": parent.map(|p| p.accounts.iter().map(|(a, (n, b, c))| serde_json::json!({
+            "addr": format!("{a:?}"), "nonce": n, "balance": b.to_string(), "code_hash": format!("{c:?}"),
+        })).collect::<Vec<_>>()),
+        "parent_storage": parent.map(|p| p.storage.iter().map(|((a, k), v)| serde_json::json!({
+            "addr": format!("{a:?}"), "slot": format!("{k:?}"), "value": v.to_string(),
+        })).collect::<Vec<_>>()),
+    });
+    match std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            tracing::error!(block, path = %path.display(), "divergence inputs dumped for offline replay")
+        }
+        Err(e) => tracing::warn!(block, error = %e, "divergence dump failed"),
+    }
 }
 
 /// Build the validator's whole-block execution strategy: seeded parallel
@@ -834,17 +1105,21 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
     batch_size: usize,
 ) -> BlockExec<D> {
     Box::new(
-        move |snapshot: &D, records: &[BufferedRecord], env: ExecEnv, block: u64| {
+        move |snapshot: &D,
+              parent: Option<&PendingDelta>,
+              records: &[BufferedRecord],
+              env: ExecEnv,
+              block: u64| {
             let tx_only = records
                 .iter()
                 .all(|r| matches!(r, BufferedRecord::Tx { .. }));
             if !tx_only || records.is_empty() {
-                return execute_block_sequential(snapshot, records, env);
+                return execute_block_sequential(snapshot, parent, records, env);
             }
-            let Some(idx) = claims.take(block, CLAIM_WAIT) else {
+            let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
                 crate::metrics::counter_parallel_fallback();
                 tracing::debug!(block, "no BAL claims in time; sequential re-execution");
-                return execute_block_sequential(snapshot, records, env);
+                return execute_block_sequential(snapshot, parent, records, env);
             };
             let txs: Vec<BlockTx> = records
                 .iter()
@@ -861,7 +1136,25 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                     BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
                 })
                 .collect();
-            let out = execute_block_parallel(snapshot, &txs, &idx, env, batch_size)?;
+            let out = match execute_block_parallel(
+                snapshot,
+                parent,
+                &txs,
+                &idx,
+                env,
+                batch_size,
+                granularity,
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    // FLIGHT RECORDER: the live K=20 DeFi divergence is
+                    // deterministic but has resisted offline modelling
+                    // (the composition sweep passes). Dump the exact
+                    // inputs so the failing block replays as a unit test.
+                    dump_divergence_inputs(block, &txs, &idx, parent, granularity, &e);
+                    return Err(e);
+                }
+            };
             crate::metrics::counter_parallel_block(out.batches);
             Ok(BlockExecOutput {
                 receipts: out.receipts,

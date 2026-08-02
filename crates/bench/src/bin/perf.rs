@@ -76,6 +76,9 @@ struct RunArgs {
     /// Ingress JSON-RPC URL.
     #[arg(long, default_value = "http://192.168.56.31:8545")]
     rpc: String,
+    /// Workload for the ramp+soak phases: transfers or defi.
+    #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
+    workload: kardamom_bench::load::Workload,
     /// L2 chain id (deploy/cluster genesis).
     #[arg(long, default_value_t = 412346)]
     chain_id: u64,
@@ -126,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
     LoadConfig {
+        workload: a.workload,
         rpc: a.rpc.clone(),
         chain_id: Some(a.chain_id),
         duration: Duration::from_secs(0),

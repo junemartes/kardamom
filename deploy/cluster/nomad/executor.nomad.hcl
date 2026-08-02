@@ -78,9 +78,15 @@ job "executor" {
       # encoded sizes at each K so the batch size can be chosen from data.
       # Unset in normal operation; harmless (log-only) when set.
       env {
-        # Set to a K list (e.g. "1,5,10,20") to log per-granularity encoded
-        # sizes per block; unset in normal operation.
-        # KARDAMOM_BAL_MEASURE = "1,5,10,20"
+        # BAL attribution granularity: K=20 measured -31% frame bytes on
+        # contract workloads (docs/agents/2026-08-01-bal-phase1-measurement
+        # + the DeFi run) at zero parallelism cost under seeded execution.
+        KARDAMOM_BAL_GRANULARITY = "20"
+        # NOTE: KARDAMOM_BAL_MEASURE stays UNSET in deployed profiles. The
+        # K-ladder measure mode re-encodes every frame 4x ON THE PUBLISHER
+        # THREAD; under DeFi loads that saturated the publisher, filled the
+        # bounded exec->publisher handoff, and back-pressured the exec
+        # thread into 10-15s stalls (the wandering ramp cliff).
       }
 
       config {

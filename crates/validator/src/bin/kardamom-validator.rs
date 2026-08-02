@@ -392,48 +392,45 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
+                if let kardamom_types::BalFrame::V2 {
+                    bal_rlp,
+                    granularity,
+                    delta,
+                } = &frame
                 {
-                    if let kardamom_types::BalFrame::V2 {
-                        bal_rlp,
-                        granularity,
-                        delta,
-                    } = &frame
-                    {
-                        // Decode the access list into seed-lookup form for the
-                        // parallel engine. A decode failure degrades to
-                        // sequential re-execution (the merged cross-check below
-                        // is unaffected), never to a verification gap.
-                        let mut slice: &[u8] = bal_rlp;
-                        match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
-                            &mut slice,
-                        ) {
-                            // Empty lists are skipped: empty blocks never take
-                            // claims (the parallel path short-circuits before
-                            // its take), so inserting them would grow the
-                            // buffer for the whole idle period — the cursor
-                            // only advances on takes. Quantized frames
-                            // (granularity > 1) are also skipped: per-tx
-                            // verification against chunk-collapsed claims
-                            // would false-diverge; those blocks validate
-                            // sequentially until ladder-aware verification
-                            // lands.
-                            Ok(bal) if !bal.is_empty() && *granularity == 1 => {
-                                claims_sub.insert(
-                                    delta.block_number,
-                                    kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
-                                );
-                            }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!(
-                                block = delta.block_number,
-                                error = %e,
-                                granularity,
-                                "BAL access-list decode failed; block validates sequentially"
-                            ),
+                    // Decode the access list into seed-lookup form for the
+                    // parallel engine. A decode failure degrades to
+                    // sequential re-execution (the merged cross-check below
+                    // is unaffected), never to a verification gap.
+                    let mut slice: &[u8] = bal_rlp;
+                    match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(
+                        &mut slice,
+                    ) {
+                        // Empty lists are skipped: empty blocks never take
+                        // claims (the parallel path short-circuits before
+                        // its take), so inserting them would grow the
+                        // buffer for the whole idle period — the cursor
+                        // only advances on takes. Quantized frames carry
+                        // their granularity so verification coarsens to
+                        // the chunk with batches aligned to it — the
+                        // validator's ladder view always follows the wire.
+                        Ok(bal) if !bal.is_empty() => {
+                            claims_sub.insert(
+                                delta.block_number,
+                                *granularity,
+                                kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
+                            );
                         }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(
+                            block = delta.block_number,
+                            error = %e,
+                            granularity,
+                            "BAL access-list decode failed; block validates sequentially"
+                        ),
                     }
-                    bals.insert(frame.delta().clone());
                 }
+                bals.insert(frame.delta().clone());
             }
         });
     }
@@ -503,7 +500,12 @@ async fn main() -> Result<()> {
         MdbxWriterQueue::new(writer.delta_tx.clone()),
         bals.clone(),
         divergence.clone(),
-    );
+    )
+    // Blocks at or below the recovery resume point were verified before
+    // the restart; replay re-execution against already-applied state
+    // yields empty deltas that CANNOT match the BAL — comparing them
+    // produced false-divergence restart cascades.
+    .with_verify_floor(recovery.last_committed_block);
 
     // L1 output attester: enabled only when the three flags are all present.
     // (Runs inside this tokio runtime; the task lives as long as a handle
