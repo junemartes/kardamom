@@ -274,3 +274,100 @@ mod tests {
         }
     }
 }
+
+/// Pre-sign per-sender queues of a SINGLE op family (allocation profiling:
+/// per-family numbers separate contract-execution cost from engine fixed
+/// cost). Families needing state (withdraw needs shares, cancel needs
+/// orders) interleave a setup op every 4th tx so the measured op dominates.
+pub fn pregenerate_family(
+    signers: &[DerivedSigner],
+    chain_id: u64,
+    contracts: &DefiContracts,
+    fam: &str,
+    per_sender: usize,
+    nonce_start: u64,
+    gas_price: u128,
+) -> anyhow::Result<Vec<Vec<PlannedTx>>> {
+    let mut out = Vec::with_capacity(signers.len());
+    for (sender, s) in signers.iter().enumerate() {
+        let base = if sender == 0 {
+            nonce_start + 3
+        } else {
+            nonce_start
+        };
+        let mut queue = Vec::with_capacity(per_sender);
+        for i in 0..per_sender {
+            let nonce = base + i as u64;
+            let seq = i as u64;
+            let (to, input, gas) = match (fam, i) {
+                (_, 0) => (contracts.pool, call("seed()", &[]), CALL_GAS_LIMIT),
+                ("swap", _) => (
+                    contracts.pool,
+                    call(
+                        "swap(bool,uint256)",
+                        &[U256::from(seq & 1), U256::from(10u128.pow(17))],
+                    ),
+                    CALL_GAS_LIMIT,
+                ),
+                ("vault_deposit", _) => (
+                    contracts.vault,
+                    call("deposit(uint256)", &[U256::from(10u128.pow(18))]),
+                    CALL_GAS_LIMIT,
+                ),
+                ("vault_withdraw", n) if n % 4 == 1 => (
+                    contracts.vault,
+                    call("deposit(uint256)", &[U256::from(4u128 * 10u128.pow(18))]),
+                    CALL_GAS_LIMIT,
+                ),
+                ("vault_withdraw", _) => (
+                    contracts.vault,
+                    call("withdraw(uint256)", &[U256::from(10u128.pow(17))]),
+                    CALL_GAS_LIMIT,
+                ),
+                ("clob_place", _) => (
+                    contracts.clob,
+                    call(
+                        "place(bool,uint256,uint96)",
+                        &[
+                            U256::from(seq & 1),
+                            U256::from(1_000 + seq % 64),
+                            U256::from(1_000_000u64),
+                        ],
+                    ),
+                    CALL_GAS_LIMIT,
+                ),
+                ("clob_cancel", n) if n % 2 == 1 => (
+                    contracts.clob,
+                    call(
+                        "place(bool,uint256,uint96)",
+                        &[
+                            U256::from(0u64),
+                            U256::from(1_000u64),
+                            U256::from(1_000_000u64),
+                        ],
+                    ),
+                    CALL_GAS_LIMIT,
+                ),
+                ("clob_cancel", _) => (
+                    contracts.clob,
+                    call("cancel(uint256)", &[U256::from(seq.max(1))]),
+                    CALL_GAS_LIMIT,
+                ),
+                ("transfer", _) => (Address::repeat_byte(0xEE), Bytes::new(), 21_000),
+                (other, _) => anyhow::bail!("unknown profile family {other:?}"),
+            };
+            queue.push(sign(
+                s,
+                chain_id,
+                nonce,
+                gas_price,
+                gas,
+                TxKind::Call(to),
+                input,
+                sender,
+            )?);
+        }
+        out.push(queue);
+    }
+    Ok(out)
+}

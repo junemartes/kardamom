@@ -769,10 +769,15 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
         ws.accounts
             .insert(*addr, (info.nonce, info.balance, info.code_hash));
 
-        // Code bytes: if revm loaded fresh bytecode this tx, capture it once
-        // keyed by code_hash. KECCAK_EMPTY is the canonical empty-code marker
-        // and isn't worth shipping in the delta.
-        if let Some(code) = info.code.as_ref()
+        // Code bytes: ONLY for accounts CREATED this tx. revm also loads
+        // the bytecode of every contract merely CALLED (`info.code` is
+        // populated on load), and the old unconditional capture copied the
+        // full runtime into the WriteSet per call — 1.6KB/tx on CLOB
+        // workloads, the second-largest allocation site post-ExecScope.
+        // A called contract's code is already durable (snapshot/parent);
+        // only a CREATE introduces new bytes the delta must carry.
+        if account.is_created()
+            && let Some(code) = info.code.as_ref()
             && info.code_hash != KECCAK_EMPTY
             && !code.is_empty()
         {

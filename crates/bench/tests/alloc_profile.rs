@@ -28,6 +28,15 @@ const CHAIN_ID: u64 = 412_346;
 const SENDERS: usize = 8;
 const TXS_PER_SENDER: usize = 400;
 
+/// Op family under measurement: `KARDAMOM_PROFILE_OPS` =
+/// mix (default) | swap | vault_deposit | vault_withdraw | clob_place |
+/// clob_cancel | transfer. Per-family numbers separate the contract
+/// execution cost (journal, cache inserts, logs) from the engine
+/// fixed cost — the mix hides where the bytes live.
+fn family() -> String {
+    std::env::var("KARDAMOM_PROFILE_OPS").unwrap_or_else(|_| "mix".into())
+}
+
 #[test]
 #[ignore = "profiling run — invoke explicitly with --ignored"]
 fn defi_execution_allocation_profile() {
@@ -43,15 +52,29 @@ fn defi_execution_allocation_profile() {
     }
     let snap = b.build();
     let (deploys, contracts) = deployment_txs(&signers, CHAIN_ID, 0, 1_000_000_000).unwrap();
-    let queues = pregenerate_defi(
-        &signers,
-        CHAIN_ID,
-        &contracts,
-        TXS_PER_SENDER,
-        0,
-        1_000_000_000,
-    )
-    .unwrap();
+    let fam = family();
+    let queues: Vec<Vec<kardamom_bench::load::plan::PlannedTx>> = if fam == "mix" {
+        pregenerate_defi(
+            &signers,
+            CHAIN_ID,
+            &contracts,
+            TXS_PER_SENDER,
+            0,
+            1_000_000_000,
+        )
+        .unwrap()
+    } else {
+        kardamom_bench::load::defi::pregenerate_family(
+            &signers,
+            CHAIN_ID,
+            &contracts,
+            &fam,
+            TXS_PER_SENDER,
+            0,
+            1_000_000_000,
+        )
+        .unwrap()
+    };
 
     let env = ExecEnv::new(
         CHAIN_ID,
@@ -183,7 +206,8 @@ fn defi_execution_allocation_profile() {
     let allocs = stats.total_blocks - stats0.total_blocks;
     let bytes = stats.total_bytes - stats0.total_bytes;
     println!(
-        "==================== ALLOCATION PROFILE (defi, {} txs) ====================",
+        "==================== ALLOCATION PROFILE ({} / {} txs) ====================",
+        family(),
         n
     );
     println!("allocs/tx:      {:.1}", allocs as f64 / n as f64);
@@ -199,4 +223,5 @@ fn defi_execution_allocation_profile() {
         (gas as f64 / 1e6) / wall.as_secs_f64()
     );
     drop(profiler); // writes dhat-heap.json with per-callsite attribution
+    let _ = std::fs::rename("dhat-heap.json", format!("dhat-heap-{}.json", family()));
 }
