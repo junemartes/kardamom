@@ -43,6 +43,14 @@ pub struct ClaimIndex {
     pub nonce: BTreeMap<Address, Vec<(u64, u64)>>,
     /// Read-only slots per account (attribution only; not seeds).
     pub reads: BTreeMap<Address, Vec<B256>>,
+    /// address → ordered (bal_index, deployed code). CODE IS A SEED: a
+    /// CREATE in chunk i followed by a CALL in chunk j > i (one block)
+    /// must seed chunk j with the BYTECODE, not just the account entry —
+    /// the original spec excluded code from attribution reasoning from
+    /// the wave-DAG model (ordering), which the seeded model does not
+    /// have. Without this every cross-chunk call to a same-block contract
+    /// no-ops against empty code (the burst-block divergence).
+    pub code: BTreeMap<Address, Vec<(u64, bytes::Bytes)>>,
 }
 
 impl ClaimIndex {
@@ -86,6 +94,20 @@ impl ClaimIndex {
                 v.sort_by_key(|(i, _)| *i);
                 out.nonce.insert(addr, v);
             }
+            if !acct.code_changes.is_empty() {
+                let mut v: Vec<(u64, bytes::Bytes)> = acct
+                    .code_changes
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.block_access_index,
+                            bytes::Bytes::copy_from_slice(c.new_code.as_ref()),
+                        )
+                    })
+                    .collect();
+                v.sort_by_key(|(i, _)| *i);
+                out.code.insert(addr, v);
+            }
         }
         out
     }
@@ -104,6 +126,13 @@ impl ClaimIndex {
         self.balance
             .get(&addr)
             .and_then(|w| w.iter().rev().find(|(i, _)| *i < before).map(|(_, v)| *v))
+    }
+
+    /// Latest claimed CODE strictly before `bal_index`.
+    pub fn code_seed(&self, addr: Address, before: u64) -> Option<&bytes::Bytes> {
+        self.code
+            .get(&addr)
+            .and_then(|w| w.iter().rev().find(|(i, _)| *i < before).map(|(_, c)| c))
     }
 
     /// Latest claimed nonce strictly before `bal_index`.
@@ -135,10 +164,17 @@ impl ClaimIndex {
                 nonce.insert(*addr, *v);
             }
         }
+        let mut code = BTreeMap::new();
+        for (addr, writes) in &self.code {
+            if let Some((_, c)) = writes.iter().rev().find(|(i, _)| *i >= from && *i <= to) {
+                code.insert(*addr, alloy_primitives::keccak256(c));
+            }
+        }
         ClaimSlice {
             storage,
             balance,
             nonce,
+            code,
         }
     }
 }
@@ -149,25 +185,12 @@ pub struct ClaimSlice {
     pub storage: BTreeMap<(Address, B256), U256>,
     pub balance: BTreeMap<Address, U256>,
     pub nonce: BTreeMap<Address, u64>,
+    /// keccak of the unit-final claimed code (bytes stay out of the
+    /// comparison struct; the hash pins them).
+    pub code: BTreeMap<Address, B256>,
 }
 
 impl ClaimSlice {
-    /// Project a re-executed batch's merged `WriteSet` into the same shape,
-    /// so verification is a structural equality.
-    pub fn from_write_set(ws: &WriteSet) -> Self {
-        let mut balance = BTreeMap::new();
-        let mut nonce = BTreeMap::new();
-        for (addr, (n, bal, _code)) in &ws.accounts {
-            balance.insert(*addr, *bal);
-            nonce.insert(*addr, *n);
-        }
-        Self {
-            storage: ws.storage.clone(),
-            balance,
-            nonce,
-        }
-    }
-
     /// Human-readable first difference, for the divergence reason.
     pub fn diff_summary(&self, other: &Self) -> String {
         for (k, v) in &self.storage {
@@ -211,6 +234,18 @@ impl ClaimSlice {
         for (a, v) in &other.nonce {
             if !self.nonce.contains_key(a) {
                 return format!("nonce {a:?}: unclaimed write {v}");
+            }
+        }
+        for (a, v) in &self.code {
+            match other.code.get(a) {
+                Some(o) if o == v => {}
+                Some(o) => return format!("code {a:?}: claimed {v}, recomputed {o}"),
+                None => return format!("code {a:?}: claimed {v}, recomputed absent"),
+            }
+        }
+        for (a, v) in &other.code {
+            if !self.code.contains_key(a) {
+                return format!("code {a:?}: unclaimed deploy {v}");
             }
         }
         "sets differ".to_string()
@@ -336,23 +371,6 @@ use kardamom_engine::exec_types::TxIndex;
 use kardamom_engine::executor::execute_tx;
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 
-impl ClaimSlice {
-    /// Project a batch's merged [`PendingDelta`] into claim shape.
-    pub fn from_pending(delta: &PendingDelta) -> Self {
-        let mut balance = BTreeMap::new();
-        let mut nonce = BTreeMap::new();
-        for (addr, (n, bal, _code)) in &delta.accounts {
-            balance.insert(*addr, *bal);
-            nonce.insert(*addr, *n);
-        }
-        Self {
-            storage: delta.storage.clone(),
-            balance,
-            nonce,
-        }
-    }
-}
-
 /// One transaction as the validator receives it from the canonical stream.
 pub struct BlockTx {
     pub tx_idx: TxIndex,
@@ -387,12 +405,14 @@ pub fn build_seed<S: StateDatabase>(
 
     let mut addrs: Vec<Address> = claims.balance.keys().copied().collect();
     addrs.extend(claims.nonce.keys().copied());
+    addrs.extend(claims.code.keys().copied());
     addrs.sort_unstable();
     addrs.dedup();
     for addr in addrs {
         let claimed_bal = claims.balance_seed(addr, before);
         let claimed_nonce = claims.nonce_seed(addr, before);
-        if claimed_bal.is_none() && claimed_nonce.is_none() {
+        let claimed_code = claims.code_seed(addr, before);
+        if claimed_bal.is_none() && claimed_nonce.is_none() && claimed_code.is_none() {
             continue; // nothing claimed before this batch — snapshot stands
         }
         let base = match seed.accounts.get(&addr) {
@@ -402,12 +422,20 @@ pub fn build_seed<S: StateDatabase>(
                 .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
                 .unwrap_or((0, U256::ZERO, alloy_primitives::KECCAK256_EMPTY)),
         };
+        let code_hash = match claimed_code {
+            Some(code) => {
+                let h = alloy_primitives::keccak256(code);
+                seed.code.insert(h, code.clone());
+                h
+            }
+            None => base.2,
+        };
         seed.accounts.insert(
             addr,
             (
                 claimed_nonce.unwrap_or(base.0),
                 claimed_bal.unwrap_or(base.1),
-                base.2,
+                code_hash,
             ),
         );
     }
@@ -441,22 +469,20 @@ pub fn execute_batch<S: StateDatabase>(
     // its captured Bal is quantized through the SAME shared code the
     // executor used, and compared once at the end.
     let mut batch_bal = revm::state::bal::Bal::new();
+    // ONE execution scope per batch (EVM + commit-into cache reused across
+    // the batch's txs — the per-tx construction was ~90% of execution-path
+    // allocation). The seed layer plays the parent role.
+    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, Some(seed), env)?;
     for (i, tx) in txs.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
         // Recompute this tx's claims through the executor's EXACT capture
-        // path (execute_tx feeds revm's Bal, which records per-FIELD
+        // path (the scope feeds revm's Bal, which records per-FIELD
         // changes: a transfer's recipient claims a balance change but NO
         // nonce change). Comparing a WriteSet projection instead diverged
-        // on every live transfer — the WriteSet carries the full
-        // (nonce, balance) triple for every touched account, so the
-        // recipient's UNCHANGED nonce showed up computed-but-not-claimed.
-        // Symmetric construction is the only drift-proof comparison.
-        let (receipt, ws) = execute_tx(
-            snapshot,
-            Some(seed),
-            &delta,
-            env,
+        // on every live transfer — symmetric construction is the only
+        // drift-proof comparison.
+        let (receipt, ws) = scope.execute_tx(
             tx.tx_idx,
             tx.position,
             &tx.envelope,
@@ -974,6 +1000,7 @@ pub fn execute_block_sequential<S: StateDatabase>(
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
+    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
         let (receipt, ws) = match rec {
@@ -981,40 +1008,92 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 tx_idx,
                 envelope,
                 position,
-            } => execute_tx(
-                snapshot,
-                parent,
-                &delta,
-                env,
-                *tx_idx,
-                *position,
-                envelope,
-                idx_in_block,
-                cumulative,
-                None,
-            )?,
+            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
                 position,
-            } => execute_deposit_tx(
-                snapshot,
-                parent,
-                &delta,
-                env,
-                *tx_idx,
-                *position,
-                deposit,
-                idx_in_block,
-                cumulative,
-                None,
-            )?,
+            } => {
+                let out = execute_deposit_tx(
+                    snapshot,
+                    parent,
+                    &delta,
+                    env,
+                    *tx_idx,
+                    *position,
+                    deposit,
+                    idx_in_block,
+                    cumulative,
+                    None,
+                )?;
+                // Fold deposit writes into the scope cache (mirrors the
+                // actor's streaming path) so later txs observe them.
+                let mut layer = PendingDelta::new();
+                layer.apply(out.1.clone());
+                scope.seed_layer(&layer)?;
+                out
+            }
         };
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
     }
     Ok(BlockExecOutput { receipts, delta })
+}
+
+/// Serialize a diverging block's inputs for offline replay. Best-effort:
+/// failures only log. Format: JSON envelope with hex payloads — small
+/// (one block), self-contained, versioned by field presence.
+fn dump_divergence_inputs(
+    block: u64,
+    txs: &[BlockTx],
+    claims: &ClaimIndex,
+    parent: Option<&PendingDelta>,
+    granularity: u16,
+    err: &ExecutorError,
+) {
+    let dir = std::path::Path::new("/opt/kardamom/state");
+    let path = dir.join(format!("divergence-{block}.json"));
+    let payload = serde_json::json!({
+        "block": block,
+        "granularity": granularity,
+        "error": format!("{err:?}"),
+        "txs": txs.iter().map(|t| serde_json::json!({
+            "raw": alloy_primitives::hex::encode(&t.envelope.raw_tx),
+            "sender": format!("{:?}", t.envelope.sender),
+            "hash": format!("{:?}", t.envelope.tx_hash),
+            "correlation_id": t.envelope.correlation_id,
+            "idx": t.tx_idx.0,
+            "pos": t.position.as_index(),
+        })).collect::<Vec<_>>(),
+        "claims_storage": claims.storage.iter().map(|((a, k), w)| serde_json::json!({
+            "addr": format!("{a:?}"), "slot": format!("{k:?}"),
+            "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "claims_balance": claims.balance.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+        "claims_nonce": claims.nonce.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.clone(),
+        })).collect::<Vec<_>>(),
+        "parent_accounts": parent.map(|p| p.accounts.iter().map(|(a, (n, b, c))| serde_json::json!({
+            "addr": format!("{a:?}"), "nonce": n, "balance": b.to_string(), "code_hash": format!("{c:?}"),
+        })).collect::<Vec<_>>()),
+        "parent_storage": parent.map(|p| p.storage.iter().map(|((a, k), v)| serde_json::json!({
+            "addr": format!("{a:?}"), "slot": format!("{k:?}"), "value": v.to_string(),
+        })).collect::<Vec<_>>()),
+    });
+    match std::fs::write(
+        &path,
+        serde_json::to_vec_pretty(&payload).unwrap_or_default(),
+    ) {
+        Ok(()) => {
+            tracing::error!(block, path = %path.display(), "divergence inputs dumped for offline replay")
+        }
+        Err(e) => tracing::warn!(block, error = %e, "divergence dump failed"),
+    }
 }
 
 /// Build the validator's whole-block execution strategy: seeded parallel
@@ -1057,8 +1136,25 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                     BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
                 })
                 .collect();
-            let out =
-                execute_block_parallel(snapshot, parent, &txs, &idx, env, batch_size, granularity)?;
+            let out = match execute_block_parallel(
+                snapshot,
+                parent,
+                &txs,
+                &idx,
+                env,
+                batch_size,
+                granularity,
+            ) {
+                Ok(out) => out,
+                Err(e) => {
+                    // FLIGHT RECORDER: the live K=20 DeFi divergence is
+                    // deterministic but has resisted offline modelling
+                    // (the composition sweep passes). Dump the exact
+                    // inputs so the failing block replays as a unit test.
+                    dump_divergence_inputs(block, &txs, &idx, parent, granularity, &e);
+                    return Err(e);
+                }
+            };
             crate::metrics::counter_parallel_block(out.batches);
             Ok(BlockExecOutput {
                 receipts: out.receipts,

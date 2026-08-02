@@ -136,22 +136,43 @@ fn defi_execution_allocation_profile() {
         delta.apply(ws);
     }
 
-    // Measured window under DHAT.
-    let profiler = dhat::Profiler::builder().testing().build();
+    // Measured window under DHAT — through the PRODUCTION path: ONE
+    // ExecScope per simulated block, re-scoped every BLOCK_TXS to model
+    // boundaries.
+    const BLOCK_TXS: usize = 1000;
+    let profiler = dhat::Profiler::builder().build();
     let stats0 = dhat::HeapStats::get();
     let t0 = std::time::Instant::now();
     let mut gas = 0u64;
     let measured: Vec<_> = txs.iter().skip(SENDERS * 4).collect();
-    for (si, t) in &measured {
-        let (r, ws) = run_one(
-            &snap,
-            &delta,
-            env,
-            t,
-            signers[*si].signer.address(),
-            &mut i,
-            &mut cumulative,
-        );
+    let mut scope: Option<kardamom_engine::executor::ExecScope<&MockStateDatabase>> = None;
+    for (n, (si, t)) in measured.iter().enumerate() {
+        if n % BLOCK_TXS == 0 {
+            let mut sc =
+                kardamom_engine::executor::ExecScope::new(&snap, None, env).expect("scope");
+            sc.seed_layer(&delta).expect("seed");
+            scope = Some(sc);
+        }
+        let e = TxEnvelope {
+            correlation_id: i,
+            raw_tx: t.raw.clone().into(),
+            sender: signers[*si].signer.address(),
+            tx_hash: t.hash,
+        };
+        let (r, ws) = scope
+            .as_mut()
+            .unwrap()
+            .execute_tx(
+                TxIndex(i),
+                BPosition::from_index(i),
+                &e,
+                i,
+                cumulative,
+                None,
+            )
+            .expect("execute");
+        cumulative = r.cumulative_gas_used;
+        i += 1;
         gas += r.gas_used;
         delta.apply(ws);
     }
