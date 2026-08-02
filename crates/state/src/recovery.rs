@@ -290,4 +290,88 @@ mod trie_bootstrap_tests {
         // Idempotent: re-running lands on the same root.
         assert_eq!(bootstrap_trie_from_state(&env).unwrap(), root);
     }
+
+    /// The join must not just adopt — VERIFIED execution continues on top of
+    /// the bootstrapped trie. After bootstrap, applying the next block
+    /// INCREMENTALLY must land on the same root as a pure full rebuild over
+    /// the merged state (the property the validator's post-adoption
+    /// verification rides on).
+    #[test]
+    fn incremental_block_on_bootstrapped_trie_matches_oracle() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = StateEnvBuilder::new(dir.path()).open().unwrap();
+        let addr_a = Address::repeat_byte(0x11);
+        let addr_c = Address::repeat_byte(0x33);
+
+        {
+            let txn = env.raw().begin_rw_sync().unwrap();
+            let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS)).unwrap();
+            let v = AccountValue {
+                nonce: 3,
+                balance: U256::from(100u64),
+                code_hash: B256::ZERO,
+                storage_root: B256::ZERO,
+            };
+            txn.put(
+                accounts_db,
+                encode_account_key(addr_a),
+                encode_account_value(&v),
+                WriteFlags::UPSERT,
+            )
+            .unwrap();
+            txn.commit().unwrap();
+        }
+        bootstrap_trie_from_state(&env).unwrap();
+
+        // "Next block": A bumps its nonce, C appears.
+        let delta = kardamom_types::BlockDelta {
+            block_number: 1,
+            accounts: vec![
+                kardamom_types::AccountChange {
+                    address: addr_a,
+                    nonce: 4,
+                    balance: U256::from(90u64),
+                    code_hash: B256::ZERO,
+                },
+                kardamom_types::AccountChange {
+                    address: addr_c,
+                    nonce: 1,
+                    balance: U256::from(10u64),
+                    code_hash: B256::ZERO,
+                },
+            ],
+            storage: Vec::new(),
+            code: Vec::new(),
+            receipts: Vec::new(),
+        };
+        let txn = env.raw().begin_rw_sync().unwrap();
+        let tables = crate::trie::TrieTables::open(&txn).unwrap();
+        let root = crate::trie::update_for_block(&txn, &tables, &delta).unwrap();
+        txn.commit().unwrap();
+
+        let want = crate::trie::state_root([
+            (
+                addr_a,
+                crate::trie::AccountTrieParts {
+                    nonce: 4,
+                    balance: U256::from(90u64),
+                    code_hash: B256::ZERO,
+                    storage_root: B256::ZERO,
+                },
+            ),
+            (
+                addr_c,
+                crate::trie::AccountTrieParts {
+                    nonce: 1,
+                    balance: U256::from(10u64),
+                    code_hash: B256::ZERO,
+                    storage_root: B256::ZERO,
+                },
+            ),
+        ]);
+        assert_eq!(
+            root, want,
+            "incremental block on a bootstrapped trie must match the oracle"
+        );
+    }
 }
