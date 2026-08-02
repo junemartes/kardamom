@@ -1,8 +1,8 @@
 //! DeFi bench workload: CLOB updates, Uniswap-style swaps, vault flows.
 //!
-//! Contracts live in `contracts/bench/src/BenchDefi.sol` (own foundry
+//! Contracts live in `bench-contracts/src/BenchDefi.sol` (own foundry
 //! project, isolated from the pinned CREATE2-sensitive one); creation
-//! bytecode is embedded via `contracts/bench/embed.sh` into
+//! bytecode is embedded via `bench-contracts/embed.sh` into
 //! `defi_bytecode.rs`. The mix is chosen for its BAL/write-set profile as
 //! much as its gas profile:
 //!
