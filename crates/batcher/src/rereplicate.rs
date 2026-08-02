@@ -137,11 +137,16 @@ where
 /// arbiter of WHICH side is corrupt — mirror inequality alone only proves that
 /// one of them is.
 pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, BatcherError> {
-    let diverged = diff_mirror(source_dir, dest_dir)?;
-    if !diverged.is_empty() {
+    let diff = diff_mirror(source_dir, dest_dir)?;
+    if !diff.is_clean() {
         return Err(BatcherError::Corruption(format!(
             "segments diverge from mirror: {}",
-            diverged.join(", ")
+            diff.diverged
+                .iter()
+                .cloned()
+                .chain(diff.dest_only.iter().map(|n| format!("{n} (dest-only)")))
+                .collect::<Vec<_>>()
+                .join(", ")
         )));
     }
     let mut verified = 0usize;
@@ -156,8 +161,28 @@ pub fn verify_mirror(source_dir: &Path, dest_dir: &Path) -> Result<usize, Batche
 /// Compare every source `.rec` against its mirror copy in `dest_dir` and
 /// return the names of segments that are missing or whose bytes differ. The
 /// heal path copies exactly this set (instead of the whole archive).
-pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<Vec<String>, BatcherError> {
-    let mut diverged = Vec::new();
+/// What [`diff_mirror`] found. `diverged` are segments the mirror can vouch
+/// for and [`heal_from_mirror`] can repair; `dest_only` are segments present
+/// ONLY on the destination — recording ids are per-archive counters, so a
+/// daemon restart / post-restore session opens ids the mirror never has
+/// (issue #126). Those are UNHEALABLE from this mirror and must be surfaced,
+/// not silently skipped: an iterate-source-only diff claims "no divergence"
+/// for bytes the mirror cannot vouch for.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MirrorDiff {
+    pub diverged: Vec<String>,
+    pub dest_only: Vec<String>,
+}
+
+impl MirrorDiff {
+    pub fn is_clean(&self) -> bool {
+        self.diverged.is_empty() && self.dest_only.is_empty()
+    }
+}
+
+pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<MirrorDiff, BatcherError> {
+    let mut diff = MirrorDiff::default();
+    let mut source_names = std::collections::HashSet::new();
     for entry in std::fs::read_dir(source_dir)? {
         let entry = entry?;
         let path = entry.path();
@@ -167,11 +192,23 @@ pub fn diff_mirror(source_dir: &Path, dest_dir: &Path) -> Result<Vec<String>, Ba
         let name = entry.file_name().to_string_lossy().into_owned();
         let dest = dest_dir.join(entry.file_name());
         if !dest.is_file() || files_differ(&path, &dest)? {
-            diverged.push(name);
+            diff.diverged.push(name.clone());
+        }
+        source_names.insert(name);
+    }
+    for entry in std::fs::read_dir(dest_dir)? {
+        let entry = entry?;
+        if !entry.path().extension().is_some_and(|x| x == "rec") {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !source_names.contains(&name) {
+            diff.dest_only.push(name);
         }
     }
-    diverged.sort();
-    Ok(diverged)
+    diff.diverged.sort();
+    diff.dest_only.sort();
+    Ok(diff)
 }
 
 /// Chunked byte compare — segments can be large, so never slurp whole files.
@@ -349,8 +386,35 @@ mod tests {
         write(dst.path(), "1-0.rec", &corrupt);
         std::fs::remove_file(dst.path().join("2-0.rec")).unwrap();
 
-        let diverged = diff_mirror(src.path(), dst.path()).unwrap();
-        assert_eq!(diverged, vec!["1-0.rec".to_string(), "2-0.rec".to_string()]);
+        let diff = diff_mirror(src.path(), dst.path()).unwrap();
+        assert_eq!(
+            diff.diverged,
+            vec!["1-0.rec".to_string(), "2-0.rec".to_string()]
+        );
+        assert!(diff.dest_only.is_empty());
+    }
+
+    /// Issue #126: recording ids are per-archive counters, so a restarted /
+    /// post-restore destination owns segment names the mirror never has. An
+    /// iterate-source-only diff silently skips them — they must surface as
+    /// dest-only (unhealable from this mirror, but absolutely a divergence).
+    #[test]
+    fn diff_reports_dest_only_segments() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        write(src.path(), "0-0.rec", &[1u8; 1024]);
+        mirror_archive(src.path(), dst.path()).unwrap();
+        write(dst.path(), "11-0.rec", &[7u8; 1024]);
+
+        let diff = diff_mirror(src.path(), dst.path()).unwrap();
+        assert!(diff.diverged.is_empty());
+        assert_eq!(diff.dest_only, vec!["11-0.rec".to_string()]);
+        assert!(!diff.is_clean());
+        // And the mirror-equality gate refuses to call this archive clean.
+        let err = verify_mirror(src.path(), dst.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("11-0.rec (dest-only)"), "got: {err}");
     }
 
     #[test]

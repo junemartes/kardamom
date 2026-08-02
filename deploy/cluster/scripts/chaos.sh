@@ -1300,6 +1300,17 @@ run_case() { # <case-name>
           'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
         cand_name="$(basename "${cand}")"
         cand_rid="${cand_name%%-*}"
+        # #126: recording ids are per-archive counters, so the victim's
+        # post-restart/post-restore sessions (archive-driver-loss and
+        # archive-tx-data-wipe both run earlier in this shard) own ids the
+        # mirror never opened. A victim-only segment is unhealable from the
+        # mirror BY CONSTRUCTION — no source bytes exist — so it cannot
+        # drill the detect→heal loop; only candidates present on BOTH
+        # archives qualify. (--diff now surfaces such segments as
+        # "dest-only" instead of silently skipping them.)
+        if ! docker exec kardamom-ingress-1 test -f "/opt/kardamom/archive/dir/${cand_name}" 2>/dev/null; then
+          continue
+        fi
         cand_out="$(docker exec kardamom-ingress-0 bash -lc \
           "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
            --add-opens java.base/java.util.zip=ALL-UNNAMED \
