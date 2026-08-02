@@ -56,51 +56,7 @@ const RETENTION_BLOCKS: usize = 256;
 /// to the same item collapse to the chunk-final value. Applied to the
 /// exported alloy BAL so the wire artifact matches what the validator will
 /// verify against at that granularity.
-fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::BlockAccessList {
-    if k <= 1 {
-        return bal;
-    }
-    let k = u64::from(k);
-    let chunk = |i: u64| if i == 0 { 0 } else { i.div_ceil(k) };
-    let mut out = bal;
-    for acct in out.iter_mut() {
-        for slot in acct.storage_changes.iter_mut() {
-            let mut seen: std::collections::BTreeMap<u64, usize> = Default::default();
-            let mut kept: Vec<alloy_eip7928::StorageChange> =
-                Vec::with_capacity(slot.changes.len());
-            for c in slot.changes.iter() {
-                let ci = chunk(c.block_access_index);
-                match seen.get(&ci) {
-                    // Later write in the same chunk wins (chunk-final value).
-                    Some(&pos) => {
-                        kept[pos] = alloy_eip7928::StorageChange {
-                            block_access_index: ci,
-                            new_value: c.new_value,
-                        }
-                    }
-                    None => {
-                        seen.insert(ci, kept.len());
-                        kept.push(alloy_eip7928::StorageChange {
-                            block_access_index: ci,
-                            new_value: c.new_value,
-                        });
-                    }
-                }
-            }
-            slot.changes = kept;
-        }
-        for c in acct.balance_changes.iter_mut() {
-            c.block_access_index = chunk(c.block_access_index);
-        }
-        for c in acct.nonce_changes.iter_mut() {
-            c.block_access_index = chunk(c.block_access_index);
-        }
-        for c in acct.code_changes.iter_mut() {
-            c.block_access_index = chunk(c.block_access_index);
-        }
-    }
-    out
-}
+use kardamom_engine::bal_ladder::quantize;
 
 /// Copy bytes into the aligned buffer the publish API expects.
 fn aligned(bytes: &[u8]) -> rkyv::util::AlignedVec {

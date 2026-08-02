@@ -424,7 +424,7 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
 /// missing claim index degrades to sequential re-execution, never to a
 /// verification gap.
 pub struct ClaimBuffer {
-    core: KeyedBuffer<u64, std::sync::Arc<crate::parallel::ClaimIndex>>,
+    core: KeyedBuffer<u64, (u16, std::sync::Arc<crate::parallel::ClaimIndex>)>,
 }
 
 impl Default for ClaimBuffer {
@@ -440,8 +440,12 @@ impl ClaimBuffer {
         Arc::new(Self::default())
     }
 
-    pub fn insert(&self, block: u64, claims: crate::parallel::ClaimIndex) {
-        self.core.insert(block, std::sync::Arc::new(claims));
+    /// Insert a block's claims WITH the granularity the frame declared —
+    /// the validator's view of the ladder must come from the wire (what the
+    /// executor actually produced), never from local config.
+    pub fn insert(&self, block: u64, granularity: u16, claims: crate::parallel::ClaimIndex) {
+        self.core
+            .insert(block, (granularity, std::sync::Arc::new(claims)));
     }
 
     /// Take `block`'s claims, waiting up to `timeout`. `None` ⇒ the caller
@@ -450,7 +454,7 @@ impl ClaimBuffer {
         &self,
         block: u64,
         timeout: Duration,
-    ) -> Option<std::sync::Arc<crate::parallel::ClaimIndex>> {
+    ) -> Option<(u16, std::sync::Arc<crate::parallel::ClaimIndex>)> {
         self.core.take(block, timeout)
     }
 }

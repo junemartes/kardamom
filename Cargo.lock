@@ -3710,6 +3710,7 @@ dependencies = [
  "hdrhistogram",
  "humantime",
  "jsonrpsee",
+ "kardamom-engine",
  "kardamom-ingress",
  "kardamom-types",
  "pprof",

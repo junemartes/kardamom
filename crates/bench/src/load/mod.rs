@@ -12,6 +12,7 @@
 //!   undelivered receipts fail.
 
 pub mod accounting;
+pub mod defi;
 pub mod engine;
 pub mod plan;
 pub mod scrape;
@@ -69,6 +70,10 @@ pub struct LoadConfig {
     pub to: Address,
     /// Wei per transfer.
     pub value: U256,
+    /// Workload family: plain transfers, or the DeFi mix (CLOB + swap pool
+    /// + vault; see `load::defi`). DeFi deploys its contracts from the
+    /// FIRST sender before the ramp and reports gas-centric throughput.
+    pub workload: Workload,
     /// Legacy gas price (wei).
     pub gas_price: u128,
     /// Max outstanding submits (open-loop back-pressure bound).
@@ -117,6 +122,26 @@ pub struct LoadConfig {
     pub output: Option<PathBuf>,
 }
 
+/// Workload family driven by the harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Workload {
+    #[default]
+    Transfers,
+    Defi,
+}
+
+impl std::str::FromStr for Workload {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "transfers" => Ok(Self::Transfers),
+            "defi" => Ok(Self::Defi),
+            other => anyhow::bail!("unknown workload {other:?} (transfers|defi)"),
+        }
+    }
+}
+
 /// One ramp step's sustainability evaluation.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct RampStep {
@@ -136,6 +161,10 @@ pub struct RampStep {
     pub lat_p50_us: u64,
     #[serde(default)]
     pub lat_p95_us: u64,
+    /// Gas consumed by receipts confirmed during this step (Mgas/s = this
+    /// over the step duration).
+    #[serde(default)]
+    pub gas_used: u64,
     #[serde(default)]
     pub lat_p99_us: u64,
 }
@@ -164,6 +193,12 @@ pub struct LoadReport {
     pub lat_p99_us: u64,
     /// Receipt latency max (µs).
     pub lat_max_us: u64,
+    /// Total gas consumed by receipted txs over the soak window.
+    #[serde(default)]
+    pub total_gas: u64,
+    /// Workload the run drove (`transfers` or `defi`).
+    #[serde(default)]
+    pub workload: String,
     /// Completeness + drop accounting + keep-pace.
     pub verdict: Verdict,
 }
@@ -216,7 +251,11 @@ async fn receipt_feed_task(ws_url: String, senders: Vec<Address>, tracker: Arc<T
                         .as_str()
                         .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
                         .unwrap_or(0);
-                    tracker.confirm_from_feed(hash, status);
+                    let gas = r["gasUsed"]
+                        .as_str()
+                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                        .unwrap_or(0);
+                    tracker.confirm_from_feed(hash, status, gas);
                 }
                 Some("txError") => {
                     tracing::warn!(payload = %v, "receipt feed: sequencer rejection");
@@ -307,16 +346,76 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         "kardamom-load: pre-generating {} txs",
         per_sender * signers.len()
     );
-    let queues_vec = plan::pregenerate(
-        signers,
-        chain_id,
-        cfg.to,
-        cfg.value,
-        per_sender,
-        cfg.nonce_start,
-        cfg.gas_price,
-    )?;
+    let (queues_vec, defi_deploys) = match cfg.workload {
+        Workload::Transfers => (
+            plan::pregenerate(
+                signers,
+                chain_id,
+                cfg.to,
+                cfg.value,
+                per_sender,
+                cfg.nonce_start,
+                cfg.gas_price,
+            )?,
+            None,
+        ),
+        Workload::Defi => {
+            let (deploys, contracts) =
+                defi::deployment_txs(signers, chain_id, cfg.nonce_start, cfg.gas_price)?;
+            tracing::info!(
+                pool = %contracts.pool,
+                vault = %contracts.vault,
+                clob = %contracts.clob,
+                "defi workload: deploying bench contracts"
+            );
+            let queues = defi::pregenerate_defi(
+                signers,
+                chain_id,
+                &contracts,
+                per_sender,
+                cfg.nonce_start,
+                cfg.gas_price,
+            )?;
+            (queues, Some(deploys))
+        }
+    };
     let mut queues = Queues::new(queues_vec);
+
+    // DeFi setup: land the three deployments before any load — every
+    // workload call targets their computed addresses, so a call arriving
+    // before its contract exists would revert and poison the verdict.
+    if let Some(deploys) = defi_deploys {
+        for d in &deploys {
+            let _: alloy_primitives::B256 = client
+                .request("eth_sendRawTransaction", rpc_params![d.raw.clone()])
+                .await
+                .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        for d in &deploys {
+            loop {
+                let v: Option<serde_json::Value> = client
+                    .request("eth_getTransactionReceipt", rpc_params![d.hash])
+                    .await
+                    .unwrap_or(None);
+                if let Some(r) = v {
+                    anyhow::ensure!(
+                        r["status"].as_str() == Some("0x1"),
+                        "defi deploy reverted (nonce {}): {r}",
+                        d.nonce
+                    );
+                    break;
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "defi deploy not mined within 30s (nonce {})",
+                    d.nonce
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        tracing::info!("defi contracts deployed + confirmed");
+    }
 
     let scraper = build_scraper(&cfg);
     let tracker = Arc::new(Tracker::new()?);
@@ -481,6 +580,11 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         lat_p95_us: p95,
         lat_p99_us: p99,
         lat_max_us: max,
+        total_gas: tracker.total_gas(),
+        workload: match cfg.workload {
+            Workload::Transfers => "transfers".to_string(),
+            Workload::Defi => "defi".to_string(),
+        },
         verdict,
     };
 
@@ -561,6 +665,8 @@ async fn ramp_to_max(
         let seq_clean = step_seq_clean(&s0, &s1);
         let sustainable = accept_ratio >= 0.99 && recv_ok && gap_ok && seq_clean;
         let (lat_p50_us, lat_p95_us, lat_p99_us) = tracker.take_step_latency_us();
+        let gas_used = tracker.take_step_gas();
+        let mgas_s = gas_used as f64 / 1e6 / cfg.ramp_step_secs.max(1) as f64;
         tracing::info!(
             rate,
             offered,
@@ -569,6 +675,7 @@ async fn ramp_to_max(
             p50_ms = lat_p50_us / 1000,
             p95_ms = lat_p95_us / 1000,
             p99_ms = lat_p99_us / 1000,
+            mgas_s = format!("{mgas_s:.1}"),
             gap_ok,
             seq_clean,
             sustainable,
@@ -583,6 +690,7 @@ async fn ramp_to_max(
             lat_p50_us,
             lat_p95_us,
             lat_p99_us,
+            gas_used,
         });
         if sustainable {
             discovered = rate;
@@ -637,12 +745,13 @@ fn print_report(r: &LoadReport) {
         println!("---- ramp ----");
         for s in &r.ramp {
             println!(
-                "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms gap_ok={:<5} seq_clean={:<5} {}",
+                "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms step_mgas={:<8.1} gap_ok={:<5} seq_clean={:<5} {}",
                 s.rate,
                 s.accept_ratio,
                 s.lat_p50_us / 1000,
                 s.lat_p95_us / 1000,
                 s.lat_p99_us / 1000,
+                s.gas_used as f64 / 1e6,
                 s.gap_ok,
                 s.seq_clean,
                 if s.sustainable {
@@ -654,6 +763,20 @@ fn print_report(r: &LoadReport) {
         }
     }
     let v = &r.verdict;
+    if r.total_gas > 0 && r.duration_secs > 0.0 {
+        // total_gas spans ramp + soak; the soak window's own gas is the
+        // total minus what the ramp steps drained into their counters.
+        let ramp_gas: u64 = r.ramp.iter().map(|s| s.gas_used).sum();
+        let soak_gas = r.total_gas.saturating_sub(ramp_gas);
+        println!(
+            "gas: run_total={:.3} Ggas  soak={:.3} Ggas -> {:.4} Ggas/s ({:.1} Mgas/s) [{}]",
+            r.total_gas as f64 / 1e9,
+            soak_gas as f64 / 1e9,
+            soak_gas as f64 / 1e9 / r.duration_secs,
+            soak_gas as f64 / 1e6 / r.duration_secs,
+            r.workload,
+        );
+    }
     println!(
         "offered={}  accepted={}  receipted={}  missing={}  unlanded={}  bad_status={}",
         v.offered, v.accepted, v.receipted, v.missing, v.unlanded, v.bad_status
