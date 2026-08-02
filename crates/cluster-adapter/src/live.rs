@@ -424,11 +424,25 @@ fn run_session(
             match frame_rx.try_recv() {
                 Ok(frame) => {
                     worked = true;
-                    egress_alive_at_ms = now_ms();
-                    // Real egress: the path works again — reset the watchdog
-                    // backoff so a FUTURE outage gets the fast first retry.
-                    egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
-                    for ev in driver.on_egress(&frame) {
+                    let events = driver.on_egress(&frame);
+                    // Liveness = frames that SURVIVE the session filter. A
+                    // frame for a FOREIGN session (the pre-restart zombie's
+                    // boundary broadcasts land on this same static endpoint
+                    // until the cluster reaps it at the 90s session timeout)
+                    // returns no events and must NOT feed the watchdog —
+                    // counting raw channel bytes kept the only escape hatch
+                    // (force_reconnect below) disarmed for exactly as long as
+                    // a zombie was being served, wedging a restarted
+                    // validator in a 3s replay-request loop with a session
+                    // the cluster may have silently closed.
+                    if !events.is_empty() {
+                        egress_alive_at_ms = now_ms();
+                        // Real egress: the path works again — reset the
+                        // watchdog backoff so a FUTURE outage gets the fast
+                        // first retry.
+                        egress_silence_reset_ms = EGRESS_SILENCE_RESET_MS;
+                    }
+                    for ev in events {
                         match ev {
                             DriverEvent::AppMessage(payload) => {
                                 subscribe_confirmed = true;
@@ -659,6 +673,18 @@ fn run_session(
         if sel.ready_timeout(wait).is_ok() && frame_rx.is_empty() && req_rx.is_empty() {
             thread::sleep(wait);
         }
+    }
+
+    // Graceful shutdown: tell the cluster to close our session instead of
+    // leaking it until the 90s session timeout. The zombie is not just
+    // hygiene — the sealer keeps unicasting boundary broadcasts to a dead
+    // session's egress endpoint, and for a restarting consumer on the SAME
+    // static endpoint those foreign frames used to disarm the egress-liveness
+    // watchdog for the whole zombie lifetime (issue #141). Best-effort: on a
+    // crash there is no close either, which is exactly what the watchdog +
+    // session-filtered liveness now cover.
+    if let Some(close_frame) = driver.force_reconnect("shutdown") {
+        ingress.publish_best_effort(to_aligned(&close_frame));
     }
 }
 
