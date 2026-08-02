@@ -65,9 +65,11 @@ impl TxDataSubscription for FakeASubAdapter {
         self.sequencer_id
     }
 
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+    fn next(
+        &mut self,
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         loop {
-            let mut out: Option<(kardamom_types::TxDataLoc, KtTxEnvelope)> = None;
+            let mut out: Option<(kardamom_types::TxDataLoc, kardamom_log::TxFrame)> = None;
             self.sub.poll(
                 |loc, env| {
                     if out.is_none() {
@@ -135,7 +137,7 @@ impl StateWriterSignal for Imm {
     }
 }
 
-fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnvelope {
+fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -149,12 +151,13 @@ fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnvelope 
     let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
     let raw_tx = Bytes::from(alloy_env.encoded_2718());
     let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
+    kardamom_log::TxFrame::from_owned(&KtTxEnvelope {
         correlation_id: 0,
         raw_tx,
         sender: signer.address(),
         tx_hash,
-    }
+    })
+    .expect("encode test envelope")
 }
 
 #[test]
@@ -207,7 +210,7 @@ fn m4_canonical_b_order_drives_receipts() {
             let nonce = by_sid_nonce[sid as usize];
             by_sid_nonce[sid as usize] += 1;
             let env = transfer(&signers[sid as usize], nonce, to);
-            let h = env.tx_hash;
+            let h = env.tx_hash();
             let pos_a = a_pubs[sid as usize].publish(&env).expect("publish A");
             plan.push((sid, pos_a, h));
         }
@@ -381,7 +384,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     let env = transfer(&signer, 0, to);
-    let expected_hash = env.tx_hash;
+    let expected_hash = env.tx_hash();
 
     // Schedule the tx_data publish on a background thread so the
     // ref-then-envelope order is genuine.

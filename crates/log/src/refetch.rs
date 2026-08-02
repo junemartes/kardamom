@@ -40,7 +40,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope};
+use crate::TxFrame;
+use kardamom_types::{BPosition, Deposit, TxDataLoc};
 use rusteron_archive::{
     AeronArchiveRecordingDescriptor, AeronArchiveRecordingDescriptorConsumerFuncCallback,
     AeronArchiveReplayParams, Handler,
@@ -95,7 +96,7 @@ pub struct ArchiveRefetcher {
     /// has no close-subscription; entries are reused across refetches (a new
     /// bounded replay onto the same channel forms a fresh image on the same
     /// subscription). Bounded by publisher restarts, i.e. tiny.
-    tx_data_subs: HashMap<(i32, i32), UnboundedReceiver<(TxDataLoc, TxEnvelope)>>,
+    tx_data_subs: HashMap<(i32, i32), UnboundedReceiver<(TxDataLoc, TxFrame)>>,
     deposit_subs: HashMap<(i32, i32), UnboundedReceiver<(BPosition, Deposit)>>,
 }
 
@@ -131,7 +132,7 @@ impl ArchiveRefetcher {
         stream_id: i32,
         session_id: i32,
         from: BPosition,
-        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
+        sink: &mut dyn FnMut(TxDataLoc, TxFrame),
     ) -> Result<u64, LogError> {
         let endpoints = self.cfg.tx_data_endpoints.clone();
         self.ensure_session(&endpoints)?;

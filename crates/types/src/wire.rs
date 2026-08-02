@@ -230,3 +230,15 @@ where
         Ok(v.into_iter().map(B256::from).collect())
     }
 }
+
+/// Zero-copy read helpers: convert ARCHIVED adapter forms back to the
+/// domain types without going through a deserializer (the tx_data frame
+/// accessors in kardamom-log read fields in place).
+#[must_use]
+pub fn address_from_archived(a: &Archived<[u8; 20]>) -> Address {
+    Address::from(*a)
+}
+#[must_use]
+pub fn b256_from_archived(b: &Archived<[u8; 32]>) -> B256 {
+    B256::from(*b)
+}

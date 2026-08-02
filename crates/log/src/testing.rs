@@ -105,6 +105,21 @@ impl FakeConcurrentPublication {
             term_offset: header.term_offset(),
         })
     }
+
+    /// Publish pre-encoded wire bytes verbatim (frame republish in tests).
+    fn publish_bytes_with_session(
+        &self,
+        bytes: &[u8],
+        session_id: i32,
+    ) -> Result<BPosition, LogError> {
+        let off = self.offer_with_session(bytes, session_id);
+        let frag_start = off - bytes.len() as i64;
+        let header = FakeHeader::from_offset_session(frag_start, session_id);
+        Ok(BPosition {
+            term_id: header.term_id(),
+            term_offset: header.term_offset(),
+        })
+    }
 }
 
 /// Mimics `rusteron_client::Header` enough for our consumers.
@@ -299,8 +314,9 @@ impl FakeTxDataPublication {
     /// Publish a `TxEnvelope` and return its fragment-start `BPosition` on
     /// tx_data[i]. The subscriber pairs this position with `session_id` into a
     /// `TxDataLoc`; the sequencer stamps the session into `TxRef`.
-    pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
-        self.pub_handle.publish_with_session(env, self.session_id)
+    pub fn publish(&self, env: &crate::TxFrame) -> Result<BPosition, LogError> {
+        self.pub_handle
+            .publish_bytes_with_session(env.as_bytes(), self.session_id)
     }
 }
 
@@ -327,14 +343,14 @@ impl FakeTxDataSubscription {
     /// `TxDataLoc` pairs the publisher `session_id` with the fragment-*start*
     /// `BPosition` — exactly what the sequencer stamps into `TxRef`
     /// (`tx_data_session_id` + `tx_data_position`).
-    pub fn poll<F: FnMut(TxDataLoc, TxEnvelope)>(
+    pub fn poll<F: FnMut(TxDataLoc, crate::TxFrame)>(
         &mut self,
         mut f: F,
         fragment_limit: usize,
     ) -> usize {
         self.sub.poll(
             |bytes: &[u8], header: FakeHeader| {
-                if let Ok(env) = rkyv::from_bytes::<TxEnvelope, rancor::Error>(bytes) {
+                if let Ok(frame) = crate::TxFrame::new(bytes) {
                     f(
                         TxDataLoc::new(
                             header.session_id(),
@@ -343,7 +359,7 @@ impl FakeTxDataSubscription {
                                 term_offset: header.term_offset(),
                             },
                         ),
-                        env,
+                        frame,
                     );
                 }
             },

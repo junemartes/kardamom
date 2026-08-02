@@ -53,9 +53,8 @@ use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
-use kardamom_types::{
-    BPosition, BlockBoundaryStart, Deposit, TxDataLoc, TxEnvelope, TxOrderingMessage,
-};
+use kardamom_log::TxFrame;
+use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, TxDataLoc, TxOrderingMessage};
 
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
@@ -76,7 +75,7 @@ pub trait TxDataSubscription: Send {
     /// buffer and surface diagnostics.
     fn sequencer_id(&self) -> u8;
 
-    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError>;
+    fn next(&mut self) -> Result<(TxDataLoc, TxFrame), ExecutorError>;
 }
 
 /// Subscription to **tx_ordering** (the canonical orderer).
@@ -110,7 +109,7 @@ impl TxDataSubscription for Box<dyn TxDataSubscription> {
         (**self).sequencer_id()
     }
 
-    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
+    fn next(&mut self) -> Result<(TxDataLoc, TxFrame), ExecutorError> {
         (**self).next()
     }
 }
@@ -140,7 +139,7 @@ impl DepositSubscription for Box<dyn DepositSubscription> {
 /// we never iterate.
 #[derive(Clone, Default)]
 pub struct JoinBuffer {
-    inner: Arc<DashMap<(u8, i32, BPosition), TxEnvelope>>,
+    inner: Arc<DashMap<(u8, i32, BPosition), TxFrame>>,
 }
 
 impl JoinBuffer {
@@ -153,7 +152,7 @@ impl JoinBuffer {
         sequencer_id: u8,
         session_id: i32,
         tx_data_position: BPosition,
-        env: TxEnvelope,
+        env: TxFrame,
     ) {
         self.inner
             .insert((sequencer_id, session_id, tx_data_position), env);
@@ -167,7 +166,7 @@ impl JoinBuffer {
         sequencer_id: u8,
         session_id: i32,
         tx_data_position: BPosition,
-    ) -> Option<TxEnvelope> {
+    ) -> Option<TxFrame> {
         self.inner
             .remove(&(sequencer_id, session_id, tx_data_position))
             .map(|kv| kv.1)
@@ -243,7 +242,7 @@ pub trait JoinRecovery {
         shard_id: u8,
         session_id: i32,
         from: BPosition,
-        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
+        sink: &mut dyn FnMut(TxDataLoc, TxFrame),
     ) -> Result<u64, String>;
 
     /// Fetch tx_deposits recorded at/after `from` (any publisher session),
@@ -312,7 +311,7 @@ impl Default for ReaderConfig {
 pub enum ReaderToExec {
     Tx {
         tx_idx: TxIndex,
-        envelope: TxEnvelope,
+        envelope: TxFrame,
         position: BPosition,
     },
     Deposit {
@@ -599,7 +598,7 @@ fn join_envelope(
     recovery: &mut Option<Box<dyn JoinRecovery>>,
     tx_ref: &kardamom_types::TxRef,
     cfg: &ReaderConfig,
-) -> Option<TxEnvelope> {
+) -> Option<TxFrame> {
     let (shard, session, pos) = (
         tx_ref.shard_id,
         tx_ref.tx_data_session_id,
@@ -736,7 +735,7 @@ fn wait_for_envelope(
     tx_data_position: BPosition,
     timeout: Duration,
     poll_interval: Duration,
-) -> Option<TxEnvelope> {
+) -> Option<TxFrame> {
     if let Some(env) = buffer.take(sequencer_id, session_id, tx_data_position) {
         return Some(env);
     }
@@ -789,7 +788,7 @@ mod tests {
     use kardamom_types::TxRef;
     use std::collections::VecDeque;
 
-    fn envelope(signer: &PrivateKeySigner, nonce: u64) -> TxEnvelope {
+    fn envelope(signer: &PrivateKeySigner, nonce: u64) -> TxFrame {
         let mut tx = TxLegacy {
             chain_id: Some(1),
             nonce,
@@ -803,12 +802,13 @@ mod tests {
         let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
         let raw_tx = Bytes::from(alloy_env.encoded_2718());
         let tx_hash = keccak256(&raw_tx);
-        TxEnvelope {
+        TxFrame::from_owned(&kardamom_types::TxEnvelope {
             correlation_id: 0,
             raw_tx,
             sender: signer.address(),
             tx_hash,
-        }
+        })
+        .expect("encode test envelope")
     }
 
     fn pos(off: i32) -> BPosition {
@@ -822,13 +822,13 @@ mod tests {
     /// `(TxDataLoc, TxEnvelope)` records.
     struct VecTxDataSub {
         sequencer_id: u8,
-        queue: VecDeque<Result<(TxDataLoc, TxEnvelope), ExecutorError>>,
+        queue: VecDeque<Result<(TxDataLoc, TxFrame), ExecutorError>>,
     }
     impl TxDataSubscription for VecTxDataSub {
         fn sequencer_id(&self) -> u8 {
             self.sequencer_id
         }
-        fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
+        fn next(&mut self) -> Result<(TxDataLoc, TxFrame), ExecutorError> {
             self.queue
                 .pop_front()
                 .unwrap_or(Err(ExecutorError::TxDataClosed {
@@ -1003,7 +1003,7 @@ mod tests {
         }
         assert_eq!(out.len(), 1);
         match &out[0] {
-            ReaderToExec::Tx { envelope: e, .. } => assert_eq!(e.tx_hash, env.tx_hash),
+            ReaderToExec::Tx { envelope: e, .. } => assert_eq!(e.tx_hash(), env.tx_hash()),
             _ => panic!("expected Tx"),
         }
     }
@@ -1053,7 +1053,7 @@ mod tests {
         let env = envelope(&signer, 0);
         buf.insert(2, 0, pos(0), env.clone());
 
-        let dup = TxOrderingMessage::TxRef(TxRef::new(env.tx_hash, 2, pos(0), 0));
+        let dup = TxOrderingMessage::TxRef(TxRef::new(env.tx_hash(), 2, pos(0), 0));
         let b = VecTxOrderingSub {
             queue: VecDeque::from(vec![
                 Ok((pos(0), dup.clone())),
@@ -1079,7 +1079,7 @@ mod tests {
         }
         assert_eq!(out.len(), 1, "P duplicates must collapse to one dispatch");
         match &out[0] {
-            ReaderToExec::Tx { envelope: e, .. } => assert_eq!(e.tx_hash, env.tx_hash),
+            ReaderToExec::Tx { envelope: e, .. } => assert_eq!(e.tx_hash(), env.tx_hash()),
             _ => panic!("expected Tx"),
         }
     }
@@ -1124,8 +1124,8 @@ mod tests {
         // Each session's take returns its own envelope.
         let got_a = buf.take(3, 100, p).expect("session 100 present");
         let got_b = buf.take(3, 200, p).expect("session 200 present");
-        assert_eq!(got_a.tx_hash, env_a.tx_hash);
-        assert_eq!(got_b.tx_hash, env_b.tx_hash);
+        assert_eq!(got_a.tx_hash(), env_a.tx_hash());
+        assert_eq!(got_b.tx_hash(), env_b.tx_hash());
         assert_eq!(buf.len(), 0);
 
         // A wrong-session lookup misses (it would have silently returned the
@@ -1167,11 +1167,11 @@ mod tests {
             queue: VecDeque::from(vec![
                 Ok((
                     pos(0),
-                    TxOrderingMessage::TxRef(TxRef::new(env_b.tx_hash, 5, pos(0), 200)),
+                    TxOrderingMessage::TxRef(TxRef::new(env_b.tx_hash(), 5, pos(0), 200)),
                 )),
                 Ok((
                     pos(16),
-                    TxOrderingMessage::TxRef(TxRef::new(env_a.tx_hash, 5, pos(0), 100)),
+                    TxOrderingMessage::TxRef(TxRef::new(env_a.tx_hash(), 5, pos(0), 100)),
                 )),
             ]),
         };
@@ -1196,14 +1196,19 @@ mod tests {
         assert_eq!(out.len(), 2);
         match &out[0] {
             ReaderToExec::Tx { envelope: e, .. } => {
-                assert_eq!(e.tx_hash, env_b.tx_hash, "first ref → session 200 envelope")
+                assert_eq!(
+                    e.tx_hash(),
+                    env_b.tx_hash(),
+                    "first ref → session 200 envelope"
+                )
             }
             _ => panic!("expected Tx"),
         }
         match &out[1] {
             ReaderToExec::Tx { envelope: e, .. } => {
                 assert_eq!(
-                    e.tx_hash, env_a.tx_hash,
+                    e.tx_hash(),
+                    env_a.tx_hash(),
                     "second ref → session 100 envelope"
                 )
             }

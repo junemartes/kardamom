@@ -10,7 +10,8 @@
 //! `tx_hash` populated by the proxy — no recovery or hashing happens here.
 
 use crate::error::SequencerError;
-use kardamom_types::{TxDataLoc, TxEnvelope};
+use kardamom_log::TxFrame;
+use kardamom_types::TxDataLoc;
 
 /// Subscription to one tx_data stream. Yields `(TxDataLoc, envelope)` per Aeron
 /// fragment — the envelope paired with its publisher `session_id` and
@@ -29,7 +30,7 @@ pub trait TxDataSubscriber: Send {
     ///  - `Ok(None)` when no message is ready (caller backs off).
     ///  - `Err(IngressDisconnected)` when the subscription is permanently
     ///    closed.
-    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError>;
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxFrame)>, SequencerError>;
 }
 
 // ===========================================================================
@@ -48,12 +49,12 @@ pub mod fakes {
     /// before driving `Sequencer::run_once`.
     #[derive(Default)]
     pub struct ScriptedTxData {
-        pub queue: VecDeque<(TxDataLoc, TxEnvelope)>,
+        pub queue: VecDeque<(TxDataLoc, TxFrame)>,
         pub disconnected: bool,
     }
 
     impl TxDataSubscriber for ScriptedTxData {
-        fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
+        fn poll(&mut self) -> Result<Option<(TxDataLoc, TxFrame)>, SequencerError> {
             if self.disconnected {
                 return Err(SequencerError::IngressDisconnected);
             }

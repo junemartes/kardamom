@@ -353,7 +353,16 @@ pub fn run_feed<P: Provider>(
         match rx.recv_timeout(cfg.flush) {
             Ok(ReaderToExec::Tx {
                 envelope, position, ..
-            }) => acc.observe_tx(envelope, position),
+            }) => {
+                // The batcher persists full envelopes into L1 batch blobs —
+                // materialize the zero-copy frame here (block-rate flush
+                // path, not the executor's per-tx hot path). A frame that
+                // validated at ingest cannot fail to deserialize.
+                let env = envelope
+                    .to_owned_value()
+                    .expect("validated frame must materialize");
+                acc.observe_tx(env, position)
+            }
             // Deposits are absent from DA by design: re-derivable from L1
             // (mirrors MultiArchiveReader skipping DepositRefs offline).
             Ok(ReaderToExec::Deposit { .. }) => {}

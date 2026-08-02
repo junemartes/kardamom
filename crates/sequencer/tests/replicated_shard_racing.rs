@@ -57,7 +57,7 @@ fn signed_envelope(
     s: &alloy_signer_local::PrivateKeySigner,
     nonce: u64,
     correlation_id: u64,
-) -> TxEnvelope {
+) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -72,12 +72,13 @@ fn signed_envelope(
     let mut buf = Vec::with_capacity(256);
     alloy_env.encode(&mut buf);
     let tx_hash = keccak256(&buf);
-    TxEnvelope {
+    kardamom_log::TxFrame::from_owned(&TxEnvelope {
         correlation_id,
         raw_tx: Bytes::from(buf),
         sender: s.address(),
         tx_hash,
-    }
+    })
+    .expect("encode test envelope")
 }
 
 fn shard0_cfg() -> SequencerConfig {
@@ -92,7 +93,7 @@ fn shard0_cfg() -> SequencerConfig {
 /// The shared per-shard tx_data stream: SENDERS senders' txs interleaved
 /// round-robin, nonce-ordered per sender, with distinct A-positions (the way
 /// Aeron fragment offsets are in production).
-fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
+fn shard_stream() -> Vec<(TxDataLoc, kardamom_log::TxFrame)> {
     let signers: Vec<_> = (1..=SENDERS as u64).map(signer).collect();
     // Sanity: sharding is a property of the ingress router, not the
     // sequencer; with partition_count=1 every sender is ours.
@@ -116,11 +117,14 @@ fn shard_stream() -> Vec<(TxDataLoc, TxEnvelope)> {
 }
 
 /// Run one replica over `stream`, returning its published refs.
-fn run_replica(stream: &[(TxDataLoc, TxEnvelope)]) -> Vec<TxRef> {
+fn run_replica(stream: &[(TxDataLoc, kardamom_log::TxFrame)]) -> Vec<TxRef> {
     run_replica_with(shard0_cfg(), stream)
 }
 
-fn run_replica_with(cfg: SequencerConfig, stream: &[(TxDataLoc, TxEnvelope)]) -> Vec<TxRef> {
+fn run_replica_with(
+    cfg: SequencerConfig,
+    stream: &[(TxDataLoc, kardamom_log::TxFrame)],
+) -> Vec<TxRef> {
     let mut inbound = ScriptedTxData::default();
     for (loc, env) in stream {
         inbound.queue.push_back((*loc, env.clone()));
@@ -206,11 +210,11 @@ fn first_seen_dedup_of_any_interleaving_is_the_single_replica_stream() {
             let (idx, env) = stream
                 .iter()
                 .enumerate()
-                .find(|(_, (_, e))| e.tx_hash == r.tx_hash)
+                .find(|(_, (_, e))| e.tx_hash() == r.tx_hash)
                 .map(|(i, (_, e))| (i, e))
                 .unwrap();
             let nonce = idx as u64 / SENDERS as u64;
-            let want = next.entry(env.sender).or_insert(0);
+            let want = next.entry(env.sender()).or_insert(0);
             assert_eq!(nonce, *want, "sender nonce order inverted");
             *want += 1;
         }
@@ -264,11 +268,11 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
     let stream: Vec<_> = full
         .into_iter()
         .filter(|(_, env)| {
-            if env.sender != victim {
+            if env.sender() != victim {
                 return true;
             }
             use alloy_rlp::Decodable as _;
-            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
+            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx().as_ref()).unwrap();
             use alloy_consensus::transaction::Transaction as _;
             !(e.nonce() == 3 || e.nonce() == 4)
         })
@@ -284,10 +288,10 @@ fn client_abandoned_nonce_hole_is_never_published_past() {
         // Reconstruct (sender, nonce) for each published ref via its position.
         if let Some(r) = refs.iter().find(|r| r.tx_data_position == loc.position) {
             use alloy_rlp::Decodable as _;
-            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx.as_ref()).unwrap();
+            let e = alloy_consensus::TxEnvelope::decode(&mut env.raw_tx().as_ref()).unwrap();
             use alloy_consensus::transaction::Transaction as _;
-            assert_eq!(r.tx_hash, env.tx_hash);
-            per_sender.entry(env.sender).or_default().push(e.nonce());
+            assert_eq!(r.tx_hash, env.tx_hash());
+            per_sender.entry(env.sender()).or_default().push(e.nonce());
         }
     }
     for (sender, mut nonces) in per_sender {

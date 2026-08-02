@@ -28,13 +28,15 @@ use kardamom_executor::{
 
 struct ChanASub {
     sequencer_id: u8,
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
+    rx: Receiver<(BPosition, kardamom_log::TxFrame)>,
 }
 impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+    fn next(
+        &mut self,
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         self.rx
             .recv()
             .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
@@ -73,7 +75,7 @@ fn bpos(off: i32) -> BPosition {
 }
 
 fn populate(
-    a_tx: &Sender<(BPosition, KtTxEnvelope)>,
+    a_tx: &Sender<(BPosition, kardamom_log::TxFrame)>,
     b_tx: &Sender<(BPosition, TxOrderingMessage)>,
     signer: &PrivateKeySigner,
 ) {
@@ -96,12 +98,13 @@ fn populate(
             let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
             let raw_tx = Bytes::from(alloy_env.encoded_2718());
             let tx_hash = keccak256(&raw_tx);
-            let env = KtTxEnvelope {
+            let env = kardamom_log::TxFrame::from_owned(&KtTxEnvelope {
                 correlation_id: 0,
                 raw_tx,
                 sender: signer.address(),
                 tx_hash,
-            };
+            })
+            .expect("encode test envelope");
             let tx_data_position = bpos(a_pos);
             a_tx.send((tx_data_position, env)).unwrap();
             b_tx.send((
@@ -137,7 +140,7 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
     let writer_q = WriterApplyingQueue::new(snap.clone());
     let snapshots = MutatingSnapshotSource(snap);
 
-    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(128);
+    let (a_tx, a_rx) = bounded::<(BPosition, kardamom_log::TxFrame)>(128);
     let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(128);
     let (c_tx, c_rx) = bounded::<CMessage>(128);
 

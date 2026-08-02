@@ -35,13 +35,15 @@ use kardamom_executor::{
 /// to a synthetic offset for the test.
 struct ChanASub {
     sequencer_id: u8,
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
+    rx: Receiver<(BPosition, kardamom_log::TxFrame)>,
 }
 impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+    fn next(
+        &mut self,
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         self.rx
             .recv()
             .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
@@ -78,7 +80,7 @@ impl StateWriterSignal for Imm {
 }
 
 /// Proxy-style envelope builder: sign, encode raw_tx, populate sender + tx_hash.
-fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> KtTxEnvelope {
+fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -92,12 +94,13 @@ fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> KtT
     let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
     let raw_tx = Bytes::from(alloy_env.encoded_2718());
     let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
+    kardamom_log::TxFrame::from_owned(&KtTxEnvelope {
         correlation_id: 0,
         raw_tx,
         sender: signer.address(),
         tx_hash,
-    }
+    })
+    .expect("encode test envelope")
 }
 
 fn bpos(off: i32) -> BPosition {
@@ -121,7 +124,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
         .build();
 
     // Single-sequencer topology: one tx_data, one tx_ordering.
-    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(64);
+    let (a_tx, a_rx) = bounded::<(BPosition, kardamom_log::TxFrame)>(64);
     let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(64);
     let (c_tx, c_rx) = bounded::<CMessage>(64);
 
@@ -134,7 +137,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     for (n_txs, blk) in plan {
         for _ in 0..n_txs {
             let env = transfer(&signer, nonce, to, 1);
-            let tx_hash = env.tx_hash;
+            let tx_hash = env.tx_hash();
             expected_hashes.push(tx_hash);
             // Publish to tx_data[0] at `a_pos`.
             let tx_data_position = bpos(a_pos);

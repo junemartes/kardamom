@@ -27,6 +27,11 @@
 
 pub mod aeron_live;
 pub mod codec;
+
+/// The tx_data wire frame: an owned, validated, zero-copy view of a
+/// [`kardamom_types::TxEnvelope`]. One aligned copy per frame; field reads
+/// never allocate; clones are refcount bumps.
+pub type TxFrame = codec::ArchivedFrame<kardamom_types::TxEnvelope>;
 pub mod config;
 pub mod error;
 mod offer_retry;

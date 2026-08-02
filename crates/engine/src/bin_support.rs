@@ -153,7 +153,7 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 
 struct LiveTxDataSub {
     sequencer_id: u8,
-    rx: sync_mpsc::Receiver<(TxDataLoc, TxEnvelope)>,
+    rx: sync_mpsc::Receiver<(TxDataLoc, kardamom_log::TxFrame)>,
 }
 
 impl TxDataSubscription for LiveTxDataSub {
@@ -161,7 +161,7 @@ impl TxDataSubscription for LiveTxDataSub {
         self.sequencer_id
     }
 
-    fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
+    fn next(&mut self) -> Result<(TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         self.rx.recv().map_err(|_| ExecutorError::TxDataClosed {
             sequencer_id: self.sequencer_id,
         })
@@ -198,7 +198,7 @@ pub fn open_tx_data_subs(
 ) -> Result<Vec<Box<dyn TxDataSubscription>>> {
     let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(shards as usize);
     for shard_id in 0..shards {
-        let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
+        let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, kardamom_log::TxFrame)>();
         let mut handle = TxDataSubscriberHandle::open(rt, channels, shard_id)
             .with_context(|| format!("open TxDataSubscriberHandle shard={shard_id}"))?;
         tokio::spawn(async move {
@@ -253,7 +253,7 @@ impl JoinRecovery for ArchiveJoinRecovery {
         shard_id: u8,
         session_id: i32,
         from: BPosition,
-        sink: &mut dyn FnMut(TxDataLoc, TxEnvelope),
+        sink: &mut dyn FnMut(TxDataLoc, kardamom_log::TxFrame),
     ) -> Result<u64, String> {
         self.refetcher
             .fetch_tx_data(

@@ -43,13 +43,15 @@ const REVERT_CODE: [u8; 5] = [0x60, 0x00, 0x60, 0x00, 0xfd];
 
 struct ChanASub {
     sequencer_id: u8,
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
+    rx: Receiver<(BPosition, kardamom_log::TxFrame)>,
 }
 impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+    fn next(
+        &mut self,
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         self.rx
             .recv()
             .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
@@ -96,7 +98,7 @@ fn legacy(
     value: u64,
     data: AlloyBytes,
     gas: u64,
-) -> KtTxEnvelope {
+) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -110,21 +112,25 @@ fn legacy(
     let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
     let raw_tx = Bytes::from(alloy_env.encoded_2718());
     let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
+    kardamom_log::TxFrame::from_owned(&KtTxEnvelope {
         correlation_id: 0,
         raw_tx,
         sender: signer.address(),
         tx_hash,
-    }
+    })
+    .expect("encode test envelope")
 }
 
-fn naive_reference(snap: MockStateDatabase, txs: &[(KtTxEnvelope, Address)]) -> Vec<(bool, u64)> {
+fn naive_reference(
+    snap: MockStateDatabase,
+    txs: &[(kardamom_log::TxFrame, Address)],
+) -> Vec<(bool, u64)> {
     use alloy_consensus::Transaction;
     let snap_ref = SnapshotRef { inner: &snap };
     let mut cache: CacheDB<SnapshotRef<'_, MockStateDatabase>> = CacheDB::new(snap_ref);
     let mut out = Vec::new();
     for (kt_env, signer) in txs {
-        let mut slice: &[u8] = kt_env.raw_tx.as_ref();
+        let mut slice: &[u8] = kt_env.raw_tx();
         let env = alloy_consensus::TxEnvelope::decode_2718(&mut slice).expect("decode raw_tx");
         let tx_env = TxEnv {
             caller: *signer,
@@ -198,7 +204,7 @@ fn actor_receipts_match_naive_reference() {
         .code(revert_hash, Bytes::copy_from_slice(revert_code.as_ref()))
         .build();
 
-    let txs: [KtTxEnvelope; 3] = [
+    let txs: [kardamom_log::TxFrame; 3] = [
         legacy(
             &signer,
             APTxKind::Call(to),
@@ -224,17 +230,18 @@ fn actor_receipts_match_naive_reference() {
             100_000,
         ),
     ];
-    let pairs: Vec<(KtTxEnvelope, Address)> = txs.iter().cloned().map(|t| (t, from)).collect();
+    let pairs: Vec<(kardamom_log::TxFrame, Address)> =
+        txs.iter().cloned().map(|t| (t, from)).collect();
 
     let reference = naive_reference(snap_ref, &pairs);
 
     // Now drive the actor.
-    let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>(8);
+    let (a_tx, a_rx) = bounded::<(BPosition, kardamom_log::TxFrame)>(8);
     let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(8);
     let (c_tx, c_rx) = bounded::<CMessage>(8);
     for (i, (env, _sg)) in pairs.iter().enumerate() {
         let tx_data_position = bpos((i as i32) * 200);
-        let tx_hash = env.tx_hash;
+        let tx_hash = env.tx_hash();
         a_tx.send((tx_data_position, env.clone())).unwrap();
         b_tx.send((
             bpos(i as i32),

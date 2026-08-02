@@ -109,12 +109,13 @@ fn defi_execution_allocation_profile() {
         i: &mut u64,
         cumulative: &mut u64,
     ) -> (kardamom_types::Receipt, kardamom_engine::delta::WriteSet) {
-        let e = TxEnvelope {
+        let e = kardamom_log::TxFrame::from_owned(&TxEnvelope {
             correlation_id: *i,
             raw_tx: raw.raw.clone().into(),
             sender,
             tx_hash: raw.hash,
-        };
+        })
+        .expect("encode test envelope");
         let (r, ws) = execute_tx(
             snap,
             None,
@@ -176,19 +177,20 @@ fn defi_execution_allocation_profile() {
             sc.seed_layer(&delta).expect("seed");
             scope = Some(sc);
         }
-        let e = TxEnvelope {
+        let e = kardamom_log::TxFrame::from_owned(&TxEnvelope {
             correlation_id: i,
             raw_tx: t.raw.clone().into(),
             sender: signers[*si].signer.address(),
             tx_hash: t.hash,
-        };
+        })
+        .expect("encode test envelope");
         let (r, ws) = scope
             .as_mut()
             .unwrap()
             .execute_tx(
                 TxIndex(i),
                 BPosition::from_index(i),
-                &e,
+                (&e).into(),
                 i,
                 cumulative,
                 None,

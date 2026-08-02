@@ -375,7 +375,7 @@ use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 pub struct BlockTx {
     pub tx_idx: TxIndex,
     pub position: BPosition,
-    pub envelope: TxEnvelope,
+    pub envelope: kardamom_log::TxFrame,
 }
 
 /// A batch's result: its receipts (with LOCAL cumulative gas — the caller
@@ -485,7 +485,12 @@ pub fn execute_batch<S: StateDatabase>(
         let (receipt, ws) = scope.execute_tx(
             tx.tx_idx,
             tx.position,
-            &tx.envelope,
+            kardamom_engine::executor::TxEnvelopeRef {
+                correlation_id: tx.envelope.correlation_id(),
+                sender: tx.envelope.sender(),
+                tx_hash: tx.envelope.tx_hash(),
+                raw_tx: tx.envelope.raw_tx(),
+            },
             global_index_in_block,
             cumulative,
             Some((&mut batch_bal, bal_index)),
@@ -678,12 +683,13 @@ mod engine_tests {
                 term_id: 0,
                 term_offset: (i * 64) as i32,
             },
-            envelope: TxEnvelope {
+            envelope: kardamom_log::TxFrame::from_owned(&TxEnvelope {
                 correlation_id: i,
                 raw_tx: raw.into(),
                 sender: signer.address(),
                 tx_hash: alloy_primitives::B256::repeat_byte(i as u8 + 1),
-            },
+            })
+            .expect("encode test envelope"),
         }
     }
 
@@ -1008,7 +1014,19 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 tx_idx,
                 envelope,
                 position,
-            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
+            } => scope.execute_tx(
+                *tx_idx,
+                *position,
+                kardamom_engine::executor::TxEnvelopeRef {
+                    correlation_id: envelope.correlation_id(),
+                    sender: envelope.sender(),
+                    tx_hash: envelope.tx_hash(),
+                    raw_tx: envelope.raw_tx(),
+                },
+                idx_in_block,
+                cumulative,
+                None,
+            )?,
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
@@ -1059,10 +1077,10 @@ fn dump_divergence_inputs(
         "granularity": granularity,
         "error": format!("{err:?}"),
         "txs": txs.iter().map(|t| serde_json::json!({
-            "raw": alloy_primitives::hex::encode(&t.envelope.raw_tx),
-            "sender": format!("{:?}", t.envelope.sender),
-            "hash": format!("{:?}", t.envelope.tx_hash),
-            "correlation_id": t.envelope.correlation_id,
+            "raw": alloy_primitives::hex::encode(t.envelope.raw_tx()),
+            "sender": format!("{:?}", t.envelope.sender()),
+            "hash": format!("{:?}", t.envelope.tx_hash()),
+            "correlation_id": t.envelope.correlation_id(),
             "idx": t.tx_idx.0,
             "pos": t.position.as_index(),
         })).collect::<Vec<_>>(),

@@ -45,18 +45,19 @@ const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
 fn wrap_envelope(
     signer: &PrivateKeySigner,
     alloy_env: alloy_consensus::TxEnvelope,
-) -> KtTxEnvelope {
+) -> kardamom_log::TxFrame {
     let raw_tx = Bytes::from(alloy_env.encoded_2718());
     let tx_hash = keccak256(&raw_tx);
-    KtTxEnvelope {
+    kardamom_log::TxFrame::from_owned(&KtTxEnvelope {
         correlation_id: 0,
         raw_tx,
         sender: signer.address(),
         tx_hash,
-    }
+    })
+    .expect("encode test envelope")
 }
 
-fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> KtTxEnvelope {
+fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -70,7 +71,11 @@ fn signed_transfer(signer: &PrivateKeySigner, to: Address, nonce: u64) -> KtTxEn
     wrap_envelope(signer, tx.into_signed(sig).into())
 }
 
-fn signed_sstore_call(signer: &PrivateKeySigner, contract: Address, nonce: u64) -> KtTxEnvelope {
+fn signed_sstore_call(
+    signer: &PrivateKeySigner,
+    contract: Address,
+    nonce: u64,
+) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -174,13 +179,15 @@ fn bench_sstore_step(c: &mut Criterion) {
 // Actor end-to-end: BATCH txs per iter; reports throughput in tx/s.
 struct ChanASub {
     sequencer_id: u8,
-    rx: Receiver<(BPosition, KtTxEnvelope)>,
+    rx: Receiver<(BPosition, kardamom_log::TxFrame)>,
 }
 impl TxDataSubscription for ChanASub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
-    fn next(&mut self) -> Result<(kardamom_types::TxDataLoc, KtTxEnvelope), ExecutorError> {
+    fn next(
+        &mut self,
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         self.rx
             .recv()
             .map(|(pos, env)| (kardamom_types::TxDataLoc::new(0, pos), env))
@@ -232,14 +239,14 @@ fn bench_actor_throughput(c: &mut Criterion) {
             // executor starts. The bench measures end-to-end actor
             // throughput; the demux split itself adds one extra crossbeam
             // hop per tx, which should be negligible vs. revm time.
-            let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>((BATCH as usize) + 8);
+            let (a_tx, a_rx) = bounded::<(BPosition, kardamom_log::TxFrame)>((BATCH as usize) + 8);
             let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((BATCH as usize) + 8);
             let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
 
             for i in 0..BATCH {
                 let tx_data_position = pos((i as i32) * 200);
                 let env = signed_transfer(&signer, to, i);
-                let tx_hash = env.tx_hash;
+                let tx_hash = env.tx_hash();
                 a_tx.send((tx_data_position, env)).unwrap();
                 b_tx.send((
                     pos(i as i32),

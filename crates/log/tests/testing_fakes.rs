@@ -66,13 +66,14 @@ fn fake_fsync_watermark_stream_per_recorder() {
 // TxData / TxOrdering fakes.
 // ---------------------------------------------------------------------------
 
-fn env(corr: u64, byte: u8) -> TxEnvelope {
-    TxEnvelope {
+fn env(corr: u64, byte: u8) -> kardamom_log::TxFrame {
+    kardamom_log::TxFrame::from_owned(&TxEnvelope {
         correlation_id: corr,
         raw_tx: Bytes::from(vec![byte; 32]),
         sender: Address::repeat_byte(byte),
         tx_hash: B256::repeat_byte(byte),
-    }
+    })
+    .expect("encode test envelope")
 }
 
 #[test]
@@ -88,7 +89,7 @@ fn channel_a_publish_returns_tx_data_positionnd_subscription_yields_same_positio
     assert!(p1 < p2);
 
     let mut got: Vec<(BPosition, u64)> = Vec::new();
-    sub.poll(|loc, e| got.push((loc.position, e.correlation_id)), 16);
+    sub.poll(|loc, e| got.push((loc.position, e.correlation_id())), 16);
     assert_eq!(got.len(), 3);
     assert_eq!(got[0].0, p0);
     assert_eq!(got[1].0, p1);
@@ -196,7 +197,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
         .unwrap();
 
     // Drain both A-streams into the executor's per-A buffer.
-    let mut a_buffer: HashMap<(u8, BPosition), TxEnvelope> = HashMap::new();
+    let mut a_buffer: HashMap<(u8, BPosition), kardamom_log::TxFrame> = HashMap::new();
     let mut a0_sub = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-0", 2001);
     let mut a1_sub = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-1", 2002);
     a0_sub.poll(
@@ -222,7 +223,7 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
                 let env = a_buffer
                     .remove(&(r.shard_id, r.tx_data_position))
                     .expect("ref must hit A-buffer");
-                canonical.push(env.correlation_id);
+                canonical.push(env.correlation_id());
             }
         },
         16,

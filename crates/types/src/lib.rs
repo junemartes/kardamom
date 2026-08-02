@@ -30,6 +30,8 @@ pub mod tx_ordering;
 pub mod txref;
 pub mod watermark;
 pub mod wire;
+
+pub use alloy_primitives::{Address, B256};
 pub mod withdrawals;
 
 pub use ack_policy::AckPolicy;

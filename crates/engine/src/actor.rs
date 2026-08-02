@@ -188,7 +188,7 @@ pub type BalHandoff = (
 pub enum BufferedRecord {
     Tx {
         tx_idx: TxIndex,
-        envelope: kardamom_types::TxEnvelope,
+        envelope: kardamom_log::TxFrame,
         position: BPosition,
     },
     Deposit {
@@ -372,7 +372,7 @@ impl TxDataSubscription for BoxedASub {
     }
     fn next(
         &mut self,
-    ) -> Result<(kardamom_types::TxDataLoc, kardamom_types::TxEnvelope), ExecutorError> {
+    ) -> Result<(kardamom_types::TxDataLoc, kardamom_log::TxFrame), ExecutorError> {
         self.0.next()
     }
 }
@@ -576,7 +576,12 @@ where
                         let result = sc.execute_tx(
                             tx_idx,
                             position,
-                            &envelope,
+                            crate::executor::TxEnvelopeRef {
+                                correlation_id: envelope.correlation_id(),
+                                sender: envelope.sender(),
+                                tx_hash: envelope.tx_hash(),
+                                raw_tx: envelope.raw_tx(),
+                            },
                             tx_index_in_block,
                             cumulative_gas_used,
                             bal_tx
@@ -1006,7 +1011,12 @@ mod exec_tests {
         }
     }
 
-    fn legacy(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64) -> KtTxEnvelope {
+    fn legacy(
+        signer: &PrivateKeySigner,
+        to: Address,
+        nonce: u64,
+        value: u64,
+    ) -> kardamom_log::TxFrame {
         let mut tx = TxLegacy {
             chain_id: Some(1),
             nonce,
@@ -1020,12 +1030,13 @@ mod exec_tests {
         let alloy_env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
         let raw_tx = Bytes::from(alloy_env.encoded_2718());
         let tx_hash = keccak256(&raw_tx);
-        KtTxEnvelope {
+        kardamom_log::TxFrame::from_owned(&KtTxEnvelope {
             correlation_id: 0,
             raw_tx,
             sender: signer.address(),
             tx_hash,
-        }
+        })
+        .expect("encode test envelope")
     }
 
     struct ImmediateCommit;

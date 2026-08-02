@@ -125,10 +125,10 @@ impl revm::database_interface::DBErrorMarker for StateRefError {}
 /// the proxy (S1, S0); we just need the typed accessors to build a
 /// revm `TxEnv`.
 pub fn decode_alloy_envelope(
-    raw_tx: &Bytes,
+    raw_tx: &[u8],
     tx_idx: TxIndex,
 ) -> Result<alloy_consensus::TxEnvelope, ExecutorError> {
-    let mut slice: &[u8] = raw_tx.as_ref();
+    let mut slice: &[u8] = raw_tx;
     alloy_consensus::TxEnvelope::decode_2718(&mut slice).map_err(|e| ExecutorError::Execution {
         idx: tx_idx,
         detail: format!("decode raw_tx: {e}"),
@@ -153,6 +153,39 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas()),
         ..Default::default()
+    }
+}
+/// Borrowed view of a transaction envelope for execution: the zero-copy
+/// tx_data path reads these fields straight out of the wire frame
+/// ([`kardamom_log::TxFrame`]); owned [`TxEnvelope`] callers borrow into
+/// it via `From`. Execution needs exactly these four fields.
+#[derive(Clone, Copy)]
+pub struct TxEnvelopeRef<'a> {
+    pub correlation_id: u64,
+    pub sender: Address,
+    pub tx_hash: B256,
+    pub raw_tx: &'a [u8],
+}
+
+impl<'a> From<&'a TxEnvelope> for TxEnvelopeRef<'a> {
+    fn from(e: &'a TxEnvelope) -> Self {
+        Self {
+            correlation_id: e.correlation_id,
+            sender: e.sender,
+            tx_hash: e.tx_hash,
+            raw_tx: e.raw_tx.as_ref(),
+        }
+    }
+}
+
+impl<'a> From<&'a kardamom_log::TxFrame> for TxEnvelopeRef<'a> {
+    fn from(f: &'a kardamom_log::TxFrame) -> Self {
+        Self {
+            correlation_id: f.correlation_id(),
+            sender: f.sender(),
+            tx_hash: f.tx_hash(),
+            raw_tx: f.raw_tx(),
+        }
     }
 }
 
@@ -240,7 +273,7 @@ impl<S: StateDatabase> ExecScope<S> {
         &mut self,
         tx_idx: TxIndex,
         tx_position: BPosition,
-        inbound_envelope: &TxEnvelope,
+        inbound_envelope: TxEnvelopeRef<'_>,
         tx_index_in_block: u64,
         cumulative_gas_used_before: u64,
         // EIP-7928 capture: see the free `execute_tx`.
@@ -262,7 +295,7 @@ impl<S: StateDatabase> ExecScope<S> {
         // Non-deterministic failures (Database errors) still fail-stop below.
         // A skip is LOUD: any occurrence means an upstream guard failed
         // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
-        let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
+        let alloy_env = match decode_alloy_envelope(inbound_envelope.raw_tx, tx_idx) {
             Ok(env_) => env_,
             Err(e) => {
                 return Ok(invalid_skip(
@@ -403,14 +436,14 @@ impl<S: StateDatabase> ExecScope<S> {
 #[allow(clippy::too_many_arguments)] // 8 args is the natural shape of an
 // "execute one tx" entry point — packaging them into a struct would shuffle
 // the noise around without reducing it.
-pub fn execute_tx<S: StateDatabase>(
+pub fn execute_tx<'a, S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
     delta: &PendingDelta,
     env: ExecEnv,
     tx_idx: TxIndex,
     tx_position: BPosition,
-    inbound_envelope: &TxEnvelope,
+    inbound_envelope: impl Into<TxEnvelopeRef<'a>>,
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
     // EIP-7928 capture (spec: bal-attribution-parallel-validation): when
@@ -428,7 +461,7 @@ pub fn execute_tx<S: StateDatabase>(
     scope.execute_tx(
         tx_idx,
         tx_position,
-        inbound_envelope,
+        inbound_envelope.into(),
         tx_index_in_block,
         cumulative_gas_used_before,
         bal,
@@ -446,7 +479,7 @@ pub fn execute_tx<S: StateDatabase>(
 fn invalid_skip(
     reason: &str,
     tx_position: BPosition,
-    inbound_envelope: &TxEnvelope,
+    inbound_envelope: TxEnvelopeRef<'_>,
     nonce: u64,
     to: Option<Address>,
     block_number: u64,

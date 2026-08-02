@@ -63,7 +63,6 @@ use crate::inbound::TxDataSubscriber;
 use crate::metrics;
 use crate::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use crate::partition::partition_for;
-use crate::sender::sender_of;
 use crate::state::{NonceOutcome, PartitionState, ProcessAction};
 
 /// Metadata needed to (re-)publish a `TxRef` for a buffered or just-arrived
@@ -472,7 +471,7 @@ impl Sequencer {
         };
         metrics::record_ingest(self.cfg.partition_index);
 
-        let sender = sender_of(&envelope);
+        let sender = envelope.sender();
 
         // Defensive: drop messages routed to the wrong shard. Routing
         // disagreement between proxy and sequencer would otherwise silently
@@ -491,7 +490,7 @@ impl Sequencer {
         // The decode is the only per-tx work the sequencer does beyond the
         // state-machine arithmetic; the result is discarded after the nonce
         // is read. We never call `recover_signer()` on it.
-        let nonce = decode_nonce(&envelope.raw_tx)?;
+        let nonce = decode_nonce(envelope.raw_tx())?;
 
         // Cold senders seed at nonce 0 — the sequencer holds no committed-state
         // reader (it is a pure reorderer). Committed-nonce truth arrives out of
@@ -504,8 +503,8 @@ impl Sequencer {
         }
 
         let meta = RefMetadata {
-            correlation_id: envelope.correlation_id,
-            tx_hash: envelope.tx_hash,
+            correlation_id: envelope.correlation_id(),
+            tx_hash: envelope.tx_hash(),
             tx_data_position: tx_data_loc.position,
             tx_data_session_id: tx_data_loc.session_id,
         };
@@ -671,8 +670,8 @@ impl Sequencer {
 /// Decode the nonce out of an RLP-encoded alloy `TxEnvelope`. The proxy
 /// already verified the envelope is well-formed, but we re-decode here so
 /// the sequencer doesn't need to be passed the nonce as a side channel.
-fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError> {
-    let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref())
+fn decode_nonce(raw_tx: &[u8]) -> Result<u64, SequencerError> {
+    let env = ConsensusEnvelope::decode(&mut &raw_tx[..])
         .map_err(|e| SequencerError::MalformedFrame(format!("decode envelope: {e}")))?;
     Ok(env.nonce())
 }

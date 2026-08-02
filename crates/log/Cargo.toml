@@ -31,6 +31,7 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dhat = "0.3"
 # alloy-primitives / bytes are used only by the integration tests in tests/,
 # not by the library crate itself.
 alloy-primitives.workspace = true

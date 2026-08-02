@@ -33,7 +33,11 @@ fn signer(seed: u64) -> PrivateKeySigner {
     PrivateKeySigner::from_bytes(&k.into()).unwrap()
 }
 
-fn signed_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
+fn signed_envelope(
+    signer: &PrivateKeySigner,
+    nonce: u64,
+    correlation_id: u64,
+) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce,
@@ -47,12 +51,13 @@ fn signed_envelope(signer: &PrivateKeySigner, nonce: u64, correlation_id: u64) -
     let alloy_env: ConsensusEnvelope = tx.into_signed(sig).into();
     let mut buf = Vec::with_capacity(256);
     alloy_env.encode(&mut buf);
-    TxEnvelope {
+    kardamom_log::TxFrame::from_owned(&TxEnvelope {
         correlation_id,
         raw_tx: Bytes::from(buf),
         sender: signer.address(),
         tx_hash: Default::default(),
-    }
+    })
+    .expect("encode test envelope")
 }
 
 /// Synthesize an A-position for each scripted envelope so refs carry a

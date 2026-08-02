@@ -35,13 +35,14 @@ fn env_for(block: u64) -> ExecEnv {
     )
 }
 
-fn envelope(t: &PlannedTx, sender: Address, i: u64) -> TxEnvelope {
-    TxEnvelope {
+fn envelope(t: &PlannedTx, sender: Address, i: u64) -> kardamom_log::TxFrame {
+    kardamom_log::TxFrame::from_owned(&TxEnvelope {
         correlation_id: i,
         raw_tx: t.raw.clone().into(),
         sender,
         tx_hash: t.hash,
-    }
+    })
+    .expect("encode test envelope")
 }
 
 /// xorshift — deterministic composition shuffling (no external RNG dep).

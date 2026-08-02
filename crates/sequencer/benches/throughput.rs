@@ -23,9 +23,9 @@ use kardamom_sequencer::outbound::fakes::{
 };
 use kardamom_sequencer::sequencer::Sequencer;
 
-struct DequeTxData(VecDeque<(TxDataLoc, TxEnvelope)>);
+struct DequeTxData(VecDeque<(TxDataLoc, kardamom_log::TxFrame)>);
 impl TxDataSubscriber for DequeTxData {
-    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, kardamom_log::TxFrame)>, SequencerError> {
         Ok(self.0.pop_front())
     }
 }
@@ -36,7 +36,7 @@ fn signer(seed: u64) -> PrivateKeySigner {
     PrivateKeySigner::from_bytes(&k.into()).unwrap()
 }
 
-fn signed_envelope(s: &PrivateKeySigner, n: u64, correlation_id: u64) -> TxEnvelope {
+fn signed_envelope(s: &PrivateKeySigner, n: u64, correlation_id: u64) -> kardamom_log::TxFrame {
     let mut tx = TxLegacy {
         chain_id: Some(1),
         nonce: n,
@@ -50,17 +50,18 @@ fn signed_envelope(s: &PrivateKeySigner, n: u64, correlation_id: u64) -> TxEnvel
     let alloy_env: ConsensusEnvelope = tx.into_signed(sig).into();
     let mut buf = Vec::with_capacity(256);
     alloy_env.encode(&mut buf);
-    TxEnvelope {
+    kardamom_log::TxFrame::from_owned(&TxEnvelope {
         correlation_id,
         raw_tx: Bytes::from(buf),
         sender: s.address(),
         tx_hash: Default::default(),
-    }
+    })
+    .expect("encode test envelope")
 }
 
 fn bench_in_order(c: &mut Criterion) {
     let signers: Vec<_> = (1..=64u64).map(signer).collect();
-    let mut batch: Vec<(TxDataLoc, TxEnvelope)> = Vec::with_capacity(64 * 16);
+    let mut batch: Vec<(TxDataLoc, kardamom_log::TxFrame)> = Vec::with_capacity(64 * 16);
     for (i, s) in signers.iter().enumerate() {
         for n in 0u64..16 {
             let correlation = (i * 16 + n as usize) as u64;

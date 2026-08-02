@@ -48,6 +48,118 @@ where
     rkyv::from_bytes::<T, rancor::Error>(bytes).map_err(|e| LogError::Codec(e.to_string()))
 }
 
+/// An owned, validated rkyv frame: ONE aligned copy of the wire bytes,
+/// checked at construction, then read IN PLACE forever after — the
+/// zero-copy alternative to [`materialize`] for values that must outlive
+/// the Aeron fragment buffer.
+///
+/// `Arc`-backed so clones are refcount bumps (the validator's parallel
+/// batches clone envelopes per batch; with owned `TxEnvelope` each clone
+/// copied the raw tx).
+pub struct ArchivedFrame<T> {
+    bytes: std::sync::Arc<AlignedVec>,
+    _t: std::marker::PhantomData<T>,
+}
+
+impl<T> Clone for ArchivedFrame<T> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            _t: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for ArchivedFrame<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ArchivedFrame<{}>({}B)",
+            std::any::type_name::<T>(),
+            self.bytes.len()
+        )
+    }
+}
+
+impl<T> ArchivedFrame<T>
+where
+    T: Archive,
+    T::Archived: for<'a> rkyv::bytecheck::CheckBytes<HighValidator<'a, rancor::Error>>,
+{
+    /// Copy `bytes` into an aligned buffer and VALIDATE once. All later
+    /// reads use the unchecked accessor — safe because the buffer is
+    /// immutable from here on.
+    pub fn new(bytes: &[u8]) -> Result<Self, LogError> {
+        let mut av = AlignedVec::with_capacity(bytes.len());
+        av.extend_from_slice(bytes);
+        rkyv::access::<T::Archived, rancor::Error>(&av)
+            .map_err(|e| LogError::Codec(e.to_string()))?;
+        Ok(Self {
+            bytes: std::sync::Arc::new(av),
+            _t: std::marker::PhantomData,
+        })
+    }
+
+    /// Encode an owned value into a frame (rare paths: archive refetch,
+    /// tests). One encode + one validation.
+    pub fn from_owned(value: &T) -> Result<Self, LogError>
+    where
+        T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
+    {
+        let av = encode(value)?;
+        rkyv::access::<T::Archived, rancor::Error>(&av)
+            .map_err(|e| LogError::Codec(e.to_string()))?;
+        Ok(Self {
+            bytes: std::sync::Arc::new(av),
+            _t: std::marker::PhantomData,
+        })
+    }
+
+    /// The underlying wire bytes (verbatim republish, tests).
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The archived view. Zero-copy, zero-cost after construction.
+    #[must_use]
+    pub fn get(&self) -> &T::Archived {
+        // SAFETY: validated in `new`/`from_owned`; the buffer is behind an
+        // Arc and never mutated.
+        unsafe { rkyv::access_unchecked::<T::Archived>(&self.bytes) }
+    }
+
+    /// Materialize an owned `T` (off the hot path: forensics, dumps).
+    pub fn to_owned_value(&self) -> Result<T, LogError>
+    where
+        T::Archived: Deserialize<T, HighDeserializer<rancor::Error>>,
+    {
+        materialize(&self.bytes)
+    }
+}
+
+/// Zero-copy field accessors for the tx_data hot path: every tx crosses
+/// this frame once per subscriber, so reads must not allocate.
+impl ArchivedFrame<kardamom_types::TxEnvelope> {
+    #[must_use]
+    pub fn correlation_id(&self) -> u64 {
+        self.get().correlation_id.to_native()
+    }
+    #[must_use]
+    pub fn sender(&self) -> kardamom_types::Address {
+        kardamom_types::wire::address_from_archived(&self.get().sender)
+    }
+    #[must_use]
+    pub fn tx_hash(&self) -> kardamom_types::B256 {
+        kardamom_types::wire::b256_from_archived(&self.get().tx_hash)
+    }
+    /// The raw signed transaction bytes, borrowed from the frame.
+    #[must_use]
+    pub fn raw_tx(&self) -> &[u8] {
+        self.get().raw_tx.as_slice()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -60,6 +60,7 @@ use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{error, warn};
 
+use crate::TxFrame;
 use crate::codec;
 use crate::config::ChannelsConfig;
 use crate::error::LogError;
@@ -499,15 +500,18 @@ impl AeronRuntime {
         &self,
         uri: &str,
         stream_id: i32,
-    ) -> Result<UnboundedReceiver<(TxDataLoc, TxEnvelope)>, LogError> {
-        let (msg_tx, msg_rx) = unbounded_channel::<(TxDataLoc, TxEnvelope)>();
+    ) -> Result<UnboundedReceiver<(TxDataLoc, TxFrame)>, LogError> {
+        let (msg_tx, msg_rx) = unbounded_channel::<(TxDataLoc, TxFrame)>();
         let deliver: DeliverFn = Box::new(move |bytes: &[u8], pos: BPosition, session: i32| {
-            match codec::materialize::<TxEnvelope>(bytes) {
-                Ok(v) => {
-                    let _ = msg_tx.send((TxDataLoc::new(session, pos), v));
+            // ZERO-COPY: one aligned copy + one validation per frame; every
+            // downstream field read is in place. materialize() here used to
+            // build the full owned TxEnvelope graph per subscriber per tx.
+            match TxFrame::new(bytes) {
+                Ok(frame) => {
+                    let _ = msg_tx.send((TxDataLoc::new(session, pos), frame));
                 }
                 Err(e) => {
-                    error!(error = %e, "decode failed on tx_data subscription delivery");
+                    error!(error = %e, "invalid frame on tx_data subscription delivery");
                 }
             }
         });
@@ -1044,7 +1048,7 @@ impl TxDataPublisherHandle {
 /// stamp `TxRef.tx_data_session_id` and the executor can key its join buffer on
 /// `(shard, session, position)` under concurrent ingress publishers.
 pub struct TxDataSubscriberHandle {
-    rx: UnboundedReceiver<(TxDataLoc, TxEnvelope)>,
+    rx: UnboundedReceiver<(TxDataLoc, TxFrame)>,
 }
 
 impl TxDataSubscriberHandle {
@@ -1061,11 +1065,11 @@ impl TxDataSubscriberHandle {
         })
     }
 
-    pub async fn recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
+    pub async fn recv(&mut self) -> Option<(TxDataLoc, TxFrame)> {
         self.rx.recv().await
     }
 
-    pub fn try_recv(&mut self) -> Option<(TxDataLoc, TxEnvelope)> {
+    pub fn try_recv(&mut self) -> Option<(TxDataLoc, TxFrame)> {
         self.rx.try_recv().ok()
     }
 }
