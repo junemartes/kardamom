@@ -850,8 +850,8 @@ mod engine_tests {
         let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 20);
         let claims = ClaimIndex::from_alloy(&quantized);
 
-        let out =
-            execute_block_parallel(&snap, None, &txs, &claims, env(), 8, 20).expect("quantized parity");
+        let out = execute_block_parallel(&snap, None, &txs, &claims, env(), 8, 20)
+            .expect("quantized parity");
         assert_eq!(out.delta.accounts, expected.accounts);
         assert_eq!(out.batches, 3, "47 txs at K=20 -> 3 aligned chunks");
 
@@ -872,7 +872,7 @@ mod engine_tests {
         }
     }
 
-/// THE depth-K regression: under the pipelined commit the snapshot can
+    /// THE depth-K regression: under the pipelined commit the snapshot can
     /// be K blocks stale — block 2's txs must observe block 1's writes via
     /// the PARENT layer. The first DeFi gate diverged exactly here: the
     /// hook dropped the parent, the validator saw stale nonces, and skipped
@@ -895,8 +895,8 @@ mod engine_tests {
         // semantics: the mock snapshot still says nonce 0).
         let b1: Vec<BlockTx> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
         let claims1 = honest_claims(&snap, &b1);
-        let out1 = execute_block_parallel(&snap, None, &b1, &claims1, env(), 2, 1)
-            .expect("block 1");
+        let out1 =
+            execute_block_parallel(&snap, None, &b1, &claims1, env(), 2, 1).expect("block 1");
         let parent = out1.delta.clone();
 
         // Block 2: nonces 4..7. Against the bare snapshot every tx is a
@@ -908,8 +908,16 @@ mod engine_tests {
         let mut cumulative = 0u64;
         for (i, t) in b2.iter().enumerate() {
             let (r, ws) = execute_tx(
-                &snap, Some(&parent), &delta, env(), t.tx_idx, t.position, &t.envelope,
-                i as u64, cumulative, Some((&mut bal, (i + 1) as u64)),
+                &snap,
+                Some(&parent),
+                &delta,
+                env(),
+                t.tx_idx,
+                t.position,
+                &t.envelope,
+                i as u64,
+                cumulative,
+                Some((&mut bal, (i + 1) as u64)),
             )
             .expect("seq block 2");
             assert!(r.status, "block-2 txs must execute given the parent");
@@ -935,7 +943,8 @@ mod engine_tests {
     #[test]
     fn empty_block_is_a_no_op() {
         let snap = MockStateDatabase::builder().build();
-        let out = execute_block_parallel(&snap, None, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
+        let out =
+            execute_block_parallel(&snap, None, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
         assert!(out.receipts.is_empty() && out.batches == 0);
     }
 }
