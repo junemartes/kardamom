@@ -47,43 +47,35 @@ impl WriteSet {
     /// width + endianness so two replicas on different architectures produce
     /// identical bytes.
     pub fn hash(&self) -> B256 {
-        let mut buf: Vec<u8> = Vec::with_capacity(
-            3 + 4
-                + self.accounts.len() * (20 + 8 + 32 + 32)
-                + 3
-                + 4
-                + self.storage.len() * (20 + 32 + 32)
-                + 3
-                + 4
-                + self.code.len() * (32 + 8),
-        );
-
-        buf.extend_from_slice(b"ACC");
-        buf.extend_from_slice(&(self.accounts.len() as u32).to_be_bytes());
+        // STREAMED into the hasher — the old buffer-then-hash allocated a
+        // per-tx Vec sized to the whole serialization (including full
+        // contract BYTECODE via the code section: 3.1KB/tx on CLOB
+        // workloads, the single largest allocation site post-ExecScope).
+        // The byte SEQUENCE is identical, so the hash is unchanged.
+        let mut h = alloy_primitives::Keccak256::new();
+        h.update(b"ACC");
+        h.update((self.accounts.len() as u32).to_be_bytes());
         for (addr, (nonce, balance, code_hash)) in &self.accounts {
-            buf.extend_from_slice(addr.as_slice());
-            buf.extend_from_slice(&nonce.to_le_bytes());
-            buf.extend_from_slice(&balance.to_be_bytes::<32>());
-            buf.extend_from_slice(code_hash.as_slice());
+            h.update(addr.as_slice());
+            h.update(nonce.to_le_bytes());
+            h.update(balance.to_be_bytes::<32>());
+            h.update(code_hash.as_slice());
         }
-
-        buf.extend_from_slice(b"STO");
-        buf.extend_from_slice(&(self.storage.len() as u32).to_be_bytes());
+        h.update(b"STO");
+        h.update((self.storage.len() as u32).to_be_bytes());
         for ((addr, key), value) in &self.storage {
-            buf.extend_from_slice(addr.as_slice());
-            buf.extend_from_slice(key.as_slice());
-            buf.extend_from_slice(&value.to_be_bytes::<32>());
+            h.update(addr.as_slice());
+            h.update(key.as_slice());
+            h.update(value.to_be_bytes::<32>());
         }
-
-        buf.extend_from_slice(b"COD");
-        buf.extend_from_slice(&(self.code.len() as u32).to_be_bytes());
+        h.update(b"COD");
+        h.update((self.code.len() as u32).to_be_bytes());
         for (code_hash, bytes) in &self.code {
-            buf.extend_from_slice(code_hash.as_slice());
-            buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            buf.extend_from_slice(bytes);
+            h.update(code_hash.as_slice());
+            h.update((bytes.len() as u64).to_le_bytes());
+            h.update(bytes.as_ref());
         }
-
-        keccak256(&buf)
+        h.finalize()
     }
 }
 
