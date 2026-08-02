@@ -441,22 +441,20 @@ pub fn execute_batch<S: StateDatabase>(
     // its captured Bal is quantized through the SAME shared code the
     // executor used, and compared once at the end.
     let mut batch_bal = revm::state::bal::Bal::new();
+    // ONE execution scope per batch (EVM + commit-into cache reused across
+    // the batch's txs — the per-tx construction was ~90% of execution-path
+    // allocation). The seed layer plays the parent role.
+    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, Some(seed), env)?;
     for (i, tx) in txs.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
         // Recompute this tx's claims through the executor's EXACT capture
-        // path (execute_tx feeds revm's Bal, which records per-FIELD
+        // path (the scope feeds revm's Bal, which records per-FIELD
         // changes: a transfer's recipient claims a balance change but NO
         // nonce change). Comparing a WriteSet projection instead diverged
-        // on every live transfer — the WriteSet carries the full
-        // (nonce, balance) triple for every touched account, so the
-        // recipient's UNCHANGED nonce showed up computed-but-not-claimed.
-        // Symmetric construction is the only drift-proof comparison.
-        let (receipt, ws) = execute_tx(
-            snapshot,
-            Some(seed),
-            &delta,
-            env,
+        // on every live transfer — symmetric construction is the only
+        // drift-proof comparison.
+        let (receipt, ws) = scope.execute_tx(
             tx.tx_idx,
             tx.position,
             &tx.envelope,
@@ -974,6 +972,7 @@ pub fn execute_block_sequential<S: StateDatabase>(
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
+    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
         let (receipt, ws) = match rec {
@@ -981,34 +980,31 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 tx_idx,
                 envelope,
                 position,
-            } => execute_tx(
-                snapshot,
-                parent,
-                &delta,
-                env,
-                *tx_idx,
-                *position,
-                envelope,
-                idx_in_block,
-                cumulative,
-                None,
-            )?,
+            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
                 position,
-            } => execute_deposit_tx(
-                snapshot,
-                parent,
-                &delta,
-                env,
-                *tx_idx,
-                *position,
-                deposit,
-                idx_in_block,
-                cumulative,
-                None,
-            )?,
+            } => {
+                let out = execute_deposit_tx(
+                    snapshot,
+                    parent,
+                    &delta,
+                    env,
+                    *tx_idx,
+                    *position,
+                    deposit,
+                    idx_in_block,
+                    cumulative,
+                    None,
+                )?;
+                // Fold deposit writes into the scope cache (mirrors the
+                // actor's streaming path) so later txs observe them.
+                let mut layer = PendingDelta::new();
+                layer.apply(out.1.clone());
+                scope.seed_layer(&layer)?;
+                out
+            }
         };
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);

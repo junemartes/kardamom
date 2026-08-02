@@ -452,6 +452,13 @@ where
             // Whole-block buffer, used only when a block-exec strategy is
             // supplied (validator parallel path).
             let mut buffered: Vec<BufferedRecord> = Vec::new();
+            // Per-BLOCK execution scope (streaming path): one EVM + one
+            // commit-into cache for the whole block — the per-tx
+            // construction was ~90% of execution-path allocation. Dropped
+            // at each boundary; rebuilt lazily at the block's first tx
+            // (seeded with parent + whatever the live delta already holds,
+            // e.g. deposits that landed before the first tx).
+            let mut scope: Option<crate::executor::ExecScope<S::Db>> = None;
             let mut parent: Option<PendingDelta> = None;
             let mut inflight: std::collections::VecDeque<(BlockBoundary, PendingDelta)> =
                 std::collections::VecDeque::new();
@@ -554,11 +561,19 @@ where
                             l2_timestamp: current_l2_ts,
                         };
                         let apply_start = Instant::now();
-                        let result = execute_tx(
-                            &snapshot,
-                            parent.as_ref(),
-                            &delta,
-                            env,
+                        let sc = match scope.as_mut() {
+                            Some(sc) => sc,
+                            None => {
+                                let mut sc = crate::executor::ExecScope::new(
+                                    snapshots.snapshot_after(current_block.saturating_sub(1)),
+                                    parent.as_ref(),
+                                    env,
+                                )?;
+                                sc.seed_layer(&delta)?;
+                                scope.insert(sc)
+                            }
+                        };
+                        let result = sc.execute_tx(
                             tx_idx,
                             position,
                             &envelope,
@@ -636,6 +651,14 @@ where
                                 .as_ref()
                                 .map(|_| (&mut block_bal, tx_index_in_block + 1)),
                         );
+                        // Deposits run outside the scope (rare, own commit
+                        // semantics) — fold their writes into the block
+                        // cache so later txs in this block observe them.
+                        if let (Some(sc), Ok((_, ws))) = (scope.as_mut(), &result) {
+                            let mut layer = PendingDelta::new();
+                            layer.apply(ws.clone());
+                            sc.seed_layer(&layer)?;
+                        }
                         if result.is_ok() {
                             tx_applied_ok.increment(1);
                         } else {
@@ -804,6 +827,13 @@ where
                         // tx_receipts is AT-LEAST-ONCE and every consumer
                         // must dedup on `tx_idx` (ingress does).
                         let pending = std::mem::take(&mut delta);
+                        // The block's execution scope dies with the block:
+                        // the NEXT block gets a new parent layer and block
+                        // env, and (when commits settled) a fresh snapshot.
+                        // Dropping here is unconditional — a scope reused
+                        // across a boundary would execute against the
+                        // previous block's parent and env.
+                        scope = None;
                         // EIP-7928 handoff: move the block's Bal + a
                         // receipts-free copy of the merged delta to the
                         // publisher thread (encode + reliable delivery live
@@ -1291,6 +1321,87 @@ mod exec_tests {
     /// handoff at each boundary must carry a POPULATED Bal. Live phase-1
     /// measurement produced 1-byte (empty) BALs while deltas were 76KB —
     /// direct `execute_tx` tests passed, so the gap is in this wiring.
+    /// Scope-cache visibility across record kinds: a DEPOSIT credits an
+    /// account mid-block; a LATER TX in the same block spends that credit.
+    /// The deposit runs outside the ExecScope (own commit semantics), so
+    /// its writes are folded into the scope cache explicitly — this test
+    /// pins that fold. Without it the spend is an insufficient-funds skip.
+    #[test]
+    fn deposit_credit_is_visible_to_later_txs_in_the_block() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("00000000000000000000000000000000000BEEF0");
+        // The sender does NOT exist pre-block: only the deposit funds it.
+        let snap = MockStateDatabase::builder().build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(64);
+
+        tx_r2e
+            .send(ReaderToExec::Deposit {
+                tx_idx: TxIndex(0),
+                deposit: kardamom_types::Deposit {
+                    source_hash: alloy_primitives::B256::repeat_byte(0x11),
+                    from,
+                    to: Some(from),
+                    mint: 10u128.pow(18),
+                    value: U256::ZERO,
+                    gas_limit: 100_000,
+                    is_system_transaction: false,
+                    input: Default::default(),
+                },
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(1),
+                envelope: legacy(&signer, to, 1, 1_000),
+                position: pos(64),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(2),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+            None,
+            None,
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        // The transfer must have EXECUTED (status true), not skipped for
+        // missing funds: the deposit's credit reached the scope cache.
+        let mut saw_transfer_success = false;
+        while let Ok(msg) = rx_e2c.try_recv() {
+            if let ExecToCommit::Receipt(r) = msg {
+                if r.tx_idx == pos(64) {
+                    assert!(
+                        r.status,
+                        "transfer after same-block deposit must execute: {r:?}"
+                    );
+                    assert!(r.gas_used > 0);
+                    saw_transfer_success = true;
+                }
+            }
+        }
+        assert!(saw_transfer_success, "transfer receipt not observed");
+    }
+
     #[test]
     fn exec_handoff_carries_a_populated_bal() {
         let signer = PrivateKeySigner::random();
