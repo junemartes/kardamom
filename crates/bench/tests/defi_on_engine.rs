@@ -7,7 +7,7 @@
 //! exactly as the executor will run them.
 
 use alloy_primitives::{Address, U256};
-use kardamom_bench::load::defi::{DefiContracts, deployment_txs, pregenerate_defi};
+use kardamom_bench::load::defi::{deployment_txs, pregenerate_defi};
 use kardamom_bench::load::plan::PlannedTx;
 use kardamom_bench::mnemonic;
 use kardamom_engine::block_env::ExecEnv;

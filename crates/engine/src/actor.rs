@@ -54,7 +54,6 @@ use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::{CMessage, TxIndex};
 use crate::executor::execute_deposit_tx;
-use crate::executor::execute_tx;
 use crate::reader::{
     DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
     TxDataSubscription, TxOrderingSubscription, spawn_tx_data_reader, spawn_tx_deposits_reader,
@@ -256,7 +255,7 @@ impl Executor {
     /// `recovery` is the archive-backed join-miss refetch factory (see
     /// [`crate::reader::JoinRecovery`]); `None` keeps the plain bounded join.
     #[allow(clippy::too_many_arguments)] // 10 args is the natural shape of the
-    // executor's run-once API; see the long-form note in [`execute_tx`]
+    // executor's run-once API; see the long-form note in [`crate::executor::execute_tx`]
     // for the same rationale applied to per-tx execution.
     pub fn run<C, S, Q, P>(
         cfg: ExecutorConfig,
@@ -1388,15 +1387,15 @@ mod exec_tests {
         // missing funds: the deposit's credit reached the scope cache.
         let mut saw_transfer_success = false;
         while let Ok(msg) = rx_e2c.try_recv() {
-            if let ExecToCommit::Receipt(r) = msg {
-                if r.tx_idx == pos(64) {
-                    assert!(
-                        r.status,
-                        "transfer after same-block deposit must execute: {r:?}"
-                    );
-                    assert!(r.gas_used > 0);
-                    saw_transfer_success = true;
-                }
+            if let ExecToCommit::Receipt(r) = msg
+                && r.tx_idx == pos(64)
+            {
+                assert!(
+                    r.status,
+                    "transfer after same-block deposit must execute: {r:?}"
+                );
+                assert!(r.gas_used > 0);
+                saw_transfer_success = true;
             }
         }
         assert!(saw_transfer_success, "transfer receipt not observed");

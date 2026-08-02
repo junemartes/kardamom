@@ -110,6 +110,7 @@ fn op(contracts: &DefiContracts, sender: usize, seq: u64) -> (Address, Bytes) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sign(
     s: &DerivedSigner,
     chain_id: u64,
@@ -227,54 +228,6 @@ pub fn pregenerate_defi(
     Ok(out)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::mnemonic;
-
-    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
-
-    #[test]
-    fn op_mix_covers_all_contracts_and_is_deterministic() {
-        let c = DefiContracts::at(Address::repeat_byte(9), 0);
-        let mut hit = std::collections::HashSet::new();
-        for sender in 0..4 {
-            for seq in 1..64 {
-                let (to, data) = op(&c, sender, seq);
-                assert_eq!(op(&c, sender, seq), (to, data.clone()), "deterministic");
-                hit.insert(to);
-                assert!(data.len() >= 4);
-            }
-        }
-        assert!(hit.contains(&c.pool) && hit.contains(&c.vault) && hit.contains(&c.clob));
-    }
-
-    #[test]
-    fn deployment_addresses_match_planned_nonces() {
-        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 2).unwrap();
-        let (txs, contracts) = deployment_txs(&signers, 412_346, 5, 1_000_000_000).unwrap();
-        assert_eq!(txs.len(), 3);
-        assert_eq!(txs[0].nonce, 5);
-        assert_eq!(txs[2].nonce, 7);
-        let expect = DefiContracts::at(signers[0].signer.address(), 5);
-        assert_eq!(contracts.pool, expect.pool);
-        assert_eq!(contracts.clob, expect.clob);
-    }
-
-    #[test]
-    fn sender_zero_queue_starts_after_deployments() {
-        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 2).unwrap();
-        let c = DefiContracts::at(signers[0].signer.address(), 0);
-        let q = pregenerate_defi(&signers, 412_346, &c, 4, 0, 1_000_000_000).unwrap();
-        assert_eq!(q[0][0].nonce, 3, "sender 0 shifted past deployments");
-        assert_eq!(q[1][0].nonce, 0, "other senders start at nonce_start");
-        // Every sender's first op is the pool seed (funds swap balances).
-        for queue in &q {
-            assert!(!queue.is_empty());
-        }
-    }
-}
-
 /// Pre-sign per-sender queues of a SINGLE op family (allocation profiling:
 /// per-family numbers separate contract-execution cost from engine fixed
 /// cost). Families needing state (withdraw needs shares, cancel needs
@@ -370,4 +323,52 @@ pub fn pregenerate_family(
         out.push(queue);
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mnemonic;
+
+    const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
+
+    #[test]
+    fn op_mix_covers_all_contracts_and_is_deterministic() {
+        let c = DefiContracts::at(Address::repeat_byte(9), 0);
+        let mut hit = std::collections::HashSet::new();
+        for sender in 0..4 {
+            for seq in 1..64 {
+                let (to, data) = op(&c, sender, seq);
+                assert_eq!(op(&c, sender, seq), (to, data.clone()), "deterministic");
+                hit.insert(to);
+                assert!(data.len() >= 4);
+            }
+        }
+        assert!(hit.contains(&c.pool) && hit.contains(&c.vault) && hit.contains(&c.clob));
+    }
+
+    #[test]
+    fn deployment_addresses_match_planned_nonces() {
+        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 2).unwrap();
+        let (txs, contracts) = deployment_txs(&signers, 412_346, 5, 1_000_000_000).unwrap();
+        assert_eq!(txs.len(), 3);
+        assert_eq!(txs[0].nonce, 5);
+        assert_eq!(txs[2].nonce, 7);
+        let expect = DefiContracts::at(signers[0].signer.address(), 5);
+        assert_eq!(contracts.pool, expect.pool);
+        assert_eq!(contracts.clob, expect.clob);
+    }
+
+    #[test]
+    fn sender_zero_queue_starts_after_deployments() {
+        let signers = mnemonic::derive_signers(ANVIL_PHRASE, 2).unwrap();
+        let c = DefiContracts::at(signers[0].signer.address(), 0);
+        let q = pregenerate_defi(&signers, 412_346, &c, 4, 0, 1_000_000_000).unwrap();
+        assert_eq!(q[0][0].nonce, 3, "sender 0 shifted past deployments");
+        assert_eq!(q[1][0].nonce, 0, "other senders start at nonce_start");
+        // Every sender's first op is the pool seed (funds swap balances).
+        for queue in &q {
+            assert!(!queue.is_empty());
+        }
+    }
 }

@@ -70,9 +70,9 @@ pub struct LoadConfig {
     pub to: Address,
     /// Wei per transfer.
     pub value: U256,
-    /// Workload family: plain transfers, or the DeFi mix (CLOB + swap pool
-    /// + vault; see `load::defi`). DeFi deploys its contracts from the
-    /// FIRST sender before the ramp and reports gas-centric throughput.
+    /// Workload family: plain transfers, or the DeFi mix (CLOB + swap
+    /// pool + vault; see `load::defi`). DeFi deploys its contracts from
+    /// the FIRST sender before the ramp and reports gas-centric throughput.
     pub workload: Workload,
     /// Legacy gas price (wei).
     pub gas_price: u128,

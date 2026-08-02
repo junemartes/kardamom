@@ -16,7 +16,7 @@
 
 use std::collections::BTreeMap;
 
-use alloy_primitives::{Address, B256, U256, keccak256};
+use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use kardamom_types::delta::CodeEntry;
 use kardamom_types::{AccountChange, BlockDelta, StorageChange};
@@ -32,6 +32,7 @@ use kardamom_types::{AccountChange, BlockDelta, StorageChange};
 /// push then call [`WriteSet::finish`]; [`WriteSet::hash`] debug-asserts
 /// sortedness.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[allow(clippy::type_complexity)]
 pub struct WriteSet {
     /// (address, (nonce, balance, code_hash)), sorted by address.
     pub accounts: smallvec::SmallVec<[(Address, (u64, U256, B256)); 3]>,
