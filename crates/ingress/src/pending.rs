@@ -195,10 +195,22 @@ impl PendingReceipts {
             let seq = self
                 .park_seq
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tx_idx = receipt.tx_idx;
             self.parked
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert((receipt.tx_idx, seq), Arc::downgrade(&entry));
+                .insert((tx_idx, seq), Arc::downgrade(&entry));
+            drop(e);
+            // CHECK-PARK-RECHECK: a watermark tick between the gate check
+            // and the insert would have drained a prefix this entry now
+            // belongs to — and if that was the burst's FINAL tick, the
+            // waiter would hang until client timeout, holding its
+            // connection (an fd amplifier at burst tails). Re-draining
+            // after the park is idempotent and closes the window.
+            let latest2 = *self.latest.lock().await;
+            if self.gate_satisfied(&latest2, tx_idx) {
+                self.release_satisfied().await;
+            }
         }
     }
 

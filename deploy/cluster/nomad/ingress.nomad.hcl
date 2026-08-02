@@ -90,6 +90,13 @@ job "ingress" {
       driver = "docker"
 
       config {
+        # 8192 rpc conns + WS feed + aeron + docker overhead: the default
+        # container nofile (1024 soft on some daemons) EMFILE'd under a
+        # 2,500tps blocking-submit burst (held conn per in-flight tx),
+        # collapsing acceptance and starving receipt polls.
+        ulimit {
+          nofile = "65536:65536"
+        }
         image        = "192.168.56.10:5000/kardamom-ingress:dev"
         # Always pull the freshly-built image: the mutable :dev tag would otherwise
         # let Nomad reuse a stale node-cached layer across rebuilds (caused a
