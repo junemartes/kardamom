@@ -65,6 +65,12 @@ job "validator" {
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           "/opt/kardamom/state:/opt/kardamom/state",
+          # Adoption-only checkpoint staging (#143): peer checkpoints fetched
+          # here when the cluster refuses replay (cursor below the retention
+          # floor); adopted on the next start. The validator never creates
+          # checkpoints. Blocks through an adopted checkpoint are UNVERIFIED
+          # by this validator (trust class of the #78 catch-up).
+          "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
         ]
         args = [
           # Seeded parallel batch re-execution from the EIP-7928 BAL
@@ -93,6 +99,11 @@ job "validator" {
           # distinct anyway). tx_ordering recovery rides the cluster replay.
           "--replay-destination-endpoint", "${meta.node_ip}:40131",
           "--archive-control-response-endpoint", "${meta.node_ip}:40141",
+          # Replay-unavailable fallback (#143): fetch a peer checkpoint from
+          # the executors' serve endpoints and adopt it on restart, exactly
+          # like the executors' recovery-D loop.
+          "--checkpoint-dir", "/opt/kardamom/checkpoints",
+          "--checkpoint-peers", "192.168.56.41:9014,192.168.56.42:9014,192.168.56.43:9014",
           # Shadow-check the node-incremental state trie against a full rebuild
           # every 8th block; a walker bug fail-stops the validator (dead alloc =
           # verdict failure) and bumps kardamom_state_trie_shadow_mismatch_total.

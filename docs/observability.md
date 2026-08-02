@@ -128,7 +128,15 @@ Two low-rate counters deserve standing alerts:
   overrun (`REPLAY_UNAVAILABLE`). Any non-zero rate means a node fell behind
   the retention window and repaired itself from a peer checkpoint —
   `unrecoverable` means it could not and is waiting for an operator (see
-  `docs/failure-modes.md`, "Replay-window overrun").
+  `docs/failure-modes.md`, "Replay-window overrun"). The validator twin is
+  `validator_resync_total` (#143); a `peer-checkpoint` increment there also
+  means blocks through the adopted checkpoint are unverified by that
+  validator.
+- `validator_bal_sub_reopen_total` counts tx_bal subscription reopens after
+  60s of silence (#144 — a never-joined or silently dead multicast image
+  self-healing). Occasional increments on an idle cluster are noise;
+  sustained growth on a progressing chain means BAL delivery to that node is
+  broken and verification coverage is degrading.
 - `kardamom_executor_invalid_tx_skipped_total` counts deterministically-invalid
   canonical txs skipped with a marker receipt (`status=false, gas_used=0` —
   `Receipt::is_invalid_skip`; issue #92). The skip keeps the chain live and is
