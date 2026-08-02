@@ -365,6 +365,14 @@ pub struct ValidatorWriterQueue<Q: StateWriterQueue> {
     bals: Arc<BalBuffer>,
     divergence: Arc<Divergence>,
     wait: Duration,
+    /// Blocks at or below this were DURABLY VERIFIED before a restart.
+    /// Crash-recovery replays them for state reconstruction, but
+    /// re-execution against already-applied state yields EMPTY deltas
+    /// (every tx skips as nonce-too-low) — comparing those against
+    /// retained BAL frames produced FALSE divergences that cascaded:
+    /// each fail-stop restart re-entered replay and diverged again,
+    /// turning any transient stall into a permanent restart loop.
+    verify_floor: u64,
 }
 
 impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
@@ -374,7 +382,18 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
             bals,
             divergence,
             wait: BAL_WAIT,
+            verify_floor: 0,
         }
+    }
+
+    /// Skip BAL verification for blocks at or below `floor` (the recovery
+    /// resume point): they were verified before the restart, and replay
+    /// re-execution against already-applied state legitimately produces
+    /// deltas that cannot match the BAL.
+    #[must_use]
+    pub fn with_verify_floor(mut self, floor: u64) -> Self {
+        self.verify_floor = floor;
+        self
     }
 
     #[cfg(test)]
@@ -386,6 +405,14 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
 
 impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+        if block.block_number <= self.verify_floor {
+            tracing::debug!(
+                block = block.block_number,
+                floor = self.verify_floor,
+                "recovery replay overlap; BAL verification skipped (verified pre-restart)"
+            );
+            return self.inner.submit(block, delta);
+        }
         match self.bals.take(block.block_number, self.wait) {
             Some(bal) => {
                 if write_set_eq(&delta, &bal) {

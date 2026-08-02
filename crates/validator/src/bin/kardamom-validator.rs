@@ -388,7 +388,12 @@ async fn main() -> Result<()> {
         MdbxWriterQueue::new(writer.delta_tx.clone()),
         bals.clone(),
         divergence.clone(),
-    );
+    )
+    // Blocks at or below the recovery resume point were verified before
+    // the restart; replay re-execution against already-applied state
+    // yields empty deltas that CANNOT match the BAL — comparing them
+    // produced false-divergence restart cascades.
+    .with_verify_floor(recovery.last_committed_block);
 
     // L1 output attester: enabled only when the three flags are all present.
     // (Runs inside this tokio runtime; the task lives as long as a handle
