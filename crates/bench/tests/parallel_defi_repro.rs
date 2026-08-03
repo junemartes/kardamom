@@ -12,13 +12,14 @@ use alloy_primitives::{Address, U256};
 use kardamom_bench::load::defi::{DefiContracts, deployment_txs, pregenerate_defi};
 use kardamom_bench::load::plan::PlannedTx;
 use kardamom_bench::mnemonic;
+use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::exec_types::TxIndex;
 use kardamom_engine::executor::execute_tx;
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
-use kardamom_validator::parallel::{BlockTx, ClaimIndex, execute_block_parallel};
+use kardamom_validator::parallel::{ClaimIndex, execute_block_parallel};
 
 const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
 const CHAIN_ID: u64 = 412_346;
@@ -166,10 +167,10 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
         }
         let alloy_bal = bal.into_alloy_bal();
 
-        let block_txs: Vec<BlockTx> = txs
+        let block_txs: Vec<BufferedRecord> = txs
             .iter()
             .enumerate()
-            .map(|(i, (_si, t))| BlockTx {
+            .map(|(i, (_si, t))| BufferedRecord::Tx {
                 tx_idx: TxIndex(i as u64),
                 position: BPosition::from_index(i as u64),
                 envelope: envelope(t, signers[txs[i].0].signer.address(), i as u64),
@@ -269,10 +270,10 @@ fn create_then_call_across_chunks_in_one_block() {
     }
     let alloy_bal = bal.into_alloy_bal();
 
-    let block_txs: Vec<BlockTx> = txs
+    let block_txs: Vec<BufferedRecord> = txs
         .iter()
         .enumerate()
-        .map(|(i, (_si, t))| BlockTx {
+        .map(|(i, (_si, t))| BufferedRecord::Tx {
             tx_idx: TxIndex(i as u64),
             position: BPosition::from_index(i as u64),
             envelope: envelope(t, signers[txs[i].0].signer.address(), i as u64),

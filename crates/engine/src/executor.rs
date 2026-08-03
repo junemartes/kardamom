@@ -673,21 +673,42 @@ fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
 /// classification; only present values are ever serialized). Both executor
 /// and validator build deposit claims through this same path, keeping the
 /// claims symmetric. Reads are not attributed for deposits.
+///
+/// Classification in revm's Bal is per FIELD, each compared against the
+/// fabricated original — so every field a later batch may seed from must
+/// have its original forced to differ. Nonce and balance always (post-values
+/// only; the mint IS a balance claim), code only when this record deployed
+/// it (`ws.code` carries created-only bytecode, and the claim must include
+/// the BYTES — code is a seed, see `ClaimIndex::code`). The first version
+/// fabricated only the nonce, and per-field classification silently dropped
+/// the balance and code claims: the deposit mint never reached the BAL.
 pub fn record_writeset_into_bal(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {
     use revm::state::{Account, AccountInfo, AccountStatus, EvmStorageSlot};
     let mut by_addr: std::collections::BTreeMap<Address, Account> =
         std::collections::BTreeMap::new();
     for (addr, (nonce, balance, code_hash)) in &ws.accounts {
+        let code = ws
+            .code
+            .iter()
+            .find(|(h, _)| h == code_hash)
+            .map(|(_, b)| Bytecode::new_raw(AlloyBytes::from(b.clone())));
+        let deployed_here = code.is_some();
         let info = AccountInfo {
             nonce: *nonce,
             balance: *balance,
             code_hash: *code_hash,
-            code: None,
+            code,
             account_id: None,
         };
         let mut original = info.clone();
-        // Force change-classification: fabricate a differing original.
         original.nonce = original.nonce.wrapping_add(1);
+        original.balance = original.balance.wrapping_add(U256::ONE);
+        if deployed_here {
+            // `ws.code` never carries empty bytecode, so KECCAK256_EMPTY is
+            // guaranteed to differ from the deployed hash.
+            original.code_hash = alloy_primitives::KECCAK256_EMPTY;
+            original.code = None;
+        }
         by_addr.insert(
             *addr,
             Account {
