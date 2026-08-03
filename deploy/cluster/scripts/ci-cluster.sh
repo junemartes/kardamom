@@ -458,6 +458,10 @@ fi
 
 # --- 6. Deploy the Nomad jobs + smoke ---------------------------------------
 export NOMAD_ADDR="http://192.168.56.10:4646"
+# Runner identity, stamped for EVERY shard (#124: chaos-case load verdicts
+# show the same intermittent collapses as the load shard).
+log "runner: name=${RUNNER_NAME:-local} host=$(hostname) cpus=$(nproc) loadavg=[$(cut -d' ' -f1-3 /proc/loadavg)] mem_avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+
 log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 ./scripts/deploy.sh
 
@@ -486,6 +490,24 @@ log "smoke test (gate: single-tx must pass before load smoke runs)"
 LOAD_BIN="${ROOT}/target/release/kardamom-load"
 if [[ -x "${LOAD_BIN}" ]]; then
   if [[ "${RUN_LOAD:-1}" == "1" ]]; then
+    # Runner-identity stamping (#124): the load ceiling swings 800→18 on
+    # identical code, and "degraded runner window" has only ever been an
+    # inference. Stamp WHO is running this shard and HOW LOADED the host is —
+    # at start and sampled through the load stages — so collapses correlate
+    # with runner hosts/windows instead of being guessed at. RUNNER_NAME is
+    # exported by the workflow (github's runner.name); absent locally.
+    log "load runner: name=${RUNNER_NAME:-local} host=$(hostname) cpus=$(nproc) loadavg=[$(cut -d' ' -f1-3 /proc/loadavg)] mem_avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+    (
+      while true; do
+        log "load runner sample: loadavg=[$(cut -d' ' -f1-3 /proc/loadavg)] mem_avail_kb=$(awk '/MemAvailable/{print $2}' /proc/meminfo)"
+        sleep 30
+      done
+    ) &
+    LOADAVG_SAMPLER_PID=$!
+    # No EXIT trap here — it would CLOBBER on_exit's teardown trap. The
+    # sampler is killed explicitly after the load stages; on a mid-load
+    # failure exit the orphan is reaped by the CI job's process cleanup.
+
     log "load test: kardamom-load ramp+soak (duration=${LOAD_DURATION_S:-60}s target=${LOAD_TARGET_TPS:-200}tps)"
     # --chain-id is passed explicitly (412346, from group_vars/all.yml) rather
     # than probed via eth_chainId: ingress.toml sets no chain_id, so its
@@ -512,6 +534,10 @@ if [[ -x "${LOAD_BIN}" ]]; then
       --senders "${DEFI_SENDERS:-6}" --sender-offset "$((1 + ${LOAD_SENDERS:-6}))" \
       --assert-all-delivered --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
       --scrape executor,ingress,sequencer --output /tmp/kardamom-load-defi.json
+
+    # Load stages done — stop the runner sampler (#124).
+    kill "${LOADAVG_SAMPLER_PID}" 2>/dev/null || true
+    LOADAVG_SAMPLER_PID=""
   else
     log "RUN_LOAD=0 — skipping sustained-load stage (chaos-only shard)"
   fi
