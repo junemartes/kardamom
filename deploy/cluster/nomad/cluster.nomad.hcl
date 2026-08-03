@@ -13,6 +13,17 @@
 # cluster totally orders + dedups + commits via Raft and replays the committed
 # stream out the client egress, which the executor consumes.
 #
+
+# Egress replay retention, in frames (-Dkardamom.cluster.retention). The
+# default matches the sealer's own DEFAULT_RETENTION (65536 ≈ 321s @200tps).
+# The retention-overrun chaos case deploys a SMALL window (deploy.sh passes
+# -var from KARDAMOM_CLUSTER_RETENTION) so a frozen consumer's cursor can age
+# out — and recovery-D be exercised — inside one chaos case.
+variable "cluster_retention" {
+  type    = string
+  default = "65536"
+}
+
 # Pure JVM image (cluster.Dockerfile launches io.kardamom.sealer.cluster.ClusterNode).
 
 job "cluster" {
@@ -69,7 +80,7 @@ job "cluster" {
       # VM options (same mechanism as the aeron job's _JAVA_OPTIONS). ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention}"
       }
 
       config {

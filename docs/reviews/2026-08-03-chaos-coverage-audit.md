@@ -203,11 +203,15 @@ byte parity, or that the chain is rebuildable from L1.
 ## Recommended work, in order
 
 **P0 — close the two product holes**
-1. Verify DA blob content against the versioned hash in `recover_blocks`; test with a flipped blob byte.
-2. Stamp + verify checkpoint integrity and chain identity on restore (folds in the known recovery-C follow-up).
+1. **DONE (PR #152)** — Verify DA blob content against the versioned hash in `recover_blocks`; test with a flipped blob byte.
+2. **DONE (PR #152)** — Stamp + verify checkpoint integrity and chain identity on restore (folds in the known recovery-C follow-up). Checkpoints are now self-contained dirs (`mdbx.dat` + `MANIFEST`, one atomic rename) so any copy mechanism carries the proof.
 
 **P1 — exercise the tier that has never run**
-3. `retention-overrun` chaos case: deploy the cluster job with a small
+3. **DONE** — `retention-overrun` + `retention-overrun-validator` on the new
+   `chaos-retention` CI shard (retention 16384, adaptive SIGSTOP freeze sized
+   from the same env var, verified-freeze per #108; also crosses the 90s
+   session timeout, covering the long-halt leg of item 5). Original ask:
+   deploy the cluster job with a small
    `-Dkardamom.cluster.retention`, halt a consumer past it, assert
    `REPLAY_UNAVAILABLE` → `resync_total{outcome=peer-checkpoint}` → park → restart →
    rejoin. Covers executor **and** validator repairs (#143) and `park_state_db`.

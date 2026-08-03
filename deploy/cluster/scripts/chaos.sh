@@ -763,6 +763,166 @@ inject_hard() { # <node-container(s), space-separated candidates> <task-name>
   KILLED_NODE="${node}"; KILLED_TASK="$2"; KILLED_CID="${cid}"
 }
 
+# retention-overrun / retention-overrun-validator: the LIVE replay-window
+# overrun tier (recovery-D), which NO other case reaches. state-checkpoint-
+# restore and replay-window-resync both start from a WIPED node; here a
+# RUNNING consumer is frozen (SIGSTOP) until the cluster's bounded egress
+# retention rolls past its cursor, so on thaw its REPLAY_FROM is refused
+# (REPLAY_UNAVAILABLE) and the node must repair itself end-to-end: fetch a
+# peer checkpoint at/above the floor, park the stale state DB, exit, restart,
+# restore (executor) / adopt (validator, #143), rejoin. The freeze also
+# crosses the 90s cluster session timeout, so the resume goes through a fresh
+# session — the long-halt path.
+#
+# ONLY meaningful on a cluster DEPLOYED with a small egress retention:
+# KARDAMOM_CLUSTER_RETENTION must hold the same value deploy.sh injected as
+# -Dkardamom.cluster.retention (the chaos-retention CI shard sets one env var
+# and both read it). At the default 65536 frames the freeze would need ~11
+# minutes of sustained 200tps to overrun — the reason this tier had never
+# executed before this case existed.
+KARDAMOM_CLUSTER_RETENTION="${KARDAMOM_CLUSTER_RETENTION:-}"
+RETENTION_FREEZE_S="${RETENTION_FREEZE_S:-}"
+# executor-2 is the victim: 0/1 stay untouched as checkpoint donors.
+RETENTION_VICTIM_EXEC_IDX=2
+
+retention_freeze_s() {
+  # Freeze until frames produced during the freeze exceed the retention window
+  # with 2x margin (the floor moves ~1 frame per tx, so overrun needs
+  # frames-during-freeze > retention), never less than 120s so the 90s session
+  # timeout lapses too.
+  [ -n "${RETENTION_FREEZE_S}" ] && { printf '%s' "${RETENTION_FREEZE_S}"; return 0; }
+  local s=$(( (2 * KARDAMOM_CLUSTER_RETENTION) / CHAOS_TPS + 30 ))
+  [ "${s}" -lt 120 ] && s=120
+  printf '%s' "${s}"
+}
+
+run_retention_overrun() { # <executor|validator>
+  local kind="$1" node port inner cid0
+  [ -n "${KARDAMOM_CLUSTER_RETENTION}" ] \
+    || fail "retention-overrun(${kind}): KARDAMOM_CLUSTER_RETENTION is not set — this case only means something on a cluster deployed with a small -Dkardamom.cluster.retention (deploy.sh injects it from the same env var)"
+  local freeze_s; freeze_s="$(retention_freeze_s)"
+
+  if [ "${kind}" = "executor" ]; then
+    node="${EXECUTOR_NODES[${RETENTION_VICTIM_EXEC_IDX}]}"; port="${EXECUTOR_PORT}"
+  else
+    node="${VALIDATOR_NODE}"; port="${VALIDATOR_PORT}"
+  fi
+  inner="$(timeout 15 docker exec "${node}" sh -c \
+    'docker ps --format "{{.Names}}" | grep -im1 '"${kind}" 2>/dev/null)"
+  [ -n "${inner}" ] || fail "retention-overrun(${kind}): no inner ${kind} container on ${node}"
+  cid0="$(timeout 15 docker exec "${node}" sh -c \
+    'docker ps --filter name='"${inner}"' -q | head -1' 2>/dev/null || true)"
+
+  # The repair needs a checkpoint DONOR: recovery-D fetches from a peer at or
+  # above the post-freeze floor, and donors checkpoint every 20s while live —
+  # but only once the chain is moving. Waiting here (not failing later with a
+  # misleading "resync did not complete") names the real precondition.
+  log "retention-overrun(${kind}): waiting for a checkpoint on donor executor-0"
+  for _ in $(seq 1 15); do
+    docker exec kardamom-executor-0 bash -lc \
+      'ls /opt/kardamom/checkpoints/checkpoint-* >/dev/null 2>&1' && break
+    sleep 5
+  done
+  docker exec kardamom-executor-0 bash -lc \
+    'ls /opt/kardamom/checkpoints/checkpoint-* >/dev/null 2>&1' \
+    || fail "retention-overrun(${kind}): donor executor-0 produced no checkpoint"
+
+  # Freeze must hit a LIVE consumer (non-vacuity): its own gauge advancing.
+  local p0 p1 t=0 live=0
+  while [ "${t}" -lt 120 ]; do
+    if [ "${kind}" = "executor" ]; then
+      p1="$(exec_metrics "${RETENTION_VICTIM_EXEC_IDX}" \
+        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+    else
+      p1="$(val_metric validator_committed_block)"
+    fi
+    p1="${p1:-0}"
+    if [ -n "${p0:-}" ] && [ "${p1}" -gt "${p0}" ]; then live=1; break; fi
+    p0="${p1}"; sleep 6; t=$(( t + 6 ))
+  done
+  [ "${live}" -eq 1 ] \
+    || fail "retention-overrun(${kind}): victim not demonstrably live before the freeze (gauge ${p0:-?} -> ${p1:-?}); freezing a dead consumer asserts nothing"
+
+  # SIGSTOP + VERIFIED freeze (#108 lesson: `docker pause` no-ops silently in
+  # the nested-DinD freezer; a probe that still answers means no freeze).
+  log "retention-overrun(${kind}): freezing ${inner} on ${node} for ${freeze_s}s (retention=${KARDAMOM_CLUSTER_RETENTION} frames @ ${CHAOS_TPS}tps ≈ $(( KARDAMOM_CLUSTER_RETENTION / CHAOS_TPS ))s window)"
+  docker exec "${node}" docker kill -s STOP "${inner}" >/dev/null \
+    || fail "retention-overrun(${kind}): SIGSTOP failed"
+  sleep 3
+  if timeout 8 docker exec "${node}" curl -fsS --max-time 3 \
+      "http://127.0.0.1:${port}/metrics" >/dev/null 2>&1; then
+    docker exec "${node}" docker kill -s CONT "${inner}" >/dev/null 2>&1 || true
+    fail "retention-overrun(${kind}): freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
+  fi
+  log "retention-overrun(${kind}): freeze verified (metrics endpoint dark)"
+  sleep $(( freeze_s - 3 ))
+  timeout 20 docker exec "${node}" docker kill -s CONT "${inner}" >/dev/null 2>&1 \
+    || log "retention-overrun(${kind}): SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
+
+  # The recovery-D evidence is split across container GENERATIONS: the thawed
+  # process logs the refusal + fetch + park, then EXITS; its restarted
+  # successor logs the restore/adopt. Scan every task container on the node,
+  # exited ones included.
+  local needle_restored
+  if [ "${kind}" = "executor" ]; then
+    needle_restored='restored state from checkpoint'
+  else
+    needle_restored='adopted state from checkpoint'
+  fi
+  local logs unavailable=0 fetched=0 prepared=0 restored=0
+  t=0
+  while :; do
+    logs="$(timeout 25 docker exec "${node}" sh -c \
+      'for c in $(docker ps -a --format "{{.Names}}" | grep -i '"${kind}"'); do docker logs --tail 1500 "$c" 2>&1; done' \
+      2>/dev/null || true)"
+    echo "${logs}" | grep -q 'cluster replay unavailable' && unavailable=1
+    echo "${logs}" | grep -q 'fetched checkpoint from peer' && fetched=1
+    echo "${logs}" | grep -q 'resync prepared: peer checkpoint staged' && prepared=1
+    echo "${logs}" | grep -q "${needle_restored}" && restored=1
+    [ "${unavailable}" = 1 ] && [ "${prepared}" = 1 ] && [ "${restored}" = 1 ] && break
+    sleep 6; t=$(( t + 6 ))
+    if [ "${t}" -ge 300 ]; then
+      [ "${unavailable}" = 1 ] \
+        || fail "retention-overrun(${kind}): consumer never hit REPLAY_UNAVAILABLE after a ${freeze_s}s freeze — the retention tier was NOT exercised (is the deployed -Dkardamom.cluster.retention actually ${KARDAMOM_CLUSTER_RETENTION}?)"
+      [ "${fetched}" = 1 ] \
+        || fail "retention-overrun(${kind}): REPLAY_UNAVAILABLE hit but no peer checkpoint was fetched — the repair path did not run (donors dark, or --checkpoint-peers misconfigured)"
+      [ "${prepared}" = 1 ] \
+        || fail "retention-overrun(${kind}): checkpoint fetched but the stale DB was never parked (no 'resync prepared')"
+      fail "retention-overrun(${kind}): resync prepared but the restarted ${kind} never logged '${needle_restored}'"
+    fi
+  done
+  log "retention-overrun(${kind}): REPLAY_UNAVAILABLE -> fetch -> park -> restart -> restore observed (${t}s after thaw)"
+
+  # The victim must be a RESTARTED process, not the thawed original limping on
+  # (docker restarts always mint a new container id).
+  local cid_now
+  cid_now="$(timeout 15 docker exec "${node}" sh -c \
+    'docker ps --filter name='"${inner}"' -q | head -1' 2>/dev/null || true)"
+  [ -n "${cid_now}" ] && [ "${cid_now}" != "${cid0}" ] \
+    || fail "retention-overrun(${kind}): victim container was not restarted (cid ${cid0:-?} -> ${cid_now:-gone}) — the park/exit/restore loop did not complete"
+
+  if [ "${kind}" = "executor" ]; then
+    # Rejoined replica must catch the fleet (assert_executors_converged runs
+    # at case end for every case); the pipeline itself must be moving.
+    assert_executor_progress 180
+  else
+    # The adopted validator must RESUME VERIFYING, not just commit: adoption
+    # marks everything through the checkpoint unverified, so verified-total
+    # advancing is the proof the tail re-execution actually restarted.
+    local v0 v1
+    v0="$(val_metric validator_blocks_verified_total)"; v0="${v0:-0}"
+    t=0
+    while :; do
+      sleep 10; t=$(( t + 10 ))
+      v1="$(val_metric validator_blocks_verified_total)"; v1="${v1:-0}"
+      [ "${v1}" -gt "${v0}" ] && break
+      [ "${t}" -ge 240 ] \
+        && fail "retention-overrun(validator): adopted validator never resumed verifying (blocks_verified ${v0} -> ${v1} over ${t}s)"
+    done
+    log "retention-overrun(validator): verifying resumed after adoption (blocks_verified ${v0} -> ${v1}, ${t}s)"
+  fi
+}
+
 # --- assertions -------------------------------------------------------------
 
 assert_count() { # <job> <min-running> <slo-secs>
@@ -1014,6 +1174,16 @@ run_case() { # <case-name>
     local min_s=$(( INJECT_DELAY + SEQ_LAPSE_S + 60 ))
     [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
   fi
+  # retention-overrun: the freeze only overruns the retention window if frames
+  # keep FLOWING for its whole duration, and the post-thaw repair (fetch +
+  # restart + restore) needs live traffic to prove the rejoin — so the load
+  # window must cover freeze + recovery, not the global CHAOS_CASE_S.
+  if [ "${name}" = "retention-overrun" ] || [ "${name}" = "retention-overrun-validator" ]; then
+    if [ -n "${KARDAMOM_CLUSTER_RETENTION}" ]; then
+      local min_s=$(( INJECT_DELAY + $(retention_freeze_s) + 120 ))
+      [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+    fi
+  fi
 
   # Ingress baseline BEFORE the load starts, for the injection gate below.
   local rx0
@@ -1222,6 +1392,14 @@ run_case() { # <case-name>
         fi
       done
       log "replay-window-resync: executor-1 self-healed from a peer checkpoint (fetch + restore + rejoin, ${t}s)"
+      ;;
+
+    retention-overrun)
+      run_retention_overrun executor
+      ;;
+
+    retention-overrun-validator)
+      run_retention_overrun validator
       ;;
 
     archive-driver-loss)

@@ -58,7 +58,7 @@ jobs:
         # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
         # now the deploy uses the clustered sealer — see "Configure shard").
         shard:
-          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, semantics]
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, semantics]
     steps:
       - uses: actions/checkout@v4
 
@@ -162,6 +162,18 @@ jobs:
             # kill SPOF (issue #58, sealer-hard) no longer exists — the Raft quorum
             # survives the loss of any one member, so chaos-sealer is DROPPED.
             chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover"; } ;;
+            # The LIVE replay-window overrun tier (recovery-D), on its own
+            # shard because the sealer is deployed with a deliberately SMALL
+            # egress retention (KARDAMOM_CLUSTER_RETENTION -> deploy.sh -var ->
+            # -Dkardamom.cluster.retention), which would tighten every other
+            # case's replay margins. A frozen consumer's cursor ages out of the
+            # window mid-flight; the case asserts the full self-repair:
+            # REPLAY_UNAVAILABLE -> peer-checkpoint fetch -> park -> restart ->
+            # restore (executor) / adopt (validator, #143) -> rejoin. 16384
+            # frames ≈ 82s @200tps: comfortably above the 20s checkpoint
+            # interval (donors always hold an in-window restore source), small
+            # enough that a ~3min freeze overruns it 2x.
+            chaos-retention) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=retention-overrun retention-overrun-validator"; echo "KARDAMOM_CLUSTER_RETENTION=16384"; } ;;
             # The chain-semantics suite (Target C): the SAME scenario drivers
             # the per-PR Target-L job runs, against the real cluster — nonce
             # ordering, gap non-processing, RPC liveness and validator/executor

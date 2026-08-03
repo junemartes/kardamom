@@ -177,7 +177,16 @@ fi
 # archive ready) before the sequencer cluster-clients connect and the executor
 # subscribes to its egress. Election + archive recovery takes longer than the
 # old single-sealer start, hence the 180s budget.
-run_job "cluster.nomad.hcl"
+# Egress retention override (retention-overrun chaos case): the chaos-retention
+# shard exports KARDAMOM_CLUSTER_RETENTION and chaos.sh reads the SAME env var
+# to size its freeze, so the deployed window and the case's expectations can
+# never drift apart. Unset = the jobspec default (the sealer's own default).
+CLUSTER_ARGS=()
+if [[ -n "${KARDAMOM_CLUSTER_RETENTION:-}" ]]; then
+  echo "==> cluster: egress retention override: ${KARDAMOM_CLUSTER_RETENTION} frames"
+  CLUSTER_ARGS=(-var "cluster_retention=${KARDAMOM_CLUSTER_RETENTION}")
+fi
+run_job "cluster.nomad.hcl" "${CLUSTER_ARGS[@]}"
 wait_running "cluster" 300
 run_job "sequencer.nomad.hcl"
 # Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
