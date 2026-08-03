@@ -268,6 +268,7 @@ mod tests {
                 block_number: b,
                 end_tx_idx: BPosition::from_index(b),
                 l2_timestamp: 1_700_000_000 + b,
+                l1_origin: 0,
             };
             let delta = BlockDelta {
                 block_number: b,

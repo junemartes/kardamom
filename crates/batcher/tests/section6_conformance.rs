@@ -138,6 +138,7 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
             block_number: 42,
             end_tx_idx: boundary_pos,
             l2_timestamp: 1_700_000_042,
+            l1_origin: 0,
         }),
     );
     let b_path = dir.path().join("b.rec");

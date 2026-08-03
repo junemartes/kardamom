@@ -356,7 +356,11 @@ pub fn run_feed<P: Provider>(
             }) => acc.observe_tx(envelope, position),
             // Deposits are absent from DA by design: re-derivable from L1
             // (mirrors MultiArchiveReader skipping DepositRefs offline).
-            Ok(ReaderToExec::Deposit { .. }) => {}
+            // Deposits are absent from DA by design: re-derivable from L1.
+            // The epoch marker is skipped for the same reason — a
+            // reconstructor reads the origin off the block boundary and
+            // re-derives that L1 block's deposits itself.
+            Ok(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. }) => {}
             Ok(ReaderToExec::Boundary(b)) => {
                 let closed = acc.observe_boundary(b);
                 counter!(metric_names::BLOCKS_OBSERVED).increment(1);

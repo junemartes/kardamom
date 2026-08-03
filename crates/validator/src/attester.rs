@@ -600,6 +600,7 @@ mod tests {
             block_number: 9,
             end_tx_idx: kardamom_types::BPosition::from_index(0),
             l2_timestamp: 0,
+            l1_origin: 0,
         };
         q.submit(boundary, delta).unwrap();
 

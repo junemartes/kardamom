@@ -16,14 +16,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use kardamom_log::aeron_live::{AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle};
+use kardamom_log::aeron_live::{AeronRuntime, TxDataSubscriberHandle};
 use kardamom_log::config::{AeronConfig, ChannelsConfig};
 use kardamom_log::refetch::{ArchiveRefetcher, RefetchConfig};
 use kardamom_state::Durability;
 use kardamom_types::{AccountChange, BPosition, CodeEntry, Deposit, TxDataLoc, TxEnvelope};
 
 use crate::error::ExecutorError;
-use crate::reader::{DepositSubscription, JoinRecovery, JoinRecoveryFactory, TxDataSubscription};
+use crate::reader::{JoinRecovery, JoinRecoveryFactory, TxDataSubscription};
 
 /// CLI mirror of [`kardamom_state::Durability`] (clap renders the variants as
 /// `durable` / `safe-no-sync`).
@@ -168,16 +168,6 @@ impl TxDataSubscription for LiveTxDataSub {
     }
 }
 
-struct LiveTxDepositsSub {
-    rx: sync_mpsc::Receiver<(BPosition, Deposit)>,
-}
-
-impl DepositSubscription for LiveTxDepositsSub {
-    fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError> {
-        self.rx.recv().map_err(|_| ExecutorError::DepositsClosed)
-    }
-}
-
 /// Open the M per-shard tx_data subscriptions, bridging each handle's async
 /// `recv()` to the synchronous `next()` the engine's reader threads expect
 /// (dedicated tokio pump task per shard; must be called inside a tokio
@@ -214,25 +204,6 @@ pub fn open_tx_data_subs(
         }));
     }
     Ok(a_subs)
-}
-
-/// Open the tx_deposits subscription (async→sync bridged) — the deposit-path
-/// mirror of [`open_tx_data_subs`], always live for the same reason.
-pub fn open_tx_deposits_sub(
-    rt: &AeronRuntime,
-    channels: &ChannelsConfig,
-) -> Result<Box<dyn DepositSubscription>> {
-    let (d_tx, d_rx) = sync_mpsc::channel::<(BPosition, Deposit)>();
-    let mut handle = TxDepositsSubscriberHandle::open(rt, channels)
-        .context("open TxDepositsSubscriberHandle")?;
-    tokio::spawn(async move {
-        while let Some(item) = handle.recv().await {
-            if d_tx.send(item).is_err() {
-                break;
-            }
-        }
-    });
-    Ok(Box::new(LiveTxDepositsSub { rx: d_rx }))
 }
 
 // ---------------------------------------------------------------------------

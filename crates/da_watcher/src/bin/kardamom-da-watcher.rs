@@ -3,7 +3,7 @@
 //! Parses an `--l1-rpc <URL>` + `--lockbox <ADDRESS>` (plus an optional
 //! `--poll-interval <DURATION>`, default 12s), constructs an
 //! [`da_watcher::RpcL1Source`] over an alloy HTTP provider, spawns the
-//! watcher loop, and waits for ctrl-c. Each observed deposit is republished
+//! watcher loop, and waits for ctrl-c. Each finalized L1 block is republished
 //! onto the `tx_deposits` Aeron channel via the live
 //! [`LiveTxDepositsPublisher`] adapter (wraps `kardamom_log::TxDepositsPublisherHandle`).
 
@@ -19,18 +19,18 @@ use clap::Parser;
 use tokio::signal;
 
 use kardamom_da_watcher::{
-    DaWatcherConfig, DepositPublisher, PublishError, RpcL1Source, spawn as spawn_watcher,
+    DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, spawn as spawn_watcher,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
-use kardamom_types::{BPosition, Deposit};
+use kardamom_types::{BPosition, EpochRecord};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "kardamom-da-watcher",
     version,
-    about = "L1 deposit monitor — tails finalized L1 blocks and publishes Deposits onto tx_deposits"
+    about = "L1 epoch monitor — tails finalized L1 blocks and publishes one EpochRecord each onto tx_deposits"
 )]
 struct Args {
     /// L1 JSON-RPC HTTP endpoint (e.g. `http://127.0.0.1:8545`).
@@ -168,7 +168,7 @@ fn main() -> anyhow::Result<()> {
             l1_rpc = %args.l1_rpc,
             ?lockbox,
             poll_interval = ?cfg.poll_interval,
-            "kardamom-da-watcher starting; publishing deposits onto tx_deposits"
+            "kardamom-da-watcher starting; publishing epochs onto tx_deposits"
         );
 
         let handle = spawn_watcher(publisher, source, cfg);
@@ -243,10 +243,10 @@ fn run_tx_deposits_recorder(
     Ok(())
 }
 
-/// Live [`DepositPublisher`] backed by an Aeron `tx_deposits` publication.
-/// Each observed deposit is republished onto the canonical `tx_deposits`
-/// stream so the downstream sequencer can derive `DepositRef`s onto
-/// `tx_ordering`.
+/// Live [`EpochPublisher`] backed by an Aeron `tx_deposits` publication.
+/// One epoch per finalized L1 block is published onto `tx_deposits`; the
+/// downstream sequencer forwards each verbatim onto `tx_ordering` as an
+/// origin-advancing record.
 struct LiveTxDepositsPublisher {
     handle: TxDepositsPublisherHandle,
 }
@@ -257,9 +257,9 @@ impl LiveTxDepositsPublisher {
     }
 }
 
-impl DepositPublisher for LiveTxDepositsPublisher {
-    fn publish(&self, deposit: &Deposit) -> Result<BPosition, PublishError> {
-        match self.handle.publish(deposit) {
+impl EpochPublisher for LiveTxDepositsPublisher {
+    fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError> {
+        match self.handle.publish(epoch) {
             Ok(pos) => Ok(pos),
             Err(e) => {
                 let msg = e.to_string();

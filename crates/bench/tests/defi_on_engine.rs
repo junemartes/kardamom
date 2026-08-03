@@ -54,6 +54,7 @@ fn defi_workload_executes_on_the_engine() {
             block_number: 1,
             end_tx_idx: BPosition::from_index(0),
             l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
         },
     );
     let mut delta = PendingDelta::new();

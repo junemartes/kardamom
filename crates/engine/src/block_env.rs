@@ -65,6 +65,7 @@ mod tests {
             block_number: 7,
             end_tx_idx: pos(42),
             l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
         };
         let e = ExecEnv::new(412346, &b);
         assert_eq!(e.chain_id, 412346);
@@ -78,6 +79,7 @@ mod tests {
             block_number: 1,
             end_tx_idx: pos(0),
             l2_timestamp: 12345,
+            l1_origin: 0,
         };
         let env = ExecEnv::new(1, &b).block_env();
         assert_eq!(env.timestamp, U256::from(12345u64));
@@ -90,6 +92,7 @@ mod tests {
             block_number: 1,
             end_tx_idx: pos(0),
             l2_timestamp: 0,
+            l1_origin: 0,
         };
         let cfg = ExecEnv::new(412346, &b).cfg_env();
         assert_eq!(cfg.chain_id, 412346);

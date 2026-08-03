@@ -19,7 +19,9 @@ use crate::meta::{
     KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION,
     decode_b_position, decode_u64,
 };
-use crate::schema::{TABLE_HEADERS, TABLE_META, decode_header_value, encode_block_key};
+use crate::schema::{
+    HeaderValue, TABLE_HEADERS, TABLE_META, decode_header_value, encode_block_key,
+};
 
 /// Cursors read out of the `meta` table at startup. The writer uses this to
 /// hand the executor a resume point.
@@ -197,6 +199,34 @@ pub fn bootstrap_trie_from_state(env: &StateEnv) -> Result<alloy_primitives::B25
     )?;
     txn.commit()?;
     Ok(root)
+}
+
+/// Every persisted block header, in block order.
+///
+/// Read-only scan of `headers`; used by verification tooling and the
+/// chain-semantics suite to assert properties that span the whole chain (the
+/// L1-origin sequence, boundary alignment) rather than a single block.
+/// Nothing serves headers over RPC, so this is the only way to observe them.
+pub fn read_all_headers(env: &StateEnv) -> Result<Vec<(u64, HeaderValue)>, StateError> {
+    let txn = env.raw().begin_ro_sync()?;
+    let headers = txn.open_db(Some(TABLE_HEADERS))?;
+    let mut cur = txn.cursor(headers)?;
+    let mut out = Vec::new();
+    // Keys are block numbers big-endian, so mdbx's byte order IS block order.
+    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
+    while let Some((k, v)) = item {
+        if k.len() != 8 {
+            return Err(StateError::BadEncoding {
+                table: TABLE_HEADERS,
+                expected: 8,
+                got: k.len(),
+            });
+        }
+        let block_number = u64::from_be_bytes(k[..8].try_into().expect("8 bytes"));
+        out.push((block_number, decode_header_value(&v)?));
+        item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

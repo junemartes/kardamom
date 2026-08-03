@@ -1,7 +1,7 @@
 # L1-Origin Deposit Derivation — Spec
 
 - **Date:** 2026-07-25
-- **Status:** Proposed design; not implemented
+- **Status:** In progress — phases A, B and C landed. Epochs are the ONLY deposit path: the da-watcher emits one per finalized L1 block, `DepositRef` is retired, and 17 e2e scenarios (S10a–e cover the rules directly) run green
 - **Motivated by:** the chain-semantics suite's S8 (`docs/agents/chain-semantics-e2e-suite-spec.md`), which must keep its workload **deposit-free** because deposits cannot survive the DA round-trip today
 - **Goal (definition of done):** a chain reconstructed from L1 alone — blobs + L1 logs + genesis — reproduces the validator's state root **including deposits**, and a sequencer cannot omit or reorder a deposit without producing a chain that verifiers reject.
 
@@ -51,6 +51,10 @@ EpochRecord {
 
 Emitted by the da-watcher when a new finalized L1 block is observed, including when it carries **no** deposits (rule 2 requires every epoch to appear). Deduped by the cluster on `canonical_id = keccak(l1_hash)`, so racing replicas that each emit the same epoch collapse to one — the property the cluster's first-seen dedup already provides for `DepositRef`.
 
+**An epoch claims a contiguous range of canonical slots**: the marker, plus one per deposit. Every other record maps 1:1 onto a slot, and three separate mechanisms rely on that — the sealer's cumulative `canonicalCount` (the alignment key in `BlockBoundaryStart::end_tx_idx`), the egress reader's dense `next_index` cursor (a hole reads as a gap and triggers replay catch-up), and the executor's per-tx `tx_idx` (which keys receipts and the BAL, so no two txs may share one). An epoch is the one record that carries N transactions, so it reserves N+1 slots: slot 0 is the marker (advances the origin, applies no tx), slots `1..=N` are the deposits. Counting the marker even when `N == 0` keeps the range non-empty, so an empty epoch owns a distinct index instead of colliding with the record after it.
+
+The count rides on the ingress frame (`slot_count: u32`) because the Java sealer never parses payloads; every consumer that *does* parse re-derives it and fail-stops on a mismatch. This is what keeps the sealer schema-agnostic: it learns "close the block, adopt this origin, consume this many slots" without knowing what an epoch or a deposit is.
+
 Two consequences worth calling out:
 
 - **The deposit join disappears.** Today a `DepositRef` on the canonical stream must be joined against a `Deposit` envelope arriving separately on `tx_deposits`; that join is what times out and aborts the executor when an envelope is lost (the failure S9b reproduces, and a recurring theme in the recovery series). Carrying deposit content in the canonical record removes the join entirely.
@@ -64,7 +68,12 @@ Two consequences worth calling out:
 
 ⚠ **The sealer must not read L1.** `CanonicalSealerState` is a Raft-replicated deterministic state machine; giving it external I/O would let replicas observe different L1 states and diverge. The origin therefore arrives *as ordered data* (the `EpochRecord`) and the sealer only tracks "the origin of the latest epoch I have ordered". This is the single most important constraint in this design.
 
-Cost: one extra boundary per epoch — with 12 s L1 blocks and a 250 ms tick, roughly one per 48 blocks. Negligible.
+Cost: one extra boundary per epoch — with 12 s L1 blocks and a 250 ms tick, roughly one per 48 blocks. Negligible. The forced boundary carries the **old** origin: it closes a block belonging to the outgoing epoch. It is also skipped when the open block is still empty, so an L1 catch-up burst does not emit a run of empty blocks.
+
+Two smaller consequences of forcing boundaries off-tick:
+
+- **Timestamps are now forced strictly increasing.** A tick-floored timestamp alone stopped being unique once a second boundary can fall inside the same 250 ms window, and two blocks sharing a timestamp is a trap for anything reasoning about block time. Under pure tick cadence the clamp is a no-op.
+- **Sealer snapshot v2.** `l1Origin`, `lastL2Timestamp` and `lastBoundaryCount` are replicated state and must round-trip. v1 snapshots still load, with the trio defaulting to zero — exactly the pre-origin state — so this part needs no coordinated migration.
 
 ### DA payload (KAR1 → KAR2)
 
@@ -91,7 +100,7 @@ The validator already holds an L1 connection when the attester is enabled, so Ph
 
 ## Edge cases to pin down
 
-- **Genesis origin** — the chain TOML gains `l1_origin_genesis`; block 0's origin is that value, and rule 2 counts from it.
+- **Genesis origin** — the chain TOML gains `l1_origin_genesis`; block 0's origin is that value, and rule 2 counts from it. **Still open, and phase C's tests made the consequence concrete:** the watcher seeds its cursor at the finalized tip it first observes, so the origin jumps from 0 to that block in one step. Deposits made in L1 blocks *before* the seed are therefore underivable — a chain's verifiable history starts at its first epoch, not at L1 genesis. S10a/S10c exempt exactly that one transition and assert `+1` steps everywhere after it.
 - **Empty epochs** — still emit `EpochRecord` with no deposits, or rule 2 is unenforceable.
 - **L1 unavailable** — origin stalls, L2 keeps producing blocks with the old origin, deposits are delayed but never lost, and the rule-5 alarm fires. No liveness loss for ordinary transactions.
 - **Huge epochs** — a pathological L1 block with thousands of deposits could exceed the cluster's max message length (~128 KB). Either cap deposits per record and allow an epoch to span several records with an explicit "final" flag, or bound it and document the ceiling. **Open.**
@@ -100,15 +109,50 @@ The validator already holds an L1 connection when the attester is enabled, so Ph
 
 ## Testing
 
+Phase C landed with five scenarios (S10a–e) that assert the rules against
+**persisted headers and executed receipts**, not logs — a component can log
+the right thing and still build the wrong chain:
+
+| Scenario | Rule | What it would catch |
+| --- | --- | --- |
+| S10a | 1, 2, 4 | An idle L1 emitting nothing, so the origin sequence gets a hole |
+| S10b | 3 | Deposits landing mid-block when L2 traffic is flowing concurrently |
+| S10c | 3 | One L1 block's deposits split across L2 blocks, or reordered |
+| S10d | 5 | A stalled L1 stalling L2, or the origin advancing past a halted L1 |
+| S10e | 1, 2 | Any L1-recorded deposit missing from L2, or applied twice |
+
+S10e derives its expected set straight from L1 logs through the same
+`derive_epoch` the producer uses — the property a verifier will enforce in
+phase D, asserted here against the producer.
+
+
+
 - **S8** drops its deposit-free constraint; the receipt-based block recovery already handles deposits (their receipt is keyed by `source_hash` and carries `blockNumber`/`transactionIndex` like any other), so parity coverage extends for free once derivation lands.
 - **New negative scenarios**, in S7's injection style: a sequencer that omits an epoch's deposit, one that skips an epoch, and one that reorders deposits within an epoch — each must be rejected, not silently accepted. These are the tests that make the anti-censorship claim real.
 - **Freshness alarm** — a paused da-watcher must trip the rule-5 alarm within `MAX_ORIGIN_LAG`, without stalling ordinary transaction flow.
 - **Target C** needs the cluster genesis to carry `l1_origin_genesis`, alongside the contract-deploy wiring the semantics shard already requires.
 
+## Implementation status
+
+| Phase | Scope | State |
+| --- | --- | --- |
+| A | `EpochRecord` + `derive_epoch` as the one shared definition (`crates/types/src/epoch.rs`), moved out of the da-watcher so validator and reconstructor share it | **Done** |
+| B | Canonical stream: `TxOrderingMessage::Epoch`, `KIND_ORIGIN_RECORD` framing with `l1_origin` + `slot_count`, `l1_origin` on both boundary types, sealer forced boundary + origin tracking + snapshot v2, executor expansion of an epoch into marker + deposits | **Done** |
+| C | Producer switch-over: da-watcher emits one epoch per finalized L1 block (including empty ones), sequencer forwards them verbatim, executor's `tx_deposits` join retired, `l1_origin` persisted in block headers | **Done** |
+| D | Verification: validator enforces the five rules against L1, then executors (phase 2) | Not started |
+| E | KAR2 DA payload carries the origin; `kardamom-reconstruct` re-derives deposits from L1 | Not started |
+
+Phase C makes this the live path. Notes on what it changed beyond the obvious:
+
+- **`tx_deposits` now carries `EpochRecord`, not `Deposit`.** It is a da-watcher → sequencer transport only; the executor no longer subscribes to it at all, and the ref↔envelope join (with its timeout, its archive refetch, and its ability to strand a deposit) is gone. A `DepositRef` arriving on the canonical stream is now a fail-stop: this is a breaking chain change, not a rolling upgrade.
+- **An epoch is never skipped on a transport error.** The old per-deposit policy was "log it and carry on", which for epochs would punch a permanent hole in the origin sequence — exactly what rule 2 forbids. The watcher now stops the range and retries from the failed block.
+- **The watcher fetches each block's hash.** A block with no deposits has no log to carry its hash, and the hash is what the canonical id derives from. `derive_epoch` then cross-checks every log's `block_hash` against it, which catches a reorg landing between the two reads.
+- **Headers grew to 24 bytes** to persist `l1_origin`. 20-byte rows still decode as origin 0, so an existing state DB needs no migration.
+
 ## Open questions
 
 1. **`MAX_ORIGIN_LAG` value** — in L1 blocks. Long enough that ordinary da-watcher hiccups don't alarm, short enough to bound catch-up and censorship. A first guess is ~50 finalized blocks (~10 min), but it should be derived from the deposit-latency SLO we want to promise.
-2. **Huge-epoch handling** — cap-and-span vs. hard ceiling (above).
+2. **Huge-epoch handling** — cap-and-span vs. hard ceiling (above). Note the slot accounting already tolerates a spanning epoch: each record would declare its own slot range.
 3. **Migration path** — fresh chain vs. coordinated cutover.
 4. **Does the origin belong in the block header hash?** Kardamom's `headers` table stores `(end_tx_idx, l2_timestamp)` and there is no block-header commitment today, so `l1_origin` would live alongside them. If a header commitment is ever added, the origin must be inside it.
 5. **Phase 2 scope** — whether every executor taking an L1 dependency is acceptable operationally, or whether validator-only verification plus the DA-parity test is judged sufficient.

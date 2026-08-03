@@ -855,6 +855,7 @@ mod tests {
                 term_offset: 0,
             },
             l2_timestamp: 0,
+            l1_origin: 0,
         }
     }
 

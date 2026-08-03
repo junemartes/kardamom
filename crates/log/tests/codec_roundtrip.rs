@@ -77,6 +77,7 @@ fn log_codetx_receipts_channel_b_message_roundtrip() {
             term_offset: 8192,
         },
         l2_timestamp: 1_700_000_000,
+        l1_origin: 0,
     });
     let bytes_b = encode(&b).unwrap();
     let back_b: TxOrderingMessage = materialize(&bytes_b).unwrap();

@@ -123,6 +123,7 @@ fn boundary_roundtrip() {
             term_offset: 999,
         },
         l2_timestamp: 1_700_000_000,
+        l1_origin: 0,
     };
     assert_eq!(roundtrip(&start), start);
 
@@ -134,6 +135,7 @@ fn boundary_roundtrip() {
             term_offset: 999,
         },
         l2_timestamp: 1_700_000_000,
+        l1_origin: 0,
     };
     assert_eq!(roundtrip(&end), end);
 }
@@ -262,6 +264,7 @@ fn channel_b_message_boundary_roundtrip() {
             term_offset: 8192,
         },
         l2_timestamp: 1_700_000_000,
+        l1_origin: 0,
     });
     assert_eq!(roundtrip(&m), m);
 }

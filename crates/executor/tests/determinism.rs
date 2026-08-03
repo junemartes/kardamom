@@ -123,6 +123,7 @@ fn populate(
                 block_number: blk,
                 end_tx_idx: bpos(bpos_off),
                 l2_timestamp: 1_700_000_000 + blk,
+                l1_origin: 0,
             }),
         ))
         .unwrap();
@@ -160,7 +161,6 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             cfg,
             a_subs,
             b_sub,
-            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,

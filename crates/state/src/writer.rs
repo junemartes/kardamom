@@ -257,6 +257,7 @@ impl StateWriter {
         let header = HeaderValue {
             end_tx_idx: batch.boundary.end_tx_idx,
             l2_timestamp: batch.boundary.l2_timestamp,
+            l1_origin: batch.boundary.l1_origin,
         };
         txn.put(
             headers,
@@ -398,6 +399,7 @@ mod trie_writer_tests {
             block_number: block,
             end_tx_idx: BPosition::from_index(block),
             l2_timestamp: 1_700_000_000 + block,
+            l1_origin: 0,
         }
     }
 

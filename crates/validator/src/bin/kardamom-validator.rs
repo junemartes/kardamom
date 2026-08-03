@@ -30,9 +30,8 @@ use clap::Parser;
 use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_engine::reader::cluster::ClusterConfig;
 use kardamom_engine::{
-    DepositSubscription, Executor, ExecutorConfig, ExecutorError, MdbxSnapshotSource,
-    MdbxWriterQueue, MdbxWriterSignal, ResumePoint, StateWriterQueue, TxDataSubscription,
-    TxOrderingSubscription,
+    Executor, ExecutorConfig, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
+    ResumePoint, StateWriterQueue, TxDataSubscription, TxOrderingSubscription,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsSubscriberHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
@@ -284,7 +283,6 @@ async fn main() -> Result<()> {
     // LOCAL archive, which records neither stream).
     let a_subs: Vec<Box<dyn TxDataSubscription>> =
         bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
-    let dep_sub: Box<dyn DepositSubscription> = bin_support::open_tx_deposits_sub(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -645,7 +643,6 @@ async fn main() -> Result<()> {
             cfg,
             a_subs,
             b_sub,
-            Some(dep_sub),
             c_pub,
             snapshots,
             sw_signal,

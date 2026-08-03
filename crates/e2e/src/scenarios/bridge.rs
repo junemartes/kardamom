@@ -31,7 +31,11 @@ const DEPOSIT_WEI: u128 = 1_000_000_000_000_000_000;
 
 /// Wait for the L2 receipt of `tx_hash`, which for a deposit is its
 /// `source_hash`.
-async fn await_l2_receipt(t: &Target, hash: B256, what: &str) -> Result<serde_json::Value> {
+pub(crate) async fn await_l2_receipt(
+    t: &Target,
+    hash: B256,
+    what: &str,
+) -> Result<serde_json::Value> {
     poll_until(
         &format!("L2 receipt for {what}"),
         Duration::from_secs(60),
@@ -41,7 +45,7 @@ async fn await_l2_receipt(t: &Target, hash: B256, what: &str) -> Result<serde_js
     .await
 }
 
-fn receipt_field<'a>(r: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+pub(crate) fn receipt_field<'a>(r: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     r.get(key).and_then(|v| v.as_str())
 }
 

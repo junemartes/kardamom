@@ -127,6 +127,7 @@ fn channel_b_carries_tx_refs_and_boundaries_in_publish_order() {
             term_offset: 256,
         },
         l2_timestamp: 1_700_000_000,
+        l1_origin: 0,
     };
 
     let pp1 = pubr.publish_ref(&r1).unwrap();

@@ -3,11 +3,11 @@
 //!
 //! Plugged into the sequencer in place of the Aeron `kardamom_log` publisher in
 //! cluster mode. The sequencer actor is unchanged: it still calls
-//! `try_publish_ref` / `try_publish_deposit_ref`, and a back-pressured (or
+//! `try_publish_ref` / `try_publish_epoch`, and a back-pressured (or
 //! not-yet-connected) cluster offer surfaces as `SequencerError::Backpressure`
 //! so the existing rewind/retry path applies.
 
-use kardamom_types::{DepositRef, TxRef};
+use kardamom_types::{EpochRecord, TxRef};
 
 use crate::SequencerError;
 use crate::outbound::TxOrderingRefPublisher;
@@ -81,8 +81,13 @@ impl<I: ClusterIngress + Clone> TxOrderingRefPublisher for ClusterRefPublisher<I
         }
     }
 
-    fn try_publish_deposit_ref(&mut self, r: &DepositRef) -> Result<(), SequencerError> {
-        let bytes = wire::encode_ingress_depositref(r);
+    fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
+        // KIND_ORIGIN_RECORD, not a plain record: the sealer must close the
+        // open block and adopt this epoch's L1 number before relaying it.
+        // Epochs are never batched — one per L1 block, and each one forces a
+        // boundary, so there is nothing to amortize.
+        let bytes = wire::encode_ingress_epoch(e)
+            .map_err(|err| SequencerError::EncodeFailed(format!("epoch: {err}")))?;
         self.offer(&bytes)
     }
 }
@@ -170,19 +175,34 @@ mod tests {
         }
     }
 
+    /// An epoch must go out as KIND_ORIGIN_RECORD, not a plain record: the
+    /// kind byte is what makes the sealer close the block and adopt the
+    /// origin, so getting it wrong would silently strand deposits mid-block.
     #[test]
-    fn publishes_depositref_as_ingress_envelope() {
+    fn publishes_epoch_as_an_origin_record_envelope() {
         let ingress = FakeIngress::new();
         let mut pubr = ClusterRefPublisher::new(ingress.clone());
-        let r = DepositRef::new(
-            B256::repeat_byte(0x22),
-            BPosition {
-                term_id: 1,
-                term_offset: 7,
-            },
+        let e = EpochRecord {
+            l1_number: 4_242,
+            l1_hash: B256::repeat_byte(0x22),
+            deposits: vec![kardamom_types::Deposit {
+                source_hash: B256::repeat_byte(0xD1),
+                mint: 7,
+                ..Default::default()
+            }],
+        };
+        pubr.try_publish_epoch(&e).unwrap();
+
+        let sent = ingress.accepted();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0][0], wire::KIND_ORIGIN_RECORD);
+        assert_eq!(
+            u64::from_le_bytes(sent[0][33..41].try_into().unwrap()),
+            4_242,
+            "the sealer reads the origin from this fixed offset"
         );
-        pubr.try_publish_deposit_ref(&r).unwrap();
-        assert_eq!(ingress.accepted().len(), 1);
+        // Marker + 1 deposit.
+        assert_eq!(u32::from_le_bytes(sent[0][41..45].try_into().unwrap()), 2);
     }
 
     #[test]

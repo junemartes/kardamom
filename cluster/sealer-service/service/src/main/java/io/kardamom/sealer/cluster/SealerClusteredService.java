@@ -11,8 +11,10 @@ import io.aeron.cluster.service.ClusteredService;
 import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
+import io.kardamom.sealer.OriginAdvance;
 import io.kardamom.sealer.Relayed;
 import java.nio.ByteOrder;
+import java.util.Optional;
 import org.agrona.DirectBuffer;
 import org.agrona.collections.LongHashSet;
 import org.agrona.ExpandableArrayBuffer;
@@ -86,6 +88,33 @@ public final class SealerClusteredService implements ClusteredService {
      * unchanged — the batch only amortizes the ingress offer round trip.
      */
     public static final byte KIND_BATCH = 3;
+    /**
+     * Origin-advancing record:
+     * {@code [kind:4][canonical_id:32][l1_origin:u64 LE][slot_count:u32 LE][payload…]}.
+     *
+     * <p>Kind 4, not 3: {@link #KIND_BATCH} took 3. Deliberately does NOT
+     * carry the guard header {@link #KIND_INGRESS_RECORD} does — epochs are
+     * deposits, which are not nonce-gated, so there is no sender/nonce to
+     * contiguity-check.</p>
+     *
+     * <p>The service does NOT parse the payload: it stays schema-agnostic
+     * about what an epoch contains, reading only the origin and the slot count
+     * from their fixed offsets and handing them to
+     * {@link CanonicalSealerState#onOriginRecord}, which closes the open block,
+     * adopts the origin and relays. See
+     * {@code docs/agents/l1-origin-deposit-derivation-spec.md}.</p>
+     */
+    public static final byte KIND_ORIGIN_RECORD = 4;
+
+    /** Offset of the 32-byte canonical id in a {@link #KIND_ORIGIN_RECORD} frame. */
+    private static final int ORIGIN_ID_OFFSET = KIND_OFFSET + Byte.BYTES;
+    /** Offset of the u64 L1 origin within a {@link #KIND_ORIGIN_RECORD} frame. */
+    private static final int ORIGIN_OFFSET =
+            ORIGIN_ID_OFFSET + CanonicalSealerState.CANONICAL_ID_LEN;
+    /** Offset of the u32 slot count within a {@link #KIND_ORIGIN_RECORD} frame. */
+    private static final int SLOT_COUNT_OFFSET = ORIGIN_OFFSET + Long.BYTES;
+    /** Minimum valid origin-record length: kind + canonical id + origin + slots. */
+    private static final int MIN_ORIGIN_RECORD_LEN = SLOT_COUNT_OFFSET + Integer.BYTES;
 
     /** Minimum valid replay-request length: kind + from_index + from_block. */
     private static final int MIN_REPLAY_REQUEST_LEN = Byte.BYTES + Long.BYTES + Long.BYTES;
@@ -318,6 +347,11 @@ public final class SealerClusteredService implements ClusteredService {
             maybeReviveBoundaryClock();
             return;
         }
+        if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_ORIGIN_RECORD) {
+            onOriginRecord(buffer, offset, length);
+            maybeReviveBoundaryClock();
+            return;
+        }
         if (length > KIND_OFFSET && buffer.getByte(offset + KIND_OFFSET) == KIND_BATCH) {
             if (length < 3) {
                 onMalformedFrame("batch-envelope", length);
@@ -354,6 +388,58 @@ public final class SealerClusteredService implements ClusteredService {
         // sustained ingress load heals the clock without waiting for a
         // consumer reconnect.
         maybeReviveBoundaryClock();
+    }
+
+    /**
+     * Handle a {@link #KIND_ORIGIN_RECORD} frame: strip the origin and slot
+     * count, relay the remaining payload verbatim, and offer the forced
+     * boundary FIRST so the record leads the block it opens rather than
+     * trailing the one it closes.
+     */
+    private void onOriginRecord(final DirectBuffer buffer, final int offset, final int length) {
+        if (length < MIN_ORIGIN_RECORD_LEN) {
+            onMalformedFrame("origin-record", length);
+            return;
+        }
+        buffer.getBytes(offset + ORIGIN_ID_OFFSET, canonicalIdScratch);
+        final long l1Origin = buffer.getLong(offset + ORIGIN_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long slotCount =
+                buffer.getInt(offset + SLOT_COUNT_OFFSET, ByteOrder.LITTLE_ENDIAN) & 0xFFFF_FFFFL;
+
+        // The relayed payload keeps the SAME shape as an ordinary record —
+        // [canonical_id:32][record_type][fields…]. Everything after the slot
+        // count is the tail; measuring from the id offset would double-count
+        // the 32 bytes copied separately, and the slack would land where rkyv
+        // looks for its root.
+        final int tailLength = length - (SLOT_COUNT_OFFSET + Integer.BYTES);
+        final byte[] payload = new byte[CanonicalSealerState.CANONICAL_ID_LEN + tailLength];
+        buffer.getBytes(
+                offset + ORIGIN_ID_OFFSET, payload, 0, CanonicalSealerState.CANONICAL_ID_LEN);
+        if (tailLength > 0) {
+            buffer.getBytes(
+                    offset + SLOT_COUNT_OFFSET + Integer.BYTES,
+                    payload,
+                    CanonicalSealerState.CANONICAL_ID_LEN,
+                    tailLength);
+        }
+
+        final Optional<OriginAdvance> advance;
+        try {
+            advance =
+                state.onOriginRecord(canonicalIdScratch, l1Origin, slotCount, payload, cluster.time());
+        } catch (final IllegalArgumentException ex) {
+            // A non-advancing origin is a producer bug. Every member rejects it
+            // identically (the check reads only replicated state), so dropping
+            // is deterministic — and far better than throwing out of the
+            // clustered service, which would take the cluster down.
+            onMalformedFrame("origin-record-regression", length);
+            return;
+        }
+        if (advance.isEmpty()) {
+            return; // duplicate epoch from a racing sequencer
+        }
+        advance.get().forcedBoundary().ifPresent(this::offerBoundary);
+        offerRelayed(advance.get().relayed());
     }
 
     /**
@@ -700,7 +786,7 @@ public final class SealerClusteredService implements ClusteredService {
 
     /**
      * Frame a {@link Boundary} into {@link #egressBuffer}:
-     * {@code kind(1) | blockNumber(8) | endTxIdx(8) | l2Timestamp(8)}.
+     * {@code kind(1) | blockNumber(8) | endTxIdx(8) | l2Timestamp(8) | l1Origin(8)}.
      */
     private int frameBoundary(final Boundary boundary) {
         final MutableDirectBuffer buf = egressBuffer;
@@ -712,6 +798,8 @@ public final class SealerClusteredService implements ClusteredService {
         buf.putLong(pos, boundary.endTxIdx, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         buf.putLong(pos, boundary.l2Timestamp, ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putLong(pos, boundary.l1Origin, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
         return pos;
     }

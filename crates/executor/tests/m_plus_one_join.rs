@@ -254,6 +254,7 @@ fn m4_canonical_b_order_drives_receipts() {
             block_number: 1,
             end_tx_idx,
             l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
         })
         .expect("publish boundary");
 
@@ -308,7 +309,6 @@ fn m4_canonical_b_order_drives_receipts() {
             cfg,
             a_subs,
             b_sub,
-            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,
@@ -425,6 +425,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             // One canonical record applied ⇒ cumulative count 1.
             end_tx_idx: BPosition::from_index(1),
             l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
         })
         .expect("publish boundary");
 
@@ -471,7 +472,6 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             cfg,
             a_subs,
             b_sub,
-            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,

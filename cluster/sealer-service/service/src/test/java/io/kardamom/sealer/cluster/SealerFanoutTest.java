@@ -1,5 +1,6 @@
 package io.kardamom.sealer.cluster;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import io.aeron.Aeron;
@@ -373,5 +374,89 @@ class SealerFanoutTest {
         public IdleStrategy idleStrategy() {
             return idleStrategy;
         }
+    }
+
+    /**
+     * The relayed payload of an origin record must be EXACTLY
+     * {@code [canonical_id:32][record_type][fields…]} — the same shape a plain
+     * record relays in — with no trailing slack. Consumers deserialise the
+     * fields with rkyv, which locates its root at the END of the buffer, so
+     * even a few extra bytes make every epoch undecodable. Nothing on the Rust
+     * side can catch this: it is purely a property of this relay.
+     */
+    @Test
+    void origin_record_relays_id_and_fields_with_no_trailing_slack() {
+        subscribe(consumerA);
+        final byte[] fields = {0x11, 0x22, 0x33, 0x44, 0x55};
+        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        id[0] = 0x7E;
+        id[31] = 0x5A;
+
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        int pos = 0;
+        buf.putByte(pos, SealerClusteredService.KIND_ORIGIN_RECORD);
+        pos += Byte.BYTES;
+        buf.putBytes(pos, id);
+        pos += id.length;
+        buf.putLong(pos, 4_242L, java.nio.ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putInt(pos, 3, java.nio.ByteOrder.LITTLE_ENDIAN); // slot count
+        pos += Integer.BYTES;
+        buf.putBytes(pos, fields);
+        pos += fields.length;
+        service.onSessionMessage(publisher, 0, buf, 0, pos, null);
+
+        final byte[] frame = consumerA.offered.stream()
+                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_RELAYED)
+                .findFirst()
+                .orElseThrow();
+        // [kind:1][index:8][payloadLen:4][payload…]
+        final int payloadLen = new org.agrona.concurrent.UnsafeBuffer(frame)
+                .getInt(1 + Long.BYTES, java.nio.ByteOrder.LITTLE_ENDIAN);
+        assertEquals(
+                CanonicalSealerState.CANONICAL_ID_LEN + fields.length,
+                payloadLen,
+                "relayed payload must be id + fields exactly");
+
+        final byte[] payload = new byte[payloadLen];
+        System.arraycopy(frame, 1 + Long.BYTES + Integer.BYTES, payload, 0, payloadLen);
+        final byte[] gotId = java.util.Arrays.copyOfRange(payload, 0, id.length);
+        final byte[] gotFields = java.util.Arrays.copyOfRange(payload, id.length, payload.length);
+        assertArrayEquals(id, gotId);
+        assertArrayEquals(fields, gotFields);
+    }
+
+    /** The declared slot count must be consumed, so the next record starts past it. */
+    @Test
+    void origin_record_consumes_its_declared_slot_range() {
+        subscribe(consumerA);
+        originRecord(publisher, 1, 100L, 4);
+        record(publisher, 9);
+
+        final java.util.List<Long> indices = consumerA.offered.stream()
+                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_RELAYED)
+                .map(f -> new org.agrona.concurrent.UnsafeBuffer(f)
+                        .getLong(1, java.nio.ByteOrder.LITTLE_ENDIAN))
+                .toList();
+        assertEquals(java.util.List.of(0L, 4L), indices, "epoch claims slots 0..3");
+    }
+
+    private void originRecord(final StubSession from, final int n, final long origin, final int slots) {
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        int pos = 0;
+        buf.putByte(pos, SealerClusteredService.KIND_ORIGIN_RECORD);
+        pos += Byte.BYTES;
+        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
+        id[0] = (byte) n;
+        id[31] = 0x5A;
+        buf.putBytes(pos, id);
+        pos += id.length;
+        buf.putLong(pos, origin, java.nio.ByteOrder.LITTLE_ENDIAN);
+        pos += Long.BYTES;
+        buf.putInt(pos, slots, java.nio.ByteOrder.LITTLE_ENDIAN);
+        pos += Integer.BYTES;
+        buf.putByte(pos, (byte) n);
+        pos += Byte.BYTES;
+        service.onSessionMessage(from, 0, buf, 0, pos, null);
     }
 }

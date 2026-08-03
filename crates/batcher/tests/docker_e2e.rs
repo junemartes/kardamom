@@ -157,6 +157,7 @@ fn write_synthetic_archives(
             block_number: 1,
             end_tx_idx: pos(64),
             l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
         }),
     );
 

@@ -55,9 +55,8 @@ use crate::error::ExecutorError;
 use crate::exec_types::{CMessage, TxIndex};
 use crate::executor::execute_deposit_tx;
 use crate::reader::{
-    DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
-    TxDataSubscription, TxOrderingSubscription, spawn_tx_data_reader, spawn_tx_deposits_reader,
-    spawn_tx_ordering_reader,
+    JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
+    spawn_tx_data_reader, spawn_tx_ordering_reader,
 };
 
 /// Publication handle for tx_receipts.
@@ -261,7 +260,6 @@ impl Executor {
         cfg: ExecutorConfig,
         a_subs: Vec<Box<dyn TxDataSubscription>>,
         b_sub: Box<dyn TxOrderingSubscription>,
-        dep_sub: Option<Box<dyn DepositSubscription>>,
         c_pub: C,
         snapshots: S,
         sw_signal: Q,
@@ -279,7 +277,6 @@ impl Executor {
         P: StateWriterQueue + 'static,
     {
         let buffer = JoinBuffer::new();
-        let deposit_buffer = DepositJoinBuffer::new();
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth);
 
@@ -293,13 +290,9 @@ impl Executor {
             a_handles.push(spawn_tx_data_reader(BoxedASub(a), buffer.clone()));
         }
 
-        let dep_handle =
-            dep_sub.map(|d| spawn_tx_deposits_reader(BoxedDepSub(d), deposit_buffer.clone()));
-
         let b_handle = spawn_tx_ordering_reader(
             BoxedBSub(b_sub),
             buffer.clone(),
-            deposit_buffer.clone(),
             cfg.reader.clone(),
             tx_r2e,
             // The canonical source delivers from the resume cursor; indices
@@ -352,12 +345,9 @@ impl Executor {
                 r_a = res;
             }
         }
-        let r_dep = dep_handle
-            .map(|h| h.join().expect("tx_deposits reader panic"))
-            .unwrap_or(Ok(()));
         // `pipeline` was already checked above (Ok by here), so the result is
-        // determined by the A and deposit reader joins.
-        r_a.and(r_dep)
+        // determined by the A reader joins.
+        r_a
     }
 }
 
@@ -379,13 +369,6 @@ impl TxDataSubscription for BoxedASub {
 struct BoxedBSub(Box<dyn TxOrderingSubscription>);
 impl TxOrderingSubscription for BoxedBSub {
     fn next(&mut self) -> Result<(BPosition, kardamom_types::TxOrderingMessage), ExecutorError> {
-        self.0.next()
-    }
-}
-
-struct BoxedDepSub(Box<dyn DepositSubscription>);
-impl DepositSubscription for BoxedDepSub {
-    fn next(&mut self) -> Result<(BPosition, kardamom_types::Deposit), ExecutorError> {
         self.0.next()
     }
 }
@@ -690,6 +673,31 @@ where
                             return Ok(());
                         }
                     }
+                    ReaderToExec::Epoch {
+                        tx_idx,
+                        epoch,
+                        position,
+                    } => {
+                        // The marker consumes one slot and applies no tx: it
+                        // exists so the L1 origin advances at a point every
+                        // replica agrees on, and so the deposits that follow
+                        // start at a slot the sealer also reserved.
+                        if tx_idx != expected_tx_idx {
+                            tracing::error!(block = current_block, ?position, ?tx_idx, ?expected_tx_idx, "exec ERROR: OutOfOrderTx (Epoch)");
+                            return Err(ExecutorError::OutOfOrderTx {
+                                got: tx_idx,
+                                expected: expected_tx_idx,
+                            });
+                        }
+                        expected_tx_idx = expected_tx_idx.next();
+                        tracing::debug!(
+                            target: "kardamom_executor::exec",
+                            block = current_block,
+                            l1_number = epoch.l1_number,
+                            deposits = epoch.deposits.len(),
+                            "epoch marker: L1 origin advances"
+                        );
+                    }
                     ReaderToExec::Deposit {
                         tx_idx,
                         deposit,
@@ -761,6 +769,7 @@ where
                         block_number,
                         end_tx_idx,
                         l2_timestamp,
+                        l1_origin,
                     }) => {
                         // Settle sweep: pop every in-flight commit the writer
                         // has ALREADY durably finished (non-blocking probe).
@@ -885,12 +894,16 @@ where
                         }
 
                         // S0: NO state-root computation. The sealed
-                        // BlockBoundary on tx_receipts is slim — three
-                        // fields, no commitment.
+                        // BlockBoundary on tx_receipts is slim — no
+                        // commitment. `l1_origin` rides through unchanged
+                        // from the sealer's marker: it identifies the L1
+                        // epoch this block belongs to, which is what lets a
+                        // reconstructor place the epoch's deposits.
                         let boundary = BlockBoundary {
                             block_number,
                             end_tx_idx,
                             l2_timestamp,
+                            l1_origin,
                         };
 
                         // Drain the delta. We swap it out so the writer owns
@@ -1200,6 +1213,7 @@ mod exec_tests {
                 block_number: 1,
                 end_tx_idx: pos(2),
                 l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1241,11 +1255,15 @@ mod exec_tests {
         assert!(delta.receipts.iter().all(|r| r.block_number == 1));
         assert_eq!(delta.receipts[0].nonce, 0);
         assert_eq!(delta.receipts[1].nonce, 1);
-        // S0 regression guard: destructure to enforce the 3-field
-        // shape of BlockBoundary at compile time.
+        // S0 regression guard: destructure to enforce the shape of
+        // BlockBoundary at compile time — specifically that NO state-root
+        // commitment sneaks in. `l1_origin` is a deliberate addition (the L1
+        // epoch this block belongs to); a new field appearing here without a
+        // spec behind it is the thing this guard is watching for.
         let BlockBoundary {
             block_number: _,
             end_tx_idx: _,
+            l1_origin: _,
             l2_timestamp: _,
         } = boundary;
     }
@@ -1288,6 +1306,7 @@ mod exec_tests {
                 block_number: 1,
                 end_tx_idx: pos(1),
                 l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
             }))
             .unwrap();
         // Block 2: B → C spends funds B only has via block 1's writes.
@@ -1303,6 +1322,7 @@ mod exec_tests {
                 block_number: 2,
                 end_tx_idx: pos(2),
                 l2_timestamp: 1_700_000_002,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1373,6 +1393,7 @@ mod exec_tests {
                     block_number: n,
                     end_tx_idx: pos(0),
                     l2_timestamp: 1_700_000_000 + n,
+                    l1_origin: 0,
                 }))
                 .unwrap();
         }
@@ -1444,6 +1465,7 @@ mod exec_tests {
                     block_number: n,
                     end_tx_idx: pos(0),
                     l2_timestamp: 1_700_000_000 + n,
+                    l1_origin: 0,
                 }))
                 .unwrap();
         }
@@ -1541,6 +1563,7 @@ mod exec_tests {
                 block_number: 1,
                 end_tx_idx: pos(2),
                 l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1603,6 +1626,7 @@ mod exec_tests {
                 block_number: 1,
                 end_tx_idx: pos(1),
                 l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1656,6 +1680,7 @@ mod exec_tests {
                 block_number: 1,
                 end_tx_idx: pos(5),
                 l2_timestamp: 0,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1747,6 +1772,7 @@ mod exec_tests {
                 block_number: 2,
                 end_tx_idx: pos(3),
                 l2_timestamp: 1_700_000_001,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1818,6 +1844,7 @@ mod exec_tests {
                 block_number: 4,
                 end_tx_idx: pos(1),
                 l2_timestamp: 1_700_000_004,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1883,6 +1910,7 @@ mod exec_tests {
                 block_number: 2,
                 end_tx_idx: pos(10),
                 l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1936,6 +1964,7 @@ mod exec_tests {
                 block_number: 1,
                 end_tx_idx: pos(1),
                 l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
             }))
             .unwrap();
         drop(tx_r2e);
@@ -1999,6 +2028,7 @@ mod commit_tests {
             block_number: 1,
             end_tx_idx: pos0,
             l2_timestamp: 100,
+            l1_origin: 0,
         }))
         .unwrap();
         drop(tx);
@@ -2121,6 +2151,7 @@ mod commit_tests {
                 term_offset: 4 * 64,
             },
             l2_timestamp: 100,
+            l1_origin: 0,
         }))
         .unwrap();
         drop(tx);

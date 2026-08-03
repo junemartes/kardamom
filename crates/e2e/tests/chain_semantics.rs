@@ -21,8 +21,8 @@ use std::time::Duration;
 use e2e::harness::services::IngressOptions;
 use e2e::harness::{LocalStack, StackConfig};
 use e2e::scenarios::{
-    bridge, consistency, crash_recovery, da_parity, divergence, nonce_gap, nonce_unordered,
-    rpc_liveness,
+    bridge, consistency, crash_recovery, da_parity, derivation, divergence, nonce_gap,
+    nonce_unordered, rpc_liveness,
 };
 
 /// Client request bound, kept above every server-side park bound used here.
@@ -442,4 +442,148 @@ async fn s8_da_parity_batcher_matches_validator() {
         expected_root,
     )
     .expect("S8 DA parity");
+}
+
+// ---------------------------------------------------------------------------
+// S10 — L1-origin deposit derivation.
+//
+// The rules these assert live in
+// docs/agents/l1-origin-deposit-derivation-spec.md. They are asserted against
+// persisted headers and executed receipts, not logs: a component can log the
+// right thing and still build the wrong chain.
+// ---------------------------------------------------------------------------
+
+/// S10a: the L1 origin advances, monotonically and without skipping, over a
+/// stretch of L1 that carries NO deposits. An idle L1 is exactly where it is
+/// tempting to emit nothing, and the no-skipping rule is what that breaks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s10a_origin_advances_over_an_idle_l1() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let l1 = stack.l1().expect("l1");
+    let state_dir = stack.executor_state_dir().expect("executor state dir");
+    derivation::origin_advances_over_an_idle_l1(l1, &state_dir)
+        .await
+        .expect("S10a");
+}
+
+/// S10b: an epoch's deposits LEAD the block they open, even while L2 traffic
+/// is flowing. Under interleaving, "deposits come first" can only hold
+/// because the epoch is atomic and forces a boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s10b_deposits_lead_their_block_under_load() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let l1 = stack.l1().expect("l1");
+    let state_dir = stack.executor_state_dir().expect("executor state dir");
+    derivation::deposits_lead_their_block_under_load(&t, l1, &state_dir)
+        .await
+        .expect("S10b");
+}
+
+/// S10c: several deposits in ONE L1 block all land in ONE L2 block, in L1
+/// log order — the grouping the atomic epoch record exists to guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s10c_multi_deposit_epoch_lands_in_log_order() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let l1 = stack.l1().expect("l1");
+    let state_dir = stack.executor_state_dir().expect("executor state dir");
+    derivation::multi_deposit_epoch_lands_in_log_order(&t, l1, &state_dir)
+        .await
+        .expect("S10c");
+}
+
+/// S10d: a stalled L1 delays deposits but must not stall L2. This is the
+/// difference between the bounded-lag rule being a liveness ALARM and a
+/// liveness FAILURE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s10d_stalled_l1_does_not_stall_l2() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let l1 = stack.l1().expect("l1");
+    let state_dir = stack.executor_state_dir().expect("executor state dir");
+    derivation::stalled_l1_does_not_stall_l2(&t, l1, &state_dir)
+        .await
+        .expect("S10d");
+}
+
+/// S10e: every deposit L1 recorded appears on L2 exactly once. Derives the
+/// expected set from L1 itself — the property a verifier will enforce in
+/// phase D, asserted here against the producer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s10e_every_l1_deposit_appears_exactly_once() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let l1 = stack.l1().expect("l1");
+    let state_dir = stack.executor_state_dir().expect("executor state dir");
+
+    // Give the chain something to find: two deposits in separate L1 blocks.
+    let signers = e2e::harness::l2::dev_signers(4).expect("signers");
+    for signer in &signers[2..4] {
+        l1.deposit_eth(
+            signer.address,
+            alloy_primitives::U256::from(2_000_000_000_000_000u64),
+        )
+        .await
+        .expect("depositETH");
+        l1.mine(3).await.expect("mine");
+    }
+    l1.mine(6).await.expect("mine past finality");
+
+    derivation::every_l1_deposit_appears_exactly_once(&t, l1, &state_dir)
+        .await
+        .expect("S10e");
 }

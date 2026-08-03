@@ -5,6 +5,8 @@ edition.workspace = true
 
 [features]
 default = []
+# Exposes the in-memory L1 source / epoch publisher fakes to other crates.
+testing = []
 
 [dependencies]
 kardamom-types = { workspace = true }

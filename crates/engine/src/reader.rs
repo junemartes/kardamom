@@ -48,13 +48,12 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use alloy_primitives::B256;
 use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
 use kardamom_types::{
-    BPosition, BlockBoundaryStart, Deposit, TxDataLoc, TxEnvelope, TxOrderingMessage,
+    BPosition, BlockBoundaryStart, Deposit, EpochRecord, TxDataLoc, TxEnvelope, TxOrderingMessage,
 };
 
 use crate::error::ExecutorError;
@@ -91,17 +90,6 @@ pub trait TxOrderingSubscription: Send {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError>;
 }
 
-/// Subscription to **tx_deposits** (the DA-watcher → sequencer/executor
-/// channel). Yields full [`Deposit`] envelopes the DA watcher published.
-///
-/// The deposit reader thread iterates this and inserts every
-/// `(deposit_position, Deposit)` into the [`DepositJoinBuffer`] keyed by
-/// `source_hash`. The tx_ordering reader then dedups `DepositRef`s by
-/// `source_hash` and removes the buffered deposit.
-pub trait DepositSubscription: Send {
-    fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError>;
-}
-
 // Boxed trait objects are subscriptions too, so callers holding
 // `Box<dyn ...>` (the `bin_support` open_* helpers' return type) can hand
 // them straight to the spawn_* functions.
@@ -111,12 +99,6 @@ impl TxDataSubscription for Box<dyn TxDataSubscription> {
     }
 
     fn next(&mut self) -> Result<(TxDataLoc, TxEnvelope), ExecutorError> {
-        (**self).next()
-    }
-}
-
-impl DepositSubscription for Box<dyn DepositSubscription> {
-    fn next(&mut self) -> Result<(BPosition, Deposit), ExecutorError> {
         (**self).next()
     }
 }
@@ -181,36 +163,6 @@ impl JoinBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
-    }
-}
-
-/// Lookup-and-remove join buffer keyed by `source_hash`.
-///
-/// The deposit reader thread inserts via [`DepositJoinBuffer::insert`]
-/// every `(deposit_position, Deposit)` it pulls off tx_deposits. The
-/// tx_ordering reader pulls via [`DepositJoinBuffer::take`] (remove-on-hit)
-/// when it sees a `DepositRef`. Bounded by the in-flight L1 deposit
-/// window — typically tiny (~tens of entries) since L1 finalised
-/// deposits arrive at L1-block cadence.
-#[derive(Clone, Default)]
-pub struct DepositJoinBuffer {
-    inner: Arc<DashMap<B256, (BPosition, Deposit)>>,
-}
-
-impl DepositJoinBuffer {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn insert(&self, deposit_position: BPosition, deposit: Deposit) {
-        self.inner
-            .insert(deposit.source_hash, (deposit_position, deposit));
-    }
-
-    /// Remove and return the deposit indexed by `source_hash`, or `None`
-    /// if it isn't (yet) present.
-    pub fn take(&self, source_hash: B256) -> Option<(BPosition, Deposit)> {
-        self.inner.remove(&source_hash).map(|kv| kv.1)
     }
 }
 
@@ -320,6 +272,14 @@ pub enum ReaderToExec {
         deposit: Deposit,
         position: BPosition,
     },
+    /// An L1 epoch marker: advances the block's L1 origin and consumes the
+    /// first slot of the epoch's range. Applies NO transaction — the epoch's
+    /// deposits follow as their own [`ReaderToExec::Deposit`] messages.
+    Epoch {
+        tx_idx: TxIndex,
+        epoch: EpochRecord,
+        position: BPosition,
+    },
     Boundary(BlockBoundaryStart),
 }
 
@@ -347,31 +307,6 @@ where
             }
         })
         .expect("spawn tx_data reader")
-}
-
-/// Spawn the deposit reader thread. Pulls `(deposit_position, Deposit)`
-/// records off tx_deposits and inserts them into `buffer` keyed by
-/// `deposit.source_hash`. Returns `Ok(())` when the subscription closes
-/// cleanly (mirrors [`spawn_tx_data_reader`]).
-pub fn spawn_tx_deposits_reader<D>(
-    mut d_sub: D,
-    buffer: DepositJoinBuffer,
-) -> JoinHandle<Result<(), ExecutorError>>
-where
-    D: DepositSubscription + 'static,
-{
-    thread::Builder::new()
-        .name("executor-reader-deposits".into())
-        .spawn(move || {
-            loop {
-                match d_sub.next() {
-                    Ok((deposit_position, deposit)) => buffer.insert(deposit_position, deposit),
-                    Err(ExecutorError::DepositsClosed) => return Ok(()),
-                    Err(e) => return Err(e),
-                }
-            }
-        })
-        .expect("spawn tx_deposits reader")
 }
 
 /// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
@@ -427,7 +362,6 @@ impl DedupWindow {
 pub fn spawn_tx_ordering_reader<B>(
     mut b_sub: B,
     buffer: JoinBuffer,
-    deposit_buffer: DepositJoinBuffer,
     cfg: ReaderConfig,
     exec_out: Sender<ReaderToExec>,
     start_tx_idx: TxIndex,
@@ -516,55 +450,68 @@ where
                             return Ok(()); // exec thread shutting down
                         }
                     }
-                    TxOrderingMessage::DepositRef(dep_ref) => {
-                        if !seen_canonical_ids.first_seen(dep_ref.source_hash) {
-                            // Duplicate from racing sequencers (MDS) — drop.
+                    TxOrderingMessage::Epoch(epoch) => {
+                        // An epoch claims a contiguous slot range: the marker,
+                        // then one slot per deposit (see `wire::epoch_slots`).
+                        // Dispatching the marker first keeps the exec side's
+                        // per-record counter — the block-boundary alignment key
+                        // — in step without giving the marker a transaction.
+                        if !seen_canonical_ids.first_seen(epoch.canonical_id()) {
                             debug!(
-                                target: "executor::reader",
-                                source_hash = ?dep_ref.source_hash,
-                                "skipping duplicate DepositRef"
+                                target: "kardamom_executor::reader",
+                                l1_number = epoch.l1_number,
+                                "skipping duplicate Epoch (MDS racing sequencers)"
                             );
                             continue;
                         }
-                        let (resolved_pos, deposit) = match join_deposit(
-                            &deposit_buffer,
-                            &mut recovery,
-                            &dep_ref,
-                            &cfg,
-                        ) {
-                            Some(d) => d,
-                            None => {
-                                warn!(
-                                    target: "executor::reader",
-                                    source_hash = ?dep_ref.source_hash,
-                                    deposit_position = ?dep_ref.deposit_position,
-                                    timeout_ms = cfg.join_timeout.as_millis() as u64,
-                                    "join timeout: DepositRef has no deposit on tx_deposits; aborting"
-                                );
-                                return Err(ExecutorError::DepositJoinTimeout {
-                                    source_hash: dep_ref.source_hash,
-                                    deposit_position: dep_ref.deposit_position,
-                                    timeout_ms: cfg.join_timeout.as_millis() as u64,
-                                });
-                            }
-                        };
-                        debug_assert_eq!(
-                            resolved_pos, dep_ref.deposit_position,
-                            "deposit_position observed by the deposit reader must match the ref"
-                        );
-
-                        let tx_idx = next_tx_idx;
+                        let deposits = epoch.deposits.clone();
+                        let marker_idx = next_tx_idx;
                         next_tx_idx = next_tx_idx.next();
                         if exec_out
-                            .send(ReaderToExec::Deposit {
-                                tx_idx,
-                                deposit,
+                            .send(ReaderToExec::Epoch {
+                                tx_idx: marker_idx,
+                                epoch,
                                 position,
                             })
                             .is_err()
                         {
                             return Ok(()); // exec thread shutting down
                         }
+                        // The deposits travel INSIDE the epoch record, so
+                        // unlike a DepositRef there is no side-stream join to
+                        // wait on — nothing here can time out or go missing.
+                        for deposit in deposits {
+                            let tx_idx = next_tx_idx;
+                            next_tx_idx = next_tx_idx.next();
+                            if exec_out
+                                .send(ReaderToExec::Deposit {
+                                    tx_idx,
+                                    deposit,
+                                    position,
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    TxOrderingMessage::DepositRef(dep_ref) => {
+                        // Retired by the epoch switch-over: deposits now
+                        // travel INSIDE an epoch record, so there is no
+                        // `tx_deposits` envelope left to join against. A ref
+                        // here means the stream predates the cutover (this is
+                        // a breaking chain change, not a rolling upgrade), so
+                        // fail loudly rather than silently drop a deposit.
+                        tracing::error!(
+                            target: "kardamom_executor::reader",
+                            source_hash = ?dep_ref.source_hash,
+                            "legacy DepositRef on the canonical stream; this chain derives \
+                             deposits from epochs (see docs/agents/l1-origin-deposit-derivation-spec.md)"
+                        );
+                        return Err(ExecutorError::State(format!(
+                            "legacy DepositRef {:?}: deposits are carried by epochs on this chain",
+                            dep_ref.source_hash
+                        )));
                     }
                     TxOrderingMessage::BoundaryStart(b) => {
                         debug!(
@@ -667,68 +614,9 @@ fn join_envelope(
     }
 }
 
-/// Deposit twin of [`join_envelope`]: bounded wait keyed by `source_hash`,
-/// with archive refetch of the tx_deposits stream from the ref's position.
-fn join_deposit(
-    buffer: &DepositJoinBuffer,
-    recovery: &mut Option<Box<dyn JoinRecovery>>,
-    dep_ref: &kardamom_types::DepositRef,
-    cfg: &ReaderConfig,
-) -> Option<(BPosition, Deposit)> {
-    let deadline = Instant::now() + cfg.join_timeout;
-    let first_slice = match recovery {
-        Some(_) => cfg.join_refetch_after.min(cfg.join_timeout),
-        None => cfg.join_timeout,
-    };
-    if let Some(d) = wait_for_deposit(
-        buffer,
-        dep_ref.source_hash,
-        first_slice,
-        cfg.join_poll_interval,
-    ) {
-        return Some(d);
-    }
-    loop {
-        let r = recovery.as_mut()?;
-        if Instant::now() >= deadline {
-            return None;
-        }
-        warn!(
-            target: "kardamom_executor::reader",
-            source_hash = ?dep_ref.source_hash,
-            deposit_position = ?dep_ref.deposit_position,
-            "join miss on tx_deposits — refetching from durability archive"
-        );
-        let mut recovered = 0u64;
-        match r.recover_deposits(dep_ref.deposit_position, &mut |pos, dep| {
-            buffer.insert(pos, dep);
-            recovered += 1;
-        }) {
-            Ok(_) => tracing::info!(
-                target: "kardamom_executor::reader",
-                recovered,
-                "deposit archive refetch complete"
-            ),
-            Err(e) => warn!(
-                target: "kardamom_executor::reader",
-                error = %e,
-                "deposit archive refetch failed; will retry within the join budget"
-            ),
-        }
-        let slice = cfg
-            .join_refetch_after
-            .min(deadline.saturating_duration_since(Instant::now()));
-        if slice.is_zero() {
-            return buffer.take(dep_ref.source_hash);
-        }
-        if let Some(d) =
-            wait_for_deposit(buffer, dep_ref.source_hash, slice, cfg.join_poll_interval)
-        {
-            return Some(d);
-        }
-    }
-}
-
+/// Spin until the tx_data envelope keyed by
+/// `(sequencer_id, session_id, tx_data_position)` lands on the
+/// [`JoinBuffer`], or the timeout elapses.
 fn wait_for_envelope(
     buffer: &JoinBuffer,
     sequencer_id: u8,
@@ -745,30 +633,6 @@ fn wait_for_envelope(
         thread::sleep(poll_interval);
         if let Some(env) = buffer.take(sequencer_id, session_id, tx_data_position) {
             return Some(env);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-    }
-}
-
-/// Mirror of [`wait_for_envelope`] for the deposit join. Spin with bounded
-/// backoff until the deposit identified by `source_hash` lands on the
-/// [`DepositJoinBuffer`], or the timeout elapses.
-fn wait_for_deposit(
-    buffer: &DepositJoinBuffer,
-    source_hash: B256,
-    timeout: Duration,
-    poll_interval: Duration,
-) -> Option<(BPosition, Deposit)> {
-    if let Some(d) = buffer.take(source_hash) {
-        return Some(d);
-    }
-    let deadline = Instant::now() + timeout;
-    loop {
-        thread::sleep(poll_interval);
-        if let Some(d) = buffer.take(source_hash) {
-            return Some(d);
         }
         if Instant::now() >= deadline {
             return None;
@@ -906,20 +770,13 @@ mod tests {
                         block_number: 1,
                         end_tx_idx: pos(16),
                         l2_timestamp: 1_700_000_000,
+                        l1_origin: 0,
                     }),
                 )),
             ]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(8);
-        let h = spawn_tx_ordering_reader(
-            b,
-            buf,
-            DepositJoinBuffer::new(),
-            ReaderConfig::default(),
-            tx,
-            TxIndex::ZERO,
-            None,
-        );
+        let h = spawn_tx_ordering_reader(b, buf, ReaderConfig::default(), tx, TxIndex::ZERO, None);
         h.join().expect("no panic").expect("ok");
 
         let mut out = Vec::new();
@@ -954,6 +811,119 @@ mod tests {
         }
     }
 
+    /// An epoch expands to the marker plus one dispatch per deposit, with
+    /// `tx_idx` running consecutively across the whole range — that contiguity
+    /// is what the exec side's boundary alignment counts on.
+    #[test]
+    fn channel_b_reader_expands_an_epoch_into_marker_plus_deposits() {
+        let deposits: Vec<Deposit> = (0..3)
+            .map(|i| Deposit {
+                source_hash: alloy_primitives::B256::repeat_byte(0xD0 + i),
+                mint: 1_000 + i as u128,
+                ..Default::default()
+            })
+            .collect();
+        let epoch = EpochRecord {
+            l1_number: 4_242,
+            l1_hash: alloy_primitives::B256::repeat_byte(0xE1),
+            deposits: deposits.clone(),
+        };
+
+        let b = VecTxOrderingSub {
+            queue: VecDeque::from(vec![
+                Ok((pos(0), TxOrderingMessage::Epoch(epoch.clone()))),
+                Ok((
+                    pos(4),
+                    TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+                        block_number: 1,
+                        // Marker + 3 deposits = 4 slots consumed.
+                        end_tx_idx: pos(4),
+                        l2_timestamp: 1_700_000_000,
+                        l1_origin: 4_242,
+                    }),
+                )),
+            ]),
+        };
+        let (tx, rx) = bounded::<ReaderToExec>(8);
+        let h = spawn_tx_ordering_reader(
+            b,
+            JoinBuffer::new(),
+            ReaderConfig::default(),
+            tx,
+            TxIndex::ZERO,
+            None,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let mut out = Vec::new();
+        while let Ok(m) = rx.recv() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 5, "marker + 3 deposits + boundary");
+        match &out[0] {
+            ReaderToExec::Epoch {
+                tx_idx, epoch: e, ..
+            } => {
+                assert_eq!(*tx_idx, TxIndex(0));
+                assert_eq!(e.l1_number, 4_242);
+            }
+            other => panic!("expected Epoch marker, got {other:?}"),
+        }
+        for (i, expected) in deposits.iter().enumerate() {
+            match &out[1 + i] {
+                ReaderToExec::Deposit {
+                    tx_idx, deposit, ..
+                } => {
+                    // Deposits occupy slots 1..=N, in L1 log order.
+                    assert_eq!(*tx_idx, TxIndex(1 + i as u64));
+                    assert_eq!(deposit.source_hash, expected.source_hash);
+                }
+                other => panic!("expected Deposit at {i}, got {other:?}"),
+            }
+        }
+        match &out[4] {
+            ReaderToExec::Boundary(b) => assert_eq!(b.end_tx_idx, pos(4)),
+            other => panic!("expected Boundary, got {other:?}"),
+        }
+    }
+
+    /// A duplicate epoch from a racing sequencer must dispatch NOTHING — a
+    /// second expansion would double-apply every deposit in it.
+    #[test]
+    fn channel_b_reader_drops_a_duplicate_epoch() {
+        let epoch = EpochRecord {
+            l1_number: 7,
+            l1_hash: alloy_primitives::B256::repeat_byte(0xE2),
+            deposits: vec![Deposit {
+                source_hash: alloy_primitives::B256::repeat_byte(0xD9),
+                mint: 5,
+                ..Default::default()
+            }],
+        };
+        let b = VecTxOrderingSub {
+            queue: VecDeque::from(vec![
+                Ok((pos(0), TxOrderingMessage::Epoch(epoch.clone()))),
+                Ok((pos(2), TxOrderingMessage::Epoch(epoch))),
+            ]),
+        };
+        let (tx, rx) = bounded::<ReaderToExec>(8);
+        let h = spawn_tx_ordering_reader(
+            b,
+            JoinBuffer::new(),
+            ReaderConfig::default(),
+            tx,
+            TxIndex::ZERO,
+            None,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let mut out = Vec::new();
+        while let Ok(m) = rx.recv() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 2, "one marker + one deposit, not two of each");
+    }
+
     /// Race test: `TxRef` arrives BEFORE its envelope. The B reader spins
     /// and picks it up once the A reader inserts.
     #[test]
@@ -985,15 +955,7 @@ mod tests {
             ))]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(2);
-        let h = spawn_tx_ordering_reader(
-            b,
-            buf,
-            DepositJoinBuffer::new(),
-            cfg,
-            tx,
-            TxIndex::ZERO,
-            None,
-        );
+        let h = spawn_tx_ordering_reader(b, buf, cfg, tx, TxIndex::ZERO, None);
         h.join().expect("no panic").expect("ok");
         a_inserter.join().unwrap();
 
@@ -1025,15 +987,7 @@ mod tests {
             ))]),
         };
         let (tx, _rx) = bounded::<ReaderToExec>(2);
-        let h = spawn_tx_ordering_reader(
-            b,
-            buf,
-            DepositJoinBuffer::new(),
-            cfg,
-            tx,
-            TxIndex::ZERO,
-            None,
-        );
+        let h = spawn_tx_ordering_reader(b, buf, cfg, tx, TxIndex::ZERO, None);
         let res = h.join().expect("no panic");
         assert!(matches!(
             res,
@@ -1062,15 +1016,7 @@ mod tests {
             ]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(4);
-        let h = spawn_tx_ordering_reader(
-            b,
-            buf,
-            DepositJoinBuffer::new(),
-            ReaderConfig::default(),
-            tx,
-            TxIndex::ZERO,
-            None,
-        );
+        let h = spawn_tx_ordering_reader(b, buf, ReaderConfig::default(), tx, TxIndex::ZERO, None);
         h.join().expect("no panic").expect("ok");
 
         let mut out = Vec::new();
@@ -1176,18 +1122,10 @@ mod tests {
             ]),
         };
         let (tx, rx) = bounded::<ReaderToExec>(4);
-        spawn_tx_ordering_reader(
-            b,
-            buf,
-            DepositJoinBuffer::new(),
-            ReaderConfig::default(),
-            tx,
-            TxIndex::ZERO,
-            None,
-        )
-        .join()
-        .expect("no panic")
-        .expect("ok");
+        spawn_tx_ordering_reader(b, buf, ReaderConfig::default(), tx, TxIndex::ZERO, None)
+            .join()
+            .expect("no panic")
+            .expect("ok");
 
         let mut out = Vec::new();
         while let Ok(m) = rx.recv() {
