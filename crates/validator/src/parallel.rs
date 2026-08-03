@@ -363,18 +363,11 @@ mod tests {
 // Seeded parallel execution engine
 // ---------------------------------------------------------------------------
 
+use kardamom_engine::actor::BufferedRecord;
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
-use kardamom_engine::exec_types::TxIndex;
-use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
-
-/// One transaction as the validator receives it from the canonical stream.
-pub struct BlockTx {
-    pub tx_idx: TxIndex,
-    pub position: BPosition,
-    pub envelope: TxEnvelope,
-}
+use kardamom_types::{Receipt, StateDatabase};
 
 /// A batch's result: its receipts (with LOCAL cumulative gas — the caller
 /// fixes up block-cumulative in order) and its merged writes.
@@ -452,14 +445,14 @@ pub fn build_seed<S: StateDatabase>(
 pub fn execute_batch<S: StateDatabase>(
     snapshot: &S,
     seed: &PendingDelta,
-    txs: &[BlockTx],
+    records: &[BufferedRecord],
     claims: &ClaimIndex,
     env: ExecEnv,
     first_index: u64,
     granularity: u16,
 ) -> Result<BatchOutcome, ExecutorError> {
     let mut delta = PendingDelta::new();
-    let mut receipts = Vec::with_capacity(txs.len());
+    let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
     // At granularity K > 1 the wire claims are chunk-collapsed, so per-tx
     // comparison is impossible: verification coarsens to the CHUNK — the
@@ -471,23 +464,57 @@ pub fn execute_batch<S: StateDatabase>(
     // the batch's txs — the per-tx construction was ~90% of execution-path
     // allocation). The seed layer plays the parent role.
     let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, Some(seed), env)?;
-    for (i, tx) in txs.iter().enumerate() {
+    for (i, rec) in records.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
-        // Recompute this tx's claims through the executor's EXACT capture
-        // path (the scope feeds revm's Bal, which records per-FIELD
-        // changes: a transfer's recipient claims a balance change but NO
-        // nonce change). Comparing a WriteSet projection instead diverged
-        // on every live transfer — symmetric construction is the only
-        // drift-proof comparison.
-        let (receipt, ws) = scope.execute_tx(
-            tx.tx_idx,
-            tx.position,
-            &tx.envelope,
-            global_index_in_block,
-            cumulative,
-            Some((&mut batch_bal, bal_index)),
-        )?;
+        // Recompute each record's claims through the executor's EXACT
+        // capture path (revm's Bal records per-FIELD changes for txs; the
+        // synthetic WriteSet path for deposits). Comparing a WriteSet
+        // projection instead diverged on every live transfer — symmetric
+        // construction is the only drift-proof comparison.
+        let (receipt, ws) = match rec {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => scope.execute_tx(
+                *tx_idx,
+                *position,
+                envelope,
+                global_index_in_block,
+                cumulative,
+                Some((&mut batch_bal, bal_index)),
+            )?,
+            BufferedRecord::Deposit {
+                tx_idx,
+                deposit,
+                position,
+            } => {
+                // Deposits run outside the scope (own commit semantics —
+                // the mint is durable even when the inner call reverts).
+                // The seed plays the parent role; `delta` carries this
+                // batch's earlier writes.
+                let out = kardamom_engine::executor::execute_deposit_tx(
+                    snapshot,
+                    Some(seed),
+                    &delta,
+                    env,
+                    *tx_idx,
+                    *position,
+                    deposit,
+                    global_index_in_block,
+                    cumulative,
+                    Some((&mut batch_bal, bal_index)),
+                )?;
+                // Fold the deposit's writes into the scope cache so later
+                // records in this batch observe them (mirrors the actor's
+                // streaming path and the sequential fallback).
+                let mut layer = PendingDelta::new();
+                layer.apply(out.1.clone());
+                scope.seed_layer(&layer)?;
+                out
+            }
+        };
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
@@ -503,7 +530,7 @@ pub fn execute_batch<S: StateDatabase>(
         kardamom_engine::bal_ladder::quantize(batch_bal.into_alloy_bal(), granularity);
     let computed_idx = ClaimIndex::from_alloy(&computed_alloy);
     let k = u64::from(granularity.max(1));
-    let last_index = first_index + txs.len() as u64 - 1;
+    let last_index = first_index + records.len() as u64 - 1;
     if granularity <= 1 {
         for unit in first_index..=last_index {
             let claimed = claims.claims_in_range(unit, unit);
@@ -544,9 +571,13 @@ pub struct BlockOutcome {
     pub batches: usize,
 }
 
-/// Re-execute a block's transactions as FULLY PARALLEL batches, each seeded
-/// from the BAL's claims, verifying every batch's claims where they are
-/// produced.
+/// Re-execute a block's records (transactions AND deposits) as FULLY
+/// PARALLEL batches, each seeded from the BAL's claims, verifying every
+/// batch's claims where they are produced. Deposits occupy bal indices in
+/// the same space as txs (the executor's streaming capture passes
+/// `tx_index_in_block + 1` for both), so their claims seed later batches
+/// exactly like tx claims — the mint is a balance claim, a CREATE
+/// deposit's bytecode a code claim.
 ///
 /// Returns `Err(ExecutorError::Divergence)` on the first batch whose
 /// recomputed writes differ from what the executor claimed — the claim was
@@ -555,7 +586,7 @@ pub struct BlockOutcome {
 pub fn execute_block_parallel<S: StateDatabase + Sync>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
-    txs: &[BlockTx],
+    txs: &[BufferedRecord],
     claims: &ClaimIndex,
     env: ExecEnv,
     batch_size: usize,
@@ -650,13 +681,20 @@ mod engine_tests {
     use super::*;
     use alloy_consensus::{SignableTransaction, TxLegacy};
     use alloy_network::TxSignerSync;
-    use alloy_primitives::{TxKind, address};
+    use alloy_primitives::{B256, TxKind, address};
     use alloy_signer_local::PrivateKeySigner;
+    use kardamom_engine::exec_types::TxIndex;
     use kardamom_engine::executor::execute_tx;
     use kardamom_engine::state::MockStateDatabase;
-    use kardamom_types::BlockBoundaryStart;
+    use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, TxEnvelope};
 
-    fn tx(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64, i: u64) -> BlockTx {
+    fn tx(
+        signer: &PrivateKeySigner,
+        to: Address,
+        nonce: u64,
+        value: u64,
+        i: u64,
+    ) -> BufferedRecord {
         let inner = TxLegacy {
             chain_id: Some(1),
             nonce,
@@ -671,7 +709,7 @@ mod engine_tests {
         let env: alloy_consensus::TxEnvelope = m.into_signed(sig).into();
         let mut raw = Vec::new();
         alloy_eips::eip2718::Encodable2718::encode_2718(&env, &mut raw);
-        BlockTx {
+        BufferedRecord::Tx {
             tx_idx: TxIndex(i),
             position: BPosition {
                 term_id: 0,
@@ -682,6 +720,62 @@ mod engine_tests {
                 raw_tx: raw.into(),
                 sender: signer.address(),
                 tx_hash: alloy_primitives::B256::repeat_byte(i as u8 + 1),
+            },
+        }
+    }
+
+    fn call_tx(signer: &PrivateKeySigner, to: Address, nonce: u64, i: u64) -> BufferedRecord {
+        let inner = TxLegacy {
+            chain_id: Some(1),
+            nonce,
+            gas_price: 1_000_000_000,
+            gas_limit: 100_000,
+            to: TxKind::Call(to),
+            value: U256::ZERO,
+            input: Default::default(),
+        };
+        let mut m = inner;
+        let sig = signer.sign_transaction_sync(&mut m).unwrap();
+        let env: alloy_consensus::TxEnvelope = m.into_signed(sig).into();
+        let mut raw = Vec::new();
+        alloy_eips::eip2718::Encodable2718::encode_2718(&env, &mut raw);
+        BufferedRecord::Tx {
+            tx_idx: TxIndex(i),
+            position: BPosition {
+                term_id: 0,
+                term_offset: (i * 64) as i32,
+            },
+            envelope: TxEnvelope {
+                correlation_id: i,
+                raw_tx: raw.into(),
+                sender: signer.address(),
+                tx_hash: alloy_primitives::B256::repeat_byte(i as u8 + 1),
+            },
+        }
+    }
+
+    fn dep(
+        from: Address,
+        to: Option<Address>,
+        mint: u128,
+        input: Vec<u8>,
+        i: u64,
+    ) -> BufferedRecord {
+        BufferedRecord::Deposit {
+            tx_idx: TxIndex(i),
+            position: BPosition {
+                term_id: 0,
+                term_offset: (i * 64) as i32,
+            },
+            deposit: Deposit {
+                source_hash: B256::repeat_byte(0xd0u8.wrapping_add(i as u8)),
+                from,
+                to,
+                mint,
+                value: U256::ZERO,
+                gas_limit: 1_000_000,
+                is_system_transaction: false,
+                input: input.into(),
             },
         }
     }
@@ -698,57 +792,91 @@ mod engine_tests {
     }
 
     /// Build a claim index by SEQUENTIALLY executing the block through the
-    /// executor's REAL capture path (`execute_tx` → revm `Bal`), exactly as
-    /// the live executor produces claims. The first version of this fixture
-    /// hand-rolled claims from WriteSets — symmetric with a verification bug
-    /// (per-field vs whole-triple attribution), so both passed while live
-    /// traffic diverged on every transfer. The fixture and the producer must
-    /// share code, not shape.
-    fn honest_claims<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> ClaimIndex {
+    /// executor's REAL capture path (`execute_tx` / `execute_deposit_tx` →
+    /// revm `Bal`), exactly as the live executor produces claims. The first
+    /// version of this fixture hand-rolled claims from WriteSets — symmetric
+    /// with a verification bug (per-field vs whole-triple attribution), so
+    /// both passed while live traffic diverged on every transfer. The
+    /// fixture and the producer must share code, not shape.
+    fn honest_claims<S: StateDatabase>(snap: &S, records: &[BufferedRecord]) -> ClaimIndex {
         let mut bal = revm::state::bal::Bal::new();
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
-        for (i, t) in txs.iter().enumerate() {
-            let (r, ws) = execute_tx(
+        for (i, rec) in records.iter().enumerate() {
+            let (r, ws) = exec_record(
                 snap,
                 None,
                 &delta,
-                env(),
-                t.tx_idx,
-                t.position,
-                &t.envelope,
+                rec,
                 i as u64,
                 cumulative,
-                Some((&mut bal, (i + 1) as u64)),
-            )
-            .expect("seq execute");
+                Some(&mut bal),
+            );
             cumulative = r.cumulative_gas_used;
             delta.apply(ws);
         }
         ClaimIndex::from_alloy(&bal.into_alloy_bal())
     }
 
-    fn seq_delta<S: StateDatabase>(snap: &S, txs: &[BlockTx]) -> PendingDelta {
+    fn seq_delta<S: StateDatabase>(snap: &S, records: &[BufferedRecord]) -> PendingDelta {
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
-        for (i, t) in txs.iter().enumerate() {
-            let (r, ws) = execute_tx(
-                snap,
-                None,
-                &delta,
-                env(),
-                t.tx_idx,
-                t.position,
-                &t.envelope,
-                i as u64,
-                cumulative,
-                None,
-            )
-            .expect("seq execute");
+        for (i, rec) in records.iter().enumerate() {
+            let (r, ws) = exec_record(snap, None, &delta, rec, i as u64, cumulative, None);
             cumulative = r.cumulative_gas_used;
             delta.apply(ws);
         }
         delta
+    }
+
+    /// One record through the free executor path (tx or deposit), the same
+    /// producer code the live executor runs.
+    fn exec_record<S: StateDatabase>(
+        snap: &S,
+        parent: Option<&PendingDelta>,
+        delta: &PendingDelta,
+        rec: &BufferedRecord,
+        i: u64,
+        cumulative: u64,
+        bal: Option<&mut revm::state::bal::Bal>,
+    ) -> (kardamom_types::Receipt, kardamom_engine::delta::WriteSet) {
+        let bal = bal.map(|b| (b, i + 1));
+        match rec {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => execute_tx(
+                snap,
+                parent,
+                delta,
+                env(),
+                *tx_idx,
+                *position,
+                envelope,
+                i,
+                cumulative,
+                bal,
+            )
+            .expect("seq execute"),
+            BufferedRecord::Deposit {
+                tx_idx,
+                deposit,
+                position,
+            } => execute_deposit_tx(
+                snap,
+                parent,
+                delta,
+                env(),
+                *tx_idx,
+                *position,
+                deposit,
+                i,
+                cumulative,
+                bal,
+            )
+            .expect("seq deposit"),
+        }
     }
 
     /// THE parity property: parallel seeded batches must produce byte-identical
@@ -769,7 +897,7 @@ mod engine_tests {
             .build();
         // 12 txs from ONE sender: maximal conflict (each reads the balance and
         // nonce the previous tx wrote).
-        let txs: Vec<BlockTx> = (0..12).map(|i| tx(&signer, to, i, 1_000 + i, i)).collect();
+        let txs: Vec<BufferedRecord> = (0..12).map(|i| tx(&signer, to, i, 1_000 + i, i)).collect();
 
         let claims = honest_claims(&snap, &txs);
         let expected = seq_delta(&snap, &txs);
@@ -806,7 +934,7 @@ mod engine_tests {
                 alloy_primitives::KECCAK256_EMPTY,
             )
             .build();
-        let txs: Vec<BlockTx> = (0..8).map(|i| tx(&signer, to, i, 500, i)).collect();
+        let txs: Vec<BufferedRecord> = (0..8).map(|i| tx(&signer, to, i, 500, i)).collect();
 
         let mut claims = honest_claims(&snap, &txs);
         // Tamper: inflate the recipient's claimed balance at tx 6 (batch 2 of
@@ -846,28 +974,14 @@ mod engine_tests {
                 alloy_primitives::KECCAK256_EMPTY,
             )
             .build();
-        let txs: Vec<BlockTx> = (0..47).map(|i| tx(&signer, to, i, 100 + i, i)).collect();
+        let txs: Vec<BufferedRecord> = (0..47).map(|i| tx(&signer, to, i, 100 + i, i)).collect();
 
         // The executor's view: per-tx capture, then the SHARED quantize.
-        let per_tx = honest_claims(&snap, &txs);
-        let _ = &per_tx;
         let mut bal = revm::state::bal::Bal::new();
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
         for (i, t) in txs.iter().enumerate() {
-            let (r, ws) = execute_tx(
-                &snap,
-                None,
-                &delta,
-                env(),
-                t.tx_idx,
-                t.position,
-                &t.envelope,
-                i as u64,
-                cumulative,
-                Some((&mut bal, (i + 1) as u64)),
-            )
-            .expect("seq");
+            let (r, ws) = exec_record(&snap, None, &delta, t, i as u64, cumulative, Some(&mut bal));
             cumulative = r.cumulative_gas_used;
             delta.apply(ws);
         }
@@ -918,7 +1032,7 @@ mod engine_tests {
         // Block 1: nonces 0..3, executed and folded into a parent layer —
         // but NEVER committed to the snapshot (StaticSnapshotSource
         // semantics: the mock snapshot still says nonce 0).
-        let b1: Vec<BlockTx> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
+        let b1: Vec<BufferedRecord> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
         let claims1 = honest_claims(&snap, &b1);
         let out1 =
             execute_block_parallel(&snap, None, &b1, &claims1, env(), 2, 1).expect("block 1");
@@ -926,25 +1040,21 @@ mod engine_tests {
 
         // Block 2: nonces 4..7. Against the bare snapshot every tx is a
         // nonce-mismatch skip; with the parent layer they execute.
-        let b2: Vec<BlockTx> = (4..8).map(|i| tx(&signer, to, i, 100, i)).collect();
+        let b2: Vec<BufferedRecord> = (4..8).map(|i| tx(&signer, to, i, 100, i)).collect();
         // Build block-2 claims through the same capture path, WITH parent.
         let mut bal = revm::state::bal::Bal::new();
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
         for (i, t) in b2.iter().enumerate() {
-            let (r, ws) = execute_tx(
+            let (r, ws) = exec_record(
                 &snap,
                 Some(&parent),
                 &delta,
-                env(),
-                t.tx_idx,
-                t.position,
-                &t.envelope,
+                t,
                 i as u64,
                 cumulative,
-                Some((&mut bal, (i + 1) as u64)),
-            )
-            .expect("seq block 2");
+                Some(&mut bal),
+            );
             assert!(r.status, "block-2 txs must execute given the parent");
             cumulative = r.cumulative_gas_used;
             delta.apply(ws);
@@ -972,13 +1082,184 @@ mod engine_tests {
             execute_block_parallel(&snap, None, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
         assert!(out.receipts.is_empty() && out.batches == 0);
     }
+
+    /// THE deposit-emission regression: a deposit's mint MUST be claimed in
+    /// the BAL as a balance write, because later batches seed the recipient's
+    /// balance from it. Before the fix, `record_writeset_into_bal` fabricated
+    /// only a differing nonce and revm's per-FIELD classification silently
+    /// dropped the balance claim — batch 2 seeded the pre-mint balance and
+    /// every spend of minted funds diverged.
+    #[test]
+    fn deposit_mint_seeds_later_batches() {
+        let signer = PrivateKeySigner::random();
+        let d = signer.address();
+        let to = address!("00000000000000000000000000000000000000EE");
+        // D starts at ZERO balance: only the mint can fund its txs.
+        let snap = MockStateDatabase::builder()
+            .account(d, U256::ZERO, 0, alloy_primitives::KECCAK256_EMPTY)
+            .build();
+        // The CALL-type deposit bumps d's nonce to 1 (revm bumps the caller
+        // nonce for `is_call` deposits too), so the spends start at nonce 1.
+        let records: Vec<BufferedRecord> = vec![
+            dep(d, Some(to), 10u128.pow(18), Vec::new(), 0),
+            tx(&signer, to, 1, 1_000, 1),
+            tx(&signer, to, 2, 1_000, 2),
+        ];
+
+        let claims = honest_claims(&snap, &records);
+        // The mint must be visible as a balance claim at the deposit's index.
+        assert!(
+            claims.balance_seed(d, 2).is_some(),
+            "deposit mint must be claimed in the BAL (balance change at index 1)"
+        );
+        let expected = seq_delta(&snap, &records);
+
+        // batch_size 1: the spends run in batches seeded ONLY from claims.
+        let out = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+            .expect("deposit-seeded parallel block");
+        assert_eq!(out.delta.accounts, expected.accounts);
+        assert_eq!(out.delta.storage, expected.storage);
+        assert_eq!(out.batches, 3);
+        // The deposit's receipt survives the parallel path intact.
+        assert_eq!(out.receipts[0].tx_type, kardamom_types::TX_TYPE_DEPOSIT);
+        assert!(out.receipts.iter().all(|r| r.status));
+    }
+
+    /// A CREATE deposit's bytecode is a CODE claim: a later batch calling
+    /// the deposited contract must seed the BYTES, or the call no-ops
+    /// against empty code (the cross-chunk CREATE-then-CALL class, deposit
+    /// edition).
+    #[test]
+    fn create_deposit_code_seeds_later_calls() {
+        let signer = PrivateKeySigner::random();
+        let l1_sender = address!("00000000000000000000000000000000000000F1");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        // Initcode returning runtime `PUSH1 1 PUSH1 0 SSTORE STOP`: every
+        // call writes slot 0 = 1.
+        let initcode = alloy_primitives::hex::decode("656001600055006000526006601af3").unwrap();
+        // CREATE address: keccak(rlp(from, nonce=0)).
+        let contract = l1_sender.create(0);
+        let records: Vec<BufferedRecord> = vec![
+            dep(l1_sender, None, 0, initcode, 0),
+            call_tx(&signer, contract, 0, 1),
+        ];
+
+        let claims = honest_claims(&snap, &records);
+        assert!(
+            claims.code_seed(contract, 2).is_some(),
+            "CREATE deposit bytecode must be claimed in the BAL"
+        );
+        let expected = seq_delta(&snap, &records);
+        // The call's SSTORE proves it executed real code.
+        assert_eq!(
+            expected.storage.get(&(contract, B256::ZERO)),
+            Some(&U256::from(1u64)),
+            "sequential call must hit the deployed contract"
+        );
+
+        let out = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+            .expect("CREATE-deposit-seeded parallel block");
+        assert_eq!(out.delta.accounts, expected.accounts);
+        assert_eq!(out.delta.storage, expected.storage);
+        assert_eq!(out.batches, 2);
+    }
+
+    /// Deposits inside a K > 1 chunk: chunk-aligned batches with a deposit
+    /// mid-chunk verify and match sequential (the deposit's claims are
+    /// quantized through the same shared ladder as tx claims).
+    #[test]
+    fn quantized_chunk_containing_a_deposit_verifies() {
+        let signer = PrivateKeySigner::random();
+        let d = signer.address();
+        let filler = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000F2");
+        let snap = MockStateDatabase::builder()
+            .account(d, U256::ZERO, 0, alloy_primitives::KECCAK256_EMPTY)
+            .account(
+                filler.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        // Chunk 1 (K=4): 3 filler txs + the deposit at bal index 4, so the
+        // deposit is CHUNK-FINAL for d's balance — chunk 2's spends seed the
+        // mint from the deposit's claim alone, and no same-chunk tx re-claim
+        // can mask a missing deposit emission. (The CALL deposit bumps d's
+        // nonce to 1; spends run nonces 1..4.)
+        let mut records: Vec<BufferedRecord> =
+            (0..3u64).map(|i| tx(&filler, to, i, 100, i)).collect();
+        records.push(dep(d, Some(to), 10u128.pow(18), Vec::new(), 3));
+        for i in 4..8u64 {
+            records.push(tx(&signer, to, i - 3, 500, i));
+        }
+
+        // Executor view: per-record capture, then the SHARED quantize at K=4.
+        let mut bal = revm::state::bal::Bal::new();
+        let mut delta = PendingDelta::new();
+        let mut cumulative = 0u64;
+        for (i, r) in records.iter().enumerate() {
+            let (rc, ws) =
+                exec_record(&snap, None, &delta, r, i as u64, cumulative, Some(&mut bal));
+            assert!(rc.status);
+            cumulative = rc.cumulative_gas_used;
+            delta.apply(ws);
+        }
+        let expected = delta;
+        let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 4);
+        let claims = ClaimIndex::from_alloy(&quantized);
+
+        let out = execute_block_parallel(&snap, None, &records, &claims, env(), 3, 4)
+            .expect("deposit-in-chunk quantized parity");
+        assert_eq!(out.delta.accounts, expected.accounts);
+        assert_eq!(out.delta.storage, expected.storage);
+        assert_eq!(out.batches, 2, "8 records at K=4 -> 2 aligned chunks");
+    }
+
+    /// A forged claim about a DEPOSIT fails-stop like any other — deposits
+    /// get no special trust.
+    #[test]
+    fn a_forged_deposit_claim_fails_stop() {
+        let signer = PrivateKeySigner::random();
+        let d = signer.address();
+        let to = address!("00000000000000000000000000000000000000F3");
+        let snap = MockStateDatabase::builder()
+            .account(d, U256::ZERO, 0, alloy_primitives::KECCAK256_EMPTY)
+            .build();
+        let records: Vec<BufferedRecord> = vec![
+            dep(d, Some(to), 10u128.pow(18), Vec::new(), 0),
+            tx(&signer, to, 1, 1_000, 1),
+        ];
+        let mut claims = honest_claims(&snap, &records);
+        // Tamper the deposit's claimed mint (bal index 1).
+        let w = claims.balance.get_mut(&d).expect("mint claim");
+        let entry = w.iter_mut().find(|(i, _)| *i == 1).expect("index 1");
+        entry.1 += U256::from(7u64);
+
+        let err = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+            .expect_err("forged deposit claim must be caught");
+        match err {
+            ExecutorError::Divergence(msg) => {
+                assert!(msg.contains("tx 1"), "must name the producing unit: {msg}");
+                assert!(msg.contains("balance"), "must name the field: {msg}");
+            }
+            other => panic!("expected Divergence, got {other:?}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Engine strategy: what the validator hands to the exec loop
 // ---------------------------------------------------------------------------
 
-use kardamom_engine::actor::{BlockExec, BlockExecOutput, BufferedRecord};
+use kardamom_engine::actor::{BlockExec, BlockExecOutput};
 use kardamom_engine::executor::execute_deposit_tx;
 use std::sync::Arc;
 use std::time::Duration;
@@ -988,8 +1269,8 @@ use std::time::Duration;
 const CLAIM_WAIT: Duration = Duration::from_millis(250);
 
 /// Sequential re-execution of a whole block — the always-available fallback
-/// (no claims yet, or the block contains deposits, which carry no
-/// attribution). Identical semantics to the engine's streaming path.
+/// when the block's BAL claims don't arrive in time. Identical semantics to
+/// the engine's streaming path.
 pub fn execute_block_sequential<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -1045,7 +1326,7 @@ pub fn execute_block_sequential<S: StateDatabase>(
 /// (one block), self-contained, versioned by field presence.
 fn dump_divergence_inputs(
     block: u64,
-    txs: &[BlockTx],
+    records: &[BufferedRecord],
     claims: &ClaimIndex,
     parent: Option<&PendingDelta>,
     granularity: u16,
@@ -1057,14 +1338,29 @@ fn dump_divergence_inputs(
         "block": block,
         "granularity": granularity,
         "error": format!("{err:?}"),
-        "txs": txs.iter().map(|t| serde_json::json!({
-            "raw": alloy_primitives::hex::encode(&t.envelope.raw_tx),
-            "sender": format!("{:?}", t.envelope.sender),
-            "hash": format!("{:?}", t.envelope.tx_hash),
-            "correlation_id": t.envelope.correlation_id,
-            "idx": t.tx_idx.0,
-            "pos": t.position.as_index(),
-        })).collect::<Vec<_>>(),
+        "records": records.iter().map(|r| match r {
+            BufferedRecord::Tx { tx_idx, envelope, position } => serde_json::json!({
+                "kind": "tx",
+                "raw": alloy_primitives::hex::encode(&envelope.raw_tx),
+                "sender": format!("{:?}", envelope.sender),
+                "hash": format!("{:?}", envelope.tx_hash),
+                "correlation_id": envelope.correlation_id,
+                "idx": tx_idx.0,
+                "pos": position.as_index(),
+            }),
+            BufferedRecord::Deposit { tx_idx, deposit, position } => serde_json::json!({
+                "kind": "deposit",
+                "source_hash": format!("{:?}", deposit.source_hash),
+                "from": format!("{:?}", deposit.from),
+                "to": deposit.to.map(|a| format!("{a:?}")),
+                "mint": deposit.mint.to_string(),
+                "value": deposit.value.to_string(),
+                "gas_limit": deposit.gas_limit,
+                "input": alloy_primitives::hex::encode(&deposit.input),
+                "idx": tx_idx.0,
+                "pos": position.as_index(),
+            }),
+        }).collect::<Vec<_>>(),
         "claims_storage": claims.storage.iter().map(|((a, k), w)| serde_json::json!({
             "addr": format!("{a:?}"), "slot": format!("{k:?}"),
             "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
@@ -1096,9 +1392,11 @@ fn dump_divergence_inputs(
 }
 
 /// Build the validator's whole-block execution strategy: seeded parallel
-/// batches when this block's BAL claims are available and it contains only
-/// transactions; sequential otherwise. Deposits fall back because EIP-7928
-/// attribution covers transaction execution, not L1-derived credits.
+/// batches when this block's BAL claims arrive in time; sequential
+/// otherwise. Deposits participate like transactions — the executor
+/// captures their writes into the BAL at their block index (mint as a
+/// balance claim, CREATE bytecode as a code claim), so deposit-containing
+/// blocks validate in parallel too.
 pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
     claims: Arc<crate::ClaimBuffer>,
     batch_size: usize,
@@ -1109,10 +1407,7 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
               records: &[BufferedRecord],
               env: ExecEnv,
               block: u64| {
-            let tx_only = records
-                .iter()
-                .all(|r| matches!(r, BufferedRecord::Tx { .. }));
-            if !tx_only || records.is_empty() {
+            if records.is_empty() {
                 return execute_block_sequential(snapshot, parent, records, env);
             }
             let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
@@ -1120,25 +1415,10 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                 tracing::debug!(block, "no BAL claims in time; sequential re-execution");
                 return execute_block_sequential(snapshot, parent, records, env);
             };
-            let txs: Vec<BlockTx> = records
-                .iter()
-                .map(|r| match r {
-                    BufferedRecord::Tx {
-                        tx_idx,
-                        envelope,
-                        position,
-                    } => BlockTx {
-                        tx_idx: *tx_idx,
-                        position: *position,
-                        envelope: envelope.clone(),
-                    },
-                    BufferedRecord::Deposit { .. } => unreachable!("tx_only checked above"),
-                })
-                .collect();
             let out = match execute_block_parallel(
                 snapshot,
                 parent,
-                &txs,
+                records,
                 &idx,
                 env,
                 batch_size,
@@ -1150,7 +1430,7 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                     // deterministic but has resisted offline modelling
                     // (the composition sweep passes). Dump the exact
                     // inputs so the failing block replays as a unit test.
-                    dump_divergence_inputs(block, &txs, &idx, parent, granularity, &e);
+                    dump_divergence_inputs(block, records, &idx, parent, granularity, &e);
                     return Err(e);
                 }
             };

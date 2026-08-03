@@ -214,6 +214,41 @@ parallelism from "ordered waves" to "fully independent execution":
    than discovering truth. The executor has no claims to seed from —
    executor-side parallelism remains a Block-STM problem, out of scope.
 
+## Deposits are claims too
+
+Every state transition is emitted as BAL claims — deposits included.
+The executor's streaming path captures a deposit's write set into the
+block Bal at its block index (`tx_index_in_block + 1`, the same index
+space as txs), via the synthetic `record_writeset_into_bal` path. Because
+revm classifies changes per FIELD against an `original` value, and the
+synthetic path only knows post-values, the fabricated original must
+differ in every field a later batch may seed from: nonce and balance
+always (the MINT is a balance claim), code when the deposit deployed it
+(a CREATE deposit's bytecode is a code claim, same class as the
+cross-chunk CREATE-then-CALL divergence). The first version fabricated
+only the nonce and per-field classification silently dropped the mint —
+nothing consumed deposit claims then, so it was latent.
+
+The validator executes deposit records inside seeded batches through
+`execute_deposit_tx` with the SAME capture handle (symmetric
+construction), folds the deposit's writes into the batch scope, and
+verifies its claims at the producing unit like any tx. Blocks containing
+deposits validate fully in parallel; the sequential path remains only as
+the claims-timeout fallback.
+
+## Granularity policy: K=20 to run, K=1 to debug
+
+Production runs `KARDAMOM_BAL_GRANULARITY=20` (chunk-collapsed claims,
+chunk-level verification). K>1 verification is deliberately coarse: an
+intra-chunk divergence on a slot re-written later in the same chunk is
+invisible to the chunk-final comparison (the receipt `write_set_hash`
+check is the per-tx backstop). When validating that executor and
+validator produce the SAME behavior — reproducing a divergence, chasing
+a receipt-wsh mismatch, qualifying an engine change — redeploy with
+granularity 1: claims become per-tx, verification runs at every tx
+through the exact capture path, and the flight recorder dump names the
+first diverging transaction instead of a 20-tx chunk.
+
 ## Rollout
 
 1. **Capture + publish** (executor): V2 frames via the publisher thread
