@@ -39,16 +39,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # rusteron's build.rs compiles the Aeron C library with -march=native;
-      # those objects land in target/ and travel in the rust cache. GitHub's
-      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
-      # microarchitecture SIGILLs (exit 132) when restored on an older one —
-      # observed as a 6/7-shard wave of sequencers crash-looping with empty
-      # stderr the moment they touched Aeron. Key the cache by CPU model so
-      # native objects never cross microarchitectures.
+      # rusteron's build.rs compiles the Aeron C library with -march=native
+      # (hardcoded, no opt-out); those objects land in target/ and travel in
+      # the rust cache. GitHub's runner fleet is CPU-heterogeneous, so a cache
+      # populated on a wider-ISA VM SIGILLs (exit 132, empty stderr) when
+      # restored on a narrower one — observed as multi-shard waves of
+      # sequencers crash-looping the moment they touched Aeron. Key the cache
+      # by the CPU's feature-flag set so native objects never cross ISAs.
       - name: CPU microarch cache key
         id: cpukey
-        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+        # Key by the CPUID FEATURE FLAGS, not the model name: hypervisors mask
+        # feature bits per VM independently of the brand string, and the reroll
+        # SIGILL'd again on a full-match model-name cache (host runnervmvrwv9
+        # reports the same model as the fleet but a narrower ISA). The flags
+        # line is exactly the surface -march=native compiles against.
+        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
@@ -67,16 +72,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # rusteron's build.rs compiles the Aeron C library with -march=native;
-      # those objects land in target/ and travel in the rust cache. GitHub's
-      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
-      # microarchitecture SIGILLs (exit 132) when restored on an older one —
-      # observed as a 6/7-shard wave of sequencers crash-looping with empty
-      # stderr the moment they touched Aeron. Key the cache by CPU model so
-      # native objects never cross microarchitectures.
+      # rusteron's build.rs compiles the Aeron C library with -march=native
+      # (hardcoded, no opt-out); those objects land in target/ and travel in
+      # the rust cache. GitHub's runner fleet is CPU-heterogeneous, so a cache
+      # populated on a wider-ISA VM SIGILLs (exit 132, empty stderr) when
+      # restored on a narrower one — observed as multi-shard waves of
+      # sequencers crash-looping the moment they touched Aeron. Key the cache
+      # by the CPU's feature-flag set so native objects never cross ISAs.
       - name: CPU microarch cache key
         id: cpukey
-        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+        # Key by the CPUID FEATURE FLAGS, not the model name: hypervisors mask
+        # feature bits per VM independently of the brand string, and the reroll
+        # SIGILL'd again on a full-match model-name cache (host runnervmvrwv9
+        # reports the same model as the fleet but a narrower ISA). The flags
+        # line is exactly the surface -march=native compiles against.
+        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
@@ -95,16 +105,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # rusteron's build.rs compiles the Aeron C library with -march=native;
-      # those objects land in target/ and travel in the rust cache. GitHub's
-      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
-      # microarchitecture SIGILLs (exit 132) when restored on an older one —
-      # observed as a 6/7-shard wave of sequencers crash-looping with empty
-      # stderr the moment they touched Aeron. Key the cache by CPU model so
-      # native objects never cross microarchitectures.
+      # rusteron's build.rs compiles the Aeron C library with -march=native
+      # (hardcoded, no opt-out); those objects land in target/ and travel in
+      # the rust cache. GitHub's runner fleet is CPU-heterogeneous, so a cache
+      # populated on a wider-ISA VM SIGILLs (exit 132, empty stderr) when
+      # restored on a narrower one — observed as multi-shard waves of
+      # sequencers crash-looping the moment they touched Aeron. Key the cache
+      # by the CPU's feature-flag set so native objects never cross ISAs.
       - name: CPU microarch cache key
         id: cpukey
-        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+        # Key by the CPUID FEATURE FLAGS, not the model name: hypervisors mask
+        # feature bits per VM independently of the brand string, and the reroll
+        # SIGILL'd again on a full-match model-name cache (host runnervmvrwv9
+        # reports the same model as the fleet but a narrower ISA). The flags
+        # line is exactly the surface -march=native compiles against.
+        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
@@ -123,16 +138,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
-      # rusteron's build.rs compiles the Aeron C library with -march=native;
-      # those objects land in target/ and travel in the rust cache. GitHub's
-      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
-      # microarchitecture SIGILLs (exit 132) when restored on an older one —
-      # observed as a 6/7-shard wave of sequencers crash-looping with empty
-      # stderr the moment they touched Aeron. Key the cache by CPU model so
-      # native objects never cross microarchitectures.
+      # rusteron's build.rs compiles the Aeron C library with -march=native
+      # (hardcoded, no opt-out); those objects land in target/ and travel in
+      # the rust cache. GitHub's runner fleet is CPU-heterogeneous, so a cache
+      # populated on a wider-ISA VM SIGILLs (exit 132, empty stderr) when
+      # restored on a narrower one — observed as multi-shard waves of
+      # sequencers crash-looping the moment they touched Aeron. Key the cache
+      # by the CPU's feature-flag set so native objects never cross ISAs.
       - name: CPU microarch cache key
         id: cpukey
-        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+        # Key by the CPUID FEATURE FLAGS, not the model name: hypervisors mask
+        # feature bits per VM independently of the brand string, and the reroll
+        # SIGILL'd again on a full-match model-name cache (host runnervmvrwv9
+        # reports the same model as the fleet but a narrower ISA). The flags
+        # line is exactly the surface -march=native compiles against.
+        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
