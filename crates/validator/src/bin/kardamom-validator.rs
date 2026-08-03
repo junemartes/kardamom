@@ -42,6 +42,10 @@ use kardamom_validator::{
     BalBuffer, Divergence, ReceiptBuffer, ValidatorReceiptSink, ValidatorWriterQueue, metrics,
 };
 
+/// Marker file in the state dir: a checkpoint was adopted and the trie
+/// bootstrap has not yet committed. See the adoption block in `main`.
+const ADOPTION_MARKER: &str = ".adopted-needs-trie-bootstrap";
+
 /// Top-level config the `kardamom-validator` binary deserializes from
 /// `--config`. Same `[cluster]` section shape as the executor's.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -91,6 +95,19 @@ struct Args {
     /// State durability mode.
     #[arg(long, value_enum, default_value_t = StateDurabilityArg::Durable)]
     state_durability: StateDurabilityArg,
+    /// Local checkpoint staging dir for the replay-unavailable fallback
+    /// (#143): peer checkpoints are fetched here and adopted on the next
+    /// start. The validator never CREATES checkpoints (its state is derived);
+    /// this is an adoption-only dir.
+    #[arg(long, env = "KARDAMOM_CHECKPOINT_DIR")]
+    checkpoint_dir: Option<PathBuf>,
+    /// Executor checkpoint-serve addresses (`host:port`, comma-separated) to
+    /// fetch from when the cluster refuses replay (cursor below the retention
+    /// floor). Blocks through an adopted checkpoint are UNVERIFIED by this
+    /// validator — the same trust class as #78 catch-up; the trustless
+    /// alternative is rebuild-from-L1 (kardamom-reconstruct).
+    #[arg(long, env = "KARDAMOM_CHECKPOINT_PEERS", value_delimiter = ',')]
+    checkpoint_peers: Vec<String>,
     /// Enable the state-trie shadow-check: every N blocks, recompute the world
     /// state root by full rebuild and fail-stop on mismatch with the incremental
     /// walker (a canary against trie bugs). Absent ⇒ incremental only; `1` ⇒
@@ -199,6 +216,47 @@ async fn main() -> Result<()> {
     // --- State backend + crash-recovery decision (mirrors the executor). ---
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
 
+    // Checkpoint adoption, cold-start half (#143): a fresh validator joining
+    // a chain that outgrew the cluster retention window can NOT re-execute
+    // from genesis (REPLAY_FROM(genesis) is refused), so adopt the newest
+    // staged/peer checkpoint BEFORE opening the env — startup then resumes
+    // from its cursor and only the tail replays. Blocks through the adopted
+    // checkpoint are UNVERIFIED by this validator (trust class of #78
+    // catch-up); the trustless alternative is rebuild-from-L1.
+    if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
+        let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
+            .context("probe validator state dir")?;
+        if fresh {
+            let mut local =
+                kardamom_state::latest_checkpoint(ckpt_dir).context("scan checkpoint dir")?;
+            if local.is_none() && !args.checkpoint_peers.is_empty() {
+                local = kardamom_state::fetch_best_checkpoint(&args.checkpoint_peers, ckpt_dir, 1);
+            }
+            if let Some(ckpt) = local {
+                let block = kardamom_state::restore_checkpoint(&ckpt.path, &args.state_dir)
+                    .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
+                // Adoption is recorded EXPLICITLY: executor checkpoints carry
+                // the genesis-seeded mirror + trie (built for every env by
+                // seed_genesis, then never updated by the trie-off writer),
+                // so a "trie present?" probe passes on an image whose trie is
+                // frozen at genesis — and the incremental walker would extend
+                // that stale base into silently wrong roots the shadow-check
+                // cannot catch (it rebuilds from the SAME stale mirror).
+                // Caught by the validator-join chaos case's non-vacuity grep.
+                // The marker survives a crash between restore and bootstrap;
+                // the bootstrap below is idempotent.
+                std::fs::write(args.state_dir.join(ADOPTION_MARKER), b"")
+                    .context("write adoption marker")?;
+                tracing::info!(
+                    restored_block = block,
+                    checkpoint = %ckpt.path.display(),
+                    "adopted state from checkpoint (UNVERIFIED through this block); \
+                     will re-execute + verify the tail from here"
+                );
+            }
+        }
+    }
+
     let env = StateEnvBuilder::new(&args.state_dir)
         .durability(args.state_durability.into())
         .open()
@@ -279,8 +337,25 @@ async fn main() -> Result<()> {
     let claims = kardamom_validator::ClaimBuffer::new();
     let receipts = ReceiptBuffer::new();
 
-    // tx_bal: per-block BlockDelta (BAL). Simple (multicast/IPC) subscription.
+    // tx_bal: per-block BlockDelta (BAL). Simple (multicast/IPC) subscription,
+    // wrapped in a SILENCE WATCHDOG (#144): a multicast image that never
+    // joins (or silently dies) starves verification while everything else
+    // works — observed as `validator_blocks_verified_total == 0` for a whole
+    // run. Executors publish one BAL per committed block (empty blocks
+    // included), so 60s of silence on a progressing chain is a dead
+    // subscription, not an idle one: drop it and reopen. On a genuinely idle
+    // cluster the reopen is a harmless no-op churn.
+    //
+    // The pump holds an AeronRuntime clone (needed to reopen), which is the
+    // documented SIGTERM-deadlock trap (see the tx_receipts comment below):
+    // the runtime only shuts down when its last clone drops. Hence the 5s
+    // wake tick + `bal_pump_stop`, set BEFORE the main path drops `rt`, so
+    // this task releases its clone within one tick and graceful shutdown
+    // completes.
+    let bal_pump_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
+        const BAL_TICK: Duration = Duration::from_secs(5);
+        const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
         // BalFrame (spec: bal-attribution-parallel-validation): V1 carries
         // the merged delta alone; V2 adds the EIP-7928 access list. The
         // write-set cross-check consumes the merged section either way —
@@ -293,8 +368,46 @@ async fn main() -> Result<()> {
             .context("open tx_bal subscription")?;
         let bals = bals.clone();
         let claims_sub = claims.clone();
+        let bal_rt = rt.clone();
+        let bal_channel = channels.tx_bal_channel.clone();
+        let bal_stream_id = channels.tx_bal_stream_id;
+        let stop = bal_pump_stop.clone();
         tokio::spawn(async move {
-            while let Some((_pos, frame)) = bal_rx.recv().await {
+            let mut silent_for = Duration::ZERO;
+            loop {
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    return; // release the runtime clone promptly on shutdown
+                }
+                let frame = match tokio::time::timeout(BAL_TICK, bal_rx.recv()).await {
+                    Ok(Some((_pos, frame))) => {
+                        silent_for = Duration::ZERO;
+                        frame
+                    }
+                    Ok(None) => return, // runtime shutting down
+                    Err(_) => {
+                        silent_for += BAL_TICK;
+                        if silent_for >= BAL_SILENCE_REOPEN {
+                            silent_for = Duration::ZERO;
+                            metrics::counter_bal_sub_reopen();
+                            tracing::warn!(
+                                silence_s = BAL_SILENCE_REOPEN.as_secs(),
+                                "tx_bal silent — reopening the subscription \
+                                 (never-joined or dead multicast image, #144)"
+                            );
+                            match bal_rt.open_subscription::<kardamom_types::BalFrame>(
+                                &bal_channel,
+                                bal_stream_id,
+                            ) {
+                                Ok(rx) => bal_rx = rx,
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "tx_bal reopen failed; retrying after the next window"
+                                ),
+                            }
+                        }
+                        continue;
+                    }
+                };
                 if let kardamom_types::BalFrame::V2 {
                     bal_rlp,
                     granularity,
@@ -380,6 +493,28 @@ async fn main() -> Result<()> {
         Some(every_n) => TrieMode::ShadowCheck { every_n },
         None => TrieMode::Incremental,
     };
+    // Adopted executor checkpoints carry a trie FROZEN AT GENESIS (seeded
+    // into every env, never updated by the trie-off writer) — so adoption is
+    // signaled by the explicit marker, not a presence probe, and the
+    // bootstrap rebuilds the mirror + trie from the plain state tables
+    // wholesale. Idempotent and crash-safe (one RW txn; the marker is
+    // removed only after commit). `has_trie` remains as a belt-and-braces
+    // net for a truly mirror-less image (e.g. an operator-copied dir).
+    let adoption_marker = args.state_dir.join(ADOPTION_MARKER);
+    if adoption_marker.exists() || !kardamom_state::has_trie(&env).context("probe state trie")? {
+        tracing::info!("adopted state image — bootstrapping hashed mirror + trie");
+        let started = std::time::Instant::now();
+        let root = kardamom_state::bootstrap_trie_from_state(&env)
+            .context("bootstrap trie from adopted state")?;
+        tracing::info!(
+            state_root = %root,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "trie bootstrap complete"
+        );
+        if adoption_marker.exists() {
+            std::fs::remove_file(&adoption_marker).context("clear adoption marker")?;
+        }
+    }
     let writer =
         StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
@@ -538,22 +673,23 @@ async fn main() -> Result<()> {
         }
         res = &mut join => Some(res),
     };
+    bal_pump_stop.store(true, std::sync::atomic::Ordering::SeqCst);
     drop(rt);
     drop(cluster_guard);
     let joined = match engine_result {
         Some(r) => r,
         None => join.await,
     };
-    let mut engine_error = false;
+    let mut engine_error: Option<Option<ExecutorError>> = None;
     match joined {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "validator main loop returned an error");
-            engine_error = true;
+            engine_error = Some(Some(e));
         }
         Err(e) => {
             tracing::error!(error = %e, "validator task panicked");
-            engine_error = true;
+            engine_error = Some(None);
         }
     }
     if let Err(e) = writer.shutdown() {
@@ -570,7 +706,70 @@ async fn main() -> Result<()> {
         }
         std::process::exit(2);
     }
-    if engine_error {
+    if let Some(cause) = engine_error {
+        // Replay-window overrun: repair BEFORE exiting, exactly like the
+        // executor's recovery-D path (#94) — fetch a peer checkpoint at/above
+        // the retention floor and park the stale DB, so the next restart takes
+        // the ordinary fresh-start restore path instead of a deterministic
+        // crash loop re-requesting the same refused REPLAY_FROM (#143).
+        // Adoption trust class: the adopted state is unverified BY THIS
+        // validator through the checkpoint block — the same accepted tradeoff
+        // as #78's BAL catch-up; the divergence latch only ever covers blocks
+        // this validator actually verified. The trustless alternative remains
+        // kardamom-reconstruct (rebuild-from-L1) into --state-dir.
+        if let Some(ExecutorError::ClusterReplayUnavailable {
+            from_index,
+            oldest_index,
+            oldest_block,
+        }) = &cause
+        {
+            let oldest_block = *oldest_block;
+            tracing::warn!(
+                from_index,
+                oldest_index,
+                oldest_block,
+                "cluster replay unavailable — attempting peer-checkpoint fallback"
+            );
+            match (
+                args.checkpoint_dir.as_ref(),
+                args.checkpoint_peers.is_empty(),
+            ) {
+                (Some(ckpt_dir), false) => {
+                    match kardamom_state::fetch_best_checkpoint(
+                        &args.checkpoint_peers,
+                        ckpt_dir,
+                        oldest_block,
+                    ) {
+                        Some(ckpt) => {
+                            kardamom_state::park_state_db(&args.state_dir)
+                                .context("park stale validator state DB")?;
+                            metrics::resync_counter("peer-checkpoint").increment(1);
+                            tracing::info!(
+                                checkpoint_block = ckpt.block,
+                                "resync prepared: peer checkpoint staged, stale state \
+                                 parked; restart will adopt it (blocks through the \
+                                 checkpoint are UNVERIFIED by this validator)"
+                            );
+                        }
+                        None => {
+                            metrics::resync_counter("unrecoverable").increment(1);
+                            tracing::error!(
+                                oldest_block,
+                                "resync fallback failed: no peer checkpoint at or above \
+                                 the retention floor — operator action required (restore \
+                                 a checkpoint into --checkpoint-dir, or rebuild-from-L1 \
+                                 with kardamom-reconstruct into --state-dir)"
+                            );
+                        }
+                    }
+                }
+                _ => tracing::error!(
+                    "resync fallback unavailable (--checkpoint-dir/--checkpoint-peers \
+                     not configured) — operator action required (rebuild-from-L1 with \
+                     kardamom-reconstruct, or restore a peer checkpoint manually)"
+                ),
+            }
+        }
         tracing::error!(
             "validator halted on an engine error (NOT a proven divergence); if the \
              cluster refused replay (resync required), rebuild state via \

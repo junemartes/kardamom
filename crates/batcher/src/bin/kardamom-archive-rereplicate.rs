@@ -61,12 +61,23 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if cli.diff {
-        let diverged = diff_mirror(&cli.source_dir, &cli.dest_dir).context("diff mirror")?;
-        for name in &diverged {
+        let diff = diff_mirror(&cli.source_dir, &cli.dest_dir).context("diff mirror")?;
+        for name in &diff.diverged {
             println!("{name}");
         }
-        println!("diverged segments={}", diverged.len());
-        if !diverged.is_empty() {
+        // Dest-only segments (recording ids the mirror never opened — daemon
+        // restart / post-restore sessions, issue #126) are a divergence the
+        // mirror CANNOT vouch for, and --heal cannot repair them from this
+        // source; tagged so scripted callers can tell the two classes apart.
+        for name in &diff.dest_only {
+            println!("{name} dest-only (no source counterpart; unhealable from this mirror)");
+        }
+        println!(
+            "diverged segments={} dest-only={}",
+            diff.diverged.len(),
+            diff.dest_only.len()
+        );
+        if !diff.is_clean() {
             std::process::exit(3);
         }
         return Ok(());
@@ -74,7 +85,18 @@ fn main() -> anyhow::Result<()> {
 
     if cli.heal {
         let segments = if cli.segments.is_empty() {
-            diff_mirror(&cli.source_dir, &cli.dest_dir).context("detect diverging segments")?
+            // Auto-detect heals only what the mirror can vouch for; dest-only
+            // segments have no source bytes to copy and are reported by
+            // --diff instead.
+            let diff =
+                diff_mirror(&cli.source_dir, &cli.dest_dir).context("detect diverging segments")?;
+            if !diff.dest_only.is_empty() {
+                tracing::warn!(
+                    dest_only = diff.dest_only.len(),
+                    "destination has segments with no mirror counterpart; not healable from this source (see --diff)"
+                );
+            }
+            diff.diverged
         } else {
             cli.segments.clone()
         };

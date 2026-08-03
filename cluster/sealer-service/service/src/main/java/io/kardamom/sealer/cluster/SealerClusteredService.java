@@ -580,16 +580,25 @@ public final class SealerClusteredService implements ClusteredService {
             return;
         }
         long served = 0;
+        long dropped = 0;
         for (final RetainedFrame f : retained) {
             final boolean wanted = f.boundary ? f.key >= fromBlock : f.key >= fromIndex;
             if (wanted) {
-                offerBytesToSession(session, f.frame);
-                served++;
+                // Count DELIVERED frames, not attempted ones: an offer into a
+                // closed/back-pressured session returns false, and pretending
+                // it was "served" made a wholesale-dropped replay look
+                // identical to a successful one in these logs (issue #141).
+                if (offerBytesToSession(session, f.frame)) {
+                    served++;
+                } else {
+                    dropped++;
+                }
             }
         }
         System.out.println("cluster REPLAY memberId=" + memberId
             + " session=" + session.id() + " from=(" + fromIndex + "," + fromBlock
-            + ") served=" + served + " retained=" + retained.size());
+            + ") served=" + served + " dropped=" + dropped
+            + " retained=" + retained.size());
         offerControl(session, EGRESS_KIND_REPLAY_DONE, state.canonicalCount(), state.blockNumber());
     }
 
@@ -735,22 +744,36 @@ public final class SealerClusteredService implements ClusteredService {
      * the F07.5 terminal-result close (a MAX_POSITION_EXCEEDED egress is
      * permanently dead; returning silently would leave a zombie session).
      */
-    private void offerBytesToSession(final ClientSession session, final byte[] frame) {
+    private boolean offerBytesToSession(final ClientSession session, final byte[] frame) {
         final UnsafeBuffer buf = new UnsafeBuffer(frame);
         final long deadline = System.nanoTime() + OFFER_DEADLINE_NS;
         long result;
         do {
             result = session.offer(buf, 0, frame.length);
             if (result >= 0) {
-                return;
+                return true;
             }
             if (!retryable(result)) {
                 if (result != Publication.CLOSED) {
-                    session.close();
+                    closeSessionLoudly(session, "terminal offer result " + result);
                 }
-                return;
+                return false;
             }
         } while (System.nanoTime() < deadline);
+        closeSessionLoudly(session, "offer deadline exhausted (back-pressure)");
+        return false;
+    }
+
+    /**
+     * Close a session AND say so on stdout. The SessionEvent(CLOSED) the
+     * consensus module emits for the client travels over the very egress
+     * publication that just failed, so the client plausibly never hears it
+     * (its liveness watchdog is what actually recovers it) — this line is
+     * then the only durable record of WHY the session died (issue #141).
+     */
+    private void closeSessionLoudly(final ClientSession session, final String reason) {
+        System.out.println("cluster EGRESS-CLOSE memberId=" + memberId
+            + " session=" + session.id() + " reason=" + reason);
         session.close();
     }
 
@@ -770,15 +793,17 @@ public final class SealerClusteredService implements ClusteredService {
                 // zombie kept alive by ingress keep-alives while every frame
                 // for it is dropped.
                 if (result != Publication.CLOSED) {
-                    session.close();
+                    closeSessionLoudly(session, "terminal offer result " + result);
                 }
                 return;
             }
         } while (System.nanoTime() < deadline);
         // Deadline exhausted on persistent back-pressure: this session's
         // subscriber has stopped draining. Close it rather than drop frames —
-        // a closed session is a fact the client sees; a gap is silent corruption.
-        session.close();
+        // a gap is silent corruption. NOTE the close EVENT may never reach
+        // the client (it rides the same wedged egress); the client's
+        // delivered-frame liveness watchdog is the recovery path.
+        closeSessionLoudly(session, "offer deadline exhausted (back-pressure)");
     }
 
     /** Whether a negative offer result is retryable within the deadline. */

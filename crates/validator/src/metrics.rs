@@ -36,6 +36,25 @@ pub fn describe() {
     );
 }
 
+pub const RESYNC_TOTAL: &str = "validator_resync_total";
+pub const BAL_SUB_REOPEN_TOTAL: &str = "validator_bal_sub_reopen_total";
+
+/// Replay-window-overrun resync outcomes (#143), labeled
+/// `outcome=peer-checkpoint|unrecoverable` — the validator twin of
+/// `kardamom_executor_resync_total`. Any `peer-checkpoint` increment also
+/// means blocks through the adopted checkpoint are UNVERIFIED by this
+/// validator (same trust class as #78 catch-up).
+pub fn resync_counter(outcome: &'static str) -> metrics::Counter {
+    metrics::counter!(RESYNC_TOTAL, "outcome" => outcome)
+}
+
+/// tx_bal subscription reopened after prolonged silence (#144) — a never-
+/// joined or silently-dead multicast image self-healing. Sustained growth
+/// means BAL delivery to this node is genuinely broken.
+pub fn counter_bal_sub_reopen() {
+    metrics::counter!(BAL_SUB_REOPEN_TOTAL).increment(1);
+}
+
 pub fn counter_divergence() {
     metrics::counter!(DIVERGENCE_TOTAL).increment(1);
 }

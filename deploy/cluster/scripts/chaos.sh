@@ -375,6 +375,111 @@ run_validator_lapse() {
     log "validator-lapse PASS (newborn): crash-only recovery verified — fresh process verifying live (verified=${vf1}, lag $(( e_now - v1 ))), 0 divergences (bal_missing not comparable across restart; catch-up commits the freeze backlog unverified by design, #78)"
   fi
 }
+
+# validator-join (#143): a FRESH validator joining a chain already in
+# progress. Stop the running validator, wipe its state + checkpoint staging,
+# and let Nomad restart it with nothing: the newborn must ADOPT an executor
+# peer checkpoint (the cold-start half of the replay-unavailable fallback),
+# bootstrap the hashed mirror + trie from that trie-off image, catch up to
+# the live head, and RESUME VERIFIED execution with zero divergences —
+# proving both sync and state correctness (the divergence latch re-executes
+# and cross-checks every post-join block against the executors' BAL +
+# receipts, and the MPT root advancing proves the bootstrapped trie is
+# coherent). Executors checkpoint every 20s from bring-up, so a peer
+# checkpoint always exists; the adoption log grep keeps the case
+# non-vacuous — a genesis-replay join would NOT print it.
+run_validator_join() {
+  local inner
+  inner="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
+  [ -n "${inner}" ] || fail "validator-join: no inner validator container on ${VALIDATOR_NODE}"
+
+  # Warm up: the chain must be far enough along that adoption skips real work,
+  # and the pre-join validator must be verifying live so the case-end state
+  # ("verifying again") is meaningful.
+  local t=0 vprev=-1 v_now e_now verified warmed=0
+  while [ "${t}" -lt 150 ]; do
+    verified="$(val_metric validator_blocks_verified_total)"; verified="${verified:-0}"
+    v_now="$(val_metric validator_committed_block)"; v_now="${v_now:-0}"
+    e_now="$(executor_progress || echo 0)"
+    if [ "${verified}" -gt 0 ] && [ "${verified}" -gt "${vprev}" ] \
+       && [ "${v_now}" -gt 0 ] && [ $(( e_now - v_now )) -le 15 ]; then
+      warmed=1
+      break
+    fi
+    vprev="${verified}"; sleep 6; t=$(( t + 6 ))
+  done
+  [ "${warmed}" -eq 1 ] \
+    || fail "validator-join: cluster never warmed up within ${t}s (verified=${verified} block=${v_now} exec=${e_now})"
+  log "validator-join: warmed up (verified=${verified} block=${v_now} exec=${e_now}); wiping the validator for a fresh join"
+
+  # Container NAMES survive a task restart (task-<alloc-id>), so newborn
+  # identity is the docker StartedAt timestamp — the validator-lapse case's
+  # lesson, relearned on this case's first CI run (sync succeeded, the
+  # name-based newborn detection never fired).
+  local started0
+  started0="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${inner}" 2>/dev/null || true)"
+
+  # Kill, then wipe inside the restart delay (the job's restart stanza waits
+  # 15s before the replacement container starts — the wipe wins the race, and
+  # a wipe-first order would race the LIVE mdbx instead).
+  docker exec "${VALIDATOR_NODE}" docker kill "${inner}" >/dev/null \
+    || fail "validator-join: kill failed"
+  timeout 15 docker exec "${VALIDATOR_NODE}" sh -c \
+      'rm -rf /opt/kardamom/state/validator /opt/kardamom/checkpoints/*' \
+    || fail "validator-join: state wipe failed"
+  log "validator-join: validator killed, state + checkpoint staging wiped"
+
+  # The newborn must appear, ADOPT a peer checkpoint, catch up, and verify.
+  local deadline=$(( $(date +%s) + 240 )) newborn="" joined=0 vf1=0 v1=0
+  while [ "$(date +%s)" -lt "${deadline}" ]; do
+    if [ -z "${newborn}" ]; then
+      local cur started1
+      cur="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
+      if [ -n "${cur}" ]; then
+        started1="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${cur}" 2>/dev/null || true)"
+        if [ -n "${started1}" ] && [ "${started1}" != "${started0}" ]; then
+          newborn="${cur}"
+          log "validator-join: newborn container ${newborn} up (started ${started1})"
+        fi
+      fi
+    fi
+    vf1="$(val_metric validator_blocks_verified_total)"; vf1="${vf1:-0}"
+    v1="$(val_metric validator_committed_block)"; v1="${v1:-0}"
+    e_now="$(executor_progress || echo 0)"
+    if [ -n "${newborn}" ] && [ "${vf1}" -gt 0 ] && [ "${v1}" -gt 0 ] \
+       && [ $(( e_now - v1 )) -le 25 ]; then
+      joined=1
+      break
+    fi
+    sleep 10
+  done
+  if [ "${joined}" -ne 1 ]; then
+    val_debug
+    fail "validator-join: fresh validator not verifying + caught up within 240s (newborn=${newborn:-none}, verified=${vf1}, block=${v1}, exec=${e_now})"
+  fi
+
+  # Non-vacuity: the join must have gone through ADOPTION (the #143 path),
+  # incl. the trie bootstrap of the trie-off executor image — a genesis
+  # replay would satisfy the sync asserts without exercising either.
+  local nlogs
+  nlogs="$(timeout 20 docker exec "${VALIDATOR_NODE}" docker logs "${newborn}" 2>&1 | tail -400 || true)"
+  echo "${nlogs}" | grep -q "adopted state from checkpoint" \
+    || { val_debug; fail "validator-join: newborn did not adopt a peer checkpoint (genesis replay? peers unreachable?)"; }
+  echo "${nlogs}" | grep -q "trie bootstrap complete" \
+    || { val_debug; fail "validator-join: adopted state but no trie bootstrap ran (trie-off image not detected?)"; }
+
+  # State correctness: zero divergences across the whole join (the latch
+  # covers every post-join block the validator actually verified), and the
+  # MPT root observation must be advancing (the bootstrapped trie is live).
+  local div root_blk
+  div="$(val_metric validator_divergence_total)"; div="${div:-0}"
+  [ "${div}" -eq 0 ] || { val_debug; fail "validator-join: ${div} divergence(s) after join"; }
+  root_blk="$(val_metric validator_state_root_block)"; root_blk="${root_blk:-0}"
+  [ "${root_blk}" -gt 0 ] \
+    || { val_debug; fail "validator-join: no MPT state-root observation after join (trie dead?)"; }
+  log "validator-join PASS: fresh validator adopted a peer checkpoint, bootstrapped the trie, caught up (lag $(( e_now - v1 ))), verifying live (verified=${vf1}), root observed at block ${root_blk}, 0 divergences"
+}
+
 # sequencer-lapse case: PAUSE one racing replica of shard 0 (seq-a on
 # kardamom-sequencer-0) for a window under pinned shard-0 load, then resume.
 # The twin (seq-b, other node) keeps ordering — the pipeline must never
@@ -1300,6 +1405,17 @@ run_case() { # <case-name>
           'ls -S /opt/kardamom/archive/dir/*.rec 2>/dev/null | head -6'); do
         cand_name="$(basename "${cand}")"
         cand_rid="${cand_name%%-*}"
+        # #126: recording ids are per-archive counters, so the victim's
+        # post-restart/post-restore sessions (archive-driver-loss and
+        # archive-tx-data-wipe both run earlier in this shard) own ids the
+        # mirror never opened. A victim-only segment is unhealable from the
+        # mirror BY CONSTRUCTION — no source bytes exist — so it cannot
+        # drill the detect→heal loop; only candidates present on BOTH
+        # archives qualify. (--diff now surfaces such segments as
+        # "dest-only" instead of silently skipping them.)
+        if ! docker exec kardamom-ingress-1 test -f "/opt/kardamom/archive/dir/${cand_name}" 2>/dev/null; then
+          continue
+        fi
         cand_out="$(docker exec kardamom-ingress-0 bash -lc \
           "docker run --rm -v /opt/kardamom/archive:/opt/kardamom/archive --entrypoint java ${aeron_img} \
            --add-opens java.base/java.util.zip=ALL-UNNAMED \
@@ -1515,6 +1631,14 @@ print(best + 40 if best >= 0 else -1)
       # anything that aged out. All validator-specific asserts live in the
       # helper.
       run_validator_lapse
+      ;;
+
+    validator-join)
+      # Fresh validator joins the running chain mid-run: wipe + restart, must
+      # adopt an executor peer checkpoint (#143 cold-start half, incl. the
+      # trie bootstrap), catch up, and resume VERIFIED execution with zero
+      # divergences. All asserts in the helper.
+      run_validator_join
       ;;
 
     sequencer-lapse)
