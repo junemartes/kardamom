@@ -8,9 +8,22 @@ source perf/alloc-baselines.env
 
 run() { # <name> <dir> <test> <env...>
   local name=$1 dir=$2 test=$3; shift 3
+  local raw="/tmp/alloc-gate-$name.log"
+  # Keep the FULL cargo output (stderr included): a compile or runtime
+  # failure must be printed, never swallowed — the first version piped
+  # stderr to /dev/null and a broken build failed the job with zero output.
+  if ! (cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture) >"$raw" 2>&1; then
+    echo "== $name: HARNESS FAILED (cargo test exit != 0); last 40 lines:"
+    tail -40 "$raw"
+    return 1
+  fi
   local out
-  out=$(cd "$dir" && env "$@" cargo test --test "$test" --release -- --ignored --nocapture 2>/dev/null \
-        | grep -E "allocs/(tx|op)|bytes/(tx|op)|wall/(tx|op)")
+  out=$(grep -E "allocs/(tx|op)|bytes/(tx|op)|wall/(tx|op)" "$raw" || true)
+  if [[ -z "$out" ]]; then
+    echo "== $name: NO MEASUREMENT LINES in harness output; last 40 lines:"
+    tail -40 "$raw"
+    return 1
+  fi
   echo "== $name"; echo "$out"
   local allocs bytes
   allocs=$(echo "$out" | grep -E "allocs" | grep -oE "[0-9]+\.?[0-9]*" | head -1)
