@@ -497,6 +497,21 @@ if [[ -x "${LOAD_BIN}" ]]; then
       --senders "${LOAD_SENDERS:-6}" --sender-offset 1 --assert-all-delivered \
       --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
       --scrape executor,ingress,sequencer --output /tmp/kardamom-load.json
+
+    # DeFi stage: CLOB + swap-pool + vault mix (contracts deployed by the
+    # harness from its first sender). Contract-shaped gas + write sets —
+    # exercises the BAL attribution + parallel-validation path under
+    # realistic storage churn, reported gas-centrically (Mgas/s). Fresh
+    # nonces continue from the transfer stage via --nonce-start probing:
+    # kardamom-load starts at 0, so this stage uses DIFFERENT senders
+    # (offset past the transfer stage's) to keep nonce bookkeeping trivial.
+    log "load test: kardamom-load DEFI stage (duration=${DEFI_DURATION_S:-45}s target=${DEFI_TARGET_TPS:-150}tps)"
+    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 \
+      --workload defi \
+      --duration "${DEFI_DURATION_S:-45}s" --target-tps "${DEFI_TARGET_TPS:-150}" \
+      --senders "${DEFI_SENDERS:-6}" --sender-offset "$((1 + ${LOAD_SENDERS:-6}))" \
+      --assert-all-delivered --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
+      --scrape executor,ingress,sequencer --output /tmp/kardamom-load-defi.json
   else
     log "RUN_LOAD=0 — skipping sustained-load stage (chaos-only shard)"
   fi

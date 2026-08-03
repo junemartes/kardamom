@@ -365,6 +365,21 @@ pub struct ValidatorWriterQueue<Q: StateWriterQueue> {
     bals: Arc<BalBuffer>,
     divergence: Arc<Divergence>,
     wait: Duration,
+    /// Highest block already submitted THIS process lifetime. A cluster
+    /// SESSION replay (lapse + reconnect, no restart) re-delivers blocks
+    /// the validator already executed; re-execution against
+    /// already-applied state yields empty deltas that cannot match the
+    /// BAL — same false-divergence class as the restart cascade, session
+    /// flavor.
+    high_water: u64,
+    /// Blocks at or below this were DURABLY VERIFIED before a restart.
+    /// Crash-recovery replays them for state reconstruction, but
+    /// re-execution against already-applied state yields EMPTY deltas
+    /// (every tx skips as nonce-too-low) — comparing those against
+    /// retained BAL frames produced FALSE divergences that cascaded:
+    /// each fail-stop restart re-entered replay and diverged again,
+    /// turning any transient stall into a permanent restart loop.
+    verify_floor: u64,
 }
 
 impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
@@ -374,7 +389,19 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
             bals,
             divergence,
             wait: BAL_WAIT,
+            verify_floor: 0,
+            high_water: 0,
         }
+    }
+
+    /// Skip BAL verification for blocks at or below `floor` (the recovery
+    /// resume point): they were verified before the restart, and replay
+    /// re-execution against already-applied state legitimately produces
+    /// deltas that cannot match the BAL.
+    #[must_use]
+    pub fn with_verify_floor(mut self, floor: u64) -> Self {
+        self.verify_floor = floor;
+        self
     }
 
     #[cfg(test)]
@@ -386,6 +413,16 @@ impl<Q: StateWriterQueue> ValidatorWriterQueue<Q> {
 
 impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
+        if block.block_number <= self.verify_floor || block.block_number <= self.high_water {
+            tracing::debug!(
+                block = block.block_number,
+                floor = self.verify_floor,
+                high_water = self.high_water,
+                "replay overlap; BAL verification skipped (already verified)"
+            );
+            return self.inner.submit(block, delta);
+        }
+        self.high_water = block.block_number;
         match self.bals.take(block.block_number, self.wait) {
             Some(bal) => {
                 if write_set_eq(&delta, &bal) {
@@ -424,7 +461,7 @@ impl<Q: StateWriterQueue> StateWriterQueue for ValidatorWriterQueue<Q> {
 /// missing claim index degrades to sequential re-execution, never to a
 /// verification gap.
 pub struct ClaimBuffer {
-    core: KeyedBuffer<u64, std::sync::Arc<crate::parallel::ClaimIndex>>,
+    core: KeyedBuffer<u64, (u16, std::sync::Arc<crate::parallel::ClaimIndex>)>,
 }
 
 impl Default for ClaimBuffer {
@@ -440,8 +477,12 @@ impl ClaimBuffer {
         Arc::new(Self::default())
     }
 
-    pub fn insert(&self, block: u64, claims: crate::parallel::ClaimIndex) {
-        self.core.insert(block, std::sync::Arc::new(claims));
+    /// Insert a block's claims WITH the granularity the frame declared —
+    /// the validator's view of the ladder must come from the wire (what the
+    /// executor actually produced), never from local config.
+    pub fn insert(&self, block: u64, granularity: u16, claims: crate::parallel::ClaimIndex) {
+        self.core
+            .insert(block, (granularity, std::sync::Arc::new(claims)));
     }
 
     /// Take `block`'s claims, waiting up to `timeout`. `None` ⇒ the caller
@@ -450,7 +491,7 @@ impl ClaimBuffer {
         &self,
         block: u64,
         timeout: Duration,
-    ) -> Option<std::sync::Arc<crate::parallel::ClaimIndex>> {
+    ) -> Option<(u16, std::sync::Arc<crate::parallel::ClaimIndex>)> {
         self.core.take(block, timeout)
     }
 }

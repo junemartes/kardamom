@@ -56,51 +56,7 @@ const RETENTION_BLOCKS: usize = 256;
 /// to the same item collapse to the chunk-final value. Applied to the
 /// exported alloy BAL so the wire artifact matches what the validator will
 /// verify against at that granularity.
-fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::BlockAccessList {
-    if k <= 1 {
-        return bal;
-    }
-    let k = u64::from(k);
-    let chunk = |i: u64| if i == 0 { 0 } else { i.div_ceil(k) };
-    let mut out = bal;
-    for acct in out.iter_mut() {
-        for slot in acct.storage_changes.iter_mut() {
-            let mut seen: std::collections::BTreeMap<u64, usize> = Default::default();
-            let mut kept: Vec<alloy_eip7928::StorageChange> =
-                Vec::with_capacity(slot.changes.len());
-            for c in slot.changes.iter() {
-                let ci = chunk(c.block_access_index);
-                match seen.get(&ci) {
-                    // Later write in the same chunk wins (chunk-final value).
-                    Some(&pos) => {
-                        kept[pos] = alloy_eip7928::StorageChange {
-                            block_access_index: ci,
-                            new_value: c.new_value,
-                        }
-                    }
-                    None => {
-                        seen.insert(ci, kept.len());
-                        kept.push(alloy_eip7928::StorageChange {
-                            block_access_index: ci,
-                            new_value: c.new_value,
-                        });
-                    }
-                }
-            }
-            slot.changes = kept;
-        }
-        for c in acct.balance_changes.iter_mut() {
-            c.block_access_index = chunk(c.block_access_index);
-        }
-        for c in acct.nonce_changes.iter_mut() {
-            c.block_access_index = chunk(c.block_access_index);
-        }
-        for c in acct.code_changes.iter_mut() {
-            c.block_access_index = chunk(c.block_access_index);
-        }
-    }
-    out
-}
+use kardamom_engine::bal_ladder::quantize;
 
 /// Copy bytes into the aligned buffer the publish API expects.
 fn aligned(bytes: &[u8]) -> rkyv::util::AlignedVec {
@@ -189,12 +145,28 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
         // Ack'd delivery with a bounded deadline. Retained regardless of
         // live-delivery outcome: retention IS the durability path (a
         // validator that was down catches up from the ring).
+        //
+        // NOT_CONNECTED is TERMINAL, not retried: it means no subscriber
+        // exists right now (e.g. a validator-less stack), and spinning the
+        // full deadline on every frame capped this pump's drain rate at
+        // 2 frames/s — below the local 250ms block cadence — so the
+        // bounded exec→pump handoff filled and BLOCKED THE EXEC THREAD,
+        // delaying every receipt behind it (S4's -32000 park timeouts;
+        // chain-semantics red). The frame still lands in the retention
+        // ring either way; only BACK_PRESSURED-class transients are worth
+        // the bounded retry.
         let deadline = Instant::now() + PUBLISH_DEADLINE;
         let mut outcome = "ok";
         loop {
             match pubh.publish_bytes(aligned(&bytes)) {
                 Ok(_) => break,
                 Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("NOT_CONNECTED") {
+                        tracing::debug!(block, "BAL: no subscriber; frame retained for replay");
+                        outcome = "not_connected";
+                        break;
+                    }
                     if Instant::now() >= deadline {
                         tracing::warn!(block, error = %e, "BAL live publish deadline exhausted; frame retained for replay");
                         outcome = "deadline";

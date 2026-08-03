@@ -46,7 +46,15 @@ pub async fn publish_corrupt_bal(aeron_dir: &Path, blocks: Vec<u64>) -> Result<(
                     code: vec![],
                     receipts: vec![],
                 };
-                let bytes = kardamom_log::codec::encode(&delta).context("encode corrupt BAL")?;
+                // The CURRENT tx_bal wire type: a bare BlockDelta stopped
+                // decoding when the versioned BalFrame wrapper landed — the
+                // frames failed rkyv validation at the subscription layer and
+                // never reached the cross-check, so the drill silently
+                // stopped drilling (S7 red). The corruption must be
+                // SEMANTIC (wrong values in a structurally valid frame);
+                // structural garbage only tests the codec.
+                let bytes = kardamom_log::codec::encode(&kardamom_types::BalFrame::V1(delta))
+                    .context("encode corrupt BAL")?;
                 bal_pub.publish_best_effort(bytes);
             }
             // Spread the rounds (~3s total) so at least one frame lands while

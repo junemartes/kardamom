@@ -54,7 +54,6 @@ use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::exec_types::{CMessage, TxIndex};
 use crate::executor::execute_deposit_tx;
-use crate::executor::execute_tx;
 use crate::reader::{
     DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
     TxDataSubscription, TxOrderingSubscription, spawn_tx_data_reader, spawn_tx_deposits_reader,
@@ -210,8 +209,21 @@ pub struct BlockExecOutput {
 /// verifier) makes the exec thread BUFFER a block's records and execute
 /// them together at the boundary — which is what allows batches to run
 /// concurrently, seeded from BAL claims.
+/// (snapshot, PARENT LAYER, records, env, block_number). The parent layer
+/// is the actor's merged not-yet-durable writes — the depth-K commit
+/// pipeline lets execution run up to K blocks ahead of fsync, so the
+/// snapshot alone can be K blocks STALE. Ignoring it executes against old
+/// state: under load the validator skipped txs (nonce mismatch) the
+/// executor had executed, a proven divergence in the first DeFi gate.
 pub type BlockExec<D> = Box<
-    dyn Fn(&D, &[BufferedRecord], ExecEnv, u64) -> Result<BlockExecOutput, ExecutorError> + Send,
+    dyn Fn(
+            &D,
+            Option<&PendingDelta>,
+            &[BufferedRecord],
+            ExecEnv,
+            u64,
+        ) -> Result<BlockExecOutput, ExecutorError>
+        + Send,
 >;
 
 /// Internal envelope routed from exec → commit thread.
@@ -243,7 +255,7 @@ impl Executor {
     /// `recovery` is the archive-backed join-miss refetch factory (see
     /// [`crate::reader::JoinRecovery`]); `None` keeps the plain bounded join.
     #[allow(clippy::too_many_arguments)] // 10 args is the natural shape of the
-    // executor's run-once API; see the long-form note in [`execute_tx`]
+    // executor's run-once API; see the long-form note in [`crate::executor::execute_tx`]
     // for the same rationale applied to per-tx execution.
     pub fn run<C, S, Q, P>(
         cfg: ExecutorConfig,
@@ -439,6 +451,13 @@ where
             // Whole-block buffer, used only when a block-exec strategy is
             // supplied (validator parallel path).
             let mut buffered: Vec<BufferedRecord> = Vec::new();
+            // Per-BLOCK execution scope (streaming path): one EVM + one
+            // commit-into cache for the whole block — the per-tx
+            // construction was ~90% of execution-path allocation. Dropped
+            // at each boundary; rebuilt lazily at the block's first tx
+            // (seeded with parent + whatever the live delta already holds,
+            // e.g. deposits that landed before the first tx).
+            let mut scope: Option<crate::executor::ExecScope<S::Db>> = None;
             let mut parent: Option<PendingDelta> = None;
             let mut inflight: std::collections::VecDeque<(BlockBoundary, PendingDelta)> =
                 std::collections::VecDeque::new();
@@ -494,10 +513,40 @@ where
             let tx_applied_error =
                 metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error");
 
+            // How long an IDLE exec thread waits before probing the writer
+            // for settled in-flight commits. Settling used to happen only at
+            // the NEXT boundary — correct under sustained load (a boundary
+            // per tick), but on an idle tail the last ≤K blocks' boundary
+            // closeouts never published: ingress watermarks stalled (S4's
+            // -32000), executor/validator never converged on a drain (S6/S9),
+            // and the attester never covered the final blocks (S2) — the
+            // chain-semantics suite went red from the day the pipeline
+            // landed (#129) while the constantly-loaded cluster shards
+            // stayed green. Under load the timeout never fires (records
+            // arrive faster); when idle the probe is a cheap non-blocking
+            // read.
+            const IDLE_SETTLE_PROBE: Duration = Duration::from_millis(25);
             loop {
-                let msg = match rx.recv() {
-                    Ok(m) => m,
-                    Err(_) => {
+                enum Recv {
+                    Msg(ReaderToExec),
+                    IdleProbe,
+                    Closed,
+                }
+                let got = if inflight.is_empty() {
+                    match rx.recv() {
+                        Ok(m) => Recv::Msg(m),
+                        Err(_) => Recv::Closed,
+                    }
+                } else {
+                    match rx.recv_timeout(IDLE_SETTLE_PROBE) {
+                        Ok(m) => Recv::Msg(m),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => Recv::IdleProbe,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Recv::Closed,
+                    }
+                };
+                let msg = match got {
+                    Recv::Msg(m) => m,
+                    Recv::Closed => {
                         // Clean end of stream: settle every in-flight commit
                         // so the final boundaries aren't silently dropped.
                         if let Some((last, _)) = inflight.back() {
@@ -509,6 +558,57 @@ where
                             }
                         }
                         return Ok(());
+                    }
+                    Recv::IdleProbe => {
+                        // Settle ONLY at a block edge: with a block OPEN
+                        // (scope materialized / records buffered), the live
+                        // ExecScope's cache is seeded against the CURRENT
+                        // snapshot ∘ parent — swapping the snapshot and
+                        // rebuilding parent under it mid-block mixes read
+                        // bases and diverges execution (caught by the load
+                        // shard's validator divergence latch on the first
+                        // soak of this probe). Between blocks — the idle-tail
+                        // case this probe exists for — both are empty, and a
+                        // mid-block gap simply defers to the next boundary's
+                        // sweep exactly as before the probe existed.
+                        if scope.is_some() || !buffered.is_empty() {
+                            continue;
+                        }
+                        // Same non-blocking settle sweep as the boundary arm,
+                        // minus the full-depth blocking wait (an idle probe
+                        // must never park).
+                        let durable = sw_signal.committed()?;
+                        let mut newest_settled = None;
+                        while inflight
+                            .front()
+                            .is_some_and(|(b, _)| b.block_number <= durable)
+                        {
+                            let (b, _) = inflight.pop_front().expect("front checked");
+                            metrics::gauge!(crate::metrics::BLOCK_NUMBER)
+                                .set(b.block_number as f64);
+                            newest_settled = Some(b.block_number);
+                            if tx.send(ExecToCommit::Boundary(b)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        if let Some(n) = newest_settled {
+                            debug!(
+                                target: "executor",
+                                durable,
+                                through_block = n,
+                                unsettled = inflight.len(),
+                                "pipelined commits settled on idle probe; snapshot swapped"
+                            );
+                            snapshot = snapshots.snapshot_after(n);
+                            parent = inflight.iter().fold(None, |acc, (_, d)| match acc {
+                                None => Some(d.clone()),
+                                Some(mut m) => {
+                                    m.merge_from(d);
+                                    Some(m)
+                                }
+                            });
+                        }
+                        continue;
                     }
                 };
                 match msg {
@@ -541,11 +641,19 @@ where
                             l2_timestamp: current_l2_ts,
                         };
                         let apply_start = Instant::now();
-                        let result = execute_tx(
-                            &snapshot,
-                            parent.as_ref(),
-                            &delta,
-                            env,
+                        let sc = match scope.as_mut() {
+                            Some(sc) => sc,
+                            None => {
+                                let mut sc = crate::executor::ExecScope::new(
+                                    snapshots.snapshot_after(current_block.saturating_sub(1)),
+                                    parent.as_ref(),
+                                    env,
+                                )?;
+                                sc.seed_layer(&delta)?;
+                                scope.insert(sc)
+                            }
+                        };
+                        let result = sc.execute_tx(
                             tx_idx,
                             position,
                             &envelope,
@@ -623,6 +731,14 @@ where
                                 .as_ref()
                                 .map(|_| (&mut block_bal, tx_index_in_block + 1)),
                         );
+                        // Deposits run outside the scope (rare, own commit
+                        // semantics) — fold their writes into the block
+                        // cache so later txs in this block observe them.
+                        if let (Some(sc), Ok((_, ws))) = (scope.as_mut(), &result) {
+                            let mut layer = PendingDelta::new();
+                            layer.apply(ws.clone());
+                            sc.seed_layer(&layer)?;
+                        }
                         if result.is_ok() {
                             tx_applied_ok.increment(1);
                         } else {
@@ -741,7 +857,13 @@ where
                                 l2_timestamp: current_l2_ts,
                             };
                             let apply_start = Instant::now();
-                            let out = exec_block(&snapshot, &buffered, env, block_number)?;
+                            let out = exec_block(
+                                &snapshot,
+                                parent.as_ref(),
+                                &buffered,
+                                env,
+                                block_number,
+                            )?;
                             *block_apply_elapsed.get_or_insert(Duration::ZERO) +=
                                 apply_start.elapsed();
                             buffered.clear();
@@ -785,6 +907,13 @@ where
                         // tx_receipts is AT-LEAST-ONCE and every consumer
                         // must dedup on `tx_idx` (ingress does).
                         let pending = std::mem::take(&mut delta);
+                        // The block's execution scope dies with the block:
+                        // the NEXT block gets a new parent layer and block
+                        // env, and (when commits settled) a fresh snapshot.
+                        // Dropping here is unconditional — a scope reused
+                        // across a boundary would execute against the
+                        // previous block's parent and env.
+                        scope = None;
                         // EIP-7928 handoff: move the block's Bal + a
                         // receipts-free copy of the merged delta to the
                         // publisher thread (encode + reliable delivery live
@@ -792,11 +921,31 @@ where
                         // the publisher is gone mid-shutdown — not fatal.
                         if let Some(btx) = bal_tx.as_ref() {
                             let bal_delta = pending.clone().finalize(block_number, Vec::new());
-                            let _ = btx.send((
+                            // try_send: the BAL handoff must NEVER block
+                            // execution — a slow/stuck publisher pump once
+                            // back-pressured this thread through the bounded
+                            // channel and delayed every receipt behind it
+                            // (S4). A dropped frame costs one block of BAL
+                            // retention (that block verifies as bal_missing,
+                            // the tolerated path); a stalled exec thread
+                            // costs the chain.
+                            match btx.try_send((
                                 boundary.clone(),
                                 bal_delta,
                                 std::mem::take(&mut block_bal),
-                            ));
+                            )) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        block = block_number,
+                                        "BAL handoff full; dropping this block's frame \
+                                         (publisher pump stalled?)"
+                                    );
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    // Publisher gone mid-shutdown — not fatal.
+                                }
+                            }
                         }
                         match parent.as_mut() {
                             Some(m) => m.merge_from(&pending),
@@ -1268,10 +1417,166 @@ mod exec_tests {
         assert_eq!(writer_log.lock().unwrap().len(), 6, "all deltas submitted");
     }
 
+    /// Idle-tail settling (the #129 regression that turned chain-semantics
+    /// red): in-flight commits below depth K must settle and forward their
+    /// boundaries WITHOUT any further input on the reader channel — via the
+    /// idle probe — once the writer reports them durable. Before the probe,
+    /// settling only happened at the NEXT boundary, so an idle chain's last
+    /// ≤K boundary closeouts never published (stalled ingress watermarks,
+    /// executor/validator drains that never converged, uncovered attester
+    /// blocks).
+    #[test]
+    fn exec_settles_inflight_commits_while_idle() {
+        let snap = MockStateDatabase::builder().build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let blocking_waits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
+
+        // Three boundaries — BELOW depth K, so nothing blocks and, with a
+        // writer stuck at 0, nothing settles either. The channel stays OPEN:
+        // no end-of-stream drain can rescue them.
+        for n in 1..=3u64 {
+            tx_r2e
+                .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                    block_number: n,
+                    end_tx_idx: pos(0),
+                    l2_timestamp: 1_700_000_000 + n,
+                }))
+                .unwrap();
+        }
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            StagedCommit {
+                durable: durable.clone(),
+                blocking_waits: blocking_waits.clone(),
+            },
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+            None,
+            None,
+        );
+
+        // The writer catches up on its own; the exec thread must notice via
+        // the idle probe and forward all three boundaries, with NO blocking
+        // wait and NO further reader input.
+        durable.store(3, std::sync::atomic::Ordering::SeqCst);
+        let mut boundaries = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while boundaries.len() < 3 && std::time::Instant::now() < deadline {
+            match rx_e2c.recv_timeout(Duration::from_millis(100)) {
+                Ok(ExecToCommit::Boundary(b)) => boundaries.push(b.block_number),
+                Ok(ExecToCommit::Receipt(_)) => panic!("no receipts in this scenario"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(
+            boundaries,
+            vec![1, 2, 3],
+            "idle probe must settle + forward in-flight boundaries without further input"
+        );
+        assert_eq!(
+            blocking_waits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an idle probe must never park"
+        );
+
+        drop(tx_r2e);
+        h.join().expect("no panic").expect("exec ok");
+    }
+
     /// End-to-end through the ACTOR: with a BAL channel attached, the
     /// handoff at each boundary must carry a POPULATED Bal. Live phase-1
     /// measurement produced 1-byte (empty) BALs while deltas were 76KB —
     /// direct `execute_tx` tests passed, so the gap is in this wiring.
+    /// Scope-cache visibility across record kinds: a DEPOSIT credits an
+    /// account mid-block; a LATER TX in the same block spends that credit.
+    /// The deposit runs outside the ExecScope (own commit semantics), so
+    /// its writes are folded into the scope cache explicitly — this test
+    /// pins that fold. Without it the spend is an insufficient-funds skip.
+    #[test]
+    fn deposit_credit_is_visible_to_later_txs_in_the_block() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("00000000000000000000000000000000000BEEF0");
+        // The sender does NOT exist pre-block: only the deposit funds it.
+        let snap = MockStateDatabase::builder().build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(64);
+
+        tx_r2e
+            .send(ReaderToExec::Deposit {
+                tx_idx: TxIndex(0),
+                deposit: kardamom_types::Deposit {
+                    source_hash: alloy_primitives::B256::repeat_byte(0x11),
+                    from,
+                    to: Some(from),
+                    mint: 10u128.pow(18),
+                    value: U256::ZERO,
+                    gas_limit: 100_000,
+                    is_system_transaction: false,
+                    input: Default::default(),
+                },
+                position: pos(0),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(1),
+                envelope: legacy(&signer, to, 1, 1_000),
+                position: pos(64),
+            })
+            .unwrap();
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(2),
+                l2_timestamp: 1_700_000_000,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+            None,
+            None,
+        );
+        h.join().expect("no panic").expect("exec ok");
+
+        // The transfer must have EXECUTED (status true), not skipped for
+        // missing funds: the deposit's credit reached the scope cache.
+        let mut saw_transfer_success = false;
+        while let Ok(msg) = rx_e2c.try_recv() {
+            if let ExecToCommit::Receipt(r) = msg
+                && r.tx_idx == pos(64)
+            {
+                assert!(
+                    r.status,
+                    "transfer after same-block deposit must execute: {r:?}"
+                );
+                assert!(r.gas_used > 0);
+                saw_transfer_success = true;
+            }
+        }
+        assert!(saw_transfer_success, "transfer receipt not observed");
+    }
+
     #[test]
     fn exec_handoff_carries_a_populated_bal() {
         let signer = PrivateKeySigner::random();

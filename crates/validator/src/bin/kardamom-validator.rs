@@ -313,15 +313,14 @@ async fn main() -> Result<()> {
                         // claims (the parallel path short-circuits before
                         // its take), so inserting them would grow the
                         // buffer for the whole idle period — the cursor
-                        // only advances on takes. Quantized frames
-                        // (granularity > 1) are also skipped: per-tx
-                        // verification against chunk-collapsed claims
-                        // would false-diverge; those blocks validate
-                        // sequentially until ladder-aware verification
-                        // lands.
-                        Ok(bal) if !bal.is_empty() && *granularity == 1 => {
+                        // only advances on takes. Quantized frames carry
+                        // their granularity so verification coarsens to
+                        // the chunk with batches aligned to it — the
+                        // validator's ladder view always follows the wire.
+                        Ok(bal) if !bal.is_empty() => {
                             claims_sub.insert(
                                 delta.block_number,
+                                *granularity,
                                 kardamom_validator::parallel::ClaimIndex::from_alloy(&bal),
                             );
                         }
@@ -389,7 +388,12 @@ async fn main() -> Result<()> {
         MdbxWriterQueue::new(writer.delta_tx.clone()),
         bals.clone(),
         divergence.clone(),
-    );
+    )
+    // Blocks at or below the recovery resume point were verified before
+    // the restart; replay re-execution against already-applied state
+    // yields empty deltas that CANNOT match the BAL — comparing them
+    // produced false-divergence restart cascades.
+    .with_verify_floor(recovery.last_committed_block);
 
     // L1 output attester: enabled only when the three flags are all present.
     // (Runs inside this tokio runtime; the task lives as long as a handle

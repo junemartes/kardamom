@@ -57,7 +57,22 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
 
     // Freeze the executor; inject corrupt BALs for the validator's next few
     // blocks (within the backlog lookbehind — see the module docs).
-    let committed = t.validator_metric(super::VALIDATOR_COMMITTED_BLOCK).await? as u64;
+    //
+    // Polled, not single-shot: the committed-block gauge is set by an async
+    // snapshot poller and can lag the FIRST verified block by a beat since
+    // the #129 pipeline let verification run ahead of the durable commit.
+    let committed = poll_until(
+        "validator committed gauge",
+        Duration::from_secs(10),
+        Duration::from_millis(200),
+        || async {
+            Ok(t.validator_metric(super::VALIDATOR_COMMITTED_BLOCK)
+                .await
+                .ok()
+                .filter(|v| *v > 0.0))
+        },
+    )
+    .await? as u64;
     stack.suspend_executor();
     let targets: Vec<u64> = (committed + 1..=committed + 8).collect();
     inject::publish_corrupt_bal(&stack.aeron_dir(), targets)

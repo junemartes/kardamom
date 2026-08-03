@@ -87,6 +87,10 @@ struct Args {
     /// per-tx eth_getTransactionReceipt re-fetch (halves HTTP request load).
     #[arg(long, default_value_t = false)]
     feed_confirm: bool,
+    /// Workload family: plain transfers or the DeFi mix (CLOB + swap pool
+    /// + vault) with gas-centric reporting.
+    #[arg(long, default_value = "transfers", value_parser = clap::builder::ValueParser::new(|s: &str| s.parse::<kardamom_bench::load::Workload>().map_err(|e| e.to_string())))]
+    workload: kardamom_bench::load::Workload,
 
     #[arg(long = "retry-submit", default_value_t = 2)]
     retry_submit: u32,
@@ -181,6 +185,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let cfg = LoadConfig {
+        workload: args.workload,
         rpc: args.rpc,
         chain_id: args.chain_id,
         duration: args.duration,

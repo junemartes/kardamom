@@ -37,6 +37,30 @@ pub struct SnapshotRef<'a, S: StateDatabase> {
     pub inner: &'a S,
 }
 
+/// Owned variant of [`SnapshotRef`]: [`ExecScope`] must be storable across
+/// the actor's loop iterations, so it owns its snapshot (`S` can still be a
+/// `&T` via the blanket `StateDatabase for &T` impl).
+pub struct SnapshotDb<S: StateDatabase> {
+    pub inner: S,
+}
+
+impl<S: StateDatabase> DatabaseRef for SnapshotDb<S> {
+    type Error = StateRefError;
+
+    fn basic_ref(&self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        SnapshotRef { inner: &self.inner }.basic_ref(address)
+    }
+    fn code_by_hash_ref(&self, code_hash: B256) -> Result<Bytecode, Self::Error> {
+        SnapshotRef { inner: &self.inner }.code_by_hash_ref(code_hash)
+    }
+    fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
+        SnapshotRef { inner: &self.inner }.storage_ref(address, index)
+    }
+    fn block_hash_ref(&self, number: u64) -> Result<B256, Self::Error> {
+        SnapshotRef { inner: &self.inner }.block_hash_ref(number)
+    }
+}
+
 impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
     type Error = StateRefError;
 
@@ -132,6 +156,236 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
     }
 }
 
+/// Per-BLOCK execution scope: ONE `CacheDB` (layered over
+/// `parent ∘ snapshot`) that revm COMMITS into after each tx, and ONE EVM
+/// instance whose tx-env is swapped per transaction.
+///
+/// This replaces the old per-tx construction, which DHAT measured at ~90%
+/// of all execution-path allocation (421KB/tx): eight 32KB interpreter
+/// stacks per tx (the EVM rebuilt per call) plus a rehash storm from
+/// re-seeding the whole block delta into a fresh cache for every tx. The
+/// per-tx `delta` seeding disappears entirely — the committed cache IS the
+/// intra-block view; `PendingDelta` remains the boundary/BAL artifact,
+/// maintained by the caller exactly as before.
+///
+/// The free [`execute_tx`] wrapper (one scope per call) keeps the old
+/// signature for replay and tests; hot paths hold a scope per block
+/// (executor) or per batch (validator).
+pub struct ExecScope<S: StateDatabase> {
+    evm: revm::handler::MainnetEvm<
+        revm::context::Context<
+            revm::context::BlockEnv,
+            revm::context::TxEnv,
+            revm::context::CfgEnv,
+            CacheDB<SnapshotDb<S>>,
+        >,
+    >,
+    env: ExecEnv,
+}
+
+impl<S: StateDatabase> ExecScope<S> {
+    /// Build the block's scope: cache seeded with the PARENT layer only
+    /// (fixed for the whole block), EVM constructed once.
+    pub fn new(
+        snapshot: S,
+        parent: Option<&PendingDelta>,
+        env: ExecEnv,
+    ) -> Result<Self, ExecutorError> {
+        let cache: CacheDB<SnapshotDb<S>> = CacheDB::new(SnapshotDb { inner: snapshot });
+        let evm = Context::mainnet()
+            .with_db(cache)
+            .with_block(env.block_env())
+            .with_cfg(env.cfg_env())
+            .build_mainnet();
+        let mut scope = Self { evm, env };
+        if let Some(layer) = parent {
+            scope.seed_layer(layer)?;
+        }
+        Ok(scope)
+    }
+
+    /// Seed a delta layer into the block cache (later seeds overwrite).
+    /// Used for the parent layer at construction and by the compatibility
+    /// wrapper for a caller-maintained live delta.
+    pub fn seed_layer(&mut self, layer: &PendingDelta) -> Result<(), ExecutorError> {
+        let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
+        for (addr, (nonce, balance, code_hash)) in &layer.accounts {
+            let code = layer
+                .code
+                .get(code_hash)
+                .cloned()
+                .filter(|b| !b.is_empty())
+                .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
+            cache.insert_account_info(
+                *addr,
+                AccountInfo {
+                    balance: *balance,
+                    nonce: *nonce,
+                    code_hash: *code_hash,
+                    account_id: None,
+                    code,
+                },
+            );
+        }
+        for ((addr, key), value) in &layer.storage {
+            let u_key = U256::from_be_bytes::<32>(key.0);
+            cache
+                .insert_account_storage(*addr, u_key, *value)
+                .map_err(|e| ExecutorError::State(format!("seed layer storage: {e:?}")))?;
+        }
+        Ok(())
+    }
+
+    pub fn execute_tx(
+        &mut self,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        // EIP-7928 capture: see the free `execute_tx`.
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
+        // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
+        // invalid — undecodable bytes, or a tx revm rejects at validation
+        // (NonceTooLow duplicate past every dedup layer, NonceTooHigh from a
+        // sealed gap, insufficient balance, …) — must NOT halt execution: every
+        // replica, the recovery replay, and the validator all see the same input
+        // and would all halt in lockstep, permanently (a poisoned log wedges
+        // recovery replay on the same record forever). Instead it is SKIPPED with
+        // a receipt: `status=false, gas_used=0` — unreachable by real execution,
+        // since any executed tx (revert or halt included) charges at least
+        // intrinsic gas — so the pair is the wire-visible skip marker
+        // ([`kardamom_types::Receipt::is_invalid_skip`]). The skip is part of the
+        // deterministic state transition (empty write set, no state change,
+        // counters advance), identical across live / replay / validator re-exec.
+        // Non-deterministic failures (Database errors) still fail-stop below.
+        // A skip is LOUD: any occurrence means an upstream guard failed
+        // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
+        let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
+            Ok(env_) => env_,
+            Err(e) => {
+                return Ok(invalid_skip(
+                    &format!("undecodable raw_tx: {e}"),
+                    tx_position,
+                    inbound_envelope,
+                    0,
+                    None,
+                    self.env.block_number,
+                    tx_index_in_block,
+                    cumulative_gas_used_before,
+                ));
+            }
+        };
+        let signer = inbound_envelope.sender; // trusted from proxy; no recovery
+        let nonce = alloy_env.nonce();
+        let to = alloy_env.to();
+        // Effective gas price mirrors the value `tx_env_from_alloy` feeds revm:
+        // legacy/2930 `gas_price` when present, otherwise the 1559/4844
+        // `max_fee_per_gas` cap. v0 has basefee = 0 so the cap is what's paid.
+        let effective_gas_price = alloy_env
+            .gas_price()
+            .unwrap_or_else(|| alloy_env.max_fee_per_gas());
+
+        let tx_env = tx_env_from_alloy(&alloy_env, signer);
+        let outcome = match self.evm.transact(tx_env) {
+            Ok(o) => o,
+            // Deterministic input-invalidity: every replica computes the same
+            // rejection from the same (state, tx) — skip, never halt (#92).
+            Err(revm::context::result::EVMError::Transaction(reason)) => {
+                return Ok(invalid_skip(
+                    &format!("{reason:?}"),
+                    tx_position,
+                    inbound_envelope,
+                    nonce,
+                    to,
+                    self.env.block_number,
+                    tx_index_in_block,
+                    cumulative_gas_used_before,
+                ));
+            }
+            Err(revm::context::result::EVMError::Header(reason)) => {
+                return Ok(invalid_skip(
+                    &format!("{reason:?}"),
+                    tx_position,
+                    inbound_envelope,
+                    nonce,
+                    to,
+                    self.env.block_number,
+                    tx_index_in_block,
+                    cumulative_gas_used_before,
+                ));
+            }
+            // Database / custom failures are LOCAL, not derivable from the input:
+            // halting here is correct (crash recovery replays cleanly).
+            Err(e) => {
+                return Err(ExecutorError::Execution {
+                    idx: tx_idx,
+                    detail: format!("{e:?}"),
+                });
+            }
+        };
+
+        let gas_used = outcome.result.gas().tx_gas_used();
+        let (status, logs) = match &outcome.result {
+            ExecutionResult::Success { logs, .. } => (ReceiptStatus::Success, logs.clone()),
+            ExecutionResult::Revert { .. } => (ReceiptStatus::Revert, Vec::new()),
+            ExecutionResult::Halt { reason, .. } => {
+                (ReceiptStatus::Halt(reason.clone()), Vec::new())
+            }
+        };
+
+        // Build the write set from revm's per-tx EvmState. Only touched / changed
+        // accounts and slots are emitted, which keeps the per-tx hash stable
+        // across replicas (revm's iteration is over an AddressMap; we re-sort
+        // into BTreeMap inside WriteSet via insert).
+        let ws = write_set_from_evm_state(&outcome.state);
+        if let Some((bal, bal_index)) = bal {
+            for (addr, account) in outcome.state.iter() {
+                bal.update_account(bal_index, *addr, account);
+            }
+        }
+        // Fold this tx's writes into the block cache: later txs read them
+        // directly — no per-tx re-seeding (this WAS 84% of all allocation).
+        revm::DatabaseCommit::commit(
+            revm::context_interface::ContextTr::db_mut(&mut *self.evm),
+            outcome.state,
+        );
+
+        let write_set_hash = ws.hash();
+        let wire_logs = logs.iter().map(wire_log).collect();
+        let cumulative_gas_used = cumulative_gas_used_before + gas_used;
+        // Contract address is meaningful only for successful CREATE txs.
+        // Failed CREATEs and any CALL tx have `contract_address = None`.
+        let contract_address = if to.is_none() && status.is_success() {
+            Some(signer.create(nonce))
+        } else {
+            None
+        };
+
+        // CRITICAL (S0): copy `tx_hash` straight from the inbound envelope —
+        // DO NOT recompute via keccak256(raw_tx). The proxy (S1) is the canonical
+        // hash producer.
+        let receipt = Receipt {
+            tx_idx: tx_position,
+            tx_hash: inbound_envelope.tx_hash,
+            status: status.is_success(),
+            gas_used,
+            logs: wire_logs,
+            write_set_hash,
+            nonce,
+            from: signer,
+            to,
+            contract_address,
+            effective_gas_price,
+            block_number: self.env.block_number,
+            transaction_index: tx_index_in_block,
+            cumulative_gas_used,
+        };
+        Ok((receipt, ws))
+    }
+}
+
 /// Execute one tx against a snapshot + the current PendingDelta. Returns the
 /// receipt plus a fresh per-tx WriteSet. The caller folds the WriteSet into
 /// the PendingDelta before invoking the next tx so later txs see the writes.
@@ -166,180 +420,19 @@ pub fn execute_tx<S: StateDatabase>(
     // revm classifies from original-vs-present in `outcome.state`.
     bal: Option<(&mut revm::state::bal::Bal, u64)>,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
-    // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
-    // invalid — undecodable bytes, or a tx revm rejects at validation
-    // (NonceTooLow duplicate past every dedup layer, NonceTooHigh from a
-    // sealed gap, insufficient balance, …) — must NOT halt execution: every
-    // replica, the recovery replay, and the validator all see the same input
-    // and would all halt in lockstep, permanently (a poisoned log wedges
-    // recovery replay on the same record forever). Instead it is SKIPPED with
-    // a receipt: `status=false, gas_used=0` — unreachable by real execution,
-    // since any executed tx (revert or halt included) charges at least
-    // intrinsic gas — so the pair is the wire-visible skip marker
-    // ([`kardamom_types::Receipt::is_invalid_skip`]). The skip is part of the
-    // deterministic state transition (empty write set, no state change,
-    // counters advance), identical across live / replay / validator re-exec.
-    // Non-deterministic failures (Database errors) still fail-stop below.
-    // A skip is LOUD: any occurrence means an upstream guard failed
-    // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
-    let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
-        Ok(env_) => env_,
-        Err(e) => {
-            return Ok(invalid_skip(
-                &format!("undecodable raw_tx: {e}"),
-                tx_position,
-                inbound_envelope,
-                0,
-                None,
-                env.block_number,
-                tx_index_in_block,
-                cumulative_gas_used_before,
-            ));
-        }
-    };
-    let signer = inbound_envelope.sender; // trusted from proxy; no recovery
-    let nonce = alloy_env.nonce();
-    let to = alloy_env.to();
-    // Effective gas price mirrors the value `tx_env_from_alloy` feeds revm:
-    // legacy/2930 `gas_price` when present, otherwise the 1559/4844
-    // `max_fee_per_gas` cap. v0 has basefee = 0 so the cap is what's paid.
-    let effective_gas_price = alloy_env
-        .gas_price()
-        .unwrap_or_else(|| alloy_env.max_fee_per_gas());
-
-    // Layer the running delta on top of the snapshot via CacheDB so revm
-    // sees writes from earlier txs in the same block.
-    let snap_ref = SnapshotRef { inner: snapshot };
-    let mut cache: CacheDB<SnapshotRef<'_, S>> = CacheDB::new(snap_ref);
-
-    // Seed layers in order — the PARENT (the previous block's writes while
-    // its commit is still fsyncing, pipelined-commit) first, then the live
-    // delta, so later inserts overwrite and the view equals
-    // snapshot ∘ parent ∘ delta.
-    for layer in parent.into_iter().chain(std::iter::once(delta)) {
-        for (addr, (nonce, balance, code_hash)) in &layer.accounts {
-            let code = layer
-                .code
-                .get(code_hash)
-                .cloned()
-                .filter(|b| !b.is_empty())
-                .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
-            cache.insert_account_info(
-                *addr,
-                AccountInfo {
-                    balance: *balance,
-                    nonce: *nonce,
-                    code_hash: *code_hash,
-                    account_id: None,
-                    code,
-                },
-            );
-        }
-        for ((addr, key), value) in &layer.storage {
-            let u_key = U256::from_be_bytes::<32>(key.0);
-            cache
-                .insert_account_storage(*addr, u_key, *value)
-                .map_err(|e| ExecutorError::Execution {
-                    idx: tx_idx,
-                    detail: format!("seed storage: {e:?}"),
-                })?;
-        }
-    }
-
-    let tx_env = tx_env_from_alloy(&alloy_env, signer);
-    let mut evm = Context::mainnet()
-        .with_db(&mut cache)
-        .with_block(env.block_env())
-        .with_cfg(env.cfg_env())
-        .build_mainnet();
-
-    let outcome = match evm.transact(tx_env) {
-        Ok(o) => o,
-        // Deterministic input-invalidity: every replica computes the same
-        // rejection from the same (state, tx) — skip, never halt (#92).
-        Err(revm::context::result::EVMError::Transaction(reason)) => {
-            return Ok(invalid_skip(
-                &format!("{reason:?}"),
-                tx_position,
-                inbound_envelope,
-                nonce,
-                to,
-                env.block_number,
-                tx_index_in_block,
-                cumulative_gas_used_before,
-            ));
-        }
-        Err(revm::context::result::EVMError::Header(reason)) => {
-            return Ok(invalid_skip(
-                &format!("{reason:?}"),
-                tx_position,
-                inbound_envelope,
-                nonce,
-                to,
-                env.block_number,
-                tx_index_in_block,
-                cumulative_gas_used_before,
-            ));
-        }
-        // Database / custom failures are LOCAL, not derivable from the input:
-        // halting here is correct (crash recovery replays cleanly).
-        Err(e) => {
-            return Err(ExecutorError::Execution {
-                idx: tx_idx,
-                detail: format!("{e:?}"),
-            });
-        }
-    };
-
-    let gas_used = outcome.result.gas().tx_gas_used();
-    let (status, logs) = match &outcome.result {
-        ExecutionResult::Success { logs, .. } => (ReceiptStatus::Success, logs.clone()),
-        ExecutionResult::Revert { .. } => (ReceiptStatus::Revert, Vec::new()),
-        ExecutionResult::Halt { reason, .. } => (ReceiptStatus::Halt(reason.clone()), Vec::new()),
-    };
-
-    // Build the write set from revm's per-tx EvmState. Only touched / changed
-    // accounts and slots are emitted, which keeps the per-tx hash stable
-    // across replicas (revm's iteration is over an AddressMap; we re-sort
-    // into BTreeMap inside WriteSet via insert).
-    let ws = write_set_from_evm_state(&outcome.state);
-    if let Some((bal, bal_index)) = bal {
-        for (addr, account) in outcome.state.iter() {
-            bal.update_account(bal_index, *addr, account);
-        }
-    }
-
-    let write_set_hash = ws.hash();
-    let wire_logs = logs.iter().map(wire_log).collect();
-    let cumulative_gas_used = cumulative_gas_used_before + gas_used;
-    // Contract address is meaningful only for successful CREATE txs.
-    // Failed CREATEs and any CALL tx have `contract_address = None`.
-    let contract_address = if to.is_none() && status.is_success() {
-        Some(signer.create(nonce))
-    } else {
-        None
-    };
-
-    // CRITICAL (S0): copy `tx_hash` straight from the inbound envelope —
-    // DO NOT recompute via keccak256(raw_tx). The proxy (S1) is the canonical
-    // hash producer.
-    let receipt = Receipt {
-        tx_idx: tx_position,
-        tx_hash: inbound_envelope.tx_hash,
-        status: status.is_success(),
-        gas_used,
-        logs: wire_logs,
-        write_set_hash,
-        nonce,
-        from: signer,
-        to,
-        contract_address,
-        effective_gas_price,
-        block_number: env.block_number,
-        transaction_index: tx_index_in_block,
-        cumulative_gas_used,
-    };
-    Ok((receipt, ws))
+    // Compatibility wrapper: one throwaway scope per call (replay + tests).
+    // Hot paths hold an [`ExecScope`] per block/batch instead — that is
+    // where the allocation win lives.
+    let mut scope = ExecScope::new(snapshot, parent, env)?;
+    scope.seed_layer(delta)?;
+    scope.execute_tx(
+        tx_idx,
+        tx_position,
+        inbound_envelope,
+        tx_index_in_block,
+        cumulative_gas_used_before,
+        bal,
+    )
 }
 
 /// Build the deterministic SKIP receipt for a canonical record that is
@@ -641,7 +734,7 @@ fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
         }
         let info = &account.info;
         ws.accounts
-            .insert(*addr, (info.nonce, info.balance, info.code_hash));
+            .push((*addr, (info.nonce, info.balance, info.code_hash)));
 
         // CacheDB stores bytecode separately by code_hash; resolve via the
         // `contracts` map. KECCAK_EMPTY (canonical empty-code) and empty
@@ -650,17 +743,18 @@ fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
             && let Some(code) = state.contracts.get(&info.code_hash)
             && !code.is_empty()
         {
-            ws.code.insert(
+            ws.code.push((
                 info.code_hash,
                 Bytes::copy_from_slice(code.original_bytes().as_ref()),
-            );
+            ));
         }
 
         for (key, value) in &account.storage {
             let b_key = B256::from(key.to_be_bytes::<32>());
-            ws.storage.insert((*addr, b_key), *value);
+            ws.storage.push(((*addr, b_key), *value));
         }
     }
+    ws.finish();
     ws
 }
 
@@ -674,19 +768,24 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
         }
         let info = &account.info;
         ws.accounts
-            .insert(*addr, (info.nonce, info.balance, info.code_hash));
+            .push((*addr, (info.nonce, info.balance, info.code_hash)));
 
-        // Code bytes: if revm loaded fresh bytecode this tx, capture it once
-        // keyed by code_hash. KECCAK_EMPTY is the canonical empty-code marker
-        // and isn't worth shipping in the delta.
-        if let Some(code) = info.code.as_ref()
+        // Code bytes: ONLY for accounts CREATED this tx. revm also loads
+        // the bytecode of every contract merely CALLED (`info.code` is
+        // populated on load), and the old unconditional capture copied the
+        // full runtime into the WriteSet per call — 1.6KB/tx on CLOB
+        // workloads, the second-largest allocation site post-ExecScope.
+        // A called contract's code is already durable (snapshot/parent);
+        // only a CREATE introduces new bytes the delta must carry.
+        if account.is_created()
+            && let Some(code) = info.code.as_ref()
             && info.code_hash != KECCAK_EMPTY
             && !code.is_empty()
         {
-            ws.code.insert(
+            ws.code.push((
                 info.code_hash,
                 Bytes::copy_from_slice(code.original_bytes().as_ref()),
-            );
+            ));
         }
 
         for (key, slot) in account.storage.iter() {
@@ -694,10 +793,11 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
             // original_value. revm tracks both on `EvmStorageSlot`.
             if slot.original_value != slot.present_value {
                 let b_key = B256::from(key.to_be_bytes::<32>());
-                ws.storage.insert((*addr, b_key), slot.present_value);
+                ws.storage.push(((*addr, b_key), slot.present_value));
             }
         }
     }
+    ws.finish();
     ws
 }
 
@@ -892,9 +992,9 @@ mod tests {
         assert!(receipt.status); // success = bool true (kardamom_types::Receipt)
         assert!(receipt.gas_used >= 21_000);
         // Both accounts touched: sender (balance + nonce) and recipient (balance).
-        assert!(ws.accounts.contains_key(&from));
-        assert!(ws.accounts.contains_key(&to));
-        assert_eq!(ws.accounts[&to].1, U256::from(1_000u64));
+        assert!(ws.account(&from).is_some());
+        assert!(ws.account(&to).is_some());
+        assert_eq!(ws.account(&to).unwrap().1, U256::from(1_000u64));
         // No storage or code writes for a plain transfer.
         assert!(ws.storage.is_empty());
         assert!(ws.code.is_empty());
@@ -962,8 +1062,8 @@ mod tests {
         .expect("execute 2");
         assert!(r2.status);
         assert_eq!(r2.tx_hash, tx2.tx_hash);
-        assert_eq!(ws2.accounts[&to].1, U256::from(150u64));
-        assert_eq!(ws2.accounts[&from].0, 2); // nonce
+        assert_eq!(ws2.account(&to).unwrap().1, U256::from(150u64));
+        assert_eq!(ws2.account(&from).unwrap().0, 2); // nonce
         // RPC enrichment: tx2 sees a higher nonce + transaction_index;
         // cumulative_gas_used accumulates across both txs in the block.
         assert_eq!(r2.nonce, 1);
@@ -1008,8 +1108,8 @@ mod tests {
         // - sender ends at 1000 - 400 = 600
         // - recipient ends at 400
         // (Gas price is 0 — no fee deduction.)
-        assert_eq!(ws.accounts[&from].1, U256::from(600u64));
-        assert_eq!(ws.accounts[&to].1, U256::from(400u64));
+        assert_eq!(ws.account(&from).unwrap().1, U256::from(600u64));
+        assert_eq!(ws.account(&to).unwrap().1, U256::from(400u64));
 
         // Receipt fields specific to deposits.
         assert_eq!(receipt.tx_hash, d.source_hash);
@@ -1050,7 +1150,7 @@ mod tests {
 
         // Mint pre-credit is OUTSIDE the EVM call: from keeps the full mint.
         assert_eq!(
-            ws.accounts[&from].1,
+            ws.account(&from).unwrap().1,
             U256::from(1_000u64),
             "from must keep full mint after inner revert"
         );
@@ -1058,9 +1158,7 @@ mod tests {
         assert!(!receipt.status, "inner-revert deposit yields status=false");
         // Recipient observed no transferred value.
         assert!(
-            ws.accounts
-                .get(&revert_addr)
-                .is_none_or(|a| a.1 == U256::ZERO),
+            ws.account(&revert_addr).is_none_or(|a| a.1 == U256::ZERO),
             "revert target must not retain value"
         );
     }
