@@ -907,11 +907,31 @@ where
                         // the publisher is gone mid-shutdown — not fatal.
                         if let Some(btx) = bal_tx.as_ref() {
                             let bal_delta = pending.clone().finalize(block_number, Vec::new());
-                            let _ = btx.send((
+                            // try_send: the BAL handoff must NEVER block
+                            // execution — a slow/stuck publisher pump once
+                            // back-pressured this thread through the bounded
+                            // channel and delayed every receipt behind it
+                            // (S4). A dropped frame costs one block of BAL
+                            // retention (that block verifies as bal_missing,
+                            // the tolerated path); a stalled exec thread
+                            // costs the chain.
+                            match btx.try_send((
                                 boundary.clone(),
                                 bal_delta,
                                 std::mem::take(&mut block_bal),
-                            ));
+                            )) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        block = block_number,
+                                        "BAL handoff full; dropping this block's frame \
+                                         (publisher pump stalled?)"
+                                    );
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    // Publisher gone mid-shutdown — not fatal.
+                                }
+                            }
                         }
                         match parent.as_mut() {
                             Some(m) => m.merge_from(&pending),
