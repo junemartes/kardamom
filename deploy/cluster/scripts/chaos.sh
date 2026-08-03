@@ -876,8 +876,9 @@ run_retention_overrun() { # <executor|validator>
 
   # The recovery-D evidence is split across container GENERATIONS: the thawed
   # process logs the refusal + fetch + park, then EXITS; its restarted
-  # successor logs the restore/adopt. Scan every task container on the node,
-  # exited ones included.
+  # successor logs the restore/adopt. Nomad GCs the dead generation's
+  # container immediately, so the only stream holding BOTH halves is the
+  # alloc's own Nomad log (job name == consumer kind for both victims).
   local needle_restored
   if [ "${kind}" = "executor" ]; then
     needle_restored='restored state from checkpoint'
@@ -887,9 +888,7 @@ run_retention_overrun() { # <executor|validator>
   local logs unavailable=0 fetched=0 prepared=0 restored=0
   t=0
   while :; do
-    logs="$(timeout 25 docker exec "${node}" sh -c \
-      'for c in $(docker ps -a --format "{{.Names}}" | grep -i '"${kind}"'); do docker logs --tail 1500 "$c" 2>&1; done' \
-      2>/dev/null || true)"
+    logs="$(job_alloc_logs "${kind}")"
     echo "${logs}" | grep -q 'cluster replay unavailable' && unavailable=1
     echo "${logs}" | grep -q 'fetched checkpoint from peer' && fetched=1
     echo "${logs}" | grep -q 'resync prepared: peer checkpoint staged' && prepared=1
@@ -1125,6 +1124,24 @@ assert_accepted_delivered() { # <json> <case>
 # Prints the leader memberId on stdout (and nothing else); fails if none found in
 # time. Reads logs via the control node's `nomad alloc logs` (same access pattern
 # the rest of the file uses).
+# Concatenated stdout+stderr of every alloc of a Nomad job. THE evidence
+# source for lines that straddle a task restart: Nomad's docker driver GCs
+# the dead container on an in-place restart, so `docker logs` on the node
+# silently loses everything the dying generation said (first retention-
+# overrun run: the sealer provably refused the replay and the executor
+# provably self-repaired, but the refusal/fetch/park lines lived in the
+# reaped container and the case read "never happened"). Nomad's own alloc
+# log files persist across restarts of the same alloc.
+job_alloc_logs() { # <nomad-job>
+  local allocs alloc
+  allocs="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}}{{\"\n\"}}{{end}}" "$1"' "$1" 2>/dev/null || true)"
+  while read -r alloc; do
+    [ -n "${alloc}" ] || continue
+    on_control 'nomad alloc logs "$1" 2>/dev/null; nomad alloc logs -stderr "$1" 2>/dev/null' \
+      "${alloc}" 2>/dev/null || true
+  done <<<"${allocs}"
+}
+
 # Concatenated stdout of every cluster alloc (running or not) — the uniform
 # evidence source for snapshot/restore lines. Alloc logs survive in-place task
 # restarts, so pre-kill and post-rejoin lines land in the same stream; callers
@@ -1831,20 +1848,20 @@ print(best + 40 if best >= 0 else -1)
       # restart time of members whose dirs survive; that path is asserted by
       # cluster-follower-kill). Full log replay is deterministic, so the
       # correct outcome here is: a FRESH-at-genesis service start, the whole
-      # log replayed, the member back as FOLLOWER, 3/3 running, pipeline
-      # unaffected throughout (quorum 2/3 held). First run of this case
+      # log replayed (proven via a post-rejoin snapshot TAKEN), 3/3 running,
+      # pipeline unaffected throughout (quorum 2/3 held). First run of this case
       # proved exactly that (the wiped member replayed to the live head and
       # resumed serving replay sessions). NOTE the cost this documents: a
       # blank member's rejoin time grows with the lifetime log — bounding it
       # needs log purge after snapshot, tracked as audit follow-up.
-      local leader follower f0 f1 role0 role1 t
+      local leader follower f0 f1 taken0 taken1 t
       leader="$(cluster_leader)"
       for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
 
       # Baselines BEFORE the wipe (counts, not presence: bring-up also logs a
-      # fresh start, and earlier cases add FOLLOWER role lines).
+      # fresh start, and every earlier scheduler tick adds TAKEN lines).
       f0="$(cluster_alloc_logs | grep -c "sealer state FRESH at genesis memberId=${follower}" || true)"
-      role0="$(cluster_alloc_logs | grep -c "cluster role=FOLLOWER memberId=${follower}" || true)"
+      taken0="$(cluster_alloc_logs | grep -c "sealer snapshot TAKEN memberId=${follower}" || true)"
 
       log "cluster-member-rejoin: leader=memberId=${leader}; killing FOLLOWER memberId=${follower} and WIPING its cluster + archive dirs"
       inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
@@ -1859,20 +1876,26 @@ print(best + 40 if best >= 0 else -1)
 
       # The restarted member must (a) start BLANK — fresh-at-genesis count
       # grew, proving the wipe took and this is genuinely the empty-state
-      # path — and (b) finish the full log replay and rejoin as FOLLOWER.
+      # path — and (b) finish the full log replay. Catch-up proof: the member
+      # logs a NEW 'sealer snapshot TAKEN' — snapshots run on every member at
+      # the same replicated log position, so taking one at a post-rejoin
+      # position requires having replayed the log all the way there. (A
+      # FOLLOWER role line cannot serve: a member that STARTS as follower
+      # never gets an onRoleChange — round 2 measured role count 0 -> 0 on a
+      # healthy rejoin.) Budget: full replay + one scheduler interval.
       t=0
       while :; do
         f1="$(cluster_alloc_logs | grep -c "sealer state FRESH at genesis memberId=${follower}" || true)"
-        role1="$(cluster_alloc_logs | grep -c "cluster role=FOLLOWER memberId=${follower}" || true)"
-        [ "${f1}" -gt "${f0}" ] && [ "${role1}" -gt "${role0}" ] && break
+        taken1="$(cluster_alloc_logs | grep -c "sealer snapshot TAKEN memberId=${follower}" || true)"
+        [ "${f1}" -gt "${f0}" ] && [ "${taken1}" -gt "${taken0}" ] && break
         sleep 10; t=$(( t + 10 ))
-        if [ "${t}" -ge 300 ]; then
+        if [ "${t}" -ge 360 ]; then
           [ "${f1}" -gt "${f0}" ] \
             || fail "cluster-member-rejoin: restarted member did not start blank (fresh-at-genesis count ${f0} -> ${f1}) — the wipe did not take, this run proved nothing about empty-state rejoin"
-          fail "cluster-member-rejoin: blank member never returned to FOLLOWER within ${t}s (role count ${role0} -> ${role1}) — log-replay catch-up wedged"
+          fail "cluster-member-rejoin: blank member never took a post-rejoin snapshot within ${t}s (TAKEN count ${taken0} -> ${taken1}) — log-replay catch-up wedged or the scheduler is not running"
         fi
       done
-      log "cluster-member-rejoin: memberId=${follower} rejoined blank via full log replay (fresh ${f0}->${f1}, FOLLOWER ${role0}->${role1}, ${t}s); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
+      log "cluster-member-rejoin: memberId=${follower} rejoined blank via full log replay (fresh ${f0}->${f1}, snapshot TAKEN ${taken0}->${taken1}, ${t}s); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
       ;;
 
     cluster-quorum-loss-recover)

@@ -434,6 +434,15 @@ public final class SealerClusteredService implements ClusteredService {
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
         writeSnapshot(snapshotPublication, state.takeSnapshot(), cluster.idleStrategy());
+        // stdout for grep-ability (same contract as the role line below). Every
+        // member snapshots at the same replicated log position, so this line is
+        // a CATCH-UP PROOF: a member that logs a TAKEN at a post-rejoin block
+        // must have replayed the log all the way to that position. The
+        // cluster-member-rejoin chaos case asserts a wiped member's count grows
+        // (a follower that starts as follower never gets an onRoleChange, so
+        // role lines cannot prove rejoin).
+        System.out.println("sealer snapshot TAKEN memberId=" + memberId
+            + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
     }
 
     @Override

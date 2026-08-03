@@ -230,8 +230,11 @@ byte parity, or that the chain is rebuildable from L1.
      Aeron 1.44 static membership does not transfer snapshots to blank
      members. Deterministic and converged (the wiped member replayed to the
      live head and resumed serving replay sessions), so
-     `cluster-member-rejoin` asserts fresh-at-genesis start + FOLLOWER rejoin
-     + quorum held + 3/3.
+     `cluster-member-rejoin` asserts fresh-at-genesis start + a post-rejoin
+     snapshot TAKEN (catch-up proof: snapshots run at a replicated log
+     position, so taking one requires having replayed there; a FOLLOWER role
+     line cannot serve — members that START as follower never get an
+     onRoleChange) + quorum held + 3/3.
    - **OPEN follow-up:** blank-member rejoin time grows with the lifetime log;
      bounding it needs log purge after snapshot (`ClusterTool` purge/seed) —
      without it the snapshots bound only intact-dir restarts, not blank
