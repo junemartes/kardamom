@@ -116,34 +116,43 @@ pub fn encode_code_key(hash: B256) -> [u8; 32] {
 // ---------- headers ----------
 //
 // Per, headers do NOT carry a state-root commitment. The encoded value
-// is `(end_tx_idx: BPosition, l2_timestamp: u64)`. We use a hand-rolled fixed-
-// width encoding (8 + 8 + 4 reserved = 20 bytes) instead of RLP — the row is
-// fixed-size and BPosition is not an RLP-native type.
+// is `(end_tx_idx: BPosition, l2_timestamp: u64, l1_origin: u64)`. We use a
+// hand-rolled fixed-width encoding (8 + 8 + 8 = 24 bytes) instead of RLP — the
+// row is fixed-size and BPosition is not an RLP-native type.
+//
+// The origin took the 4 reserved bytes plus 4 more, so rows grew 20 → 24.
+// Decode still accepts the 20-byte form and reports `l1_origin: 0`, which is
+// exactly what a pre-origin chain meant, so an existing state DB keeps
+// reading without a migration pass.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HeaderValue {
     pub end_tx_idx: BPosition,
     pub l2_timestamp: u64,
+    /// L1 block number whose epoch this block belongs to. See
+    /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
+    pub l1_origin: u64,
 }
 
 pub fn encode_block_key(block_number: u64) -> [u8; 8] {
     block_number.to_be_bytes()
 }
 
-pub fn encode_header_value(v: &HeaderValue) -> [u8; 20] {
-    let mut out = [0u8; 20];
+pub fn encode_header_value(v: &HeaderValue) -> [u8; 24] {
+    let mut out = [0u8; 24];
     out[..4].copy_from_slice(&v.end_tx_idx.term_id.to_be_bytes());
     out[4..8].copy_from_slice(&v.end_tx_idx.term_offset.to_be_bytes());
     out[8..16].copy_from_slice(&v.l2_timestamp.to_be_bytes());
-    // bytes 16..20 reserved (zero-filled) for forward-compat
+    out[16..24].copy_from_slice(&v.l1_origin.to_be_bytes());
     out
 }
 
 pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
-    if bytes.len() != 20 {
+    // 20 bytes is the pre-origin row; anything else is corruption.
+    if bytes.len() != 24 && bytes.len() != 20 {
         return Err(StateError::BadEncoding {
             table: TABLE_HEADERS,
-            expected: 20,
+            expected: 24,
             got: bytes.len(),
         });
     }
@@ -153,6 +162,11 @@ pub fn decode_header_value(bytes: &[u8]) -> Result<HeaderValue, StateError> {
             term_offset: i32::from_be_bytes(bytes[4..8].try_into().expect("4 bytes")),
         },
         l2_timestamp: u64::from_be_bytes(bytes[8..16].try_into().expect("8 bytes")),
+        l1_origin: if bytes.len() == 24 {
+            u64::from_be_bytes(bytes[16..24].try_into().expect("8 bytes"))
+        } else {
+            0
+        },
     })
 }
 
@@ -263,13 +277,14 @@ mod tests {
     #[test]
     fn header_value_layout_is_pinned() {
         // `headers` value is an at-rest format: term_id (i32 BE) ++ term_offset
-        // (i32 BE) ++ l2_timestamp (u64 BE) ++ 4 reserved zero bytes = 20 bytes.
+        // (i32 BE) ++ l2_timestamp (u64 BE) ++ l1_origin (u64 BE) = 24 bytes.
         let v = HeaderValue {
             end_tx_idx: BPosition {
                 term_id: 0x0102_0304,
                 term_offset: 0x0506_0708,
             },
             l2_timestamp: 0x1112_1314_1516_1718,
+            l1_origin: 0x2122_2324_2526_2728,
         };
         assert_eq!(
             encode_header_value(&v),
@@ -277,9 +292,28 @@ mod tests {
                 0x01, 0x02, 0x03, 0x04, // term_id BE
                 0x05, 0x06, 0x07, 0x08, // term_offset BE
                 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // l2_timestamp BE
-                0x00, 0x00, 0x00, 0x00, // reserved
+                0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, // l1_origin BE
             ]
         );
+        assert_eq!(decode_header_value(&encode_header_value(&v)).unwrap(), v);
+    }
+
+    /// A state DB written before the origin existed must keep reading: its
+    /// 20-byte rows mean origin 0, which is what that chain actually had.
+    #[test]
+    fn pre_origin_header_rows_still_decode() {
+        let legacy = [
+            0x01, 0x02, 0x03, 0x04, // term_id BE
+            0x05, 0x06, 0x07, 0x08, // term_offset BE
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, // l2_timestamp BE
+            0x00, 0x00, 0x00, 0x00, // the old reserved tail
+        ];
+        let v = decode_header_value(&legacy).unwrap();
+        assert_eq!(v.l2_timestamp, 0x1112_1314_1516_1718);
+        assert_eq!(v.l1_origin, 0);
+        // Anything that is neither width is corruption, not a third version.
+        assert!(decode_header_value(&legacy[..19]).is_err());
+        assert!(decode_header_value(&[0u8; 32]).is_err());
     }
 
     #[test]

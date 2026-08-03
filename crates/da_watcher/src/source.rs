@@ -9,32 +9,13 @@
 //! "L1 has no finalized block yet" — the latter is classified separately so
 //! the watcher can debug-log instead of marking the tick as an error.
 
-use alloy_primitives::{Address, B256, Bytes};
+use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 
-/// A `DepositInitiated` event decoded from L1.
-///
-/// `from` is the un-aliased L1 sender; the watcher applies the OP-style
-/// alias ([`crate::alias_l1_address`]) before publishing onto `tx_deposits`,
-/// so the L2 executor never observes the bare L1 address.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DepositLog {
-    /// Hash of the L1 block this log was emitted in. Feeds `source_hash`.
-    pub block_hash: B256,
-    /// Position of this log within the L1 block. Feeds `source_hash`.
-    pub log_index: u64,
-    /// L1 sender (un-aliased).
-    pub from: Address,
-    /// L2 recipient of the credited mint.
-    pub to: Address,
-    /// Amount minted on L2 (and forwarded as `value` in the inner EVM call).
-    /// Wire type on L1 is `uint256`; we reject `mint > u128::MAX` at decode.
-    pub mint: u128,
-    /// Gas limit for the inner EVM call.
-    pub gas_limit: u64,
-    /// Optional calldata for the inner EVM call.
-    pub data: Bytes,
-}
+// `DepositLog` — the decoded `DepositInitiated` event — lives in
+// `kardamom_types::epoch` alongside the derivation rule that consumes it, so
+// producer and verifier share one definition.
+pub use kardamom_types::epoch::DepositLog;
 
 /// Errors that can surface from an `L1Source`. Exclusively transport- or
 /// decode-level; semantic deposit failures (overflow, dedup) come back from
@@ -55,11 +36,19 @@ pub enum L1SourceError {
     NotFinalized,
 }
 
-/// The L1 view the watcher needs. Two methods, both async, both fallible.
+/// The L1 view the watcher needs. All methods async and fallible.
 #[async_trait]
 pub trait L1Source: Send + Sync + 'static {
     /// Latest finalized L1 block number.
     async fn finalized_block_number(&self) -> Result<u64, L1SourceError>;
+
+    /// Hash of L1 block `number`.
+    ///
+    /// Needed because an epoch must be emitted for EVERY finalized L1 block,
+    /// including ones with no deposits — and a block with no logs has no log
+    /// to carry its hash. The hash is what the epoch's canonical id is derived
+    /// from, so it cannot be skipped or synthesised.
+    async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError>;
 
     /// `DepositInitiated` logs emitted by `lockbox` in the inclusive block
     /// range `[from_block, to_block]`. Order within the response is the
@@ -72,7 +61,7 @@ pub trait L1Source: Send + Sync + 'static {
     ) -> Result<Vec<DepositLog>, L1SourceError>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod fakes {
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -87,6 +76,20 @@ pub mod fakes {
         pub tips: Mutex<VecDeque<Result<u64, L1SourceError>>>,
         /// Pre-scripted outcomes for `deposit_logs(...)` calls (FIFO).
         pub logs: Mutex<VecDeque<Result<Vec<DepositLog>, L1SourceError>>>,
+        /// Hash returned for a given block number. Unlisted numbers get a
+        /// deterministic filler (`repeat_byte(number)`) so tests that don't
+        /// care about hashes don't have to populate this.
+        pub hashes: Mutex<std::collections::BTreeMap<u64, B256>>,
+        /// If set, `block_hash` fails with this provider error instead.
+        pub block_hash_fails: Mutex<bool>,
+    }
+
+    impl MockL1Source {
+        /// Deterministic filler hash for a block number, used when `hashes`
+        /// has no entry. Tests building expected epochs use it too.
+        pub fn filler_hash(number: u64) -> B256 {
+            B256::repeat_byte(number as u8)
+        }
     }
 
     impl MockL1Source {
@@ -94,6 +97,8 @@ pub mod fakes {
             Self {
                 tips: Mutex::new(VecDeque::new()),
                 logs: Mutex::new(VecDeque::new()),
+                hashes: Mutex::new(std::collections::BTreeMap::new()),
+                block_hash_fails: Mutex::new(false),
             }
         }
 
@@ -120,6 +125,21 @@ pub mod fakes {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Err(L1SourceError::NotFinalized))
+        }
+
+        async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError> {
+            if *self.block_hash_fails.lock().unwrap() {
+                return Err(L1SourceError::Provider(
+                    "scripted block_hash failure".into(),
+                ));
+            }
+            Ok(self
+                .hashes
+                .lock()
+                .unwrap()
+                .get(&number)
+                .copied()
+                .unwrap_or_else(|| Self::filler_hash(number)))
         }
 
         async fn deposit_logs(

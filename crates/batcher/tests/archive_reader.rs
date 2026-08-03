@@ -43,6 +43,7 @@ fn reads_two_interleaved_b_records() {
             block_number: 1,
             end_tx_idx: pos(64),
             l2_timestamp: 1234,
+            l1_origin: 0,
         }),
     );
 

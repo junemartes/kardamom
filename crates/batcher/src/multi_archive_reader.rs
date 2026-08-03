@@ -182,9 +182,17 @@ impl Iterator for MultiArchiveReader {
                         Err(e) => Some(Err(e)),
                     };
                 }
-                TxOrderingMessage::DepositRef(_) => {
+                TxOrderingMessage::DepositRef(_) | TxOrderingMessage::Epoch(_) => {
                     // L1 deposits originated on L1; they don't need to be
                     // re-batched back. Skip.
+                    //
+                    // Epochs are skipped for the same reason and, under the
+                    // deposit-derivation design, deliberately so: a
+                    // reconstructor re-derives an epoch's deposits from L1
+                    // itself, guided by the block's `l1_origin`, so putting
+                    // them in the blob would be both wasted space and an
+                    // unverifiable claim (deposits are unsigned). See
+                    // docs/agents/l1-origin-deposit-derivation-spec.md.
                     continue;
                 }
                 TxOrderingMessage::BoundaryStart(b) => {

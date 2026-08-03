@@ -67,7 +67,7 @@ impl MockService {
 
     /// Stamp a boundary at `clock_ms`; advance the block number.
     fn tick(&mut self, clock_ms: u64) -> Vec<u8> {
-        let frame = encode_egress_boundary(self.block, self.count, (clock_ms / 250) * 250);
+        let frame = encode_egress_boundary(self.block, self.count, (clock_ms / 250) * 250, 0);
         self.block += 1;
         frame
     }

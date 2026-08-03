@@ -16,7 +16,7 @@
 //!   watcher needs (`finalized_block_number`, `deposit_logs`). The trait is
 //!   the seam for tests (mock impl) and production
 //!   ([`rpc_source::RpcL1Source`] — alloy-provider-backed).
-//! - [`publisher::DepositPublisher`] — sink for the
+//! - [`publisher::EpochPublisher`] — sink for the
 //!   [`kardamom_types::Deposit`] records the watcher emits. Production wraps
 //!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`; tests use the
 //!   in-memory fake in [`publisher::fakes`].
@@ -46,15 +46,18 @@
 //!   operation; the watcher trusts finality.
 //! - L1-attributes / system txs (OP `is_system_transaction = true`).
 
-pub mod derive;
 pub mod metrics;
 pub mod publisher;
 pub mod rpc_source;
 pub mod source;
 pub mod watcher;
 
-pub use derive::{alias_l1_address, source_hash};
-pub use publisher::{DepositPublisher, PublishError};
+// The deposit-derivation rule moved to `kardamom_types::epoch` so the
+// VERIFIER can share it — a second copy would verify nothing (see
+// docs/agents/l1-origin-deposit-derivation-spec.md). Re-exported here so
+// existing callers keep working.
+pub use kardamom_types::epoch::{DepositLog, alias_l1_address, deposit_from_log, source_hash};
+pub use publisher::{EpochPublisher, PublishError};
 pub use rpc_source::RpcL1Source;
-pub use source::{DepositLog, L1Source, L1SourceError};
+pub use source::{L1Source, L1SourceError};
 pub use watcher::{DaWatcherConfig, MonitorError, WatcherHandle, process_once, spawn};

@@ -78,10 +78,15 @@ jobs:
             -p kardamom-validator -p kardamom-state -p kardamom-da-watcher \
             -p kardamom-batcher -p kardamom-reconstruct
 
-      # Each test brings up its own stack (2 JVMs + 4 service processes);
-      # cap parallelism at 2 on the shared runner.
+      # Each test brings up its own stack (2 JVMs + 4 service processes), and
+      # the L1-backed ones add an anvil on top. Two of those at once on a
+      # 2-core runner starves the Aeron media driver — it shows up as
+      # "MediaDriver keepalive: age>10000ms" and then a scenario timing out
+      # waiting for a receipt that the wedged transport never delivered. Run
+      # them one at a time; the suite is ~10 min serial, well inside the
+      # 30-minute job timeout.
       - name: Run the chain-semantics suite (Target L)
         run: |
           cargo test -p e2e --features full-pipeline-e2e \
             --test chain_semantics --locked \
-            -- --ignored --nocapture --test-threads=2
+            -- --ignored --nocapture --test-threads=1

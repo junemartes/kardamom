@@ -28,15 +28,15 @@
 pub mod cluster;
 
 use alloy_primitives::Address;
-use kardamom_types::{DepositRef, TxError, TxRef};
+use kardamom_types::{EpochRecord, TxError, TxRef};
 
 use crate::error::SequencerError;
 
 /// TxOrdering publisher contract — the canonical orderer. Publishes tiny
-/// reference records into Aeron's concurrent multi-publisher stream: regular
-/// [`TxRef`]s for L2 txs (~41 B) and [`DepositRef`]s for L1 deposits
-/// (~36 B). Both lanes share the same tx_ordering channel so deposits and
-/// regular txs interleave in canonical order.
+/// [`TxRef`]s for L2 txs (~41 B) into Aeron's concurrent multi-publisher
+/// stream, plus whole [`EpochRecord`]s for L1 epochs. Both lanes share the
+/// tx_ordering channel so deposits and regular txs interleave in canonical
+/// order.
 ///
 /// A blocked transport must surface as `Err(SequencerError::Backpressure)`
 /// so the state machine can rewind.
@@ -69,11 +69,13 @@ pub trait TxOrderingRefPublisher: Send {
         (refs.len(), None)
     }
 
-    /// Publish a [`DepositRef`] for a deposit observed on `tx_deposits`.
-    /// Same backpressure semantics as `try_publish_ref` — deposits aren't
-    /// nonce-gated and have no pending state to rewind, so on `Backpressure`
-    /// the caller just retries the same ref next tick.
-    fn try_publish_deposit_ref(&mut self, r: &DepositRef) -> Result<(), SequencerError>;
+    /// Publish an [`EpochRecord`] observed on `tx_deposits` as an
+    /// ORIGIN-ADVANCING record: the sealer closes the open block, adopts the
+    /// epoch's L1 number, then relays it, so the epoch's deposits lead a
+    /// block. Same backpressure semantics as `try_publish_ref` — epochs
+    /// aren't nonce-gated and have no pending state to rewind, so on
+    /// `Backpressure` the caller retries the same epoch next tick.
+    fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError>;
 }
 
 /// TxErrors channel publisher. Best-effort: errors are logged by the
@@ -92,17 +94,17 @@ pub trait TxErrorPublisher: Send {
 pub mod fakes {
     use std::sync::{Arc, Mutex};
 
-    use kardamom_types::{DepositRef, TxRef};
+    use kardamom_types::{EpochRecord, TxRef};
 
     use super::*;
 
     /// In-memory tx_ordering publisher. Records every published `TxRef` and
-    /// `DepositRef` in arrival order so tests can assert the canonical
+    /// `EpochRecord` in arrival order so tests can assert the canonical
     /// sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
         pub refs: Arc<Mutex<Vec<TxRef>>>,
-        pub deposit_refs: Arc<Mutex<Vec<DepositRef>>>,
+        pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
     }
 
@@ -120,11 +122,11 @@ pub mod fakes {
             Ok(())
         }
 
-        fn try_publish_deposit_ref(&mut self, r: &DepositRef) -> Result<(), SequencerError> {
+        fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(SequencerError::Backpressure);
             }
-            self.deposit_refs.lock().unwrap().push(*r);
+            self.epochs.lock().unwrap().push(e.clone());
             Ok(())
         }
     }
@@ -146,7 +148,7 @@ mod tests {
     use super::fakes::*;
     use super::*;
     use alloy_primitives::{Address, B256};
-    use kardamom_types::{BPosition, DepositRef, TxError, TxErrorReason, TxRef};
+    use kardamom_types::{BPosition, TxError, TxErrorReason, TxRef};
 
     #[test]
     fn fake_b_records_refs() {
@@ -191,23 +193,27 @@ mod tests {
         assert_eq!(p.errors.lock().unwrap().len(), 1);
     }
 
-    #[test]
-    fn fake_b_records_deposit_refs() {
-        let mut p = InMemoryTxOrderingRefPublisher::default();
-        p.try_publish_deposit_ref(&DepositRef::new(
-            B256::repeat_byte(0x77),
-            BPosition::default(),
-        ))
-        .unwrap();
-        assert_eq!(p.deposit_refs.lock().unwrap().len(), 1);
+    fn test_epoch(n: u64) -> EpochRecord {
+        EpochRecord {
+            l1_number: n,
+            l1_hash: B256::repeat_byte(n as u8),
+            deposits: Vec::new(),
+        }
     }
 
     #[test]
-    fn fake_b_deposit_refs_back_off_under_pressure() {
+    fn fake_b_records_epochs() {
+        let mut p = InMemoryTxOrderingRefPublisher::default();
+        p.try_publish_epoch(&test_epoch(7)).unwrap();
+        assert_eq!(p.epochs.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn fake_b_epochs_back_off_under_pressure() {
         let mut p = InMemoryTxOrderingRefPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            p.try_publish_deposit_ref(&DepositRef::new(B256::ZERO, BPosition::default())),
+            p.try_publish_epoch(&test_epoch(1)),
             Err(SequencerError::Backpressure)
         ));
     }

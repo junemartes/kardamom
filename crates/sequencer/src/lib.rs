@@ -25,7 +25,7 @@
 //! zero secp256k1 work on the hot path.
 
 pub mod config;
-pub mod deposit;
+pub mod epoch;
 pub mod error;
 pub mod inbound;
 pub mod metrics;
@@ -38,7 +38,7 @@ pub mod sequencer;
 pub mod state;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
-pub use deposit::{DepositSubscriber, process_deposit};
+pub use epoch::{EpochSubscriber, process_epoch};
 pub use error::SequencerError;
 pub use sequencer::{Sequencer, Shutdown};
 

@@ -24,6 +24,7 @@ use rkyv::{Archive, Deserialize, Serialize};
 
 use crate::boundary::BlockBoundaryStart;
 use crate::deposit::DepositRef;
+use crate::epoch::EpochRecord;
 use crate::txref::TxRef;
 
 /// One tx_ordering wire record. Variants are kept narrow to preserve the
@@ -38,6 +39,14 @@ pub enum TxOrderingMessage {
     DepositRef(DepositRef),
     /// A block-boundary marker emitted by the sealer.
     BoundaryStart(BlockBoundaryStart),
+    /// An L1 epoch: its origin plus that L1 block's deposits, in log order.
+    ///
+    /// Ordered like any other record, but the sealer treats the carrying
+    /// frame as origin-advancing — it closes the current block first, so an
+    /// epoch's deposits always LEAD a block, and stamps its `l1_number` into
+    /// every subsequent boundary. See
+    /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
+    Epoch(EpochRecord),
 }
 
 impl TxOrderingMessage {
@@ -57,11 +66,16 @@ impl TxOrderingMessage {
         matches!(self, Self::BoundaryStart(_))
     }
 
+    /// Whether this record is an L1 epoch.
+    pub const fn is_epoch(&self) -> bool {
+        matches!(self, Self::Epoch(_))
+    }
+
     /// If this record is a tx ref, return the contained `TxRef`.
     pub const fn as_tx_ref(&self) -> Option<&TxRef> {
         match self {
             Self::TxRef(r) => Some(r),
-            Self::DepositRef(_) | Self::BoundaryStart(_) => None,
+            Self::DepositRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => None,
         }
     }
 
@@ -69,7 +83,15 @@ impl TxOrderingMessage {
     pub const fn as_deposit_ref(&self) -> Option<&DepositRef> {
         match self {
             Self::DepositRef(d) => Some(d),
-            Self::TxRef(_) | Self::BoundaryStart(_) => None,
+            Self::TxRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => None,
+        }
+    }
+
+    /// If this record is an epoch, return it.
+    pub const fn as_epoch(&self) -> Option<&EpochRecord> {
+        match self {
+            Self::Epoch(e) => Some(e),
+            Self::TxRef(_) | Self::DepositRef(_) | Self::BoundaryStart(_) => None,
         }
     }
 
@@ -77,7 +99,7 @@ impl TxOrderingMessage {
     pub const fn as_boundary(&self) -> Option<&BlockBoundaryStart> {
         match self {
             Self::BoundaryStart(b) => Some(b),
-            Self::TxRef(_) | Self::DepositRef(_) => None,
+            Self::TxRef(_) | Self::DepositRef(_) | Self::Epoch(_) => None,
         }
     }
 }

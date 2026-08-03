@@ -286,8 +286,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
     use kardamom_batcher::live;
     use kardamom_engine::bin_support;
     use kardamom_engine::reader::{
-        DepositJoinBuffer, JoinBuffer, ReaderConfig, spawn_tx_data_reader,
-        spawn_tx_deposits_reader, spawn_tx_ordering_reader,
+        JoinBuffer, ReaderConfig, spawn_tx_data_reader, spawn_tx_ordering_reader,
     };
     use kardamom_log::aeron_live::AeronRuntime;
     use kardamom_log::config::LogConfig;
@@ -353,7 +352,6 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
     };
     let a_subs = bin_support::open_tx_data_subs(&rt, &channels, cli.shards)?;
-    let dep_sub = bin_support::open_tx_deposits_sub(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -385,12 +383,12 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
     info!("kardamom-batcher: tx_ordering via Aeron Cluster");
 
     let join_buffer = JoinBuffer::new();
-    let deposit_buffer = DepositJoinBuffer::new();
     let mut reader_handles = Vec::new();
     for a_sub in a_subs {
         reader_handles.push(spawn_tx_data_reader(a_sub, join_buffer.clone()));
     }
-    reader_handles.push(spawn_tx_deposits_reader(dep_sub, deposit_buffer.clone()));
+    // No tx_deposits reader: deposits ride inside the epoch record on the
+    // canonical stream, so there is nothing to join against.
     let (feed_tx, feed_rx) = crossbeam_channel::bounded(1 << 14);
     // The default 100 ms join timeout is an IPC-locality assumption; on the
     // cluster's UDP multicast a transient frame drop takes the archive
@@ -404,7 +402,6 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
     let ordering_handle = spawn_tx_ordering_reader(
         b_sub,
         join_buffer,
-        deposit_buffer,
         reader_cfg,
         feed_tx,
         kardamom_engine::TxIndex(cursor.next_index),

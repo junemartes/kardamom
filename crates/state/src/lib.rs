@@ -29,7 +29,9 @@ pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;
 pub use genesis::{genesis_applied, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, sweep};
-pub use recovery::{RecoveryPoint, bootstrap_trie_from_state, has_trie, read_recovery_point};
+pub use recovery::{
+    RecoveryPoint, bootstrap_trie_from_state, has_trie, read_all_headers, read_recovery_point,
+};
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};
 pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};

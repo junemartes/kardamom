@@ -123,7 +123,12 @@ impl<E: ClusterEgress> ClusterTxOrderingSubscription<E> {
             None => !self.catching_up,
         };
         if record_is_next && let Some(msg) = self.pending_records.remove(&ni) {
-            self.cursor.next_index.store(ni + 1, Ordering::Relaxed);
+            // Almost every record is one slot wide; an epoch claims the marker
+            // plus one slot per deposit, so the cursor must skip the whole
+            // range or the next record reads as a gap.
+            self.cursor
+                .next_index
+                .store(ni + slot_width(&msg), Ordering::Relaxed);
             return Some((BPosition::from_index(ni), msg));
         }
         None
@@ -278,6 +283,17 @@ pub fn cluster_tx_ordering_subscription(
     ))
 }
 
+/// Canonical slots one record occupies. See [`wire::epoch_slots`] for why an
+/// epoch is the only record wider than a single slot.
+fn slot_width(msg: &TxOrderingMessage) -> u64 {
+    match msg {
+        TxOrderingMessage::Epoch(e) => wire::epoch_slots(e),
+        TxOrderingMessage::TxRef(_)
+        | TxOrderingMessage::DepositRef(_)
+        | TxOrderingMessage::BoundaryStart(_) => 1,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,14 +327,14 @@ mod tests {
         let egress = FakeEgress::new();
         // Live-ahead: record 5 and boundary 2 arrive before the replay.
         egress.push(encode_egress_record(5, &relayed_txref(1, 5)));
-        egress.push(encode_egress_boundary(2, 4, 2_000));
+        egress.push(encode_egress_boundary(2, 4, 2_000, 0));
         // Replayed frames (emission order), incl. a duplicate of record 5's
         // predecessor range and both boundaries.
         for i in 0..5 {
             egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
         }
-        egress.push(encode_egress_boundary(1, 2, 1_000));
-        egress.push(encode_egress_boundary(2, 4, 2_000)); // duplicate boundary
+        egress.push(encode_egress_boundary(1, 2, 1_000, 0));
+        egress.push(encode_egress_boundary(2, 4, 2_000, 0)); // duplicate boundary
         egress.push(wire::encode_replay_done(6, 3));
         egress.close();
 
@@ -339,8 +355,8 @@ mod tests {
     fn boundary_first_stream_delivers_in_emission_order() {
         // An idle chain emits boundaries with no records: b1(end0) b2(end0).
         let egress = FakeEgress::new();
-        egress.push(encode_egress_boundary(1, 0, 1_000));
-        egress.push(encode_egress_boundary(2, 0, 2_000));
+        egress.push(encode_egress_boundary(1, 0, 1_000, 0));
+        egress.push(encode_egress_boundary(2, 0, 2_000, 0));
         egress.close();
         let mut sub = ClusterTxOrderingSubscription::new(egress);
         let (p1, m1) = sub.next().unwrap();
@@ -387,8 +403,8 @@ mod tests {
         for i in 0..5 {
             egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
         }
-        egress.push(encode_egress_boundary(1, 2, 1_000)); // below cursor: dup
-        egress.push(encode_egress_boundary(2, 5, 2_000));
+        egress.push(encode_egress_boundary(1, 2, 1_000, 0)); // below cursor: dup
+        egress.push(encode_egress_boundary(2, 5, 2_000, 0));
         egress.push(wire::encode_replay_done(5, 3));
         egress.close();
         let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(3, 2));
@@ -423,7 +439,7 @@ mod tests {
     #[test]
     fn yields_boundary_with_fields_intact() {
         let egress = FakeEgress::new();
-        egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250));
+        egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250, 0));
         egress.close();
         // Consumer resumed at (42 records applied, next block 7) — the
         // boundary is the next in-order item and must decode field-intact.
@@ -453,7 +469,7 @@ mod tests {
     fn late_boundary_sealing_below_cursor_is_fatal() {
         let egress = FakeEgress::new();
         egress.push(encode_egress_record(2, &relayed_txref(1, 2)));
-        egress.push(encode_egress_boundary(1, 2, 1_000));
+        egress.push(encode_egress_boundary(1, 2, 1_000, 0));
         egress.close();
         let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(2, 1));
         // Live mode: record 2 is next-index and delivers immediately.
@@ -471,7 +487,7 @@ mod tests {
     fn malformed_frame_is_skipped_not_fatal() {
         let egress = FakeEgress::new();
         egress.push(vec![0xFF, 0x00]); // bad egress kind
-        egress.push(encode_egress_boundary(1, 0, 0));
+        egress.push(encode_egress_boundary(1, 0, 0, 0));
         egress.close();
         let mut sub = ClusterTxOrderingSubscription::new(egress);
         // The malformed frame is skipped; the next good frame is returned.

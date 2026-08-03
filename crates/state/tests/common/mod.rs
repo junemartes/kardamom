@@ -54,6 +54,7 @@ pub fn simple_delta(
         block_number: block,
         end_tx_idx: end_pos,
         l2_timestamp: 1_700_000_000 + block,
+        l1_origin: 0,
     };
     let delta = BlockDelta {
         block_number: block,

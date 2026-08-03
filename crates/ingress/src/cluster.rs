@@ -137,7 +137,7 @@ mod tests {
     fn boundary_advances_to_end_tx_idx_and_never_regresses() {
         let egress = FakeEgress::new();
         // Boundary end_tx_idx=42 ⇒ count 42 ⇒ durable position from_index(41).
-        egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250));
+        egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250, 0));
         // A stale record (index 5 ⇒ count 6) must NOT regress below from_index(41).
         egress.push(record(5, 99));
         egress.close();

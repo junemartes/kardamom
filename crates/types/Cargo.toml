@@ -5,7 +5,13 @@ edition.workspace = true
 
 
 [dependencies]
-alloy-primitives = { workspace = true, features = ["serde"] }
+# `rlp` is required by epoch::source_hash — the RLP encoding of the L1 block
+# hash is part of the consensus rule, so the feature is explicit here rather
+# than inherited transitively from whoever else happens to enable it.
+alloy-primitives = { workspace = true, features = ["serde", "rlp"] }
+# `source_hash` is a CONSENSUS rule (RLP-encoded, OP-aligned), so it lives
+# with the shared types rather than in a service crate — see epoch.rs.
+alloy-rlp.workspace = true
 bytes.workspace = true
 rkyv.workspace = true
 serde.workspace = true

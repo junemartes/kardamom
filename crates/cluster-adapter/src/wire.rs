@@ -28,6 +28,7 @@
 //! replicated state machine; the executor maps it to `BPosition::from_index`.
 
 use alloy_primitives::{Address, B256};
+use kardamom_types::epoch::EpochRecord;
 use kardamom_types::{BPosition, BlockBoundaryStart, DepositRef, TxOrderingMessage, TxRef};
 use thiserror::Error;
 
@@ -48,6 +49,21 @@ pub const KIND_SUBSCRIBE: u8 = 2;
 /// (~75-byte refs each previously paid a full offer round trip). Matches
 /// Java `KIND_BATCH`.
 pub const KIND_BATCH: u8 = 3;
+/// Ingress kind: an ORIGIN-ADVANCING record
+/// `[kind:u8 = 4][canonical_id:32][l1_origin:u64][slot_count:u32][record_type:u8][fields…]`.
+///
+/// Deduped by `canonical_id` like a normal record, but the service closes the
+/// current block FIRST (so the record's contents lead a new block) and adopts
+/// `l1_origin` for subsequent boundaries. Deliberately a separate KIND rather
+/// than a record_type the service would have to parse: the sealer stays
+/// schema-agnostic (it never learns what an epoch or a deposit is), the
+/// hot-path TxRef framing is untouched, and the origin reaches the Raft state
+/// machine as ORDERED DATA rather than by the sealer reading L1, which would
+/// make replicas non-deterministic. Carries NO guard header — deposits are not
+/// nonce-gated, so there is nothing to contiguity-check. Kind 4 because
+/// [`KIND_BATCH`] holds 3. Matches Java `KIND_ORIGIN_RECORD`. See
+/// `docs/agents/l1-origin-deposit-derivation-spec.md`.
+pub const KIND_ORIGIN_RECORD: u8 = 4;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >= from_index`
 /// or `boundary.block_number >= from_block` to the REQUESTING session only (not
@@ -79,6 +95,31 @@ pub const EGRESS_KIND_CONTIGUITY_REJECT: u8 = 5;
 /// Record discriminant inside the relayed payload.
 pub const RT_TXREF: u8 = 0;
 pub const RT_DEPOSITREF: u8 = 1;
+/// An rkyv-encoded [`EpochRecord`]: the L1 origin's deposits, in log order.
+pub const RT_EPOCH: u8 = 2;
+
+/// How many canonical slots an epoch occupies: **one for the epoch marker
+/// itself, plus one per deposit**.
+///
+/// Every other record maps 1:1 onto a slot, and three separate mechanisms lean
+/// on that: the sealer's cumulative `canonicalCount` (the block-boundary
+/// alignment key in `BlockBoundaryStart::end_tx_idx`), the egress reader's
+/// dense `next_index` cursor (a hole there is read as a gap and triggers replay
+/// catch-up), and the executor's per-tx `tx_idx` (which keys receipts and the
+/// BAL, so two txs must never share one).
+///
+/// An epoch is the exception — one record carrying N deposits — so it claims a
+/// CONTIGUOUS RANGE instead: slot 0 is the marker (it advances the origin and
+/// applies no tx), slots `1..=N` are the deposits. Counting the marker even
+/// when `N == 0` is what keeps the range non-empty, so an empty epoch still
+/// owns a distinct index rather than colliding with the record after it.
+///
+/// The count travels on the frame because the Java sealer never parses the
+/// payload; every consumer that DOES parse it re-derives this value and
+/// fail-stops on a mismatch.
+pub fn epoch_slots(epoch: &EpochRecord) -> u64 {
+    1 + epoch.deposits.len() as u64
+}
 
 /// Canonical id length (a 32-byte hash). Matches Java `CANONICAL_ID_LEN`.
 pub const CANONICAL_ID_LEN: usize = 32;
@@ -101,6 +142,8 @@ pub enum WireError {
     BadRecordType(u8),
     #[error("declared payload_len {declared} exceeds remaining {remaining}")]
     BadPayloadLen { declared: usize, remaining: usize },
+    #[error("bad epoch record: {0}")]
+    BadEpoch(String),
 }
 
 // ── encode (ingress: Rust → cluster) ────────────────────────────────────────
@@ -189,10 +232,12 @@ pub fn decode_egress(buf: &[u8]) -> Result<EgressItem, WireError> {
             let block_number = rd_u64(buf, 1)?;
             let end_tx_idx = rd_u64(buf, 9)?;
             let l2_timestamp = rd_u64(buf, 17)?;
+            let l1_origin = rd_u64(buf, 25)?;
             Ok(EgressItem::Boundary(BlockBoundaryStart {
                 block_number,
                 end_tx_idx: BPosition::from_index(end_tx_idx),
                 l2_timestamp,
+                l1_origin,
             }))
         }
         EGRESS_KIND_REPLAY_UNAVAILABLE => Ok(EgressItem::ReplayUnavailable {
@@ -367,8 +412,54 @@ fn decode_relayed_payload(p: &[u8]) -> Result<TxOrderingMessage, WireError> {
                 },
             )))
         }
+        RT_EPOCH => {
+            // The rkyv body sits at offset 33 of the relayed payload (after the
+            // canonical id and the record type), so it is NEVER 8-aligned in
+            // place — rkyv refuses to read it without a copy into an aligned
+            // buffer. Every other record type decodes field-by-field and so
+            // never hits this. Epochs are ~one per L1 block, so the copy is
+            // immaterial; the alternative (padding the frame to realign) would
+            // have to survive the Java relay byte-for-byte.
+            let mut aligned = rkyv::util::AlignedVec::<8>::with_capacity(fields.len());
+            aligned.extend_from_slice(fields);
+            let epoch: EpochRecord = rkyv::from_bytes::<EpochRecord, rkyv::rancor::Error>(&aligned)
+                .map_err(|e| WireError::BadEpoch(e.to_string()))?;
+            // The canonical id is derived from the epoch itself, so a relayed
+            // record whose id does not match its payload has been tampered
+            // with or mis-encoded — reject rather than trust the header.
+            if epoch.canonical_id() != id {
+                return Err(WireError::BadEpoch(format!(
+                    "canonical id {id} does not match epoch for L1 block {}",
+                    epoch.l1_number
+                )));
+            }
+            Ok(TxOrderingMessage::Epoch(epoch))
+        }
         other => Err(WireError::BadRecordType(other)),
     }
+}
+
+/// Encode an [`EpochRecord`] as an ORIGIN-ADVANCING ingress message:
+/// `[kind=4][canonical_id:32][l1_origin:u64][slot_count:u32][RT_EPOCH][rkyv
+/// EpochRecord…]`.
+///
+/// The service closes the current block before relaying this, so the epoch's
+/// deposits lead a block, and adopts `l1_origin` for later boundaries.
+/// `slot_count` is [`epoch_slots`].
+pub fn encode_ingress_epoch(epoch: &EpochRecord) -> Result<Vec<u8>, WireError> {
+    let body = rkyv::to_bytes::<rkyv::rancor::Error>(epoch)
+        .map_err(|e| WireError::BadEpoch(e.to_string()))?;
+    let slots = u32::try_from(epoch_slots(epoch)).map_err(|_| {
+        WireError::BadEpoch(format!("{} deposits overflows u32", epoch.deposits.len()))
+    })?;
+    let mut b = Vec::with_capacity(1 + CANONICAL_ID_LEN + 8 + 4 + 1 + body.len());
+    b.push(KIND_ORIGIN_RECORD);
+    b.extend_from_slice(epoch.canonical_id().as_slice());
+    b.extend_from_slice(&epoch.l1_number.to_le_bytes());
+    b.extend_from_slice(&slots.to_le_bytes());
+    b.push(RT_EPOCH);
+    b.extend_from_slice(&body);
+    Ok(b)
 }
 
 // ── encode (egress: mirrors the Java framing — for tests / a Rust service mock) ─
@@ -385,12 +476,18 @@ pub fn encode_egress_record(index: u64, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Frame a block boundary exactly as the Java service does.
-pub fn encode_egress_boundary(block_number: u64, end_tx_idx: u64, l2_timestamp: u64) -> Vec<u8> {
-    let mut b = Vec::with_capacity(1 + 8 + 8 + 8);
+pub fn encode_egress_boundary(
+    block_number: u64,
+    end_tx_idx: u64,
+    l2_timestamp: u64,
+    l1_origin: u64,
+) -> Vec<u8> {
+    let mut b = Vec::with_capacity(1 + 8 + 8 + 8 + 8);
     b.push(EGRESS_KIND_BOUNDARY);
     b.extend_from_slice(&block_number.to_le_bytes());
     b.extend_from_slice(&end_tx_idx.to_le_bytes());
     b.extend_from_slice(&l2_timestamp.to_le_bytes());
+    b.extend_from_slice(&l1_origin.to_le_bytes());
     b
 }
 
@@ -529,7 +626,7 @@ mod tests {
 
     #[test]
     fn boundary_roundtrip() {
-        let egress = encode_egress_boundary(12, 100, 1_700_000_000_250);
+        let egress = encode_egress_boundary(12, 100, 1_700_000_000_250, 0);
         match decode_egress(&egress).unwrap() {
             EgressItem::Boundary(b) => {
                 assert_eq!(b.block_number, 12);

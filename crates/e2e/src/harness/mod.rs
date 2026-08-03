@@ -434,39 +434,56 @@ impl LocalStack {
             p.suspend();
         }
 
-        // Drain: executor's block freezes (no more boundaries) and the
-        // validator catches up to the same block.
+        // Drain: wait until BOTH consumers have stopped advancing and the
+        // validator is no longer behind.
+        //
+        // NOT "the two gauges are equal". `EXEC_BLOCK_NUMBER` is the newest
+        // DURABLE block — set in the inflight sweep as the state writer
+        // settles — and commits are pipelined to depth 4 (#129), settling "at
+        // a later boundary's sweep, or at end of stream". The sealer is
+        // SIGSTOPped just above, so no later boundary is coming: the last few
+        // executed blocks stay unsettled until the SIGTERM BELOW ends the
+        // stream. Requiring equality here waits for something that cannot
+        // happen until after this loop, so it always burned the full 60s
+        // (observed: executor durable 3, validator committed 4, forever).
+        //
+        // The validator therefore sits legitimately AHEAD of the executor's
+        // durability gauge, and can never run ahead of what the executor
+        // actually executed — it verifies off that output. So "both stable,
+        // validator >= executor" is the honest settled condition; the
+        // executor flushes its pipeline on the clean exit that follows, and
+        // the offline phase then compares equal final blocks from the two
+        // persisted DBs.
         let exec_addr = self.executor.metrics_addr;
         let val_addr = self.validator.as_ref().map(|v| v.metrics_addr);
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut last_exec = -1.0f64;
+        let mut last_val = -1.0f64;
         loop {
             let exec_block = metrics::scrape(exec_addr)
                 .await?
                 .value(crate::scenarios::EXEC_BLOCK_NUMBER)
                 .unwrap_or(0.0);
-            let val_ok = match val_addr {
-                None => true,
-                Some(addr) => {
-                    let committed = metrics::scrape(addr)
-                        .await?
-                        .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
-                        .unwrap_or(0.0);
-                    committed == exec_block
-                }
+            let val_block = match val_addr {
+                None => exec_block, // no validator: its half is vacuously settled
+                Some(addr) => metrics::scrape(addr)
+                    .await?
+                    .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                    .unwrap_or(0.0),
             };
-            if val_ok && exec_block == last_exec {
-                break; // stable across one interval AND validator caught up
+            if exec_block == last_exec && val_block == last_val && val_block >= exec_block {
+                break; // both stable across one interval, validator not behind
             }
             last_exec = exec_block;
+            last_val = val_block;
             anyhow::ensure!(
                 std::time::Instant::now() < deadline,
-                "drain: executor/validator did not settle on a common block in 60s"
+                "drain: executor/validator did not settle in 60s                  (executor durable {exec_block}, validator committed {val_block})"
             );
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
 
-        // Both consumers are committed through the same block now, so SIGTERM
+        // Both consumers are caught up now, so SIGTERM
         // them and require a CLEAN exit from each. This doubles as the
         // regression test for the receipts-pump ownership cycle that made the
         // validator ignore SIGTERM entirely (fixed by

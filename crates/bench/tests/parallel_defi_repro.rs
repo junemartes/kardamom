@@ -32,6 +32,7 @@ fn env_for(block: u64) -> ExecEnv {
             block_number: block,
             end_tx_idx: BPosition::from_index(0),
             l2_timestamp: 1_700_000_000 + block * 2,
+            l1_origin: 0,
         },
     )
 }

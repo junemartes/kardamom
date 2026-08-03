@@ -10,7 +10,7 @@
 //! event signature is byte-pinned to the on-chain `ETHLockbox.sol` ABI by
 //! the contracts' bytecode-hash CI check.
 
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
 use alloy_rpc_types_eth::{BlockNumberOrTag, Filter, Log as RpcLog};
 use alloy_sol_types::{SolEvent, sol};
@@ -59,6 +59,21 @@ where
             .map_err(|e| L1SourceError::Provider(e.to_string()))?
             .ok_or(L1SourceError::NotFinalized)?;
         Ok(block.header.number)
+    }
+
+    async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError> {
+        let block = self
+            .provider
+            .get_block_by_number(BlockNumberOrTag::Number(number))
+            .await
+            .map_err(|e| L1SourceError::Provider(e.to_string()))?
+            .ok_or_else(|| {
+                // The caller only ever asks for blocks at or below the
+                // finalized tip, so a miss is a reorg or a lying provider —
+                // not an expected "not yet" like NotFinalized.
+                L1SourceError::Provider(format!("finalized L1 block {number} not found"))
+            })?;
+        Ok(block.header.hash)
     }
 
     async fn deposit_logs(
@@ -117,8 +132,12 @@ pub(crate) fn decode_deposit_log(log: &RpcLog) -> Result<DepositLog, L1SourceErr
     let log_index = log
         .log_index
         .ok_or_else(|| L1SourceError::Decode("log missing log_index".to_string()))?;
+    let block_number = log
+        .block_number
+        .ok_or_else(|| L1SourceError::Decode("log missing block_number".to_string()))?;
 
     Ok(DepositLog {
+        block_number,
         block_hash,
         log_index,
         from: evt.from,

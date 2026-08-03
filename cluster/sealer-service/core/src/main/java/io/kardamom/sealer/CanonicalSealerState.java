@@ -54,8 +54,14 @@ public final class CanonicalSealerState {
     public static final long GENESIS_BLOCK_NUMBER = 1L;
 
     private static final int SNAPSHOT_MAGIC = 0x4B53_4541; // "KSEA"
-    /** v2 appends the contiguity-guard sender map; v1 snapshots still load. */
-    private static final int SNAPSHOT_VERSION = 2;
+    /**
+     * v2 appended the contiguity-guard sender map; v3 appends the L1-origin
+     * trio ({@code l1Origin}, {@code lastL2Timestamp}, {@code lastBoundaryCount})
+     * AFTER it, so v1 and v2 parsing is untouched and older snapshots still
+     * load — the trio defaults to zero, which is exactly the pre-origin state.
+     * A cluster upgrades in place without a coordinated snapshot migration.
+     */
+    private static final int SNAPSHOT_VERSION = 3;
 
     /**
      * FIFO first-seen window. Insertion-ordered, so the oldest inserted id is
@@ -86,6 +92,30 @@ public final class CanonicalSealerState {
     /** Block number the next {@link #onTick(long)} will stamp. */
     private long blockNumber;
 
+    /**
+     * L1 block number stamped into every boundary until the next
+     * origin-advancing record. Echoed from ordered input — this state machine
+     * NEVER reads L1, which is what keeps it deterministic across replicas.
+     */
+    private long l1Origin;
+
+    /**
+     * Timestamp of the last boundary stamped. Boundaries are forced strictly
+     * increasing: a tick-aligned timestamp alone stopped being unique once
+     * {@link #onOriginRecord} can force a second boundary inside the same
+     * 250 ms window, and two blocks sharing a timestamp is a trap for anything
+     * reasoning about block time.
+     */
+    private long lastL2Timestamp;
+
+    /**
+     * {@code canonicalCount} at the last boundary — i.e. how many records the
+     * currently open block already holds. Lets {@link #onOriginRecord} skip
+     * forcing a boundary when the open block is still empty, so a burst of
+     * epochs (L1 catch-up) does not emit a run of empty blocks.
+     */
+    private long lastBoundaryCount;
+
     /** Construct at genesis (block number {@value #GENESIS_BLOCK_NUMBER}). */
     public CanonicalSealerState(int dedupCapacity) {
         this(dedupCapacity, GENESIS_BLOCK_NUMBER);
@@ -105,6 +135,9 @@ public final class CanonicalSealerState {
         };
         this.canonicalCount = 0L;
         this.blockNumber = initialBlockNumber;
+        this.l1Origin = 0L;
+        this.lastL2Timestamp = 0L;
+        this.lastBoundaryCount = 0L;
     }
 
     /**
@@ -244,10 +277,93 @@ public final class CanonicalSealerState {
      * gap-free block numbers.
      */
     public Boundary onTick(long leaderClockMillis) {
-        long l2Timestamp = (leaderClockMillis / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
-        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp);
+        long floored = (leaderClockMillis / TICK_INTERVAL_MS) * TICK_INTERVAL_MS;
+        // Under pure tick cadence `floored` always clears the previous stamp by
+        // a full interval and this max() is a no-op; it only bites after
+        // onOriginRecord forced an extra boundary inside the same window.
+        long l2Timestamp = Math.max(floored, lastL2Timestamp + 1);
+        Boundary boundary = new Boundary(blockNumber, canonicalCount, l2Timestamp, l1Origin);
         blockNumber++;
+        lastL2Timestamp = l2Timestamp;
+        lastBoundaryCount = canonicalCount;
         return boundary;
+    }
+
+    /**
+     * Process one ORIGIN-ADVANCING record: a record whose carrying frame also
+     * declares a new L1 origin (see {@code KIND_ORIGIN_RECORD} in
+     * {@code crates/cluster-adapter/src/wire.rs}). Semantics, in order:
+     *
+     * <ol>
+     *   <li>drop it if the canonical id is a duplicate — every sequencer
+     *       forwards every epoch, so most offers are re-offers of a record
+     *       already ordered, carrying the origin it already adopted;</li>
+     *   <li>close the currently open block (if it holds any records) so the
+     *       record LEADS a block rather than landing mid-block. The forced
+     *       boundary still carries the OLD origin: it closes a block that
+     *       belongs to the old epoch;</li>
+     *   <li>adopt {@code newL1Origin}, so every subsequent boundary carries
+     *       it;</li>
+     *   <li>relay the payload verbatim, exactly like {@link #onRecord}.</li>
+     * </ol>
+     *
+     * <p>{@code slotCount} is how many canonical slots this record claims (see
+     * {@code epoch_slots} in {@code crates/cluster-adapter/src/wire.rs}): an
+     * epoch is the one record that expands to a contiguous RANGE — the marker
+     * plus one slot per deposit — because every slot must map to at most one
+     * transaction downstream. The sealer takes the count on trust since it
+     * never parses the payload; consumers that do parse it re-derive and
+     * fail-stop on a mismatch.</p>
+     *
+     * <p>The origin is echoed, never validated against L1 — this state machine
+     * has no L1 access by design. Monotonicity is enforced because that check
+     * is purely local to replicated state.</p>
+     *
+     * @param newL1Origin the L1 block number this record's epoch belongs to
+     * @param slotCount canonical slots claimed; must be >= 1
+     * @return empty if the record was a duplicate; otherwise the forced
+     *         boundary (if any) and the relayed record
+     * @throws IllegalArgumentException if {@code newL1Origin} does not advance
+     *         or {@code slotCount} is below 1
+     */
+    public Optional<OriginAdvance> onOriginRecord(
+            byte[] canonicalId32,
+            long newL1Origin,
+            long slotCount,
+            byte[] payload,
+            long leaderClockMillis) {
+        if (slotCount < 1) {
+            // A zero-width record would make the next record reuse this index,
+            // and the consumer's dense cursor keys records BY index.
+            throw new IllegalArgumentException("slotCount must be >= 1, got " + slotCount);
+        }
+        // Dedup FIRST. Checking monotonicity before dedup would reject the M
+        // racing sequencers' normal re-offers as regressions.
+        if (!firstSeen(canonicalId32)) {
+            return Optional.empty();
+        }
+        if (newL1Origin <= l1Origin) {
+            // Not a duplicate, yet claiming an origin at or below the current
+            // one: two producers disagree about L1. Rejecting keeps l1Origin
+            // monotonic, which the derivation rules depend on.
+            throw new IllegalArgumentException(
+                    "l1Origin must advance: have " + l1Origin + ", got " + newL1Origin);
+        }
+        Boundary forced = null;
+        if (canonicalCount > lastBoundaryCount) {
+            forced = onTick(leaderClockMillis);
+        }
+        l1Origin = newL1Origin;
+        long index = canonicalCount;
+        // The record is relayed at the FIRST slot of its range; the rest of the
+        // range is consumed here so the next record starts past the deposits.
+        canonicalCount += slotCount;
+        return Optional.of(new OriginAdvance(forced, new Relayed(index, payload)));
+    }
+
+    /** L1 origin currently stamped into boundaries. */
+    public long l1Origin() {
+        return l1Origin;
     }
 
     /** Cumulative count of canonical records relayed so far. */
@@ -302,13 +418,18 @@ public final class CanonicalSealerState {
      *
      * <p>Layout (big-endian): magic(4) | version(4) | canonicalCount(8) |
      * blockNumber(8) | idCount(4) | idCount * 32 | senderCount(4) |
-     * senderCount * (sender 20 + expectedNonce 8).</p>
+     * senderCount * (sender 20 + expectedNonce 8) | l1Origin(8) |
+     * lastL2Timestamp(8) | lastBoundaryCount(8).</p>
+     *
+     * <p>The v3 origin trio is APPENDED after the v2 sender map so v1/v2
+     * parsing is byte-identical and older snapshots keep loading.</p>
      */
     public byte[] takeSnapshot() {
         int idCount = dedup.size();
         int senderCount = expectedNonce.size();
         int size = 4 + 4 + 8 + 8 + 4 + idCount * CANONICAL_ID_LEN
-                + 4 + senderCount * (SENDER_LEN + 8);
+                + 4 + senderCount * (SENDER_LEN + 8)
+                + 8 + 8 + 8;
         ByteBuffer buf = ByteBuffer.allocate(size).order(ByteOrder.BIG_ENDIAN);
         buf.putInt(SNAPSHOT_MAGIC);
         buf.putInt(SNAPSHOT_VERSION);
@@ -331,6 +452,10 @@ public final class CanonicalSealerState {
             buf.put(raw);
             buf.putLong(e.getValue());
         }
+        // v3 tail.
+        buf.putLong(l1Origin);
+        buf.putLong(lastL2Timestamp);
+        buf.putLong(lastBoundaryCount);
         return buf.array();
     }
 
@@ -348,7 +473,7 @@ public final class CanonicalSealerState {
                     "bad snapshot magic: 0x" + Integer.toHexString(magic));
         }
         int version = buf.getInt();
-        if (version != 1 && version != SNAPSHOT_VERSION) {
+        if (version != 1 && version != 2 && version != SNAPSHOT_VERSION) {
             throw new IllegalArgumentException("unsupported snapshot version: " + version);
         }
         long canonicalCount = buf.getLong();
@@ -403,9 +528,15 @@ public final class CanonicalSealerState {
                 state.expectedNonce.put(ByteBuffer.wrap(raw).asReadOnlyBuffer(), expected);
             }
         }
+        if (version >= 3) {
+            state.l1Origin = buf.getLong();
+            state.lastL2Timestamp = buf.getLong();
+            state.lastBoundaryCount = buf.getLong();
+        }
         // A v1 snapshot (pre-guard deploy) restores an EMPTY guard map: every
         // sender re-seeds on its next record — trust-on-first-sight, honest
-        // degradation, no false rejects.
+        // degradation, no false rejects. A v1/v2 snapshot (pre-origin)
+        // restores origin 0, which is exactly the state that chain was in.
         state.canonicalCount = canonicalCount;
         return state;
     }

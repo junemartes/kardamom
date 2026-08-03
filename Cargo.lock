@@ -4045,6 +4045,7 @@ name = "kardamom-types"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "bytes",
  "rkyv",
  "serde",

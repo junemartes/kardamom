@@ -15,12 +15,12 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_sequencer::config::SequencerConfig;
-use kardamom_sequencer::deposit::{DepositSubscriber, process_deposit};
+use kardamom_sequencer::epoch::{EpochSubscriber, process_epoch};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
-use kardamom_types::{BPosition, Deposit, TxDataLoc, TxEnvelope, TxError};
+use kardamom_types::{BPosition, EpochRecord, TxDataLoc, TxEnvelope, TxError};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -434,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
         cluster_pub.clone(),
         cluster_pub,
         LiveTxErrorPub::new(tx_errors_pub),
-        LiveDepositSub::new(tx_deposits_sub),
+        LiveEpochSub::new(tx_deposits_sub),
         Some(resync_controller),
         shutdown_for_main,
         shutdown_for_deposits,
@@ -449,9 +449,9 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::error!(error = %e, "sequencer task panicked"),
     }
     match join_deposits.await {
-        Ok(Ok(())) => tracing::info!("sequencer deposit pump returned cleanly"),
-        Ok(Err(e)) => tracing::error!(error = %e, "sequencer deposit pump returned an error"),
-        Err(e) => tracing::error!(error = %e, "sequencer deposit task panicked"),
+        Ok(Ok(())) => tracing::info!("sequencer epoch pump returned cleanly"),
+        Ok(Err(e)) => tracing::error!(error = %e, "sequencer epoch pump returned an error"),
+        Err(e) => tracing::error!(error = %e, "sequencer epoch task panicked"),
     }
     // Drop the cluster session only after both loops have stopped. This also
     // closes the egress channel, unblocking the watermark thread; the
@@ -499,7 +499,7 @@ type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
 /// Spawn the main sequencer loop + the deposit pump over a pair of
 /// `TxOrderingRefPublisher`s (`main_pub` for the canonical `TxRef` loop,
-/// `deposit_pub` for the `DepositRef` pump). Generic over the publisher type so
+/// `deposit_pub` for the epoch pump). Generic over the publisher type so
 /// the Aeron and cluster branches share one implementation; both supply
 /// concrete publishers that impl the trait.
 #[allow(clippy::too_many_arguments)]
@@ -509,7 +509,7 @@ fn spawn_publish_loops<P>(
     main_pub: P,
     deposit_pub: P,
     mut tx_errors: LiveTxErrorPub,
-    mut deposit_sub: LiveDepositSub,
+    mut epoch_sub: LiveEpochSub,
     resync: Option<kardamom_sequencer::resync::ResyncController>,
     shutdown_for_main: Shutdown,
     shutdown_for_deposits: Shutdown,
@@ -534,17 +534,17 @@ where
         )
     });
 
-    // Independent pump for tx_deposits → DepositRef on tx_ordering. The
-    // deposit path is not nonce-gated; it's a simple poll → publish loop
+    // Independent pump for tx_deposits → epoch on tx_ordering. The epoch
+    // path is not nonce-gated; it's a simple poll → publish loop
     // that runs alongside the canonical TxData → TxRef path.
-    let mut deposit_pub = deposit_pub;
+    let mut epoch_pub = deposit_pub;
     let join_deposits = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
         let mut backoff_us = 1u64;
         loop {
             if shutdown_for_deposits.is_signaled() {
                 return Ok(());
             }
-            match process_deposit(&mut deposit_sub, &mut deposit_pub) {
+            match process_epoch(&mut epoch_sub, &mut epoch_pub) {
                 Ok(true) => backoff_us = 1,
                 Ok(false) => {
                     std::thread::sleep(Duration::from_micros(backoff_us));
@@ -584,18 +584,18 @@ impl TxDataSubscriber for LiveTxDataSub {
     }
 }
 
-struct LiveDepositSub {
+struct LiveEpochSub {
     handle: TxDepositsSubscriberHandle,
 }
 
-impl LiveDepositSub {
+impl LiveEpochSub {
     fn new(handle: TxDepositsSubscriberHandle) -> Self {
         Self { handle }
     }
 }
 
-impl DepositSubscriber for LiveDepositSub {
-    fn poll(&mut self) -> Result<Option<(BPosition, Deposit)>, SequencerError> {
+impl EpochSubscriber for LiveEpochSub {
+    fn poll(&mut self) -> Result<Option<(BPosition, EpochRecord)>, SequencerError> {
         Ok(self.handle.try_recv())
     }
 }

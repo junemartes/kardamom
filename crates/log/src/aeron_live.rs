@@ -65,7 +65,7 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use crate::offer_retry::{OFFER_TIMEOUT, offer_code_str};
 use kardamom_types::{
-    BPosition, BlockBoundary, Deposit, FsyncWatermark, QuorumWatermark, Receipt, TxDataLoc,
+    BPosition, BlockBoundary, EpochRecord, FsyncWatermark, QuorumWatermark, Receipt, TxDataLoc,
     TxEnvelope, TxError,
 };
 
@@ -1431,8 +1431,8 @@ impl TxDepositsPublisherHandle {
         })
     }
 
-    pub fn publish(&self, d: &Deposit) -> Result<BPosition, LogError> {
-        self.inner.publish(d)
+    pub fn publish(&self, e: &EpochRecord) -> Result<BPosition, LogError> {
+        self.inner.publish(e)
     }
 
     pub fn raw(&self) -> &PubHandle {
@@ -1441,22 +1441,24 @@ impl TxDepositsPublisherHandle {
 }
 
 pub struct TxDepositsSubscriberHandle {
-    rx: UnboundedReceiver<(BPosition, Deposit)>,
+    rx: UnboundedReceiver<(BPosition, EpochRecord)>,
 }
 
 impl TxDepositsSubscriberHandle {
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
-            rx: rt
-                .open_subscription::<Deposit>(&ch.tx_deposits_channel, ch.tx_deposits_stream_id)?,
+            rx: rt.open_subscription::<EpochRecord>(
+                &ch.tx_deposits_channel,
+                ch.tx_deposits_stream_id,
+            )?,
         })
     }
 
-    pub async fn recv(&mut self) -> Option<(BPosition, Deposit)> {
+    pub async fn recv(&mut self) -> Option<(BPosition, EpochRecord)> {
         self.rx.recv().await
     }
 
-    pub fn try_recv(&mut self) -> Option<(BPosition, Deposit)> {
+    pub fn try_recv(&mut self) -> Option<(BPosition, EpochRecord)> {
         self.rx.try_recv().ok()
     }
 }

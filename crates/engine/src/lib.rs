@@ -37,8 +37,7 @@ pub use error::{EngineError, ExecutorError};
 pub use exec_types::{CMessage, ReceiptStatus, TxIndex};
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
-    DepositJoinBuffer, DepositSubscription, JoinBuffer, ReaderConfig, ReaderToExec,
-    TxDataSubscription, TxOrderingSubscription,
+    JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
 };
 pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};
 pub use state::{

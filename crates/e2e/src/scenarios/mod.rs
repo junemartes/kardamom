@@ -12,6 +12,7 @@ pub mod bridge;
 pub mod consistency;
 pub mod crash_recovery;
 pub mod da_parity;
+pub mod derivation;
 pub mod divergence;
 pub mod l1_batch;
 pub mod nonce_gap;

@@ -160,6 +160,7 @@ mod tests {
             block_number,
             end_tx_idx: BPosition::from_index(block_number),
             l2_timestamp: 1_700_000_000 + block_number,
+            l1_origin: 0,
         }
     }
 

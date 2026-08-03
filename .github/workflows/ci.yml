@@ -4,6 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger. The three e2e workflows already have one; CI lacking it
+  # meant that when GitHub stopped delivering `pull_request` events for a
+  # branch, the lint/test lane was the one lane with no way to run at all.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

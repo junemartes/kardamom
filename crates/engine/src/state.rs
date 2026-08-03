@@ -308,6 +308,7 @@ mod tests {
             block_number: 1,
             end_tx_idx: BPosition::ZERO,
             l2_timestamp: 0,
+            l1_origin: 0,
         };
         q.submit(boundary, delta).unwrap();
 

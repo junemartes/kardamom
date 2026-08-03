@@ -1,9 +1,13 @@
-//! Outbound sink: the [`DepositPublisher`] trait the DA watcher writes
-//! [`kardamom_types::Deposit`] envelopes to. Production binds this to a
+//! Outbound sink: the [`EpochPublisher`] trait the DA watcher writes
+//! [`kardamom_types::EpochRecord`]s to. Production binds this to a
 //! `kardamom_log::aeron_live::TxDepositsPublisherHandle`; tests use the
 //! in-memory fake in [`fakes`].
+//!
+//! The unit is an EPOCH, not a deposit: one record per finalized L1 block,
+//! carrying that block's deposits by value and emitted even when there are
+//! none. See `docs/agents/l1-origin-deposit-derivation-spec.md`.
 
-use kardamom_types::{BPosition, Deposit};
+use kardamom_types::{BPosition, EpochRecord};
 
 /// Errors a publish can surface.
 #[derive(Debug, thiserror::Error)]
@@ -21,36 +25,36 @@ pub enum PublishError {
     Transport(String),
 }
 
-/// Sink for deposits the watcher emits. Implementors must be `Send + Sync`
+/// Sink for epochs the watcher emits. Implementors must be `Send + Sync`
 /// because the watcher's tokio task moves them between executions.
-pub trait DepositPublisher: Send + Sync + 'static {
-    /// Publish a single deposit. Returns the assigned wire position
-    /// (analogous to Aeron's offer-position) so callers can correlate.
-    fn publish(&self, deposit: &Deposit) -> Result<BPosition, PublishError>;
+pub trait EpochPublisher: Send + Sync + 'static {
+    /// Publish one epoch. Returns the assigned wire position (analogous to
+    /// Aeron's offer-position) so callers can correlate.
+    fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError>;
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod fakes {
     use std::sync::{Arc, Mutex};
 
     use super::*;
 
-    /// In-memory `DepositPublisher` that records every published deposit
-    /// in order. The synthesised `BPosition` advances by `64` per record so
-    /// tests can assert positions without coupling to Aeron framing.
+    /// In-memory [`EpochPublisher`] that records every published epoch in
+    /// order. The synthesised `BPosition` advances by `64` per record so tests
+    /// can assert positions without coupling to Aeron framing.
     #[derive(Default, Clone)]
-    pub struct InMemoryDepositPublisher {
-        pub published: Arc<Mutex<Vec<Deposit>>>,
+    pub struct InMemoryEpochPublisher {
+        pub published: Arc<Mutex<Vec<EpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
     }
 
-    impl DepositPublisher for InMemoryDepositPublisher {
-        fn publish(&self, deposit: &Deposit) -> Result<BPosition, PublishError> {
+    impl EpochPublisher for InMemoryEpochPublisher {
+        fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(PublishError::Backpressure);
             }
             let mut v = self.published.lock().unwrap();
-            v.push(deposit.clone());
+            v.push(epoch.clone());
             Ok(BPosition {
                 term_id: 0,
                 term_offset: (v.len() as i32) * 64,
@@ -62,38 +66,34 @@ pub mod fakes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy_primitives::{Address, B256, U256};
-    use bytes::Bytes;
-    use fakes::InMemoryDepositPublisher;
+    use alloy_primitives::B256;
+    use fakes::InMemoryEpochPublisher;
 
-    fn deposit() -> Deposit {
-        Deposit {
-            source_hash: B256::repeat_byte(0x42),
-            from: Address::repeat_byte(0x11),
-            to: Some(Address::repeat_byte(0x22)),
-            mint: 1_000,
-            value: U256::from(1_000u64),
-            gas_limit: 100_000,
-            is_system_transaction: false,
-            input: Bytes::new(),
+    fn epoch(n: u64) -> EpochRecord {
+        EpochRecord {
+            l1_number: n,
+            l1_hash: B256::repeat_byte(n as u8),
+            deposits: Vec::new(),
         }
     }
 
     #[test]
     fn in_memory_publisher_records_in_order() {
-        let p = InMemoryDepositPublisher::default();
-        let pos1 = p.publish(&deposit()).unwrap();
-        let pos2 = p.publish(&deposit()).unwrap();
-        assert!(pos2.term_offset > pos1.term_offset);
-        assert_eq!(p.published.lock().unwrap().len(), 2);
+        let p = InMemoryEpochPublisher::default();
+        p.publish(&epoch(1)).unwrap();
+        p.publish(&epoch(2)).unwrap();
+        let got = p.published.lock().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].l1_number, 1);
+        assert_eq!(got[1].l1_number, 2);
     }
 
     #[test]
-    fn in_memory_publisher_surfaces_backpressure() {
-        let p = InMemoryDepositPublisher::default();
+    fn in_memory_publisher_can_simulate_backpressure() {
+        let p = InMemoryEpochPublisher::default();
         *p.fail_with_backpressure.lock().unwrap() = true;
         assert!(matches!(
-            p.publish(&deposit()),
+            p.publish(&epoch(1)),
             Err(PublishError::Backpressure)
         ));
         assert!(p.published.lock().unwrap().is_empty());

@@ -22,9 +22,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_executor::{
-    CMessage, DepositSubscription, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig,
-    MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription,
-    TxOrderingSubscription, TxReceiptsPublication,
+    CMessage, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, MdbxSnapshotSource,
+    MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription, TxOrderingSubscription,
+    TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
@@ -326,7 +326,6 @@ async fn main() -> Result<()> {
     // neither stream — a resuming process had no tx_data source at all).
     let a_subs: Vec<Box<dyn TxDataSubscription>> =
         bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
-    let dep_sub: Box<dyn DepositSubscription> = bin_support::open_tx_deposits_sub(&rt, &channels)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -465,7 +464,6 @@ async fn main() -> Result<()> {
             cfg,
             a_subs,
             b_sub,
-            Some(dep_sub),
             c_pub,
             snapshots,
             sw_signal,

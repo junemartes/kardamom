@@ -213,6 +213,11 @@ where
             block_number: block.block_number,
             end_tx_idx: BPosition::from_index(counters.global_pos),
             l2_timestamp: block.l2_timestamp,
+            // Offline replay reconstructs from the DA payload, which does not
+            // carry the origin yet (KAR2 adds it — see the deposit-derivation
+            // spec). Zero here is honest: reconstruction currently derives no
+            // deposits, so no block it builds has an epoch to point at.
+            l1_origin: 0,
         };
         queue.submit(boundary, block_delta)?;
         signal.wait_committed(block.block_number)?;

@@ -257,6 +257,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
                     // count — here all BATCH txs. (Not the last tx's index.)
                     end_tx_idx: BPosition::from_index(BATCH),
                     l2_timestamp: 0,
+                    l1_origin: 0,
                 }),
             ))
             .unwrap();
@@ -277,7 +278,6 @@ fn bench_actor_throughput(c: &mut Criterion) {
                     },
                     a_subs,
                     b_sub,
-                    None,
                     ChanCPub(c_tx),
                     snapshots,
                     Imm,

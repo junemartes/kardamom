@@ -30,6 +30,7 @@ fn boundary_emits_block_with_pending_txs() {
         block_number: 7,
         end_tx_idx: pos(128),
         l2_timestamp: 1234,
+        l1_origin: 0,
     });
     assert_eq!(closed.block_number, 7);
     assert_eq!(closed.txs.len(), 2);
@@ -45,11 +46,13 @@ fn back_to_back_boundaries_emit_empty_blocks() {
         block_number: 1,
         end_tx_idx: pos(0),
         l2_timestamp: 100,
+        l1_origin: 0,
     });
     let next = acc.observe_boundary(BlockBoundaryStart {
         block_number: 2,
         end_tx_idx: pos(0),
         l2_timestamp: 200,
+        l1_origin: 0,
     });
     assert_eq!(next.block_number, 2);
     assert!(next.txs.is_empty());
@@ -63,6 +66,7 @@ fn txs_interleave_correctly_across_three_blocks() {
         block_number: 1,
         end_tx_idx: pos(64),
         l2_timestamp: 100,
+        l1_origin: 0,
     });
     acc.observe_tx(env(2), pos(64));
     acc.observe_tx(env(3), pos(128));
@@ -70,11 +74,13 @@ fn txs_interleave_correctly_across_three_blocks() {
         block_number: 2,
         end_tx_idx: pos(192),
         l2_timestamp: 200,
+        l1_origin: 0,
     });
     let b3 = acc.observe_boundary(BlockBoundaryStart {
         block_number: 3,
         end_tx_idx: pos(192),
         l2_timestamp: 300,
+        l1_origin: 0,
     });
 
     assert_eq!(b1.txs.len(), 1);

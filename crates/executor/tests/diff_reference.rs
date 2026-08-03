@@ -250,6 +250,7 @@ fn actor_receipts_match_naive_reference() {
             // txs applied), encoded via bpos (== BPosition::from_index here).
             end_tx_idx: bpos(pairs.len() as i32),
             l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
         }),
     ))
     .unwrap();
@@ -272,7 +273,6 @@ fn actor_receipts_match_naive_reference() {
             },
             a_subs,
             b_sub,
-            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,

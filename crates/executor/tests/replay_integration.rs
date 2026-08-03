@@ -159,6 +159,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
                 block_number: blk,
                 end_tx_idx: bpos(bpos_off),
                 l2_timestamp: 1_700_000_000 + blk,
+                l1_origin: 0,
             }),
         ))
         .unwrap();
@@ -183,7 +184,6 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             cfg,
             a_subs,
             b_sub,
-            None,
             ChanCPub(c_tx),
             snapshots,
             Imm,
@@ -215,6 +215,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
                     block_number,
                     end_tx_idx: _,
                     l2_timestamp: _,
+                    l1_origin: _,
                 } = b;
                 assert!((1..=3).contains(&block_number));
                 boundaries += 1;

@@ -301,4 +301,121 @@ impl L1 {
         let log_index = log.log_index.context("log carries no index")?;
         Ok((block_hash, log_index))
     }
+
+    /// Several `depositETH` calls landing in ONE L1 block — i.e. one epoch
+    /// with several deposits.
+    ///
+    /// Auto-mining is disabled for the duration so the sends queue up, then a
+    /// single `evm_mine` seals them together. Sending them under auto-mine
+    /// would put each in its own block and test nothing about grouping.
+    ///
+    /// Returns `(block_hash, block_number, log_index)` per deposit.
+    pub async fn deposit_eth_batch(
+        &self,
+        recipients: &[Address],
+        value: U256,
+    ) -> Result<Vec<(B256, u64, u64)>> {
+        let provider = self.wallet(DEPOSITOR_KEY)?;
+        let raw = self.provider();
+        let _: serde_json::Value = raw
+            .raw_request("evm_setAutomine".into(), (false,))
+            .await
+            .context("evm_setAutomine(false)")?;
+
+        let lockbox = ETHLockbox::new(self.lockbox, &provider);
+        let mut pending = Vec::new();
+        for to in recipients {
+            let p = lockbox
+                .depositETH(*to, 200_000u64, Bytes::new())
+                .value(value)
+                .send()
+                .await
+                .context("send depositETH (batched)")?;
+            pending.push(p);
+        }
+
+        let _: serde_json::Value = raw
+            .raw_request("evm_mine".into(), ())
+            .await
+            .context("evm_mine (seal batch)")?;
+        let _: serde_json::Value = raw
+            .raw_request("evm_setAutomine".into(), (true,))
+            .await
+            .context("evm_setAutomine(true)")?;
+
+        let mut out = Vec::new();
+        for p in pending {
+            let receipt = p
+                .get_receipt()
+                .await
+                .context("batched depositETH receipt")?;
+            anyhow::ensure!(receipt.status(), "batched depositETH reverted");
+            let log = receipt
+                .inner
+                .logs()
+                .iter()
+                .find(|l| l.address() == self.lockbox)
+                .context("no DepositInitiated log from the lockbox")?;
+            out.push((
+                log.block_hash.context("log carries no block hash")?,
+                log.block_number.context("log carries no block number")?,
+                log.log_index.context("log carries no index")?,
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Stop L1 block production entirely (anvil runs with `block_time(1)`, so
+    /// simply not calling [`mine`](Self::mine) does NOT make L1 idle).
+    /// Pairs with [`resume_block_production`](Self::resume_block_production).
+    pub async fn pause_block_production(&self) -> Result<()> {
+        let _: serde_json::Value = self
+            .provider()
+            .raw_request("evm_setAutomine".into(), (false,))
+            .await
+            .context("evm_setAutomine(false)")?;
+        Ok(())
+    }
+
+    /// Resume automatic L1 block production.
+    pub async fn resume_block_production(&self) -> Result<()> {
+        let _: serde_json::Value = self
+            .provider()
+            .raw_request("evm_setAutomine".into(), (true,))
+            .await
+            .context("evm_setAutomine(true)")?;
+        Ok(())
+    }
+
+    /// Latest finalized L1 block number — the same view the da-watcher tails.
+    pub async fn finalized_block_number(&self) -> Result<u64> {
+        let block = self
+            .provider()
+            .get_block_by_number(alloy_eips::BlockNumberOrTag::Finalized)
+            .await
+            .context("get finalized block")?
+            .context("L1 has no finalized block yet")?;
+        Ok(block.header.number)
+    }
+
+    /// Every `DepositInitiated` log the lockbox emitted in `[from, to]`,
+    /// decoded through the SAME rule the producer uses.
+    ///
+    /// Tests compare the chain against this, so re-implementing the decode
+    /// here would let a producer bug and a test bug cancel out.
+    pub async fn deposit_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<kardamom_types::DepositLog>> {
+        // Built locally rather than via `provider()`: that returns an
+        // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(self.anvil.endpoint_url());
+        let source = kardamom_da_watcher::RpcL1Source::new(provider);
+        kardamom_da_watcher::L1Source::deposit_logs(&source, self.lockbox, from_block, to_block)
+            .await
+            .context("read deposit logs")
+    }
 }
