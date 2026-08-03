@@ -701,8 +701,8 @@ fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError> {
 fn peek_nonce(b: &[u8]) -> Option<u64> {
     // (payload_start, skip_fields) for the list holding the nonce.
     let (mut i, skip) = match b.first()? {
-        0x01 | 0x02 | 0x03 => (1usize, 1usize), // typed: [chain_id, nonce, ..]
-        f if *f >= 0xc0 => (0usize, 0usize),    // legacy: [nonce, ..]
+        0x01..=0x03 => (1usize, 1usize),     // typed: [chain_id, nonce, ..]
+        f if *f >= 0xc0 => (0usize, 0usize), // legacy: [nonce, ..]
         _ => return None,
     };
     // Enter the outer list.

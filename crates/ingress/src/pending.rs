@@ -116,9 +116,12 @@ pub struct PendingReceipts {
     /// a tick O(released + log parked) with zero steady-state allocation.
     /// Entries are inserted only when a receipt arrives still-gated; a
     /// dropped waiter's Weak simply fails to upgrade at drain.
-    parked: std::sync::Mutex<std::collections::BTreeMap<(BPosition, u64), Weak<Mutex<Entry>>>>,
+    parked: std::sync::Mutex<ParkedIndex>,
     park_seq: std::sync::atomic::AtomicU64,
 }
+
+/// `(tx_idx, insertion seq) → parked entry`, ordered by watermark.
+type ParkedIndex = std::collections::BTreeMap<(BPosition, u64), Weak<Mutex<Entry>>>;
 
 impl Default for PendingReceipts {
     fn default() -> Self {
