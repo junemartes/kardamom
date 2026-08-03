@@ -69,3 +69,48 @@ pub async fn publish_corrupt_bal(aeron_dir: &Path, blocks: Vec<u64>) -> Result<(
     .await
     .context("injection task join")?
 }
+
+/// Publish a FORGED epoch onto `tx_deposits` — an epoch claiming L1 block
+/// `l1_number` with a hash L1 never produced.
+///
+/// The sequencer forwards it verbatim onto the canonical stream (it is not the
+/// sequencer's job to know what L1 said), the sealer accepts it because the
+/// origin advances, and the validator — which re-derives every epoch from L1 —
+/// must find the hash does not match and fail-stop.
+///
+/// The bogus hash is what makes the drill deterministic: an epoch's canonical
+/// id is `keccak(l1_hash)`, so a forged hash yields an id the cluster has never
+/// seen and dedup cannot swallow the injection. Pair with
+/// [`crate::harness::LocalStack::suspend_da_watcher`] so the honest epoch for
+/// the same L1 block does not race it.
+pub async fn publish_forged_epoch(aeron_dir: &Path, l1_number: u64) -> Result<()> {
+    let aeron_dir = aeron_dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let channels = LogConfig::resolve(None)
+            .context("resolve log config")?
+            .channels;
+        let rt = AeronRuntime::spawn_with_dir(&aeron_dir).context("attach injection runtime")?;
+        let dep_pub = rt
+            .open_publication(
+                &channels.tx_deposits_channel,
+                channels.tx_deposits_stream_id,
+            )
+            .context("open tx_deposits publication")?;
+        // Structurally valid, semantically a lie: the fault must be in what
+        // the epoch CLAIMS, not in its encoding — otherwise the drill only
+        // tests the codec (the lesson S7 learned the hard way).
+        let forged = kardamom_types::EpochRecord {
+            l1_number,
+            l1_hash: B256::repeat_byte(0xF0),
+            deposits: Vec::new(),
+        };
+        for _round in 0..10 {
+            let bytes = kardamom_log::codec::encode(&forged).context("encode forged epoch")?;
+            dep_pub.publish_best_effort(bytes);
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+        Ok(())
+    })
+    .await
+    .context("injection task join")?
+}

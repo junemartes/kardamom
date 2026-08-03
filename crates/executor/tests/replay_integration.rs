@@ -194,6 +194,9 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             // Whole-block exec strategy (validator parallel path).
             None,
             None,
+            // The executor trusts the ordered stream (phase 2 would
+            // give it its own L1 dependency); only the validator verifies.
+            None,
         )
     });
 

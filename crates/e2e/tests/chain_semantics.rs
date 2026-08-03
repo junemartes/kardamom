@@ -587,3 +587,28 @@ async fn s10e_every_l1_deposit_appears_exactly_once() {
         .await
         .expect("S10e");
 }
+
+/// S11: a forged epoch must halt the validator. S10a-e prove an honest
+/// producer builds a derivable chain; this proves the guarantee has teeth —
+/// an epoch L1 never produced is rejected rather than committed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s11_forged_epoch_halts_validator() {
+    let Some(stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        validator: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    let l1 = stack.l1().expect("l1");
+    divergence::forged_epoch_halts_validator(&stack, &t, l1)
+        .await
+        .expect("S11");
+}

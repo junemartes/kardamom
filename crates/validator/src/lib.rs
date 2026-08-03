@@ -35,6 +35,7 @@ pub mod flight;
 pub mod parallel;
 
 pub mod attester;
+pub mod epoch_verify;
 pub mod metrics;
 
 /// Shared divergence flag. Once tripped, the validator has observed a proven
