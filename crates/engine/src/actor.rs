@@ -560,6 +560,20 @@ where
                         return Ok(());
                     }
                     Recv::IdleProbe => {
+                        // Settle ONLY at a block edge: with a block OPEN
+                        // (scope materialized / records buffered), the live
+                        // ExecScope's cache is seeded against the CURRENT
+                        // snapshot ∘ parent — swapping the snapshot and
+                        // rebuilding parent under it mid-block mixes read
+                        // bases and diverges execution (caught by the load
+                        // shard's validator divergence latch on the first
+                        // soak of this probe). Between blocks — the idle-tail
+                        // case this probe exists for — both are empty, and a
+                        // mid-block gap simply defers to the next boundary's
+                        // sweep exactly as before the probe existed.
+                        if scope.is_some() || !buffered.is_empty() {
+                            continue;
+                        }
                         // Same non-blocking settle sweep as the boundary arm,
                         // minus the full-depth blocking wait (an idle probe
                         // must never park).
