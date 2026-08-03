@@ -192,11 +192,17 @@ pub fn fetch_latest_checkpoint(
         // Already have this exact checkpoint — nothing to transfer.
         return Ok(Some(CheckpointInfo { block, path: dest }));
     }
+    // Build the same shape `create_checkpoint` produces — a directory holding
+    // `mdbx.dat` + `MANIFEST` — under a hidden tmp name, so the checkpoint we
+    // publish is self-contained and re-verifiable from disk.
     let tmp = checkpoints_dir.join(format!(".{}.fetch.tmp", checkpoint_name(block)));
-    let mut out = std::fs::File::create(&tmp)?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let tmp_data = tmp.join("mdbx.dat");
+    let mut out = std::fs::File::create(&tmp_data)?;
     let copied = std::io::copy(&mut reader.by_ref().take(len), &mut out)?;
     if copied != len {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint transfer from {peer} truncated: got {copied} of {len} bytes"
         )));
@@ -209,23 +215,23 @@ pub fn fetch_latest_checkpoint(
     // a lying peer, or a checkpoint from a previous chain all became this
     // node's state (the recovery-C incident: a stale checkpoint wedged a
     // fresh node into an endless replay request loop).
-    let got = crate::checkpoint::file_keccak(&tmp)?;
+    let got = crate::checkpoint::file_keccak(&tmp_data)?;
     let Some(want) = keccak else {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint peer {peer} sent no x-checkpoint-keccak — refusing an \
              unverifiable image"
         )));
     };
     if got != want {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint transfer from {peer} is CORRUPT: {len} bytes arrived but \
              hash to {got:#x}, peer advertised {want:#x}"
         )));
     }
     let Some(genesis_digest) = genesis else {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint peer {peer} sent no x-checkpoint-genesis — refusing an \
              unidentifiable image"
@@ -234,24 +240,22 @@ pub fn fetch_latest_checkpoint(
     if let Some(expect) = expected_genesis
         && expect != genesis_digest
     {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint peer {peer} serves a DIFFERENT CHAIN: its genesis digest \
              is {genesis_digest:#x}, this node's is {expect:#x}"
         )));
     }
 
-    // Persist the manifest beside the image (same order as create: manifest
-    // first, image rename is the commit point) so a LATER restore re-verifies
-    // from disk rather than trusting that this fetch happened.
+    // Persist the manifest INSIDE the checkpoint dir so a LATER restore
+    // re-verifies from disk rather than trusting that this fetch happened;
+    // the rename publishes image + manifest atomically.
     let manifest = crate::checkpoint::CheckpointManifest {
         block,
         image_keccak: got,
         genesis_digest,
     };
-    let mtmp = checkpoints_dir.join(format!(".{}.manifest.fetch.tmp", checkpoint_name(block)));
-    std::fs::write(&mtmp, manifest.encode())?;
-    std::fs::rename(&mtmp, crate::checkpoint::manifest_path(&dest))?;
+    std::fs::write(tmp.join("MANIFEST"), manifest.encode())?;
     std::fs::rename(&tmp, &dest)?;
     info!(
         block,
@@ -359,7 +363,8 @@ mod tests {
     /// chain identity.
     fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -> PathBuf {
         let p = dir.join(checkpoint_name(block));
-        std::fs::write(&p, contents).unwrap();
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("mdbx.dat"), contents).unwrap();
         let manifest = crate::checkpoint::CheckpointManifest {
             block,
             image_keccak: alloy_primitives::keccak256(contents),
@@ -367,6 +372,11 @@ mod tests {
         };
         std::fs::write(crate::checkpoint::manifest_path(&p), manifest.encode()).unwrap();
         p
+    }
+
+    /// Read the image bytes of a dir-mode checkpoint.
+    fn image_bytes(checkpoint: &Path) -> Vec<u8> {
+        std::fs::read(crate::checkpoint::checkpoint_data_file(checkpoint).unwrap()).unwrap()
     }
 
     fn serve_ephemeral(dir: PathBuf) -> SocketAddr {
@@ -393,7 +403,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(got.block, 7);
-        assert_eq!(std::fs::read(&got.path).unwrap(), b"newest image bytes");
+        assert_eq!(image_bytes(&got.path), b"newest image bytes");
         // No tmp residue.
         assert!(
             std::fs::read_dir(local.path()).unwrap().all(|e| !e
@@ -433,7 +443,7 @@ mod tests {
         ];
         let best = fetch_best_checkpoint(&peers, local.path(), 0, None).unwrap();
         assert_eq!(best.block, 9);
-        assert_eq!(std::fs::read(&best.path).unwrap(), b"b9");
+        assert_eq!(image_bytes(&best.path), b"b9");
     }
 
     #[test]
@@ -465,6 +475,6 @@ mod tests {
             .unwrap();
         assert_eq!(got.block, 4);
         // The local copy is kept, not overwritten by the peer's.
-        assert_eq!(std::fs::read(&got.path).unwrap(), b"local bytes");
+        assert_eq!(image_bytes(&got.path), b"local bytes");
     }
 }

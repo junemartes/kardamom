@@ -112,13 +112,14 @@ impl CheckpointManifest {
     }
 }
 
-/// Manifest path for a checkpoint image. Named `<image>.manifest`, which
-/// `parse_checkpoint_block` rejects (the numeric parse fails), so scanners
-/// never mistake it for a checkpoint.
+/// Manifest path for a checkpoint: `<checkpoint>/MANIFEST`, INSIDE the
+/// checkpoint directory. Living inside means the single directory rename
+/// publishes image and manifest atomically, and any copy of the checkpoint —
+/// peer fetch, chaos re-replication, an operator's rsync — carries its
+/// manifest by construction. A sibling file would be silently dropped by
+/// exactly the copy paths the manifest exists to protect.
 pub fn manifest_path(checkpoint: &Path) -> PathBuf {
-    let mut p = checkpoint.as_os_str().to_os_string();
-    p.push(".manifest");
-    PathBuf::from(p)
+    checkpoint.join("MANIFEST")
 }
 
 /// keccak256 of a file's bytes, read in chunks (images are hundreds of MB).
@@ -218,20 +219,18 @@ pub fn create_checkpoint(
     // `latest_checkpoint`/`prune_checkpoints` never see in-progress copies.
     sweep_stale_tmp(checkpoints_dir)?;
     let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
-    compact_to(env, &tmp)?;
-    // Manifest first, image second: the image rename is the commit point, so
-    // an image on disk always has its manifest beside it. The reverse order
-    // would expose a window where a peer fetches (or a restart adopts) an
-    // image that cannot be verified. A crash between the two leaves an orphan
-    // manifest, swept by `sweep_stale_tmp`.
+    let tmp_data = tmp.join("mdbx.dat");
+    compact_to(env, &tmp_data)?;
+    // Manifest INSIDE the tmp dir, then one rename: image and manifest become
+    // visible atomically, so an observable checkpoint is always verifiable
+    // and self-contained under any copy mechanism. A crash before the rename
+    // leaves only the hidden tmp dir, swept by `sweep_stale_tmp`.
     let manifest = CheckpointManifest {
         block,
-        image_keccak: file_keccak(&tmp)?,
+        image_keccak: file_keccak(&tmp_data)?,
         genesis_digest: stored_genesis_digest(env)?,
     };
-    let mtmp = checkpoints_dir.join(format!(".{}.manifest.tmp", checkpoint_name(block)));
-    std::fs::write(&mtmp, manifest.encode())?;
-    std::fs::rename(&mtmp, manifest_path(&dest))?;
+    std::fs::write(tmp.join("MANIFEST"), manifest.encode())?;
     std::fs::rename(&tmp, &dest)?;
     info!(block, path = %dest.display(), "created state checkpoint");
     Ok(CheckpointInfo { block, path: dest })
