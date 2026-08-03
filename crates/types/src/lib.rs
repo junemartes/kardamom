@@ -39,7 +39,7 @@ pub use deposit::{Deposit, DepositRef};
 pub use envelope::TxEnvelope;
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::{BPosition, TxDataLoc};
-pub use receipt::{Receipt, WireLog};
+pub use receipt::{Receipt, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, WireLog, tx_type_of};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;

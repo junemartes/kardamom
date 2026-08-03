@@ -43,6 +43,11 @@ use crate::metrics;
 pub struct FloorUpdate {
     pub sender: Address,
     pub executed_nonce: u64,
+    /// L1-originated deposit: consumes no L2 nonce, so it is neither floor
+    /// evidence nor a publish confirmation. Explicit since deposits carry
+    /// `Receipt::tx_type == TX_TYPE_DEPOSIT` — the nonce-0 heuristic this
+    /// replaces could not tell a deposit from a genuine nonce-0 tx.
+    pub deposit: bool,
     /// #92 marker receipt: the tx was ORDERED (canonical-log commitment is
     /// proven — it confirms publishes) but consumed no nonce (it is NOT
     /// floor evidence).
@@ -233,23 +238,33 @@ impl ResyncController {
     ///
     /// - `raised_floors` — senders whose executed-truth floor ROSE, for
     ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts (#92)
-    ///   and nonce-0 receipts (deposit-indistinguishable) are NOT floor
-    ///   evidence.
+    ///   and DEPOSIT receipts are NOT floor evidence (a skip consumed no
+    ///   nonce; a deposit has no L2 nonce at all).
     /// - `confirmations` — `(sender, nonce)` per receipt, INCLUDING skip
     ///   receipts (ordering in the canonical log is exactly what a publish
     ///   confirmation needs — #85: an Aeron offer is NOT a commit; only a
-    ///   receipt proves the ref survived into the committed stream). Nonce-0
-    ///   receipts are excluded here too (a deposit receipt must not confirm
-    ///   a same-sender nonce-0 TxRef); a genuine nonce-0 ref is confirmed
-    ///   cumulatively by the sender's nonce-1 receipt, or re-offers
-    ///   harmlessly until then (dedup absorbs).
+    ///   receipt proves the ref survived into the committed stream) and
+    ///   INCLUDING nonce 0.
+    ///
+    ///   Nonce 0 used to be excluded wholesale, because a deposit receipt
+    ///   (filler nonce 0) was indistinguishable from a genuine nonce-0 tx
+    ///   and must not confirm one. The cost was silent and unbounded: a
+    ///   one-tx sender's nonce-0 ref could never be confirmed, so the #85
+    ///   ledger re-offered it every confirm-timeout FOREVER, rewinding that
+    ///   sender's nonce floor on every sweep (observed in CI: 46 rewinds,
+    ///   one every 15s, for the whole soak — issue #124). With
+    ///   `Receipt::tx_type` the two are distinguishable at the source, so
+    ///   the exclusion is now exactly "is this a deposit?".
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
         let mut raised = Vec::new();
         let mut confirmations = Vec::new();
         for _ in 0..FLOOR_DRAIN_PER_ITER {
             match self.floor_rx.try_recv() {
                 Ok(u) => {
-                    if u.executed_nonce == 0 {
+                    // Deposits consume no L2 nonce: neither a confirmation
+                    // (they never correspond to a published TxRef) nor floor
+                    // evidence.
+                    if u.deposit {
                         continue;
                     }
                     confirmations.push((u.sender, u.executed_nonce));
@@ -534,6 +549,7 @@ mod tests {
     fn floor_updates_raise_and_report() {
         let (mut c, tx, _w) = mk(ResyncConfig::default());
         tx.send(FloorUpdate {
+            deposit: false,
             sender: s(1),
             executed_nonce: 4,
             invalid_skip: false,
@@ -556,6 +572,7 @@ mod tests {
         // floor evidence).
         let (mut c, tx, _w) = mk(ResyncConfig::default());
         tx.send(FloorUpdate {
+            deposit: false,
             sender: s(1),
             executed_nonce: 7,
             invalid_skip: true,
@@ -568,11 +585,13 @@ mod tests {
     }
 
     #[test]
-    fn nonce_zero_receipts_neither_confirm_nor_raise() {
-        // Deposit receipts stamp a filler nonce 0 and are indistinguishable
-        // on the wire — they must not confirm a same-sender nonce-0 TxRef.
+    fn deposit_receipts_neither_confirm_nor_raise() {
+        // Deposits carry a filler nonce 0 and consume no L2 nonce: they must
+        // neither confirm a same-sender nonce-0 TxRef nor raise the floor.
+        // Marked by tx_type, NOT inferred from the nonce (#124).
         let (mut c, tx, _w) = mk(ResyncConfig::default());
         tx.send(FloorUpdate {
+            deposit: true,
             sender: s(1),
             executed_nonce: 0,
             invalid_skip: false,
@@ -580,6 +599,47 @@ mod tests {
         .unwrap();
         let (raised, confirmations) = c.drain_floor_updates();
         assert!(raised.is_empty() && confirmations.is_empty());
+    }
+
+    /// The #124 loop, pinned: a GENUINE nonce-0 tx must confirm its ref (and
+    /// raise the floor to 1). While nonce 0 was excluded wholesale, a one-tx
+    /// sender's ref could never be confirmed, so the #85 ledger re-offered it
+    /// every confirm-timeout forever — rewinding that sender's nonce floor on
+    /// every sweep for the life of the process.
+    #[test]
+    fn genuine_nonce_zero_tx_confirms_and_raises() {
+        let (mut c, tx, _w) = mk(ResyncConfig::default());
+        tx.send(FloorUpdate {
+            deposit: false,
+            sender: s(1),
+            executed_nonce: 0,
+            invalid_skip: false,
+        })
+        .unwrap();
+        let (raised, confirmations) = c.drain_floor_updates();
+        assert_eq!(
+            confirmations,
+            vec![(s(1), 0)],
+            "a real nonce-0 receipt must confirm its published ref"
+        );
+        assert_eq!(raised, vec![(s(1), 1)], "and prove execution through 0");
+    }
+
+    /// A nonce-0 SKIP receipt (#92) confirms the publish but is not floor
+    /// evidence — the two exclusions are independent.
+    #[test]
+    fn nonce_zero_skip_confirms_without_raising() {
+        let (mut c, tx, _w) = mk(ResyncConfig::default());
+        tx.send(FloorUpdate {
+            deposit: false,
+            sender: s(1),
+            executed_nonce: 0,
+            invalid_skip: true,
+        })
+        .unwrap();
+        let (raised, confirmations) = c.drain_floor_updates();
+        assert_eq!(confirmations, vec![(s(1), 0)]);
+        assert!(raised.is_empty(), "a skip consumed no nonce");
     }
 
     #[test]
@@ -607,6 +667,7 @@ mod tests {
     fn floors_are_monotonic() {
         let (mut c, tx, _w) = mk(ResyncConfig::default());
         tx.send(FloorUpdate {
+            deposit: false,
             sender: s(1),
             executed_nonce: 9,
             invalid_skip: false,
@@ -615,6 +676,7 @@ mod tests {
         // A LOWER receipt later (late-arriving multicast frame) must not
         // regress the floor.
         tx.send(FloorUpdate {
+            deposit: false,
             sender: s(1),
             executed_nonce: 3,
             invalid_skip: false,

@@ -393,9 +393,9 @@ async fn main() -> anyhow::Result<()> {
                             // bounded to them.
                             // Every partition-matched receipt is forwarded:
                             // the controller splits floor evidence (skip and
-                            // nonce-0 receipts excluded — #92/deposit
-                            // ambiguity) from publish CONFIRMATIONS (#85:
-                            // skip receipts count, ordering is the claim).
+                            // deposits excluded — they consume no L2 nonce)
+                            // from publish CONFIRMATIONS (#85: skip receipts
+                            // count, ordering is the claim).
                             if kardamom_sequencer::partition::partition_for(
                                 receipt.from,
                                 partition_count,
@@ -407,6 +407,7 @@ async fn main() -> anyhow::Result<()> {
                                         sender: receipt.from,
                                         executed_nonce: receipt.nonce,
                                         invalid_skip: receipt.is_invalid_skip(),
+                                        deposit: receipt.is_deposit(),
                                     })
                                     .is_err()
                                 {

@@ -369,6 +369,8 @@ impl<S: StateDatabase> ExecScope<S> {
         let receipt = Receipt {
             tx_idx: tx_position,
             tx_hash: inbound_envelope.tx_hash,
+            // EIP-2718 type read off the raw envelope (legacy ⇒ 0x00).
+            tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
             status: status.is_success(),
             gas_used,
             logs: wire_logs,
@@ -467,6 +469,7 @@ fn invalid_skip(
     let receipt = Receipt {
         tx_idx: tx_position,
         tx_hash: inbound_envelope.tx_hash,
+        tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
         status: false,
         gas_used: 0,
         logs: Vec::new(),
@@ -618,6 +621,9 @@ pub fn execute_deposit_tx<S: StateDatabase>(
         tx_idx: tx_position,
         // Deposits' canonical id is the OP source_hash, NOT a 2718 keccak.
         tx_hash: deposit.source_hash,
+        // L1-originated: consumes no L2 nonce (the filler `nonce: 0` below
+        // is NOT a real nonce — consumers branch on this, never on the 0).
+        tx_type: kardamom_types::TX_TYPE_DEPOSIT,
         status: status_success,
         gas_used,
         logs: wire_logs,

@@ -12,7 +12,7 @@
 //! DEDICATED thread: the exec thread's only cost is moving the captured
 //! `Bal` onto a channel.
 //!
-//! The frame is [`BalFrame::V2`]: the receipts-free merged `BlockDelta`
+//! The frame is a [`BalFrame`]: the receipts-free merged `BlockDelta`
 //! (unchanged from v1 — receipts dominate byte size and fat frames once
 //! collapsed the validator's lapse window, #113) plus the canonical
 //! RLP-encoded `alloy_eip7928::BlockAccessList` carrying per-slot
@@ -23,9 +23,8 @@ use std::time::{Duration, Instant};
 use alloy_rlp::Encodable;
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use kardamom_engine::actor::BalHandoff;
-use kardamom_engine::{ExecutorError, StateWriterQueue};
 use kardamom_log::aeron_live::PubHandle;
-use kardamom_types::{BalFrame, BlockBoundary, BlockDelta};
+use kardamom_types::{BalFrame, BlockDelta};
 
 /// Attribution granularity written into the frame. 1 = per-tx (default);
 /// K > 1 quantizes BalIndex into K-tx chunks (the size ladder — under the
@@ -76,7 +75,7 @@ fn encode_frame(
     let mut bal_rlp = Vec::new();
     alloy_bal.encode(&mut bal_rlp);
     let bal_bytes = bal_rlp.len();
-    let frame = BalFrame::V2 {
+    let frame = BalFrame {
         delta,
         bal_rlp,
         granularity,
@@ -186,35 +185,4 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
         metrics::gauge!(kardamom_engine::metrics::BAL_RETAINED_BLOCKS).set(retained.len() as f64);
     }
     tracing::info!("BAL publisher stopped");
-}
-
-/// Legacy tee: publishes the receipts-free merged `BlockDelta` as a
-/// [`BalFrame::V1`] frame from the writer-queue path. Retained for
-/// deployments that have not enabled capture (the publisher thread
-/// supersedes it when `bal_tx` is wired).
-pub struct BalPublishingWriterQueue<Q: StateWriterQueue> {
-    inner: Q,
-    bal_pub: PubHandle,
-}
-
-impl<Q: StateWriterQueue> BalPublishingWriterQueue<Q> {
-    pub fn new(inner: Q, bal_pub: PubHandle) -> Self {
-        Self { inner, bal_pub }
-    }
-}
-
-impl<Q: StateWriterQueue> StateWriterQueue for BalPublishingWriterQueue<Q> {
-    fn submit(&mut self, block: BlockBoundary, mut delta: BlockDelta) -> Result<(), ExecutorError> {
-        // Receipts stripped: they dominate byte size and fat frames once
-        // collapsed the validator's lapse window (#113).
-        let receipts = std::mem::take(&mut delta.receipts);
-        match kardamom_log::codec::encode(&BalFrame::V1(delta.clone())) {
-            Ok(bytes) => self.bal_pub.publish_best_effort(bytes),
-            Err(e) => {
-                tracing::warn!(block = block.block_number, error = %e, "BAL encode failed")
-            }
-        }
-        delta.receipts = receipts;
-        self.inner.submit(block, delta)
-    }
 }

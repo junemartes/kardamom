@@ -139,6 +139,8 @@ jobs:
       # durations.
       - name: Configure shard (${{ matrix.shard }})
         run: |
+          # Runner identity for the #124 correlation stamps in ci-cluster.sh.
+          echo "RUNNER_NAME=${{ runner.name }}" >> "$GITHUB_ENV"
           case "${{ matrix.shard }}" in
             load)            { echo "RUN_LOAD=1"; echo "RUN_CHAOS=0"; echo "LOAD_DURATION_S=300"; echo "LOAD_TARGET_TPS=800"; echo "LOAD_SENDERS=6"; } ;;
             chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor state-checkpoint-restore replay-window-resync"; } ;;
