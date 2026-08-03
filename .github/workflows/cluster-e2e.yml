@@ -161,7 +161,12 @@ jobs:
             # This SUPERSEDES the old chaos-sealer shard: the single-sealer hard-
             # kill SPOF (issue #58, sealer-hard) no longer exists — the Raft quorum
             # survives the loss of any one member, so chaos-sealer is DROPPED.
-            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover"; } ;;
+            # cluster-member-rejoin needs snapshots to exist inside one case
+            # window, so this shard deploys the sealer with a 60s snapshot
+            # interval (KARDAMOM_CLUSTER_SNAPSHOT_S -> deploy.sh -var ->
+            # -Dkardamom.cluster.snapshotIntervalS; other shards keep the
+            # jobspec default).
+            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-member-rejoin cluster-quorum-loss-recover"; echo "KARDAMOM_CLUSTER_SNAPSHOT_S=60"; } ;;
             # The LIVE replay-window overrun tier (recovery-D), on its own
             # shard because the sealer is deployed with a deliberately SMALL
             # egress retention (KARDAMOM_CLUSTER_RETENTION -> deploy.sh -var ->

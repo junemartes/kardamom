@@ -184,7 +184,11 @@ fi
 CLUSTER_ARGS=()
 if [[ -n "${KARDAMOM_CLUSTER_RETENTION:-}" ]]; then
   echo "==> cluster: egress retention override: ${KARDAMOM_CLUSTER_RETENTION} frames"
-  CLUSTER_ARGS=(-var "cluster_retention=${KARDAMOM_CLUSTER_RETENTION}")
+  CLUSTER_ARGS+=(-var "cluster_retention=${KARDAMOM_CLUSTER_RETENTION}")
+fi
+if [[ -n "${KARDAMOM_CLUSTER_SNAPSHOT_S:-}" ]]; then
+  echo "==> cluster: snapshot interval override: ${KARDAMOM_CLUSTER_SNAPSHOT_S}s"
+  CLUSTER_ARGS+=(-var "cluster_snapshot_interval_s=${KARDAMOM_CLUSTER_SNAPSHOT_S}")
 fi
 run_job "cluster.nomad.hcl" "${CLUSTER_ARGS[@]}"
 wait_running "cluster" 300

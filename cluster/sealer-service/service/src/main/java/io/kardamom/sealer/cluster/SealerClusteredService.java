@@ -241,8 +241,14 @@ public final class SealerClusteredService implements ClusteredService {
             // canonical gap) instead of the honest REPLAY_UNAVAILABLE.
             this.firstRetainedIndex = state.canonicalCount();
             this.firstRetainedBlock = state.blockNumber();
+            // stdout for grep-ability (same contract as the role line below):
+            // the cluster-member-rejoin chaos case asserts a wiped member came
+            // back via SNAPSHOT restore, not silently at genesis.
+            System.out.println("sealer snapshot RESTORED memberId=" + memberId
+                + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
         } else {
             this.state = new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+            System.out.println("sealer state FRESH at genesis memberId=" + memberId);
         }
         // Do NOT scheduleTimer here: Aeron rejects it from onStart ("sending
         // messages or scheduling timers is not allowed from onStart"); the

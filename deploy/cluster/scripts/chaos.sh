@@ -1110,6 +1110,19 @@ assert_accepted_delivered() { # <json> <case>
 # Prints the leader memberId on stdout (and nothing else); fails if none found in
 # time. Reads logs via the control node's `nomad alloc logs` (same access pattern
 # the rest of the file uses).
+# Concatenated stdout of every cluster alloc (running or not) — the uniform
+# evidence source for snapshot/restore lines. Alloc logs survive in-place task
+# restarts, so pre-kill and post-rejoin lines land in the same stream; callers
+# assert on counts increasing, not mere presence.
+cluster_alloc_logs() {
+  local allocs alloc
+  allocs="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}}{{\"\n\"}}{{end}}" "$1"' "${CLUSTER_TASK}" 2>/dev/null || true)"
+  while read -r alloc; do
+    [ -n "${alloc}" ] || continue
+    on_control 'nomad alloc logs "$1" 2>/dev/null' "${alloc}" 2>/dev/null || true
+  done <<<"${allocs}"
+}
+
 cluster_leader() { # [max-secs]
   local max="${1:-${CHAOS_LEADER_SLO_S}}" t=0 allocs alloc lastrole leader
   while :; do
@@ -1766,6 +1779,75 @@ print(best + 40 if best >= 0 else -1)
         || log "cluster-follower-kill: WARN leader changed (${leader} -> ${still}); quorum still held, progress OK"
       # Killed follower's task restarts and rejoins (3/3).
       assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
+      ;;
+
+    cluster-member-rejoin)
+      # BLANK-member catch-up drill — the "join mid-way with an empty state"
+      # edge for the RAFT MEMBERS themselves. A follower's cluster dir AND
+      # archive are wiped after its kill, so the restarted member owns NOTHING:
+      # it must rejoin via Aeron's snapshot + log-tail replication from the
+      # leader, restore the sealer state from that snapshot (asserted via the
+      # 'sealer snapshot RESTORED' line — NOT a silent fresh-at-genesis start,
+      # which would be deterministic state divergence), and return the cluster
+      # to 3/3 with the pipeline unaffected throughout (quorum 2/3 held).
+      #
+      # Snapshots come from the in-process scheduler that shipped WITH this
+      # case (-Dkardamom.cluster.snapshotIntervalS; the chaos-cluster shard
+      # shortens it via KARDAMOM_CLUSTER_SNAPSHOT_S) — before it, nothing in
+      # the deploy ever took one, so the restore path had never run outside
+      # unit tests.
+      local leader follower r0 r1 rblock rline t
+      leader="$(cluster_leader)"
+      for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
+
+      # 1. A snapshot must EXIST before the wipe; waiting here names the real
+      # precondition instead of failing later as "member never restored".
+      log "cluster-member-rejoin: leader=memberId=${leader}; waiting for a cluster snapshot"
+      t=0
+      while :; do
+        cluster_alloc_logs | grep -q 'cluster SNAPSHOT triggered' && break
+        sleep 10; t=$(( t + 10 ))
+        [ "${t}" -ge 240 ] \
+          && fail "cluster-member-rejoin: no snapshot within ${t}s — is the snapshot scheduler running (KARDAMOM_CLUSTER_SNAPSHOT_S deployed)?"
+      done
+      log "cluster-member-rejoin: snapshot observed after ${t}s"
+
+      # 2. Baseline BEFORE the wipe: earlier cases restart members with their
+      # dirs intact, which also restores from a local snapshot — the assert
+      # below is on the count INCREASING, not mere presence.
+      r0="$(cluster_alloc_logs | grep -c "sealer snapshot RESTORED memberId=${follower}" || true)"
+
+      log "cluster-member-rejoin: killing FOLLOWER memberId=${follower} and WIPING its cluster + archive dirs"
+      inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
+      docker exec "kardamom-sealer-${follower}" bash -lc \
+        'rm -rf /opt/kardamom/cluster/* /opt/kardamom/archive/*' \
+        || fail "cluster-member-rejoin: could not wipe memberId=${follower} state"
+
+      # 3. Quorum (2/3) holds: the pipeline keeps committing throughout.
+      assert_executor_progress
+      # 4. The wiped member's task restarts and the job returns to 3/3.
+      assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
+
+      # 5. The rejoined member must have restored the SNAPSHOT (count grew),
+      # at a mid-chain position (block > 0 — restoring an empty genesis
+      # snapshot would prove nothing about catch-up).
+      t=0
+      while :; do
+        r1="$(cluster_alloc_logs | grep -c "sealer snapshot RESTORED memberId=${follower}" || true)"
+        [ "${r1}" -gt "${r0}" ] && break
+        sleep 10; t=$(( t + 10 ))
+        if [ "${t}" -ge 240 ]; then
+          if cluster_alloc_logs | grep -q "sealer state FRESH at genesis memberId=${follower}"; then
+            fail "cluster-member-rejoin: wiped member restarted FRESH AT GENESIS instead of restoring the leader's snapshot — blank-member replication did not happen (silent state divergence risk)"
+          fi
+          fail "cluster-member-rejoin: wiped member logged neither a snapshot restore nor a fresh start within ${t}s (rejoin wedged?)"
+        fi
+      done
+      rline="$(cluster_alloc_logs | grep "sealer snapshot RESTORED memberId=${follower}" | tail -1)"
+      rblock="$(printf '%s' "${rline}" | sed -nE 's/.*block=([0-9]+).*/\1/p')"
+      [ -n "${rblock}" ] && [ "${rblock}" -gt 0 ] \
+        || fail "cluster-member-rejoin: snapshot restore was at block ${rblock:-?} — not a mid-chain catch-up (${rline})"
+      log "cluster-member-rejoin: memberId=${follower} rejoined from snapshot at block ${rblock} (${t}s after restart); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
       ;;
 
     cluster-quorum-loss-recover)

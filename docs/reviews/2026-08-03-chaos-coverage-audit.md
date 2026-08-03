@@ -215,9 +215,13 @@ byte parity, or that the chain is rebuildable from L1.
    `-Dkardamom.cluster.retention`, halt a consumer past it, assert
    `REPLAY_UNAVAILABLE` → `resync_total{outcome=peer-checkpoint}` → park → restart →
    rejoin. Covers executor **and** validator repairs (#143) and `park_state_db`.
-4. `cluster-member-rejoin` chaos case: take a snapshot (add periodic snapshots
-   or an explicit `ClusterTool snapshot` step), wipe one member's cluster dir,
-   assert it rejoins via snapshot/log catch-up and the pipeline is unaffected.
+4. **DONE** — `cluster-member-rejoin` on the chaos-cluster shard + an
+   in-process snapshot scheduler in `ClusterNode` (`ClusterTool.snapshot`
+   every `-Dkardamom.cluster.snapshotIntervalS`, default 300s; the shard
+   deploys 60s). The case wipes a follower's cluster + archive dirs after a
+   kill and asserts the restarted member restored the leader's snapshot
+   ("sealer snapshot RESTORED", count-increase + block>0 — a FRESH-at-genesis
+   restart fails loudly as divergence risk), quorum held, 3/3 restored.
 5. Long-halt case: freeze a consumer **past the 90 s session timeout**; assert
    session re-establishment + gapless replay. Fix the wrong comment at
    `chaos.sh:1614`.

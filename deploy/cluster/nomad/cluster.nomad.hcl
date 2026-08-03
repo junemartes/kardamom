@@ -24,6 +24,18 @@ variable "cluster_retention" {
   default = "65536"
 }
 
+# Automatic Raft snapshot interval in seconds
+# (-Dkardamom.cluster.snapshotIntervalS; 0 disables). Every member runs the
+# scheduler; only the current leader's toggle fires, and the snapshot action
+# replicates through the log so all members snapshot at the same position.
+# The chaos-cluster shard shortens this (deploy.sh -var from
+# KARDAMOM_CLUSTER_SNAPSHOT_S) so cluster-member-rejoin can wait for a
+# snapshot inside one case.
+variable "cluster_snapshot_interval_s" {
+  type    = string
+  default = "300"
+}
+
 # Pure JVM image (cluster.Dockerfile launches io.kardamom.sealer.cluster.ClusterNode).
 
 job "cluster" {
@@ -80,7 +92,7 @@ job "cluster" {
       # VM options (same mechanism as the aeron job's _JAVA_OPTIONS). ${meta.node_ip}
       # interpolates in env exactly as it would in args.
       env {
-        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention}"
+        JAVA_TOOL_OPTIONS = "-Dkardamom.cluster.nodeIp=${meta.node_ip} -Dkardamom.cluster.members=0,192.168.56.51:40200,192.168.56.51:40201,192.168.56.51:40202,192.168.56.51:40203,192.168.56.51:40204|1,192.168.56.52:40200,192.168.56.52:40201,192.168.56.52:40202,192.168.56.52:40203,192.168.56.52:40204|2,192.168.56.53:40200,192.168.56.53:40201,192.168.56.53:40202,192.168.56.53:40203,192.168.56.53:40204 -Daeron.dir=/opt/kardamom/aeron-mount/cluster-dir -Dkardamom.cluster.dir=/opt/kardamom/cluster -Dkardamom.archive.dir=/opt/kardamom/archive -Dkardamom.cluster.ingressStreamId=101 -Dkardamom.cluster.tickMs=2000 -Dkardamom.cluster.retention=${var.cluster_retention} -Dkardamom.cluster.snapshotIntervalS=${var.cluster_snapshot_interval_s}"
       }
 
       config {

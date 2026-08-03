@@ -2,6 +2,7 @@ package io.kardamom.sealer.cluster;
 
 import io.aeron.archive.Archive;
 import io.aeron.archive.ArchiveThreadingMode;
+import io.aeron.cluster.ClusterTool;
 import io.aeron.cluster.ClusteredMediaDriver;
 import io.aeron.cluster.ConsensusModule;
 import io.aeron.cluster.service.ClusteredServiceContainer;
@@ -93,8 +94,53 @@ public final class ClusterNode {
         try (ClusteredMediaDriver ignored = driver;
              ClusteredServiceContainer ignored2 = container) {
             System.out.println("cluster node up memberId=" + memberId + " endpoints=" + String.join(",", me));
+            startSnapshotScheduler(clusterDir, memberId);
             barrier.await();
         }
+    }
+
+    /**
+     * Periodic cluster-wide snapshot trigger ({@code -Dkardamom.cluster.snapshotIntervalS},
+     * 0 disables). Before this existed NOTHING ever took a snapshot, so the Raft log
+     * grew without bound and a blank member rejoining had to replay the entire
+     * lifetime log — the snapshot/restore path shipped without ever running outside
+     * unit tests.
+     *
+     * Runs identically on EVERY member: only the leader's control toggle accepts
+     * SNAPSHOT (the action is appended to the replicated log, so all members then
+     * snapshot at the same log position), and on followers {@link ClusterTool#snapshot}
+     * is a no-op returning false — "the current leader snapshots on schedule" with no
+     * cross-member coordination and no deploy special-casing. Failures are logged and
+     * the next tick retries; a snapshot trigger must never take a member down.
+     */
+    private static void startSnapshotScheduler(final String clusterDir, final int memberId) {
+        final long intervalS = Long.getLong("kardamom.cluster.snapshotIntervalS", 300L);
+        if (intervalS <= 0) {
+            System.out.println("cluster snapshot scheduler DISABLED memberId=" + memberId);
+            return;
+        }
+        final Thread t = new Thread(() -> {
+            while (true) {
+                try {
+                    Thread.sleep(intervalS * 1000L);
+                } catch (final InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                try {
+                    if (ClusterTool.snapshot(new File(clusterDir), System.out)) {
+                        System.out.println("cluster SNAPSHOT triggered memberId=" + memberId);
+                    }
+                } catch (final Exception e) {
+                    System.out.println("cluster SNAPSHOT attempt failed memberId=" + memberId
+                        + " (leader may be mid-election; next tick retries): " + e);
+                }
+            }
+        }, "kardamom-snapshot-scheduler");
+        t.setDaemon(true);
+        t.start();
+        System.out.println("cluster snapshot scheduler up memberId=" + memberId
+            + " intervalS=" + intervalS);
     }
 
     /** Launch retries past the ~10s mark-file liveness window with margin. */
