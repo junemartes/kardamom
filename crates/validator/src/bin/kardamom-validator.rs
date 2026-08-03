@@ -42,6 +42,10 @@ use kardamom_validator::{
     BalBuffer, Divergence, ReceiptBuffer, ValidatorReceiptSink, ValidatorWriterQueue, metrics,
 };
 
+/// Marker file in the state dir: a checkpoint was adopted and the trie
+/// bootstrap has not yet committed. See the adoption block in `main`.
+const ADOPTION_MARKER: &str = ".adopted-needs-trie-bootstrap";
+
 /// Top-level config the `kardamom-validator` binary deserializes from
 /// `--config`. Same `[cluster]` section shape as the executor's.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
@@ -231,6 +235,18 @@ async fn main() -> Result<()> {
             if let Some(ckpt) = local {
                 let block = kardamom_state::restore_checkpoint(&ckpt.path, &args.state_dir)
                     .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
+                // Adoption is recorded EXPLICITLY: executor checkpoints carry
+                // the genesis-seeded mirror + trie (built for every env by
+                // seed_genesis, then never updated by the trie-off writer),
+                // so a "trie present?" probe passes on an image whose trie is
+                // frozen at genesis — and the incremental walker would extend
+                // that stale base into silently wrong roots the shadow-check
+                // cannot catch (it rebuilds from the SAME stale mirror).
+                // Caught by the validator-join chaos case's non-vacuity grep.
+                // The marker survives a crash between restore and bootstrap;
+                // the bootstrap below is idempotent.
+                std::fs::write(args.state_dir.join(ADOPTION_MARKER), b"")
+                    .context("write adoption marker")?;
                 tracing::info!(
                     restored_block = block,
                     checkpoint = %ckpt.path.display(),
@@ -477,12 +493,16 @@ async fn main() -> Result<()> {
         Some(every_n) => TrieMode::ShadowCheck { every_n },
         None => TrieMode::Incremental,
     };
-    // Adopted executor checkpoints are TRIE-OFF images (plain state tables,
-    // no hashed mirror, no stored nodes) — build the mirror + trie once
-    // before spawning the incremental writer. Idempotent and crash-safe (one
-    // RW txn); a from-genesis env already has its trie from seeding.
-    if !kardamom_state::has_trie(&env).context("probe state trie")? {
-        tracing::info!("adopted trie-off state image — bootstrapping hashed mirror + trie");
+    // Adopted executor checkpoints carry a trie FROZEN AT GENESIS (seeded
+    // into every env, never updated by the trie-off writer) — so adoption is
+    // signaled by the explicit marker, not a presence probe, and the
+    // bootstrap rebuilds the mirror + trie from the plain state tables
+    // wholesale. Idempotent and crash-safe (one RW txn; the marker is
+    // removed only after commit). `has_trie` remains as a belt-and-braces
+    // net for a truly mirror-less image (e.g. an operator-copied dir).
+    let adoption_marker = args.state_dir.join(ADOPTION_MARKER);
+    if adoption_marker.exists() || !kardamom_state::has_trie(&env).context("probe state trie")? {
+        tracing::info!("adopted state image — bootstrapping hashed mirror + trie");
         let started = std::time::Instant::now();
         let root = kardamom_state::bootstrap_trie_from_state(&env)
             .context("bootstrap trie from adopted state")?;
@@ -491,6 +511,9 @@ async fn main() -> Result<()> {
             elapsed_ms = started.elapsed().as_millis() as u64,
             "trie bootstrap complete"
         );
+        if adoption_marker.exists() {
+            std::fs::remove_file(&adoption_marker).context("clear adoption marker")?;
+        }
     }
     let writer =
         StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;

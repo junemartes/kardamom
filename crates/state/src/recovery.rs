@@ -291,6 +291,82 @@ mod trie_bootstrap_tests {
         assert_eq!(bootstrap_trie_from_state(&env).unwrap(), root);
     }
 
+    /// The REAL adopted-executor-checkpoint shape (validator-join chaos case
+    /// finding): every env carries the GENESIS-seeded mirror + trie (built by
+    /// seed_genesis, then never updated by a trie-off writer), so an adopted
+    /// image has a stale-at-genesis mirror under newer plain state. The
+    /// bootstrap must converge that to the oracle root of the CURRENT state —
+    /// and a presence probe alone would wrongly skip it (which is why
+    /// adoption is marker-signaled, not probed).
+    #[test]
+    fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = StateEnvBuilder::new(dir.path()).open().unwrap();
+        let addr_a = Address::repeat_byte(0x11);
+        let addr_b = Address::repeat_byte(0x22);
+
+        // Genesis: A exists with nonce 0 / balance 1000. Seeds mirror + trie.
+        let genesis = [kardamom_types::AccountChange {
+            address: addr_a,
+            nonce: 0,
+            balance: U256::from(1000u64),
+            code_hash: B256::ZERO,
+        }];
+        assert!(crate::genesis::seed_genesis(&env, &genesis, &[]).unwrap());
+        assert!(has_trie(&env).unwrap(), "genesis seed builds the mirror");
+
+        // Trie-off progress (what an executor does): A changes, B appears —
+        // plain tables only, mirror left frozen at genesis.
+        {
+            let txn = env.raw().begin_rw_sync().unwrap();
+            let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS)).unwrap();
+            for (addr, nonce, bal) in [(addr_a, 7u64, 400u64), (addr_b, 2, 600)] {
+                let v = AccountValue {
+                    nonce,
+                    balance: U256::from(bal),
+                    code_hash: B256::ZERO,
+                    storage_root: B256::ZERO,
+                };
+                txn.put(
+                    accounts_db,
+                    encode_account_key(addr),
+                    encode_account_value(&v),
+                    WriteFlags::UPSERT,
+                )
+                .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        // The trap: the probe still says "trie present" (it is — stale).
+        assert!(has_trie(&env).unwrap());
+
+        let root = bootstrap_trie_from_state(&env).unwrap();
+        let want = crate::trie::state_root([
+            (
+                addr_a,
+                crate::trie::AccountTrieParts {
+                    nonce: 7,
+                    balance: U256::from(400u64),
+                    code_hash: B256::ZERO,
+                    storage_root: B256::ZERO,
+                },
+            ),
+            (
+                addr_b,
+                crate::trie::AccountTrieParts {
+                    nonce: 2,
+                    balance: U256::from(600u64),
+                    code_hash: B256::ZERO,
+                    storage_root: B256::ZERO,
+                },
+            ),
+        ]);
+        assert_eq!(
+            root, want,
+            "bootstrap must converge a stale mirror to the current-state oracle"
+        );
+    }
+
     /// The join must not just adopt — VERIFIED execution continues on top of
     /// the bootstrapped trie. After bootstrap, applying the next block
     /// INCREMENTALLY must land on the same root as a pure full rebuild over

@@ -175,8 +175,13 @@ one.
 A replay-window overrun self-repairs like the executor's recovery-D loop
 (#143): fetch a peer checkpoint at/above the retention floor from an
 executor's serve endpoint, park the stale DB, exit; the restart adopts it —
-including a one-time hashed-mirror + trie bootstrap, since executor
-checkpoints are trie-off images — and resumes verified execution from there.
+including a marker-driven one-time hashed-mirror + trie bootstrap: executor
+checkpoints carry a trie FROZEN AT GENESIS (seeded into every env, never
+updated by the trie-off writer), so adoption must rebuild it wholesale — a
+presence probe would pass on the stale trie and the incremental walker would
+extend it into silently wrong roots the shadow-check cannot catch (it
+rebuilds from the same stale mirror) — and resumes verified execution from
+there.
 The adoption trust class is the same as #78 catch-up, made explicit: blocks
 through the adopted checkpoint are **unverified by this validator**
 (`validator_resync_total{outcome="peer-checkpoint"}` counts adoptions); the
