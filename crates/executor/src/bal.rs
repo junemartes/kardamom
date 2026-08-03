@@ -145,12 +145,28 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
         // Ack'd delivery with a bounded deadline. Retained regardless of
         // live-delivery outcome: retention IS the durability path (a
         // validator that was down catches up from the ring).
+        //
+        // NOT_CONNECTED is TERMINAL, not retried: it means no subscriber
+        // exists right now (e.g. a validator-less stack), and spinning the
+        // full deadline on every frame capped this pump's drain rate at
+        // 2 frames/s — below the local 250ms block cadence — so the
+        // bounded exec→pump handoff filled and BLOCKED THE EXEC THREAD,
+        // delaying every receipt behind it (S4's -32000 park timeouts;
+        // chain-semantics red). The frame still lands in the retention
+        // ring either way; only BACK_PRESSURED-class transients are worth
+        // the bounded retry.
         let deadline = Instant::now() + PUBLISH_DEADLINE;
         let mut outcome = "ok";
         loop {
             match pubh.publish_bytes(aligned(&bytes)) {
                 Ok(_) => break,
                 Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("NOT_CONNECTED") {
+                        tracing::debug!(block, "BAL: no subscriber; frame retained for replay");
+                        outcome = "not_connected";
+                        break;
+                    }
                     if Instant::now() >= deadline {
                         tracing::warn!(block, error = %e, "BAL live publish deadline exhausted; frame retained for replay");
                         outcome = "deadline";

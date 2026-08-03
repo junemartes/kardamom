@@ -513,10 +513,40 @@ where
             let tx_applied_error =
                 metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error");
 
+            // How long an IDLE exec thread waits before probing the writer
+            // for settled in-flight commits. Settling used to happen only at
+            // the NEXT boundary — correct under sustained load (a boundary
+            // per tick), but on an idle tail the last ≤K blocks' boundary
+            // closeouts never published: ingress watermarks stalled (S4's
+            // -32000), executor/validator never converged on a drain (S6/S9),
+            // and the attester never covered the final blocks (S2) — the
+            // chain-semantics suite went red from the day the pipeline
+            // landed (#129) while the constantly-loaded cluster shards
+            // stayed green. Under load the timeout never fires (records
+            // arrive faster); when idle the probe is a cheap non-blocking
+            // read.
+            const IDLE_SETTLE_PROBE: Duration = Duration::from_millis(25);
             loop {
-                let msg = match rx.recv() {
-                    Ok(m) => m,
-                    Err(_) => {
+                enum Recv {
+                    Msg(ReaderToExec),
+                    IdleProbe,
+                    Closed,
+                }
+                let got = if inflight.is_empty() {
+                    match rx.recv() {
+                        Ok(m) => Recv::Msg(m),
+                        Err(_) => Recv::Closed,
+                    }
+                } else {
+                    match rx.recv_timeout(IDLE_SETTLE_PROBE) {
+                        Ok(m) => Recv::Msg(m),
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => Recv::IdleProbe,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Recv::Closed,
+                    }
+                };
+                let msg = match got {
+                    Recv::Msg(m) => m,
+                    Recv::Closed => {
                         // Clean end of stream: settle every in-flight commit
                         // so the final boundaries aren't silently dropped.
                         if let Some((last, _)) = inflight.back() {
@@ -528,6 +558,57 @@ where
                             }
                         }
                         return Ok(());
+                    }
+                    Recv::IdleProbe => {
+                        // Settle ONLY at a block edge: with a block OPEN
+                        // (scope materialized / records buffered), the live
+                        // ExecScope's cache is seeded against the CURRENT
+                        // snapshot ∘ parent — swapping the snapshot and
+                        // rebuilding parent under it mid-block mixes read
+                        // bases and diverges execution (caught by the load
+                        // shard's validator divergence latch on the first
+                        // soak of this probe). Between blocks — the idle-tail
+                        // case this probe exists for — both are empty, and a
+                        // mid-block gap simply defers to the next boundary's
+                        // sweep exactly as before the probe existed.
+                        if scope.is_some() || !buffered.is_empty() {
+                            continue;
+                        }
+                        // Same non-blocking settle sweep as the boundary arm,
+                        // minus the full-depth blocking wait (an idle probe
+                        // must never park).
+                        let durable = sw_signal.committed()?;
+                        let mut newest_settled = None;
+                        while inflight
+                            .front()
+                            .is_some_and(|(b, _)| b.block_number <= durable)
+                        {
+                            let (b, _) = inflight.pop_front().expect("front checked");
+                            metrics::gauge!(crate::metrics::BLOCK_NUMBER)
+                                .set(b.block_number as f64);
+                            newest_settled = Some(b.block_number);
+                            if tx.send(ExecToCommit::Boundary(b)).is_err() {
+                                return Ok(());
+                            }
+                        }
+                        if let Some(n) = newest_settled {
+                            debug!(
+                                target: "executor",
+                                durable,
+                                through_block = n,
+                                unsettled = inflight.len(),
+                                "pipelined commits settled on idle probe; snapshot swapped"
+                            );
+                            snapshot = snapshots.snapshot_after(n);
+                            parent = inflight.iter().fold(None, |acc, (_, d)| match acc {
+                                None => Some(d.clone()),
+                                Some(mut m) => {
+                                    m.merge_from(d);
+                                    Some(m)
+                                }
+                            });
+                        }
+                        continue;
                     }
                 };
                 match msg {
@@ -840,11 +921,31 @@ where
                         // the publisher is gone mid-shutdown — not fatal.
                         if let Some(btx) = bal_tx.as_ref() {
                             let bal_delta = pending.clone().finalize(block_number, Vec::new());
-                            let _ = btx.send((
+                            // try_send: the BAL handoff must NEVER block
+                            // execution — a slow/stuck publisher pump once
+                            // back-pressured this thread through the bounded
+                            // channel and delayed every receipt behind it
+                            // (S4). A dropped frame costs one block of BAL
+                            // retention (that block verifies as bal_missing,
+                            // the tolerated path); a stalled exec thread
+                            // costs the chain.
+                            match btx.try_send((
                                 boundary.clone(),
                                 bal_delta,
                                 std::mem::take(&mut block_bal),
-                            ));
+                            )) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        block = block_number,
+                                        "BAL handoff full; dropping this block's frame \
+                                         (publisher pump stalled?)"
+                                    );
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                                    // Publisher gone mid-shutdown — not fatal.
+                                }
+                            }
                         }
                         match parent.as_mut() {
                             Some(m) => m.merge_from(&pending),
@@ -1314,6 +1415,81 @@ mod exec_tests {
             "settled in order, none lost"
         );
         assert_eq!(writer_log.lock().unwrap().len(), 6, "all deltas submitted");
+    }
+
+    /// Idle-tail settling (the #129 regression that turned chain-semantics
+    /// red): in-flight commits below depth K must settle and forward their
+    /// boundaries WITHOUT any further input on the reader channel — via the
+    /// idle probe — once the writer reports them durable. Before the probe,
+    /// settling only happened at the NEXT boundary, so an idle chain's last
+    /// ≤K boundary closeouts never published (stalled ingress watermarks,
+    /// executor/validator drains that never converged, uncovered attester
+    /// blocks).
+    #[test]
+    fn exec_settles_inflight_commits_while_idle() {
+        let snap = MockStateDatabase::builder().build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+        let durable = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let blocking_waits = Arc::new(std::sync::atomic::AtomicU64::new(0));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
+
+        // Three boundaries — BELOW depth K, so nothing blocks and, with a
+        // writer stuck at 0, nothing settles either. The channel stays OPEN:
+        // no end-of-stream drain can rescue them.
+        for n in 1..=3u64 {
+            tx_r2e
+                .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                    block_number: n,
+                    end_tx_idx: pos(0),
+                    l2_timestamp: 1_700_000_000 + n,
+                }))
+                .unwrap();
+        }
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            StagedCommit {
+                durable: durable.clone(),
+                blocking_waits: blocking_waits.clone(),
+            },
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+            None,
+            None,
+        );
+
+        // The writer catches up on its own; the exec thread must notice via
+        // the idle probe and forward all three boundaries, with NO blocking
+        // wait and NO further reader input.
+        durable.store(3, std::sync::atomic::Ordering::SeqCst);
+        let mut boundaries = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while boundaries.len() < 3 && std::time::Instant::now() < deadline {
+            match rx_e2c.recv_timeout(Duration::from_millis(100)) {
+                Ok(ExecToCommit::Boundary(b)) => boundaries.push(b.block_number),
+                Ok(ExecToCommit::Receipt(_)) => panic!("no receipts in this scenario"),
+                Err(_) => {}
+            }
+        }
+        assert_eq!(
+            boundaries,
+            vec![1, 2, 3],
+            "idle probe must settle + forward in-flight boundaries without further input"
+        );
+        assert_eq!(
+            blocking_waits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an idle probe must never park"
+        );
+
+        drop(tx_r2e);
+        h.join().expect("no panic").expect("exec ok");
     }
 
     /// End-to-end through the ACTOR: with a BAL channel attached, the
