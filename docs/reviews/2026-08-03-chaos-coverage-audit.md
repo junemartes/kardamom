@@ -208,9 +208,11 @@ byte parity, or that the chain is rebuildable from L1.
 
 **P1 — exercise the tier that has never run**
 3. **DONE** — `retention-overrun` + `retention-overrun-validator` on the new
-   `chaos-retention` CI shard (retention 16384, adaptive SIGSTOP freeze sized
-   from the same env var, verified-freeze per #108; also crosses the 90s
-   session timeout, covering the long-halt leg of item 5). Original ask:
+   `chaos-retention` CI shard (retention 6144; verified-freeze per #108, held
+   ADAPTIVELY until the observed ingress delta exceeds 2x retention — the
+   first run measured ~36tps against the 200tps target, so duration-based
+   sizing can never be trusted on shared runners; the freeze also crosses the
+   90s session timeout, covering the long-halt leg of item 5). Original ask:
    deploy the cluster job with a small
    `-Dkardamom.cluster.retention`, halt a consumer past it, assert
    `REPLAY_UNAVAILABLE` → `resync_total{outcome=peer-checkpoint}` → park → restart →
@@ -218,10 +220,22 @@ byte parity, or that the chain is rebuildable from L1.
 4. **DONE** — `cluster-member-rejoin` on the chaos-cluster shard + an
    in-process snapshot scheduler in `ClusterNode` (`ClusterTool.snapshot`
    every `-Dkardamom.cluster.snapshotIntervalS`, default 300s; the shard
-   deploys 60s). The case wipes a follower's cluster + archive dirs after a
-   kill and asserts the restarted member restored the leader's snapshot
-   ("sealer snapshot RESTORED", count-increase + block>0 — a FRESH-at-genesis
-   restart fails loudly as divergence risk), quorum held, 3/3 restored.
+   deploys 60s). First execution taught the real semantics, and the asserts
+   now encode them:
+   - **Intact-dir restart restores from snapshot** (bounded restart time) —
+     observed live (`sealer snapshot RESTORED block=114 canonicalCount=21365`)
+     and now asserted by `cluster-follower-kill` (count-increase after a
+     snapshot provably exists).
+   - **A BLANK member is caught up by full log replay from position 0** —
+     Aeron 1.44 static membership does not transfer snapshots to blank
+     members. Deterministic and converged (the wiped member replayed to the
+     live head and resumed serving replay sessions), so
+     `cluster-member-rejoin` asserts fresh-at-genesis start + FOLLOWER rejoin
+     + quorum held + 3/3.
+   - **OPEN follow-up:** blank-member rejoin time grows with the lifetime log;
+     bounding it needs log purge after snapshot (`ClusterTool` purge/seed) —
+     without it the snapshots bound only intact-dir restarts, not blank
+     rejoins.
 5. Long-halt case: freeze a consumer **past the 90 s session timeout**; assert
    session re-establishment + gapless replay. Fix the wrong comment at
    `chaos.sh:1614`.

@@ -174,11 +174,14 @@ jobs:
             # case's replay margins. A frozen consumer's cursor ages out of the
             # window mid-flight; the case asserts the full self-repair:
             # REPLAY_UNAVAILABLE -> peer-checkpoint fetch -> park -> restart ->
-            # restore (executor) / adopt (validator, #143) -> rejoin. 16384
-            # frames ≈ 82s @200tps: comfortably above the 20s checkpoint
-            # interval (donors always hold an in-window restore source), small
-            # enough that a ~3min freeze overruns it 2x.
-            chaos-retention) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=retention-overrun retention-overrun-validator"; echo "KARDAMOM_CLUSTER_RETENTION=16384"; } ;;
+            # restore (executor) / adopt (validator, #143) -> rejoin. The
+            # freeze is ADAPTIVE — held until the OBSERVED ingress delta
+            # exceeds 2x retention (first run: the runner delivered ~36tps of
+            # the 200tps target, so a fixed-duration freeze never overran the
+            # window). 6144 frames keeps the donors' 20s checkpoint interval
+            # inside the window even at a full 200tps (~4000 frames of lag),
+            # while a ~36tps runner overruns it in ~6min, inside the cap.
+            chaos-retention) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=retention-overrun retention-overrun-validator"; echo "KARDAMOM_CLUSTER_RETENTION=6144"; } ;;
             # The chain-semantics suite (Target C): the SAME scenario drivers
             # the per-PR Target-L job runs, against the real cluster — nonce
             # ordering, gap non-processing, RPC liveness and validator/executor

@@ -781,26 +781,18 @@ inject_hard() { # <node-container(s), space-separated candidates> <task-name>
 # minutes of sustained 200tps to overrun — the reason this tier had never
 # executed before this case existed.
 KARDAMOM_CLUSTER_RETENTION="${KARDAMOM_CLUSTER_RETENTION:-}"
-RETENTION_FREEZE_S="${RETENTION_FREEZE_S:-}"
 # executor-2 is the victim: 0/1 stay untouched as checkpoint donors.
 RETENTION_VICTIM_EXEC_IDX=2
 
-retention_freeze_s() {
-  # Freeze until frames produced during the freeze exceed the retention window
-  # with 2x margin (the floor moves ~1 frame per tx, so overrun needs
-  # frames-during-freeze > retention), never less than 120s so the 90s session
-  # timeout lapses too.
-  [ -n "${RETENTION_FREEZE_S}" ] && { printf '%s' "${RETENTION_FREEZE_S}"; return 0; }
-  local s=$(( (2 * KARDAMOM_CLUSTER_RETENTION) / CHAOS_TPS + 30 ))
-  [ "${s}" -lt 120 ] && s=120
-  printf '%s' "${s}"
-}
+# Hard cap on the adaptive freeze (below). Overrun is declared from OBSERVED
+# traffic, so the cap only trips when the load is too slow to ever roll the
+# window — a loud, named failure instead of a vacuous pass.
+RETENTION_FREEZE_CAP_S="${RETENTION_FREEZE_CAP_S:-600}"
 
 run_retention_overrun() { # <executor|validator>
   local kind="$1" node port inner cid0
   [ -n "${KARDAMOM_CLUSTER_RETENTION}" ] \
     || fail "retention-overrun(${kind}): KARDAMOM_CLUSTER_RETENTION is not set — this case only means something on a cluster deployed with a small -Dkardamom.cluster.retention (deploy.sh injects it from the same env var)"
-  local freeze_s; freeze_s="$(retention_freeze_s)"
 
   if [ "${kind}" = "executor" ]; then
     node="${EXECUTOR_NODES[${RETENTION_VICTIM_EXEC_IDX}]}"; port="${EXECUTOR_PORT}"
@@ -845,7 +837,16 @@ run_retention_overrun() { # <executor|validator>
 
   # SIGSTOP + VERIFIED freeze (#108 lesson: `docker pause` no-ops silently in
   # the nested-DinD freezer; a probe that still answers means no freeze).
-  log "retention-overrun(${kind}): freezing ${inner} on ${node} for ${freeze_s}s (retention=${KARDAMOM_CLUSTER_RETENTION} frames @ ${CHAOS_TPS}tps ≈ $(( KARDAMOM_CLUSTER_RETENTION / CHAOS_TPS ))s window)"
+  # The freeze is ADAPTIVE, sized by OBSERVED traffic, not the target rate:
+  # the first run of this case froze a fixed 2*retention/CHAOS_TPS seconds
+  # while the runner delivered ~36tps of the 200tps target — the retained
+  # window never even filled, the floor never left genesis, and the thawed
+  # replay was served in full. Overrun needs frames-SINCE-FREEZE > retention;
+  # accepted txs (ingress counter) are the observable lower-bound proxy for
+  # egress frames (boundary ticks only add to it).
+  local rx_freeze rx_now delta=0 elapsed=0 need=$(( 2 * KARDAMOM_CLUSTER_RETENTION ))
+  rx_freeze="$(ingress_received || echo 0)"
+  log "retention-overrun(${kind}): freezing ${inner} on ${node} until ${need} frames flow past it (retention=${KARDAMOM_CLUSTER_RETENTION}, cap ${RETENTION_FREEZE_CAP_S}s)"
   docker exec "${node}" docker kill -s STOP "${inner}" >/dev/null \
     || fail "retention-overrun(${kind}): SIGSTOP failed"
   sleep 3
@@ -855,7 +856,21 @@ run_retention_overrun() { # <executor|validator>
     fail "retention-overrun(${kind}): freeze did NOT take effect (metrics endpoint still answering mid-freeze)"
   fi
   log "retention-overrun(${kind}): freeze verified (metrics endpoint dark)"
-  sleep $(( freeze_s - 3 ))
+  elapsed=3
+  while :; do
+    sleep 15; elapsed=$(( elapsed + 15 ))
+    rx_now="$(ingress_received || echo "${rx_freeze}")"
+    delta=$(( rx_now - rx_freeze ))
+    # Both legs matter: the window must ROLL PAST the frozen cursor (delta)
+    # AND the 90s cluster session must lapse (elapsed), so the resume goes
+    # through a fresh session whose REPLAY_FROM is genuinely below the floor.
+    [ "${delta}" -ge "${need}" ] && [ "${elapsed}" -ge 120 ] && break
+    if [ "${elapsed}" -ge "${RETENTION_FREEZE_CAP_S}" ]; then
+      timeout 20 docker exec "${node}" docker kill -s CONT "${inner}" >/dev/null 2>&1 || true
+      fail "retention-overrun(${kind}): load too slow to overrun the retention window — only ${delta} of ${need} frames flowed in ${elapsed}s (≈$(( delta / elapsed ))tps); raise the load rate or lower KARDAMOM_CLUSTER_RETENTION"
+    fi
+  done
+  log "retention-overrun(${kind}): window overrun (${delta} frames in ${elapsed}s ≈ $(( delta / elapsed ))tps); thawing"
   timeout 20 docker exec "${node}" docker kill -s CONT "${inner}" >/dev/null 2>&1 \
     || log "retention-overrun(${kind}): SIGCONT failed (container may have been replaced mid-freeze); the log asserts below own the verdict"
 
@@ -883,7 +898,7 @@ run_retention_overrun() { # <executor|validator>
     sleep 6; t=$(( t + 6 ))
     if [ "${t}" -ge 300 ]; then
       [ "${unavailable}" = 1 ] \
-        || fail "retention-overrun(${kind}): consumer never hit REPLAY_UNAVAILABLE after a ${freeze_s}s freeze — the retention tier was NOT exercised (is the deployed -Dkardamom.cluster.retention actually ${KARDAMOM_CLUSTER_RETENTION}?)"
+        || fail "retention-overrun(${kind}): consumer never hit REPLAY_UNAVAILABLE after a ${elapsed}s freeze with ${delta} frames flowed — the retention tier was NOT exercised (is the deployed -Dkardamom.cluster.retention actually ${KARDAMOM_CLUSTER_RETENTION}?)"
       [ "${fetched}" = 1 ] \
         || fail "retention-overrun(${kind}): REPLAY_UNAVAILABLE hit but no peer checkpoint was fetched — the repair path did not run (donors dark, or --checkpoint-peers misconfigured)"
       [ "${prepared}" = 1 ] \
@@ -1192,10 +1207,8 @@ run_case() { # <case-name>
   # restart + restore) needs live traffic to prove the rejoin — so the load
   # window must cover freeze + recovery, not the global CHAOS_CASE_S.
   if [ "${name}" = "retention-overrun" ] || [ "${name}" = "retention-overrun-validator" ]; then
-    if [ -n "${KARDAMOM_CLUSTER_RETENTION}" ]; then
-      local min_s=$(( INJECT_DELAY + $(retention_freeze_s) + 120 ))
-      [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
-    fi
+    local min_s=$(( INJECT_DELAY + RETENTION_FREEZE_CAP_S + 120 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
   fi
 
   # Ingress baseline BEFORE the load starts, for the injection gate below.
@@ -1763,11 +1776,25 @@ print(best + 40 if best >= 0 else -1)
       # the pipeline must keep progressing with NO stall — the executor's block
       # gauge advances throughout. (No new election is required; the leader is
       # untouched.) The killed member's task then restarts and rejoins (3/3).
-      local leader follower
+      local leader follower fk_r0 fk_r1 fk_t
       leader="$(cluster_leader)"
       # Pick any memberId in 0..2 that isn't the leader.
       for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
-      log "cluster-follower-kill: leader=memberId=${leader}; killing FOLLOWER memberId=${follower} on kardamom-sealer-${follower}"
+      # A snapshot must exist BEFORE the kill: an intact-dir restart is where
+      # the sealer's snapshot RESTORE path actually runs (Aeron 1.44 static
+      # membership replays a BLANK member from log position 0 instead — see
+      # cluster-member-rejoin), and before the in-process scheduler existed
+      # this path had never executed outside unit tests.
+      log "cluster-follower-kill: leader=memberId=${leader}; waiting for a cluster snapshot"
+      fk_t=0
+      while :; do
+        cluster_alloc_logs | grep -q 'cluster SNAPSHOT triggered' && break
+        sleep 10; fk_t=$(( fk_t + 10 ))
+        [ "${fk_t}" -ge 300 ] \
+          && fail "cluster-follower-kill: no snapshot within ${fk_t}s — is the snapshot scheduler running?"
+      done
+      fk_r0="$(cluster_alloc_logs | grep -c "sealer snapshot RESTORED memberId=${follower}" || true)"
+      log "cluster-follower-kill: snapshot present (member ${follower} restore count ${fk_r0}); killing FOLLOWER memberId=${follower} on kardamom-sealer-${follower}"
       inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
       # Quorum holds (2/3): the executor must keep applying blocks with no stall.
       assert_executor_progress
@@ -1779,75 +1806,73 @@ print(best + 40 if best >= 0 else -1)
         || log "cluster-follower-kill: WARN leader changed (${leader} -> ${still}); quorum still held, progress OK"
       # Killed follower's task restarts and rejoins (3/3).
       assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
+      # The restarted member's dirs are INTACT, so it must recover by loading
+      # its local latest snapshot — bounded restart time — not by replaying
+      # the whole lifetime log. Count-increase, because earlier restarts in
+      # this shard may have restored already.
+      fk_t=0
+      while :; do
+        fk_r1="$(cluster_alloc_logs | grep -c "sealer snapshot RESTORED memberId=${follower}" || true)"
+        [ "${fk_r1}" -gt "${fk_r0}" ] && break
+        sleep 10; fk_t=$(( fk_t + 10 ))
+        [ "${fk_t}" -ge 180 ] \
+          && fail "cluster-follower-kill: restarted member never logged 'sealer snapshot RESTORED' (count ${fk_r0} -> ${fk_r1}) — the snapshot restore path did not run on an intact-dir restart"
+      done
+      log "cluster-follower-kill: member ${follower} restored from snapshot on restart (count ${fk_r0} -> ${fk_r1}, ${fk_t}s)"
       ;;
 
     cluster-member-rejoin)
       # BLANK-member catch-up drill — the "join mid-way with an empty state"
       # edge for the RAFT MEMBERS themselves. A follower's cluster dir AND
-      # archive are wiped after its kill, so the restarted member owns NOTHING:
-      # it must rejoin via Aeron's snapshot + log-tail replication from the
-      # leader, restore the sealer state from that snapshot (asserted via the
-      # 'sealer snapshot RESTORED' line — NOT a silent fresh-at-genesis start,
-      # which would be deterministic state divergence), and return the cluster
-      # to 3/3 with the pipeline unaffected throughout (quorum 2/3 held).
-      #
-      # Snapshots come from the in-process scheduler that shipped WITH this
-      # case (-Dkardamom.cluster.snapshotIntervalS; the chaos-cluster shard
-      # shortens it via KARDAMOM_CLUSTER_SNAPSHOT_S) — before it, nothing in
-      # the deploy ever took one, so the restore path had never run outside
-      # unit tests.
-      local leader follower r0 r1 rblock rline t
+      # archive are wiped after its kill, so the restarted member owns
+      # NOTHING. Under Aeron 1.44 STATIC membership a blank member is caught
+      # up by replicating and replaying the leader's LOG FROM POSITION 0 —
+      # snapshots are NOT transferred to blank members (they bound the
+      # restart time of members whose dirs survive; that path is asserted by
+      # cluster-follower-kill). Full log replay is deterministic, so the
+      # correct outcome here is: a FRESH-at-genesis service start, the whole
+      # log replayed, the member back as FOLLOWER, 3/3 running, pipeline
+      # unaffected throughout (quorum 2/3 held). First run of this case
+      # proved exactly that (the wiped member replayed to the live head and
+      # resumed serving replay sessions). NOTE the cost this documents: a
+      # blank member's rejoin time grows with the lifetime log — bounding it
+      # needs log purge after snapshot, tracked as audit follow-up.
+      local leader follower f0 f1 role0 role1 t
       leader="$(cluster_leader)"
       for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
 
-      # 1. A snapshot must EXIST before the wipe; waiting here names the real
-      # precondition instead of failing later as "member never restored".
-      log "cluster-member-rejoin: leader=memberId=${leader}; waiting for a cluster snapshot"
-      t=0
-      while :; do
-        cluster_alloc_logs | grep -q 'cluster SNAPSHOT triggered' && break
-        sleep 10; t=$(( t + 10 ))
-        [ "${t}" -ge 240 ] \
-          && fail "cluster-member-rejoin: no snapshot within ${t}s — is the snapshot scheduler running (KARDAMOM_CLUSTER_SNAPSHOT_S deployed)?"
-      done
-      log "cluster-member-rejoin: snapshot observed after ${t}s"
+      # Baselines BEFORE the wipe (counts, not presence: bring-up also logs a
+      # fresh start, and earlier cases add FOLLOWER role lines).
+      f0="$(cluster_alloc_logs | grep -c "sealer state FRESH at genesis memberId=${follower}" || true)"
+      role0="$(cluster_alloc_logs | grep -c "cluster role=FOLLOWER memberId=${follower}" || true)"
 
-      # 2. Baseline BEFORE the wipe: earlier cases restart members with their
-      # dirs intact, which also restores from a local snapshot — the assert
-      # below is on the count INCREASING, not mere presence.
-      r0="$(cluster_alloc_logs | grep -c "sealer snapshot RESTORED memberId=${follower}" || true)"
-
-      log "cluster-member-rejoin: killing FOLLOWER memberId=${follower} and WIPING its cluster + archive dirs"
+      log "cluster-member-rejoin: leader=memberId=${leader}; killing FOLLOWER memberId=${follower} and WIPING its cluster + archive dirs"
       inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
       docker exec "kardamom-sealer-${follower}" bash -lc \
         'rm -rf /opt/kardamom/cluster/* /opt/kardamom/archive/*' \
         || fail "cluster-member-rejoin: could not wipe memberId=${follower} state"
 
-      # 3. Quorum (2/3) holds: the pipeline keeps committing throughout.
+      # Quorum (2/3) holds: the pipeline keeps committing throughout.
       assert_executor_progress
-      # 4. The wiped member's task restarts and the job returns to 3/3.
+      # The wiped member's task restarts and the job returns to 3/3.
       assert_count "${CLUSTER_TASK}" 3 "${CHAOS_RESTART_SLO_S}"
 
-      # 5. The rejoined member must have restored the SNAPSHOT (count grew),
-      # at a mid-chain position (block > 0 — restoring an empty genesis
-      # snapshot would prove nothing about catch-up).
+      # The restarted member must (a) start BLANK — fresh-at-genesis count
+      # grew, proving the wipe took and this is genuinely the empty-state
+      # path — and (b) finish the full log replay and rejoin as FOLLOWER.
       t=0
       while :; do
-        r1="$(cluster_alloc_logs | grep -c "sealer snapshot RESTORED memberId=${follower}" || true)"
-        [ "${r1}" -gt "${r0}" ] && break
+        f1="$(cluster_alloc_logs | grep -c "sealer state FRESH at genesis memberId=${follower}" || true)"
+        role1="$(cluster_alloc_logs | grep -c "cluster role=FOLLOWER memberId=${follower}" || true)"
+        [ "${f1}" -gt "${f0}" ] && [ "${role1}" -gt "${role0}" ] && break
         sleep 10; t=$(( t + 10 ))
-        if [ "${t}" -ge 240 ]; then
-          if cluster_alloc_logs | grep -q "sealer state FRESH at genesis memberId=${follower}"; then
-            fail "cluster-member-rejoin: wiped member restarted FRESH AT GENESIS instead of restoring the leader's snapshot — blank-member replication did not happen (silent state divergence risk)"
-          fi
-          fail "cluster-member-rejoin: wiped member logged neither a snapshot restore nor a fresh start within ${t}s (rejoin wedged?)"
+        if [ "${t}" -ge 300 ]; then
+          [ "${f1}" -gt "${f0}" ] \
+            || fail "cluster-member-rejoin: restarted member did not start blank (fresh-at-genesis count ${f0} -> ${f1}) — the wipe did not take, this run proved nothing about empty-state rejoin"
+          fail "cluster-member-rejoin: blank member never returned to FOLLOWER within ${t}s (role count ${role0} -> ${role1}) — log-replay catch-up wedged"
         fi
       done
-      rline="$(cluster_alloc_logs | grep "sealer snapshot RESTORED memberId=${follower}" | tail -1)"
-      rblock="$(printf '%s' "${rline}" | sed -nE 's/.*block=([0-9]+).*/\1/p')"
-      [ -n "${rblock}" ] && [ "${rblock}" -gt 0 ] \
-        || fail "cluster-member-rejoin: snapshot restore was at block ${rblock:-?} — not a mid-chain catch-up (${rline})"
-      log "cluster-member-rejoin: memberId=${follower} rejoined from snapshot at block ${rblock} (${t}s after restart); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
+      log "cluster-member-rejoin: memberId=${follower} rejoined blank via full log replay (fresh ${f0}->${f1}, FOLLOWER ${role0}->${role1}, ${t}s); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
       ;;
 
     cluster-quorum-loss-recover)
