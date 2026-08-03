@@ -1357,11 +1357,18 @@ run_case() { # <case-name>
         docker exec kardamom-executor-1 tar -C /opt/kardamom --warning=no-file-changed -cf - "checkpoints/${ck_name}" \
           | docker exec -i kardamom-executor-0 tar -C /opt/kardamom -xf - || ck_rc=$?
         # tar rc=1 = live-writer drift; restore-side validation + replay
-        # fallback (recovery C/D) is the integrity gate.
-        if [ "${ck_rc}" -le 1 ]; then
+        # fallback (recovery C/D) is the integrity gate. But a tar that raced
+        # the source's PRUNE can deliver a TORN copy (image without MANIFEST)
+        # with rc<=1 — the executor now refuses + quarantines such a copy and
+        # self-heals from a peer, but verify completeness here so this case
+        # exercises the LOCAL-restore path it exists for, not the network
+        # fallback.
+        if [ "${ck_rc}" -le 1 ] && docker exec kardamom-executor-0 bash -lc \
+            "test -s '/opt/kardamom/checkpoints/${ck_name}/MANIFEST' && test -s '/opt/kardamom/checkpoints/${ck_name}/mdbx.dat'"; then
           copied=1
           break
         fi
+        log "state-checkpoint-restore: copy of ${ck_name} incomplete or failed (raced the writer's prune?); retrying"
         sleep 2
       done
       [ "${copied}" = 1 ] || fail "state-checkpoint-restore: checkpoint copy failed"

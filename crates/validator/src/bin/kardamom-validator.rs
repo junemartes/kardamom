@@ -234,23 +234,33 @@ async fn main() -> Result<()> {
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe validator state dir")?;
         if fresh {
-            let mut local =
-                kardamom_state::latest_checkpoint(ckpt_dir).context("scan checkpoint dir")?;
-            if local.is_none() && !args.checkpoint_peers.is_empty() {
-                local = kardamom_state::fetch_best_checkpoint(
+            // Newest-first with QUARANTINE on verification failure — a torn
+            // or foreign checkpoint falls through to the peer fetch instead
+            // of crash-looping the adoption (same hardening as the executor).
+            let mut restored = kardamom_state::restore_best_checkpoint(
+                ckpt_dir,
+                &args.state_dir,
+                expected_genesis,
+            )
+            .context("restore local checkpoint")?;
+            if restored.is_none()
+                && !args.checkpoint_peers.is_empty()
+                && kardamom_state::fetch_best_checkpoint(
                     &args.checkpoint_peers,
                     ckpt_dir,
                     1,
                     expected_genesis,
-                );
-            }
-            if let Some(ckpt) = local {
-                let block = kardamom_state::restore_checkpoint(
-                    &ckpt.path,
+                )
+                .is_some()
+            {
+                restored = kardamom_state::restore_best_checkpoint(
+                    ckpt_dir,
                     &args.state_dir,
                     expected_genesis,
                 )
-                .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
+                .context("restore fetched checkpoint")?;
+            }
+            if let Some((block, ckpt_path)) = restored {
                 // Adoption is recorded EXPLICITLY: executor checkpoints carry
                 // the genesis-seeded mirror + trie (built for every env by
                 // seed_genesis, then never updated by the trie-off writer),
@@ -265,7 +275,7 @@ async fn main() -> Result<()> {
                     .context("write adoption marker")?;
                 tracing::info!(
                     restored_block = block,
-                    checkpoint = %ckpt.path.display(),
+                    checkpoint = %ckpt_path.display(),
                     "adopted state from checkpoint (UNVERIFIED through this block); \
                      will re-execute + verify the tail from here"
                 );

@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 
 use alloy_primitives::B256;
 
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::compaction::compact_to;
 use crate::env::StateEnv;
@@ -343,6 +343,57 @@ pub fn restore_checkpoint(
     Ok(block)
 }
 
+/// Restore the newest VERIFIABLE checkpoint under `checkpoints_dir` into
+/// `state_dir`, returning `(restored_block, checkpoint_path)`. A checkpoint
+/// that fails verification is QUARANTINED — renamed to a hidden
+/// `.rejected-<name>` the scanners never pick up — and the next-newest is
+/// tried. A bad image must cost the node one rung of its fallback ladder
+/// (older checkpoint -> peer fetch -> genesis), never wedge it: observed in
+/// CI, a copy that raced the source's prune delivered an image without its
+/// MANIFEST, and the restart refused it, exited, restarted into the same
+/// refusal — a crash loop that held the fleet at 2/3 until the case timed
+/// out. `Ok(None)` when no restorable checkpoint remains.
+pub fn restore_best_checkpoint(
+    checkpoints_dir: &Path,
+    state_dir: &Path,
+    expected_genesis: Option<B256>,
+) -> Result<Option<(u64, PathBuf)>, StateError> {
+    loop {
+        let Some(ckpt) = latest_checkpoint(checkpoints_dir)? else {
+            return Ok(None);
+        };
+        match restore_checkpoint(&ckpt.path, state_dir, expected_genesis) {
+            Ok(block) => return Ok(Some((block, ckpt.path))),
+            Err(e) => {
+                // A failure after verification (I/O mid-copy) may have staged
+                // a partial data file; a leftover would make the next attempt
+                // refuse "state dir already holds a DB".
+                let _ = std::fs::remove_file(state_dir.join("mdbx.dat"));
+                let name = ckpt
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "checkpoint".into());
+                let rejected = ckpt.path.with_file_name(format!(".rejected-{name}"));
+                warn!(
+                    checkpoint = %ckpt.path.display(),
+                    error = %e,
+                    quarantined_as = %rejected.display(),
+                    "checkpoint failed verification; quarantining and trying the next-newest"
+                );
+                // If even the rename fails the loop cannot make progress —
+                // surface the original refusal rather than spinning.
+                std::fs::rename(&ckpt.path, &rejected).map_err(|re| {
+                    StateError::Recovery(format!(
+                        "checkpoint {} failed verification ({e}) and could not be                          quarantined: {re}",
+                        ckpt.path.display()
+                    ))
+                })?;
+            }
+        }
+    }
+}
+
 /// Resolve a checkpoint's mdbx data file: either `<checkpoint>/mdbx.dat` (the
 /// env was copied in subdir mode) or the `<checkpoint>` file itself
 /// (single-file mode). Either way it is a complete mdbx image; dir-mode open
@@ -611,6 +662,58 @@ mod tests {
         assert!(
             format!("{err}").contains("manifest"),
             "expected an unverifiable-image refusal, got: {err}"
+        );
+    }
+
+    /// A bad newest checkpoint must cost one rung of the ladder, not wedge
+    /// the node: restore_best quarantines it and restores the next-newest.
+    #[test]
+    fn restore_best_quarantines_bad_and_falls_back() {
+        let src = tempfile::tempdir().unwrap();
+        let ckpt = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let addr = Address::from([0x24; 20]);
+        let env = StateEnvBuilder::new(src.path())
+            .durability(Durability::SafeNoSync)
+            .open()
+            .unwrap();
+        seed_test_genesis(&env);
+        commit_blocks(&env, addr, 2);
+        let good = create_checkpoint(&env, ckpt.path()).unwrap();
+        commit_blocks(&env, addr, 5);
+        let torn = create_checkpoint(&env, ckpt.path()).unwrap();
+        drop(env);
+
+        // Make the newest look like the observed CI failure: an image whose
+        // MANIFEST never arrived (tar raced the writer's prune).
+        std::fs::remove_file(manifest_path(&torn.path)).unwrap();
+
+        let (block, path) = restore_best_checkpoint(ckpt.path(), dst.path(), None)
+            .expect("restore_best must not error on a quarantinable checkpoint")
+            .expect("the older good checkpoint must restore");
+        assert_eq!(block, good.block);
+        assert_eq!(path, good.path);
+        // The torn one is quarantined under a hidden name, not retried forever.
+        assert!(!torn.path.exists());
+        let rejected: Vec<_> = std::fs::read_dir(ckpt.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".rejected-"))
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "expected one quarantined checkpoint: {rejected:?}"
+        );
+
+        // Nothing restorable left -> Ok(None), never a crash loop.
+        let dst2 = tempfile::tempdir().unwrap();
+        std::fs::remove_file(manifest_path(&good.path)).unwrap();
+        assert!(
+            restore_best_checkpoint(ckpt.path(), dst2.path(), None)
+                .unwrap()
+                .is_none()
         );
     }
 

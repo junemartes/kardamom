@@ -21,8 +21,8 @@ pub mod writer;
 
 pub use checkpoint::{
     CheckpointInfo, CheckpointManifest, create_checkpoint, has_state_db, latest_checkpoint,
-    manifest_path, park_state_db, prune_checkpoints, read_manifest, restore_checkpoint,
-    verify_checkpoint,
+    manifest_path, park_state_db, prune_checkpoints, read_manifest, restore_best_checkpoint,
+    restore_checkpoint, verify_checkpoint,
 };
 pub use checkpoint_transfer::{fetch_best_checkpoint, fetch_latest_checkpoint, serve_checkpoints};
 pub use compaction::compact_to;
