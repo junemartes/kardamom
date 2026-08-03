@@ -412,6 +412,13 @@ run_validator_join() {
     || fail "validator-join: cluster never warmed up within ${t}s (verified=${verified} block=${v_now} exec=${e_now})"
   log "validator-join: warmed up (verified=${verified} block=${v_now} exec=${e_now}); wiping the validator for a fresh join"
 
+  # Container NAMES survive a task restart (task-<alloc-id>), so newborn
+  # identity is the docker StartedAt timestamp — the validator-lapse case's
+  # lesson, relearned on this case's first CI run (sync succeeded, the
+  # name-based newborn detection never fired).
+  local started0
+  started0="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${inner}" 2>/dev/null || true)"
+
   # Kill, then wipe inside the restart delay (the job's restart stanza waits
   # 15s before the replacement container starts — the wipe wins the race, and
   # a wipe-first order would race the LIVE mdbx instead).
@@ -426,11 +433,14 @@ run_validator_join() {
   local deadline=$(( $(date +%s) + 240 )) newborn="" joined=0 vf1=0 v1=0
   while [ "$(date +%s)" -lt "${deadline}" ]; do
     if [ -z "${newborn}" ]; then
-      local cur
+      local cur started1
       cur="$(timeout 15 docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null || true)"
-      if [ -n "${cur}" ] && [ "${cur}" != "${inner}" ]; then
-        newborn="${cur}"
-        log "validator-join: newborn container ${newborn} up"
+      if [ -n "${cur}" ]; then
+        started1="$(timeout 15 docker exec "${VALIDATOR_NODE}" docker inspect -f '{{.State.StartedAt}}' "${cur}" 2>/dev/null || true)"
+        if [ -n "${started1}" ] && [ "${started1}" != "${started0}" ]; then
+          newborn="${cur}"
+          log "validator-join: newborn container ${newborn} up (started ${started1})"
+        fi
       fi
     fi
     vf1="$(val_metric validator_blocks_verified_total)"; vf1="${vf1:-0}"
