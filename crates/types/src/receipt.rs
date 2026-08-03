@@ -7,6 +7,21 @@ use rkyv::{Archive, Deserialize, Serialize, with::Map};
 use crate::position::BPosition;
 use crate::wire;
 
+/// EIP-2718 type byte for a legacy (untyped, RLP-list) transaction.
+pub const TX_TYPE_LEGACY: u8 = 0x00;
+/// EIP-2718 type byte for an L1-originated deposit — the OP-stack value.
+pub const TX_TYPE_DEPOSIT: u8 = 0x7E;
+
+/// The EIP-2718 type byte of a raw encoded transaction: for a typed
+/// envelope the leading byte IS the type (`0x00..=0x7f`); anything above
+/// that range is the first byte of a legacy RLP list.
+pub fn tx_type_of(raw_tx: &[u8]) -> u8 {
+    match raw_tx.first() {
+        Some(&b) if b <= 0x7f => b,
+        _ => TX_TYPE_LEGACY,
+    }
+}
+
 /// Lightweight log entry that mirrors `alloy_primitives::Log` but uses our
 /// rkyv-friendly wire types. Topic count is variable per the EVM spec.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
@@ -36,6 +51,19 @@ pub struct WireLog {
 #[rkyv(derive(Debug))]
 pub struct Receipt {
     pub tx_idx: BPosition,
+    /// EIP-2718 transaction type: [`TX_TYPE_LEGACY`] for an ordinary signed
+    /// L2 tx (or the envelope's type byte for a typed one), and
+    /// [`TX_TYPE_DEPOSIT`] for an L1-originated deposit.
+    ///
+    /// Load-bearing beyond RPC fidelity: a deposit carries no L2 nonce (the
+    /// `nonce` field below is filler 0), so consumers that reason about
+    /// nonces MUST branch on this rather than on `nonce == 0`. Before this
+    /// field existed, deposits and genuine nonce-0 txs were
+    /// indistinguishable on the wire, which forced the sequencer's
+    /// publish-confirmation ledger to ignore ALL nonce-0 receipts — leaving
+    /// a one-tx sender's nonce-0 ref unconfirmable and re-offered every
+    /// confirm-timeout forever.
+    pub tx_type: u8,
     /// Copied from `TxEnvelope.tx_hash` — never recomputed by the executor.
     #[rkyv(with = wire::B256Bytes)]
     pub tx_hash: B256,
@@ -83,6 +111,12 @@ impl Receipt {
     /// and wrote NO state (its `write_set_hash` is the empty-set hash).
     pub fn is_invalid_skip(&self) -> bool {
         !self.status && self.gas_used == 0
+    }
+
+    /// Whether this receipt is for an L1-originated deposit (which consumes
+    /// no L2 nonce — see [`Receipt::tx_type`]).
+    pub fn is_deposit(&self) -> bool {
+        self.tx_type == TX_TYPE_DEPOSIT
     }
 }
 

@@ -62,6 +62,7 @@ fn tx_envelope_roundtrip() {
 #[test]
 fn receipt_roundtrip() {
     let v = Receipt {
+        tx_type: kardamom_types::TX_TYPE_LEGACY,
         tx_idx: BPosition {
             term_id: 3,
             term_offset: 4096,
@@ -91,6 +92,7 @@ fn receipt_roundtrip() {
 fn receipt_roundtrip_contract_creation() {
     // CREATE tx variant: `to` is None, `contract_address` is Some.
     let v = Receipt {
+        tx_type: kardamom_types::TX_TYPE_LEGACY,
         tx_idx: BPosition {
             term_id: 0,
             term_offset: 0,

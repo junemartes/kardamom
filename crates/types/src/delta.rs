@@ -45,35 +45,38 @@ pub struct CodeEntry {
     pub code: Bytes,
 }
 
-/// Versioned `tx_bal` wire frame (spec:
-/// docs/agents/bal-attribution-parallel-validation-spec.md).
+/// `tx_bal` wire frame (spec:
+/// docs/agents/bal-attribution-parallel-validation-spec.md): the merged
+/// final-value write set plus the EIP-7928 Block Access List (canonical
+/// alloy RLP) carrying per-slot `(tx_index, value)` write lists and
+/// per-account storage reads.
 ///
-/// `V1` is exactly the pre-attribution payload (receipts-stripped
-/// [`BlockDelta`]); `V2` adds the EIP-7928 Block Access List — canonical
-/// alloy RLP bytes — carrying per-slot `(tx_index, value)` write lists and
-/// per-account storage reads. The merged `delta` section is unchanged so
-/// V1-only consumers (prefetch, the write-set-hash cross-check) read it
-/// identically. `granularity` = 1 for per-tx attribution; K > 1 means
-/// BalIndex was quantized to ceil(idx/K) chunks (the size-degradation
-/// ladder).
+/// UNVERSIONED by choice: this was a V1/V2 enum, but V1 (the receipts-free
+/// delta alone) had exactly one producer — a legacy writer-queue tee that
+/// the publisher thread superseded and that nothing wired anymore — so the
+/// discriminant only bought a permanent match arm on every consumer and an
+/// injection-path footgun (the S7 corrupt-BAL drill silently stopped
+/// drilling when its hand-rolled frames kept the pre-wrapper shape). While
+/// the chain is v0 the wire is free to change; add versioning back when
+/// there is a second live shape to carry.
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
-pub enum BalFrame {
-    V1(BlockDelta),
-    V2 {
-        delta: BlockDelta,
-        bal_rlp: Vec<u8>,
-        granularity: u16,
-    },
+pub struct BalFrame {
+    /// The merged final-value write set for the block (receipts stripped:
+    /// they dominate frame size and fat frames collapsed the validator's
+    /// lapse window, #113).
+    pub delta: BlockDelta,
+    /// RLP-encoded EIP-7928 block access list (attribution), quantized at
+    /// `granularity`. Empty when capture is disabled.
+    pub bal_rlp: Vec<u8>,
+    /// Attribution granularity: 1 = per-tx; K > 1 collapses K-tx chunks.
+    pub granularity: u16,
 }
 
 impl BalFrame {
-    /// The merged final-value section, whichever version.
+    /// The merged final-value section.
     pub fn delta(&self) -> &BlockDelta {
-        match self {
-            BalFrame::V1(d) => d,
-            BalFrame::V2 { delta, .. } => delta,
-        }
+        &self.delta
     }
 }
 

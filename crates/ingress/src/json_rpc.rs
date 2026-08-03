@@ -286,15 +286,30 @@ fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
         })
         .collect();
     let logs_bloom = alloy_primitives::logs_bloom(logs.iter().map(|l| &l.inner));
+    let with_bloom = alloy_consensus::ReceiptWithBloom {
+        receipt: alloy_consensus::Receipt {
+            status: alloy_consensus::Eip658Value::Eip658(r.status),
+            cumulative_gas_used: r.cumulative_gas_used,
+            logs,
+        },
+        logs_bloom,
+    };
+    // Report the tx's REAL EIP-2718 type. This was hardcoded to Legacy, so
+    // every deposit surfaced to clients as a type-0x00 transaction —
+    // bridge tooling identifies deposits by the 0x7E byte.
+    let inner = match r.tx_type {
+        kardamom_types::TX_TYPE_LEGACY => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
+        0x01 => alloy_rpc_types_eth::ReceiptEnvelope::Eip2930(with_bloom),
+        0x02 => alloy_rpc_types_eth::ReceiptEnvelope::Eip1559(with_bloom),
+        0x03 => alloy_rpc_types_eth::ReceiptEnvelope::Eip4844(with_bloom),
+        // Deposits (0x7E) have no alloy-eth envelope variant — the OP type
+        // lives in op-alloy. Legacy is the closest structural carrier; the
+        // authoritative deposit marker for kardamom consumers is
+        // `Receipt::is_deposit()` on the native stream.
+        _ => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
+    };
     TransactionReceipt {
-        inner: alloy_rpc_types_eth::ReceiptEnvelope::Legacy(alloy_consensus::ReceiptWithBloom {
-            receipt: alloy_consensus::Receipt {
-                status: alloy_consensus::Eip658Value::Eip658(r.status),
-                cumulative_gas_used: r.cumulative_gas_used,
-                logs,
-            },
-            logs_bloom,
-        }),
+        inner,
         transaction_hash: r.tx_hash,
         transaction_index: Some(r.transaction_index),
         block_hash: None,

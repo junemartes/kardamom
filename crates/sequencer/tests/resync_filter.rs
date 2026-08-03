@@ -110,6 +110,7 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     // load harness's seq_clean verdict).
     floor_tx
         .send(FloorUpdate {
+            deposit: false,
             sender: s.address(),
             executed_nonce: 1,
             invalid_skip: false,
@@ -176,6 +177,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
     // Execution evidence arrives: nonce 4 receipted → floor 5.
     floor_tx
         .send(FloorUpdate {
+            deposit: false,
             sender: s.address(),
             executed_nonce: 4,
             invalid_skip: false,
@@ -216,6 +218,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     // Confirm nonce 1: cumulative per sender, retires BOTH (0 and 1).
     floor_tx
         .send(FloorUpdate {
+            deposit: false,
             sender: s.address(),
             executed_nonce: 1,
             invalid_skip: false,
@@ -245,6 +248,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     // Confirming it stops the churn.
     floor_tx
         .send(FloorUpdate {
+            deposit: false,
             sender: s.address(),
             executed_nonce: 2,
             invalid_skip: false,

@@ -356,10 +356,10 @@ async fn main() -> Result<()> {
     {
         const BAL_TICK: Duration = Duration::from_secs(5);
         const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
-        // BalFrame (spec: bal-attribution-parallel-validation): V1 carries
-        // the merged delta alone; V2 adds the EIP-7928 access list. The
-        // write-set cross-check consumes the merged section either way —
-        // attribution drives the parallel engine in phase 3.
+        // BalFrame (spec: bal-attribution-parallel-validation): the merged
+        // delta plus the EIP-7928 access list; the write-set cross-check
+        // consumes the merged section, attribution drives the parallel
+        // engine.
         let mut bal_rx = rt
             .open_subscription::<kardamom_types::BalFrame>(
                 &channels.tx_bal_channel,
@@ -408,12 +408,12 @@ async fn main() -> Result<()> {
                         continue;
                     }
                 };
-                if let kardamom_types::BalFrame::V2 {
-                    bal_rlp,
-                    granularity,
-                    delta,
-                } = &frame
                 {
+                    let kardamom_types::BalFrame {
+                        bal_rlp,
+                        granularity,
+                        delta,
+                    } = &frame;
                     // Decode the access list into seed-lookup form for the
                     // parallel engine. A decode failure degrades to
                     // sequential re-execution (the merged cross-check below
