@@ -20,14 +20,15 @@ pub mod trie;
 pub mod writer;
 
 pub use checkpoint::{
-    CheckpointInfo, create_checkpoint, has_state_db, latest_checkpoint, park_state_db,
-    prune_checkpoints, restore_checkpoint,
+    CheckpointInfo, CheckpointManifest, create_checkpoint, has_state_db, latest_checkpoint,
+    manifest_path, park_state_db, prune_checkpoints, read_manifest, restore_checkpoint,
+    verify_checkpoint,
 };
 pub use checkpoint_transfer::{fetch_best_checkpoint, fetch_latest_checkpoint, serve_checkpoints};
 pub use compaction::compact_to;
 pub use env::{Durability, StateEnv, StateEnvBuilder};
 pub use error::StateError;
-pub use genesis::{genesis_applied, seed_genesis};
+pub use genesis::{genesis_applied, genesis_digest, seed_genesis};
 pub use integrity::{IntegrityReport, deep_compare, sweep};
 pub use recovery::{RecoveryPoint, bootstrap_trie_from_state, has_trie, read_recovery_point};
 pub use snapshot::StateSnapshot;
