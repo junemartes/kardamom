@@ -155,10 +155,42 @@ pub fn recover_blocks<S: BlobSource>(
     for d in descriptors {
         let mut blobs = Vec::with_capacity(d.versioned_hashes.len());
         for vh in &d.versioned_hashes {
-            blobs.push(source.fetch_blob(*vh)?);
+            let blob = source.fetch_blob(*vh)?;
+            verify_blob_against_hash(*vh, &blob)?;
+            blobs.push(blob);
         }
         let frames = reconstruct(&blobs)?;
         blocks.extend(frames);
     }
     Ok(blocks)
+}
+
+/// Prove that `blob`'s bytes are the ones L1 committed to as `versioned_hash`:
+/// recompute the KZG commitment and derive its versioned hash.
+///
+/// The DA store is an UNTRUSTED boundary — it is keyed by versioned hash but
+/// nothing about a filesystem (or a future networked store) guarantees the
+/// bytes behind a name. Without this, a store returning right-length wrong
+/// bytes was silently accepted and `kardamom-reconstruct` rebuilt a WRONG
+/// chain from it — from the layer that exists to be the last-resort backstop
+/// when every in-cluster durable copy is gone. The hash is already in the
+/// `BatchPosted` event, so the check costs one commitment per blob on a
+/// recovery path that runs at most once per incident.
+pub fn verify_blob_against_hash(
+    versioned_hash: B256,
+    blob: &alloy_eips::eip4844::Blob,
+) -> Result<(), BatcherError> {
+    // Recomputed through the SAME helper that produced the hash on the post
+    // path, so producer and verifier can never drift apart.
+    let sidecar = build_sidecar(vec![*blob])?;
+    let got = sidecar.versioned_hashes().next().ok_or_else(|| {
+        BatcherError::Corruption("sidecar produced no versioned hash".to_string())
+    })?;
+    if got != versioned_hash {
+        return Err(BatcherError::Corruption(format!(
+            "DA blob content does not match its commitment: L1 committed to \
+             {versioned_hash}, stored bytes hash to {got}"
+        )));
+    }
+    Ok(())
 }
