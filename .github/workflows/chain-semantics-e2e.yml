@@ -54,9 +54,20 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      # rusteron's build.rs compiles the Aeron C library with -march=native;
+      # those objects land in target/ and travel in the rust cache. GitHub's
+      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
+      # microarchitecture SIGILLs (exit 132) when restored on an older one —
+      # observed as a 6/7-shard wave of sequencers crash-looping with empty
+      # stderr the moment they touched Aeron. Key the cache by CPU model so
+      # native objects never cross microarchitectures.
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: chain-semantics-e2e
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
 
       - name: Build the sealer jar
         working-directory: cluster/sealer-service

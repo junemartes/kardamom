@@ -39,7 +39,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # rusteron's build.rs compiles the Aeron C library with -march=native;
+      # those objects land in target/ and travel in the rust cache. GitHub's
+      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
+      # microarchitecture SIGILLs (exit 132) when restored on an older one —
+      # observed as a 6/7-shard wave of sequencers crash-looping with empty
+      # stderr the moment they touched Aeron. Key the cache by CPU model so
+      # native objects never cross microarchitectures.
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
       - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   build:
@@ -55,7 +67,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # rusteron's build.rs compiles the Aeron C library with -march=native;
+      # those objects land in target/ and travel in the rust cache. GitHub's
+      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
+      # microarchitecture SIGILLs (exit 132) when restored on an older one —
+      # observed as a 6/7-shard wave of sequencers crash-looping with empty
+      # stderr the moment they touched Aeron. Key the cache by CPU model so
+      # native objects never cross microarchitectures.
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
       - run: cargo build --workspace --all-targets --locked
 
   test:
@@ -71,7 +95,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # rusteron's build.rs compiles the Aeron C library with -march=native;
+      # those objects land in target/ and travel in the rust cache. GitHub's
+      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
+      # microarchitecture SIGILLs (exit 132) when restored on an older one —
+      # observed as a 6/7-shard wave of sequencers crash-looping with empty
+      # stderr the moment they touched Aeron. Key the cache by CPU model so
+      # native objects never cross microarchitectures.
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
       - run: cargo test --workspace --all-targets --locked
 
   doc-test:
@@ -87,7 +123,19 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends libbsd-dev uuid-dev
+      # rusteron's build.rs compiles the Aeron C library with -march=native;
+      # those objects land in target/ and travel in the rust cache. GitHub's
+      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
+      # microarchitecture SIGILLs (exit 132) when restored on an older one —
+      # observed as a 6/7-shard wave of sequencers crash-looping with empty
+      # stderr the moment they touched Aeron. Key the cache by CPU model so
+      # native objects never cross microarchitectures.
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
       - run: cargo test --workspace --doc --locked
 
   forge-build:

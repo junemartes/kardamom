@@ -79,9 +79,20 @@ jobs:
           # GitHub releases API, which 403s under the unauthenticated per-IP
           # rate limit on Actions runners. A concrete tag downloads directly.
           version: v1.7.1
+      # rusteron's build.rs compiles the Aeron C library with -march=native;
+      # those objects land in target/ and travel in the rust cache. GitHub's
+      # runner fleet is CPU-heterogeneous, so a cache populated on a newer
+      # microarchitecture SIGILLs (exit 132) when restored on an older one —
+      # observed as a 6/7-shard wave of sequencers crash-looping with empty
+      # stderr the moment they touched Aeron. Key the cache by CPU model so
+      # native objects never cross microarchitectures.
+      - name: CPU microarch cache key
+        id: cpukey
+        run: echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: cluster-e2e
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
 
       # JDK for the Java Aeron-Cluster sealer node. The clustered sealer image is
       # a pure-JVM shadowJar (no native libs); temurin 17 matches cluster.Dockerfile
