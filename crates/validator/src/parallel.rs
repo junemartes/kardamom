@@ -26,7 +26,6 @@
 use std::collections::BTreeMap;
 
 use alloy_primitives::{Address, B256, U256};
-use kardamom_engine::WriteSet;
 
 /// A BAL claim indexed for seeding: per (address, slot) and per account
 /// field, the ordered `(bal_index, value)` writes the executor claimed.
@@ -368,7 +367,6 @@ use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
 use kardamom_engine::exec_types::TxIndex;
-use kardamom_engine::executor::execute_tx;
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 
 /// One transaction as the validator receives it from the canonical stream.
@@ -654,6 +652,7 @@ mod engine_tests {
     use alloy_network::TxSignerSync;
     use alloy_primitives::{TxKind, address};
     use alloy_signer_local::PrivateKeySigner;
+    use kardamom_engine::executor::execute_tx;
     use kardamom_engine::state::MockStateDatabase;
     use kardamom_types::BlockBoundaryStart;
 
@@ -883,10 +882,10 @@ mod engine_tests {
 
         // Forge a chunk-2 claim: must fail-stop naming the chunk.
         let mut forged = claims.clone();
-        if let Some(w) = forged.balance.get_mut(&to) {
-            if let Some(e) = w.iter_mut().find(|(i, _)| *i == 2) {
-                e.1 += U256::from(999u64);
-            }
+        if let Some(w) = forged.balance.get_mut(&to)
+            && let Some(e) = w.iter_mut().find(|(i, _)| *i == 2)
+        {
+            e.1 += U256::from(999u64);
         }
         let err = execute_block_parallel(&snap, None, &txs, &forged, env(), 8, 20)
             .expect_err("forged chunk claim must be caught");
