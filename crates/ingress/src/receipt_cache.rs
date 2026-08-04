@@ -23,8 +23,8 @@ use kardamom_types::Receipt;
 /// `eth_getTransactionReceipt` for evicted entries return `null` (a future
 /// v1 fallback can hit the state DB).
 pub struct ReceiptCache {
-    by_sender_nonce: Arc<DashMap<(Address, u64), Receipt>>,
-    by_tx_hash: Arc<DashMap<B256, Receipt>>,
+    by_sender_nonce: Arc<DashMap<(Address, u64), std::sync::Arc<Receipt>>>,
+    by_tx_hash: Arc<DashMap<B256, std::sync::Arc<Receipt>>>,
     capacity: usize,
 }
 
@@ -44,12 +44,18 @@ impl ReceiptCache {
     pub fn insert(&self, receipt: Receipt) {
         self.evict_if_full(&self.by_sender_nonce);
         self.evict_if_full(&self.by_tx_hash);
+        // ONE allocation shared by both indexes (each previously stored a
+        // full Receipt clone — logs and all).
+        let receipt = std::sync::Arc::new(receipt);
         self.by_sender_nonce
             .insert((receipt.from, receipt.nonce), receipt.clone());
         self.by_tx_hash.insert(receipt.tx_hash, receipt);
     }
 
-    fn evict_if_full<K: Eq + std::hash::Hash + Copy>(&self, map: &DashMap<K, Receipt>) {
+    fn evict_if_full<K: Eq + std::hash::Hash + Copy>(
+        &self,
+        map: &DashMap<K, std::sync::Arc<Receipt>>,
+    ) {
         if map.len() >= self.capacity {
             // Copy a victim key out and DROP the iterator BEFORE `remove()`.
             // DashMap's `Iter` holds a read-guard on the shard it is positioned
@@ -72,11 +78,11 @@ impl ReceiptCache {
     pub fn lookup(&self, sender: Address, nonce: u64) -> Option<Receipt> {
         self.by_sender_nonce
             .get(&(sender, nonce))
-            .map(|r| r.clone())
+            .map(|r| (**r).clone())
     }
 
     pub fn lookup_by_tx_hash(&self, tx_hash: B256) -> Option<Receipt> {
-        self.by_tx_hash.get(&tx_hash).map(|r| r.clone())
+        self.by_tx_hash.get(&tx_hash).map(|r| (**r).clone())
     }
 
     pub fn len(&self) -> usize {

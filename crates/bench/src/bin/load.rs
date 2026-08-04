@@ -119,6 +119,12 @@ struct Args {
     #[arg(long = "chaos-mode", default_value_t = false)]
     chaos_mode: bool,
 
+    /// Fixed-rate framing: skip the ramp, soak at target-tps with the STRICT
+    /// verdict. For CI invariant gating on shared/weak hosts, where edge
+    /// discovery measures the hypervisor rather than the stack.
+    #[arg(long = "fixed-rate", default_value_t = false)]
+    fixed_rate: bool,
+
     /// Comma-separated services to scrape: executor/ingress/sequencer. The
     /// `kardamom_sealer_*` values ride the executor scrape — the clustered
     /// sealer (Aeron Cluster, Raft) has no endpoint of its own; executors
@@ -207,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         completeness,
         assert_all_delivered: args.assert_all_delivered,
         chaos_mode: args.chaos_mode,
+        fixed_rate: args.fixed_rate,
         scrape: csv(&args.scrape),
         metrics_via_docker: args.metrics_via_docker,
         subscribe: args.subscribe,

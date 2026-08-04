@@ -96,6 +96,14 @@ pub struct LoadConfig {
     pub assert_all_delivered: bool,
     /// Chaos framing (skip ramp; tolerate transient blips).
     pub chaos_mode: bool,
+    /// Fixed-rate framing: skip the ramp and soak at `target_tps` with the
+    /// STRICT (non-chaos) verdict. For CI invariant gating on weak/shared
+    /// hosts: edge discovery there measures the hypervisor, not the stack —
+    /// pass/fail becomes host luck (the load shard's 800→18 ceiling swings).
+    /// Correctness (zero loss, gaps, keep-pace) is rate-independent; gate on
+    /// it at a rate the weakest runner sustains, and leave performance
+    /// numbers to the perf suite on dedicated hardware.
+    pub fixed_rate: bool,
     /// Services to scrape.
     pub scrape: Vec<String>,
     /// `docker exec` scrape vs direct.
@@ -305,7 +313,7 @@ fn build_scraper(cfg: &LoadConfig) -> Scraper {
     clippy::cast_sign_loss
 )]
 fn per_sender_estimate(cfg: &LoadConfig) -> usize {
-    let ramp_steps = if cfg.chaos_mode {
+    let ramp_steps = if cfg.chaos_mode || cfg.fixed_rate {
         0
     } else {
         u64::from(cfg.target_tps.div_ceil(cfg.ramp_step_tps.max(1)))
@@ -469,7 +477,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
 
     // --- ramp (soak mode only) -------------------------------------------
     let mut ramp = Vec::new();
-    let discovered_max = if cfg.chaos_mode {
+    let discovered_max = if cfg.chaos_mode || cfg.fixed_rate {
         cfg.target_tps
     } else {
         ramp_to_max(
@@ -490,7 +498,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss
     )]
-    let soak_rate = if cfg.chaos_mode {
+    let soak_rate = if cfg.chaos_mode || cfg.fixed_rate {
         cfg.target_tps
     } else {
         ((f64::from(discovered_max) * cfg.soak_fraction).round() as u32)
@@ -575,7 +583,14 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     let (p50, p95, p99, max) = tracker.latency_us();
 
     let report = LoadReport {
-        mode: if cfg.chaos_mode { "chaos" } else { "soak" }.to_string(),
+        mode: if cfg.chaos_mode {
+            "chaos"
+        } else if cfg.fixed_rate {
+            "fixed"
+        } else {
+            "soak"
+        }
+        .to_string(),
         target_tps: cfg.target_tps,
         discovered_max_tps: discovered_max,
         soak_rate_tps: soak_rate,
