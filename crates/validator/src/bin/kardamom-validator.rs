@@ -222,18 +222,44 @@ async fn main() -> Result<()> {
     // from its cursor and only the tail replays. Blocks through the adopted
     // checkpoint are UNVERIFIED by this validator (trust class of #78
     // catch-up); the trustless alternative is rebuild-from-L1.
+    // Chain identity for checkpoint adoption: the digest of the genesis this
+    // node is configured with. A checkpoint from another chain (or corrupt
+    // bytes) is refused rather than adopted — see CheckpointManifest.
+    let expected_genesis = {
+        let (a, c) = bin_support::build_genesis_alloc(genesis.as_ref());
+        Some(kardamom_state::genesis_digest(&a, &c))
+    };
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe validator state dir")?;
         if fresh {
-            let mut local =
-                kardamom_state::latest_checkpoint(ckpt_dir).context("scan checkpoint dir")?;
-            if local.is_none() && !args.checkpoint_peers.is_empty() {
-                local = kardamom_state::fetch_best_checkpoint(&args.checkpoint_peers, ckpt_dir, 1);
+            // Newest-first with QUARANTINE on verification failure — a torn
+            // or foreign checkpoint falls through to the peer fetch instead
+            // of crash-looping the adoption (same hardening as the executor).
+            let mut restored = kardamom_state::restore_best_checkpoint(
+                ckpt_dir,
+                &args.state_dir,
+                expected_genesis,
+            )
+            .context("restore local checkpoint")?;
+            if restored.is_none()
+                && !args.checkpoint_peers.is_empty()
+                && kardamom_state::fetch_best_checkpoint(
+                    &args.checkpoint_peers,
+                    ckpt_dir,
+                    1,
+                    expected_genesis,
+                )
+                .is_some()
+            {
+                restored = kardamom_state::restore_best_checkpoint(
+                    ckpt_dir,
+                    &args.state_dir,
+                    expected_genesis,
+                )
+                .context("restore fetched checkpoint")?;
             }
-            if let Some(ckpt) = local {
-                let block = kardamom_state::restore_checkpoint(&ckpt.path, &args.state_dir)
-                    .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
+            if let Some((block, ckpt_path)) = restored {
                 // Adoption is recorded EXPLICITLY: executor checkpoints carry
                 // the genesis-seeded mirror + trie (built for every env by
                 // seed_genesis, then never updated by the trie-off writer),
@@ -248,7 +274,7 @@ async fn main() -> Result<()> {
                     .context("write adoption marker")?;
                 tracing::info!(
                     restored_block = block,
-                    checkpoint = %ckpt.path.display(),
+                    checkpoint = %ckpt_path.display(),
                     "adopted state from checkpoint (UNVERIFIED through this block); \
                      will re-execute + verify the tail from here"
                 );
@@ -736,6 +762,7 @@ async fn main() -> Result<()> {
                         &args.checkpoint_peers,
                         ckpt_dir,
                         oldest_block,
+                        expected_genesis,
                     ) {
                         Some(ckpt) => {
                             kardamom_state::park_state_db(&args.state_dir)

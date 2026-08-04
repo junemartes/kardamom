@@ -89,3 +89,52 @@ fn roundtrip_five_blocks_grouped() {
     let reconstructed = reconstruct(&batch.blobs).unwrap();
     assert_eq!(reconstructed, expected_frames(&blocks));
 }
+
+/// P0: a DA store returning right-length WRONG bytes must be caught before
+/// reconstruction, not silently rebuilt into a wrong chain. The versioned
+/// hash is only a filename to the store — L1's commitment is the authority,
+/// so `recover_blocks` recomputes it.
+#[test]
+fn corrupted_da_blob_is_rejected_against_its_commitment() {
+    use kardamom_batcher::da_store::{BlobSource, FsBlobStore};
+    use kardamom_batcher::l1::{BatchDescriptor, recover_blocks, verify_blob_against_hash};
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsBlobStore::open(dir.path()).unwrap();
+
+    // Pack a real payload and register it under its TRUE versioned hash (the
+    // same helper the post path uses to derive what L1 commits to).
+    let blobs = kardamom_batcher::blob::pack_to_blobs(b"kardamom da integrity").unwrap();
+    let sidecar = kardamom_batcher::l1::build_sidecar(blobs.clone()).unwrap();
+    let vh = sidecar.versioned_hashes().next().unwrap();
+    store.put(vh, &blobs[0]).unwrap();
+
+    // Honest bytes verify, and reconstruction proceeds.
+    let good = store.fetch_blob(vh).unwrap();
+    verify_blob_against_hash(vh, &good).expect("untouched blob must verify");
+
+    // Now corrupt the stored bytes in place, preserving length — the exact
+    // shape a size check cannot see. Field elements keep their high byte
+    // zero (BLS modulus), so flip a low byte inside the payload region.
+    let mut corrupt = good;
+    corrupt[1234] ^= 0x01;
+    store.put(vh, &corrupt).unwrap();
+
+    let err = verify_blob_against_hash(vh, &store.fetch_blob(vh).unwrap())
+        .expect_err("corrupted blob must NOT verify against its commitment");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("does not match its commitment"),
+        "unexpected error: {msg}"
+    );
+
+    // And the recovery path itself must refuse, rather than decode garbage.
+    let d = BatchDescriptor {
+        index: 1,
+        versioned_hashes: vec![vh],
+        l2_block_start: 1,
+        l2_block_end: 1,
+    };
+    let err = recover_blocks(&[d], &store).expect_err("recover_blocks must reject a corrupt blob");
+    assert!(format!("{err}").contains("does not match its commitment"));
+}

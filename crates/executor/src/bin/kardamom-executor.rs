@@ -28,9 +28,7 @@ use kardamom_executor::{
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
-use kardamom_state::checkpoint::{
-    create_checkpoint, latest_checkpoint, prune_checkpoints, restore_checkpoint,
-};
+use kardamom_state::checkpoint::{create_checkpoint, prune_checkpoints};
 use kardamom_state::{StateEnvBuilder, StateWriter, read_recovery_point, seed_genesis};
 
 #[derive(Debug, Parser)]
@@ -220,6 +218,13 @@ async fn main() -> Result<()> {
     // and a checkpoint is available, restore the newest one BEFORE opening the
     // env. Startup then sees a populated DB and resumes from the checkpoint's
     // block — replaying only the tail instead of re-syncing from genesis.
+    // Chain identity for checkpoint adoption: the digest of the genesis this
+    // node is configured with. A checkpoint from another chain (or corrupt
+    // bytes) is refused rather than adopted — see CheckpointManifest.
+    let expected_genesis = {
+        let (a, c) = bin_support::build_genesis_alloc(genesis.as_ref());
+        Some(kardamom_state::genesis_digest(&a, &c))
+    };
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
         // Serve this node's checkpoints to peers (the other side of the peer
         // fetch below). Best-effort infrastructure, but a bad bind address is
@@ -233,22 +238,45 @@ async fn main() -> Result<()> {
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe state dir")?;
         if fresh {
-            let mut local = latest_checkpoint(ckpt_dir).context("scan checkpoint dir")?;
-            // No local checkpoint: fetch one from a peer replica before the
-            // first join. A fresh node joining an old chain can NOT re-sync
-            // from genesis — the cluster's canonical stream is retained only
-            // over a bounded window, so REPLAY_FROM(genesis) would be refused
-            // (REPLAY_UNAVAILABLE) once lifetime traffic exceeds it.
-            if local.is_none() && !args.checkpoint_peers.is_empty() {
-                local = kardamom_state::fetch_best_checkpoint(&args.checkpoint_peers, ckpt_dir, 1);
+            // Newest-first with QUARANTINE on verification failure: a torn or
+            // foreign checkpoint costs one rung of the fallback ladder (older
+            // checkpoint -> peer fetch -> genesis), it must never crash-loop
+            // the node (observed: a copy that raced the writer's prune had no
+            // MANIFEST; every restart refused it and the fleet sat at 2/3).
+            let mut restored = kardamom_state::restore_best_checkpoint(
+                ckpt_dir,
+                &args.state_dir,
+                expected_genesis,
+            )
+            .context("restore local checkpoint")?;
+            // No restorable local checkpoint: fetch one from a peer replica
+            // before the first join. A fresh node joining an old chain can
+            // NOT re-sync from genesis — the cluster's canonical stream is
+            // retained only over a bounded window, so REPLAY_FROM(genesis)
+            // would be refused (REPLAY_UNAVAILABLE) once lifetime traffic
+            // exceeds it.
+            if restored.is_none()
+                && !args.checkpoint_peers.is_empty()
+                && kardamom_state::fetch_best_checkpoint(
+                    &args.checkpoint_peers,
+                    ckpt_dir,
+                    1,
+                    expected_genesis,
+                )
+                .is_some()
+            {
+                restored = kardamom_state::restore_best_checkpoint(
+                    ckpt_dir,
+                    &args.state_dir,
+                    expected_genesis,
+                )
+                .context("restore fetched checkpoint")?;
             }
-            match local {
-                Some(ckpt) => {
-                    let block = restore_checkpoint(&ckpt.path, &args.state_dir)
-                        .with_context(|| format!("restore checkpoint {}", ckpt.path.display()))?;
+            match restored {
+                Some((block, path)) => {
                     tracing::info!(
                         restored_block = block,
-                        checkpoint = %ckpt.path.display(),
+                        checkpoint = %path.display(),
                         "restored state from checkpoint; will replay tail from here"
                     );
                 }
@@ -555,6 +583,7 @@ async fn main() -> Result<()> {
                     &args.checkpoint_peers,
                     ckpt_dir,
                     oldest_block,
+                    expected_genesis,
                 ) {
                     Some(ckpt) => {
                         kardamom_state::park_state_db(&args.state_dir)

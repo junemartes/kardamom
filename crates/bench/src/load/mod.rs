@@ -391,7 +391,12 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
                 .await
                 .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
         }
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // 180s, not 30: on CI this stage starts the moment the transfer
+        // soak's verdict lands, while the host is still digesting the soak
+        // backlog (observed: loadavg 60 on 4 CPUs at stage start). The
+        // deadline is a liveness bound, not a latency SLO — the latency
+        // asserts live in the workload verdict, not in contract setup.
+        let deadline = Instant::now() + Duration::from_secs(180);
         for d in &deploys {
             loop {
                 let v: Option<serde_json::Value> = client
@@ -408,7 +413,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
                 }
                 anyhow::ensure!(
                     Instant::now() < deadline,
-                    "defi deploy not mined within 30s (nonce {})",
+                    "defi deploy not mined within 180s (nonce {})",
                     d.nonce
                 );
                 tokio::time::sleep(Duration::from_millis(200)).await;

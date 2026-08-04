@@ -33,6 +33,8 @@ use std::time::Duration;
 
 use tracing::{info, warn};
 
+use alloy_primitives::B256;
+
 use crate::checkpoint::{CheckpointInfo, checkpoint_data_file, checkpoint_name, latest_checkpoint};
 use crate::error::StateError;
 
@@ -104,12 +106,24 @@ fn serve_one(stream: TcpStream, checkpoints_dir: &Path) -> std::io::Result<()> {
             return Ok(());
         }
     };
+    // Serve the manifest fields as headers so the peer can verify the bytes
+    // it receives (and refuse a foreign chain) without a second round trip.
+    // A checkpoint we cannot describe is one we must not hand out.
+    let manifest = match crate::checkpoint::read_manifest(&ckpt.path) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = %e, "checkpoint has no valid manifest; refusing to serve");
+            stream.write_all(b"HTTP/1.0 500 Internal Server Error\r\n\r\n")?;
+            return Ok(());
+        }
+    };
     let mut file = std::fs::File::open(&data)?;
     let len = file.metadata()?.len();
     stream.write_all(
         format!(
-            "HTTP/1.0 200 OK\r\nx-checkpoint-block: {}\r\ncontent-length: {len}\r\n\r\n",
-            ckpt.block
+            "HTTP/1.0 200 OK\r\nx-checkpoint-block: {}\r\nx-checkpoint-keccak: {:#x}\r\n\
+             x-checkpoint-genesis: {:#x}\r\ncontent-length: {len}\r\n\r\n",
+            ckpt.block, manifest.image_keccak, manifest.genesis_digest
         )
         .as_bytes(),
     )?;
@@ -131,6 +145,7 @@ pub fn fetch_latest_checkpoint(
     peer: &str,
     checkpoints_dir: &Path,
     min_block: u64,
+    expected_genesis: Option<B256>,
 ) -> Result<Option<CheckpointInfo>, StateError> {
     let addr: SocketAddr = peer
         .parse()
@@ -142,7 +157,13 @@ pub fn fetch_latest_checkpoint(
     stream.write_all(b"GET /checkpoint/latest HTTP/1.0\r\n\r\n")?;
 
     let mut reader = BufReader::new(stream);
-    let (status, block, content_length) = read_response_head(&mut reader)?;
+    let ResponseHead {
+        status,
+        block,
+        content_length,
+        keccak,
+        genesis,
+    } = read_response_head(&mut reader)?;
     if status == 404 {
         return Ok(None);
     }
@@ -168,22 +189,87 @@ pub fn fetch_latest_checkpoint(
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(block));
     if dest.exists() {
-        // Already have this exact checkpoint — nothing to transfer.
+        // Already have this exact checkpoint — nothing to transfer. Logged
+        // because this is a RECOVERY decision point: the retention-overrun
+        // chaos case once read a silent short-circuit here as "the repair
+        // path never ran" while the node recovered fine.
+        info!(
+            block,
+            peer, "peer's newest checkpoint already present locally; skipping transfer"
+        );
         return Ok(Some(CheckpointInfo { block, path: dest }));
     }
+    // Build the same shape `create_checkpoint` produces — a directory holding
+    // `mdbx.dat` + `MANIFEST` — under a hidden tmp name, so the checkpoint we
+    // publish is self-contained and re-verifiable from disk.
     let tmp = checkpoints_dir.join(format!(".{}.fetch.tmp", checkpoint_name(block)));
-    let mut out = std::fs::File::create(&tmp)?;
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp)?;
+    let tmp_data = tmp.join("mdbx.dat");
+    let mut out = std::fs::File::create(&tmp_data)?;
     let copied = std::io::copy(&mut reader.by_ref().take(len), &mut out)?;
     if copied != len {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint transfer from {peer} truncated: got {copied} of {len} bytes"
         )));
     }
     out.sync_all()?;
     drop(out);
+
+    // Integrity + chain identity BEFORE the image becomes visible. Without
+    // this the transfer was plain HTTP with a length check: silent bit rot,
+    // a lying peer, or a checkpoint from a previous chain all became this
+    // node's state (the recovery-C incident: a stale checkpoint wedged a
+    // fresh node into an endless replay request loop).
+    let got = crate::checkpoint::file_keccak(&tmp_data)?;
+    let Some(want) = keccak else {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(StateError::Recovery(format!(
+            "checkpoint peer {peer} sent no x-checkpoint-keccak — refusing an \
+             unverifiable image"
+        )));
+    };
+    if got != want {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(StateError::Recovery(format!(
+            "checkpoint transfer from {peer} is CORRUPT: {len} bytes arrived but \
+             hash to {got:#x}, peer advertised {want:#x}"
+        )));
+    }
+    let Some(genesis_digest) = genesis else {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(StateError::Recovery(format!(
+            "checkpoint peer {peer} sent no x-checkpoint-genesis — refusing an \
+             unidentifiable image"
+        )));
+    };
+    if let Some(expect) = expected_genesis
+        && expect != genesis_digest
+    {
+        let _ = std::fs::remove_dir_all(&tmp);
+        return Err(StateError::Recovery(format!(
+            "checkpoint peer {peer} serves a DIFFERENT CHAIN: its genesis digest \
+             is {genesis_digest:#x}, this node's is {expect:#x}"
+        )));
+    }
+
+    // Persist the manifest INSIDE the checkpoint dir so a LATER restore
+    // re-verifies from disk rather than trusting that this fetch happened;
+    // the rename publishes image + manifest atomically.
+    let manifest = crate::checkpoint::CheckpointManifest {
+        block,
+        image_keccak: got,
+        genesis_digest,
+    };
+    std::fs::write(tmp.join("MANIFEST"), manifest.encode())?;
     std::fs::rename(&tmp, &dest)?;
-    info!(block, bytes = len, peer, "fetched checkpoint from peer");
+    info!(
+        block,
+        bytes = len,
+        peer,
+        "fetched checkpoint from peer (verified)"
+    );
     Ok(Some(CheckpointInfo { block, path: dest }))
 }
 
@@ -195,11 +281,12 @@ pub fn fetch_best_checkpoint(
     peers: &[String],
     checkpoints_dir: &Path,
     min_block: u64,
+    expected_genesis: Option<B256>,
 ) -> Option<CheckpointInfo> {
     let mut best: Option<CheckpointInfo> = None;
     for peer in peers {
         let floor = best.as_ref().map_or(min_block, |b| b.block + 1);
-        match fetch_latest_checkpoint(peer, checkpoints_dir, floor) {
+        match fetch_latest_checkpoint(peer, checkpoints_dir, floor, expected_genesis) {
             Ok(Some(c)) => best = Some(c),
             Ok(None) => {}
             Err(e) => warn!(peer, error = %e, "checkpoint fetch from peer failed"),
@@ -208,9 +295,16 @@ pub fn fetch_best_checkpoint(
     best
 }
 
-fn read_response_head<R: BufRead>(
-    reader: &mut R,
-) -> Result<(u16, Option<u64>, Option<u64>), StateError> {
+/// Parsed response head from a checkpoint peer.
+struct ResponseHead {
+    status: u16,
+    block: Option<u64>,
+    content_length: Option<u64>,
+    keccak: Option<B256>,
+    genesis: Option<B256>,
+}
+
+fn read_response_head<R: BufRead>(reader: &mut R) -> Result<ResponseHead, StateError> {
     let mut head = String::new();
     let mut line = String::new();
     loop {
@@ -241,6 +335,8 @@ fn read_response_head<R: BufRead>(
         })?;
     let mut block = None;
     let mut content_length = None;
+    let mut keccak = None;
+    let mut genesis = None;
     for l in lines {
         let Some((k, v)) = l.split_once(':') else {
             continue;
@@ -248,10 +344,18 @@ fn read_response_head<R: BufRead>(
         match k.trim().to_ascii_lowercase().as_str() {
             "x-checkpoint-block" => block = v.trim().parse().ok(),
             "content-length" => content_length = v.trim().parse().ok(),
+            "x-checkpoint-keccak" => keccak = v.trim().parse().ok(),
+            "x-checkpoint-genesis" => genesis = v.trim().parse().ok(),
             _ => {}
         }
     }
-    Ok((status, block, content_length))
+    Ok(ResponseHead {
+        status,
+        block,
+        content_length,
+        keccak,
+        genesis,
+    })
 }
 
 #[cfg(test)]
@@ -259,9 +363,27 @@ mod tests {
     use super::*;
 
     fn write_checkpoint(dir: &Path, block: u64, contents: &[u8]) -> PathBuf {
+        write_checkpoint_as(dir, block, contents, B256::repeat_byte(0x6E))
+    }
+
+    /// Write an image + a manifest that HONESTLY describes it, under a given
+    /// chain identity.
+    fn write_checkpoint_as(dir: &Path, block: u64, contents: &[u8], genesis: B256) -> PathBuf {
         let p = dir.join(checkpoint_name(block));
-        std::fs::write(&p, contents).unwrap();
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("mdbx.dat"), contents).unwrap();
+        let manifest = crate::checkpoint::CheckpointManifest {
+            block,
+            image_keccak: alloy_primitives::keccak256(contents),
+            genesis_digest: genesis,
+        };
+        std::fs::write(crate::checkpoint::manifest_path(&p), manifest.encode()).unwrap();
         p
+    }
+
+    /// Read the image bytes of a dir-mode checkpoint.
+    fn image_bytes(checkpoint: &Path) -> Vec<u8> {
+        std::fs::read(crate::checkpoint::checkpoint_data_file(checkpoint).unwrap()).unwrap()
     }
 
     fn serve_ephemeral(dir: PathBuf) -> SocketAddr {
@@ -284,11 +406,11 @@ mod tests {
         let addr = serve_ephemeral(served.path().to_path_buf());
 
         let local = tempfile::tempdir().unwrap();
-        let got = fetch_latest_checkpoint(&addr.to_string(), local.path(), 0)
+        let got = fetch_latest_checkpoint(&addr.to_string(), local.path(), 0, None)
             .unwrap()
             .unwrap();
         assert_eq!(got.block, 7);
-        assert_eq!(std::fs::read(&got.path).unwrap(), b"newest image bytes");
+        assert_eq!(image_bytes(&got.path), b"newest image bytes");
         // No tmp residue.
         assert!(
             std::fs::read_dir(local.path()).unwrap().all(|e| !e
@@ -305,7 +427,7 @@ mod tests {
         let addr = serve_ephemeral(served.path().to_path_buf());
         let local = tempfile::tempdir().unwrap();
         assert!(
-            fetch_latest_checkpoint(&addr.to_string(), local.path(), 0)
+            fetch_latest_checkpoint(&addr.to_string(), local.path(), 0, None)
                 .unwrap()
                 .is_none()
         );
@@ -326,9 +448,9 @@ mod tests {
             addr_a.to_string(),
             addr_b.to_string(),
         ];
-        let best = fetch_best_checkpoint(&peers, local.path(), 0).unwrap();
+        let best = fetch_best_checkpoint(&peers, local.path(), 0, None).unwrap();
         assert_eq!(best.block, 9);
-        assert_eq!(std::fs::read(&best.path).unwrap(), b"b9");
+        assert_eq!(image_bytes(&best.path), b"b9");
     }
 
     #[test]
@@ -340,7 +462,7 @@ mod tests {
         // Peer's newest (6) is below the required floor (10): skipped, nothing
         // written locally.
         assert!(
-            fetch_latest_checkpoint(&addr.to_string(), local.path(), 10)
+            fetch_latest_checkpoint(&addr.to_string(), local.path(), 10, None)
                 .unwrap()
                 .is_none()
         );
@@ -355,11 +477,11 @@ mod tests {
 
         let local = tempfile::tempdir().unwrap();
         write_checkpoint(local.path(), 4, b"local bytes");
-        let got = fetch_latest_checkpoint(&addr.to_string(), local.path(), 0)
+        let got = fetch_latest_checkpoint(&addr.to_string(), local.path(), 0, None)
             .unwrap()
             .unwrap();
         assert_eq!(got.block, 4);
         // The local copy is kept, not overwritten by the peer's.
-        assert_eq!(std::fs::read(&got.path).unwrap(), b"local bytes");
+        assert_eq!(image_bytes(&got.path), b"local bytes");
     }
 }

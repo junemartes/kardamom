@@ -270,8 +270,14 @@ public final class SealerClusteredService implements ClusteredService {
             // canonical gap) instead of the honest REPLAY_UNAVAILABLE.
             this.firstRetainedIndex = state.canonicalCount();
             this.firstRetainedBlock = state.blockNumber();
+            // stdout for grep-ability (same contract as the role line below):
+            // the cluster-member-rejoin chaos case asserts a wiped member came
+            // back via SNAPSHOT restore, not silently at genesis.
+            System.out.println("sealer snapshot RESTORED memberId=" + memberId
+                + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
         } else {
             this.state = new CanonicalSealerState(dedupCapacity, CanonicalSealerState.GENESIS_BLOCK_NUMBER);
+            System.out.println("sealer state FRESH at genesis memberId=" + memberId);
         }
         // Do NOT scheduleTimer here: Aeron rejects it from onStart ("sending
         // messages or scheduling timers is not allowed from onStart"); the
@@ -514,6 +520,15 @@ public final class SealerClusteredService implements ClusteredService {
     @Override
     public void onTakeSnapshot(ExclusivePublication snapshotPublication) {
         writeSnapshot(snapshotPublication, state.takeSnapshot(), cluster.idleStrategy());
+        // stdout for grep-ability (same contract as the role line below). Every
+        // member snapshots at the same replicated log position, so this line is
+        // a CATCH-UP PROOF: a member that logs a TAKEN at a post-rejoin block
+        // must have replayed the log all the way to that position. The
+        // cluster-member-rejoin chaos case asserts a wiped member's count grows
+        // (a follower that starts as follower never gets an onRoleChange, so
+        // role lines cannot prove rejoin).
+        System.out.println("sealer snapshot TAKEN memberId=" + memberId
+            + " block=" + state.blockNumber() + " canonicalCount=" + state.canonicalCount());
     }
 
     @Override
