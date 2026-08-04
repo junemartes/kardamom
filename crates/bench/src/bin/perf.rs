@@ -153,6 +153,9 @@ fn load_cfg(a: &RunArgs, out: PathBuf) -> LoadConfig {
         completeness: Completeness::Accepted,
         assert_all_delivered: true,
         chaos_mode: false,
+        // The perf suite's whole point is edge discovery on dedicated
+        // hardware — always ramp.
+        fixed_rate: false,
         scrape: vec!["executor".into(), "ingress".into(), "sequencer".into()],
         metrics_via_docker: true,
         subscribe: a.subscribe,

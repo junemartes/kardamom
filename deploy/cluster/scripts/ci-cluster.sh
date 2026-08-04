@@ -468,8 +468,9 @@ log "deploy.sh (Nomad endpoint ${NOMAD_ADDR})"
 log "smoke test (gate: single-tx must pass before load smoke runs)"
 ./scripts/smoke.sh
 
-# --- 7. High sustained-load (Rust harness: ramp -> soak; must-deliver + drop
-# accounting + keep-pace) then 8. chaos/resilience suite — env-gated stages.
+# --- 7. Sustained-load invariant gate (Rust harness: FIXED-RATE soak;
+# must-deliver + drop accounting + keep-pace) then 8. chaos/resilience
+# suite — env-gated stages.
 # Both stages drive the Rust kardamom-load harness (built alongside the service
 # bins by the workflow, staged at target/release). Durations/rates are ENV-tunable
 # so PR runs stay short and a full soak can be dialed up via the cluster-e2e.yml
@@ -508,13 +509,22 @@ if [[ -x "${LOAD_BIN}" ]]; then
     # sampler is killed explicitly after the load stages; on a mid-load
     # failure exit the orphan is reaped by the CI job's process cleanup.
 
-    log "load test: kardamom-load ramp+soak (duration=${LOAD_DURATION_S:-60}s target=${LOAD_TARGET_TPS:-200}tps)"
+    # FIXED-RATE invariant gate, not edge discovery: this shard runs on
+    # 4-core GH-hosted VMs where the whole stack + harness share the host —
+    # a ramp-to-edge there measures the hypervisor (ceilings swung 800→18 on
+    # identical code) and soaking at 0.8×edge parks the run AT the edge on a
+    # bad VM, failing deadlines sized for healthy hosts. Correctness (zero
+    # loss, no gaps, keep-pace, no divergence) is rate-independent: gate on
+    # it at a rate the weakest runner sustains. Throughput/latency numbers
+    # in the report are informational; real perf comes from the perf suite
+    # on dedicated hardware.
+    log "load test: kardamom-load fixed-rate invariant gate (duration=${LOAD_DURATION_S:-60}s rate=${LOAD_TARGET_TPS:-200}tps)"
     # --chain-id is passed explicitly (412346, from group_vars/all.yml) rather
     # than probed via eth_chainId: ingress.toml sets no chain_id, so its
     # eth_chainId returns a default that does NOT match the executors' chain, and
     # txs signed with it would never execute. smoke.sh hardcodes 412346 likewise.
     # Sender offset 1 reserves account #0 for the single-tx smoke gate above.
-    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 \
+    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 --fixed-rate \
       --duration "${LOAD_DURATION_S:-60}s" --target-tps "${LOAD_TARGET_TPS:-200}" \
       --senders "${LOAD_SENDERS:-6}" --sender-offset 1 --assert-all-delivered \
       --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
@@ -527,10 +537,10 @@ if [[ -x "${LOAD_BIN}" ]]; then
     # nonces continue from the transfer stage via --nonce-start probing:
     # kardamom-load starts at 0, so this stage uses DIFFERENT senders
     # (offset past the transfer stage's) to keep nonce bookkeeping trivial.
-    log "load test: kardamom-load DEFI stage (duration=${DEFI_DURATION_S:-45}s target=${DEFI_TARGET_TPS:-150}tps)"
-    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 \
+    log "load test: kardamom-load DEFI stage (duration=${DEFI_DURATION_S:-45}s rate=${DEFI_TARGET_TPS:-100}tps)"
+    "${LOAD_BIN}" --rpc http://192.168.56.31:8545 --chain-id 412346 --fixed-rate \
       --workload defi \
-      --duration "${DEFI_DURATION_S:-45}s" --target-tps "${DEFI_TARGET_TPS:-150}" \
+      --duration "${DEFI_DURATION_S:-45}s" --target-tps "${DEFI_TARGET_TPS:-100}" \
       --senders "${DEFI_SENDERS:-6}" --sender-offset "$((1 + ${LOAD_SENDERS:-6}))" \
       --assert-all-delivered --completeness accepted --max-gap "${LOAD_MAX_GAP:-5}" \
       --scrape executor,ingress,sequencer --output /tmp/kardamom-load-defi.json
