@@ -593,8 +593,13 @@ async fn main() -> Result<()> {
     // `AttestingWriterQueue` wiring collected nothing — every posted output
     // carried `leaves=0`, no withdrawal was ever attested, and none could be
     // finalized on L1. Caught end-to-end by the chain-semantics suite's S2.
+    // Flight ring: recent block inputs for the receipt-divergence dump.
+    // Always on — the receipt cross-check runs on the sequential path too,
+    // and the F3-era wsh mismatch is exactly the class it captures.
+    let flight = kardamom_validator::flight::FlightRing::new();
     let c_pub: Box<dyn kardamom_engine::TxReceiptsPublication> = {
-        let sink = ValidatorReceiptSink::new(receipts.clone(), divergence.clone());
+        let sink = ValidatorReceiptSink::new(receipts.clone(), divergence.clone())
+            .with_flight(flight.clone());
         match &attester_handle {
             Some(h) => Box::new(attester::AttestingReceiptSink::new(sink, h.clone())),
             None => Box::new(sink),
@@ -659,6 +664,7 @@ async fn main() -> Result<()> {
         Some(kardamom_validator::parallel::parallel_block_exec(
             claims.clone(),
             args.validation_batch_size,
+            Some(flight.clone()),
         ))
     } else {
         None

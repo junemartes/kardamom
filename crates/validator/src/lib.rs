@@ -31,6 +31,7 @@ use kardamom_types::{BPosition, BlockBoundary, BlockDelta, Receipt};
 
 /// L1 output attester: collects `MessagePassed` leaves from re-executed
 /// blocks, builds the per-output withdrawals root, posts to the L1 oracle.
+pub mod flight;
 pub mod parallel;
 
 pub mod attester;
@@ -503,6 +504,10 @@ pub struct ValidatorReceiptSink {
     receipts: Arc<ReceiptBuffer>,
     divergence: Arc<Divergence>,
     wait: Duration,
+    /// Recent-block input ring for the receipt-divergence dump — the
+    /// mismatch fires after the block's records/claims are gone, so without
+    /// this the F3-era wsh incident left one log line and nothing to replay.
+    flight: Option<Arc<crate::flight::FlightRing>>,
 }
 
 impl ValidatorReceiptSink {
@@ -511,7 +516,15 @@ impl ValidatorReceiptSink {
             receipts,
             divergence,
             wait: RECEIPT_WAIT,
+            flight: None,
         }
+    }
+
+    /// Attach the flight ring (dump block inputs on a receipt mismatch).
+    #[must_use]
+    pub fn with_flight(mut self, flight: Arc<crate::flight::FlightRing>) -> Self {
+        self.flight = Some(flight);
+        self
     }
 
     #[cfg(test)]
@@ -555,6 +568,12 @@ impl TxReceiptsPublication for ValidatorReceiptSink {
                             published.write_set_hash,
                             published.logs.len(),
                         );
+                        // FLIGHT RECORDER first (best-effort): the fail-stop
+                        // is permanent, so this is the only chance to
+                        // capture the block inputs behind the mismatch.
+                        if let Some(f) = self.flight.as_ref() {
+                            f.dump_receipt_divergence(&local, &published);
+                        }
                         self.divergence.record(reason.clone());
                         Err(ExecutorError::Divergence(reason))
                     }
@@ -708,6 +727,69 @@ mod tests {
             .publish(CMessage::Receipt(receipt(1, true, 21_000, 0xff)))
             .unwrap_err();
         assert!(matches!(err2, ExecutorError::Divergence(_)));
+    }
+
+    /// A receipt mismatch with the flight ring attached must leave a
+    /// replayable artifact: both receipts + the ring's recent block inputs.
+    /// The F3-era wsh incident left ONE LOG LINE — this is the regression
+    /// test for "never again undiagnosable".
+    #[test]
+    fn receipt_mismatch_dumps_flight_ring() {
+        use kardamom_engine::actor::BufferedRecord;
+        use kardamom_engine::exec_types::TxIndex;
+
+        let dir = std::env::temp_dir().join(format!("kardamom-flight-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: test-local env var; tests in this file don't race on it.
+        unsafe { std::env::set_var("KARDAMOM_FLIGHT_DIR", &dir) };
+
+        let ring = crate::flight::FlightRing::new();
+        ring.push(
+            7,
+            20,
+            &[BufferedRecord::Tx {
+                tx_idx: TxIndex(0),
+                position: BPosition::from_index(0),
+                envelope: kardamom_types::TxEnvelope {
+                    correlation_id: 1,
+                    raw_tx: vec![0xde, 0xad].into(),
+                    sender: Address::from([0x11; 20]),
+                    tx_hash: B256::from([0x22; 32]),
+                },
+            }],
+            None,
+        );
+
+        let buf = ReceiptBuffer::new();
+        let div = Divergence::new();
+        let mut sink = ValidatorReceiptSink::new(buf.clone(), div.clone())
+            .with_wait(Duration::from_millis(50))
+            .with_flight(ring);
+
+        buf.insert(receipt(3, true, 21_000, 0xab));
+        let err = sink
+            .publish(CMessage::Receipt(receipt(3, true, 21_000, 0xff)))
+            .unwrap_err();
+        assert!(matches!(err, ExecutorError::Divergence(_)));
+
+        let dump = dir.join("receipt-divergence-0-3.json");
+        let body = std::fs::read_to_string(&dump).expect("dump file must exist");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // Both receipts, field-level.
+        assert_eq!(
+            v["local"]["write_set_hash"],
+            format!("{:?}", B256::from([0xff; 32]))
+        );
+        assert_eq!(
+            v["published"]["write_set_hash"],
+            format!("{:?}", B256::from([0xab; 32]))
+        );
+        // The ring's block inputs are replayable.
+        assert_eq!(v["ring"][0]["block"], 7);
+        assert_eq!(v["ring"][0]["granularity"], 20);
+        assert_eq!(v["ring"][0]["records"][0]["kind"], "tx");
+        assert_eq!(v["ring"][0]["records"][0]["raw"], "dead");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // F10.5: a log-only divergence (same status/gas/write-set hash) must trip

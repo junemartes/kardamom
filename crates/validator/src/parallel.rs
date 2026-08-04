@@ -1325,22 +1325,19 @@ pub fn execute_block_sequential<S: StateDatabase>(
 /// Serialize a diverging block's inputs for offline replay. Best-effort:
 /// failures only log. Format: JSON envelope with hex payloads — small
 /// (one block), self-contained, versioned by field presence.
-fn dump_divergence_inputs(
-    block: u64,
-    records: &[BufferedRecord],
-    claims: &ClaimIndex,
-    parent: Option<&PendingDelta>,
-    granularity: u16,
-    err: &ExecutorError,
-) {
-    let dir = std::path::Path::new("/opt/kardamom/state");
-    let path = dir.join(format!("divergence-{block}.json"));
-    let payload = serde_json::json!({
-        "block": block,
-        "granularity": granularity,
-        "error": format!("{err:?}"),
-        "records": records.iter().map(|r| match r {
-            BufferedRecord::Tx { tx_idx, envelope, position } => serde_json::json!({
+/// Serializable projection of a block's canonical records — shared by the
+/// claim-path dump below and the receipt-path flight ring
+/// (`crate::flight`): both dumps must stay replayable by the same offline
+/// tooling.
+pub(crate) fn records_json(records: &[BufferedRecord]) -> Vec<serde_json::Value> {
+    records
+        .iter()
+        .map(|r| match r {
+            BufferedRecord::Tx {
+                tx_idx,
+                envelope,
+                position,
+            } => serde_json::json!({
                 "kind": "tx",
                 "raw": alloy_primitives::hex::encode(&envelope.raw_tx),
                 "sender": format!("{:?}", envelope.sender),
@@ -1349,7 +1346,11 @@ fn dump_divergence_inputs(
                 "idx": tx_idx.0,
                 "pos": position.as_index(),
             }),
-            BufferedRecord::Deposit { tx_idx, deposit, position } => serde_json::json!({
+            BufferedRecord::Deposit {
+                tx_idx,
+                deposit,
+                position,
+            } => serde_json::json!({
                 "kind": "deposit",
                 "source_hash": format!("{:?}", deposit.source_hash),
                 "from": format!("{:?}", deposit.from),
@@ -1361,7 +1362,14 @@ fn dump_divergence_inputs(
                 "idx": tx_idx.0,
                 "pos": position.as_index(),
             }),
-        }).collect::<Vec<_>>(),
+        })
+        .collect()
+}
+
+/// Serializable projection of a claim index (same sharing rationale as
+/// [`records_json`]).
+pub(crate) fn claims_json(claims: &ClaimIndex) -> serde_json::Value {
+    serde_json::json!({
         "claims_storage": claims.storage.iter().map(|((a, k), w)| serde_json::json!({
             "addr": format!("{a:?}"), "slot": format!("{k:?}"),
             "writes": w.iter().map(|(i, v)| (i, v.to_string())).collect::<Vec<_>>(),
@@ -1374,6 +1382,28 @@ fn dump_divergence_inputs(
             "addr": format!("{a:?}"),
             "writes": w.clone(),
         })).collect::<Vec<_>>(),
+        "claims_code": claims.code.iter().map(|(a, w)| serde_json::json!({
+            "addr": format!("{a:?}"),
+            "writes": w.iter().map(|(i, c)| (i, alloy_primitives::hex::encode(c))).collect::<Vec<_>>(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn dump_divergence_inputs(
+    block: u64,
+    records: &[BufferedRecord],
+    claims: &ClaimIndex,
+    parent: Option<&PendingDelta>,
+    granularity: u16,
+    err: &ExecutorError,
+) {
+    let dir = std::path::Path::new("/opt/kardamom/state");
+    let path = dir.join(format!("divergence-{block}.json"));
+    let mut payload = serde_json::json!({
+        "block": block,
+        "granularity": granularity,
+        "error": format!("{err:?}"),
+        "records": records_json(records),
         "parent_accounts": parent.map(|p| p.accounts.iter().map(|(a, (n, b, c))| serde_json::json!({
             "addr": format!("{a:?}"), "nonce": n, "balance": b.to_string(), "code_hash": format!("{c:?}"),
         })).collect::<Vec<_>>()),
@@ -1381,6 +1411,11 @@ fn dump_divergence_inputs(
             "addr": format!("{a:?}"), "slot": format!("{k:?}"), "value": v.to_string(),
         })).collect::<Vec<_>>()),
     });
+    if let (serde_json::Value::Object(p), serde_json::Value::Object(c)) =
+        (&mut payload, claims_json(claims))
+    {
+        p.extend(c);
+    }
     match std::fs::write(
         &path,
         serde_json::to_vec_pretty(&payload).unwrap_or_default(),
@@ -1401,6 +1436,7 @@ fn dump_divergence_inputs(
 pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
     claims: Arc<crate::ClaimBuffer>,
     batch_size: usize,
+    flight: Option<Arc<crate::flight::FlightRing>>,
 ) -> BlockExec<D> {
     Box::new(
         move |snapshot: &D,
@@ -1414,8 +1450,14 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
             let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
                 crate::metrics::counter_parallel_fallback();
                 tracing::debug!(block, "no BAL claims in time; sequential re-execution");
+                if let Some(f) = flight.as_ref() {
+                    f.push(block, 1, records, None);
+                }
                 return execute_block_sequential(snapshot, parent, records, env);
             };
+            if let Some(f) = flight.as_ref() {
+                f.push(block, granularity, records, Some(Arc::clone(&idx)));
+            }
             let out = match execute_block_parallel(
                 snapshot,
                 parent,
