@@ -54,10 +54,12 @@
 #
 # Cases: graceful-executor hard-executor graceful-ingress hard-ingress
 #        graceful-sequencer hard-sequencer sequencer-replica-kill
-#        sequencer-lapse
-#        sealer-graceful sealer-hard
-#        node-failure-executor archive-driver-loss
-#        cluster-leader-kill cluster-follower-kill cluster-quorum-loss-recover
+#        sequencer-lapse validator-lapse validator-join
+#        node-failure-executor state-checkpoint-restore replay-window-resync
+#        retention-overrun retention-overrun-validator
+#        archive-driver-loss archive-tx-data-wipe archive-corruption
+#        cluster-leader-kill cluster-follower-kill cluster-member-rejoin
+#        cluster-quorum-loss-recover
 # =============================================================================
 set -euo pipefail
 
@@ -88,6 +90,9 @@ LOAD_BIN="${LOAD_BIN:-${ROOT}/target/release/kardamom-load}"
 # Archive repair tool (archive-corruption case); built with the service bins.
 REREP_BIN="${REREP_BIN:-${ROOT}/target/release/kardamom-archive-rereplicate}"
 CHAOS_TPS="${CHAOS_TPS:-50}"
+# D-11: rotate the ingress blast radius across runs (0 or 1). Deterministic
+# per CI run (GITHUB_RUN_ID parity), overridable locally.
+INGRESS_VICTIM="${INGRESS_VICTIM:-$(( ${GITHUB_RUN_ID:-0} % 2 ))}"
 CHAOS_CASE_S="${CHAOS_CASE_S:-45}"
 LOAD_MAX_GAP="${LOAD_MAX_GAP:-5}"
 # Service jobs use force_pull=true, so a restart re-pulls the image from the
@@ -376,7 +381,7 @@ run_validator_lapse() {
     val_debug
     fail "validator-lapse: validator not verifying live + caught up within ${t}s of thaw (path=${path:-unknown}, verified=${vf1:-?}, block=${v1:-?}, exec=${e_now:-?})"
   fi
-  d1="$(val_metric validator_divergence_total)"; d1="${d1:-0}"
+  d1="$(val_metric_req validator_divergence_total 'validator-lapse divergence==0 assert')"
   [ "${d1}" -eq 0 ] || fail "validator-lapse: ${d1} divergence(s) after recovery"
   if [ "${path}" = "survivor" ]; then
     local m1
@@ -599,7 +604,7 @@ run_validator_join() {
   # covers every post-join block the validator actually verified), and the
   # MPT root observation must be advancing (the bootstrapped trie is live).
   local div root_blk
-  div="$(val_metric validator_divergence_total)"; div="${div:-0}"
+  div="$(val_metric_req validator_divergence_total 'validator-join divergence==0 assert')"
   [ "${div}" -eq 0 ] || { val_debug; fail "validator-join: ${div} divergence(s) after join"; }
   root_blk="$(val_metric validator_state_root_block)"; root_blk="${root_blk:-0}"
   [ "${root_blk}" -gt 0 ] \
@@ -788,6 +793,37 @@ run_sequencer_lapse() {
 # block gauge advancing IS the cluster making progress. Prints the integer value
 # (or empty if the scrape failed). awk takes $NF of the first matching sample and
 # int-truncates (the gauge may render as a float / scientific notation).
+# D-4: bare `assert_count ingress 2` after the killed-markers were consumed
+# passes even if nothing ever died. Require BOTH ingress replicas' exporters
+# to actually answer — real liveness, not a nomad row count.
+assert_ingress_pair_live() { # <case>
+  local t=0 n v ok
+  while :; do
+    ok=1
+    for n in "${INGRESS_NODES[@]}"; do
+      v="$(timeout 8 docker exec "${n}" curl -fsS --max-time 5 "http://127.0.0.1:${INGRESS_PORT}/metrics" 2>/dev/null | head -1)"
+      [ -n "${v}" ] || { ok=0; break; }
+    done
+    [ "${ok}" -eq 1 ] && { log "$1: both ingress exporters live"; return 0; }
+    sleep 5; t=$(( t + 5 ))
+    [ "${t}" -ge 120 ] && fail "$1: ingress replica ${n} exporter dark after ${t}s (pair not fully recovered)"
+  done
+}
+
+# D-2 companion to val_metric: REQUIRED scrape. val_metric's empty-on-failure
+# contract is right for progress polling, but "divergence == 0" style asserts
+# were reading a failed scrape as 0 — the assert passed exactly when the
+# validator was too wedged to answer. Retries, then fails the case loudly.
+val_metric_req() { # <metric-name> <why>
+  local v i
+  for i in 1 2 3 4 5; do
+    v="$(val_metric "$1")"
+    [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    sleep 3
+  done
+  fail "validator metric $1 unscrapeable after 5 tries — refusing to treat a dead exporter as 0 ($2)"
+}
+
 executor_progress() {
   # MAX across all responding executors, NOT the first responder: a replica
   # restarted by a chaos case legitimately reports gauge 0 (or a low block)
@@ -868,6 +904,16 @@ inject_graceful() { # <job>
   local alloc; alloc="$(running_alloc "$1")"
   [ -n "${alloc}" ] || fail "no running alloc to stop for job $1"
   log "graceful: nomad alloc stop ${alloc} (job $1)"
+  on_control 'nomad alloc stop "$1"' "${alloc}" >/dev/null
+  KILLED_ALLOC="${alloc}"
+}
+
+inject_graceful_group() { # <job> <task-group>
+  local alloc
+  alloc="$(on_control 'nomad job allocs -t "{{range .}}{{.ID}} {{.TaskGroup}} {{.ClientStatus}}{{\"\n\"}}{{end}}" "$1"' "$1" 2>/dev/null \
+    | awk -v g="$2" '$2==g && $3=="running"{print $1; exit}')"
+  [ -n "${alloc}" ] || fail "no running $2 alloc to stop for job $1"
+  log "graceful: nomad alloc stop ${alloc} (job $1, group $2)"
   on_control 'nomad alloc stop "$1"' "${alloc}" >/dev/null
   KILLED_ALLOC="${alloc}"
 }
@@ -1200,10 +1246,22 @@ assert_executors_converged() { # <case>
 # Cluster-mode "must NOT progress": the executor's block gauge must stay FLAT
 # over a window (quorum lost → no new commits → no false progress). $1 = window.
 assert_executor_stalled() {
-  local window="${1:-15}" e0 e1
-  e0="$(executor_progress || true)"; e0="${e0:-0}"
+  # D-1: both samples must be REAL scrapes. Defaulting to 0 made this pass
+  # vacuously (0 <= 0) exactly when a two-node kill blacked the exporters
+  # out — the one situation the quorum-loss case exists to observe. The
+  # executors themselves survive a sealer-quorum loss, so an unreachable
+  # gauge here is a harness failure, not an expected outage; retry, then
+  # fail LOUDLY.
+  local window="${1:-15}" e0="" e1="" i
+  for i in 1 2 3 4 5; do
+    e0="$(executor_progress || true)"; [ -n "${e0}" ] && break; sleep 3
+  done
+  [ -n "${e0}" ] || fail "stall assert: no executor gauge scrapeable BEFORE the window — cannot observe the stall (scrape-failure-as-zero would pass vacuously)"
   sleep "${window}"
-  e1="$(executor_progress || true)"; e1="${e1:-0}"
+  for i in 1 2 3 4 5; do
+    e1="$(executor_progress || true)"; [ -n "${e1}" ] && break; sleep 3
+  done
+  [ -n "${e1}" ] || fail "stall assert: no executor gauge scrapeable AFTER the window — cannot observe the stall"
   awk "BEGIN{exit !(${e1}<=${e0})}" \
     && log "pipeline correctly STALLED (executor block ${e0} -> ${e1} over ${window}s, no false progress)" \
     || fail "pipeline UNEXPECTEDLY progressed while quorum lost (executor block ${e0} -> ${e1})"
@@ -1319,7 +1377,8 @@ run_case() { # <case-name>
 
   # One dedicated fresh funded account per case (single sender, nonces from 0)
   # so cases never collide / leave nonce gaps on the never-reset chain.
-  if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ]; then
+  if [ "${name}" = "sequencer-replica-kill" ] || [ "${name}" = "sequencer-lapse" ] \
+    || [ "${name}" = "graceful-sequencer" ] || [ "${name}" = "hard-sequencer" ]; then
     # PIN this case's load to SHARD 0 — the shard whose replica A is killed
     # (or paused). An arbitrary account lands on shard 0 or 1 by address
     # hash, so ~half of runs would otherwise drive an UNTOUCHED shard and the
@@ -1402,12 +1461,21 @@ run_case() { # <case-name>
   case "${name}" in
     graceful-executor)  inject_graceful executor;                       assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
     hard-executor)      inject_hard "kardamom-executor-0 kardamom-executor-1 kardamom-executor-2" executor; assert_count executor 3 "${CHAOS_RESTART_SLO_S}" ;;
-    graceful-ingress)   inject_graceful ingress;                        assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
-    hard-ingress)       inject_hard kardamom-ingress-0 ingress;         assert_count ingress 1 "${CHAOS_RESTART_SLO_S}" ;;
+    # D-3: count 2, not 1 — with a killed-marker set, assert_count's
+    # replacement leg then requires the KILLED replica back, instead of the
+    # untouched peer satisfying ">=1" on the first poll.
+    # D-11: the hard-kill victim rotates by run id — ingress is active/active
+    # symmetric, and a blast radius pinned forever to ingress-0 never proves
+    # the twin can die.
+    graceful-ingress)   inject_graceful ingress;                        assert_count ingress 2 "${CHAOS_RESTART_SLO_S}" ;;
+    hard-ingress)       inject_hard "kardamom-ingress-${INGRESS_VICTIM}" ingress; assert_count ingress 2 "${CHAOS_RESTART_SLO_S}" ;;
     # Sequencers run P=2 racing replicas per shard (job groups seq-a/seq-b,
     # 4 allocs total): a kill no longer stalls its shard — the twin on the
     # other node keeps ordering, so these also assert live pipeline progress.
-    graceful-sequencer) inject_graceful sequencer;                      assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
+    # D-6: the load is PINNED to shard 0 (account selection above) and the
+    # stop targets a seq-a alloc specifically — an arbitrary alloc meant
+    # ~half of runs killed a replica the pinned load never used.
+    graceful-sequencer) inject_graceful_group sequencer seq-a;           assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
     # Explicit task name: `name=sequencer` would match BOTH the sequencer-a and
     # sequencer-b task containers and kill an arbitrary one.
     hard-sequencer)     inject_hard kardamom-sequencer-0 sequencer-a;   assert_progress; assert_count sequencer 4 "${CHAOS_RESTART_SLO_S}" ;;
@@ -1427,21 +1495,28 @@ run_case() { # <case-name>
       # seq-a on node-0: sequencer ip lane starts at .21, seq-a metrics :9001.
       assert_replica_healthy kardamom-sequencer-0 192.168.56.21 9001
       ;;
-    sealer-graceful)    inject_graceful sealer;                         assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
-    # KNOWN GAP (single-sealer topology): after a HARD sealer crash the executors
-    # freeze and don't re-attach to the restarted sealer's canonical tx_ordering
-    # (sealer was a singleton SPOF; HA was future work). SUPERSEDED by the
-    # clustered sealer (Phase 3): the cluster-leader-kill case below now covers the
-    # hard-kill-of-the-ordering-authority scenario with a 3-member Raft quorum that
-    # re-elects. Excluded from the always-on CI suite (see cluster-e2e.yml); kept
-    # here to reproduce against a legacy single-sealer deploy; tracked in issue #58.
-    sealer-hard)        inject_hard kardamom-sealer-0 sealer;           assert_count sealer 1 "${CHAOS_RESTART_SLO_S}" ;;
+    # D-9: sealer-graceful / sealer-hard DELETED — they targeted the legacy
+    # single-sealer job that no longer deploys (superseded by the 3-member
+    # Raft cluster: cluster-leader-kill / cluster-follower-kill /
+    # cluster-quorum-loss-recover below). They would fail on the first
+    # `running_alloc sealer` if ever invoked; keeping dead cases invites a
+    # future vacuous resurrection.
     node-failure-executor)
       # Kill the whole node container. With 3 executor-role nodes + distinct_hosts
       # the lost replica can't reschedule onto a peer (none free), so the cluster
       # degrades to 2 and must keep progressing; bringing the node back recovers 3.
       log "node-failure: docker kill kardamom-executor-2 (whole node)"
       docker kill kardamom-executor-2 >/dev/null || fail "could not kill node kardamom-executor-2"
+      # D-5: the survivors satisfy a bare ">= 2" instantly — first OBSERVE the
+      # outage (the victim's gauge goes dark), else the case never proves a
+      # node was actually lost.
+      local nf_t=0
+      while exec_metrics 2 >/dev/null 2>&1; do
+        sleep 3; nf_t=$(( nf_t + 3 ))
+        [ "${nf_t}" -ge 60 ] \
+          && fail "node-failure: executor-2's exporter still answering ${nf_t}s after the node kill — outage not observed"
+      done
+      log "node-failure: outage observed (executor-2 exporter dark after ${nf_t}s)"
       assert_count executor 2 "${CHAOS_RESTART_SLO_S}"
       # Wide window here too: killing a whole NODE thrashes the runner (docker
       # teardown + nomad node-down churn) enough that on 4-core CI hosts even
@@ -1636,6 +1711,7 @@ run_case() { # <case-name>
       assert_progress
       assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
       assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      assert_ingress_pair_live "${name}"
       ;;
 
     archive-tx-data-wipe)
@@ -1749,6 +1825,7 @@ run_case() { # <case-name>
       fi
       log "archive-tx-data-wipe: restored archive verified OK on ingress-0 (2-copy redundancy recovered)"
       assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      assert_ingress_pair_live "${name}"
       ;;
 
     archive-corruption)
@@ -1925,6 +2002,7 @@ print(best + 40 if best >= 0 else -1)
         || fail "archive-corruption: drain disable failed"
       assert_count aeron "${aeron_base}" "${CHAOS_RESTART_SLO_S}"
       assert_count ingress 2 "${CHAOS_RESCHEDULE_SLO_S}"
+      assert_ingress_pair_live "${name}"
       ;;
 
     # --- CLUSTERED-SEALER (Raft) cases ------------------------------------

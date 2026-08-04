@@ -216,7 +216,12 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
             && seq_dropped == Some(0)
             && seq_evicted == Some(0)
             && seq_backpressure == Some(0);
-        if input.ack_proves_receipt && drops_proven_zero {
+        // D-8 bound: the eviction explanation only covers a THIN tail. If a
+        // material fraction of accepted traffic is unresolved, "every counter
+        // reads zero" is evidence of a counter blind spot, not of cache
+        // eviction — that must stay a hard failure.
+        let within_eviction_tail = input.missing <= (c.accepted / 100).max(50);
+        if input.ack_proves_receipt && drops_proven_zero && within_eviction_tail {
             tracing::warn!(
                 unserved = input.missing,
                 "accepted receipts unresolved by feed/refetch (ingress cache \

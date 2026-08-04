@@ -495,7 +495,12 @@ log "smoke test (gate: single-tx must pass before load smoke runs)"
 # cluster mode the default set is the three Raft cases (see chaos.sh).
 LOAD_BIN="${ROOT}/target/release/kardamom-load"
 if [[ -x "${LOAD_BIN}" ]]; then
-  if [[ "${RUN_LOAD:-1}" == "1" ]]; then
+  # D-7: the semantics shard runs REAL (light) traffic through the scenario
+# drivers, so the validator can and must be held to the bounded-lag verdict —
+# it only got the weak forward-progress one because RUN_LOAD=0. The weak
+# verdict stays for CHAOS shards, where side-stream image lapse under a kill
+# barrage makes bounded lag a tracked follow-up, not an assertion.
+if [[ "${RUN_LOAD:-1}" == "1" || "${RUN_SEMANTICS:-0}" == "1" ]]; then
     # Runner-identity stamping (#124): the load ceiling swings 800→18 on
     # identical code, and "degraded runner window" has only ever been an
     # inference. Stamp WHO is running this shard and HOW LOADED the host is —
@@ -803,8 +808,16 @@ fi
 verified="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_blocks_verified_total)"
 verified="$(printf '%.0f' "${verified:-0}")"
 (( verified > 0 )) || { echo "FAIL: validator verified 0 blocks against the BAL (tx_bal not flowing?)" >&2; exit 1; }
-diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
-diverged="$(printf '%.0f' "${diverged:-0}")"
+# D-2: a failed scrape must not read as "0 divergences" — retry, then fail
+# loudly rather than pass vacuously on a dead exporter.
+diverged=""
+for _ in 1 2 3 4 5; do
+  diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
+  [[ -n "${diverged}" ]] && break
+  sleep 3
+done
+[[ -n "${diverged}" ]] || { echo "FAIL: validator divergence metric unscrapeable after 5 tries — cannot assert 0 divergences" >&2; exit 1; }
+diverged="$(printf '%.0f' "${diverged}")"
 (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
 # The metric resets if the alloc restarted (recovery loop); a PRE-restart
 # divergence still shows in the alloc log — catch it there too. Check EVERY
