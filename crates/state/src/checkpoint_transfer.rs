@@ -189,7 +189,14 @@ pub fn fetch_latest_checkpoint(
     std::fs::create_dir_all(checkpoints_dir)?;
     let dest = checkpoints_dir.join(checkpoint_name(block));
     if dest.exists() {
-        // Already have this exact checkpoint — nothing to transfer.
+        // Already have this exact checkpoint — nothing to transfer. Logged
+        // because this is a RECOVERY decision point: the retention-overrun
+        // chaos case once read a silent short-circuit here as "the repair
+        // path never ran" while the node recovered fine.
+        info!(
+            block,
+            peer, "peer's newest checkpoint already present locally; skipping transfer"
+        );
         return Ok(Some(CheckpointInfo { block, path: dest }));
     }
     // Build the same shape `create_checkpoint` produces — a directory holding

@@ -896,12 +896,16 @@ run_retention_overrun() { # <executor|validator>
     [ "${unavailable}" = 1 ] && [ "${prepared}" = 1 ] && [ "${restored}" = 1 ] && break
     sleep 6; t=$(( t + 6 ))
     if [ "${t}" -ge 300 ]; then
+      log "retention-overrun(${kind}) DEBUG: recovery-relevant alloc-log lines:"
+      job_alloc_logs "${kind}" | grep -aE "replay unavailable|resync|fetched checkpoint|already present locally|restored state|adopted state|parked" | tail -30 || true
       [ "${unavailable}" = 1 ] \
         || fail "retention-overrun(${kind}): consumer never hit REPLAY_UNAVAILABLE after a ${elapsed}s freeze with ${delta} frames flowed — the retention tier was NOT exercised (is the deployed -Dkardamom.cluster.retention actually ${KARDAMOM_CLUSTER_RETENTION}?)"
-      [ "${fetched}" = 1 ] \
-        || fail "retention-overrun(${kind}): REPLAY_UNAVAILABLE hit but no peer checkpoint was fetched — the repair path did not run (donors dark, or --checkpoint-peers misconfigured)"
+      # 'resync prepared' is the repair-ran proof: it prints after BOTH fetch
+      # outcomes (a transfer, or the peer's block already present locally —
+      # the short-circuit that once made a fetch-line assert read a healthy
+      # recovery as "the repair path did not run").
       [ "${prepared}" = 1 ] \
-        || fail "retention-overrun(${kind}): checkpoint fetched but the stale DB was never parked (no 'resync prepared')"
+        || fail "retention-overrun(${kind}): REPLAY_UNAVAILABLE hit but the peer-checkpoint resync never completed (no 'resync prepared'; fetched_line=${fetched}) — donors dark, or --checkpoint-peers misconfigured"
       fail "retention-overrun(${kind}): resync prepared but the restarted ${kind} never logged '${needle_restored}'"
     fi
   done
@@ -1326,7 +1330,7 @@ run_case() { # <case-name>
       #      "restored state from checkpoint" log line — else it silently fell back
       #      to a full genesis re-sync, which this case exists to prevent);
       #   3. executor count returns to 3.
-      local peer_ck="" ex0_inner
+      local peer_ck="" scr_r0 scr_now
       log "state-checkpoint-restore: waiting for a checkpoint on peer executor-1"
       for _ in $(seq 1 15); do
         peer_ck="$(docker exec kardamom-executor-1 bash -lc \
@@ -1335,6 +1339,11 @@ run_case() { # <case-name>
         sleep 5
       done
       [ -n "${peer_ck}" ] || fail "state-checkpoint-restore: peer executor-1 produced no checkpoint"
+      # Count-baseline over the alloc log: earlier cases' restarts also log
+      # restores, and the evidence must survive container GC + multiple
+      # restart generations (docker logs on the current container missed a
+      # generation in round 5's crash-loop).
+      scr_r0="$(job_alloc_logs executor | grep -c 'restored state from checkpoint' || true)"
       log "state-checkpoint-restore: killing executor-0 + wiping its state DB and checkpoints"
       inject_hard kardamom-executor-0 executor
       docker exec kardamom-executor-0 bash -lc 'rm -rf /opt/kardamom/state/* /opt/kardamom/checkpoints/*' \
@@ -1348,6 +1357,19 @@ run_case() { # <case-name>
       # the picked checkpoint is pruned mid-copy.
       local ck_name="" copied=0
       for _ in 1 2 3; do
+        # Self-heal short-circuit: since recovery-D the restarted executor
+        # fetches a peer checkpoint on cold start and immediately writes AND
+        # PRUNES its own checkpoints — racing this loop for the same
+        # directory (round 7: three consecutive copies were pruned away
+        # before the completeness probe ran). A self-healed victim satisfies
+        # this case's product assertion — a checkpoint restore, not a
+        # genesis re-sync — with the very same evidence line.
+        scr_now="$(job_alloc_logs executor | grep -c 'restored state from checkpoint' || true)"
+        if [ "${scr_now}" -gt "${scr_r0}" ]; then
+          log "state-checkpoint-restore: executor-0 self-healed from a peer before the harness copy landed"
+          copied=1
+          break
+        fi
         ck_name="$(docker exec kardamom-executor-1 bash -lc \
           'ls -d /opt/kardamom/checkpoints/checkpoint-* 2>/dev/null | sort | tail -1' \
           | xargs -rn1 basename)"
@@ -1376,13 +1398,15 @@ run_case() { # <case-name>
       assert_executor_progress 180
       # executor-0 restarts, restores from the peer checkpoint, rejoins to 3.
       assert_count executor 3 "${CHAOS_RESCHEDULE_SLO_S}"
-      ex0_inner="$(docker exec kardamom-executor-0 bash -lc \
-        'docker ps --format "{{.Names}}" | grep -i executor | head -1')"
-      [ -n "${ex0_inner}" ] || fail "state-checkpoint-restore: no executor container on executor-0 after restart"
-      docker exec kardamom-executor-0 bash -lc \
-        "docker logs ${ex0_inner} 2>&1 | grep -q 'restored state from checkpoint'" \
-        || fail "state-checkpoint-restore: executor-0 did NOT restore from checkpoint (fell back to genesis re-sync)"
-      log "state-checkpoint-restore: executor-0 restored from peer checkpoint + rejoined (no genesis re-sync)"
+      local scr_t=0
+      while :; do
+        scr_now="$(job_alloc_logs executor | grep -c 'restored state from checkpoint' || true)"
+        [ "${scr_now}" -gt "${scr_r0}" ] && break
+        sleep 6; scr_t=$(( scr_t + 6 ))
+        [ "${scr_t}" -ge 120 ] \
+          && fail "state-checkpoint-restore: executor-0 did NOT restore from checkpoint (count ${scr_r0} -> ${scr_now}) — fell back to genesis re-sync"
+      done
+      log "state-checkpoint-restore: executor-0 restored from checkpoint + rejoined (restore count ${scr_r0} -> ${scr_now}, no genesis re-sync)"
       ;;
 
     replay-window-resync)
