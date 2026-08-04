@@ -796,6 +796,17 @@ while read -r valloc; do
 done < <(all_allocs validator)
 if (( divergence_logged == 1 )); then
   echo "FAIL: validator halted on divergence (found in alloc ${valloc} log)" >&2
+  # Print the reason + context: the divergence line names claimed vs
+  # recomputed (or the receipt fields). Without this the CI log proves a
+  # divergence happened but not WHICH — the reason string only lived on
+  # the ephemeral runner. Also surface any flight-recorder dumps.
+  echo "----- divergence context (alloc ${valloc}) -----" >&2
+  on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+    | grep -B3 -A10 "halted on divergence" >&2 || true
+  echo "----- flight-recorder dumps on validator node (if any) -----" >&2
+  docker exec "${VALIDATOR_NODE}" sh -c \
+    'for f in /opt/kardamom/state/divergence-*.json; do [ -f "$f" ] && { echo "== $f"; head -c 4096 "$f"; echo; }; done' \
+    2>/dev/null >&2 || true
   exit 1
 fi
 # Incremental-trie shadow-check (--trie-shadow-check 8 in validator.nomad.hcl):
