@@ -14,7 +14,8 @@
 //! (EIP-6780 reduced its observable effect to balance transfer within the
 //! same tx). Add a `destroyed` flag when the runtime starts requiring it.
 
-use std::collections::BTreeMap;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;

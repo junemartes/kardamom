@@ -8,6 +8,8 @@
 //! This keeps wire types ergonomic (`pub sender: Address`) while keeping rkyv
 //! happy and the on-wire format stable.
 
+use alloc::vec::Vec;
+
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use rancor::Fallible;

@@ -16,6 +16,10 @@
 //! `#[rkyv(with = wire::AddressBytes)]` style attributes on fields. This keeps
 //! the public type ergonomic (`pub sender: Address`) while making rkyv happy.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod ack_policy;
 pub mod boundary;
 pub mod delta;

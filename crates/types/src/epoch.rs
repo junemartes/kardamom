@@ -26,6 +26,8 @@
 //! algorithm is OP-compatible and pinned by the contracts' bytecode-hash
 //! CI gate, so the implementation here must stay byte-identical.
 
+use alloc::vec::Vec;
+
 use alloy_primitives::{Address, B256, Bytes as AlloyBytes, U256, keccak256};
 use alloy_rlp::{Encodable, Header};
 use bytes::Bytes;

@@ -9,7 +9,7 @@ use crate::position::BPosition;
 use crate::receipt::Receipt;
 
 /// Errors a state implementation may surface. Concrete crates wrap their own.
-pub trait StateError: std::error::Error + Send + Sync + 'static {}
+pub trait StateError: core::error::Error + Send + Sync + 'static {}
 
 /// Read-only state access. A "snapshot" is a point-in-time view that does not
 /// observe writes made by later blocks.

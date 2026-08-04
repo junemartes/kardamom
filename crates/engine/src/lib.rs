@@ -14,18 +14,17 @@
 //! `TxOrderingSubscription` interfaces.
 
 pub mod actor;
-pub mod bal_ladder;
 pub mod bin_support;
-pub mod block_env;
-pub mod delta;
-pub mod error;
-pub mod exec_types;
-pub mod executor;
 pub mod metrics;
 pub mod persist;
 pub mod reader;
 pub mod replay;
 pub mod state;
+
+// The pure state-transition slice lives in `kardamom-exec-core` (`no_std`,
+// zk-guest-linkable). Module re-exports keep every pre-split path working:
+// `kardamom_engine::executor::…`, `crate::delta::…` etc. all still resolve.
+pub use kardamom_exec_core::{bal_ladder, block_env, delta, error, exec_types, executor};
 
 pub use actor::{
     Executor, ExecutorConfig, ResumePoint, StateWriterQueue, StateWriterSignal,
@@ -35,15 +34,15 @@ pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet};
 pub use error::{EngineError, ExecutorError};
 pub use exec_types::{CMessage, ReceiptStatus, TxIndex};
+pub use kardamom_exec_core::{
+    MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
+};
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
     JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription, TxOrderingSubscription,
 };
 pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};
-pub use state::{
-    MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource,
-    WriterApplyingQueue,
-};
+pub use state::WriterApplyingQueue;
 // Shared types re-exported from the `types` crate so callers can pull them via
 // `kardamom_engine::*` without a separate dependency line.
 pub use ::kardamom_types::{

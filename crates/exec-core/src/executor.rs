@@ -24,7 +24,12 @@ use revm::database::{CacheDB, DatabaseRef};
 use revm::primitives::{KECCAK_EMPTY, Log, TxKind};
 use revm::state::{Account, AccountInfo, Bytecode};
 use revm::{Context, DatabaseCommit, ExecuteCommitEvm, ExecuteEvm, MainBuilder, MainContext};
-use std::collections::HashMap;
+
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
+use alloc::format;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 
 use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
@@ -445,6 +450,7 @@ pub fn execute_tx<S: StateDatabase>(
 /// existing at all means an upstream guard (sequencer nonce fence, cluster
 /// dedup, resync floors) let an invalid record reach the canonical log.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(feature = "std"), allow(unused_variables))]
 fn invalid_skip(
     reason: &str,
     tx_position: BPosition,
@@ -455,15 +461,20 @@ fn invalid_skip(
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
 ) -> (Receipt, WriteSet) {
-    tracing::error!(
-        tx_hash = ?inbound_envelope.tx_hash,
-        from = ?inbound_envelope.sender,
-        nonce,
-        block = block_number,
-        reason,
-        "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
-    );
-    crate::metrics::record_invalid_tx_skipped();
+    // Loudness is a `std`-side concern; the skip receipt itself is the
+    // consensus artifact and is produced identically in guest builds.
+    #[cfg(feature = "std")]
+    {
+        tracing::error!(
+            tx_hash = ?inbound_envelope.tx_hash,
+            from = ?inbound_envelope.sender,
+            nonce,
+            block = block_number,
+            reason,
+            "INVALID canonical tx SKIPPED (deterministic; upstream guard failed — investigate)"
+        );
+        crate::metrics::record_invalid_tx_skipped();
+    }
     let ws = WriteSet::default();
     let write_set_hash = ws.hash();
     let receipt = Receipt {
@@ -526,7 +537,7 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // its commit is still fsyncing, pipelined-commit) first, then the live
     // delta, so later inserts overwrite and the view equals
     // snapshot ∘ parent ∘ delta.
-    for layer in parent.into_iter().chain(std::iter::once(delta)) {
+    for layer in parent.into_iter().chain(core::iter::once(delta)) {
         for (addr, (nonce, balance, code_hash)) in &layer.accounts {
             let code = layer
                 .code
@@ -577,9 +588,10 @@ pub fn execute_deposit_tx<S: StateDatabase>(
         })?;
     let mut acct = Account::from(info);
     acct.mark_touch();
-    let mut changes: HashMap<Address, Account> = HashMap::new();
-    changes.insert(deposit.from, acct);
-    cache.commit(changes.into_iter().collect());
+    // Single-entry commit; built via `once(…).collect()` rather than a std
+    // `HashMap` — the exec core is `no_std` and must not depend on
+    // `RandomState`.
+    cache.commit(core::iter::once((deposit.from, acct)).collect());
 
     // (2) Inner EVM call. Disable the nonce check — deposits do not carry
     // a nonce.
@@ -684,8 +696,7 @@ fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
 /// the balance and code claims: the deposit mint never reached the BAL.
 pub fn record_writeset_into_bal(bal: &mut revm::state::bal::Bal, bal_index: u64, ws: &WriteSet) {
     use revm::state::{Account, AccountInfo, AccountStatus, EvmStorageSlot};
-    let mut by_addr: std::collections::BTreeMap<Address, Account> =
-        std::collections::BTreeMap::new();
+    let mut by_addr: BTreeMap<Address, Account> = BTreeMap::new();
     for (addr, (nonce, balance, code_hash)) in &ws.accounts {
         let code = ws
             .code

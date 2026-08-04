@@ -12,6 +12,8 @@
 //! The cross-language tie is enforced by the anvil integration test, where a
 //! proof built here is verified by the real deployed `ETHLockbox`.
 
+use alloc::vec::Vec;
+
 use alloy_primitives::{Address, B256, U256, address, keccak256};
 
 /// Output-root version byte. Must equal `WithdrawalOutputOracle.OUTPUT_VERSION`.

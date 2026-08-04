@@ -6,6 +6,8 @@
 //! (chain id != 0, duplicate alloc addresses) happens in `Genesis::validate`,
 //! which the TOML loader calls after parsing.
 
+use alloc::{format, string::String, vec::Vec};
+
 use alloy_primitives::{Address, Bytes, U256, hex};
 use serde::Deserialize;
 
@@ -71,7 +73,7 @@ impl Genesis {
         if self.chain_id == 0 {
             return Err(GenesisError::ZeroChainId);
         }
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = alloc::collections::BTreeSet::new();
         for entry in &self.alloc {
             if !seen.insert(entry.address) {
                 return Err(GenesisError::DuplicateAlloc(entry.address));
