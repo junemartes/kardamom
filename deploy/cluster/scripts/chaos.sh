@@ -61,6 +61,19 @@
 # =============================================================================
 set -euo pipefail
 
+# SIGPIPE-safe substring / ERE tests over captured command output. NEVER use
+# `echo "${big}" | grep -q` (or `producer | grep -q`) for asserts in this
+# script: `grep -q` exits at the first match, and once the producer's output
+# exceeds the pipe buffer (64KB) the producer takes SIGPIPE (141) — under
+# `set -o pipefail` that DISCARDS the successful match. Observed live: the
+# retention-overrun asserts reported "consumer never hit REPLAY_UNAVAILABLE"
+# while the refusal sat in the very alloc logs they grepped (the per-iteration
+# `echo: write error: Broken pipe` spam in the CI log was each match being
+# thrown away). Negated sites are worse — a SIGPIPE'd match reads as absence.
+# Pure-bash matching has no pipe to break.
+has_line()  { [[ "$1" == *"$2"* ]]; }   # fixed substring (no regex chars)
+has_match() { [[ "$1" =~ $2 ]]; }       # POSIX ERE
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
@@ -463,9 +476,9 @@ run_validator_join() {
   # replay would satisfy the sync asserts without exercising either.
   local nlogs
   nlogs="$(timeout 20 docker exec "${VALIDATOR_NODE}" docker logs "${newborn}" 2>&1 | tail -400 || true)"
-  echo "${nlogs}" | grep -q "adopted state from checkpoint" \
+  has_line "${nlogs}" "adopted state from checkpoint" \
     || { val_debug; fail "validator-join: newborn did not adopt a peer checkpoint (genesis replay? peers unreachable?)"; }
-  echo "${nlogs}" | grep -q "trie bootstrap complete" \
+  has_line "${nlogs}" "trie bootstrap complete" \
     || { val_debug; fail "validator-join: adopted state but no trie bootstrap ran (trie-off image not detected?)"; }
 
   # State correctness: zero divergences across the whole join (the latch
@@ -889,10 +902,10 @@ run_retention_overrun() { # <executor|validator>
   t=0
   while :; do
     logs="$(job_alloc_logs "${kind}")"
-    echo "${logs}" | grep -q 'cluster replay unavailable' && unavailable=1
-    echo "${logs}" | grep -q 'fetched checkpoint from peer' && fetched=1
-    echo "${logs}" | grep -q 'resync prepared: peer checkpoint staged' && prepared=1
-    echo "${logs}" | grep -q "${needle_restored}" && restored=1
+    has_line "${logs}" 'cluster replay unavailable' && unavailable=1
+    has_line "${logs}" 'fetched checkpoint from peer' && fetched=1
+    has_line "${logs}" 'resync prepared: peer checkpoint staged' && prepared=1
+    has_line "${logs}" "${needle_restored}" && restored=1
     [ "${unavailable}" = 1 ] && [ "${prepared}" = 1 ] && [ "${restored}" = 1 ] && break
     sleep 6; t=$(( t + 6 ))
     if [ "${t}" -ge 300 ]; then
@@ -1594,9 +1607,13 @@ run_case() { # <case-name>
         verify_out="$(docker exec kardamom-ingress-0 bash -lc \
           "docker exec ${ac0} bash -lc 'java --add-opens java.base/java.util.zip=ALL-UNNAMED -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir verify -a -checksum io.aeron.archive.checksum.Crc32 2>&1'" || true)"
         stale_entries="$(echo "${verify_out}" | grep -c 'invalid Catalog checksum' || true)"
-        if ! echo "${verify_out}" | grep -q 'Exception' \
-          && echo "${verify_out}" | grep -qE "recordingId=.*OK" \
-          && ! echo "${verify_out}" | grep -v 'invalid Catalog checksum' | grep -qiE "ERR |FAILED"; then
+        # Non-checksum errors counted with `grep -c` (reads ALL input — no
+        # early exit, so no SIGPIPE) instead of a filtered `grep -q` chain.
+        local other_err
+        other_err="$(echo "${verify_out}" | grep -v 'invalid Catalog checksum' | grep -ciE "ERR |FAILED" || true)"
+        if ! has_line "${verify_out}" 'Exception' \
+          && has_match "${verify_out}" "recordingId=.*OK" \
+          && [ "${other_err:-0}" -eq 0 ]; then
           v_ok=1
           break
         fi
@@ -1673,8 +1690,8 @@ run_case() { # <case-name>
            --add-opens java.base/java.util.zip=ALL-UNNAMED \
            -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
            verify ${cand_rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
-        if echo "${cand_out}" | grep -q "recordingId=${cand_rid}) OK" \
-          && ! echo "${cand_out}" | grep -q ') ERR'; then
+        if has_line "${cand_out}" "recordingId=${cand_rid}) OK" \
+          && ! has_line "${cand_out}" ') ERR'; then
           # Segment files are PRE-ALLOCATED (equal apparent size, ls -S order
           # arbitrary), and a flip landing in a frame HEADER can send verify's
           # frame-walk out of bounds (observed: JVM SIGSEGV in the CRC32
@@ -1724,11 +1741,11 @@ print(best + 40 if best >= 0 else -1)
          --add-opens java.base/java.util.zip=ALL-UNNAMED \
          -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
          verify ${rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
-      if echo "${verify_pre}" | grep -q 'Exception'; then
+      if has_line "${verify_pre}" 'Exception'; then
         echo "${verify_pre}" | tail -20
         fail "archive-corruption: verify tool crashed (not a detection)"
       fi
-      echo "${verify_pre}" | grep -qE "recordingId=${rid}[,)].* ERR" \
+      has_match "${verify_pre}" "recordingId=${rid}[,)].* ERR" \
         || { echo "${verify_pre}" | tail -20; \
              fail "archive-corruption: CRC-armed verify did NOT flag recording ${rid} (detection hole)"; }
       log "archive-corruption: corruption detected by CRC-armed verify"
@@ -1741,12 +1758,14 @@ print(best + 40 if best >= 0 else -1)
       docker exec kardamom-ingress-1 tar -C /opt/kardamom/archive -cf - dir \
         | tar -C "${tmp_dir}/mirror" -xf - || fail "archive-corruption: staging mirror copy failed"
       diverged="$("${REREP_BIN}" --diff --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" || true)"
-      echo "${diverged}" | grep -q "${seg_name}" \
+      has_line "${diverged}" "${seg_name}" \
         || fail "archive-corruption: --diff did not name the corrupted segment ${seg_name}"
-      "${REREP_BIN}" --heal --segments "${seg_name}" --no-verify \
-        --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" \
-        | grep -q 'healed segments=1' \
-        || fail "archive-corruption: --heal did not repair the segment"
+      local heal_out
+      heal_out="$("${REREP_BIN}" --heal --segments "${seg_name}" --no-verify \
+        --source-dir "${tmp_dir}/mirror/dir" --dest-dir "${tmp_dir}/victim/dir" 2>&1 || true)"
+      has_line "${heal_out}" 'healed segments=1' \
+        || { echo "${heal_out}" | tail -20; \
+             fail "archive-corruption: --heal did not repair the segment"; }
       # Put ONLY the healed segment back, then re-validate + clear any INVALID
       # marks the detection verify persisted.
       tar -C "${tmp_dir}/victim" -cf - "dir/${seg_name}" \
@@ -1767,15 +1786,15 @@ print(best + 40 if best >= 0 else -1)
          --add-opens java.base/java.util.zip=ALL-UNNAMED \
          -cp /opt/aeron/aeron-all.jar io.aeron.archive.ArchiveTool /opt/kardamom/archive/dir \
          verify ${rid} -a -checksum io.aeron.archive.checksum.Crc32 2>&1" || true)"
-      if echo "${verify_post}" | grep -q 'Exception'; then
+      if has_line "${verify_post}" 'Exception'; then
         echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify tool crashed"
       fi
-      if ! echo "${verify_post}" | grep -q "recordingId=${rid}) OK"; then
+      if ! has_line "${verify_post}" "recordingId=${rid}) OK"; then
         echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify does not show recording ${rid} OK"
       fi
-      if echo "${verify_post}" | grep -qE "recordingId=${rid}[,)].* ERR"; then
+      if has_match "${verify_post}" "recordingId=${rid}[,)].* ERR"; then
         echo "${verify_post}" | tail -20
         fail "archive-corruption: post-heal verify still reports errors on recording ${rid}"
       fi
@@ -1835,8 +1854,10 @@ print(best + 40 if best >= 0 else -1)
       # this path had never executed outside unit tests.
       log "cluster-follower-kill: leader=memberId=${leader}; waiting for a cluster snapshot"
       fk_t=0
+      local fk_logs
       while :; do
-        cluster_alloc_logs | grep -q 'cluster SNAPSHOT triggered' && break
+        fk_logs="$(cluster_alloc_logs)"
+        has_line "${fk_logs}" 'cluster SNAPSHOT triggered' && break
         sleep 10; fk_t=$(( fk_t + 10 ))
         [ "${fk_t}" -ge 300 ] \
           && fail "cluster-follower-kill: no snapshot within ${fk_t}s — is the snapshot scheduler running?"

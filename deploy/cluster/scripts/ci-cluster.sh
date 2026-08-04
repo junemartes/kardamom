@@ -216,7 +216,12 @@ dump_diagnostics() {
     || echo "(tcpdump unavailable or no multicast captured)"
   export NOMAD_ADDR="http://192.168.56.10:4646"
   nomad job status 2>/dev/null || true
-  for job in aeron anvil cluster sealer sequencer executor ingress batcher da-watcher; do
+  # `validator` included: its job going DEAD (restart budget exhausted after
+  # repeated fail-stops) is precisely the failure this dump needs to explain,
+  # and `nomad job allocs`/`nomad alloc logs` still serve dead-but-not-GC'd
+  # allocations. It was missing from this list once — the retention-shard
+  # validator corpse (2026-08-04) left zero evidence.
+  for job in aeron anvil cluster sealer sequencer executor validator ingress batcher da-watcher; do
     local allocs
     allocs="$(nomad job allocs -t '{{range .}}{{.ID}}{{"\n"}}{{end}}' "${job}" 2>/dev/null || true)"
     [[ -z "${allocs}" ]] && continue
