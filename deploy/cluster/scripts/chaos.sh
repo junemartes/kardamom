@@ -819,9 +819,17 @@ val_metric_req() { # <metric-name> <why>
   for i in 1 2 3 4 5; do
     v="$(val_metric "$1")"
     [ -n "${v}" ] && { printf '%s' "${v}"; return 0; }
+    # Absent metric vs dead exporter: metrics-rs counters are not exported
+    # until first incremented, so a healthy zero-divergence validator has NO
+    # divergence_total line at all. If the always-present canary scrapes,
+    # the exporter is alive and the absent counter genuinely IS 0.
+    if [ -n "$(val_metric validator_committed_block)" ]; then
+      printf '0'
+      return 0
+    fi
     sleep 3
   done
-  fail "validator metric $1 unscrapeable after 5 tries — refusing to treat a dead exporter as 0 ($2)"
+  fail "validator exporter unscrapeable after 5 tries — refusing to treat a dead exporter as 0 ($2)"
 }
 
 executor_progress() {

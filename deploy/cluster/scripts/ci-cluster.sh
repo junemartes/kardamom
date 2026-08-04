@@ -814,9 +814,17 @@ diverged=""
 for _ in 1 2 3 4 5; do
   diverged="$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_divergence_total)"
   [[ -n "${diverged}" ]] && break
+  # Absent metric vs dead exporter: divergence_total is not exported until
+  # first incremented, so a healthy validator has no such line. The canary
+  # (committed_block, always present once live) proves the exporter answers;
+  # the absent counter then genuinely IS 0.
+  if [[ -n "$(scrape_metric "${VALIDATOR_NODE}" "${VALIDATOR_PORT}" validator_committed_block)" ]]; then
+    diverged=0
+    break
+  fi
   sleep 3
 done
-[[ -n "${diverged}" ]] || { echo "FAIL: validator divergence metric unscrapeable after 5 tries — cannot assert 0 divergences" >&2; exit 1; }
+[[ -n "${diverged}" ]] || { echo "FAIL: validator exporter unscrapeable after 5 tries — cannot assert 0 divergences" >&2; exit 1; }
 diverged="$(printf '%.0f' "${diverged}")"
 (( diverged == 0 )) || { echo "FAIL: validator counted ${diverged} divergence(s)" >&2; exit 1; }
 # The metric resets if the alloc restarted (recovery loop); a PRE-restart
