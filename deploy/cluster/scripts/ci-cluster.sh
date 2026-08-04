@@ -765,6 +765,16 @@ if [[ "${RUN_LOAD:-1}" == "1" ]]; then
   e_blk="${e_blk:-?}"
   if (( ok != 1 )); then
     echo "FAIL: validator did not sync within ${VALIDATOR_SYNC_TIMEOUT_S}s (validator=${v_blk:-?} executor=${e_blk}, started at ${v_start})" >&2
+    # A frozen committed-block gauge is the WEDGE signature (F3 class): the
+    # reason lives only in the validator's own log on the ephemeral runner —
+    # dump its tail or the failure is undiagnosable (the 2026-08-04 #155
+    # load-shard wedge at block 227 left nothing).
+    echo "----- validator alloc log tails -----" >&2
+    while read -r valloc; do
+      [[ -z "${valloc}" ]] && continue
+      echo "== alloc ${valloc} (stderr tail)" >&2
+      on_control 'nomad alloc logs -stderr "$1" 2>/dev/null | tail -60' "${valloc}" >&2 2>/dev/null || true
+    done < <(all_allocs validator)
     exit 1
   fi
   log "validator synced: block ${v_blk} vs executor ${e_blk} (lag $(( e_blk - v_blk )) <= ${VALIDATOR_LAG_MAX})"
