@@ -114,6 +114,33 @@ jobs:
           prefix-key: v0-rust-nostd
       - run: cargo check -p kardamom-types -p kardamom-exec-core --no-default-features --target riscv32imac-unknown-none-elf --locked
 
+  # EEST state-test conformance against the pinned fixture release
+  # (docs/agents/l1-client-suite-port-spec.md, W1). Latest fork only; the
+  # xfail list is crates/exec-core/tests/eest_expected_failures.json.
+  eest-conformance:
+    name: eest conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-eest
+      - name: Fixture tag
+        id: eest
+        run: echo "tag=$(grep -m1 '^EEST_TAG=' scripts/fetch-eest-fixtures.sh | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - name: Cache fixtures
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/kardamom/eest
+          key: eest-fixtures-${{ steps.eest.outputs.tag }}
+      - name: Fetch fixtures
+        run: scripts/fetch-eest-fixtures.sh
+      - name: Run conformance
+        run: |
+          KARDAMOM_EEST_FIXTURES="$(scripts/fetch-eest-fixtures.sh | tail -1)" \
+            cargo test -p kardamom-exec-core --release --test eest_state --locked -- --ignored --nocapture
+
   test:
     name: test
     runs-on: ubuntu-latest

@@ -59,3 +59,10 @@ metrics = { version = "0.24", optional = true }
 [dev-dependencies]
 alloy-signer-local = { workspace = true }
 alloy-network = { workspace = true }
+# EEST conformance runner (`tests/eest_state.rs`): revm's statetest fixture
+# models, tree walking, and the pure state-root oracle.
+revm = { version = "38", features = ["test-types", "serde"] }
+alloy-trie = { version = "0.9", features = ["ethereum"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+walkdir = "2"

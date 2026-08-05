@@ -212,11 +212,29 @@ impl<S: StateDatabase> ExecScope<S> {
         parent: Option<&PendingDelta>,
         env: ExecEnv,
     ) -> Result<Self, ExecutorError> {
+        let (block, cfg) = (env.block_env(), env.cfg_env());
+        Self::new_with_envs(snapshot, parent, env, block, cfg)
+    }
+
+    /// Like [`ExecScope::new`], but with caller-supplied revm envs instead of
+    /// the [`ExecEnv`]-derived production ones. This is the seam the EEST
+    /// conformance runner uses to execute under a *fixture's* block env
+    /// (coinbase, basefee, difficulty, blob params) — it tests the engine's
+    /// revm integration, not kardamom's boundary derivation. Production
+    /// paths use [`ExecScope::new`]; `env` here only feeds the metadata on
+    /// skip receipts (block number).
+    pub fn new_with_envs(
+        snapshot: S,
+        parent: Option<&PendingDelta>,
+        env: ExecEnv,
+        block: revm::context::BlockEnv,
+        cfg: revm::context::CfgEnv,
+    ) -> Result<Self, ExecutorError> {
         let cache: CacheDB<SnapshotDb<S>> = CacheDB::new(SnapshotDb { inner: snapshot });
         let evm = Context::mainnet()
             .with_db(cache)
-            .with_block(env.block_env())
-            .with_cfg(env.cfg_env())
+            .with_block(block)
+            .with_cfg(cfg)
             .build_mainnet();
         let mut scope = Self { evm, env };
         if let Some(layer) = parent {
