@@ -348,8 +348,17 @@ where
     ) -> Result<ReceiptResponse, IngressError> {
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         if let Some(prev) = v.cached {
-            // A resubmission served from the receipt cache succeeds; count it
-            // so received == accepted + rejected holds on every path.
+            // A resubmission is only a resubmission if it is the SAME tx: the
+            // cache is keyed (sender, nonce), so a DIFFERENT tx reusing a
+            // receipted nonce would otherwise be answered with the previous
+            // tx's receipt — and its hash — as if it had landed (#156: the
+            // submit response must never carry another tx's identity).
+            if prev.tx_hash != v.tx_hash {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "nonce-conflict")
+                    .increment(1);
+                return Err(IngressError::Duplicate((v.sender, v.nonce)));
+            }
+            // Count it so received == accepted + rejected holds on every path.
             metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
             return Ok(ReceiptResponse { receipt: prev });
         }
@@ -386,6 +395,32 @@ where
             }
         }
 
+        // Identity check on the fulfilled receipt: the pending map is keyed
+        // (sender, nonce), so with racing replicas — or any upstream
+        // receipt mix-up — the receipt that releases this waiter can belong
+        // to a DIFFERENT tx. Echoing its hash as the submit response is how
+        // #156 surfaced (in-cluster nonce-unordered: "returned hash !=
+        // locally computed"). Fail loudly and NAME both hashes instead: the
+        // error attributes the mix-up to the component that produced it.
+        if let Ok(resp) = &result
+            && resp.receipt.tx_hash != v.tx_hash
+        {
+            tracing::error!(
+                sender = %v.sender,
+                nonce = v.nonce,
+                submitted = %v.tx_hash,
+                receipted = %resp.receipt.tx_hash,
+                "receipt fulfilled (sender, nonce) with a DIFFERENT tx — refusing to \
+                 answer the submit with a foreign identity"
+            );
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "receipt-identity")
+                .increment(1);
+            return Err(IngressError::Internal(format!(
+                "receipt for ({}, {}) belongs to a different tx: submitted {} got {}",
+                v.sender, v.nonce, v.tx_hash, resp.receipt.tx_hash
+            )));
+        }
+
         result
     }
 
@@ -405,6 +440,13 @@ where
     ) -> Result<B256, IngressError> {
         let v = self.validate_submission(client_ip, &raw_tx).await?;
         if let Some(prev) = v.cached {
+            // Same hash-identity rule as the blocking path (#156): a cached
+            // receipt only answers a resubmission of the SAME tx.
+            if prev.tx_hash != v.tx_hash {
+                metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "nonce-conflict")
+                    .increment(1);
+                return Err(IngressError::Duplicate((v.sender, v.nonce)));
+            }
             metrics::counter!(crate::metrics::TX_ACCEPTED_TOTAL).increment(1);
             return Ok(prev.tx_hash);
         }
