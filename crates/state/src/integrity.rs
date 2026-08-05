@@ -388,12 +388,26 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
                         continue;
                     }
                     if va != vb {
-                        diffs.push(format!(
-                            "{table}[{:02x?}]: values differ ({} vs {} bytes)",
-                            &ka[..ka.len().min(8)],
-                            va.len(),
-                            vb.len()
-                        ));
+                        // Byte lengths alone say nothing about WHAT diverged —
+                        // "224 vs 224 bytes" is the shape a fixed-width field
+                        // mismatch takes, and chasing it from CI logs is
+                        // guesswork. Receipts decode, so name the fields.
+                        let detail = if *table == TABLE_RECEIPTS {
+                            receipt_field_diff(va, vb)
+                        } else {
+                            None
+                        };
+                        match detail {
+                            Some(d) => {
+                                diffs.push(format!("{table}[{:02x?}]: {d}", &ka[..ka.len().min(8)]))
+                            }
+                            None => diffs.push(format!(
+                                "{table}[{:02x?}]: values differ ({} vs {} bytes)",
+                                &ka[..ka.len().min(8)],
+                                va.len(),
+                                vb.len()
+                            )),
+                        }
                         table_diffs += 1;
                     }
                     ia = ca.next::<Vec<u8>, Vec<u8>>()?;
@@ -445,6 +459,54 @@ pub fn deep_compare(a: &StateEnv, b: &StateEnv) -> Result<Vec<String>, StateErro
     }
 
     Ok(diffs)
+}
+
+/// Field-level diff of two encoded receipts, for the deep-compare report.
+///
+/// Returns `None` when either side does not decode — the caller then falls
+/// back to the byte-length message, which is still true, just uninformative.
+fn receipt_field_diff(a: &[u8], b: &[u8]) -> Option<String> {
+    let ra = decode_receipt_value(a).ok()?;
+    let rb = decode_receipt_value(b).ok()?;
+    let mut fields: Vec<String> = Vec::new();
+    macro_rules! cmp {
+        ($f:ident) => {
+            if ra.$f != rb.$f {
+                fields.push(format!("{}: {:?} vs {:?}", stringify!($f), ra.$f, rb.$f));
+            }
+        };
+    }
+    cmp!(tx_idx);
+    cmp!(tx_type);
+    cmp!(tx_hash);
+    cmp!(status);
+    cmp!(gas_used);
+    cmp!(write_set_hash);
+    cmp!(nonce);
+    cmp!(from);
+    cmp!(to);
+    cmp!(contract_address);
+    cmp!(effective_gas_price);
+    cmp!(block_number);
+    cmp!(transaction_index);
+    if ra.logs != rb.logs {
+        fields.push(format!(
+            "logs: {} vs {} entries",
+            ra.logs.len(),
+            rb.logs.len()
+        ));
+    }
+    if fields.is_empty() {
+        // Decoded equal but the bytes differ: an encoding difference, which
+        // is itself worth saying out loud rather than reporting as "no diff".
+        return Some(format!(
+            "receipts decode EQUAL but encode differently ({} vs {} bytes) — an \
+             encoding-level divergence",
+            a.len(),
+            b.len()
+        ));
+    }
+    Some(format!("receipt fields differ — {}", fields.join("; ")))
 }
 
 #[cfg(test)]

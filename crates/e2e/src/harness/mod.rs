@@ -389,6 +389,19 @@ impl LocalStack {
 
     /// Freeze the executor (SIGSTOP): its genuine BAL/receipt publications
     /// stop so an injected corrupt frame faces no competition (S7).
+    /// SIGSTOP the DA watcher so no honest epoch competes with an injected
+    /// one — the same determinism trick `suspend_executor` gives the BAL
+    /// drill. Returns false when the stack has no watcher (no L1).
+    pub fn suspend_da_watcher(&self) -> bool {
+        match &self.da_watcher {
+            Some(w) => {
+                w.proc.suspend();
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn suspend_executor(&self) {
         self.executor.proc.suspend();
     }

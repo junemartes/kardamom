@@ -1,7 +1,7 @@
 # L1-Origin Deposit Derivation — Spec
 
 - **Date:** 2026-07-25
-- **Status:** In progress — phases A, B and C landed. Epochs are the ONLY deposit path: the da-watcher emits one per finalized L1 block, `DepositRef` is retired, and 17 e2e scenarios (S10a–e cover the rules directly) run green
+- **Status:** In progress — phases A, B, C and D landed. Epochs are the ONLY deposit path: the da-watcher emits one per finalized L1 block, `DepositRef` is retired, and 17 e2e scenarios (S10a–e cover the rules directly) run green
 - **Motivated by:** the chain-semantics suite's S8 (`docs/agents/chain-semantics-e2e-suite-spec.md`), which must keep its workload **deposit-free** because deposits cannot survive the DA round-trip today
 - **Goal (definition of done):** a chain reconstructed from L1 alone — blobs + L1 logs + genesis — reproduces the validator's state root **including deposits**, and a sequencer cannot omit or reorder a deposit without producing a chain that verifiers reject.
 
@@ -93,6 +93,32 @@ Bump `VERSION` in `frame.rs` (the byte exists) and keep a v1 decode path.
 
 Deriving deposits is only half the guarantee; someone must **check** that the chain obeyed the rule, or a buggy sequencer silently produces a chain nobody can rebuild.
 
+**Phase 1 shipped.** Notes on what landed, and what it does NOT buy:
+
+- Split by cost. Rules 1–2 (monotonic, no-skip) read only local state, so they
+  run INLINE on the exec thread and reject before the epoch's deposits are
+  applied. The content check (hash + exact deposits) needs an L1 round trip, so
+  it runs on a background task; its verdict lands on the next epoch. That
+  deferral is the honest price of phase 1 — a bad epoch is DETECTED, not
+  PREVENTED, and one more epoch may be applied before the halt. Preventing it
+  is phase 2.
+- Rule 4 is enforced as "L1 still does not have this block after the retry
+  window". An epoch anchored to a block that has not happened is a fault, not
+  an outage. The distinction matters: an unreachable L1 must never read as a
+  divergence, or an RPC blip takes the validator down.
+- Verification is retried (8 attempts, 2 s apart) before any verdict. A
+  one-shot check would silently drop coverage for an epoch that arrived during
+  a blip — exactly where a forgery would hide — and would also fail the honest
+  race where this validator's L1 view lags the producer's.
+- The validator derives through the producer's own `derive_epoch`. A verifier
+  running a second, subtly different copy of the rule would verify nothing.
+- Enabled by `--lockbox` alongside `--l1-rpc-url`. Without it the origin
+  SEQUENCE is still enforced; only content checking is off.
+- **S11** is the drill: a forged epoch must halt the validator. S10a–e prove an
+  honest producer builds a derivable chain; S11 proves the guarantee has teeth.
+  The whole L1-backed suite now runs with verification ON, so a producer that
+  quietly stopped matching L1 would fail every bridge scenario, not just S11.
+
 - **Phase 1 — validator verifies.** The validator gains an L1 read connection and, for each `EpochRecord`, re-derives the epoch's deposits from L1 and requires an exact match (set, order, and `l1_hash` for `l1_number`), plus rules 1–2 on the origin sequence. Mismatch is a divergence → the existing fail-stop machinery. Safety without new executor dependencies.
 - **Phase 2 — executors verify too.** Executors gain a read-only `--l1-rpc` and reject a bad epoch rather than committing it. This is the difference between "we notice" and "it cannot happen", and it costs every executor an L1 dependency — a real deployment change, hence its own phase.
 
@@ -139,7 +165,7 @@ phase D, asserted here against the producer.
 | A | `EpochRecord` + `derive_epoch` as the one shared definition (`crates/types/src/epoch.rs`), moved out of the da-watcher so validator and reconstructor share it | **Done** |
 | B | Canonical stream: `TxOrderingMessage::Epoch`, `KIND_ORIGIN_RECORD` framing with `l1_origin` + `slot_count`, `l1_origin` on both boundary types, sealer forced boundary + origin tracking + snapshot v2, executor expansion of an epoch into marker + deposits | **Done** |
 | C | Producer switch-over: da-watcher emits one epoch per finalized L1 block (including empty ones), sequencer forwards them verbatim, executor's `tx_deposits` join retired, `l1_origin` persisted in block headers | **Done** |
-| D | Verification: validator enforces the five rules against L1, then executors (phase 2) | Not started |
+| D | Verification (phase 1): the validator re-derives every epoch from L1 and fail-stops on disagreement — rules 1, 2 and 4 plus exact deposit content | **Done** |
 | E | KAR2 DA payload carries the origin; `kardamom-reconstruct` re-derives deposits from L1 | Not started |
 
 Phase C makes this the live path. Notes on what it changed beyond the obvious:

@@ -42,6 +42,7 @@ pub const INGRESS_QUEUE_DEPTH: &str = "kardamom_ingress_queue_depth";
 pub const VALIDATOR_COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const VALIDATOR_BLOCKS_VERIFIED: &str = "validator_blocks_verified_total";
 pub const VALIDATOR_BAL_MISSING: &str = "validator_bal_missing_total";
+pub const VALIDATOR_EPOCH_FAULTS: &str = "validator_epoch_faults_total";
 pub const VALIDATOR_DIVERGENCE: &str = "validator_divergence_total";
 pub const TRIE_SHADOW_CHECKS: &str = "kardamom_state_trie_shadow_checks_total";
 pub const TRIE_SHADOW_MISMATCH: &str = "kardamom_state_trie_shadow_mismatch_total";

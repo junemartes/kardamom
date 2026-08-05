@@ -280,7 +280,13 @@ pub fn spawn_validator(
         cmd.args(["--l1-rpc-url", &l1.rpc_url])
             .args(["--output-oracle", &l1.oracle])
             .args(["--attester-key", &l1.attester_key])
-            .args(["--attester-post-interval", "1"]);
+            .args(["--attester-post-interval", "1"])
+            // With the RPC URL, this turns on epoch verification: every epoch
+            // is re-derived from L1 and a mismatch is a divergence. The whole
+            // L1-backed suite therefore runs WITH verification on, so an
+            // honest producer that quietly stopped matching L1 would surface
+            // as a failure in every bridge scenario, not just S11.
+            .args(["--lockbox", &l1.lockbox]);
     }
     cmd.env("RUST_LOG", "info");
     let proc = Proc::spawn("validator", cmd, spec.root.join("validator.log"))?;

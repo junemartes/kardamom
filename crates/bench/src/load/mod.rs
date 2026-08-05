@@ -399,13 +399,33 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
                 .await
                 .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
         }
-        // 180s, not 30: on CI this stage starts the moment the transfer
-        // soak's verdict lands, while the host is still digesting the soak
-        // backlog (observed: loadavg 60 on 4 CPUs at stage start). The
-        // deadline is a liveness bound, not a latency SLO — the latency
-        // asserts live in the workload verdict, not in contract setup.
-        let deadline = Instant::now() + Duration::from_secs(180);
+        // A LIVENESS bound, expressed as one. This stage starts the moment
+        // the transfer soak's verdict lands, so the chain is still draining
+        // that backlog and the deploy queues behind it; how long that takes
+        // is a property of the runner, not of the code under test. A fixed
+        // wall-clock deadline therefore races the drain — it was 30s, then
+        // 180s, and CI still burned the whole 180s with the chain making
+        // steady progress the entire time.
+        //
+        // So: wait as long as the CHAIN IS ADVANCING, and fail only when it
+        // stops. A stalled pipeline is caught in seconds; a merely slow one
+        // is waited out. The overall cap stays as a backstop against waiting
+        // forever on a chain that advances but never includes this tx.
+        const STALL_LIMIT: Duration = Duration::from_secs(60);
+        const HARD_CAP: Duration = Duration::from_secs(600);
+        macro_rules! head_block {
+            () => {
+                client
+                    .request::<String, _>("eth_blockNumber", rpc_params![])
+                    .await
+                    .ok()
+                    .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+            };
+        }
+        let started = Instant::now();
         for d in &deploys {
+            let mut last_block = head_block!();
+            let mut last_progress = Instant::now();
             loop {
                 let v: Option<serde_json::Value> = client
                     .request("eth_getTransactionReceipt", rpc_params![d.hash])
@@ -419,10 +439,26 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
                     );
                     break;
                 }
+                let now = head_block!();
+                if now.is_some() && now != last_block {
+                    last_block = now;
+                    last_progress = Instant::now();
+                }
                 anyhow::ensure!(
-                    Instant::now() < deadline,
-                    "defi deploy not mined within 180s (nonce {})",
-                    d.nonce
+                    last_progress.elapsed() < STALL_LIMIT,
+                    "defi deploy not mined (nonce {}): chain STOPPED advancing — no new \
+                     block for {}s while waiting (head {:?})",
+                    d.nonce,
+                    STALL_LIMIT.as_secs(),
+                    last_block
+                );
+                anyhow::ensure!(
+                    started.elapsed() < HARD_CAP,
+                    "defi deploy not mined (nonce {}) within {}s although the chain kept \
+                     advancing to {:?} — the tx was accepted but never included",
+                    d.nonce,
+                    HARD_CAP.as_secs(),
+                    last_block
                 );
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }

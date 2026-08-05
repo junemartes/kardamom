@@ -319,6 +319,9 @@ fn m4_canonical_b_order_drives_receipts() {
             // Whole-block exec strategy (validator parallel path).
             None,
             None,
+            // The executor trusts the ordered stream (phase 2 would
+            // give it its own L1 dependency); only the validator verifies.
+            None,
         )
     });
 
@@ -481,6 +484,9 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             None,
             // Whole-block exec strategy (validator parallel path).
             None,
+            None,
+            // The executor trusts the ordered stream (phase 2 would
+            // give it its own L1 dependency); only the validator verifies.
             None,
         )
     });

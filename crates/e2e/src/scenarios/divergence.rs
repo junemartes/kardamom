@@ -98,3 +98,87 @@ pub async fn corrupt_bal_halts_validator(stack: &mut LocalStack, t: &Target) -> 
     stack.resume_executor();
     Ok(())
 }
+
+/// S11 — a forged epoch must halt the validator.
+///
+/// The counterpart to S7 for the deposit path: S10a-e prove an HONEST producer
+/// builds a derivable chain, but "a sequencer cannot drop a deposit without
+/// producing a chain verifiers reject" is only true if someone actually
+/// rejects. This drill injects an epoch L1 never produced and requires the
+/// validator to notice.
+///
+/// Uses a bogus `l1_hash` rather than a doctored deposit set: the canonical id
+/// is `keccak(l1_hash)`, so the forgery cannot be swallowed by cluster dedup,
+/// and the validator's very first check against L1 — does this block have this
+/// hash — fails. Same class of fault as a dropped deposit, deterministic to
+/// stage.
+pub async fn forged_epoch_halts_validator(
+    stack: &LocalStack,
+    t: &Target,
+    l1: &crate::harness::l1::L1,
+) -> Result<()> {
+    // Warm up: the halt must provably land on a validator that was verifying
+    // happily, not on one that never started.
+    poll_until(
+        "validator verifying (warmup)",
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+        || async {
+            let v = t
+                .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
+                .await
+                .unwrap_or(0.0);
+            Ok((v > 0.0).then_some(()))
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        t.validator_metric(super::VALIDATOR_DIVERGENCE)
+            .await
+            .unwrap_or(0.0)
+            == 0.0,
+        "diverged before injection"
+    );
+
+    // Freeze the honest producer so its epoch for this L1 block cannot race
+    // the forgery, then forge one origin PAST where the chain has got to
+    // (the sealer only accepts an advancing origin).
+    anyhow::ensure!(
+        stack.suspend_da_watcher(),
+        "S11 needs a DA watcher (l1: true)"
+    );
+    let tip = l1.finalized_block_number().await?;
+    crate::harness::inject::publish_forged_epoch(&stack.aeron_dir(), tip + 50).await?;
+
+    // The verdict is deferred by one epoch on purpose (the L1 read runs off
+    // the exec thread), so keep honest epochs coming to carry it through.
+    l1.mine(12).await?;
+
+    poll_until(
+        "validator divergence on the forged epoch",
+        Duration::from_secs(60),
+        Duration::from_millis(500),
+        || async {
+            let d = t
+                .validator_metric(super::VALIDATOR_DIVERGENCE)
+                .await
+                .unwrap_or(0.0);
+            Ok((d > 0.0).then_some(()))
+        },
+    )
+    .await
+    .context("validator must reject an epoch L1 never produced")?;
+
+    // And it must be recorded as an epoch fault specifically — a divergence
+    // from some unrelated check would pass the line above while proving
+    // nothing about epoch verification.
+    let faults = t
+        .validator_metric(super::VALIDATOR_EPOCH_FAULTS)
+        .await
+        .unwrap_or(0.0);
+    anyhow::ensure!(
+        faults > 0.0,
+        "validator diverged but recorded no epoch fault — halted for another reason"
+    );
+    Ok(())
+}

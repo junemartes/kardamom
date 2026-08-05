@@ -309,6 +309,24 @@ where
         .expect("spawn tx_data reader")
 }
 
+/// Role-specific hook called for every [`EpochRecord`] on the canonical
+/// stream, in canonical order, before its deposits are applied.
+///
+/// The executor wires nothing here — it trusts the ordered stream. The
+/// VALIDATOR wires a verifier that re-derives the epoch from L1 and rejects a
+/// chain that disagrees (phase 1 of
+/// `docs/agents/l1-origin-deposit-derivation-spec.md`): deriving deposits is
+/// only half the guarantee, since without a checker a buggy sequencer silently
+/// produces a chain nobody can rebuild.
+///
+/// Returning `Err` stops the engine — the same fail-stop a receipt or write-set
+/// divergence takes. Implementations must be CHEAP: this runs on the exec
+/// thread, so anything with network latency (an L1 read) belongs on a
+/// background task with a deferred verdict, not inline here.
+pub trait EpochObserver: Send {
+    fn observe(&mut self, epoch: &EpochRecord) -> Result<(), ExecutorError>;
+}
+
 /// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
 ///
 /// `first_seen` returns `false` for an id already in the window. Once more

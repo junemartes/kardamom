@@ -37,6 +37,7 @@ use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsSubscriberHandle};
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_state::{StateEnvBuilder, StateWriter, TrieMode, read_recovery_point, seed_genesis};
 use kardamom_validator::attester::{self, AttesterConfig};
+use kardamom_validator::epoch_verify;
 use kardamom_validator::{
     BalBuffer, Divergence, ReceiptBuffer, ValidatorReceiptSink, ValidatorWriterQueue, metrics,
 };
@@ -147,6 +148,14 @@ struct Args {
     /// Address of the deployed `WithdrawalOutputOracle` proxy.
     #[arg(long, env = "KARDAMOM_OUTPUT_ORACLE")]
     output_oracle: Option<alloy_primitives::Address>,
+    /// Address of the deployed `ETHLockbox` proxy. With `--l1-rpc-url`, turns
+    /// on EPOCH VERIFICATION: every epoch on the canonical stream is
+    /// re-derived from L1 and a mismatch is a divergence (phase 1 of
+    /// docs/agents/l1-origin-deposit-derivation-spec.md). Without it the
+    /// validator still checks the origin SEQUENCE (rules 1-2, which need no
+    /// L1) but cannot check an epoch's contents.
+    #[arg(long, env = "KARDAMOM_LOCKBOX")]
+    lockbox: Option<alloy_primitives::Address>,
     /// Attester private key: raw hex, or `env:VAR` to read it from the
     /// environment (the deployer's key convention). Must be the oracle's
     /// permissioned `attester`.
@@ -670,6 +679,36 @@ async fn main() -> Result<()> {
         None
     };
 
+    // Epoch verification (phase 1). Sequence rules 1-2 are local and always
+    // enforced once an epoch appears; the CONTENT check needs L1, so it is
+    // only wired when both the RPC URL and the lockbox address are given.
+    let epoch_observer: Option<Box<dyn kardamom_engine::EpochObserver>> =
+        match (args.l1_rpc_url.as_deref(), args.lockbox) {
+            (Some(url), Some(lockbox)) => {
+                let provider = alloy_provider::ProviderBuilder::new()
+                    .disable_recommended_fillers()
+                    .connect_http(url.parse().context("parse --l1-rpc-url")?);
+                let source = std::sync::Arc::new(kardamom_da_watcher::RpcL1Source::new(provider));
+                tracing::info!(
+                    %lockbox,
+                    "epoch verification enabled: epochs are re-derived from L1"
+                );
+                Some(Box::new(epoch_verify::EpochVerifier::spawn(
+                    source,
+                    lockbox,
+                    divergence.clone(),
+                    &tokio::runtime::Handle::current(),
+                )))
+            }
+            _ => {
+                tracing::info!(
+                    "epoch CONTENT verification disabled (needs --l1-rpc-url and \
+                     --lockbox); origin sequence rules still apply"
+                );
+                None
+            }
+        };
+
     let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run(
             cfg,
@@ -687,6 +726,7 @@ async fn main() -> Result<()> {
             // Whole-block exec strategy (validator parallel path).
             block_exec,
             join_recovery,
+            epoch_observer,
         )
     });
 

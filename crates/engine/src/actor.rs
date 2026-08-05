@@ -273,6 +273,10 @@ impl Executor {
         bal_tx: Option<Sender<BalHandoff>>,
         block_exec: Option<BlockExec<S::Db>>,
         recovery: Option<crate::reader::JoinRecoveryFactory>,
+        // Role-specific epoch check. `None` on the executor (it trusts the
+        // ordered stream); the validator passes a verifier that re-derives
+        // each epoch from L1.
+        epoch_observer: Option<Box<dyn crate::reader::EpochObserver>>,
     ) -> Result<(), ExecutorError>
     where
         C: TxReceiptsPublication + 'static,
@@ -316,6 +320,7 @@ impl Executor {
             resume,
             bal_tx,
             block_exec,
+            epoch_observer,
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 
@@ -392,6 +397,7 @@ fn spawn_exec<S, Q, P>(
     resume: Option<ResumePoint>,
     bal_tx: Option<Sender<BalHandoff>>,
     block_exec: Option<BlockExec<S::Db>>,
+    mut epoch_observer: Option<Box<dyn crate::reader::EpochObserver>>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     S: SnapshotSource + 'static,
@@ -694,6 +700,11 @@ where
                             });
                         }
                         expected_tx_idx = expected_tx_idx.next();
+                        // Checked BEFORE the epoch's deposits are applied, so a
+                        // rejected epoch fail-stops instead of committing.
+                        if let Some(obs) = epoch_observer.as_mut() {
+                            obs.observe(&epoch)?;
+                        }
                         tracing::debug!(
                             target: "kardamom_executor::exec",
                             block = current_block,
@@ -1234,6 +1245,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
         drop(rx_e2c);
@@ -1343,6 +1355,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1417,6 +1430,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1485,6 +1499,7 @@ mod exec_tests {
             },
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
             None,
             None,
@@ -1583,6 +1598,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1646,6 +1662,7 @@ mod exec_tests {
             None,
             Some(bal_tx),
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1708,6 +1725,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log),
             0,
+            None,
             None,
             None,
             None,
@@ -1797,6 +1815,7 @@ mod exec_tests {
             }),
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1868,6 +1887,7 @@ mod exec_tests {
             }),
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1934,6 +1954,7 @@ mod exec_tests {
             }),
             None,
             None,
+            None,
         );
         let res = h.join().expect("no panic");
         assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -1981,6 +2002,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
             None,
             None,

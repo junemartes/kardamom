@@ -171,6 +171,9 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             // Whole-block exec strategy (validator parallel path).
             None,
             None,
+            // The executor trusts the ordered stream (phase 2 would
+            // give it its own L1 dependency); only the validator verifies.
+            None,
         )
     });
 

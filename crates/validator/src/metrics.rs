@@ -8,6 +8,15 @@ pub const BAL_MISSING_TOTAL: &str = "validator_bal_missing_total";
 pub const RECEIPT_MISSING_TOTAL: &str = "validator_receipt_missing_total";
 pub const COMMITTED_BLOCK: &str = "validator_committed_block";
 pub const STATE_ROOT_BLOCK: &str = "validator_state_root_block";
+/// Epochs whose deposits were re-derived from L1 and matched.
+pub const EPOCHS_VERIFIED_TOTAL: &str = "validator_epochs_verified_total";
+/// Epochs that FAILED verification — a chain fault, always paired with a
+/// divergence.
+pub const EPOCH_FAULTS_TOTAL: &str = "validator_epoch_faults_total";
+/// Epochs skipped because L1 was unreachable. NOT a fault: an RPC outage must
+/// not read as a divergence. Sustained non-zero means verification coverage
+/// has holes.
+pub const EPOCHS_UNVERIFIED_TOTAL: &str = "validator_epochs_unverified_total";
 
 /// Register metric descriptions. Call once at startup (after `kardamom_obs::init`).
 pub fn describe() {
@@ -57,6 +66,18 @@ pub fn counter_bal_sub_reopen() {
 
 pub fn counter_divergence() {
     metrics::counter!(DIVERGENCE_TOTAL).increment(1);
+}
+
+pub fn counter_epoch_verified() {
+    metrics::counter!(EPOCHS_VERIFIED_TOTAL).increment(1);
+}
+
+pub fn counter_epoch_fault() {
+    metrics::counter!(EPOCH_FAULTS_TOTAL).increment(1);
+}
+
+pub fn counter_epoch_unverified() {
+    metrics::counter!(EPOCHS_UNVERIFIED_TOTAL).increment(1);
 }
 
 /// Blocks re-executed as seeded parallel batches (label: batch count).

@@ -507,6 +507,9 @@ async fn main() -> Result<()> {
             // Whole-block exec strategy (validator parallel path).
             None,
             join_recovery,
+            // The executor trusts the ordered stream (phase 2 would
+            // give it its own L1 dependency); only the validator verifies.
+            None,
         )
     });
 
