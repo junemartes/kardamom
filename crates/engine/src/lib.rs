@@ -24,7 +24,7 @@ pub mod state;
 // The pure state-transition slice lives in `kardamom-exec-core` (`no_std`,
 // zk-guest-linkable). Module re-exports keep every pre-split path working:
 // `kardamom_engine::executor::…`, `crate::delta::…` etc. all still resolve.
-pub use kardamom_exec_core::{bal_ladder, block_env, delta, error, exec_types, executor};
+pub use kardamom_exec_core::{bal_ladder, block_env, delta, error, exec_types, executor, witness};
 
 pub use actor::{
     Executor, ExecutorConfig, ResumePoint, StateWriterQueue, StateWriterSignal,

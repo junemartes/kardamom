@@ -37,6 +37,7 @@ pub mod parallel;
 pub mod attester;
 pub mod epoch_verify;
 pub mod metrics;
+pub mod witness;
 
 /// Shared divergence flag. Once tripped, the validator has observed a proven
 /// discrepancy between its independent re-execution and the sequencer's output;

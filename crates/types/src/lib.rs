@@ -36,6 +36,7 @@ pub mod txref;
 pub mod watermark;
 pub mod wire;
 pub mod withdrawals;
+pub mod witness;
 
 pub use ack_policy::AckPolicy;
 pub use boundary::{BlockBoundary, BlockBoundaryStart};
@@ -51,3 +52,4 @@ pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;
 pub use txref::TxRef;
 pub use watermark::{FsyncWatermark, QuorumWatermark};
+pub use witness::{ExecutionWitness, WitnessAccount, WitnessSlot};
