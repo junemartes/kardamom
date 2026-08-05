@@ -556,9 +556,13 @@ impl TxReceiptsPublication for ValidatorReceiptSink {
                     if receipt_consistent(&local, &published) {
                         Ok(())
                     } else {
+                        // Identify the tx, not just the mismatch: #159 took a
+                        // multi-day forensic hash inversion to attribute
+                        // because this line once carried only status/gas/wsh.
                         let reason = format!(
                             "receipt mismatch at tx_idx {:?}: local(status={}, gas={}, wsh={}, \
-                             logs={}) vs published(status={}, gas={}, wsh={}, logs={})",
+                             logs={}) vs published(status={}, gas={}, wsh={}, logs={}) \
+                             [tx_hash={} from={} to={:?} block={} tx_index={}]",
                             local.tx_idx,
                             local.status,
                             local.gas_used,
@@ -568,6 +572,11 @@ impl TxReceiptsPublication for ValidatorReceiptSink {
                             published.gas_used,
                             published.write_set_hash,
                             published.logs.len(),
+                            local.tx_hash,
+                            local.from,
+                            local.to,
+                            local.block_number,
+                            local.transaction_index,
                         );
                         // FLIGHT RECORDER first (best-effort): the fail-stop
                         // is permanent, so this is the only chance to

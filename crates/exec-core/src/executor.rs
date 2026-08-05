@@ -77,7 +77,23 @@ impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
         Ok(a.map(|(nonce, balance, code_hash)| AccountInfo {
             balance,
             nonce,
-            code_hash,
+            // Genesis-seeded EOAs carry `code_hash = B256::ZERO` in the state
+            // DB, and revm's CacheDB normalizes zero code hashes to
+            // KECCAK_EMPTY when accounts pass through an execution scope
+            // (`CacheDB::insert_contract`). Without normalizing HERE too, the
+            // code_hash an account's write set carries depends on WHERE it was
+            // read from — the mdbx snapshot (fresh scope ⇒ ZERO) vs the
+            // intra-scope commit cache (⇒ KECCAK_EMPTY). The executor batches
+            // per block and the validator per BAL chunk, so a fresh account's
+            // first two txs straddling a validator batch boundary while
+            // sharing an executor block produced a wsh-only receipt
+            // "divergence" and a validator fail-stop (#159). Two spellings of
+            // "no code" must hash identically.
+            code_hash: if code_hash == B256::ZERO {
+                KECCAK_EMPTY
+            } else {
+                code_hash
+            },
             account_id: None,
             code: None,
         }))
