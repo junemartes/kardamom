@@ -123,21 +123,19 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     assert_fast(&out, fast, "unrecoverable-sig submit")?;
     expect_call_error(&out, CODE_INVALID, "unrecoverable-sig submit")?;
 
-    // A DIFFERENT tx at the landed (sender, nonce 0) slot: the
-    // (sender, nonce)-keyed receipt cache answers with the slot's canonical
-    // hash immediately — no re-execution, no park.
+    // A DIFFERENT tx at the landed (sender, nonce 0) slot: identity-honest
+    // semantics (#156). The old contract answered with the slot's canonical
+    // hash — i.e., a submit response carrying ANOTHER tx's identity, which
+    // is exactly the shape that let an upstream receipt mix-up silently
+    // poison a client's view of what landed. The contract is now a PROMPT
+    // named nonce-conflict rejection (the "nonce too low" analogue); the
+    // liveness property under test — bounded, non-hanging answers — holds
+    // through the error path.
     let tx0_alt = l2::sign_transfer(sender, t.chain_id, 0, to, 2)?;
     anyhow::ensure!(tx0_alt.hash != tx0.hash, "alt tx must differ");
     let out = t.rpc.send_raw(&tx0_alt.raw).await;
     assert_fast(&out, fast, "different-tx-at-landed-slot submit")?;
-    let h = out
-        .result
-        .map_err(|e| anyhow::anyhow!("slot-idempotency submit errored: {e}"))?;
-    anyhow::ensure!(
-        h == tx0.hash,
-        "slot idempotency returned {h}, expected the canonical {}",
-        tx0.hash
-    );
+    expect_call_error(&out, CODE_INVALID, "different-tx-at-landed-slot submit")?;
 
     // Idempotent raw resubmit.
     let out = t.rpc.send_raw(&tx0.raw).await;
