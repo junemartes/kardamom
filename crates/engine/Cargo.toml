@@ -7,8 +7,11 @@ edition.workspace = true
 # execution, delta/write-set accumulation, and the reader→exec→commit
 # orchestration behind the `StateWriterQueue` / `TxReceiptsPublication` seams.
 # Shared by the sequencer-side `kardamom-executor` and the `kardamom-validator`.
+# The pure per-tx execution slice lives in `kardamom-exec-core` (`no_std`,
+# zk-guest-linkable) and is re-exported from this crate's root.
 
 [dependencies]
+kardamom-exec-core = { workspace = true }
 smallvec.workspace = true
 alloy-eip7928.workspace = true
 alloy-rlp.workspace = true

@@ -7,6 +7,8 @@
 //! structural equality, so the two sides must transform identically by
 //! construction, not by parallel maintenance.
 
+use alloc::vec::Vec;
+
 /// Chunk ordinal for a 1-based bal index at granularity `k`.
 #[must_use]
 pub fn chunk_of(index: u64, k: u64) -> u64 {
@@ -23,7 +25,7 @@ pub fn quantize(bal: alloy_eip7928::BlockAccessList, k: u16) -> alloy_eip7928::B
     let mut out = bal;
     for acct in out.iter_mut() {
         for slot in acct.storage_changes.iter_mut() {
-            let mut seen: std::collections::BTreeMap<u64, usize> = Default::default();
+            let mut seen: alloc::collections::BTreeMap<u64, usize> = Default::default();
             let mut kept: Vec<alloy_eip7928::StorageChange> =
                 Vec::with_capacity(slot.changes.len());
             for c in slot.changes.iter() {

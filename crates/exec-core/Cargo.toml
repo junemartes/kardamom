@@ -1,0 +1,61 @@
+# The `no_std` execution core: per-tx revm execution, write-set / delta
+# accumulation, BAL quantization, and the deterministic skip/receipt rules —
+# extracted from `kardamom-engine` so a zk-guest build can link the exact
+# state-transition code the live executor and validator run, without Aeron /
+# libmdbx / tokio.
+#
+# Dependencies are declared directly (not `workspace = true`) because the
+# workspace-level entries carry default features a member cannot subtract;
+# version requirements MUST stay in sync with the workspace root so the graph
+# resolves to a single copy of each crate.
+#
+# Guest-build caveat (documented, not yet resolved — the PR-3 spec pin):
+# without `c-kzg` (a C library; unavailable on no_std/zkVM targets) revm's
+# precompile set OMITS 0x0A point-evaluation, while the live engine build
+# (workspace revm, default features) INCLUDES it. Every other precompile has a
+# pure-Rust fallback (k256, ark-bn254, ark-bls12-381, aurora-engine-modexp).
+# The guest integration must either pin the chain spec below Cancun, ship a
+# Rust kzg backend, or spec 0x0A out of the chain.
+
+[package]
+name = "kardamom-exec-core"
+version.workspace = true
+edition.workspace = true
+
+[features]
+default = ["std"]
+# `std` adds the operational side-channels (tracing + metrics on the
+# invalid-tx skip path) and the `state` mock module. Execution semantics are
+# IDENTICAL with and without — receipts, write sets, and deltas carry all
+# consensus-relevant output.
+std = [
+    "kardamom-types/std",
+    "revm/std",
+    "alloy-primitives/std",
+    "alloy-consensus/std",
+    "alloy-eips/std",
+    "alloy-eip7928/std",
+    "alloy-rlp/std",
+    "bytes/std",
+    "thiserror/std",
+    "dep:tracing",
+    "dep:metrics",
+]
+
+[dependencies]
+kardamom-types = { path = "../types", default-features = false }
+revm = { version = "38", default-features = false }
+alloy-primitives = { version = "1.6", default-features = false }
+alloy-consensus = { version = "2.0", default-features = false }
+alloy-eips = { version = "2.0", default-features = false }
+alloy-eip7928 = { version = "0.3", default-features = false, features = ["rlp"] }
+alloy-rlp = { version = "0.3", default-features = false }
+bytes = { version = "1", default-features = false }
+smallvec = { version = "1", default-features = false }
+thiserror = { version = "2", default-features = false }
+tracing = { version = "0.1", optional = true }
+metrics = { version = "0.24", optional = true }
+
+[dev-dependencies]
+alloy-signer-local = { workspace = true }
+alloy-network = { workspace = true }

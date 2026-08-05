@@ -33,15 +33,10 @@ pub const BAL_PUBLISH_TOTAL: &str = "kardamom_executor_bal_publish_total";
 pub const BAL_RETAINED_BLOCKS: &str = "kardamom_executor_bal_retained_blocks";
 
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
-/// Deterministically-invalid canonical txs skipped with a marker receipt
-/// (#92). ANY nonzero value means an upstream guard (sequencer nonce fence,
-/// cluster dedup, resync floors) let an invalid record into the canonical
-/// log — standing-alert material, like `RESYNC_TOTAL`.
-pub const INVALID_TX_SKIPPED_TOTAL: &str = "kardamom_executor_invalid_tx_skipped_total";
-
-pub fn record_invalid_tx_skipped() {
-    metrics::counter!(INVALID_TX_SKIPPED_TOTAL).increment(1);
-}
+// The invalid-tx-skip counter is emitted from inside the `no_std` exec core
+// (`invalid_skip`), so the constant and its `record_` helper live there;
+// re-exported here so the metric namespace stays browsable in one place.
+pub use kardamom_exec_core::metrics::{INVALID_TX_SKIPPED_TOTAL, record_invalid_tx_skipped};
 
 pub fn describe() {
     metrics::describe_counter!(TX_APPLIED_TOTAL, "tx executions, labelled by outcome");

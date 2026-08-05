@@ -3,6 +3,8 @@
 //! Carries the full account / storage / code mutations + receipts produced by
 //! a sealed block, so the S6 state writer can commit them atomically.
 
+use alloc::vec::Vec;
+
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize, Serialize};

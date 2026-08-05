@@ -96,6 +96,24 @@ jobs:
           prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
       - run: cargo build --workspace --all-targets --locked
 
+  # The exec core (and the types crate under it) must stay linkable inside a
+  # zk-guest build: `no_std` + `alloc`, no Aeron/libmdbx/tokio. A bare-metal
+  # target is the only reliable gate — a host-target check with
+  # --no-default-features would still link std transitively and pass.
+  # Deliberately no Aeron/foundry setup: nothing here touches rusteron.
+  no-std:
+    name: no_std exec-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: riscv32imac-unknown-none-elf
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-nostd
+      - run: cargo check -p kardamom-types -p kardamom-exec-core --no-default-features --target riscv32imac-unknown-none-elf --locked
+
   test:
     name: test
     runs-on: ubuntu-latest

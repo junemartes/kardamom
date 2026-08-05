@@ -1,5 +1,7 @@
 //! Errors raised by the engine actor and its helpers.
 
+use alloc::string::String;
+
 use alloy_primitives::B256;
 
 use crate::exec_types::TxIndex;

@@ -3833,6 +3833,7 @@ dependencies = [
  "crossbeam-channel",
  "dashmap",
  "kardamom-cluster-adapter",
+ "kardamom-exec-core",
  "kardamom-log",
  "kardamom-state",
  "kardamom-types",
@@ -3846,6 +3847,26 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber 0.3.23",
+]
+
+[[package]]
+name = "kardamom-exec-core"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eip7928",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-signer-local",
+ "bytes",
+ "kardamom-types",
+ "metrics",
+ "revm",
+ "smallvec",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

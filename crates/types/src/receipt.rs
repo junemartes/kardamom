@@ -1,5 +1,7 @@
 //! Per-tx execution receipt.
 
+use alloc::vec::Vec;
+
 use alloy_primitives::{Address, B256};
 use bytes::Bytes;
 use rkyv::{Archive, Deserialize, Serialize, with::Map};
