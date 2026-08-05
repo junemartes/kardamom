@@ -97,12 +97,29 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
 ## Phase plan (series)
 
 - **PR 1 (this)** — extraction + CI gate. Pure refactor.
-- **PR 2** — `WitnessDb: StateDatabase` over witness maps + validator-side
-  witness collector (the BAL enumerates the touched key-set; the state DB
-  keeps its three-consumer rule — the batcher stays state-free) + a
-  stateless re-execution test: replay a block from witness alone, assert
-  identical delta/BAL/state-root against the shadow-oracle
-  (`kardamom-state::trie::rebuild_root`).
+- **PR 2 (delivered)** — stateless execution over a captured witness:
+  - `kardamom-types::witness` — `ExecutionWitness` wire type (rkyv, sorted
+    canonical order, keccak `digest()`), with EXPLICIT absence: proven-absent
+    accounts (`exists = false`) and explicit zero slots. A key missing from
+    the witness is an incompleteness error, never a default.
+  - `kardamom-exec-core::witness` — `WitnessDb` (`no_std`, fail-closed
+    `StateDatabase` over the witness) + `WitnessRecorder` (std, the
+    validator-side collector: a first-touch recording decorator at the
+    snapshot seam — `CacheDB` memoizes reads, so the snapshot sees exactly
+    the pre-state slice). Empty-code hashes (`KECCAK_EMPTY`/`ZERO`) resolve
+    structurally and never enter the witness.
+  - `kardamom-validator::witness` — `capture_block_witness` /
+    `reexecute_stateless` over the existing sequential driver; the state DB
+    keeps its three-consumer rule (the batcher stays state-free).
+  - `tests/stateless_reexec.rs` — the round-trip contract: transfer +
+    contract call (code load, storage read/write) + deposit (mint,
+    proven-absent recipient) captured and replayed from the witness alone;
+    identical receipts/delta and post-state root via the pure trie oracle
+    (`kardamom-state::{state_root, storage_root}`); witness minimality
+    (untouched accounts never leak in); tampered witnesses fail closed.
+  - Capture runs BELOW the parent/seed layers, so pipelined-commit parent
+    reads surface as ordinary witness entries; per-batch capture at K > 1
+    composes with claim seeds but the phase-2 contract is block-granular.
 - **PR 3** — zkVM guest program + async prover harness behind a flag;
   resolve gaps 1–4 above; sparse post-state-root recompute over
   `alloy-trie`.
