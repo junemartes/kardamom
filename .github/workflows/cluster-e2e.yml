@@ -187,7 +187,13 @@ jobs:
             # interval (KARDAMOM_CLUSTER_SNAPSHOT_S -> deploy.sh -var ->
             # -Dkardamom.cluster.snapshotIntervalS; other shards keep the
             # jobspec default).
-            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-member-rejoin cluster-quorum-loss-recover"; echo "KARDAMOM_CLUSTER_SNAPSHOT_S=60"; } ;;
+            # cpu-squeeze rides this shard: 3 oscillating whole-stack
+            # starvation cycles (the lapse->reconnect->replay transition the
+            # 2026-08-03 divergence needed). On the 4-core runners the
+            # throttle stacks onto ambient oversubscription — exactly the
+            # storm that produced the incident; with the flight ring +
+            # reason-printing a recurrence now self-documents.
+            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-member-rejoin cluster-quorum-loss-recover cpu-squeeze"; echo "KARDAMOM_CLUSTER_SNAPSHOT_S=60"; echo "SQUEEZE_CYCLES=3"; echo "SQUEEZE_S=60"; echo "SQUEEZE_CPUS_PER_NODE=0.4"; } ;;
             # The LIVE replay-window overrun tier (recovery-D), on its own
             # shard because the sealer is deployed with a deliberately SMALL
             # egress retention (KARDAMOM_CLUSTER_RETENTION -> deploy.sh -var ->

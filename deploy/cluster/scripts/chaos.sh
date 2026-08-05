@@ -401,6 +401,120 @@ run_validator_lapse() {
 # coherent). Executors checkpoint every 20s from bring-up, so a peer
 # checkpoint always exists; the adoption log grep keeps the case
 # non-vacuous — a genesis-replay join would NOT print it.
+# --- cpu-squeeze: whole-stack CPU-starvation drill ------------------------
+# Recreates the degraded-CI-runner storm ON PURPOSE: every kardamom node
+# container is cgroup-throttled AT ONCE (docker update --cpus), so executors,
+# sealers, ingress, sequencers and the validator all starve together — Aeron
+# sessions lapse, back-pressure engages everywhere, and the validator falls
+# into catch-up exactly like the 4-core GH runners at loadavg 17-32. That
+# window produced the 2026-08-03 load-shard divergence (halt -> restart ->
+# CLEAN re-validation of the same blocks: non-deterministic on replay, the
+# replay-overlap class). Ambient starvation found it by luck; this drill
+# hunts it deliberately. Invariant under squeeze: NO divergence, ever —
+# starvation may slow the validator, never fork its verdict.
+SQUEEZE_S="${SQUEEZE_S:-120}"
+SQUEEZE_CPUS_PER_NODE="${SQUEEZE_CPUS_PER_NODE:-0.75}"
+SQUEEZE_RECOVER_S="${SQUEEZE_RECOVER_S:-180}"
+# Oscillation: N squeeze->release cycles instead of one long squeeze. The
+# replay-overlap class needs the TRANSITION (sessions lapse under squeeze,
+# then reconnect + replay-merge on release) — repeated cycles exercise that
+# machinery far harder than one sustained squeeze of the same total length.
+SQUEEZE_CYCLES="${SQUEEZE_CYCLES:-1}"
+SQUEEZE_RELEASE_S="${SQUEEZE_RELEASE_S:-30}"
+
+run_cpu_squeeze() {
+  # Warm-up gate (same as validator-lapse): the squeeze must hit a validator
+  # VERIFYING LIVE — squeezing one still in catch-up asserts nothing.
+  local t=0 vprev=-1 v_now e_now verified warmed=0
+  while [ "${t}" -lt 150 ]; do
+    verified="$(val_metric validator_blocks_verified_total)"; verified="${verified:-0}"
+    v_now="$(val_metric validator_committed_block)"; v_now="${v_now:-0}"
+    e_now="$(executor_progress || echo 0)"
+    if [ "${verified}" -gt 0 ] && [ "${verified}" -gt "${vprev}" ] \
+       && [ "${v_now}" -gt 0 ] && [ $(( e_now - v_now )) -le 15 ]; then
+      warmed=1
+      break
+    fi
+    vprev="${verified}"; sleep 6; t=$(( t + 6 ))
+  done
+  [ "${warmed}" -eq 1 ] \
+    || fail "cpu-squeeze: validator never verifying live within ${t}s (verified=${verified} block=${v_now} exec=${e_now})"
+  log "cpu-squeeze: warmed up (verified=${verified} block=${v_now} exec=${e_now}) after ${t}s"
+
+  # Node containers on the HOST engine (the DinD outer layer): the cgroup
+  # limit cascades to every inner task. Control/registry stay untouched —
+  # the drill starves the STACK, not the harness's own probes.
+  local nodes
+  nodes="$(docker ps --format '{{.Names}}' | grep -E '^kardamom-(executor|sequencer|ingress|sealer|aux)-[0-9]+$' || true)"
+  [ -n "${nodes}" ] || fail "cpu-squeeze: no kardamom node containers found on the host engine"
+  local n n_count cyc
+  n_count="$(wc -l <<<"${nodes}")"
+  log "cpu-squeeze: ${SQUEEZE_CYCLES} cycle(s) of ${SQUEEZE_S}s at ${SQUEEZE_CPUS_PER_NODE} CPUs across ${n_count} node containers (release ${SQUEEZE_RELEASE_S}s between)"
+  for cyc in $(seq 1 "${SQUEEZE_CYCLES}"); do
+    for n in ${nodes}; do
+      docker update --cpus "${SQUEEZE_CPUS_PER_NODE}" "${n}" >/dev/null \
+        || fail "cpu-squeeze: docker update --cpus failed for ${n}"
+    done
+    # Verify the squeeze TOOK (a silently-ignored limit would assert nothing
+    # — the validator-lapse docker-pause lesson): NanoCpus must be non-zero.
+    local nano
+    nano="$(docker inspect -f '{{.HostConfig.NanoCpus}}' "$(head -1 <<<"${nodes}")")"
+    [ "${nano:-0}" -gt 0 ] || fail "cpu-squeeze: throttle did not take (NanoCpus=${nano})"
+    log "cpu-squeeze: cycle ${cyc}/${SQUEEZE_CYCLES} squeezing ${SQUEEZE_S}s"
+    sleep "${SQUEEZE_S}"
+
+    # Restore — two passes, best-effort second: leaving a node throttled
+    # would poison every later case/assert on this cluster.
+    for n in ${nodes}; do
+      docker update --cpus 0 "${n}" >/dev/null 2>&1 \
+        || { sleep 2; docker update --cpus 0 "${n}" >/dev/null 2>&1; } \
+        || log "cpu-squeeze: WARNING restore failed for ${n} (still throttled)"
+    done
+    log "cpu-squeeze: cycle ${cyc}/${SQUEEZE_CYCLES} released"
+    [ "${cyc}" -lt "${SQUEEZE_CYCLES}" ] && sleep "${SQUEEZE_RELEASE_S}"
+  done
+  log "cpu-squeeze: restored full CPU; asserting recovery + invariants"
+
+  # Recovery: pipeline advances, validator returns to verifying live.
+  assert_progress
+  t=0; vprev=-1; local recovered=0
+  while [ "${t}" -lt "${SQUEEZE_RECOVER_S}" ]; do
+    verified="$(val_metric validator_blocks_verified_total)"; verified="${verified:-0}"
+    v_now="$(val_metric validator_committed_block)"; v_now="${v_now:-0}"
+    e_now="$(executor_progress || echo 0)"
+    if [ "${verified}" -gt 0 ] && [ "${verified}" -gt "${vprev}" ] \
+       && [ "${v_now}" -gt 0 ] && [ $(( e_now - v_now )) -le 15 ]; then
+      recovered=1
+      break
+    fi
+    vprev="${verified}"; sleep 6; t=$(( t + 6 ))
+  done
+  [ "${recovered}" -eq 1 ] \
+    || fail "cpu-squeeze: validator not verifying live within ${SQUEEZE_RECOVER_S}s of restore (verified=${verified} block=${v_now} exec=${e_now})"
+
+  # THE invariant: zero divergences — metric AND logs (the metric resets if
+  # the validator restarted mid-squeeze; a pre-restart divergence still shows
+  # in the old alloc's log, exactly the 2026-08-03 signature).
+  local div
+  div="$(val_metric validator_divergence_total)"; div="$(printf '%.0f' "${div:-0}")"
+  [ "${div}" -eq 0 ] || fail "cpu-squeeze: validator counted ${div} divergence(s) under starvation"
+  local valloc
+  while read -r valloc; do
+    [ -z "${valloc}" ] && continue
+    if on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+        | grep -q "halted on divergence"; then
+      echo "----- divergence context (alloc ${valloc}) -----" >&2
+      on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+        | grep -B3 -A10 "halted on divergence" >&2 || true
+      docker exec "${VALIDATOR_NODE}" sh -c \
+        'for f in /opt/kardamom/state/divergence-*.json; do [ -f "$f" ] && { echo "== $f"; head -c 4096 "$f"; echo; }; done' \
+        >&2 2>/dev/null || true
+      fail "cpu-squeeze: validator diverged under starvation (alloc ${valloc}; context above)"
+    fi
+  done < <(all_allocs validator)
+  log "cpu-squeeze PASS: ${n_count} nodes starved ${SQUEEZE_S}s at ${SQUEEZE_CPUS_PER_NODE} CPUs, validator recovered (verified=${verified}, lag $(( e_now - v_now ))), 0 divergences"
+}
+
 run_validator_join() {
   local inner
   inner="$(docker exec "${VALIDATOR_NODE}" sh -c 'docker ps --format "{{.Names}}" | grep -m1 "^validator"' 2>/dev/null)"
@@ -1244,6 +1358,13 @@ run_case() { # <case-name>
     local min_s=$(( INJECT_DELAY + RETENTION_FREEZE_CAP_S + 120 ))
     [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
   fi
+  # cpu-squeeze: load must keep flowing through the whole starvation window
+  # AND the recovery assert — a squeeze with an idle pipeline exercises
+  # nothing (the divergence it hunts needs live traffic + catch-up).
+  if [ "${name}" = "cpu-squeeze" ]; then
+    local min_s=$(( INJECT_DELAY + SQUEEZE_CYCLES * (SQUEEZE_S + SQUEEZE_RELEASE_S) + 90 ))
+    [ "${case_s}" -lt "${min_s}" ] && case_s="${min_s}"
+  fi
 
   # Ingress baseline BEFORE the load starts, for the injection gate below.
   local rx0
@@ -1991,6 +2112,14 @@ print(best + 40 if best >= 0 else -1)
       # anything that aged out. All validator-specific asserts live in the
       # helper.
       run_validator_lapse
+      ;;
+
+    cpu-squeeze)
+      # Whole-stack CPU starvation (no kills): throttle every node container
+      # at once and assert the invariant that starvation may slow the
+      # pipeline but never fork the validator's verdict. All squeeze
+      # mechanics + asserts live in the helper.
+      run_cpu_squeeze
       ;;
 
     validator-join)

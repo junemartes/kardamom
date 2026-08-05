@@ -183,6 +183,10 @@ pub type BalHandoff = (
 
 /// One canonical record buffered for whole-block execution (validator
 /// parallel path). Mirrors [`crate::reader::ReaderToExec`]'s payload arms.
+/// Clone is cheap: envelope/deposit byte payloads are refcounted `Bytes`
+/// (the validator's flight ring keeps recent blocks' records for
+/// receipt-divergence dumps).
+#[derive(Clone)]
 pub enum BufferedRecord {
     Tx {
         tx_idx: TxIndex,
