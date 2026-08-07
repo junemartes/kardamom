@@ -177,6 +177,45 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
     }
 }
 
+/// Seed one delta layer into a block cache — later inserts overwrite, so
+/// seeding parent-then-delta composes the `snapshot ∘ parent ∘ delta` view.
+///
+/// This is the ONE view-composition primitive: the tx path
+/// ([`ExecScope::seed_layer`]) and the deposit path
+/// ([`execute_deposit_tx`]) both go through it, and the executor and
+/// validator MUST compose the view identically — a one-sided change here is
+/// a consensus divergence, not a refactor.
+fn seed_cache_layer<DB: DatabaseRef>(
+    cache: &mut CacheDB<DB>,
+    layer: &PendingDelta,
+) -> Result<(), String> {
+    for (addr, (nonce, balance, code_hash)) in &layer.accounts {
+        let code = layer
+            .code
+            .get(code_hash)
+            .cloned()
+            .filter(|b| !b.is_empty())
+            .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
+        cache.insert_account_info(
+            *addr,
+            AccountInfo {
+                balance: *balance,
+                nonce: *nonce,
+                code_hash: *code_hash,
+                account_id: None,
+                code,
+            },
+        );
+    }
+    for ((addr, key), value) in &layer.storage {
+        let u_key = U256::from_be_bytes::<32>(key.0);
+        cache
+            .insert_account_storage(*addr, u_key, *value)
+            .map_err(|e| format!("seed layer storage: {e:?}"))?;
+    }
+    Ok(())
+}
+
 /// Per-BLOCK execution scope: ONE `CacheDB` (layered over
 /// `parent ∘ snapshot`) that revm COMMITS into after each tx, and ONE EVM
 /// instance whose tx-env is swapped per transaction.
@@ -248,31 +287,7 @@ impl<S: StateDatabase> ExecScope<S> {
     /// wrapper for a caller-maintained live delta.
     pub fn seed_layer(&mut self, layer: &PendingDelta) -> Result<(), ExecutorError> {
         let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
-        for (addr, (nonce, balance, code_hash)) in &layer.accounts {
-            let code = layer
-                .code
-                .get(code_hash)
-                .cloned()
-                .filter(|b| !b.is_empty())
-                .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
-            cache.insert_account_info(
-                *addr,
-                AccountInfo {
-                    balance: *balance,
-                    nonce: *nonce,
-                    code_hash: *code_hash,
-                    account_id: None,
-                    code,
-                },
-            );
-        }
-        for ((addr, key), value) in &layer.storage {
-            let u_key = U256::from_be_bytes::<32>(key.0);
-            cache
-                .insert_account_storage(*addr, u_key, *value)
-                .map_err(|e| ExecutorError::State(format!("seed layer storage: {e:?}")))?;
-        }
-        Ok(())
+        seed_cache_layer(cache, layer).map_err(ExecutorError::State)
     }
 
     pub fn execute_tx(
@@ -572,33 +587,10 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     // delta, so later inserts overwrite and the view equals
     // snapshot ∘ parent ∘ delta.
     for layer in parent.into_iter().chain(core::iter::once(delta)) {
-        for (addr, (nonce, balance, code_hash)) in &layer.accounts {
-            let code = layer
-                .code
-                .get(code_hash)
-                .cloned()
-                .filter(|b| !b.is_empty())
-                .map(|b| Bytecode::new_raw(AlloyBytes::from(b)));
-            cache.insert_account_info(
-                *addr,
-                AccountInfo {
-                    balance: *balance,
-                    nonce: *nonce,
-                    code_hash: *code_hash,
-                    account_id: None,
-                    code,
-                },
-            );
-        }
-        for ((addr, key), value) in &layer.storage {
-            let u_key = U256::from_be_bytes::<32>(key.0);
-            cache
-                .insert_account_storage(*addr, u_key, *value)
-                .map_err(|e| ExecutorError::Execution {
-                    idx: tx_idx,
-                    detail: format!("seed storage: {e:?}"),
-                })?;
-        }
+        seed_cache_layer(&mut cache, layer).map_err(|detail| ExecutorError::Execution {
+            idx: tx_idx,
+            detail,
+        })?;
     }
 
     // (1) Mint pre-credit. `dep.mint` is u128; widen to U256 for balance

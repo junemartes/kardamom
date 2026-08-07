@@ -45,6 +45,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on request/response head size — nothing legitimate comes close.
 const MAX_HEAD: usize = 4096;
 
+/// Removes the wrapped tmp dir on drop; set the field to `None` to defuse
+/// once the dir has been published. Keeps every fetch refusal path
+/// crash-clean without a per-arm cleanup line.
+struct TmpDirGuard<'a>(Option<&'a Path>);
+
+impl Drop for TmpDirGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(p) = self.0 {
+            let _ = std::fs::remove_dir_all(p);
+        }
+    }
+}
+
 /// Serve the newest checkpoint under `checkpoints_dir` on `addr`, forever, on
 /// a dedicated thread. Binding happens before the thread spawns so a bad
 /// address fails startup loudly rather than logging from a background thread.
@@ -205,11 +218,13 @@ pub fn fetch_latest_checkpoint(
     let tmp = checkpoints_dir.join(format!(".{}.fetch.tmp", checkpoint_name(block)));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
+    // Every refusal below must leave no half-fetched tmp entry behind; the
+    // guard replaces the per-arm cleanup and is defused only by the publish.
+    let mut tmp_guard = TmpDirGuard(Some(&tmp));
     let tmp_data = tmp.join("mdbx.dat");
     let mut out = std::fs::File::create(&tmp_data)?;
     let copied = std::io::copy(&mut reader.by_ref().take(len), &mut out)?;
     if copied != len {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint transfer from {peer} truncated: got {copied} of {len} bytes"
         )));
@@ -217,53 +232,43 @@ pub fn fetch_latest_checkpoint(
     out.sync_all()?;
     drop(out);
 
-    // Integrity + chain identity BEFORE the image becomes visible. Without
+    // Integrity + chain identity BEFORE the image becomes visible — the
+    // shared refusal checks (`checkpoint::check_image_identity`). Without
     // this the transfer was plain HTTP with a length check: silent bit rot,
     // a lying peer, or a checkpoint from a previous chain all became this
     // node's state (the recovery-C incident: a stale checkpoint wedged a
     // fresh node into an endless replay request loop).
     let got = crate::checkpoint::file_keccak(&tmp_data)?;
     let Some(want) = keccak else {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint peer {peer} sent no x-checkpoint-keccak — refusing an \
              unverifiable image"
         )));
     };
-    if got != want {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(StateError::Recovery(format!(
-            "checkpoint transfer from {peer} is CORRUPT: {len} bytes arrived but \
-             hash to {got:#x}, peer advertised {want:#x}"
-        )));
-    }
     let Some(genesis_digest) = genesis else {
-        let _ = std::fs::remove_dir_all(&tmp);
         return Err(StateError::Recovery(format!(
             "checkpoint peer {peer} sent no x-checkpoint-genesis — refusing an \
              unidentifiable image"
         )));
     };
-    if let Some(expect) = expected_genesis
-        && expect != genesis_digest
-    {
-        let _ = std::fs::remove_dir_all(&tmp);
-        return Err(StateError::Recovery(format!(
-            "checkpoint peer {peer} serves a DIFFERENT CHAIN: its genesis digest \
-             is {genesis_digest:#x}, this node's is {expect:#x}"
-        )));
-    }
+    crate::checkpoint::check_image_identity(
+        &format!("from peer {peer}"),
+        "peer",
+        got,
+        want,
+        genesis_digest,
+        expected_genesis,
+    )?;
 
     // Persist the manifest INSIDE the checkpoint dir so a LATER restore
-    // re-verifies from disk rather than trusting that this fetch happened;
-    // the rename publishes image + manifest atomically.
+    // re-verifies from disk rather than trusting that this fetch happened.
     let manifest = crate::checkpoint::CheckpointManifest {
         block,
         image_keccak: got,
         genesis_digest,
     };
-    std::fs::write(tmp.join("MANIFEST"), manifest.encode())?;
-    std::fs::rename(&tmp, &dest)?;
+    crate::checkpoint::publish_checkpoint(&tmp, &dest, &manifest)?;
+    tmp_guard.0 = None;
     info!(
         block,
         bytes = len,
