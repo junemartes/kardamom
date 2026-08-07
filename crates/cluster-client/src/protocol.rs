@@ -120,17 +120,29 @@ fn need(buf: &[u8], at: usize, n: usize) -> Result<&[u8], DecodeError> {
     })
 }
 
+// Exact-width LE reads come from [`crate::bytes`] (shared with the
+// app-envelope codec in `kardamom-cluster-adapter`); a `None` maps to this
+// codec's own [`DecodeError::TooShort`] with this codec's offsets.
+
+fn too_short(buf: &[u8], at: usize, need: usize) -> DecodeError {
+    DecodeError::TooShort {
+        at,
+        need,
+        have: buf.len().saturating_sub(at),
+    }
+}
+
 fn rd_u16(buf: &[u8], at: usize) -> Result<u16, DecodeError> {
-    Ok(u16::from_le_bytes(need(buf, at, 2)?.try_into().unwrap()))
+    crate::bytes::u16_le(buf, at).ok_or_else(|| too_short(buf, at, 2))
 }
 fn rd_i32(buf: &[u8], at: usize) -> Result<i32, DecodeError> {
-    Ok(i32::from_le_bytes(need(buf, at, 4)?.try_into().unwrap()))
+    crate::bytes::i32_le(buf, at).ok_or_else(|| too_short(buf, at, 4))
 }
 fn rd_u32(buf: &[u8], at: usize) -> Result<u32, DecodeError> {
-    Ok(u32::from_le_bytes(need(buf, at, 4)?.try_into().unwrap()))
+    crate::bytes::u32_le(buf, at).ok_or_else(|| too_short(buf, at, 4))
 }
 fn rd_i64(buf: &[u8], at: usize) -> Result<i64, DecodeError> {
-    Ok(i64::from_le_bytes(need(buf, at, 8)?.try_into().unwrap()))
+    crate::bytes::i64_le(buf, at).ok_or_else(|| too_short(buf, at, 8))
 }
 
 /// Read a var-length field (`length:u32` + bytes) starting at `at` in `body`.
@@ -214,28 +226,32 @@ pub fn decode_session_connect_request(buf: &[u8]) -> Result<SessionConnectReques
 
 // ── SessionKeepAlive / SessionCloseRequest (ingress) ────────────────────────
 
+/// Encode the two-i64 body shared by KeepAlive / CloseRequest (the encode-side
+/// mirror of [`decode_two_i64`]).
+fn encode_two_i64(block_length: u16, template_id: u16, a: i64, b: i64) -> Vec<u8> {
+    let mut buf = Vec::new();
+    put_header(&mut buf, block_length, template_id);
+    buf.extend_from_slice(&a.to_le_bytes());
+    buf.extend_from_slice(&b.to_le_bytes());
+    buf
+}
+
 pub fn encode_session_keep_alive(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
-    let mut b = Vec::new();
-    put_header(
-        &mut b,
+    encode_two_i64(
         BLOCK_SESSION_KEEP_ALIVE,
         TEMPLATE_SESSION_KEEP_ALIVE,
-    );
-    b.extend_from_slice(&leadership_term_id.to_le_bytes());
-    b.extend_from_slice(&cluster_session_id.to_le_bytes());
-    b
+        leadership_term_id,
+        cluster_session_id,
+    )
 }
 
 pub fn encode_session_close_request(leadership_term_id: i64, cluster_session_id: i64) -> Vec<u8> {
-    let mut b = Vec::new();
-    put_header(
-        &mut b,
+    encode_two_i64(
         BLOCK_SESSION_CLOSE_REQUEST,
         TEMPLATE_SESSION_CLOSE_REQUEST,
-    );
-    b.extend_from_slice(&leadership_term_id.to_le_bytes());
-    b.extend_from_slice(&cluster_session_id.to_le_bytes());
-    b
+        leadership_term_id,
+        cluster_session_id,
+    )
 }
 
 /// Decode the two-i64 body shared by KeepAlive / CloseRequest. Returns

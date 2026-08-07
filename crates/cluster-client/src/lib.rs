@@ -13,6 +13,9 @@
 //!
 //! ## Layers
 //!
+//! - [`bytes`] — `Option`-returning little-endian read primitives, shared with
+//!   `kardamom-cluster-adapter`'s app-envelope codec (each codec maps a miss
+//!   to its own error type).
 //! - [`protocol`] — pure SBE codec for the client-facing cluster messages
 //!   (schema id = 111, `io.aeron.cluster.codecs`). No native deps.
 //! - [`session`] — the sans-IO [`session::SessionDriver`] state machine
@@ -23,5 +26,6 @@
 //! `kardamom-cluster-adapter`'s `live` module — it owns the IO, so this crate
 //! stays sans-IO and the protocol is testable without a media driver.
 
+pub mod bytes;
 pub mod protocol;
 pub mod session;
