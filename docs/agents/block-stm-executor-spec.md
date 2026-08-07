@@ -62,9 +62,23 @@ Each sequenced tx is assigned one strategy, evaluated top-down —
 exact structural knowledge first, statistics second, pessimism as the
 default when neither speaks:
 
-1. **`System` — serial barrier lane** (exact). Deposits and epoch
-   records: own commit semantics, rare, never concurrent with anything
-   (same reasoning as the validator's batch path, #151).
+1. **`System` — serial barrier lane** (exact). EPOCH MARKERS only:
+   they are not EVM executions — stream-structural records with
+   block-level semantics (L1-origin derivation, #116); a barrier is
+   semantically correct for them. DEPOSITS are NOT semantically
+   sequential: their footprint keys like any tx's (mint = Tier-1
+   sender-account write; the inner call has to/selector/calldata
+   pre-execution, so Tier-2/3 apply verbatim), the mint-survives-revert
+   rule is per-tx execution, not cross-tx ordering, and #151 already
+   runs them inside the VALIDATOR's parallel batches. v1 still routes
+   them through the serial lane purely as engineering economy — they
+   are rare (≤~1/block), so parallelizing buys ~zero wall time while
+   their separate execution path (`execute_deposit_tx` builds its own
+   view) makes MvCache integration real work for that zero. If
+   deposit-heavy traffic changes the benefit side, the keys are
+   already defined — and same-bridge deposit bursts would chain via
+   the bridge's DomainChain key anyway, which is the only ordering
+   that matters.
 2. **`SenderChain`** (exact, no stats needed). Same-sender txs are
    always ordered — nonce succession and gas-balance flow make this a
    hard data dependency. Free and precise: cross-sender parallelism is
