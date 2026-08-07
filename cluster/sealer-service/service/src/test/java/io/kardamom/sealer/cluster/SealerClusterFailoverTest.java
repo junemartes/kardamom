@@ -174,7 +174,7 @@ class SealerClusterFailoverTest {
     private void offerIngress(final AeronCluster client, final byte[] canonicalId32) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_INGRESS_RECORD);
+        buf.putByte(pos, SealerWire.KIND_INGRESS_RECORD);
         pos += Byte.BYTES;
         // Zero sender + nonce 0: guard-exempt (this test exercises failover,
         // not the contiguity guard).
@@ -296,11 +296,11 @@ class SealerClusterFailoverTest {
                 return;
             }
             final byte kind = buffer.getByte(offset);
-            if (kind == SealerClusteredService.EGRESS_KIND_RELAYED) {
+            if (kind == SealerWire.EGRESS_KIND_RELAYED) {
                 // kind(1) | index(8 LE) | payloadLen(4 LE) | payload[]
                 final long index = buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN);
                 relayedIndexes.add(index);
-            } else if (kind == SealerClusteredService.EGRESS_KIND_BOUNDARY) {
+            } else if (kind == SealerWire.EGRESS_KIND_BOUNDARY) {
                 // kind(1) | blockNumber(8 LE) | endTxIdx(8 LE) | l2Timestamp(8 LE)
                 final long blockNumber =
                         buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN);

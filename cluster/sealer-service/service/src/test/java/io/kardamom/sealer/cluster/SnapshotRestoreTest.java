@@ -105,7 +105,7 @@ class SnapshotRestoreTest {
             final Image image = awaitImage(sub, pub);
             pub.close(); // end-of-stream with ZERO bytes written
             final IllegalStateException e =
-                    assertThrows(IllegalStateException.class, () -> SealerClusteredService.readSnapshot(image, IDLE));
+                    assertThrows(IllegalStateException.class, () -> SnapshotIo.readSnapshot(image, IDLE));
             assertTrue(e.getMessage().contains("empty"), "must name the empty image: " + e.getMessage());
         }
     }
@@ -126,7 +126,7 @@ class SnapshotRestoreTest {
         try (Subscription sub = aeron.addSubscription(CHANNEL, 1003);
              ExclusivePublication pub = aeron.addExclusivePublication(CHANNEL, 1003)) {
             final Image image = awaitImage(sub, pub);
-            SealerClusteredService.writeSnapshot(pub, original.takeSnapshot(), IDLE);
+            SnapshotIo.writeSnapshot(pub, original.takeSnapshot(), IDLE);
             pub.close();
 
             final StubCluster cluster = new StubCluster();
@@ -138,7 +138,7 @@ class SnapshotRestoreTest {
             final StubSession behind = cluster.addSession(7);
             service.onSessionMessage(behind, 0, replayRequest(0, 1), 0, 17, null);
             assertEquals(1, behind.offered.size(), "exactly one control frame");
-            assertEquals(SealerClusteredService.EGRESS_KIND_REPLAY_UNAVAILABLE, behind.offered.get(0)[0],
+            assertEquals(SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE, behind.offered.get(0)[0],
                     "pre-snapshot replay must be UNAVAILABLE, not DONE");
             assertEquals(count, longAt(behind.offered.get(0), 1), "floor index = restored canonicalCount");
             assertEquals(block, longAt(behind.offered.get(0), 9), "floor block = restored blockNumber");
@@ -149,7 +149,7 @@ class SnapshotRestoreTest {
             final StubSession caughtUp = cluster.addSession(8);
             service.onSessionMessage(caughtUp, 0, replayRequest(count, block), 0, 17, null);
             assertEquals(1, caughtUp.offered.size(), "exactly one control frame");
-            assertEquals(SealerClusteredService.EGRESS_KIND_REPLAY_DONE, caughtUp.offered.get(0)[0],
+            assertEquals(SealerWire.EGRESS_KIND_REPLAY_DONE, caughtUp.offered.get(0)[0],
                     "replay from the restore point itself must complete");
         }
     }
@@ -161,9 +161,9 @@ class SnapshotRestoreTest {
         try (Subscription sub = aeron.addSubscription(CHANNEL, streamId);
              ExclusivePublication pub = aeron.addExclusivePublication(CHANNEL, streamId)) {
             final Image image = awaitImage(sub, pub);
-            SealerClusteredService.writeSnapshot(pub, snapshot, IDLE);
+            SnapshotIo.writeSnapshot(pub, snapshot, IDLE);
             pub.close();
-            return SealerClusteredService.readSnapshot(image, IDLE);
+            return SnapshotIo.readSnapshot(image, IDLE);
         }
     }
 
@@ -177,7 +177,7 @@ class SnapshotRestoreTest {
 
     private static ExpandableArrayBuffer replayRequest(final long fromIndex, final long fromBlock) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putByte(0, SealerClusteredService.KIND_REPLAY_REQUEST);
+        buf.putByte(0, SealerWire.KIND_REPLAY_REQUEST);
         buf.putLong(1, fromIndex, ByteOrder.LITTLE_ENDIAN);
         buf.putLong(1 + Long.BYTES, fromBlock, ByteOrder.LITTLE_ENDIAN);
         return buf;

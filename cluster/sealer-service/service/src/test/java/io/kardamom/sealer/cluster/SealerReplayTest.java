@@ -215,7 +215,7 @@ class SealerReplayTest {
     private void offerIngress(final AeronCluster client, final byte[] canonicalId32) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_INGRESS_RECORD);
+        buf.putByte(pos, SealerWire.KIND_INGRESS_RECORD);
         pos += Byte.BYTES;
         // Zero sender + nonce 0: guard-exempt (this test exercises replay,
         // not the contiguity guard).
@@ -234,7 +234,7 @@ class SealerReplayTest {
     private void offerReplayRequest(final AeronCluster client, final long fromIndex, final long fromBlock) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_REPLAY_REQUEST);
+        buf.putByte(pos, SealerWire.KIND_REPLAY_REQUEST);
         pos += Byte.BYTES;
         buf.putLong(pos, fromIndex, ByteOrder.LITTLE_ENDIAN);
         pos += Long.BYTES;
@@ -293,13 +293,13 @@ class SealerReplayTest {
                 return;
             }
             final byte kind = buffer.getByte(offset);
-            if (kind == SealerClusteredService.EGRESS_KIND_RELAYED) {
+            if (kind == SealerWire.EGRESS_KIND_RELAYED) {
                 relayedIndexes.add(buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN));
-            } else if (kind == SealerClusteredService.EGRESS_KIND_BOUNDARY) {
+            } else if (kind == SealerWire.EGRESS_KIND_BOUNDARY) {
                 boundaryCount++;
-            } else if (kind == SealerClusteredService.EGRESS_KIND_REPLAY_DONE) {
+            } else if (kind == SealerWire.EGRESS_KIND_REPLAY_DONE) {
                 replayDoneCount++;
-            } else if (kind == SealerClusteredService.EGRESS_KIND_REPLAY_UNAVAILABLE) {
+            } else if (kind == SealerWire.EGRESS_KIND_REPLAY_UNAVAILABLE) {
                 replayUnavailableCount++;
                 lastUnavailableOldestIndex =
                         buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN);
