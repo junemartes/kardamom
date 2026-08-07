@@ -38,11 +38,27 @@ job "validator" {
     # 'halted on divergence' line in the alloc log (the e2e verdict greps it);
     # they will crash-loop here, which is correct — a diverged validator must
     # not be quietly absorbed.
+    #
+    # mode=delay, NOT fail: the replay-unavailable recovery is a RACE against
+    # the advancing retention floor — fetch checkpoint, exit(1), restart,
+    # adopt, catch up — and it only wins when
+    #   recovery_latency < retention_window (= retention_frames / frame_rate).
+    # Measured on the dev host: recovery ≈ 42s; at retention 6144 that flips
+    # to a losing race above ~150 tps of frames, and each losing cycle
+    # (~80s/rev, reproduced 2026-08-05) burns one restart attempt while
+    # resolving NOTHING — mode=fail then kills the job on the 5th, which is
+    # how the 2026-08-04 CI retention shard produced a validator corpse ~8min
+    # after a PASSING suite. The race self-resolves the moment load abates
+    # (the window widens to minutes at idle) — a derived, off-hot-path
+    # service should wait that out, not die. mode=delay parks for the rest of
+    # the interval after the 5th attempt and keeps trying; treadmill cycles
+    # stay visible via validator_resync_total{outcome="peer-checkpoint"}
+    # (one increment per revolution — alert on its rate, not on job death).
     restart {
       attempts = 5
       interval = "10m"
       delay    = "15s"
-      mode     = "fail"
+      mode     = "delay"
     }
 
     reschedule {
