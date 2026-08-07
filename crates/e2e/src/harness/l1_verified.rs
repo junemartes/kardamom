@@ -214,17 +214,19 @@ fn apply_fault(
         Fault::SwallowLogs if method == "eth_getLogs" => {
             *result = serde_json::Value::Array(vec![]);
         }
-        Fault::WrongBlockHash { from_block } if method == "eth_getBlockByNumber" => {
-            if block_at_or_after(params, result, from_block) {
-                result["hash"] = serde_json::json!(format!("0x{}", "ee".repeat(32)));
-            }
+        Fault::WrongBlockHash { from_block }
+            if method == "eth_getBlockByNumber"
+                && block_at_or_after(params, result, from_block) =>
+        {
+            result["hash"] = serde_json::json!(format!("0x{}", "ee".repeat(32)));
         }
-        Fault::BrokenParentChain { from_block } if method == "eth_getBlockByNumber" => {
-            if block_at_or_after(params, result, from_block) {
-                // The block's OWN hash stays correct — only its ancestry is a
-                // lie, so nothing but chaining can see it.
-                result["parentHash"] = serde_json::json!(format!("0x{}", "ab".repeat(32)));
-            }
+        Fault::BrokenParentChain { from_block }
+            if method == "eth_getBlockByNumber"
+                && block_at_or_after(params, result, from_block) =>
+        {
+            // The block's OWN hash stays correct — only its ancestry is a lie,
+            // so nothing but chaining can see it.
+            result["parentHash"] = serde_json::json!(format!("0x{}", "ab".repeat(32)));
         }
         _ => {}
     }
