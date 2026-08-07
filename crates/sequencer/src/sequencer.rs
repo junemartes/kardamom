@@ -47,13 +47,8 @@
 //! See also [`crate::outbound`] for the trait surface and in-memory fakes
 //! used by tests.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use alloy_consensus::TxEnvelope as ConsensusEnvelope;
-use alloy_consensus::transaction::Transaction;
-use alloy_rlp::Decodable;
 use kardamom_types::{BPosition, TxError, TxErrorReason};
 use tracing::{trace, warn};
 
@@ -61,10 +56,17 @@ use crate::config::SequencerConfig;
 use crate::error::SequencerError;
 use crate::inbound::TxDataSubscriber;
 use crate::metrics;
+use crate::nonce_decode::decode_nonce;
 use crate::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
 use crate::partition::partition_for;
 use crate::sender::sender_of;
-use crate::state::{NonceOutcome, PartitionState, ProcessAction};
+use crate::state::{NonceOutcome, PartitionState, ProcessAction, ProcessResult};
+use crate::unconfirmed::{UnconfirmedKey, UnconfirmedLedger};
+
+// Re-export: the shutdown signal lived here before it moved to
+// `crate::shutdown`; the bin (and external callers) import
+// `kardamom_sequencer::sequencer::Shutdown`.
+pub use crate::shutdown::Shutdown;
 
 /// Metadata needed to (re-)publish a `TxRef` for a buffered or just-arrived
 /// envelope. Stored inside `PartitionState<RefMetadata>` so that
@@ -89,39 +91,6 @@ struct RefMetadata {
     tx_data_session_id: i32,
 }
 
-/// Cooperative shutdown signal shared with the loop driver. Cloneable so the
-/// signal handler thread can keep one copy and the loop thread another.
-#[derive(Clone)]
-pub struct Shutdown {
-    flag: Arc<AtomicBool>,
-}
-
-impl Shutdown {
-    pub fn from_atomic(flag: Arc<AtomicBool>) -> Self {
-        Self { flag }
-    }
-    pub fn new() -> Self {
-        Self {
-            flag: Arc::new(AtomicBool::new(false)),
-        }
-    }
-    pub fn signal(&self) {
-        self.flag.store(true, Ordering::Release);
-    }
-    pub fn is_signaled(&self) -> bool {
-        self.flag.load(Ordering::Acquire)
-    }
-    pub fn atomic(&self) -> Arc<AtomicBool> {
-        self.flag.clone()
-    }
-}
-
-impl Default for Shutdown {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 pub struct Sequencer {
     cfg: SequencerConfig,
     state: PartitionState<RefMetadata>,
@@ -133,36 +102,12 @@ pub struct Sequencer {
     /// Pre-registered metric handles — recording is allocation-free (the
     /// per-call `counter!` boxing was 6 of 10 allocations per tx).
     hot: metrics::HotMetrics,
-    /// Published-but-UNCONFIRMED refs (#85): an `Accepted` offer only proves
-    /// the bytes landed on the Aeron publication buffer, NOT that the Raft
-    /// cluster committed them — a leader kill voids the dead-leader window
-    /// and the uncommitted tail, and continuing from the optimistically
-    /// advanced nonce state seals a canonical GAP. Every published ref is
-    /// retained here until a receipt for its sender at/above its nonce
-    /// proves canonical commitment (skip receipts count — ordering is the
-    /// claim); entries older than `resync.confirm_timeout_ms` are rewound
-    /// via `reinsert_for_retry` and re-published — the cluster dedup absorbs
-    /// copies that DID commit, and voided ones get ordered.
-    unconfirmed: UnconfirmedLedger,
-    /// Publish-order expiry queue over `unconfirmed`, with LAZY deletion:
-    /// confirmations remove from the map only; a popped queue entry counts
-    /// as stale unless the map still holds the key WITH THE SAME
-    /// published-at instant (a key can be re-queued by a reject-path rewind
-    /// while its old queue entry is still buffered — timestamp equality
-    /// disambiguates). Front-peek makes the confirm-timeout sweep O(1) when
-    /// nothing has expired — the steady state — and amortized O(1) per
-    /// entry overall; the previous full-map scan was O(rate ×
-    /// receipt-latency) per iteration on the publish hot path, and worst
-    /// exactly when the system was already in failover recovery.
-    unconfirmed_expiry: std::collections::VecDeque<(std::time::Instant, UnconfirmedKey)>,
+    /// Published-but-UNCONFIRMED refs (#85): every published ref is
+    /// retained until a receipt proves canonical commitment. See
+    /// [`crate::unconfirmed`] for the ledger semantics and the expiry-queue
+    /// mechanics.
+    unconfirmed: UnconfirmedLedger<RefMetadata>,
 }
-
-/// #85 publish-confirmation ledger: (sender, nonce) → (ref metadata,
-/// published-at). BTreeMap so per-sender ranges trim cheaply on confirmation
-/// and rewinds see ascending nonce order.
-type UnconfirmedKey = (alloy_primitives::Address, u64);
-type UnconfirmedLedger =
-    std::collections::BTreeMap<UnconfirmedKey, (RefMetadata, std::time::Instant)>;
 
 impl Sequencer {
     pub fn new(cfg: SequencerConfig) -> Self {
@@ -174,8 +119,7 @@ impl Sequencer {
             hot,
             state: PartitionState::new(cap),
             resync: None,
-            unconfirmed: std::collections::BTreeMap::new(),
-            unconfirmed_expiry: std::collections::VecDeque::new(),
+            unconfirmed: UnconfirmedLedger::new(),
         }
     }
 
@@ -263,9 +207,7 @@ impl Sequencer {
                 // like a single offer, so every ref in the accepted prefix
                 // enters the unconfirmed ledger individually.
                 if self.resync.is_some() {
-                    let at = std::time::Instant::now();
-                    self.unconfirmed.insert((sender, n), (meta, at));
-                    self.unconfirmed_expiry.push_back((at, (sender, n)));
+                    self.unconfirmed.record_published(sender, n, meta);
                 }
             }
             match err {
@@ -286,51 +228,20 @@ impl Sequencer {
         Ok(())
     }
 
-    /// Drive one ingress message through the state machine. Returns
-    /// `Ok(true)` if work was done, `Ok(false)` if the retry-drain, the
-    /// floor fast-forward sweep, and the tx_data poll were all empty.
-    ///
-    /// Order of operations:
-    ///  1. First flush any metadata sitting at `pending[next_nonce]` (these
-    ///     are the rebuffered-after-backpressure entries). If the B publish
-    ///     blocks again, re-rewind and return `Backpressure` without
-    ///     touching tx_data.
-    ///  2. Then fast-forward any nonce floor that has been stalled behind a
-    ///     buffered future-run for longer than the configured lag bound
-    ///     (cold-rejoin coverage recovery — see the module docs).
-    ///  3. Then poll tx_data for the next observed envelope and process it.
-    pub fn run_once<I, B, R>(
-        &mut self,
-        channel_a: &mut I,
-        b: &mut B,
-        rc: &mut R,
-    ) -> Result<bool, SequencerError>
-    where
-        I: TxDataSubscriber,
-        B: TxOrderingRefPublisher,
-        R: TxErrorPublisher,
-    {
-        // Resync bookkeeping runs FIRST, every iteration (including idle
-        // ones, so boundary-silence detection keeps ticking): drain receipt
-        // floors, advance the nonce state machine to any raised
-        // executed-truth floor (drops proven-duplicate buffered entries;
-        // newly-contiguous runs surface via `drain_pending` below), then
-        // evaluate the watermark triggers.
+    /// Resync + #85 ledger bookkeeping. Runs FIRST, every `run_once`
+    /// iteration (including idle ones, so boundary-silence detection keeps
+    /// ticking): drain receipt floors, advance the nonce state machine to
+    /// any raised executed-truth floor (drops proven-duplicate buffered
+    /// entries; newly-contiguous runs surface via `drain_pending` in
+    /// `run_once`), then evaluate the watermark triggers.
+    fn resync_tick(&mut self) {
         if let Some(r) = self.resync.as_mut() {
             let (raised, confirmations) = r.drain_floor_updates();
-            // #85: a receipt at nonce N proves every one of OUR published
-            // refs for that sender at nonce <= N survived into the committed
-            // canonical stream (per-sender order is preserved end to end) —
-            // drop them from the unconfirmed ledger.
+            // #85: a receipt proves every one of OUR published refs for that
+            // sender at/below its nonce committed — drop them from the
+            // unconfirmed ledger.
             for (sender, confirmed) in confirmations {
-                let keys: Vec<_> = self
-                    .unconfirmed
-                    .range((sender, 0)..=(sender, confirmed))
-                    .map(|(k, _)| *k)
-                    .collect();
-                for k in keys {
-                    self.unconfirmed.remove(&k);
-                }
+                self.unconfirmed.confirm_through(sender, confirmed);
             }
             for (sender, floor) in raised {
                 if let Some((from, dropped)) = self.state.advance_floor(sender, floor) {
@@ -361,18 +272,12 @@ impl Sequencer {
             // not the sender's expected next one. Two cases (split in the
             // drain):
             //
-            // - committed-proof (nonce < expected): the ref sealed long ago
-            //   — the guard's expected advanced past it — and its dedup
-            //   entry aged out of the window. Drop the ledger entry exactly
-            //   like a receipt confirmation. Without this, an entry with no
-            //   confirming receipt (a sender whose ONLY tx is nonce 0:
-            //   nonce-0 receipts are deposit-indistinguishable and never
-            //   confirm) republishes every confirm-timeout FOREVER once the
-            //   dedup horizon rolls past it (observed live: the smoke-gate
-            //   accounts, 128+ rejects/run).
+            // - committed-proof (nonce < expected): drop the ledger entry
+            //   exactly like a receipt confirmation — see
+            //   `UnconfirmedLedger::drop_committed` for the full story.
             let (drops, rewinds) = r.drain_contiguity_rejects();
             for (sender, n) in drops {
-                if self.unconfirmed.remove(&(sender, n)).is_some() {
+                if self.unconfirmed.drop_committed(sender, n) {
                     trace!(
                         sender = ?sender,
                         nonce = n,
@@ -383,82 +288,106 @@ impl Sequencer {
             // - gap (nonce >= expected): refs for expected..nonce-1 vanished
             //   (voided offers). They are all in the unconfirmed ledger;
             //   rewind them NOW instead of waiting out the confirm timeout.
-            //   Same descending-nonce discipline as the sweep below.
+            //   The ledger hands them back in rewind-safe descending order.
             for (sender, expected) in rewinds {
-                let keys: Vec<_> = self
-                    .unconfirmed
-                    .range((sender, expected)..=(sender, u64::MAX))
-                    .map(|(k, _)| *k)
-                    .collect();
-                if keys.is_empty() {
+                let taken = self.unconfirmed.take_gap_rewinds(sender, expected);
+                if taken.is_empty() {
                     continue;
                 }
-                metrics::record_ref_republished(self.cfg.partition_index, keys.len());
+                metrics::record_ref_republished(self.cfg.partition_index, taken.len());
                 warn!(
                     sender = ?sender,
                     expected,
-                    count = keys.len(),
+                    count = taken.len(),
                     "sealer contiguity reject; rewinding unconfirmed refs for republish (#85)"
                 );
-                for (s, n) in keys.into_iter().rev() {
-                    if let Some((meta, _)) = self.unconfirmed.remove(&(s, n)) {
-                        self.state.reinsert_for_retry(s, n, meta);
-                    }
-                }
+                self.rewind_for_republish(taken);
             }
 
-            // #85: republish refs whose confirmation has not arrived within
-            // the timeout — the offer may have landed in a dead leader's
-            // void. reinsert_for_retry rewinds the nonce state so the next
-            // drain_pending re-publishes them; the cluster's first-seen
-            // dedup absorbs every copy that DID commit, and voided ones get
-            // ordered — no gap, no loss (this also un-wedges a sender whose
-            // refs vanished entirely: the ledger keeps re-offering until a
-            // receipt confirms). Bounded per iteration.
+            // #85: rewind refs past the confirm timeout for republish —
+            // see `UnconfirmedLedger::sweep_expired` for why re-offering is
+            // safe (no gap, no loss). Bounded per iteration.
             let timeout = std::time::Duration::from_millis(self.cfg.resync.confirm_timeout_ms);
             let now = std::time::Instant::now();
-            // Expiry-queue sweep: O(1) front-peek when nothing has expired
-            // (the steady state), amortized O(1) per entry overall. Entries
-            // whose map slot was confirmed away — or re-queued by a
-            // reject-path rewind with a NEWER published-at — are stale and
-            // skipped (lazy deletion). Bounded per iteration like before.
-            let mut stale: Vec<UnconfirmedKey> = Vec::new();
-            while stale.len() < 256 {
-                let Some((queued_at, key)) = self.unconfirmed_expiry.front().copied() else {
-                    break;
-                };
-                if now.duration_since(queued_at) < timeout {
-                    break;
-                }
-                self.unconfirmed_expiry.pop_front();
-                if self
-                    .unconfirmed
-                    .get(&key)
-                    .is_some_and(|(_, at)| *at == queued_at)
-                {
-                    stale.push(key);
-                }
-            }
-            if !stale.is_empty() {
-                metrics::record_ref_republished(self.cfg.partition_index, stale.len());
+            let expired = self.unconfirmed.sweep_expired(timeout, now, 256);
+            if !expired.is_empty() {
+                metrics::record_ref_republished(self.cfg.partition_index, expired.len());
                 warn!(
-                    count = stale.len(),
-                    oldest_nonce = stale.first().map(|(_, n)| *n),
+                    count = expired.len(),
+                    // Rewind-safe descending order: the oldest (lowest)
+                    // nonce is the LAST entry.
+                    oldest_nonce = expired.last().map(|((_, n), _)| *n),
                     "unconfirmed refs past confirm timeout; rewinding for republish (#85)"
                 );
-                // DESCENDING nonce order: reinsert_for_retry sets the sender's
-                // rewind floor on every call, so the LAST call per sender must
-                // carry the LOWEST nonce (same discipline as flush_drained's
-                // backpressure rebuffer) — ascending order would strand the
-                // lower nonces beneath the floor forever.
-                for (sender, n) in stale.into_iter().rev() {
-                    if let Some((meta, _)) = self.unconfirmed.remove(&(sender, n)) {
-                        self.state.reinsert_for_retry(sender, n, meta);
-                    }
-                }
+                self.rewind_for_republish(expired);
                 metrics::record_unconfirmed_refs(self.cfg.partition_index, self.unconfirmed.len());
             }
         }
+    }
+
+    /// Reinsert rewound ledger entries into the nonce state machine so the
+    /// next `drain_pending` republishes them. `entries` arrive in the
+    /// ledger's rewind-safe DESCENDING nonce order (see
+    /// `UnconfirmedLedger::take_descending`) — do not reorder.
+    fn rewind_for_republish(&mut self, entries: Vec<(UnconfirmedKey, RefMetadata)>) {
+        for ((sender, nonce), meta) in entries {
+            self.state.reinsert_for_retry(sender, nonce, meta);
+        }
+    }
+
+    /// A receipt floor strictly above `nonce` proves the sender's tx at
+    /// `nonce` already EXECUTED (the twin ordered it and the
+    /// order→execute→receipt round trip outran this replica's inbound
+    /// processing) — the resync mechanism absorbing a duplicate, not
+    /// sequencer dirt and not a client error.
+    fn proven_executed(&self, sender: alloy_primitives::Address, nonce: u64) -> bool {
+        self.resync
+            .as_ref()
+            .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
+    }
+
+    /// Tell an evicted tx's parked submit (and any receipt subscribers) it
+    /// will never be sequenced — a silent evict left the client waiting
+    /// forever and its later nonces permanently gapped.
+    fn report_evicted<R>(&self, rc: &mut R, sender: alloy_primitives::Address, nonce: u64)
+    where
+        R: TxErrorPublisher,
+    {
+        rc.publish_error(TxError {
+            sender,
+            nonce,
+            reason: TxErrorReason::Evicted {
+                expected_nonce: self.state.next_nonce(sender),
+            },
+        });
+    }
+
+    /// Drive one ingress message through the state machine. Returns
+    /// `Ok(true)` if work was done, `Ok(false)` if the retry-drain, the
+    /// floor fast-forward sweep, and the tx_data poll were all empty.
+    ///
+    /// Order of operations:
+    ///  1. First flush any metadata sitting at `pending[next_nonce]` (these
+    ///     are the rebuffered-after-backpressure entries). If the B publish
+    ///     blocks again, re-rewind and return `Backpressure` without
+    ///     touching tx_data.
+    ///  2. Then fast-forward any nonce floor that has been stalled behind a
+    ///     buffered future-run for longer than the configured lag bound
+    ///     (cold-rejoin coverage recovery — see the module docs).
+    ///  3. Then poll tx_data for the next observed envelope and process it.
+    pub fn run_once<I, B, R>(
+        &mut self,
+        channel_a: &mut I,
+        b: &mut B,
+        rc: &mut R,
+    ) -> Result<bool, SequencerError>
+    where
+        I: TxDataSubscriber,
+        B: TxOrderingRefPublisher,
+        R: TxErrorPublisher,
+    {
+        // Resync bookkeeping runs FIRST, every iteration — see `resync_tick`.
+        self.resync_tick();
 
         let pending = self.state.drain_pending();
         if !pending.is_empty() {
@@ -521,6 +450,27 @@ impl Sequencer {
             .nonce_check_seconds
             .record(t0.elapsed().as_secs_f64());
 
+        let publishes = self.handle_outcome(rc, sender, nonce, result);
+        // On backpressure the state machine is rolled back: the reinsert
+        // re-buffers every unpublished ref so the retry replays them.
+        self.flush_drained(b, publishes, "ingress")?;
+        Ok(true)
+    }
+
+    /// Process-outcome bookkeeping for one observed envelope: record
+    /// metrics, notify clients of evictions/duplicates, and collect the
+    /// publish actions for `flush_drained`. Split out of `run_once`; the
+    /// sequencing of operations is unchanged.
+    fn handle_outcome<R>(
+        &mut self,
+        rc: &mut R,
+        sender: alloy_primitives::Address,
+        nonce: u64,
+        result: ProcessResult<RefMetadata>,
+    ) -> Vec<(alloy_primitives::Address, u64, RefMetadata)>
+    where
+        R: TxErrorPublisher,
+    {
         match result.outcome {
             NonceOutcome::Matched => {}
             NonceOutcome::Buffered | NonceOutcome::BufferedReplaced => {
@@ -529,30 +479,14 @@ impl Sequencer {
             NonceOutcome::BufferedEvicting { evicted_nonce } => {
                 self.hot.buffered_future.increment(1);
                 self.hot.evictions.increment(1);
-                // Tell the evicted tx's parked submit (and any receipt
-                // subscribers) it will never be sequenced — a silent evict
-                // left the client waiting forever and its later nonces
-                // permanently gapped.
-                rc.publish_error(TxError {
-                    sender,
-                    nonce: evicted_nonce,
-                    reason: TxErrorReason::Evicted {
-                        expected_nonce: self.state.next_nonce(sender),
-                    },
-                });
+                self.report_evicted(rc, sender, evicted_nonce);
             }
             NonceOutcome::RejectedTooFar { nonce: rejected } => {
                 // Furthest-future nonce shed to protect the drainable run; the
                 // client re-submits it once it is back within the window. Counts
                 // as an eviction for observability (load-shed, not a wedge).
                 self.hot.evictions.increment(1);
-                rc.publish_error(TxError {
-                    sender,
-                    nonce: rejected,
-                    reason: TxErrorReason::Evicted {
-                        expected_nonce: self.state.next_nonce(sender),
-                    },
-                });
+                self.report_evicted(rc, sender, rejected);
             }
             NonceOutcome::BufferedDisabled => {
                 self.hot.buffered_future.increment(1);
@@ -563,23 +497,16 @@ impl Sequencer {
                 // 30166583138: seq_clean=false from 200 tps — the ramp
                 // ceiling collapsed to 100):
                 //
-                // - RECEIPT-PROVEN skip: the receipt floor advanced past
-                //   this nonce because the tx already EXECUTED (the twin
-                //   ordered it and the order→execute→receipt round trip
-                //   outran this replica's inbound processing — routine for
-                //   the marginally-behind twin under load). This is the
-                //   resync mechanism absorbing a duplicate: NOT sequencer
-                //   dirt (`dropped_past` stays flat, seq_clean holds) and
-                //   NOT a client error (the tx succeeded; a DuplicatedTx
-                //   notice would be spurious and could race the receipt at
+                // - RECEIPT-PROVEN skip (`proven_executed`): the resync
+                //   mechanism absorbing a duplicate — routine for the
+                //   marginally-behind twin under load. NOT sequencer dirt
+                //   (`dropped_past` stays flat, seq_clean holds) and NOT a
+                //   client error (the tx succeeded; a DuplicatedTx notice
+                //   would be spurious and could race the receipt at
                 //   ingress).
                 // - ordinary client double-submit / stale nonce: no floor
                 //   proof — counted and reported exactly as before.
-                if self
-                    .resync
-                    .as_ref()
-                    .is_some_and(|r| r.floor(sender).is_some_and(|f| f > nonce))
-                {
+                if self.proven_executed(sender, nonce) {
                     metrics::record_resync_skip(self.cfg.partition_index);
                 } else {
                     self.hot.dropped_past.increment(1);
@@ -587,11 +514,6 @@ impl Sequencer {
             }
         }
 
-        let proven_executed = |n: u64| {
-            self.resync
-                .as_ref()
-                .is_some_and(|r| r.floor(sender).is_some_and(|f| f > n))
-        };
         let mut publishes = Vec::new();
         for action in result.actions {
             match action {
@@ -604,7 +526,7 @@ impl Sequencer {
                 } => {
                     // Suppressed for receipt-proven skips (see above): the
                     // client's tx executed; there is nothing to report.
-                    if !proven_executed(n) {
+                    if !self.proven_executed(sender, n) {
                         rc.publish_error(TxError {
                             sender,
                             nonce: n,
@@ -614,10 +536,7 @@ impl Sequencer {
                 }
             }
         }
-        // On backpressure the state machine is rolled back: the reinsert
-        // re-buffers every unpublished ref so the retry replays them.
-        self.flush_drained(b, publishes, "ingress")?;
-        Ok(true)
+        publishes
     }
 
     /// Pin this thread to the configured core (if any) and loop until
@@ -672,179 +591,5 @@ impl Sequencer {
                 Err(e) => return Err(e),
             }
         }
-    }
-}
-
-/// Decode the nonce out of an RLP-encoded alloy `TxEnvelope`. The proxy
-/// already verified the envelope is well-formed, but we re-decode here so
-/// the sequencer doesn't need to be passed the nonce as a side channel.
-/// Extract the nonce WITHOUT materializing the envelope. The full
-/// `ConsensusEnvelope::decode` allocates a calldata copy per tx (128B/tx in
-/// the service allocation profile) to read one integer. This walks the RLP
-/// headers directly: legacy = rlp([nonce, gas_price, ...]) → field 0;
-/// typed (0x01 2930 / 0x02 1559 / 0x03 4844) = type byte ‖
-/// rlp([chain_id, nonce, ...]) → field 1. Zero allocation.
-///
-/// Falls back to the full decode for anything it does not positively
-/// recognize, so acceptance is EXACTLY the old behaviour (the equivalence
-/// test drives both paths over every tx type).
-fn decode_nonce(raw_tx: &bytes::Bytes) -> Result<u64, SequencerError> {
-    if let Some(n) = peek_nonce(raw_tx.as_ref()) {
-        return Ok(n);
-    }
-    let env = ConsensusEnvelope::decode(&mut raw_tx.as_ref())
-        .map_err(|e| SequencerError::MalformedFrame(format!("decode envelope: {e}")))?;
-    Ok(env.nonce())
-}
-
-/// RLP walk for the nonce. `None` ⇒ caller falls back to the full decode.
-fn peek_nonce(b: &[u8]) -> Option<u64> {
-    // (payload_start, skip_fields) for the list holding the nonce.
-    let (mut i, skip) = match b.first()? {
-        0x01..=0x03 => (1usize, 1usize),     // typed: [chain_id, nonce, ..]
-        f if *f >= 0xc0 => (0usize, 0usize), // legacy: [nonce, ..]
-        _ => return None,
-    };
-    // Enter the outer list.
-    let first = *b.get(i)?;
-    i += 1;
-    if first >= 0xf8 {
-        let ll = (first - 0xf7) as usize;
-        i += ll;
-    } else if first < 0xc0 {
-        return None; // not a list
-    }
-    // Skip `skip` fields, then decode the nonce as an RLP integer.
-    for _ in 0..skip {
-        i = skip_rlp_item(b, i)?;
-    }
-    let p = *b.get(i)?;
-    if p < 0x80 {
-        return Some(u64::from(p)); // single-byte integer
-    }
-    if p <= 0x88 {
-        let l = (p - 0x80) as usize;
-        let bytes = b.get(i + 1..i + 1 + l)?;
-        if l > 0 && bytes[0] == 0 {
-            return None; // non-canonical; let the full decode reject it
-        }
-        let mut v = 0u64;
-        for &x in bytes {
-            v = (v << 8) | u64::from(x);
-        }
-        return Some(v);
-    }
-    None // nonce can't be a list / >8 bytes; full decode will reject
-}
-
-/// Advance past one RLP item starting at `i`; `None` on truncation.
-fn skip_rlp_item(b: &[u8], i: usize) -> Option<usize> {
-    let p = *b.get(i)?;
-    Some(match p {
-        0x00..=0x7f => i + 1,
-        0x80..=0xb7 => i + 1 + (p - 0x80) as usize,
-        0xb8..=0xbf => {
-            let ll = (p - 0xb7) as usize;
-            let mut l = 0usize;
-            for &x in b.get(i + 1..i + 1 + ll)? {
-                l = (l << 8) | x as usize;
-            }
-            i + 1 + ll + l
-        }
-        0xc0..=0xf7 => i + 1 + (p - 0xc0) as usize,
-        0xf8..=0xff => {
-            let ll = (p - 0xf7) as usize;
-            let mut l = 0usize;
-            for &x in b.get(i + 1..i + 1 + ll)? {
-                l = (l << 8) | x as usize;
-            }
-            i + 1 + ll + l
-        }
-    })
-}
-
-#[cfg(test)]
-mod nonce_tests {
-    use super::*;
-
-    /// The nonce peek must agree with the full decode for every tx type and
-    /// nonce width — acceptance identical by construction (peek falls back
-    /// on anything unrecognized).
-    #[test]
-    fn peek_nonce_matches_full_decode() {
-        use alloy_consensus::{SignableTransaction, TxEip1559, TxEip2930, TxLegacy};
-        use alloy_eips::eip2718::Encodable2718;
-        use alloy_network::TxSignerSync;
-        use alloy_primitives::{Address, TxKind, U256};
-        use alloy_signer_local::PrivateKeySigner;
-
-        let signer = PrivateKeySigner::random();
-        let nonces = [
-            0u64,
-            1,
-            127,
-            128,
-            255,
-            256,
-            65_535,
-            1 << 20,
-            u64::from(u32::MAX),
-            u64::MAX,
-        ];
-        for &nonce in &nonces {
-            // Legacy
-            let mut t = TxLegacy {
-                chain_id: Some(412_346),
-                nonce,
-                gas_price: 1_000_000_000,
-                gas_limit: 100_000,
-                to: TxKind::Call(Address::repeat_byte(9)),
-                value: U256::from(5u64),
-                input: vec![0xAA; 68].into(),
-            };
-            let sig = signer.sign_transaction_sync(&mut t).unwrap();
-            let e: alloy_consensus::TxEnvelope = t.into_signed(sig).into();
-            let raw = bytes::Bytes::from(e.encoded_2718());
-            assert_eq!(peek_nonce(&raw), Some(nonce), "legacy nonce {nonce}");
-            assert_eq!(decode_nonce(&raw).unwrap(), nonce);
-
-            // EIP-1559
-            let mut t = TxEip1559 {
-                chain_id: 412_346,
-                nonce,
-                gas_limit: 100_000,
-                max_fee_per_gas: 2_000_000_000,
-                max_priority_fee_per_gas: 1,
-                to: TxKind::Call(Address::repeat_byte(9)),
-                value: U256::ZERO,
-                access_list: Default::default(),
-                input: vec![0xBB; 260].into(),
-            };
-            let sig = signer.sign_transaction_sync(&mut t).unwrap();
-            let e: alloy_consensus::TxEnvelope = t.into_signed(sig).into();
-            let raw = bytes::Bytes::from(e.encoded_2718());
-            assert_eq!(peek_nonce(&raw), Some(nonce), "1559 nonce {nonce}");
-            assert_eq!(decode_nonce(&raw).unwrap(), nonce);
-
-            // EIP-2930
-            let mut t = TxEip2930 {
-                chain_id: 412_346,
-                nonce,
-                gas_price: 1_000_000_000,
-                gas_limit: 100_000,
-                to: TxKind::Call(Address::repeat_byte(9)),
-                value: U256::ZERO,
-                access_list: Default::default(),
-                input: Default::default(),
-            };
-            let sig = signer.sign_transaction_sync(&mut t).unwrap();
-            let e: alloy_consensus::TxEnvelope = t.into_signed(sig).into();
-            let raw = bytes::Bytes::from(e.encoded_2718());
-            assert_eq!(peek_nonce(&raw), Some(nonce), "2930 nonce {nonce}");
-            assert_eq!(decode_nonce(&raw).unwrap(), nonce);
-        }
-        // Garbage must ERROR through the fallback, not panic.
-        assert!(decode_nonce(&bytes::Bytes::from_static(&[0xde, 0xad])).is_err());
-        assert!(decode_nonce(&bytes::Bytes::new()).is_err());
     }
 }
