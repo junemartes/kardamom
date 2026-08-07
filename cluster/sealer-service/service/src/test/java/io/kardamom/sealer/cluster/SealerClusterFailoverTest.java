@@ -1,29 +1,21 @@
 package io.kardamom.sealer.cluster;
 
+import static io.kardamom.sealer.cluster.ClusterTestHarness.awaitCondition;
+import static io.kardamom.sealer.cluster.IngressFrames.canonicalId;
+import static io.kardamom.sealer.cluster.IngressFrames.offerIngress;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-import io.aeron.Image;
-import io.aeron.Publication;
 import io.aeron.cluster.client.AeronCluster;
 import io.aeron.cluster.client.EgressListener;
-import io.aeron.cluster.codecs.CloseReason;
-import io.aeron.cluster.service.ClientSession;
-import io.aeron.cluster.service.Cluster;
-import io.aeron.logbuffer.Header;
 import io.aeron.test.InterruptAfter;
 import io.aeron.test.InterruptingTestCallback;
 import io.aeron.test.SystemTestWatcher;
-import io.aeron.test.Tests;
 import io.aeron.test.cluster.TestCluster;
 import io.aeron.test.cluster.TestNode;
 import io.kardamom.sealer.CanonicalSealerState;
-import java.nio.ByteOrder;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
-import org.agrona.DirectBuffer;
-import org.agrona.ExpandableArrayBuffer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.extension.RegisterExtension;
@@ -45,12 +37,13 @@ import org.junit.jupiter.api.extension.RegisterExtension;
  * </ul>
  *
  * <p>The cluster runs three in-JVM members each hosting a real
- * {@link SealerClusteredService} (wrapped in a delegating {@link TestNode.TestService}
+ * {@link SealerClusteredService} (wrapped in a delegating {@link SealerTestService}
  * so the 1.44.0 harness can host it). The test client is a real
  * {@link AeronCluster} whose {@link EgressListener} decodes the
  * {@code RELAYED}/{@code BOUNDARY} egress frames the service emits. All waits are
- * position/count-await loops driven by {@link Tests#yield()}; {@link InterruptAfter}
- * bounds the whole test so a missing event fails fast rather than hanging.</p>
+ * position/count-await loops driven by {@link io.aeron.test.Tests#yield()};
+ * {@link InterruptAfter} bounds the whole test so a missing event fails fast rather
+ * than hanging.</p>
  */
 @ExtendWith(InterruptingTestCallback.class)
 class SealerClusterFailoverTest {
@@ -76,18 +69,8 @@ class SealerClusterFailoverTest {
     void egressContinuesGaplesslyAcrossLeaderKill() {
         final RecordingEgressListener egress = new RecordingEgressListener();
 
-        final TestCluster cluster = TestCluster.aCluster()
-                .withStaticNodes(MEMBER_COUNT)
-                .withServiceSupplier(memberId ->
-                        new TestNode.TestService[] {
-                            // .index(memberId) is REQUIRED: TestNode.index()/role()
-                            // identity and the harness's per-node bookkeeping read
-                            // services[0].index(); the default supplier sets it too.
-                            (TestNode.TestService) new SealerTestService(
-                                    DEDUP_CAPACITY, TICK_MS, memberId).index(memberId)
-                        })
-                .start();
-        systemTestWatcher.cluster(cluster);
+        final TestCluster cluster = ClusterTestHarness.startCluster(
+                systemTestWatcher, MEMBER_COUNT, DEDUP_CAPACITY, TICK_MS);
 
         // --- bring the cluster up and connect a client wired to our listener -----
         cluster.awaitLeader();
@@ -98,7 +81,7 @@ class SealerClusterFailoverTest {
         for (int i = 0; i < K; i++) {
             offerIngress(client, canonicalId(i));
         }
-        awaitRelayedCount(client, egress, K);
+        awaitCondition(client, () -> egress.relayedIndexes.size() >= K);
 
         // O2 (pre-failover): indexes are exactly 0..K-1 in order.
         assertContiguousIndexes(egress.relayedIndexes, 0, K);
@@ -107,7 +90,7 @@ class SealerClusterFailoverTest {
         // boundary cadence is proven to be running on the ORIGINAL leader before we kill
         // it — without this the cadence-survival assertion below would be vacuous if no
         // boundary ever fired. Bounded by @InterruptAfter (no Thread.sleep).
-        awaitBoundaryCount(client, egress, 1);
+        awaitCondition(client, () -> egress.boundaryCount >= 1);
         final long preKillMaxBlockNumber = egress.maxBoundaryBlockNumber;
         final long boundaryFloorBeforeKill = preKillMaxBlockNumber;
 
@@ -135,7 +118,7 @@ class SealerClusterFailoverTest {
         for (int i = K; i < 2 * K; i++) {
             offerIngress(reconnected, canonicalId(i));
         }
-        awaitRelayedCount(reconnected, egress, 2 * K);
+        awaitCondition(reconnected, () -> egress.relayedIndexes.size() >= 2 * K);
 
         // O2 (post-failover): the full stream is 0..2K-1 contiguous — NO gap, NO
         // restart at 0. This is the core gapless-continuation contract.
@@ -147,7 +130,7 @@ class SealerClusterFailoverTest {
         // and FIRED AGAIN on the NEW leader after failover — proving boundary cadence
         // resumed across the leader kill rather than stalling. Bounded by @InterruptAfter,
         // so a broken production timer fails fast instead of hanging.
-        awaitBoundaryBlockNumberAbove(reconnected, egress, preKillMaxBlockNumber);
+        awaitCondition(reconnected, () -> egress.maxBoundaryBlockNumber > preKillMaxBlockNumber);
         final long postKillMaxBlockNumber = egress.maxBoundaryBlockNumber;
         assertTrue(postKillMaxBlockNumber > preKillMaxBlockNumber,
                 "boundary cadence must continue across failover: preKillMax=" + preKillMaxBlockNumber
@@ -162,88 +145,6 @@ class SealerClusterFailoverTest {
                 "boundary blockNumber dropped below genesis: " + egress.minBoundaryBlockNumber);
     }
 
-    // --- ingress / egress helpers ------------------------------------------------
-
-    /**
-     * Offer one app envelope {@code kind(1) | canonical_id(32) | payload} to the
-     * cluster. {@code kind} is an arbitrary non-zero tag; the payload is the 32-byte
-     * id itself (the service relays {@code [canonical_id|payload]} verbatim from
-     * {@link SealerClusteredService#RELAY_OFFSET}). Retries on back-pressure with a
-     * yield (no sleep), so the offer is deterministic, not timing-based.
-     */
-    private void offerIngress(final AeronCluster client, final byte[] canonicalId32) {
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        int pos = 0;
-        buf.putByte(pos, SealerWire.KIND_INGRESS_RECORD);
-        pos += Byte.BYTES;
-        // Zero sender + nonce 0: guard-exempt (this test exercises failover,
-        // not the contiguity guard).
-        buf.putBytes(pos, new byte[CanonicalSealerState.SENDER_LEN]);
-        pos += CanonicalSealerState.SENDER_LEN;
-        buf.putLong(pos, 0L, java.nio.ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putBytes(pos, canonicalId32);
-        pos += canonicalId32.length;
-        // payload == the id again (opaque, relayed verbatim).
-        buf.putBytes(pos, canonicalId32);
-        pos += canonicalId32.length;
-        final int length = pos;
-
-        while (true) {
-            final long result = client.offer(buf, 0, length);
-            if (result > 0) {
-                return;
-            }
-            if (result == Publication.CLOSED
-                    || result == Publication.MAX_POSITION_EXCEEDED) {
-                throw new IllegalStateException("ingress offer failed terminally: " + result);
-            }
-            // BACK_PRESSURED / ADMIN_ACTION / NOT_CONNECTED — drain egress and retry.
-            client.pollEgress();
-            Tests.yield();
-        }
-    }
-
-    /** Poll egress until at least {@code expected} relayed frames have been recorded. */
-    private void awaitRelayedCount(
-            final AeronCluster client, final RecordingEgressListener egress, final int expected) {
-        while (egress.relayedIndexes.size() < expected) {
-            if (client.pollEgress() == 0) {
-                Tests.yield();
-            }
-        }
-    }
-
-    /**
-     * Poll egress until at least {@code expected} BOUNDARY frames have been recorded.
-     * Bounded by {@link InterruptAfter}: if boundary cadence were broken the test fails
-     * fast rather than hanging. No {@code Thread.sleep} — purely yield-driven.
-     */
-    private void awaitBoundaryCount(
-            final AeronCluster client, final RecordingEgressListener egress, final long expected) {
-        while (egress.boundaryCount < expected) {
-            if (client.pollEgress() == 0) {
-                Tests.yield();
-            }
-        }
-    }
-
-    /**
-     * Poll egress until a BOUNDARY frame whose {@code blockNumber} is strictly greater
-     * than {@code floor} has been observed. This is the boundary-cadence-across-failover
-     * signal: it only returns once the boundary timer has fired AGAIN beyond the
-     * pre-kill maximum — i.e. cadence resumed on the new leader. Bounded by
-     * {@link InterruptAfter}.
-     */
-    private void awaitBoundaryBlockNumberAbove(
-            final AeronCluster client, final RecordingEgressListener egress, final long floor) {
-        while (egress.maxBoundaryBlockNumber <= floor) {
-            if (client.pollEgress() == 0) {
-                Tests.yield();
-            }
-        }
-    }
-
     /** Assert {@code indexes} equals {@code [from, from+1, ..., to-1]} exactly. */
     private static void assertContiguousIndexes(
             final List<Long> indexes, final int from, final int to) {
@@ -252,155 +153,6 @@ class SealerClusterFailoverTest {
         for (int i = from; i < to; i++) {
             assertEquals((long) i, indexes.get(i - from),
                     "canonical index stream not contiguous at position " + i + "; full=" + indexes);
-        }
-    }
-
-    /** Deterministic distinct 32-byte canonical id: byte i of every id = (n, n, ...). */
-    private static byte[] canonicalId(final int n) {
-        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
-        // Spread n across the first 4 bytes so ids stay distinct well past 255.
-        id[0] = (byte) (n & 0xFF);
-        id[1] = (byte) ((n >>> 8) & 0xFF);
-        id[2] = (byte) ((n >>> 16) & 0xFF);
-        id[3] = (byte) ((n >>> 24) & 0xFF);
-        id[31] = (byte) 0x5A; // marker so an all-zero id (a likely bug) is distinguishable
-        return id;
-    }
-
-    // --- egress listener: decodes RELAYED / BOUNDARY frames ----------------------
-
-    /**
-     * Records the ordered canonical {@code index} of every RELAYED frame and the
-     * min/max {@code blockNumber} of every BOUNDARY frame. The frame layouts match
-     * {@link SealerClusteredService#frameRelayed}/{@code frameBoundary} (little-endian).
-     */
-    private static final class RecordingEgressListener implements EgressListener {
-        final List<Long> relayedIndexes = new ArrayList<>();
-        long maxBoundaryBlockNumber = Long.MIN_VALUE;
-        long minBoundaryBlockNumber = Long.MAX_VALUE;
-        // Count of BOUNDARY frames seen — lets a yield-await loop poll for "at least
-        // one boundary has fired" without depending on a particular blockNumber. The
-        // listener runs inline on the test's pollEgress() thread (single-threaded with
-        // the awaits below), so plain fields are consistent here.
-        long boundaryCount = 0;
-
-        @Override
-        public void onMessage(
-                final long clusterSessionId,
-                final long timestamp,
-                final DirectBuffer buffer,
-                final int offset,
-                final int length,
-                final Header header) {
-            if (length < Byte.BYTES) {
-                return;
-            }
-            final byte kind = buffer.getByte(offset);
-            if (kind == SealerWire.EGRESS_KIND_RELAYED) {
-                // kind(1) | index(8 LE) | payloadLen(4 LE) | payload[]
-                final long index = buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN);
-                relayedIndexes.add(index);
-            } else if (kind == SealerWire.EGRESS_KIND_BOUNDARY) {
-                // kind(1) | blockNumber(8 LE) | endTxIdx(8 LE) | l2Timestamp(8 LE)
-                final long blockNumber =
-                        buffer.getLong(offset + Byte.BYTES, ByteOrder.LITTLE_ENDIAN);
-                maxBoundaryBlockNumber = Math.max(maxBoundaryBlockNumber, blockNumber);
-                minBoundaryBlockNumber = Math.min(minBoundaryBlockNumber, blockNumber);
-                boundaryCount++;
-            }
-        }
-    }
-
-    // --- service wrapper: hosts the real SealerClusteredService in the harness ----
-
-    /**
-     * A {@link TestNode.TestService} whose every {@link io.aeron.cluster.service.ClusteredService}
-     * callback delegates to a real {@link SealerClusteredService}. The 1.44.0
-     * {@link TestCluster} can only construct services through a
-     * {@code Supplier<TestNode.TestService[]>}, so an external {@code ClusteredService}
-     * is injected by composition here — the harness drives THIS object, which forwards
-     * verbatim to the production service. No behaviour is added or intercepted.
-     */
-    private static final class SealerTestService extends TestNode.TestService {
-        private final SealerClusteredService delegate;
-
-        SealerTestService(final int dedupCapacity, final long tickMs, final int memberId) {
-            this.delegate = new SealerClusteredService(dedupCapacity, tickMs, memberId);
-        }
-
-        @Override
-        public void onStart(final Cluster cluster, final Image snapshotImage) {
-            // WARNING — snapshot/recovery limitation: on a SNAPSHOT-recovery start both
-            // super.onStart(...) and delegate.onStart(...) are handed the SAME snapshot
-            // Image. An Image is a consumable cursor: whoever polls it first DRAINS it,
-            // so the second consumer sees an empty image and silently starts from genesis.
-            // This is harmless ONLY because this test never takes a snapshot (snapshotImage
-            // is always null here). DO NOT reuse this wrapper as-is for any snapshot/
-            // recovery test case: in that scenario the DELEGATE — not super — must be the
-            // one to consume the snapshot Image (super must be given a null/no-op image),
-            // otherwise the production service will lose its recovered state.
-            super.onStart(cluster, snapshotImage); // lets the harness latch its Cluster ref
-            delegate.onStart(cluster, snapshotImage);
-        }
-
-        @Override
-        public void onSessionOpen(final ClientSession session, final long timestamp) {
-            delegate.onSessionOpen(session, timestamp);
-        }
-
-        @Override
-        public void onSessionClose(
-                final ClientSession session, final long timestamp, final CloseReason closeReason) {
-            delegate.onSessionClose(session, timestamp, closeReason);
-        }
-
-        @Override
-        public void onSessionMessage(
-                final ClientSession session,
-                final long timestamp,
-                final DirectBuffer buffer,
-                final int offset,
-                final int length,
-                final Header header) {
-            delegate.onSessionMessage(session, timestamp, buffer, offset, length, header);
-        }
-
-        @Override
-        public void onTimerEvent(final long correlationId, final long timestamp) {
-            delegate.onTimerEvent(correlationId, timestamp);
-        }
-
-        @Override
-        public void onNewLeadershipTermEvent(
-                final long leadershipTermId,
-                final long logPosition,
-                final long timestamp,
-                final long termBaseLogPosition,
-                final int leaderMemberId,
-                final int logSessionId,
-                final TimeUnit timeUnit,
-                final int appVersion) {
-            // Drive the production service's deferred initial timer arming.
-            delegate.onNewLeadershipTermEvent(
-                    leadershipTermId, logPosition, timestamp, termBaseLogPosition,
-                    leaderMemberId, logSessionId, timeUnit, appVersion);
-        }
-
-        @Override
-        public void onTakeSnapshot(final io.aeron.ExclusivePublication snapshotPublication) {
-            delegate.onTakeSnapshot(snapshotPublication);
-        }
-
-        @Override
-        public void onRoleChange(final Cluster.Role newRole) {
-            super.onRoleChange(newRole);
-            delegate.onRoleChange(newRole);
-        }
-
-        @Override
-        public void onTerminate(final Cluster cluster) {
-            delegate.onTerminate(cluster);
-            super.onTerminate(cluster);
         }
     }
 }
