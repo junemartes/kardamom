@@ -245,12 +245,12 @@ async fn main() -> Result<()> {
             // Newest-first with QUARANTINE on verification failure — a torn
             // or foreign checkpoint falls through to the peer fetch instead
             // of crash-looping the adoption (same hardening as the executor).
-            let mut restored = kardamom_state::restore_best_checkpoint(
-                ckpt_dir,
-                &args.state_dir,
-                expected_genesis,
-            )
-            .context("restore local checkpoint")?;
+            // Try the local staging dir first; if it yields nothing and a
+            // peer fetch stages a new image, restore once more.
+            let restore = || {
+                kardamom_state::restore_best_checkpoint(ckpt_dir, &args.state_dir, expected_genesis)
+            };
+            let mut restored = restore().context("restore local checkpoint")?;
             if restored.is_none()
                 && !args.checkpoint_peers.is_empty()
                 && kardamom_state::fetch_best_checkpoint(
@@ -261,12 +261,7 @@ async fn main() -> Result<()> {
                 )
                 .is_some()
             {
-                restored = kardamom_state::restore_best_checkpoint(
-                    ckpt_dir,
-                    &args.state_dir,
-                    expected_genesis,
-                )
-                .context("restore fetched checkpoint")?;
+                restored = restore().context("restore fetched checkpoint")?;
             }
             if let Some((block, ckpt_path)) = restored {
                 // Adoption is recorded EXPLICITLY: executor checkpoints carry

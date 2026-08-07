@@ -255,10 +255,8 @@ impl Tracker {
         (missing, unlanded)
     }
 
-    /// Latency percentiles `(p50, p95, p99, max)` in microseconds over the
-    /// confirmed set.
-    #[must_use]
     /// Drain the per-step gas counter (for per-step Mgas/s).
+    #[must_use]
     pub fn take_step_gas(&self) -> u64 {
         self.step_gas.swap(0, Ordering::Relaxed)
     }
@@ -268,6 +266,8 @@ impl Tracker {
         self.gas_used.load(Ordering::Relaxed)
     }
 
+    /// Latency percentiles `(p50, p95, p99, max)` in microseconds over the
+    /// confirmed set.
     pub fn latency_us(&self) -> (u64, u64, u64, u64) {
         let h = self
             .lat_us

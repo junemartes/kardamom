@@ -498,13 +498,13 @@ run_cpu_squeeze() {
   local div
   div="$(val_metric validator_divergence_total)"; div="$(printf '%.0f' "${div:-0}")"
   [ "${div}" -eq 0 ] || fail "cpu-squeeze: validator counted ${div} divergence(s) under starvation"
-  local valloc
+  local valloc vlogs
   while read -r valloc; do
     [ -z "${valloc}" ] && continue
-    if on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
-        | grep -q "halted on divergence"; then
+    vlogs="$(on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null || true)"
+    if has_line "${vlogs}" "halted on divergence"; then
       echo "----- divergence context (alloc ${valloc}) -----" >&2
-      on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+      printf '%s\n' "${vlogs}" \
         | grep -B3 -A10 "halted on divergence" >&2 || true
       docker exec "${VALIDATOR_NODE}" sh -c \
         'for f in /opt/kardamom/state/divergence-*.json; do [ -f "$f" ] && { echo "== $f"; head -c 4096 "$f"; echo; }; done' \

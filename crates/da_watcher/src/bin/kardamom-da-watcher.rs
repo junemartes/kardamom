@@ -16,7 +16,6 @@ use alloy_primitives::Address;
 use alloy_provider::ProviderBuilder;
 use anyhow::Context;
 use clap::Parser;
-use tokio::signal;
 
 use kardamom_da_watcher::{
     DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, spawn as spawn_watcher,
@@ -172,12 +171,11 @@ fn main() -> anyhow::Result<()> {
         );
 
         let handle = spawn_watcher(publisher, source, cfg);
-        // Wait for ctrl-c, then ask the watcher to exit at the next tick
-        // boundary. Drop on the shutdown channel is also enough to signal,
-        // but explicit send() gives a clearer log line.
-        signal::ctrl_c()
-            .await
-            .map_err(|e| anyhow::anyhow!("ctrl-c handler failed: {e}"))?;
+        // Wait for SIGTERM (orchestrator stop) or Ctrl-C, then ask the
+        // watcher to exit at the next tick boundary. Drop on the shutdown
+        // channel is also enough to signal, but explicit send() gives a
+        // clearer log line.
+        wait_for_shutdown().await;
         let _ = handle.shutdown.send(());
         handle
             .task
@@ -270,5 +268,32 @@ impl EpochPublisher for LiveTxDepositsPublisher {
                 }
             }
         }
+    }
+}
+
+/// Resolve on SIGTERM (how the orchestrator stops the job) or Ctrl-C.
+/// Mirrors `kardamom_engine::bin_support::wait_for_shutdown`; this binary
+/// cannot use that copy without depending on the whole engine crate.
+async fn wait_for_shutdown() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut sigterm = match signal(SignalKind::terminate()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
+            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Ctrl-C received");
     }
 }

@@ -164,7 +164,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    kardamom_engine::bin_support::init_tracing();
     let cli = Cli::parse();
     kardamom_obs::init(
         "batcher",
@@ -424,8 +424,16 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
         flush: std::time::Duration::from_millis(cli.flush_ms),
         skip_through_block,
     };
-    let feed = tokio::task::spawn_blocking(move || live::run_feed(feed_rx, sender, feed_cfg));
-    let feed_result = feed.await.context("feed thread panicked")?;
+    let mut feed = tokio::task::spawn_blocking(move || live::run_feed(feed_rx, sender, feed_cfg));
+    let feed_result = tokio::select! {
+        r = &mut feed => r.context("feed thread panicked")?,
+        () = bin_support::wait_for_shutdown() => {
+            // Exit cleanly: the cursor is reconciled against L1 truth on every
+            // restart, so tearing down mid-batch loses nothing.
+            info!("shutdown signal received; stopping live batcher");
+            return Ok(());
+        }
+    };
 
     // The feed loop only returns on failure (channel closed or post
     // fail-stop). Surface the reader threads' errors for context before
