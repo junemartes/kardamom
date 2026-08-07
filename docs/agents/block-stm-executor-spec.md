@@ -330,6 +330,49 @@ CI load.
 4. **The BAL contract is unchanged** — same capture, same publisher,
    same frames; downstream consumers cannot tell which engine ran.
 
+## Validation bench — the whole stack, one component at a time
+
+No bespoke lab: the existing `LocalStack` harness (chain-semantics /
+full-pipeline-e2e) IS the whole stack singly instanced — one ingress,
+one sequencer, the sealer, one executor, one validator, real Aeron
+streams, real boundary cadence, plain processes on one host. The STM
+bench is that stack with **the executor as the single variable**
+(`--parallel-execution` on/off; everything else byte-identical), which
+buys what a synthetic tape would have had to fake:
+
+1. **A LIVE correctness oracle**: the in-stack validator re-executes
+   every block sequentially and fail-stops on ANY divergence —
+   receipts, wsh, BAL cross-check, flight-ring dump on mismatch. An
+   STM bug is a loud halt with forensics, not a diff someone remembers
+   to run.
+2. **Real block shapes**: actual cadence, burst blocks under load
+   spikes, deposits/epochs interleaved in canonical positions.
+
+**Attribution discipline**: end-to-end tps dilutes the executor behind
+pipeline stages — the bench reads EXECUTOR-STAGE metrics (block-apply
+elapsed, exec-thread utilization; already exported) alongside pipeline
+gigagas/s and block-latency p50/p95/p99 (the 20ms target is a latency
+target). Worker count is an env knob swept on the same stack (1..12).
+Workload knobs ride the existing generators: contention factor, mix
+ratios, senders, offered rate (block size follows rate x cadence).
+
+**Learning dynamics** measure directly: cold-start each run, watch
+hit-rate vs block index (prices the no-persistence decision), then the
+steady-state health triple (misprediction rate, false-edge rate,
+realized-vs-oracle speedup).
+
+**The offline piece that stays offline — the oracle analyzer**: pure
+computation over BALs captured from these same runs (or any recorded
+blocks — the flight-ring dump format already carries records+claims):
+the TRUE dependency graph and its critical path, the bound no predictor
+beats, computable in P0 before any STM code exists. THE go/no-go
+number, and later the denominator of `stm_speedup_ratio`.
+
+**CI**: full-pipeline-e2e already runs the mini-stack; P3 adds an
+STM-mode pass of the same scenarios (the validator gate makes it a
+correctness test with zero new assertions) plus an
+STM->=sequential-throughput bound on a parallel-friendly scenario.
+
 ## Measurement plan
 
 - P0 report: hit-rates + implied parallelism on bench-DeFi and
