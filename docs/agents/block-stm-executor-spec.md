@@ -175,6 +175,24 @@ The stats are a rolling window — the stream retrains them in minutes,
 so a contract that changes behavior (proxy upgrade) self-corrects in
 both directions.
 
+**Stats footprint**: AGGREGATES ONLY — grading folds each block into
+O(1) decayed counters (EWMA) per entry and drops the observations, so
+memory is O(live entries), independent of uptime and tps. Per
+`(to, selector)` entry ≈ 1KB: ≤8 solved Tier-2 formulas (a formula is
+~20B — base_slot + derivation + mode + counters, NOT observed slots;
+inversion is also a compression), ≤16 fixed slots with domain grouping
++ stability, a gas histogram, and the error-rate EWMAs. Cardinality is
+a bounded LFU cache whose eviction is free BY CONSTRUCTION: a cold
+selector schedules as `Tail` with or without stats, so evictees lose
+nothing. Zipfian traffic ⇒ top ~1k selectors carry ~all gas; cap 16k
+entries ≈ 16MB (64k ≈ 64MB as the paranoid knob; the bench-DeFi +
+Uniswap working set is tens of entries). Transients: the per-block
+grading buffer (DAG + BAL cross-check) peaks ~hundreds of KB on a
+burst block, freed at the boundary. No persistence in v1 — retraining
+takes minutes and cold-start merely means a brief Tail-conservative
+window after restart (P1 measures it; the mdbx table stays an open
+question until that window proves expensive).
+
 **Failure semantics under pessimism**: a validation miss or self-abort
 is not routine — the stats were wrong. Response: re-execute the tx at
 its canonical position (correctness), demote the selector (learning),
