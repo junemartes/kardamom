@@ -4,7 +4,7 @@
 use alloy_network::{Ethereum, ReceiptResponse, TransactionBuilder};
 use alloy_primitives::{Address, B256, Bytes, TxHash, U256};
 use alloy_provider::Provider;
-use alloy_rpc_types_eth::TransactionRequest;
+use alloy_rpc_types_eth::{TransactionReceipt, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
 
 use crate::addresses::{
@@ -55,6 +55,12 @@ impl From<alloy_provider::PendingTransactionError> for DeployError {
 
 impl From<alloy_contract::Error> for DeployError {
     fn from(e: alloy_contract::Error) -> Self {
+        DeployError::Provider(e.to_string())
+    }
+}
+
+impl From<alloy_provider::transport::TransportError> for DeployError {
+    fn from(e: alloy_provider::transport::TransportError) -> Self {
         DeployError::Provider(e.to_string())
     }
 }
@@ -164,12 +170,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     /// with gas can call this; the on-chain owner is set at initialize time.
     pub async fn ensure_factory(&self, operator: Address) -> Result<FactoryStatus, DeployError> {
         // (a) ERC-7955 factory must be present.
-        let factory_code = self
-            .provider
-            .get_code_at(ERC7955_FACTORY)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?;
-        if factory_code.is_empty() {
+        if !self.code_present(ERC7955_FACTORY).await? {
             return Err(DeployError::Erc7955FactoryAbsent {
                 address: ERC7955_FACTORY,
             });
@@ -182,12 +183,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let factory_proxy = self.factory_address();
 
         // (b) Already deployed?
-        let proxy_code = self
-            .provider
-            .get_code_at(factory_proxy)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?;
-        if !proxy_code.is_empty() {
+        if self.code_present(factory_proxy).await? {
             return Ok(FactoryStatus::AlreadyDeployed);
         }
 
@@ -203,12 +199,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             .await?;
 
         // (e) Verify.
-        let proxy_code_after = self
-            .provider
-            .get_code_at(factory_proxy)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?;
-        if proxy_code_after.is_empty() {
+        if !self.code_present(factory_proxy).await? {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
@@ -229,37 +220,13 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let factory_proxy = self.factory_address();
 
         // Verify factory is deployed.
-        let code = self
-            .provider
-            .get_code_at(factory_proxy)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?;
-        if code.is_empty() {
+        if !self.code_present(factory_proxy).await? {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
-        // Build raw specs (each has target_impl = zero).
+        // Build raw specs (each has target_impl = zero), then run the dedup pass.
         let mut specs: Vec<DeploymentSpec> = ops.iter().map(build_spec).collect();
-
-        // Dedup pass: within each (id, impl_salt) group, the first spec deploys the impl;
-        // the rest reference it via target_impl. The impl's CREATE2 address is computed
-        // offline using the factory address and the spec's impl_salt + impl_initcode.
-        let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
-            std::collections::HashMap::new();
-        for s in &mut specs {
-            let key = (s.id, s.impl_salt);
-            if let Some(addr) = seen_impl.get(&key) {
-                s.target_impl = *addr;
-            } else {
-                let computed = crate::addresses::app_impl_address(
-                    factory_proxy,
-                    s.impl_salt,
-                    &s.impl_initcode,
-                );
-                seen_impl.insert(key, computed);
-                // First spec in the group keeps target_impl = zero (factory CREATE2's the impl).
-            }
-        }
+        dedup_impl_specs(factory_proxy, &mut specs);
 
         // Encode + send.
         let abi_specs: Vec<IKardamomFactory::DeploymentSpec> =
@@ -272,17 +239,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             .with_to(factory_proxy)
             .with_input(Bytes::from(calldata));
 
-        let receipt = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?
-            .get_receipt()
-            .await?;
-
-        if !receipt.status() {
-            return Err(DeployError::Reverted);
-        }
+        let receipt = self.send_and_confirm(tx).await?;
         Ok(receipt.transaction_hash())
     }
 
@@ -298,12 +255,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     ) -> Result<Vec<RegistryEntry>, DeployError> {
         let factory_proxy = self.factory_address();
 
-        let code = self
-            .provider
-            .get_code_at(factory_proxy)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?;
-        if code.is_empty() {
+        if !self.code_present(factory_proxy).await? {
             return Err(DeployError::FactoryNotDeployed(factory_proxy));
         }
 
@@ -354,11 +306,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
         let slot_u256 = U256::from_be_bytes(*ERC1967_IMPL_SLOT);
 
         for entry in &entries {
-            let raw_slot: U256 = self
-                .provider
-                .get_storage_at(entry.proxy, slot_u256)
-                .await
-                .map_err(|e| DeployError::Provider(e.to_string()))?;
+            let raw_slot: U256 = self.provider.get_storage_at(entry.proxy, slot_u256).await?;
             let erc1967_impl = Address::from_word(B256::from(raw_slot));
             if erc1967_impl != entry.current_impl {
                 mismatches.push(VerifyMismatch {
@@ -379,6 +327,29 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
     // Private helpers
     // -----------------------------------------------------------------------
 
+    /// True iff `addr` has non-empty code on the connected chain.
+    async fn code_present(&self, addr: Address) -> Result<bool, DeployError> {
+        Ok(!self.provider.get_code_at(addr).await?.is_empty())
+    }
+
+    /// Send `tx`, wait for its receipt, and fail with [`DeployError::Reverted`]
+    /// if the transaction did not succeed.
+    async fn send_and_confirm(
+        &self,
+        tx: TransactionRequest,
+    ) -> Result<TransactionReceipt, DeployError> {
+        let receipt = self
+            .provider
+            .send_transaction(tx)
+            .await?
+            .get_receipt()
+            .await?;
+        if !receipt.status() {
+            return Err(DeployError::Reverted);
+        }
+        Ok(receipt)
+    }
+
     async fn send_erc7955_tx(
         &self,
         operator: Address,
@@ -391,17 +362,7 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
             .with_to(ERC7955_FACTORY)
             .with_input(calldata);
 
-        let receipt = self
-            .provider
-            .send_transaction(tx)
-            .await
-            .map_err(|e| DeployError::Provider(e.to_string()))?
-            .get_receipt()
-            .await?;
-
-        if !receipt.status() {
-            return Err(DeployError::Reverted);
-        }
+        let receipt = self.send_and_confirm(tx).await?;
         Ok(receipt.transaction_hash())
     }
 }
@@ -409,6 +370,26 @@ impl<P: Provider<Ethereum> + Clone> Deployer<P> {
 // ---------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------
+
+/// Impl-dedup pass used by [`Deployer::apply`]: within each `(id, impl_salt)`
+/// group, the first spec keeps `target_impl = zero` (the factory CREATE2's the
+/// impl); subsequent specs reference the impl via `target_impl`, computed
+/// offline from the factory address and the spec's `impl_salt` + `impl_initcode`.
+fn dedup_impl_specs(factory: Address, specs: &mut [DeploymentSpec]) {
+    let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
+        std::collections::HashMap::new();
+    for s in specs {
+        let key = (s.id, s.impl_salt);
+        if let Some(addr) = seen_impl.get(&key) {
+            s.target_impl = *addr;
+        } else {
+            let computed =
+                crate::addresses::app_impl_address(factory, s.impl_salt, &s.impl_initcode);
+            seen_impl.insert(key, computed);
+            // First spec in the group keeps target_impl = zero (factory CREATE2's the impl).
+        }
+    }
+}
 
 /// Build `salt(32) || initcode` calldata for the ERC-7955 CREATE2 factory.
 fn erc7955_calldata(salt: B256, initcode: &Bytes) -> Bytes {
@@ -492,9 +473,8 @@ mod apply_dedup_tests {
         assert_eq!(d.abi_encode(), abi.abi_encode());
     }
 
-    /// The dedup logic in `apply` is straightforward enough to unit-test directly by
-    /// reproducing it here against a fake factory address. If `apply`'s logic changes,
-    /// keep this in sync.
+    /// Exercises the dedup pass `apply` runs (`dedup_impl_specs`) against a
+    /// fake factory address.
     #[test]
     fn dedup_picks_first_in_group_for_create2() {
         let factory = Address::from([0x11; 20]);
@@ -505,18 +485,7 @@ mod apply_dedup_tests {
             raw_spec(44, 1, 1), // same (id, salt) as #0 — must reuse
         ];
 
-        let mut seen_impl: std::collections::HashMap<(B256, B256), Address> =
-            std::collections::HashMap::new();
-        for s in &mut specs {
-            let key = (s.id, s.impl_salt);
-            if let Some(addr) = seen_impl.get(&key) {
-                s.target_impl = *addr;
-            } else {
-                let computed =
-                    crate::addresses::app_impl_address(factory, s.impl_salt, &s.impl_initcode);
-                seen_impl.insert(key, computed);
-            }
-        }
+        super::dedup_impl_specs(factory, &mut specs);
 
         assert_eq!(
             specs[0].target_impl,

@@ -3,7 +3,7 @@
 use std::str::FromStr;
 
 use alloy_primitives::{Address, Bytes};
-use alloy_provider::ProviderBuilder;
+use alloy_provider::{DynProvider, Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -203,13 +203,32 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Build a [`Deployer`] connected to `rpc_url`. With a `key`, the provider
+/// signs with it and the signer's address is returned as the operator.
+fn deployer(
+    rpc_url: &str,
+    owner: Address,
+    key: Option<&str>,
+) -> Result<(Deployer<DynProvider>, Option<Address>)> {
+    let url = rpc_url.parse()?;
+    let (provider, operator) = match key {
+        Some(key) => {
+            let signer = parse_key(key)?;
+            let operator = signer.address();
+            let provider = ProviderBuilder::new()
+                .wallet(signer)
+                .connect_http(url)
+                .erased();
+            (provider, Some(operator))
+        }
+        None => (ProviderBuilder::new().connect_http(url).erased(), None),
+    };
+    Ok((Deployer::new(provider, owner), operator))
+}
+
 async fn run_ensure_factory(rpc_url: String, private_key: String, owner: Address) -> Result<()> {
-    let signer = parse_key(&private_key)?;
-    let operator = signer.address();
-    let provider = ProviderBuilder::new()
-        .wallet(signer)
-        .connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, owner);
+    let (deployer, operator) = deployer(&rpc_url, owner, Some(&private_key))?;
+    let operator = operator.expect("operator is Some when a key is given");
     let factory_addr = deployer.factory_address();
     match deployer.ensure_factory(operator).await? {
         FactoryStatus::AlreadyDeployed => {
@@ -235,12 +254,8 @@ async fn run_deploy(
     challenger: Option<Address>,
     finalization_window: u64,
 ) -> Result<()> {
-    let signer = parse_key(&private_key)?;
-    let operator = signer.address();
-    let provider = ProviderBuilder::new()
-        .wallet(signer)
-        .connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, owner);
+    let (deployer, operator) = deployer(&rpc_url, owner, Some(&private_key))?;
+    let operator = operator.expect("operator is Some when a key is given");
 
     deployer.ensure_factory(operator).await?;
 
@@ -289,11 +304,7 @@ async fn run_deploy(
     let tx = deployer.apply(&ops, operator).await?;
     println!("deployed in tx {tx}");
 
-    let entries = deployer.addresses(None).await?;
-    for e in &entries {
-        print_entry(e);
-    }
-    Ok(())
+    print_addresses(&deployer, None).await
 }
 
 async fn run_upgrade(
@@ -303,12 +314,8 @@ async fn run_upgrade(
     ids: Vec<ContractId>,
     l2_chain_ids: Vec<u64>,
 ) -> Result<()> {
-    let signer = parse_key(&private_key)?;
-    let operator = signer.address();
-    let provider = ProviderBuilder::new()
-        .wallet(signer)
-        .connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, owner);
+    let (deployer, operator) = deployer(&rpc_url, owner, Some(&private_key))?;
+    let operator = operator.expect("operator is Some when a key is given");
 
     let current_entries = deployer.addresses(None).await?;
 
@@ -332,30 +339,18 @@ async fn run_upgrade(
     let tx = deployer.apply(&ops, operator).await?;
     println!("upgraded in tx {tx}");
 
-    let entries = deployer.addresses(None).await?;
-    for e in &entries {
-        print_entry(e);
-    }
-    Ok(())
+    print_addresses(&deployer, None).await
 }
 
 async fn run_addresses(rpc_url: String, owner: Address, l2_chain_id: Option<u64>) -> Result<()> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, owner);
-    let entries = deployer.addresses(l2_chain_id).await?;
-    for e in &entries {
-        print_entry(e);
-    }
-    Ok(())
+    let (deployer, _) = deployer(&rpc_url, owner, None)?;
+    print_addresses(&deployer, l2_chain_id).await
 }
 
 async fn run_verify(rpc_url: String, owner: Address) -> Result<()> {
-    let provider = ProviderBuilder::new().connect_http(rpc_url.parse()?);
-    let deployer = Deployer::new(provider, owner);
+    let (deployer, _) = deployer(&rpc_url, owner, None)?;
     let report = deployer.verify().await?;
-    for e in &report.entries {
-        print_entry(e);
-    }
+    print_entries(&report.entries);
     if report.mismatches.is_empty() {
         println!("all entries match ERC1967 impl slot");
     } else {
@@ -404,6 +399,18 @@ fn oracle_init_args(
     let challenger =
         challenger.context("--challenger required to deploy WithdrawalOutputOracle")?;
     Ok(encode_oracle_init_args(attester, challenger, window))
+}
+
+/// Fetch registry entries (optionally filtered by L2) and print them.
+async fn print_addresses(deployer: &Deployer<DynProvider>, l2_chain_id: Option<u64>) -> Result<()> {
+    print_entries(&deployer.addresses(l2_chain_id).await?);
+    Ok(())
+}
+
+fn print_entries(entries: &[RegistryEntry]) {
+    for e in entries {
+        print_entry(e);
+    }
 }
 
 fn print_entry(e: &RegistryEntry) {
