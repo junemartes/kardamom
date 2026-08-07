@@ -141,6 +141,17 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
     backend) remains open and documented on the constant.
   - BLOCKHASH-returns-zero elevated to a documented consensus rule at the
     single adapter every profile flows through.
+  - **The BAL is a proof input**: `execute_block_stateless` takes the
+    published frame's access list + granularity, re-derives its own through
+    the SAME capture hooks the live executor publishes from
+    (`execute_block_with_bal`), quantizes through the shared `bal_ladder`,
+    and fail-stops on structural inequality (`ExecutorError::Divergence` —
+    the same class the live validator halts on). `bal_commitment` =
+    keccak256 of the canonical RLP (byte-identical to `BalFrame.bal_rlp`)
+    is the public output an L1 verifier checks against the posted frame.
+    One-code-path invariant: guest, validator sequential fallback, and the
+    executor's published artifact all run the same monomorphized exec-core
+    functions — the proof attests exactly what the validator validates.
 - **PR 3b** — witness MPT anchoring: account/storage proofs against
   `pre_state_root`, absence proofs, sparse post-state-root recompute over
   `alloy-trie` in the guest.

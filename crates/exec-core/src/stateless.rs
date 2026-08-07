@@ -54,6 +54,7 @@ pub enum BufferedRecord {
 
 /// What a block-execution strategy returns: the block's receipts in block
 /// order (block-cumulative gas already correct) and its merged writes.
+#[derive(Debug)]
 pub struct BlockExecOutput {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
@@ -70,18 +71,53 @@ pub fn execute_block<S: StateDatabase>(
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<BlockExecOutput, ExecutorError> {
+    execute_block_inner(snapshot, parent, records, env, None).map(|(out, _)| out)
+}
+
+/// [`execute_block`] with EIP-7928 capture: also returns the block's raw
+/// (granularity-1) access list, built through the SAME per-tx capture hooks
+/// the live executor publishes from — `Bal::update_account` for txs,
+/// the synthetic-WriteSet path for deposits.
+pub fn execute_block_with_bal<S: StateDatabase>(
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+) -> Result<(BlockExecOutput, alloy_eip7928::BlockAccessList), ExecutorError> {
+    let mut bal = revm::state::bal::Bal::new();
+    let (out, _) = execute_block_inner(snapshot, parent, records, env, Some(&mut bal))?;
+    Ok((out, bal.into_alloy_bal()))
+}
+
+fn execute_block_inner<S: StateDatabase>(
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+    mut bal: Option<&mut revm::state::bal::Bal>,
+) -> Result<(BlockExecOutput, ()), ExecutorError> {
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
     let mut scope = ExecScope::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
+        // revm's Bal convention: index 0 = pre-execution, 1..=n = txs in
+        // block order (same as the actor's `tx_index_in_block + 1`).
+        let bal_arg = bal.as_deref_mut().map(|b| (b, idx_in_block + 1));
         let (receipt, ws) = match rec {
             BufferedRecord::Tx {
                 tx_idx,
                 envelope,
                 position,
-            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
+            } => scope.execute_tx(
+                *tx_idx,
+                *position,
+                envelope,
+                idx_in_block,
+                cumulative,
+                bal_arg,
+            )?,
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,
@@ -97,7 +133,7 @@ pub fn execute_block<S: StateDatabase>(
                     deposit,
                     idx_in_block,
                     cumulative,
-                    None,
+                    bal_arg,
                 )?;
                 // Fold deposit writes into the scope cache (mirrors the
                 // actor's streaming path) so later txs observe them.
@@ -111,7 +147,7 @@ pub fn execute_block<S: StateDatabase>(
         delta.apply(ws);
         receipts.push(receipt);
     }
-    Ok(BlockExecOutput { receipts, delta })
+    Ok((BlockExecOutput { receipts, delta }, ()))
 }
 
 /// Re-derive a tx record's identity from its raw bytes — the in-guest
@@ -138,14 +174,27 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
     Ok(())
 }
 
-/// The zk-guest execution shape: verify every tx record's identity, then
-/// execute the block over NOTHING but the witness. Fail-closed twice over —
-/// on identity forgery and on witness incompleteness.
+/// The zk-guest execution shape, with the published BAL as a PROOF INPUT:
+/// verify every tx record's identity, execute the block over NOTHING but
+/// the witness, re-derive the access list through the live capture path,
+/// quantize it at the frame's granularity through the shared
+/// [`crate::bal_ladder`], and require structural equality with the input.
+///
+/// Fail-closed three times over — identity forgery
+/// ([`ExecutorError::RecordIdentity`]), witness incompleteness
+/// ([`crate::witness::WitnessError`] surfaced through execution), and BAL
+/// inequality ([`ExecutorError::Divergence`], the same class the live
+/// validator fail-stops on). On success the proof may bind
+/// [`bal_commitment`]`(expected_bal)` as a public output: the recomputed
+/// list is structurally equal, so the commitment attests the PUBLISHED
+/// artifact.
 pub fn execute_block_stateless(
     witness: &ExecutionWitness,
     parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
+    expected_bal: &alloy_eip7928::BlockAccessList,
+    granularity: u16,
 ) -> Result<BlockExecOutput, ExecutorError> {
     for rec in records {
         if let BufferedRecord::Tx { envelope, .. } = rec {
@@ -155,7 +204,49 @@ pub fn execute_block_stateless(
         // L1-anchored (see module docs).
     }
     let db = WitnessDb::from_witness(witness);
-    execute_block(&db, parent, records, env)
+    let (out, raw_bal) = execute_block_with_bal(&db, parent, records, env)?;
+    let recomputed = crate::bal_ladder::quantize(raw_bal, granularity);
+    if &recomputed != expected_bal {
+        return Err(ExecutorError::Divergence(format!(
+            "stateless BAL mismatch at block {}: recomputed {} account entr{} vs published {} \
+             (granularity {granularity}); first differing address: {}",
+            env.block_number,
+            recomputed.len(),
+            if recomputed.len() == 1 { "y" } else { "ies" },
+            expected_bal.len(),
+            first_bal_difference(&recomputed, expected_bal),
+        )));
+    }
+    Ok(out)
+}
+
+/// Canonical commitment to a (quantized) access list: keccak256 of its RLP
+/// encoding — the SAME bytes the executor publishes in `BalFrame.bal_rlp`,
+/// so an L1 verifier can check the proof's public output against the posted
+/// frame without re-encoding.
+pub fn bal_commitment(bal: &alloy_eip7928::BlockAccessList) -> alloy_primitives::B256 {
+    use alloy_rlp::Encodable;
+    let mut rlp = Vec::new();
+    bal.encode(&mut rlp);
+    keccak256(&rlp)
+}
+
+/// Name the first address where two access lists disagree (or the shape
+/// difference) — receipt-mismatch-grade diagnosability (#159's lesson).
+fn first_bal_difference(
+    a: &alloy_eip7928::BlockAccessList,
+    b: &alloy_eip7928::BlockAccessList,
+) -> alloc::string::String {
+    use alloc::string::ToString;
+    for (x, y) in a.iter().zip(b.iter()) {
+        if x.address != y.address {
+            return format!("{} vs {}", x.address, y.address);
+        }
+        if x != y {
+            return x.address.to_string();
+        }
+    }
+    "(entry-count mismatch)".to_string()
 }
 
 #[cfg(all(test, feature = "std"))]
