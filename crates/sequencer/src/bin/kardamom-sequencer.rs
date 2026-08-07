@@ -12,8 +12,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+    TxReceiptsSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_sequencer::config::SequencerConfig;
 use kardamom_sequencer::epoch::{EpochSubscriber, process_epoch};
 use kardamom_sequencer::error::SequencerError;
@@ -103,15 +105,9 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
-    init_tracing();
+    kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init(
-        "sequencer",
-        args.metrics_addr,
-        &args.host_id,
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
-    )?;
+    kardamom_obs::init_service!("sequencer", args.metrics_addr, &args.host_id)?;
     let raw = std::fs::read_to_string(&args.config).context("read config")?;
     let mut cfg: SequencerConfig = toml::from_str(&raw).context("parse config")?;
 
@@ -185,10 +181,7 @@ async fn main() -> anyhow::Result<()> {
     let channels: ChannelsConfig = LogConfig::resolve(args.log_config.as_deref())
         .context("resolve log config")?
         .channels;
-    let rt = match args.aeron_dir.as_ref() {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
-        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
-    };
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
     let shard_id = cfg.sequencer_id;
     let tx_data_sub = TxDataSubscriberHandle::open(&rt, &channels, shard_id)
@@ -218,12 +211,7 @@ async fn main() -> anyhow::Result<()> {
     //
     // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the cluster
     // session never contends with the tx_data subscription on the main `rt`.
-    let cluster_rt = match args.aeron_dir.as_ref() {
-        Some(dir) => {
-            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
-        }
-        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
-    };
+    let cluster_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
     let (cluster_guard, cluster_pub, cluster_egress) =
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
@@ -353,18 +341,19 @@ async fn main() -> anyhow::Result<()> {
     // the main `rt`'s polling thread must stay dedicated to the tx_data
     // subscription (same isolation rationale as `cluster_rt` above; sharing
     // was observed to collapse the sequencer's sustainable ingest rate).
-    let receipts_rt = match args.aeron_dir.as_ref() {
-        Some(dir) => {
-            AeronRuntime::spawn_with_dir(dir).context("spawn receipts AeronRuntime with dir")?
-        }
-        None => AeronRuntime::spawn_default().context("spawn receipts AeronRuntime")?,
-    };
-    let receipts_sub = open_tx_receipts(
+    let receipts_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    // NOTE: in MDS mode each attached destination BINDS its UDP socket, so two
+    // sequencer replicas on one host (seq-a + seq-b) would collide — MDS
+    // receipts + co-located replicas needs per-group endpoint bases before it
+    // can be enabled here. The cluster deploy rides the shared multicast
+    // channel instead.
+    let receipts_sub = TxReceiptsSubscriberHandle::open_auto(
         &receipts_rt,
         &channels,
         args.executor_count
             .unwrap_or(channels.tx_receipts_executor_count),
-    )?;
+    )
+    .context("open tx_receipts")?;
     let receipts_thread = std::thread::Builder::new()
         .name("tx-receipts-floors".into())
         .spawn({
@@ -468,32 +457,6 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Open the tx_receipts subscription: MDS fan-in (attach each executor
-/// replica's endpoint) when configured, else the shared (multicast) channel —
-/// the cluster deploy's shape. Mirrors the validator's helper. NOTE: in MDS
-/// mode each destination BINDS its UDP socket, so two sequencer replicas on
-/// one host (seq-a + seq-b) would collide — MDS receipts + co-located
-/// replicas needs per-group endpoint bases before it can be enabled.
-fn open_tx_receipts(
-    rt: &AeronRuntime,
-    channels: &ChannelsConfig,
-    executor_count: u32,
-) -> Result<kardamom_log::aeron_live::TxReceiptsSubscriberHandle> {
-    use kardamom_log::aeron_live::TxReceiptsSubscriberHandle;
-    if channels.tx_receipts_mds_enabled() {
-        let sub =
-            TxReceiptsSubscriberHandle::open_mds(rt, channels).context("open tx_receipts (MDS)")?;
-        for i in 0..executor_count {
-            if let Some(uri) = channels.tx_receipts_endpoint(i) {
-                sub.add_destination(&uri)
-                    .with_context(|| format!("attach tx_receipts endpoint {i}"))?;
-            }
-        }
-        Ok(sub)
-    } else {
-        TxReceiptsSubscriberHandle::open(rt, channels).context("open tx_receipts")
-    }
-}
 
 type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
@@ -624,35 +587,3 @@ impl TxErrorPublisher for LiveTxErrorPub {
     }
 }
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-}
-
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Ctrl-C received");
-    }
-}

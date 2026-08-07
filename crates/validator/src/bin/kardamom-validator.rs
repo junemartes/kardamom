@@ -34,7 +34,7 @@ use kardamom_engine::{
     ResumePoint, StateWriterQueue, TxDataSubscription, TxOrderingSubscription,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsSubscriberHandle};
-use kardamom_log::config::{ChannelsConfig, LogConfig};
+use kardamom_log::config::LogConfig;
 use kardamom_state::{StateEnvBuilder, StateWriter, TrieMode, read_recovery_point, seed_genesis};
 use kardamom_validator::attester::{self, AttesterConfig};
 use kardamom_validator::epoch_verify;
@@ -181,13 +181,7 @@ struct Args {
 async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init(
-        "validator",
-        args.metrics_addr,
-        &args.host_id,
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
-    )?;
+    kardamom_obs::init_service!("validator", args.metrics_addr, &args.host_id)?;
     kardamom_engine::metrics::describe();
     metrics::describe();
     // The TOML supplies the `[cluster]` section (the canonical tx_ordering
@@ -216,10 +210,7 @@ async fn main() -> Result<()> {
     if let Some(dir) = args.aeron_dir.as_ref() {
         aeron_cfg.aeron_dir = dir.clone();
     }
-    let rt = match args.aeron_dir.as_ref() {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
-        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
-    };
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
     // --- State backend + crash-recovery decision (mirrors the executor). ---
     let (genesis, chain_id) = bin_support::resolve_genesis(args.chain.as_deref(), args.chain_id)?;
@@ -231,38 +222,17 @@ async fn main() -> Result<()> {
     // from its cursor and only the tail replays. Blocks through the adopted
     // checkpoint are UNVERIFIED by this validator (trust class of #78
     // catch-up); the trustless alternative is rebuild-from-L1.
-    // Chain identity for checkpoint adoption: the digest of the genesis this
-    // node is configured with. A checkpoint from another chain (or corrupt
-    // bytes) is refused rather than adopted — see CheckpointManifest.
-    let expected_genesis = {
-        let (a, c) = bin_support::build_genesis_alloc(genesis.as_ref());
-        Some(kardamom_state::genesis_digest(&a, &c))
-    };
+    let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe validator state dir")?;
         if fresh {
-            // Newest-first with QUARANTINE on verification failure — a torn
-            // or foreign checkpoint falls through to the peer fetch instead
-            // of crash-looping the adoption (same hardening as the executor).
-            // Try the local staging dir first; if it yields nothing and a
-            // peer fetch stages a new image, restore once more.
-            let restore = || {
-                kardamom_state::restore_best_checkpoint(ckpt_dir, &args.state_dir, expected_genesis)
-            };
-            let mut restored = restore().context("restore local checkpoint")?;
-            if restored.is_none()
-                && !args.checkpoint_peers.is_empty()
-                && kardamom_state::fetch_best_checkpoint(
-                    &args.checkpoint_peers,
-                    ckpt_dir,
-                    1,
-                    expected_genesis,
-                )
-                .is_some()
-            {
-                restored = restore().context("restore fetched checkpoint")?;
-            }
+            let restored = bin_support::restore_or_fetch_checkpoint(
+                ckpt_dir,
+                &args.state_dir,
+                &args.checkpoint_peers,
+                expected_genesis,
+            )?;
             if let Some((block, ckpt_path)) = restored {
                 // Adoption is recorded EXPLICITLY: executor checkpoints carry
                 // the genesis-seeded mirror + trie (built for every env by
@@ -329,30 +299,15 @@ async fn main() -> Result<()> {
     // The cluster-session guard (`LiveCluster`) + its dedicated Aeron runtime
     // must outlive the validator loop, so bind the guard in the outer scope;
     // it is dropped only after the `join` await below.
-    let cluster_rt = match args.aeron_dir.as_ref() {
-        Some(dir) => {
-            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
-        }
-        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
-    };
-    // Replay cursor: resume from the persisted state cursor (fresh validators
-    // start at genesis and receive the full retained canonical stream). The
-    // replay request is re-sent on every session establishment, so a validator
-    // whose session dies mid-chaos catches back up instead of fail-stopping on
-    // an unrecoverable gap.
-    let cluster_cursor = match &resume {
-        Some(rp) => {
-            kardamom_engine::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1)
-        }
-        None => kardamom_engine::reader::cluster::ReplayCursor::genesis(),
-    };
-    let (cluster_guard, cluster_sub) =
-        kardamom_engine::reader::cluster::cluster_tx_ordering_subscription(
-            cluster_rt,
-            file_cfg.cluster.to_live(),
-            cluster_cursor,
-        )
-        .context("connect cluster tx_ordering subscription")?;
+    // Fresh validators start at genesis and receive the full retained
+    // canonical stream. The replay request is re-sent on every session
+    // establishment, so a validator whose session dies mid-chaos catches
+    // back up instead of fail-stopping on an unrecoverable gap.
+    let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
+        args.aeron_dir.as_deref(),
+        file_cfg.cluster.to_live(),
+        bin_support::cluster_replay_cursor(resume.as_ref()),
+    )?;
     tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");
     // The kardamom_sealer_* re-export is the EXECUTOR's job — a validator
     // emitting a second (lagging) copy of the series would break sum()-style
@@ -496,7 +451,9 @@ async fn main() -> Result<()> {
         let executor_count = args
             .executor_count
             .unwrap_or(channels.tx_receipts_executor_count);
-        let mut rx = open_tx_receipts(&rt, &channels, executor_count)?.into_receiver();
+        let mut rx = TxReceiptsSubscriberHandle::open_auto(&rt, &channels, executor_count)
+            .context("open tx_receipts")?
+            .into_receiver();
         let receipts = receipts.clone();
         tokio::spawn(async move {
             while let Some((_pos, r)) = rx.recv().await {
@@ -781,59 +738,15 @@ async fn main() -> Result<()> {
         // as #78's BAL catch-up; the divergence latch only ever covers blocks
         // this validator actually verified. The trustless alternative remains
         // kardamom-reconstruct (rebuild-from-L1) into --state-dir.
-        if let Some(ExecutorError::ClusterReplayUnavailable {
-            from_index,
-            oldest_index,
-            oldest_block,
-        }) = &cause
-        {
-            let oldest_block = *oldest_block;
-            tracing::warn!(
-                from_index,
-                oldest_index,
-                oldest_block,
-                "cluster replay unavailable — attempting peer-checkpoint fallback"
-            );
-            match (
-                args.checkpoint_dir.as_ref(),
-                args.checkpoint_peers.is_empty(),
-            ) {
-                (Some(ckpt_dir), false) => {
-                    match kardamom_state::fetch_best_checkpoint(
-                        &args.checkpoint_peers,
-                        ckpt_dir,
-                        oldest_block,
-                        expected_genesis,
-                    ) {
-                        Some(ckpt) => {
-                            kardamom_state::park_state_db(&args.state_dir)
-                                .context("park stale validator state DB")?;
-                            metrics::resync_counter("peer-checkpoint").increment(1);
-                            tracing::info!(
-                                checkpoint_block = ckpt.block,
-                                "resync prepared: peer checkpoint staged, stale state \
-                                 parked; restart will adopt it (blocks through the \
-                                 checkpoint are UNVERIFIED by this validator)"
-                            );
-                        }
-                        None => {
-                            metrics::resync_counter("unrecoverable").increment(1);
-                            tracing::error!(
-                                oldest_block,
-                                "resync fallback failed: no peer checkpoint at or above \
-                                 the retention floor — operator action required (restore \
-                                 a checkpoint into --checkpoint-dir, or rebuild-from-L1 \
-                                 with kardamom-reconstruct into --state-dir)"
-                            );
-                        }
-                    }
-                }
-                _ => tracing::error!(
-                    "resync fallback unavailable (--checkpoint-dir/--checkpoint-peers \
-                     not configured) — operator action required (rebuild-from-L1 with \
-                     kardamom-reconstruct, or restore a peer checkpoint manually)"
-                ),
-            }
+        if let Some(outcome) = bin_support::replay_unavailable_fallback(
+            cause.as_ref(),
+            args.checkpoint_dir.as_deref(),
+            &args.checkpoint_peers,
+            &args.state_dir,
+            expected_genesis,
+            true,
+        )? {
+            metrics::resync_counter(outcome).increment(1);
         }
         tracing::error!(
             "validator halted on an engine error (NOT a proven divergence); if the \
@@ -853,27 +766,5 @@ fn resolve_attester_key(key: &str) -> Result<String> {
             std::env::var(var).with_context(|| format!("read attester key from env var {var}"))
         }
         None => Ok(key.to_string()),
-    }
-}
-
-/// Open the tx_receipts subscription: MDS fan-in (attach each executor replica's
-/// endpoint) when configured, else the simple shared-channel subscription.
-fn open_tx_receipts(
-    rt: &AeronRuntime,
-    channels: &ChannelsConfig,
-    executor_count: u32,
-) -> Result<TxReceiptsSubscriberHandle> {
-    if channels.tx_receipts_mds_enabled() {
-        let sub =
-            TxReceiptsSubscriberHandle::open_mds(rt, channels).context("open tx_receipts (MDS)")?;
-        for i in 0..executor_count {
-            if let Some(uri) = channels.tx_receipts_endpoint(i) {
-                sub.add_destination(&uri)
-                    .with_context(|| format!("attach tx_receipts endpoint {i}"))?;
-            }
-        }
-        Ok(sub)
-    } else {
-        TxReceiptsSubscriberHandle::open(rt, channels).context("open tx_receipts")
     }
 }

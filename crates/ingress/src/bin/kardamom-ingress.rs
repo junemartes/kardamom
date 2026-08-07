@@ -25,6 +25,7 @@ use kardamom_log::aeron_live::{
 };
 use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
+use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::{
     BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
 };
@@ -156,15 +157,9 @@ impl From<AckPolicyArg> for kardamom_types::AckPolicy {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
-    init_tracing();
+    kardamom_obs::bin::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init(
-        "ingress",
-        args.metrics_addr,
-        &args.host_id,
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
-    )?;
+    kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id)?;
     kardamom_ingress::metrics::describe();
     // v0 config loading: runtime tunables come from defaults + CLI flags; the
     // TOML supplies the optional `[cluster]` section (the Aeron Cluster client
@@ -200,10 +195,7 @@ async fn main() -> Result<()> {
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let channels = resolved.channels;
     let aeron_cfg = resolved.aeron;
-    let rt = match args.aeron_dir.as_ref() {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
-        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
-    };
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
     // Archive recorders for tx_data (one per shard), co-located with the
     // publishers here. They make the full transaction envelopes durable so the
@@ -268,12 +260,7 @@ async fn main() -> Result<()> {
         }
         // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the
         // cluster session never contends with the tx_data publish / receipts work.
-        let cluster_rt = match args.aeron_dir.as_ref() {
-            Some(dir) => {
-                AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
-            }
-            None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
-        };
+        let cluster_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
         let (guard, mut observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
         // Blocking egress poll on a dedicated thread → durable count → bus.
@@ -523,18 +510,8 @@ impl LiveIngressSubscription {
         // proxy dedups by tx hash downstream (first-wins) — this layer just
         // aggregates the streams. Legacy IPC: a plain subscription on the
         // shared `tx_receipts_channel`.
-        let receipts_sub = if mds {
-            let sub = TxReceiptsSubscriberHandle::open_mds(rt, channels)
-                .map_err(|e| IngressError::Internal(format!("open tx_receipts (MDS): {e}")))?;
-            attach_executor_endpoints(channels, executor_count, false, |uri| {
-                sub.add_destination(uri)
-            })
-            .map_err(|e| IngressError::Internal(format!("attach tx_receipts destination: {e}")))?;
-            sub
-        } else {
-            TxReceiptsSubscriberHandle::open(rt, channels)
-                .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?
-        };
+        let receipts_sub = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
+            .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?;
         // `into_receiver()`: the handle's AeronRuntime clone must NOT travel
         // into the pump task — that ownership cycle keeps the runtime alive
         // forever (see `TxReceiptsSubscriberHandle::into_receiver`). Harmless
@@ -568,21 +545,9 @@ impl LiveIngressSubscription {
         // side-stream). Same MDS vs IPC branch as the receipt stream above:
         // attach the same per-replica executor endpoints to the boundary MDS
         // subscription.
-        let mut boundary_sub = if mds {
-            let sub = TxReceiptsBoundarySubscriberHandle::open_mds(rt, channels).map_err(|e| {
-                IngressError::Internal(format!("open tx_receipts boundaries (MDS): {e}"))
-            })?;
-            attach_executor_endpoints(channels, executor_count, true, |uri| {
-                sub.add_destination(uri)
-            })
-            .map_err(|e| {
-                IngressError::Internal(format!("attach tx_receipts boundary destination: {e}"))
-            })?;
-            sub
-        } else {
-            TxReceiptsBoundarySubscriberHandle::open(rt, channels)
-                .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?
-        };
+        let mut boundary_sub =
+            TxReceiptsBoundarySubscriberHandle::open_auto(rt, channels, executor_count)
+                .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
         let tx = block_boundaries_tx.clone();
         tokio::spawn(async move {
             while let Some((_pos, b)) = boundary_sub.recv().await {
@@ -628,85 +593,4 @@ impl IngressSubscription for LiveIngressSubscription {
     }
 }
 
-/// Attach each executor replica's per-replica receipt endpoint
-/// (`channels.tx_receipts_endpoint(0..executor_count)`) to one MDS
-/// subscription via `attach` (a closure over the handle's `add_destination`).
-///
-/// STATIC MEMBERSHIP (Consul-watch fallback): this runs once at startup over
-/// the fixed `0..executor_count` index space. The executor job is a count-based
-/// Nomad job with `distinct_hosts`, so replica indices are stable and a
-/// restarting replica keeps its index/endpoint — the static attach therefore
-/// stays correct across restarts. The full design watches the
-/// `executor-receipts` Consul service and add/removes destinations on
-/// membership change; see TODO(consul-watch) on
-/// `ChannelsConfig::tx_receipts_executor_count`.
-fn attach_executor_endpoints<F>(
-    channels: &kardamom_log::config::ChannelsConfig,
-    executor_count: u32,
-    boundary: bool,
-    mut attach: F,
-) -> Result<(), IngressError>
-where
-    F: FnMut(&str) -> Result<(), kardamom_log::error::LogError>,
-{
-    if executor_count == 0 {
-        tracing::warn!(
-            "tx_receipts MDS enabled but executor_count is 0 — ingress will receive no \
-             receipts; set --executor-count / KARDAMOM_EXECUTOR_COUNT or \
-             channels.tx_receipts_executor_count"
-        );
-    }
-    // Receipts and boundaries are distinct streams on distinct endpoints (ports):
-    // each manual subscription binds its destination socket, so they must not
-    // share an endpoint. See ChannelsConfig::tx_receipts_endpoint.
-    let kind = if boundary { "boundary" } else { "receipt" };
-    for i in 0..executor_count {
-        let endpoint = if boundary {
-            channels.tx_receipts_boundary_endpoint(i)
-        } else {
-            channels.tx_receipts_endpoint(i)
-        }
-        .ok_or_else(|| {
-            IngressError::Internal(format!(
-                "tx_receipts {kind} endpoint({i}) is None (MDS misconfigured)"
-            ))
-        })?;
-        attach(&endpoint)
-            .map_err(|e| IngressError::Internal(format!("add_destination {endpoint}: {e}")))?;
-        tracing::info!(replica = i, kind, %endpoint, "attached executor endpoint to MDS");
-    }
-    Ok(())
-}
 
-fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-}
-
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Ctrl-C received");
-    }
-}

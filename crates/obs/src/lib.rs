@@ -7,6 +7,28 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result, anyhow};
 use metrics_exporter_prometheus::PrometheusBuilder;
 
+pub mod bin;
+
+/// [`init`] with the version/git-sha incantation filled in at the CALL
+/// site, so each binary stamps its own crate version (a plain helper fn
+/// would bake in kardamom-obs's).
+///
+/// ```ignore
+/// kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id)?;
+/// ```
+#[macro_export]
+macro_rules! init_service {
+    ($service:expr, $metrics_addr:expr, $host_id:expr $(,)?) => {
+        $crate::init(
+            $service,
+            $metrics_addr,
+            $host_id,
+            env!("CARGO_PKG_VERSION"),
+            option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
+        )
+    };
+}
+
 /// Whether an exporter build failure is a TCP bind `AddrInUse` (the ONLY
 /// retryable class — #122). Checked structurally through the error chain,
 /// with a string fallback in case the exporter crate stringifies the io

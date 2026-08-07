@@ -58,7 +58,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver as CbReceiver, Sender as CbSender, TryRecvError};
 use rkyv::util::AlignedVec;
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::codec;
 use crate::config::ChannelsConfig;
@@ -265,6 +265,16 @@ struct PendingPublish {
 }
 
 impl AeronRuntime {
+    /// [`spawn_with_dir`](Self::spawn_with_dir) when a directory is given,
+    /// [`spawn_default`](Self::spawn_default) otherwise — the shape every
+    /// service binary's optional `--aeron-dir` flag needs.
+    pub fn spawn(aeron_dir: Option<&std::path::Path>) -> Result<Self, LogError> {
+        match aeron_dir {
+            Some(dir) => Self::spawn_with_dir(dir),
+            None => Self::spawn_default(),
+        }
+    }
+
     /// Build an Aeron client (using the default `aeron_dir`) and spawn the
     /// dedicated Aeron thread.
     pub fn spawn_default() -> Result<Self, LogError> {
@@ -1074,6 +1084,43 @@ impl TxDataSubscriberHandle {
 // TxReceipts: receipts + boundaries (RAM only).
 // ---------------------------------------------------------------------------
 
+/// Attach replicas `0..executor_count` to an MDS fan-in subscription: the
+/// shared loop behind the receipts/boundary `open_auto` constructors.
+///
+/// STATIC MEMBERSHIP (Consul-watch fallback): this runs once at startup over
+/// the fixed `0..executor_count` index space. The executor job is a
+/// count-based Nomad job with `distinct_hosts`, so replica indices are stable
+/// and a restarting replica keeps its index/endpoint — the static attach
+/// therefore stays correct across restarts. The full design watches the
+/// `executor-receipts` Consul service and add/removes destinations on
+/// membership change; see TODO(consul-watch) on
+/// `ChannelsConfig::tx_receipts_executor_count`.
+fn attach_mds_endpoints(
+    kind: &str,
+    executor_count: u32,
+    endpoint_of: impl Fn(u32) -> Option<String>,
+    attach: impl Fn(&str) -> Result<(), LogError>,
+) -> Result<(), LogError> {
+    if executor_count == 0 {
+        warn!(
+            kind,
+            "tx_receipts MDS enabled but executor_count is 0 — this subscription will \
+             receive nothing; set --executor-count / KARDAMOM_EXECUTOR_COUNT or \
+             channels.tx_receipts_executor_count"
+        );
+    }
+    for i in 0..executor_count {
+        let endpoint = endpoint_of(i).ok_or_else(|| {
+            LogError::Aeron(format!(
+                "tx_receipts {kind} endpoint({i}) is None (MDS misconfigured)"
+            ))
+        })?;
+        attach(&endpoint)?;
+        info!(replica = i, kind, %endpoint, "attached executor endpoint to MDS");
+    }
+    Ok(())
+}
+
 /// TxReceipts publisher. The executor uses `publish_receipt` and
 /// `publish_boundary` on the same channel, but with separate stream ids so
 /// subscribers can demultiplex without an in-band tag.
@@ -1228,6 +1275,30 @@ impl TxReceiptsSubscriberHandle {
         })
     }
 
+    /// [`open_mds`](Self::open_mds) + attach replicas `0..executor_count`
+    /// when the MDS control channel is configured, plain
+    /// [`open`](Self::open) otherwise — the one shape every consumer binary
+    /// (ingress, sequencer, validator) needs. A `None` endpoint under MDS is
+    /// a misconfiguration and errors rather than silently subscribing to a
+    /// subset of executors.
+    pub fn open_auto(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        executor_count: u32,
+    ) -> Result<Self, LogError> {
+        if !ch.tx_receipts_mds_enabled() {
+            return Self::open(rt, ch);
+        }
+        let sub = Self::open_mds(rt, ch)?;
+        attach_mds_endpoints(
+            "receipt",
+            executor_count,
+            |i| ch.tx_receipts_endpoint(i),
+            |uri| sub.add_destination(uri),
+        )?;
+        Ok(sub)
+    }
+
     /// MDS (fan-in) subscriber: one `control-mode=manual` subscription on
     /// `ch.tx_receipts_control_channel` that the caller attaches per-replica
     /// executor endpoints to. Errors if MDS is not configured.
@@ -1340,6 +1411,29 @@ impl TxReceiptsBoundarySubscriberHandle {
             sub_id: Some(sub_id),
             rt: rt.clone(),
         })
+    }
+
+    /// Boundary twin of [`TxReceiptsSubscriberHandle::open_auto`]: MDS +
+    /// attach `0..executor_count` when configured, plain subscription
+    /// otherwise. Boundaries ride distinct per-replica endpoints from
+    /// receipts (each manual subscription binds its destination socket) —
+    /// see [`ChannelsConfig::tx_receipts_boundary_endpoint`].
+    pub fn open_auto(
+        rt: &AeronRuntime,
+        ch: &ChannelsConfig,
+        executor_count: u32,
+    ) -> Result<Self, LogError> {
+        if !ch.tx_receipts_mds_enabled() {
+            return Self::open(rt, ch);
+        }
+        let sub = Self::open_mds(rt, ch)?;
+        attach_mds_endpoints(
+            "boundary",
+            executor_count,
+            |i| ch.tx_receipts_boundary_endpoint(i),
+            |uri| sub.add_destination(uri),
+        )?;
+        Ok(sub)
     }
 
     /// Attach an executor replica's endpoint as an MDS destination. Idempotent.

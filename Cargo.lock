@@ -3706,7 +3706,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber 0.3.23",
  "zstd",
 ]
 
@@ -3789,7 +3788,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -3835,6 +3833,7 @@ dependencies = [
  "kardamom-cluster-adapter",
  "kardamom-exec-core",
  "kardamom-log",
+ "kardamom-obs",
  "kardamom-state",
  "kardamom-types",
  "metrics",
@@ -3846,7 +3845,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -3947,7 +3945,6 @@ dependencies = [
  "toml",
  "tower",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -3982,6 +3979,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "tracing-subscriber 0.3.23",
 ]
 
 [[package]]
@@ -4042,7 +4040,6 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
- "tracing-subscriber 0.3.23",
 ]
 
 [[package]]

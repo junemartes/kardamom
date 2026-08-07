@@ -166,13 +166,7 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     kardamom_engine::bin_support::init_tracing();
     let cli = Cli::parse();
-    kardamom_obs::init(
-        "batcher",
-        cli.metrics_addr,
-        &cli.host_id,
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
-    )?;
+    kardamom_obs::init_service!("batcher", cli.metrics_addr, &cli.host_id)?;
 
     if cli.live {
         return live_main(cli).await;
@@ -347,10 +341,7 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
     if let Some(dir) = cli.aeron_dir.as_ref() {
         aeron_cfg.aeron_dir = dir.clone();
     }
-    let rt = match cli.aeron_dir.as_ref() {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
-        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
-    };
+    let rt = AeronRuntime::spawn(cli.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
     let a_subs = bin_support::open_tx_data_subs(&rt, &channels, cli.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
@@ -363,21 +354,11 @@ async fn live_main(cli: Cli) -> anyhow::Result<()> {
     // Dedicated cluster runtime, exactly as in the executor/validator: the
     // cluster session must never contend with the tx_data work on `rt`. The
     // guard must outlive the feed loop.
-    let cluster_rt = match cli.aeron_dir.as_ref() {
-        Some(dir) => {
-            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
-        }
-        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
-    };
-    let cluster_cursor =
-        kardamom_engine::reader::cluster::ReplayCursor::new(cursor.next_index, cursor.next_block);
-    let (_cluster_guard, cluster_sub) =
-        kardamom_engine::reader::cluster::cluster_tx_ordering_subscription(
-            cluster_rt,
-            file_cfg.cluster.to_live(),
-            cluster_cursor,
-        )
-        .context("connect cluster tx_ordering subscription")?;
+    let (_cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
+        cli.aeron_dir.as_deref(),
+        file_cfg.cluster.to_live(),
+        kardamom_engine::reader::cluster::ReplayCursor::new(cursor.next_index, cursor.next_block),
+    )?;
     // The kardamom_sealer_* re-export is the executor's job.
     let b_sub = cluster_sub.suppress_sealer_metrics();
     info!("kardamom-batcher: tx_ordering via Aeron Cluster");
