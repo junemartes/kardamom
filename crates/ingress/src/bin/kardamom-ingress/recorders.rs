@@ -25,7 +25,7 @@ pub fn spawn_tx_data_recorders(
     channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
     shards: u8,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<kardamom_log::shutdown::Gate>,
     ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
 ) -> Vec<std::thread::JoinHandle<()>> {
     (0..shards)

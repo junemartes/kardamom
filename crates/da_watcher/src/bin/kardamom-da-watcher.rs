@@ -109,7 +109,7 @@ fn main() -> anyhow::Result<()> {
     // recording materialises promptly) and treat failure as fatal: the
     // operator asked for --archive-durability, so running without it would be
     // a silent lie.
-    let recorder_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder_stop = std::sync::Arc::new(kardamom_log::shutdown::Gate::new());
     let recorder_handle = if args.archive_durability {
         let aeron_dir = args.aeron_dir.clone();
         let channels = channels.clone();
@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })?;
-    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    recorder_stop.signal();
     if let Some(h) = recorder_handle {
         let _ = h.join();
     }

@@ -7,7 +7,7 @@
 //! tx_ordering MDC publication; its `get_recording_position()` returns a
 //! position that is byte-durable on local storage, and the sealer publishes
 //! that one position as the durable watermark ingress gates its must-deliver
-//! ack on (see [`recorder::run_durable_watermark_loop`]). The previous N-way
+//! ack on (via the ingress cluster-egress observer). The previous N-way
 //! Q-of-N quorum aggregator + custom recorders have been removed.
 //!
 //! This crate owns the **transport implementation** only. Wire data types live
@@ -34,6 +34,7 @@ pub mod publisher;
 pub mod recorder;
 pub mod refetch;
 pub mod replay;
+pub mod shutdown;
 pub mod subscriber;
 pub mod supervisor;
 pub mod watermark;

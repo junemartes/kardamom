@@ -158,36 +158,59 @@ pub fn spawn_receipts_pump(
     Ok(())
 }
 
-/// Background poller: expose committed-block + state-root height as
-/// metrics, and feed each block's observed MPT root to the attester.
+/// Snapshot feeder: expose committed-block + state-root height as metrics,
+/// and feed each block's observed MPT root to the attester.
 /// `validator_state_root_block` is set only when the committed snapshot
 /// actually yielded a root — an independent measurement, not a mirror of
 /// the committed-block gauge.
-pub fn spawn_commit_poller(snap_rx: SnapshotReceiver, attester_handle: Option<AttesterHandle>) {
-    tokio::spawn(async move {
-        let mut last = 0u64;
-        loop {
-            if let Some(snap) = snap_rx.current() {
+///
+/// Rides the writer's post-commit notify rather than re-reading `current()`
+/// on a 200 ms tick (docs/agents/push-model-spec.md, Push-1a), so
+/// committed-block freshness and attester `submit_root` latency go from
+/// ≤200 ms to event-time.
+///
+/// Returns the thread handle: it MUST be joined after the writer stops.
+/// The feeder holds the swap slot's last snapshot, which carries the final
+/// mdbx env reference, so letting the process exit while it still holds one
+/// leaves the datafile unsteady — read-only consumers then get
+/// `MDBX_WANNA_RECOVERY`.
+pub fn spawn_commit_poller(
+    snap_rx: SnapshotReceiver,
+    attester_handle: Option<AttesterHandle>,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("snapshot-feeder".into())
+        .spawn(move || {
+            let mut last = 0u64;
+            let mut export = |snap: kardamom_state::StateSnapshot| {
                 let block = snap.block_number();
-                if block != last {
-                    last = block;
-                    metrics::set_committed_block(block);
-                    match snap.state_root() {
-                        Ok(Some(root)) => {
-                            metrics::set_state_root_block(block);
-                            tracing::debug!(block, state_root = %root, "validator committed block");
-                            if let Some(h) = attester_handle.as_ref() {
-                                h.submit_root(block, root);
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(block, error = %e, "state_root read failed")
+                if block == last {
+                    return;
+                }
+                last = block;
+                metrics::set_committed_block(block);
+                match snap.state_root() {
+                    Ok(Some(root)) => {
+                        metrics::set_state_root_block(block);
+                        tracing::debug!(block, state_root = %root, "validator committed block");
+                        if let Some(h) = attester_handle.as_ref() {
+                            h.submit_root(block, root);
                         }
                     }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(block, error = %e, "state_root read failed")
+                    }
                 }
+            };
+            // A recovery snapshot may predate this thread — export it before
+            // parking. `None` means the writer dropped: shutdown.
+            if let Some(snap) = snap_rx.current() {
+                export(snap);
             }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    });
+            while let Some(snap) = snap_rx.recv() {
+                export(snap);
+            }
+        })
+        .expect("spawn snapshot-feeder thread")
 }

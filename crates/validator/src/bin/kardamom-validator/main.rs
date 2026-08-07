@@ -257,7 +257,8 @@ async fn main() -> Result<()> {
         }
     };
 
-    pumps::spawn_commit_poller(writer.snapshot_rx.clone(), attester_handle.clone());
+    let snapshot_feeder =
+        pumps::spawn_commit_poller(writer.snapshot_rx.clone(), attester_handle.clone());
 
     let mut cfg = ExecutorConfig {
         chain_id,
@@ -395,6 +396,14 @@ async fn main() -> Result<()> {
     }
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
+    }
+    // The feeder unparks only now: writer.shutdown() dropped the snapshot
+    // notify sender, so its `recv()` returns `None`. JOIN it — it holds the
+    // swap slot's last snapshot, which carries the final mdbx env reference,
+    // and exiting while it still holds one leaves the datafile needing
+    // recovery (unopenable by read-only consumers).
+    if snapshot_feeder.join().is_err() {
+        tracing::error!("snapshot-feeder thread panicked");
     }
     // Present in the log ⇒ the clean-shutdown path ran to the writer stop;
     // absent before exit ⇒ the process died uncleanly (mdbx env left

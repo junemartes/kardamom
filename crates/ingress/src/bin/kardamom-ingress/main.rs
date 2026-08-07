@@ -208,7 +208,7 @@ async fn main() -> Result<()> {
     // envelope, so a birth-of-stream gap would permanently break executor
     // crash recovery. A recorder startup failure is fatal: the operator asked
     // for --archive-durability, so serving without it would be a silent lie.
-    let recorder_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder_stop = Arc::new(kardamom_log::shutdown::Gate::new());
     let (recorder_ready_tx, recorder_ready_rx) =
         std::sync::mpsc::channel::<(u8, Result<i64, String>)>();
     let recorder_handles = if args.archive_durability {
@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-ingress: shutdown signal received");
     handle.jsonrpc_handle.stop().ok();
     handle.jsonrpc_handle.stopped().await;
-    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    recorder_stop.signal();
     for h in recorder_handles {
         let _ = h.join();
     }
