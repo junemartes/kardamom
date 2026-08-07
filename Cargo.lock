@@ -3860,13 +3860,17 @@ dependencies = [
  "alloy-primitives",
  "alloy-rlp",
  "alloy-signer-local",
+ "alloy-trie",
  "bytes",
  "kardamom-types",
  "metrics",
  "revm",
+ "serde",
+ "serde_json",
  "smallvec",
  "thiserror 2.0.18",
  "tracing",
+ "walkdir",
 ]
 
 [[package]]
@@ -5467,6 +5471,7 @@ dependencies = [
  "revm-precompile",
  "revm-primitives",
  "revm-state",
+ "revm-statetest-types",
 ]
 
 [[package]]
@@ -5640,6 +5645,24 @@ dependencies = [
  "revm-bytecode",
  "revm-primitives",
  "serde",
+]
+
+[[package]]
+name = "revm-statetest-types"
+version = "17.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "94743de1e54a812077b79dd3a87b4059175a804650b21582fb6feae96ef2be9c"
+dependencies = [
+ "alloy-eip7928",
+ "k256",
+ "revm-context",
+ "revm-context-interface",
+ "revm-database",
+ "revm-primitives",
+ "revm-state",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

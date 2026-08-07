@@ -1,0 +1,134 @@
+[
+  {
+    "id": "tests/prague/eip7702_set_code_tx/*",
+    "reason": "typed-tx fields dropped: tx_env_from_alloy builds TxEnv with ..Default::default(), losing authorization_list/access_list/priority-fee/tx_type — 7702 txs execute as plain calls (#164)"
+  },
+  {
+    "id": "tests/berlin/eip2930_access_list/*",
+    "reason": "typed-tx fields dropped: access list not passed to TxEnv, so warm/cold accounting and access-list intrinsic gas deviate (#164)"
+  },
+  {
+    "id": "tests/berlin/eip2929_gas_cost_increases/*",
+    "reason": "typed-tx fields dropped: access-list warmth missing (same cause as eip2930 family) (#164)"
+  },
+  {
+    "id": "tests/ported_static/stEIP2930/*",
+    "reason": "typed-tx fields dropped: access list not passed to TxEnv (#164)"
+  },
+  {
+    "id": "tests/prague/eip7623_increase_calldata_cost/*",
+    "reason": "typed-tx fields dropped: failing parametrizations are type_1/type_4 only — floor pricing itself is exercised and correct on type-0 cases (#164)"
+  },
+  {
+    "id": "tests/cancun/eip5656_mcopy/*",
+    "reason": "typed-tx fields dropped: failing cases carry access lists (#164)"
+  },
+  {
+    "id": "tests/shanghai/eip3860_initcode/*",
+    "reason": "typed-tx fields dropped: failing cases carry access lists (#164)"
+  },
+  {
+    "id": "tests/cancun/eip4844_blobs/*",
+    "reason": "typed-tx fields dropped: remaining failures are tx_type_4 BLOBHASH tests (type-3 itself is skipped — unsupported by kardamom) (#164)"
+  },
+  {
+    "id": "tests/osaka/eip7825_transaction_gas_limit_cap/*",
+    "reason": "typed-tx fields dropped: at-cap cases are 7702/access-list txs; the cap itself is enforced correctly (at-cap legacy executes, over-cap skips) (#164)"
+  },
+  {
+    "id": "tests/istanbul/eip1344_chainid/*",
+    "reason": "typed-tx fields dropped: typed_transaction_1/2 parametrizations only (#164)"
+  },
+  {
+    "id": "tests/osaka/eip7939_count_leading_zeros/test_count_leading_zeros.py::test_clz_from_set_code*",
+    "reason": "typed-tx fields dropped: set-code (7702) delivery (#164)"
+  },
+  {
+    "id": "tests/ported_static/stEIP1559/*",
+    "reason": "typed-tx fields dropped: priority fee not passed to TxEnv, coinbase credit deviates; tip_too_high validation not applied (#164)"
+  },
+  {
+    "id": "tests/ported_static/stExample/test_basefee_example.py::*",
+    "reason": "typed-tx fields dropped: priority fee not passed to TxEnv (#164)"
+  },
+  {
+    "id": "tests/ported_static/stExample/test_eip1559.py::*",
+    "reason": "typed-tx fields dropped: priority fee not passed to TxEnv (#164)"
+  },
+  {
+    "id": "tests/cancun/eip6780_selfdestruct/*",
+    "reason": "selfdestruct out of scope v0 (engine delta cannot express account deletion — crates/exec-core/src/delta.rs)"
+  },
+  {
+    "id": "tests/cancun/eip1153_tstore/test_tstorage_selfdestruct.py::*",
+    "reason": "selfdestruct out of scope v0"
+  },
+  {
+    "id": "tests/ported_static/stCreate2/*",
+    "reason": "selfdestruct out of scope v0 (create2-suicide interactions; init-code d5 case included pending deeper triage)"
+  },
+  {
+    "id": "tests/ported_static/stSolidityTest/test_test_contract_suicide.py::*",
+    "reason": "selfdestruct out of scope v0"
+  },
+  {
+    "id": "tests/ported_static/stInitCodeTest/test_transaction_create_suicide_in_initcode.py::*",
+    "reason": "selfdestruct out of scope v0"
+  },
+  {
+    "id": "tests/paris/eip7610_create_collision/*",
+    "reason": "impossible-on-mainnet pre-state (account with storage but no code); reth expected-fails the same family"
+  },
+  {
+    "id": "tests/ported_static/stAttackTest/test_crashing_transaction.py::test_crashing_transaction[fork_Osaka-state_test][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stCreateTest/test_create_results.py::test_create_results[fork_Osaka-state_test-d14][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stCreateTest/test_create_results.py::test_create_results[fork_Osaka-state_test-d15][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stEIP150singleCodeGasPrices/test_gas_cost.py::test_gas_cost[fork_Osaka-state_test-d45][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stEIP150singleCodeGasPrices/test_gas_cost_berlin.py::test_gas_cost_berlin[fork_Osaka-state_test-d45][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stEIP158Specific/test_vitalik_transaction_test_paris.py::test_vitalik_transaction_test_paris[fork_Osaka-state_test][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stExample/test_merge_test.py::test_merge_test[fork_Osaka-state_test][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stTransactionTest/test_opcodes_transaction_init.py::test_opcodes_transaction_init[fork_Osaka-state_test-d127][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/constantinople/eip1052_extcodehash/*",
+    "reason": "selfdestruct out of scope v0 (created_and_deleted / subcall_selfdestruct cases; non-selfdestruct extcodehash cases pass)"
+  },
+  {
+    "id": "tests/ported_static/stStaticCall/test_static_create_contract_suicide*",
+    "reason": "selfdestruct out of scope v0"
+  },
+  {
+    "id": "tests/frontier/create/test_create_suicide*",
+    "reason": "selfdestruct out of scope v0"
+  },
+  {
+    "id": "tests/ported_static/stEIP1153_transientStorage/test_10_revert_undoes_store_after_return.py::test_10_revert_undoes_store_after_return[fork_Osaka-state_test][0]",
+    "reason": "under investigation (PR-1 triage)"
+  },
+  {
+    "id": "tests/ported_static/stEIP1153_transientStorage/test_14_revert_after_nested_staticcall.py::test_14_revert_after_nested_staticcall[fork_Osaka-state_test][0]",
+    "reason": "under investigation (PR-1 triage)"
+  }
+]

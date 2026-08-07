@@ -489,6 +489,22 @@ where
                 .increment(1);
             IngressError::Decode(e.to_string())
         })?;
+
+        // Protocol-limit checks (W1b, docs/agents/l1-client-suite-port-spec.md)
+        // — before sig-verify, so a tx that can never execute is refused with
+        // a clear error instead of costing a signature recovery and then
+        // burning into a `status=false` skip receipt downstream.
+        if let ConsensusEnvelope::Eip4844(_) = env {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "unsupported-type")
+                .increment(1);
+            return Err(IngressError::UnsupportedTxType(0x03));
+        }
+        if env.gas_limit() > kardamom_types::limits::TX_GAS_LIMIT_CAP {
+            metrics::counter!(crate::metrics::TX_REJECTED_TOTAL, "reason" => "gas-cap")
+                .increment(1);
+            return Err(IngressError::GasLimitExceedsCap(env.gas_limit()));
+        }
+
         let nonce = env.nonce();
 
         //: the proxy is the *only* place `sender` and

@@ -27,6 +27,7 @@ pub mod deposit;
 pub mod envelope;
 pub mod epoch;
 pub mod genesis;
+pub mod limits;
 pub mod position;
 pub mod receipt;
 pub mod state;

@@ -29,6 +29,16 @@ pub enum IngressError {
     Evicted((Address, u64)),
     #[error("ingress overloaded: {0} submissions pending — retry with backoff")]
     Overloaded(usize),
+    #[error(
+        "transaction gas limit {0} exceeds the EIP-7825 per-tx cap of \
+         {cap} — the tx can never execute",
+        cap = kardamom_types::limits::TX_GAS_LIMIT_CAP
+    )]
+    GasLimitExceedsCap(u64),
+    #[error(
+        "unsupported transaction type {0:#04x}: blob (EIP-4844) transactions are not supported"
+    )]
+    UnsupportedTxType(u8),
 }
 
 impl From<IngressError> for ErrorObjectOwned {
@@ -39,7 +49,9 @@ impl From<IngressError> for ErrorObjectOwned {
             // invalid params
             IngressError::Decode(_)
             | IngressError::SignatureInvalid
-            | IngressError::Duplicate(_) => -32602,
+            | IngressError::Duplicate(_)
+            | IngressError::GasLimitExceedsCap(_)
+            | IngressError::UnsupportedTxType(_) => -32602,
             // generic server error; Evicted is retryable once the sender's
             // nonce is back within the reorder window
             IngressError::PartitionUnavailable(_)
@@ -73,5 +85,15 @@ mod tests {
     fn timeout_maps_to_server_error() {
         let rpc: ErrorObjectOwned = IngressError::Timeout.into();
         assert_eq!(rpc.code(), -32000);
+    }
+
+    #[test]
+    fn gas_cap_and_tx_type_map_to_invalid_params() {
+        let rpc: ErrorObjectOwned = IngressError::GasLimitExceedsCap(30_000_000).into();
+        assert_eq!(rpc.code(), -32602);
+        assert!(rpc.message().contains("16777216"), "{}", rpc.message());
+        let rpc: ErrorObjectOwned = IngressError::UnsupportedTxType(0x03).into();
+        assert_eq!(rpc.code(), -32602);
+        assert!(rpc.message().contains("0x03"), "{}", rpc.message());
     }
 }

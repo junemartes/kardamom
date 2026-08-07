@@ -152,6 +152,15 @@ clippy:
 test:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo test --workspace --all-targets --all-features --locked
 
+# EEST state-test conformance (docs/agents/l1-client-suite-port-spec.md W1):
+# fetch the pinned fixture release, run the runner against the Osaka posts.
+eest:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    fixtures="$(scripts/fetch-eest-fixtures.sh | tail -1)"
+    KARDAMOM_EEST_FIXTURES="${fixtures}" \
+        cargo test -p kardamom-exec-core --release --test eest_state -- --ignored --nocapture
+
 # Targeted check that just the Aeron bindings compile.
 check-aeron:
     PATH="$(just java-shim):$PATH" JAVA_HOME="$(just java-home)" cargo check -p kardamom-log --features aeron-live --locked
