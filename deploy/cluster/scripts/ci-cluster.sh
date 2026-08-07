@@ -295,8 +295,42 @@ on_exit() {
   local rc="$1"
   [[ "${rc}" != "0" ]] && dump_diagnostics
   cleanup
+  release_deploy_lock
 }
 trap 'on_exit "$?"' EXIT
+
+# --- 0. Advisory deploy lock -------------------------------------------------
+# Multiple agent sessions share this host's ONE cluster, and every deploy
+# starts with a purge+wipe — two concurrent deploys destroy each other
+# (2026-08-05: two sessions traded broken half-clusters for an afternoon;
+# the second deploy's purge hit mid-provision containers of the first).
+# The lock guards DEPLOY-vs-DEPLOY only: it is held for the duration of this
+# script and released on exit (a KEEP=1 cluster left running is legitimately
+# redeployable later — deploy-over-idle is how every session starts).
+# A lock whose pid is dead is stale and reaped. Override (destroys the other
+# deploy, on your head): KARDAMOM_CLUSTER_FORCE=1.
+DEPLOY_LOCK=/tmp/kardamom-cluster-deploy.lock
+release_deploy_lock() {
+  # Only the holder removes it (re-check pid: a FORCE'd second deploy may
+  # have replaced the file with its own pid).
+  if [[ -f "${DEPLOY_LOCK}" ]]; then
+    local lpid
+    lpid="$(awk '{print $1; exit}' "${DEPLOY_LOCK}" 2>/dev/null)"
+    [[ "${lpid}" == "$$" ]] && rm -f "${DEPLOY_LOCK}"
+  fi
+}
+if [[ -f "${DEPLOY_LOCK}" && "${KARDAMOM_CLUSTER_FORCE:-0}" != "1" ]]; then
+  read -r LOCK_PID LOCK_WHO <"${DEPLOY_LOCK}" || true
+  if [[ -n "${LOCK_PID:-}" ]] && kill -0 "${LOCK_PID}" 2>/dev/null; then
+    echo "ERROR: another cluster deploy is IN FLIGHT (pid ${LOCK_PID}, ${LOCK_WHO:-unknown}, ${DEPLOY_LOCK})." >&2
+    echo "       Deploying now would purge its half-built cluster. Wait for it, or" >&2
+    echo "       KARDAMOM_CLUSTER_FORCE=1 to override (destroys their deploy)." >&2
+    exit 1
+  fi
+  echo "==> stale deploy lock (pid ${LOCK_PID:-?} dead); reaping"
+fi
+echo "$$ $(whoami)@$(hostname):${KARDAMOM_SESSION:-unlabeled} $(date -u +%FT%TZ)" >"${DEPLOY_LOCK}"
+log "deploy lock acquired (${DEPLOY_LOCK}, pid $$)"
 
 # --- 1. Host sysctls (NOT namespaced; can't be set from inside a container) --
 log "applying Aeron socket-buffer sysctls on the host"
