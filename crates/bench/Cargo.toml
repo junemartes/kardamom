@@ -20,6 +20,10 @@ name = "kardamom-load"
 path = "src/bin/load.rs"
 
 [[bin]]
+name = "kardamom-stm-p0"
+path = "src/bin/stm-p0.rs"
+
+[[bin]]
 name = "kardamom-perf"
 path = "src/bin/perf.rs"
 
@@ -52,6 +56,9 @@ jsonrpsee = { workspace = true }
 # Apple Silicon enables frame pointers by default, so no extra rustflags
 # are needed here.
 pprof = { version = "0.14", features = ["flamegraph", "frame-pointer"] }
+# STM lab (src/stm): offline capture through the real engine.
+revm.workspace = true
+kardamom-engine.workspace = true
 
 [dev-dependencies]
 revm.workspace = true
