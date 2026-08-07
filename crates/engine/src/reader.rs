@@ -103,6 +103,12 @@ impl TxDataSubscription for Box<dyn TxDataSubscription> {
     }
 }
 
+impl TxOrderingSubscription for Box<dyn TxOrderingSubscription> {
+    fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
+        (**self).next()
+    }
+}
+
 /// Lookup-and-remove join buffer keyed by
 /// `(sequencer_id, session_id, tx_data_position)`.
 ///
