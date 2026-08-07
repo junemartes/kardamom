@@ -29,7 +29,9 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use e2e::harness::l2::L2Client;
-use e2e::scenarios::{Target, consistency, l1_batch, nonce_gap, nonce_unordered, rpc_liveness};
+use e2e::scenarios::{
+    Target, consistency, l1_batch, nonce_gap, nonce_unordered, rpc_liveness, rpc_vectors,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -67,7 +69,7 @@ struct Args {
     #[arg(
         long,
         value_delimiter = ',',
-        default_value = "nonce-unordered,nonce-gap,rpc-liveness,consistency"
+        default_value = "nonce-unordered,nonce-gap,rpc-liveness,rpc-vectors,consistency"
     )]
     cases: Vec<String>,
     /// First dev-mnemonic account index this run may use. The cluster's
@@ -218,6 +220,16 @@ async fn run_case(
                 None => anyhow::bail!("the l1-batch case needs --l1-rpc and --settlement"),
             };
             l1_batch::l1_batch(t, rpc, settlement).await
+        }
+        "rpc-vectors" => {
+            rpc_vectors::run(
+                t,
+                rpc_vectors::Params {
+                    sender: base + 13,
+                    recipient: base + 14,
+                },
+            )
+            .await
         }
         other => anyhow::bail!("unknown case {other}"),
     }

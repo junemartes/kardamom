@@ -581,7 +581,7 @@ if [[ -x "${LOAD_BIN}" ]]; then
         log "ERROR: could not resolve the settlement address for the l1-batch case"
         exit 1
       fi
-      log "chain-semantics suite (Target C): ${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency,l1-batch} (settlement ${SETTLEMENT_ADDRESS})"
+      log "chain-semantics suite (Target C): ${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,rpc-vectors,consistency,l1-batch} (settlement ${SETTLEMENT_ADDRESS})"
       "${SEMANTICS_BIN}" \
         --rpc http://192.168.56.31:8545 --chain-id 412346 \
         --executor-metrics 192.168.56.41:9004,192.168.56.42:9004,192.168.56.43:9004 \
@@ -591,7 +591,7 @@ if [[ -x "${LOAD_BIN}" ]]; then
         --account-base "${SEMANTICS_ACCOUNT_BASE:-1}" \
         --l1-rpc http://192.168.56.10:8546 \
         --settlement "${SETTLEMENT_ADDRESS}" \
-        --cases "${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,consistency,l1-batch}"
+        --cases "${SEMANTICS_CASES:-nonce-unordered,nonce-gap,rpc-liveness,rpc-vectors,consistency,l1-batch}"
     else
       log "ERROR: RUN_SEMANTICS=1 but ${SEMANTICS_BIN} is not staged"
       exit 1

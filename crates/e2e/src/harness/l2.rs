@@ -141,6 +141,21 @@ impl L2Client {
         )
         .await
     }
+
+    /// Raw JSON-RPC call with untyped params/result — the rpc-vectors
+    /// driver's transport. Errors surface as `RpcError::Call{code,message}`
+    /// so vectors can match the full error contract.
+    pub async fn raw_call(
+        &self,
+        method: &str,
+        params: &[serde_json::Value],
+    ) -> RpcOutcome<serde_json::Value> {
+        let mut p = jsonrpsee::core::params::ArrayParams::new();
+        for v in params {
+            p.insert(v).expect("vector param must serialize");
+        }
+        self.call(method, p).await
+    }
 }
 
 /// Derive `count` dev signers (mnemonic index 0..count).
