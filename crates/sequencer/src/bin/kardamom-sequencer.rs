@@ -590,17 +590,36 @@ impl TxDataSubscriber for LiveTxDataSub {
 
 struct LiveEpochSub {
     handle: TxDepositsSubscriberHandle,
+    /// Batch spill from `blocking_recv_many` — drained one epoch per
+    /// `poll` so `process_epoch`'s one-at-a-time contract holds.
+    buf: std::collections::VecDeque<(BPosition, EpochRecord)>,
 }
 
 impl LiveEpochSub {
     fn new(handle: TxDepositsSubscriberHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            buf: std::collections::VecDeque::new(),
+        }
     }
 }
 
 impl EpochSubscriber for LiveEpochSub {
+    /// Park-then-batch (push-model-spec, Push-1c): blocks until an epoch
+    /// exists instead of returning `Ok(None)` for the caller to back off —
+    /// the pump's idle arm is dead in production. Channel close (runtime
+    /// teardown) surfaces as `IngressDisconnected`, the pump's clean-exit
+    /// path.
     fn poll(&mut self) -> Result<Option<(BPosition, EpochRecord)>, SequencerError> {
-        Ok(self.handle.try_recv())
+        if let Some(item) = self.buf.pop_front() {
+            return Ok(Some(item));
+        }
+        let mut batch = Vec::with_capacity(16);
+        if self.handle.blocking_recv_many(&mut batch, 16) == 0 {
+            return Err(SequencerError::IngressDisconnected);
+        }
+        self.buf.extend(batch);
+        Ok(self.buf.pop_front())
     }
 }
 

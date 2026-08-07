@@ -1459,6 +1459,17 @@ pub struct TxDepositsSubscriberHandle {
 }
 
 impl TxDepositsSubscriberHandle {
+    /// Blocking batch receive — see
+    /// [`TxReceiptsSubscriberHandle::blocking_recv_many`]. 0 = channel
+    /// closed by runtime teardown.
+    pub fn blocking_recv_many(
+        &mut self,
+        buf: &mut Vec<(BPosition, EpochRecord)>,
+        limit: usize,
+    ) -> usize {
+        self.rx.blocking_recv_many(buf, limit)
+    }
+
     pub fn open(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         Ok(Self {
             rx: rt.open_subscription::<EpochRecord>(
