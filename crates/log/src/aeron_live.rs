@@ -1192,6 +1192,20 @@ pub struct TxReceiptsSubscriberHandle {
 }
 
 impl TxReceiptsSubscriberHandle {
+    /// Blocking batch receive: parks until at least one delivery exists
+    /// (0 = runtime dropped the channel: shutdown), then moves up to
+    /// `limit` messages into `buf` in one wake — the park-then-batch
+    /// primitive of push-model-spec Push-1c. Burst-friendly by design:
+    /// the duty cycle pushes up to 64 fragments per poll, so one wake
+    /// typically carries a whole burst.
+    pub fn blocking_recv_many(
+        &mut self,
+        buf: &mut Vec<(BPosition, Receipt)>,
+        limit: usize,
+    ) -> usize {
+        self.rx.blocking_recv_many(buf, limit)
+    }
+
     /// Fan a `Vec<Receipt>` batch frame (the only receipt wire format — see
     /// [`TxReceiptsPublisherHandle::publish_receipts`]) back out into
     /// per-receipt deliveries, preserving in-frame order. Consumers keep the

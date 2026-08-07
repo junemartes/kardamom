@@ -373,11 +373,19 @@ async fn main() -> anyhow::Result<()> {
             let partition_index = cfg.partition_index;
             let mut sub = receipts_sub;
             move || {
-                let mut backoff_us = 1u64;
+                // Park-then-batch (push-model-spec, Push-1c): one wake per
+                // duty-cycle burst instead of the old 1µs→500µs backoff
+                // poll. A 0-length batch means the Aeron runtime dropped
+                // the channel — shutdown.
+                let mut batch: Vec<(kardamom_types::BPosition, kardamom_types::Receipt)> =
+                    Vec::with_capacity(256);
                 while !shutdown.is_signaled() {
-                    match sub.try_recv() {
-                        Some((_pos, receipt)) => {
-                            backoff_us = 1;
+                    batch.clear();
+                    if sub.blocking_recv_many(&mut batch, 256) == 0 {
+                        return;
+                    }
+                    for (_pos, receipt) in batch.drain(..) {
+                        {
                             // nonce == 0 receipts are EXCLUDED from floor
                             // evidence: deposit receipts stamp a filler
                             // `nonce: 0` (deposits run with the nonce check
@@ -414,10 +422,6 @@ async fn main() -> anyhow::Result<()> {
                                     return;
                                 }
                             }
-                        }
-                        None => {
-                            std::thread::sleep(Duration::from_micros(backoff_us));
-                            backoff_us = backoff_us.saturating_mul(2).min(500);
                         }
                     }
                 }
