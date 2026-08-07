@@ -121,6 +121,15 @@ Key tiers, most-certain first:
    calldata) and principal-derived `(contract, base_slot, owner)`
    (balances/allowances/shares — the principal is not always the
    sender: `allowance(owner, spender)` keys on the owner ARG).
+   `base_slot` = the Solidity storage anchor of the mapping (the slot
+   `p` of its DECLARATION; entries live at `keccak(pad32(key) ++
+   pad32(p))`, nested mappings chain the hash). Never observed
+   directly — P0 RECOVERS it by inversion: test observed slots against
+   `keccak(pad(sender|arg_i) ++ pad(p))` for small `p` (contracts
+   declare few variables; brute-forcing p∈0..255 is a handful of
+   keccaks). A slot that solves consistently self-identifies as
+   "mapping at base p keyed by X" — an algebraic identity, not a
+   co-occurrence guess, which is why Tier-2 keys are trustworthy.
 3. **Semantic domains** — fixed slots every call of `(to, selector)`
    touches regardless of caller/args (pool reserves, vault totals),
    MERGED by measured co-access stability: slots that always co-write
