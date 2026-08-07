@@ -86,12 +86,23 @@ default when neither speaks:
    *sender's own* accounts.
 3. **`Accumulator` deferred writes** (exact by algebra). Slots that are
    only ever ADDED to and not read mid-block — the fee sink above all
-   (if every tx credits the beneficiary, it is a universal serializer
-   that would chain the entire block). Such writes are recorded as
-   deltas and folded at commit in canonical order (the Aptos
-   aggregator trick). P0 must confirm from real BALs which slots
-   qualify (expected: beneficiary balance; candidates: monotone
-   counters that no same-block tx reads).
+   (CONFIRMED by P0: every tx credits the beneficiary; universal
+   serializer without this). Mechanics: the beneficiary is known from
+   BlockEnv a priori (STATIC marking — no stats needed for the fee
+   sink); workers serve its reads from the stable block-start value and
+   fold each tx's credit as a DELTA (post − seen, exact regardless of
+   the stale view) into a per-tx lane — no version published, no edges,
+   no aborts. At canonical-order commit the prefix sums materialize the
+   absolute values — and because each tx's write_set_hash contains the
+   beneficiary's ABSOLUTE post-balance, wsh finalization for
+   accumulator cells is a COMMIT-TIME fixup; with it receipts, wsh,
+   BAL balance_changes and the delta are byte-identical to sequential.
+   Runtime guard: a BALANCE read against an accumulator-marked account
+   parks until the commit pointer covers its predecessors, then
+   materializes the exact prefix (fees depend on gas_used, final only
+   at commit). Stats-discovered accumulator candidates (monotone
+   counters no same-block tx reads) are a later extension; v1 marks
+   only the fee sink.
 4. **`DomainChain { domains }`** (stats-driven, the workhorse). The
    predictor maps the tx to the contention DOMAINS it will touch —
    fixed slots of a `(to, selector)` (a pool's reserves), arg-derived
