@@ -465,7 +465,16 @@ pessimistic scheduling.
 
 **Spec adjustments from the data**:
 1. `Accumulator` is not an optimization — it is REQUIRED for any
-   speedup at all (fee sink). Promote to P2's first milestone.
+   speedup at all (fee sink). Promote to P2's first milestone. The
+   sink is the V0 documented burn (`block_env.rs`: beneficiary =
+   address(0), basefee 0 ⇒ full gas_price×gas_used credited per tx,
+   reverted txs included) — and the finding is durable across fee-model
+   evolution: any in-EVM fee crediting yields a universal write cell,
+   only the address changes. P2 safety guard: the capture cannot see
+   pure BALANCE-opcode reads, so an accumulator-treated address needs a
+   runtime hook — BALANCE against it forces materialization of the
+   pending deltas at that tx's canonical position (or parks the
+   reader). Cheap, but it must exist.
 2. Recipient-account chains bound the transfers ceiling (20.8x, not
    ~96x): the Account cell is RMW-conservative. A commutative-credit
    refinement (pure balance CREDITS as accumulator deltas when no
