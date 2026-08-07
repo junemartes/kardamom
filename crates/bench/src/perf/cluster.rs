@@ -86,10 +86,6 @@ done"#
     Ok(())
 }
 
-/// Bring the stack up fresh: `local-cluster.sh build` (reproducible builder +
-/// orchestrator image), then `ci-cluster.sh` from a fresh orchestrator with
-/// KEEP=1 and the load/chaos stages skipped. Blocks until the deploy's smoke
-/// gates pass; the cluster is left running.
 /// True when the cluster's control node container exists (running or not) —
 /// the discriminator between "redeploy over an existing cluster" (purge
 /// first) and "the cluster is gone" (a torn-down host, e.g. after another
@@ -100,6 +96,10 @@ fn cluster_exists() -> bool {
     sh("docker", &["inspect", "kardamom-control-0"]).is_ok()
 }
 
+/// Bring the stack up fresh: `local-cluster.sh build` (reproducible builder +
+/// orchestrator image), then `ci-cluster.sh` from a fresh orchestrator with
+/// KEEP=1 and the load/chaos stages skipped. Blocks until the deploy's smoke
+/// gates pass; the cluster is left running.
 pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     let root = repo_root.to_str().context("repo root not utf-8")?;
     if !skip_build {
