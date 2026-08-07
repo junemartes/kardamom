@@ -400,6 +400,82 @@ STM->=sequential-throughput bound on a parallel-friendly scenario.
   batcher isolated (cpuset Run E pairs naturally with this campaign —
   parallel execution needs cores the batcher currently steals).
 
+## P0 RESULTS (2026-08-07) — GO
+
+Measured by `kardamom-stm-p0` (crates/bench/src/stm): sequential capture
+through the REAL engine with per-tx BALs; REAL Uniswap v2-core bytecode
+(factory + pairs, router-less pair-level choreography, offline reserve
+tracking — every signed tx succeeds); classifier trained on the first
+half of each run's blocks, graded on the held-out second half.
+
+**The fee sink is real and mandatory** (as suspected): the beneficiary
+account (zero-address coinbase) is written by 100% of txs. Without the
+`Accumulator` treatment the oracle critical-path ratio is **1.00x flat
+on every workload** — one commutative cell serializes the chain. With
+it, everything below.
+
+**Contention scaling** (real Uniswap, 96 senders, 500-tx blocks, 70%
+swaps / 30% ERC20 transfers, 10% cross-pair):
+
+    pairs   1      2      4      8      16
+    oracle  1.06x  2.05x  3.90x  7.33x  13.05x
+    pred    1.06x  2.06x  3.90x  7.37x  12.97x
+
+Near-perfect linearity in domain count (cp-ratio ~ 0.9 x pairs), and
+the PREDICTOR MATCHES THE ORACLE AT EVERY POINT: **0 missed pairs
+anywhere in the sweep** (no would-abort schedules), over-merge 0.00%
+except one degenerate config (12 senders: 0.57%). Pessimistic
+scheduling by learned footprints loses essentially nothing to a perfect
+oracle on this workload.
+
+**Block size** (8 pairs): 50-tx blocks 5.43x -> 200: 6.66x -> 500:
+7.33x -> 1000: 7.69x. Parallelism is bounded by block width and
+saturates near the domain count — small blocks under-fill the DAG
+(matters for low-tps cadence; burst blocks parallelize best).
+
+**Senders**: 12 -> 5.56x, 48 -> 7.25x, 96/192 -> 7.28x. SenderChains
+bind until they are shorter than domain chains, then domains take over.
+At scale (real traffic = thousands of senders) domains are the only
+binding constraint.
+
+**Mix/joins**: 30% swap share 8.03x, 95% 7.16x; cross-pair 0% 7.46x,
+40% 6.77x — DAG joins cost measurable but modest parallelism.
+
+**Worst cases, honestly**: single hot pair = 1.06x (the block IS the
+chain; pessimism degrades to sequential, never below it). BenchDefi
+single-instance (1 pool + 1 vault + 1 clob, everything hot) = 1.99x.
+Amdahl is undefeated; more distinct hot contracts is the only cure.
+
+**Classifier** (real Uniswap): 58-60% of slot observations solve by
+keccak inversion (derived), ~40% fixed, **0.4-1.9% unpredictable**;
+learning converges within ~6 blocks (train half of 12-16 blocks
+suffices; 0 cold in every holdout). BenchDefi's CLOB shows the hard
+class as predicted: 10.9% unpredictable (order structs keyed by an
+id COUNTER — not derivable from sender/args; the Tail lane's expected
+customers).
+
+**Transfers** (96 senders, 1000-tx blocks): 20.83x, predictor exact —
+tier-1 alone schedules native transfers perfectly.
+
+**Go/no-go: GO.** Realistic multi-domain traffic clears the ~3x bar at
+4+ domains and reaches 7-13x at 8-16; the predictor gives up nothing
+vs the oracle; the misprediction risk (0 missed pairs across ~50k
+graded holdout txs) is consistent with the near-zero-abort premise of
+pessimistic scheduling.
+
+**Spec adjustments from the data**:
+1. `Accumulator` is not an optimization — it is REQUIRED for any
+   speedup at all (fee sink). Promote to P2's first milestone.
+2. Recipient-account chains bound the transfers ceiling (20.8x, not
+   ~96x): the Account cell is RMW-conservative. A commutative-credit
+   refinement (pure balance CREDITS as accumulator deltas when no
+   same-block tx reads the balance) is a plausible later multiplier —
+   left as an open question, not in v1.
+3. Small blocks under-fill the DAG: at low tps the STM engine should
+   simply not engage (worker count 1 below a block-width threshold) —
+   parallelism is for the loaded regime, which is exactly when it is
+   needed.
+
 ## Open questions
 
 - Wave commit pipelining vs the depth-4 commit pipeline (#129): the STM
