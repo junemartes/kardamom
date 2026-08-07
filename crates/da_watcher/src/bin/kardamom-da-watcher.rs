@@ -117,7 +117,7 @@ fn main() -> anyhow::Result<()> {
     // recording materialises promptly) and treat failure as fatal: the
     // operator asked for --archive-durability, so running without it would be
     // a silent lie.
-    let recorder_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder_stop = std::sync::Arc::new(kardamom_log::shutdown::Gate::new());
     let recorder_handle = if args.archive_durability {
         let aeron_dir = args.aeron_dir.clone();
         let channels = channels.clone();
@@ -185,7 +185,7 @@ fn main() -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
         Ok::<(), anyhow::Error>(())
     })?;
-    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    recorder_stop.signal();
     if let Some(h) = recorder_handle {
         let _ = h.join();
     }
@@ -202,7 +202,7 @@ fn run_tx_deposits_recorder(
     aeron_dir: Option<&std::path::Path>,
     channels: &kardamom_log::config::ChannelsConfig,
     aeron_cfg: &kardamom_log::config::AeronConfig,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<kardamom_log::shutdown::Gate>,
     ready: std::sync::mpsc::Sender<Result<i64, String>>,
 ) -> anyhow::Result<()> {
     let session = match connect_archive(aeron_dir, aeron_cfg) {
@@ -212,7 +212,7 @@ fn run_tx_deposits_recorder(
             return Err(e).context("connect archive");
         }
     };
-    let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
+    let mut should_stop = || stop.is_set();
     let recorder = match Recorder::start_stream(
         session.archive,
         &channels.tx_deposits_channel,
@@ -237,9 +237,9 @@ fn run_tx_deposits_recorder(
         "da-watcher: recording tx_deposits"
     );
     let _ = ready.send(Ok(recorder.recording_id()));
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    // Parked on the gate's Condvar until shutdown, not sleep-polled
+    // (push-model-spec 1a).
+    stop.wait();
     Ok(())
 }
 

@@ -11,8 +11,9 @@
 //! gates its must-deliver ack on that single position via the unchanged
 //! `--ack-policy on-quorum` path.
 //!
-//! See [`crate::recorder::run_durable_watermark_loop`] (the producer, driven
-//! by the sealer) and `kardamom-sealer --archive-durability` (the wiring).
+//! The polled producer loop (`run_durable_watermark_loop`) was removed as
+//! dead code in the push-model cleanup (docs/agents/push-model-spec.md):
+//! the cluster topology's ingress egress-observer replaced it.
 //!
 //! This module is intentionally left empty; it is retained as a landing place
 //! for the durability-model documentation above and to keep the `pub mod

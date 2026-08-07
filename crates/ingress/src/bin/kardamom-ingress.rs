@@ -217,7 +217,7 @@ async fn main() -> Result<()> {
     // envelope, so a birth-of-stream gap would permanently break executor
     // crash recovery. A recorder startup failure is fatal: the operator asked
     // for --archive-durability, so serving without it would be a silent lie.
-    let recorder_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let recorder_stop = Arc::new(kardamom_log::shutdown::Gate::new());
     let (recorder_ready_tx, recorder_ready_rx) =
         std::sync::mpsc::channel::<(u8, Result<i64, String>)>();
     let recorder_handles = if args.archive_durability {
@@ -300,7 +300,7 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-ingress: shutdown signal received");
     handle.jsonrpc_handle.stop().ok();
     handle.jsonrpc_handle.stopped().await;
-    recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    recorder_stop.signal();
     for h in recorder_handles {
         let _ = h.join();
     }
@@ -319,7 +319,7 @@ fn spawn_tx_data_recorders(
     channels: ChannelsConfig,
     aeron_cfg: AeronConfig,
     shards: u8,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<kardamom_log::shutdown::Gate>,
     ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
 ) -> Vec<std::thread::JoinHandle<()>> {
     (0..shards)
@@ -387,7 +387,7 @@ fn run_tx_data_recorder(
     channels: &ChannelsConfig,
     aeron_cfg: &AeronConfig,
     sid: u8,
-    stop: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<kardamom_log::shutdown::Gate>,
     ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
 ) -> Result<()> {
     let session = match connect_archive(aeron_dir, aeron_cfg) {
@@ -397,7 +397,7 @@ fn run_tx_data_recorder(
             return Err(e).context("connect archive");
         }
     };
-    let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
+    let mut should_stop = || stop.is_set();
     let recorder = match Recorder::start_stream(
         session.archive,
         &channels.tx_data_channel(sid),
@@ -423,10 +423,9 @@ fn run_tx_data_recorder(
         "ingress: recording tx_data shard"
     );
     let _ = ready.send((sid, Ok(recorder.recording_id())));
-    // Hold the recording (and its archive session) alive until shutdown.
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
+    // Hold the recording (and its archive session) alive until shutdown —
+    // parked on the gate's Condvar, not sleep-polled (push-model-spec 1a).
+    stop.wait();
     Ok(())
 }
 

@@ -623,32 +623,44 @@ async fn main() -> Result<()> {
     {
         let snap_rx = writer.snapshot_rx.clone();
         let attester_handle = attester_handle.clone();
-        tokio::spawn(async move {
-            let mut last = 0u64;
-            loop {
-                if let Some(snap) = snap_rx.current() {
+        std::thread::Builder::new()
+            .name("snapshot-feeder".into())
+            .spawn(move || {
+                let mut last = 0u64;
+                let mut export = |snap: kardamom_state::StateSnapshot| {
                     let block = snap.block_number();
-                    if block != last {
-                        last = block;
-                        metrics::set_committed_block(block);
-                        match snap.state_root() {
-                            Ok(Some(root)) => {
-                                metrics::set_state_root_block(block);
-                                tracing::debug!(block, state_root = %root, "validator committed block");
-                                if let Some(h) = attester_handle.as_ref() {
-                                    h.submit_root(block, root);
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                tracing::warn!(block, error = %e, "state_root read failed")
+                    if block == last {
+                        return;
+                    }
+                    last = block;
+                    metrics::set_committed_block(block);
+                    match snap.state_root() {
+                        Ok(Some(root)) => {
+                            metrics::set_state_root_block(block);
+                            tracing::debug!(block, state_root = %root, "validator committed block");
+                            if let Some(h) = attester_handle.as_ref() {
+                                h.submit_root(block, root);
                             }
                         }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(block, error = %e, "state_root read failed")
+                        }
                     }
+                };
+                // A recovery snapshot may predate this thread — export it
+                // before parking, then ride the writer's post-commit notify
+                // (event-time freshness, replacing the old 200 ms poll —
+                // docs/agents/push-model-spec.md, Push-1a). `None` means the
+                // writer dropped: shutdown.
+                if let Some(snap) = snap_rx.current() {
+                    export(snap);
                 }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        });
+                while let Some(snap) = snap_rx.recv() {
+                    export(snap);
+                }
+            })
+            .expect("spawn snapshot-feeder thread");
     }
 
     let mut cfg = ExecutorConfig {
