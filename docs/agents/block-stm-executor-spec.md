@@ -170,15 +170,47 @@ Costs a hash-map pass per block; no execution change; runs behind
 - Workers pull DAG-READY txs (all predecessors executed) — pessimistic
   chains mean a tx's reads of its domains see its chain predecessor's
   writes deterministically through MvCache, not speculatively.
-- Validation: after tx i's execution, its recorded read-set is checked
-  against writes committed by txs < i that landed AFTER i read (the
-  standard STM invalidation); revm's Bal capture already tracks read
-  sets natively — the same machinery the validator's claims use. Under
-  pessimistic scheduling this check is expected to fire ~never (only
-  `Independent` mispredictions can trip it); each firing re-executes
-  the tx and demotes the selector. Commit is strictly in canonical
-  order, so receipts, cumulative gas, the BAL, and the delta are
-  BYTE-IDENTICAL to sequential execution by construction.
+
+**Conflict authority — wound-wait on the canonical order.** The
+sequencer's strong total order is a free, consensus-fixed PRIORITY
+relation (classical wound-wait schemes have to invent one; we inherit
+it): lower canonical index = parent, higher = child, and the two legs
+of the discipline fall out:
+
+- **Children WAIT on parents** — ahead of time via the predicted DAG's
+  edges, and at runtime via ESTIMATE marks: when a wounded/re-executing
+  parent's write slot is read by a child, the child parks on the mark
+  instead of consuming a value about to change (prevents wound
+  cascades).
+- **Children SELF-ABORT on a parent's conflicting write.** Parents
+  never track readers and never signal anyone — tx i just writes its
+  versioned slots. Each child records `(slot, version)` as it reads
+  (revm's native capture); at every subsequent state access it re-checks
+  its recorded versions with a cheap compare, and the moment a slot it
+  read carries a newer LOWER-index version, it aborts itself and
+  re-enqueues with a LEARNED edge i→j. The detection cost rides the
+  CHILD's accesses — the speculator pays for its own speculation — and
+  the parent's hot path stays free of reader-index maintenance and
+  cross-thread flagging (a shared reader index would be touched on
+  EVERY read to serve an event pessimism makes ~never happen, and is a
+  contention magnet besides). Two-level cheapening: per-domain write
+  epochs guard the common case (epoch unchanged ⇒ skip the per-slot
+  recheck entirely). No parent ever waits on a child; deadlock-free by
+  construction (priority is the fixed total order, the wait graph is
+  acyclic). Detection latency is bounded by the child's next access,
+  and commit-time validation backstops a child that finished before
+  the parent's write landed. Learned edges RETRAIN: each self-abort is
+  a prediction miss, demoting the selector exactly like a validation
+  miss.
+
+- Validation remains as the final invariant check before commit (a
+  wound can only fire while the parent still executes; a child that
+  finished before its parent's conflicting write is caught here).
+  Under pessimistic scheduling both wounds and validation misses are
+  expected ~never on hot flows — their combined rate
+  (`stm_misprediction_total`) is THE health metric. Commit is strictly
+  in canonical order, so receipts, cumulative gas, the BAL, and the
+  delta are BYTE-IDENTICAL to sequential execution by construction.
 - Deposits and epoch records take the serial lane (rare; own commit
   semantics — same reasoning as the validator's batch path, #151).
 
