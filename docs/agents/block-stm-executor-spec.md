@@ -100,18 +100,43 @@ default when neither speaks:
    Block-STM that the correlation profile demands. Bounded damage:
    sequential throughput, i.e. today's.
 
-**Adaptive feedback** closes the loop: after each block the actual BAL
-(free, in-process) grades every prediction. A selector whose
-`DomainChain`/`Independent` predictions miss demotes toward `Tail`
-(conservative immediately); sustained accuracy promotes back. The stats
-are a rolling window — the stream retrains them in minutes, so a
-contract that changes behavior (proxy upgrade) self-corrects.
+**The objective is block wall time, never misprediction count.** A
+controller that minimizes mispredictions alone has a degenerate global
+optimum: chain everything — one thread, zero misses, zero speedup. The
+two failure modes spend the same currency (core-seconds) from opposite
+sides, and their observability is ASYMMETRIC in the dangerous
+direction:
 
-**Failure semantics under pessimism**: a validation miss is not routine
-— it means the stats were wrong. Response: re-execute the tx at its
-canonical position (correctness), demote the selector (learning), and
-count it (`stm_misprediction_total` — its rate is THE health metric of
-the whole approach; alert when it leaves ~zero).
+- **Optimism error** (false independence): bounded per event, LOUD — an
+  abort fires, work is retried, a counter ticks.
+- **Pessimism error** (false edge): silent and continuous — cores idle
+  behind an edge that never needed to exist, nothing fires. Left
+  ungraded, every noisy selector ratchets toward `Tail` and stays.
+
+So the feedback is SYMMETRIC, and the BAL grades both directions for
+free: after each block, (a) every miss (self-abort / validation
+failure) demotes its selector toward chaining, and (b) every DAG edge
+`i -> j` whose parent's ACTUAL writes did not intersect the child's
+ACTUAL reads is a convicted FALSE EDGE — its rate per selector-pair
+promotes back toward parallelism. The edge decision itself is expected
+cost, both terms estimable from the per-selector stats + gas
+histograms:
+
+    chain  iff  P(conflict) x retry_cost  >  (1 - P(conflict)) x serialized_wait
+
+The stats are a rolling window — the stream retrains them in minutes,
+so a contract that changes behavior (proxy upgrade) self-corrects in
+both directions.
+
+**Failure semantics under pessimism**: a validation miss or self-abort
+is not routine — the stats were wrong. Response: re-execute the tx at
+its canonical position (correctness), demote the selector (learning),
+count it (`stm_misprediction_total`). Health is judged on the PAIR of
+error rates plus realized utilization — `stm_misprediction_total`,
+`stm_false_edge_total`, and achieved-speedup vs the block's oracle
+critical path (`stm_speedup_ratio`) — alert on misprediction rate
+leaving ~zero AND on utilization sagging toward 1x, never on one side
+alone.
 
 ## Phases
 
@@ -206,11 +231,14 @@ of the discipline fall out:
 - Validation remains as the final invariant check before commit (a
   wound can only fire while the parent still executes; a child that
   finished before its parent's conflicting write is caught here).
-  Under pessimistic scheduling both wounds and validation misses are
-  expected ~never on hot flows — their combined rate
-  (`stm_misprediction_total`) is THE health metric. Commit is strictly
-  in canonical order, so receipts, cumulative gas, the BAL, and the
-  delta are BYTE-IDENTICAL to sequential execution by construction.
+  Under pessimistic scheduling both self-aborts and validation misses
+  are expected ~never on hot flows — but their combined rate
+  (`stm_misprediction_total`) is only ONE side of health; it is graded
+  jointly with the false-edge rate and realized speedup (see "The
+  objective is block wall time" above — misses-to-zero alone optimizes
+  toward one thread). Commit is strictly in canonical order, so
+  receipts, cumulative gas, the BAL, and the delta are BYTE-IDENTICAL
+  to sequential execution by construction.
 - Deposits and epoch records take the serial lane (rare; own commit
   semantics — same reasoning as the validator's batch path, #151).
 
