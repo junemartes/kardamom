@@ -41,12 +41,77 @@ how those slots derive from the caller:
   conflict-with-everything (falls back to Block-STM's optimism or a
   serial lane).
 
-The scheduler then builds a PREDICTED conflict graph before executing
-anything: predicted-independent txs run optimistically in parallel
-(validation still catches prediction misses — correctness never depends
-on the heuristic), predicted-conflicting txs are chained as explicit
-dependencies instead of discovered-by-abort. The heuristic buys
-throughput; STM validation keeps it sound.
+**Scheduling is PESSIMISTIC** (design decision, 2026-08-07): our
+transactions are highly correlated — swap/CLOB/vault flows converge on
+shared state as the common case, not the exception — so the scheduler
+treats predicted conflicts as authoritative ORDER, built before anything
+executes. Two txs predicted to overlap never run concurrently; there are
+no abort storms to absorb, wall time collapses to the critical path of
+the dependency DAG, and p95 stays flat under contention (aborts are
+variance, and retries steal cores other lanes need on a 12-core budget).
+Parallelism comes from the workload's TRUE structure: distinct pools /
+books / vaults / senders proceed independently; each hot domain is
+internally sequential — which is what it actually is. Validation still
+runs underneath as an invariant check (a misprediction re-executes and
+retrains the stats), so a wrong heuristic degrades throughput for a
+block, never state.
+
+## The strategy stack
+
+Each sequenced tx is assigned one strategy, evaluated top-down —
+exact structural knowledge first, statistics second, pessimism as the
+default when neither speaks:
+
+1. **`System` — serial barrier lane** (exact). Deposits and epoch
+   records: own commit semantics, rare, never concurrent with anything
+   (same reasoning as the validator's batch path, #151).
+2. **`SenderChain`** (exact, no stats needed). Same-sender txs are
+   always ordered — nonce succession and gas-balance flow make this a
+   hard data dependency. Free and precise: cross-sender parallelism is
+   the one form of independence that needs no prediction for the
+   *sender's own* accounts.
+3. **`Accumulator` deferred writes** (exact by algebra). Slots that are
+   only ever ADDED to and not read mid-block — the fee sink above all
+   (if every tx credits the beneficiary, it is a universal serializer
+   that would chain the entire block). Such writes are recorded as
+   deltas and folded at commit in canonical order (the Aptos
+   aggregator trick). P0 must confirm from real BALs which slots
+   qualify (expected: beneficiary balance; candidates: monotone
+   counters that no same-block tx reads).
+4. **`DomainChain { domains }`** (stats-driven, the workhorse). The
+   predictor maps the tx to the contention DOMAINS it will touch —
+   fixed slots of a `(to, selector)` (a pool's reserves), arg-derived
+   instances (pool-pair, CLOB market id resolved from calldata).
+   Within each domain, member txs are chained in canonical order; a tx
+   touching several domains joins all their chains (its ready-time is
+   the max of its predecessors). The DAG is the union of per-domain
+   chains — pessimistic by construction: predicted overlap ⇒ ordered.
+5. **`Independent`** (stats-driven, the bounded optimism). Only when
+   the ENTIRE predicted footprint is sender-derived slots of distinct
+   senders (the plain-transfer / distinct-user-balance class) does a tx
+   run with no incoming edges beyond its SenderChain. This is the one
+   place a prediction miss can cause an abort — it is narrow by
+   design, and v1 may ship with it disabled (pure pessimism) until P0
+   quantifies the win.
+6. **`Tail` — the pessimistic default.** Cold selectors, low-confidence
+   stats, unpredictable footprints, adversarial calldata: join the
+   global serial lane at the block's end, canonical order. NOT
+   optimistic — "when unsure, serialize" is the inversion of classic
+   Block-STM that the correlation profile demands. Bounded damage:
+   sequential throughput, i.e. today's.
+
+**Adaptive feedback** closes the loop: after each block the actual BAL
+(free, in-process) grades every prediction. A selector whose
+`DomainChain`/`Independent` predictions miss demotes toward `Tail`
+(conservative immediately); sustained accuracy promotes back. The stats
+are a rolling window — the stream retrains them in minutes, so a
+contract that changes behavior (proxy upgrade) self-corrects.
+
+**Failure semantics under pessimism**: a validation miss is not routine
+— it means the stats were wrong. Response: re-execute the tx at its
+canonical position (correctness), demote the selector (learning), and
+count it (`stm_misprediction_total` — its rate is THE health metric of
+the whole approach; alert when it leaves ~zero).
 
 ## Phases
 
@@ -67,10 +132,22 @@ per `(to, first-4-bytes-of-calldata)`:
 - gas histogram (the scheduler also wants to length-balance waves).
 
 Deliverable: a report on the bench DeFi mix + real-Uniswap workload —
-**prediction hit-rate per selector** and the implied wave-parallelism of
-recorded blocks (how wide the predicted conflict graph's antichains are).
-This number decides whether P2 is worth building: if predicted
-parallelism on realistic mixes is < ~3×, stop here.
+**prediction hit-rate per selector**, plus the numbers pessimistic
+scheduling lives or dies by:
+
+- **critical-path ratio**: block gas ÷ longest domain-chain gas — the
+  theoretical speedup under pessimism (NOT antichain width; with
+  chains, wall time = critical path). If realistic mixes give < ~3×,
+  stop here.
+- **domain-population distribution**: how block gas spreads across
+  domains (one dominant pool ⇒ its chain IS the block — Amdahl-honest).
+- **over-merge cost**: parallelism a perfect oracle would find that
+  pessimism gives up (predicted-conflict, actually-independent) — the
+  price paid for zero aborts; if large, the domain model is too coarse.
+- **join density**: fraction of txs spanning >1 domain (DAG complexity).
+- **fee-sink check**: is a beneficiary/fee slot written by every tx in
+  the recorded BALs (⇒ the `Accumulator` strategy is mandatory, not
+  optional)?
 
 ### P1 — shadow scheduler (in the executor, measurement only)
 
@@ -90,16 +167,18 @@ Costs a hash-map pass per block; no execution change; runs behind
   `(slot, version-observed)`; a read at index i sees the highest write
   below i, else the block-input view (the same layering `ExecScope`
   already encodes — MvCache is its concurrent sibling).
-- Workers execute txs optimistically in canonical-index order given by
-  the scheduler (predicted-independent first; predicted chains as
-  explicit dependencies; unpredictable txs in a serial lane).
+- Workers pull DAG-READY txs (all predecessors executed) — pessimistic
+  chains mean a tx's reads of its domains see its chain predecessor's
+  writes deterministically through MvCache, not speculatively.
 - Validation: after tx i's execution, its recorded read-set is checked
   against writes committed by txs < i that landed AFTER i read (the
   standard STM invalidation); revm's Bal capture already tracks read
-  sets natively — the same machinery the validator's claims use.
-  Aborted txs re-execute; commit is strictly in canonical order, so
-  receipts, cumulative gas, the BAL, and the delta are BYTE-IDENTICAL
-  to sequential execution by construction.
+  sets natively — the same machinery the validator's claims use. Under
+  pessimistic scheduling this check is expected to fire ~never (only
+  `Independent` mispredictions can trip it); each firing re-executes
+  the tx and demotes the selector. Commit is strictly in canonical
+  order, so receipts, cumulative gas, the BAL, and the delta are
+  BYTE-IDENTICAL to sequential execution by construction.
 - Deposits and epoch records take the serial lane (rare; own commit
   semantics — same reasoning as the validator's batch path, #151).
 
