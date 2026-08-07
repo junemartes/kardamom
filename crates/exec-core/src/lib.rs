@@ -30,6 +30,7 @@ pub mod executor;
 pub mod metrics;
 #[cfg(feature = "std")]
 pub mod state;
+pub mod stateless;
 pub mod witness;
 
 pub use block_env::ExecEnv;
@@ -38,6 +39,9 @@ pub use error::{EngineError, ExecutorError};
 pub use exec_types::{CMessage, ReceiptStatus, TxIndex};
 #[cfg(feature = "std")]
 pub use state::{MockStateDatabase, MockStateError, MutatingSnapshotSource, StaticSnapshotSource};
+pub use stateless::{
+    BlockExecOutput, BufferedRecord, execute_block, execute_block_stateless, verify_record_identity,
+};
 #[cfg(feature = "std")]
 pub use witness::WitnessRecorder;
 pub use witness::{WitnessDb, WitnessError};

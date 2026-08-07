@@ -23,6 +23,13 @@ pub enum ExecutorError {
     #[error("revm execution failure at tx {idx:?}: {detail}")]
     Execution { idx: TxIndex, detail: String },
 
+    /// A stateless (guest-shaped) execution re-derived a tx record's
+    /// identity from its raw bytes and it contradicts what the envelope
+    /// carries — forged/corrupt `sender` or `tx_hash`. Never produced by
+    /// the live pipeline, which trusts the proxy's fields (S0).
+    #[error("record identity mismatch: {0}")]
+    RecordIdentity(String),
+
     #[error("out-of-order tx_idx: got {got:?}, expected {expected:?}")]
     OutOfOrderTx { got: TxIndex, expected: TxIndex },
 
