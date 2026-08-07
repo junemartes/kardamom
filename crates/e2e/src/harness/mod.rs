@@ -15,6 +15,7 @@
 pub mod aeron;
 pub mod inject;
 pub mod l1;
+pub mod l1_verified;
 pub mod l2;
 pub mod metrics;
 pub mod proc;
@@ -48,6 +49,12 @@ pub struct StackConfig {
     /// Trie shadow-check cadence for the validator (`Some(1)` = every block,
     /// the semantics-suite default; the cluster runs 8).
     pub trie_shadow_check: Option<u64>,
+    /// Route the VALIDATOR's L1 reads through the mock verified endpoint
+    /// (`l1_verified`), the way production routes them through a light client.
+    /// The da-watcher keeps talking to anvil directly — only the VERIFIER's
+    /// view is interposed, so a fault isolates to verification instead of
+    /// also corrupting the epochs being produced.
+    pub verified_l1: bool,
     /// Which L2 genesis to run. Bridge scenarios need
     /// [`Genesis::DevWithdrawals`] for the `L2ToL1MessagePasser` predeploy.
     pub genesis: Genesis,
@@ -95,6 +102,7 @@ impl Default for StackConfig {
             genesis: Genesis::ClusterDev,
             l1: false,
             archive_durability: false,
+            verified_l1: false,
         }
     }
 }
@@ -114,6 +122,7 @@ pub struct LocalStack {
     // order.
     ingress: SpawnedIngress,
     da_watcher: Option<Spawned>,
+    verified_l1: Option<crate::harness::l1_verified::VerifiedL1>,
     executor: Spawned,
     validator: Option<Spawned>,
     sequencers: Vec<Spawned>,
@@ -258,11 +267,27 @@ impl LocalStack {
             oracle: l.oracle.to_string(),
             attester_key: l1::ATTESTER_KEY.to_string(),
         });
+        // Interpose the mock verified endpoint on the VALIDATOR's L1 view only.
+        // The da-watcher keeps reading anvil directly, so a fault isolates to
+        // verification rather than also corrupting the epochs under test.
+        let verified_l1 = match (cfg.verified_l1, l1.as_ref()) {
+            (true, Some(l)) => {
+                Some(crate::harness::l1_verified::VerifiedL1::spawn(&l.rpc_url()).await?)
+            }
+            _ => None,
+        };
+        let validator_wiring = match (&wiring, &verified_l1) {
+            (Some(w), Some(v)) => Some(services::L1Wiring {
+                rpc_url: v.url(),
+                ..w.clone()
+            }),
+            _ => wiring.clone(),
+        };
         let validator = if cfg.validator {
             Some(services::spawn_validator(
                 &spec,
                 cfg.trie_shadow_check,
-                wiring.as_ref(),
+                validator_wiring.as_ref(),
             )?)
         } else {
             None
@@ -277,6 +302,7 @@ impl LocalStack {
         let stack = Self {
             ingress,
             da_watcher,
+            verified_l1,
             executor,
             validator,
             sequencers,
@@ -435,6 +461,11 @@ impl LocalStack {
     /// SIGSTOP the DA watcher so no honest epoch competes with an injected
     /// one — the same determinism trick `suspend_executor` gives the BAL
     /// drill. Returns false when the stack has no watcher (no L1).
+    /// The mock verified L1 endpoint, when `StackConfig::verified_l1` is on.
+    pub fn verified_l1(&self) -> Option<&crate::harness::l1_verified::VerifiedL1> {
+        self.verified_l1.as_ref()
+    }
+
     pub fn suspend_da_watcher(&self) -> bool {
         match &self.da_watcher {
             Some(w) => {

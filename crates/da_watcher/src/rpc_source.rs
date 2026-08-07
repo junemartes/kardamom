@@ -61,7 +61,7 @@ where
         Ok(block.header.number)
     }
 
-    async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError> {
+    async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
         let block = self
             .provider
             .get_block_by_number(BlockNumberOrTag::Number(number))
@@ -73,7 +73,7 @@ where
                 // not an expected "not yet" like NotFinalized.
                 L1SourceError::Provider(format!("finalized L1 block {number} not found"))
             })?;
-        Ok(block.header.hash)
+        Ok((block.header.hash, block.header.parent_hash))
     }
 
     async fn deposit_logs(

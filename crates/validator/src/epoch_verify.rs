@@ -26,7 +26,7 @@
 
 use std::sync::Arc;
 
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use kardamom_engine::{EpochObserver, ExecutorError};
 use kardamom_types::EpochRecord;
 use kardamom_types::epoch::derive_epoch;
@@ -38,7 +38,8 @@ use crate::metrics;
 /// both sides read L1 through one shape (and tests can drive a fake).
 #[async_trait::async_trait]
 pub trait L1EpochSource: Send + Sync + 'static {
-    async fn block_hash(&self, number: u64) -> anyhow::Result<alloy_primitives::B256>;
+    /// `(hash, parent_hash)` of L1 block `number`, from one round trip.
+    async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)>;
     async fn deposit_logs(
         &self,
         lockbox: Address,
@@ -54,8 +55,8 @@ impl<T> L1EpochSource for T
 where
     T: kardamom_da_watcher::L1Source,
 {
-    async fn block_hash(&self, number: u64) -> anyhow::Result<alloy_primitives::B256> {
-        kardamom_da_watcher::L1Source::block_hash(self, number)
+    async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)> {
+        kardamom_da_watcher::L1Source::block_ids(self, number)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
@@ -83,6 +84,14 @@ pub enum EpochFault {
     /// The epoch names an L1 block whose hash is not what L1 reports —
     /// a different chain, or a fabricated epoch.
     HashMismatch { l1_number: u64 },
+    /// The epoch's L1 block does not descend from the previous epoch's: block
+    /// N's parent hash is not block N-1's hash. Consecutive origins must be
+    /// consecutive BLOCKS, not merely consecutive numbers.
+    ParentMismatch {
+        l1_number: u64,
+        expected_parent: B256,
+        got_parent: B256,
+    },
     /// Rule 4: the epoch names an L1 block that does not exist at or below
     /// finality, and still does not after the retry window. A chain cannot be
     /// anchored to an L1 block that has not happened.
@@ -114,6 +123,16 @@ impl std::fmt::Display for EpochFault {
             Self::HashMismatch { l1_number } => write!(
                 f,
                 "epoch for L1 block {l1_number} names a hash L1 does not report"
+            ),
+            Self::ParentMismatch {
+                l1_number,
+                expected_parent,
+                got_parent,
+            } => write!(
+                f,
+                "epoch for L1 block {l1_number} does not descend from the previous epoch: \
+                 its parent is {got_parent}, the previous epoch's block was {expected_parent} \
+                 — the origin sequence is numbered consecutively but is not one chain"
             ),
             Self::BlockBeyondFinality {
                 l1_number,
@@ -232,6 +251,11 @@ impl EpochVerifier {
             // hop through spawn_blocking per item; epochs arrive at L1 block
             // cadence (~1 per 12 s), so the hop is free.
             let rx = std::sync::Mutex::new(rx);
+            // The last epoch that VERIFIED, as the anchor the next one must
+            // descend from. Only a verified epoch becomes an anchor: chaining
+            // from an unchecked hash would let one accepted lie legitimise
+            // every block after it.
+            let mut anchor: Option<(u64, B256)> = None;
             loop {
                 let next = tokio::task::block_in_place(|| rx.lock().unwrap().recv());
                 let Ok(epoch) = next else {
@@ -247,8 +271,9 @@ impl EpochVerifier {
                 let mut attempt = 0u32;
                 loop {
                     attempt += 1;
-                    match verify_one(source.as_ref(), lockbox, &epoch).await {
+                    match verify_one(source.as_ref(), lockbox, &epoch, anchor).await {
                         Ok(()) => {
+                            anchor = Some((epoch.l1_number, epoch.l1_hash));
                             metrics::counter_epoch_verified();
                             break;
                         }
@@ -324,11 +349,27 @@ async fn verify_one<S: L1EpochSource + ?Sized>(
     source: &S,
     lockbox: Address,
     epoch: &EpochRecord,
+    previous: Option<(u64, B256)>,
 ) -> Result<(), VerifyOutcome> {
-    let hash = source
-        .block_hash(epoch.l1_number)
+    let (hash, parent) = source
+        .block_ids(epoch.l1_number)
         .await
         .map_err(VerifyOutcome::Unavailable)?;
+    // CHAIN the origins. Verifying each block in isolation lets an L1 endpoint
+    // serve any hash it likes for any number; requiring block N to descend
+    // from block N-1 forces it to fabricate a consistent chain instead. Costs
+    // nothing — the parent hash came back in the same header. Only checked for
+    // the immediate predecessor, which the sequence rules already require.
+    if let Some((prev_number, prev_hash)) = previous
+        && prev_number + 1 == epoch.l1_number
+        && parent != prev_hash
+    {
+        return Err(VerifyOutcome::Fault(EpochFault::ParentMismatch {
+            l1_number: epoch.l1_number,
+            expected_parent: prev_hash,
+            got_parent: parent,
+        }));
+    }
     let logs = source
         .deposit_logs(lockbox, epoch.l1_number, epoch.l1_number)
         .await
@@ -558,5 +599,114 @@ mod tests {
         };
         let m = f.to_string();
         assert!(m.contains("52") && m.contains("8 attempts"), "{m}");
+    }
+
+    /// A fake L1 whose blocks are whatever the test says they are — the shape
+    /// a lying or buggy endpoint takes.
+    struct FakeL1 {
+        blocks: std::collections::BTreeMap<u64, (B256, B256)>,
+    }
+
+    #[async_trait::async_trait]
+    impl L1EpochSource for FakeL1 {
+        async fn block_ids(&self, number: u64) -> anyhow::Result<(B256, B256)> {
+            self.blocks
+                .get(&number)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("finalized L1 block {number} not found"))
+        }
+        async fn deposit_logs(
+            &self,
+            _lockbox: Address,
+            _from: u64,
+            _to: u64,
+        ) -> anyhow::Result<Vec<DepositLog>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn lockbox() -> Address {
+        address!("0000000000000000000000000000000000C0DE01")
+    }
+
+    #[tokio::test]
+    async fn a_properly_chained_pair_of_epochs_verifies() {
+        let (h7, h8) = (B256::repeat_byte(0x77), B256::repeat_byte(0x88));
+        let l1 = FakeL1 {
+            blocks: [(7, (h7, B256::repeat_byte(0x66))), (8, (h8, h7))]
+                .into_iter()
+                .collect(),
+        };
+        let e7 = derive_epoch(7, h7, &[]).unwrap();
+        let e8 = derive_epoch(8, h8, &[]).unwrap();
+
+        assert!(verify_one(&l1, lockbox(), &e7, None).await.is_ok());
+        assert!(verify_one(&l1, lockbox(), &e8, Some((7, h7))).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_epoch_that_does_not_descend_from_its_predecessor_is_caught() {
+        // The lie the per-block check CANNOT see: block 8 exists, its hash
+        // matches what the epoch claims, and its deposits match — but it is
+        // not built on block 7. Numbered consecutively, not one chain.
+        let (h7, h8) = (B256::repeat_byte(0x77), B256::repeat_byte(0x88));
+        let orphan_parent = B256::repeat_byte(0xEE);
+        let l1 = FakeL1 {
+            blocks: [(8, (h8, orphan_parent))].into_iter().collect(),
+        };
+        let e8 = derive_epoch(8, h8, &[]).unwrap();
+
+        // Without an anchor the epoch passes — nothing to chain against.
+        assert!(verify_one(&l1, lockbox(), &e8, None).await.is_ok());
+
+        // With one, the break is caught.
+        let err = verify_one(&l1, lockbox(), &e8, Some((7, h7)))
+            .await
+            .unwrap_err();
+        match err {
+            VerifyOutcome::Fault(EpochFault::ParentMismatch {
+                l1_number,
+                expected_parent,
+                got_parent,
+            }) => {
+                assert_eq!(l1_number, 8);
+                assert_eq!(expected_parent, h7);
+                assert_eq!(got_parent, orphan_parent);
+            }
+            VerifyOutcome::Fault(other) => panic!("wrong fault: {other}"),
+            VerifyOutcome::Unavailable(e) => panic!("expected a fault, got {e}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chaining_is_skipped_across_a_gap_in_the_anchor() {
+        // After a deferred (unverified) epoch the anchor goes stale, so the
+        // next epoch is not the anchor's successor. Chaining must SKIP rather
+        // than report a false parent mismatch — the sequence rules already
+        // reject genuine gaps, and inventing a divergence here would halt a
+        // healthy validator over an L1 blip.
+        let h9 = B256::repeat_byte(0x99);
+        let l1 = FakeL1 {
+            blocks: [(9, (h9, B256::repeat_byte(0xAB)))].into_iter().collect(),
+        };
+        let e9 = derive_epoch(9, h9, &[]).unwrap();
+
+        // Anchor is block 7, this is block 9 — not adjacent, so no chain check.
+        assert!(
+            verify_one(&l1, lockbox(), &e9, Some((7, B256::repeat_byte(0x77))))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn parent_mismatch_message_names_both_hashes() {
+        let f = EpochFault::ParentMismatch {
+            l1_number: 8,
+            expected_parent: B256::repeat_byte(0x77),
+            got_parent: B256::repeat_byte(0xEE),
+        };
+        let m = f.to_string();
+        assert!(m.contains("8") && m.contains("not one chain"), "{m}");
     }
 }
