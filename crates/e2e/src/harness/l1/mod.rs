@@ -14,91 +14,37 @@
 //!   debugging time; it is the single most important line in this file.)
 //! - `block_time(1)` so blocks are produced without explicit mining.
 
+mod contracts;
+
 use std::time::Duration;
 
 use alloy_network::EthereumWallet;
-use alloy_primitives::{Address, B256, Bytes, U256, address};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{Provider, ProviderBuilder};
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::sol;
 use anyhow::{Context, Result};
 use kardamom_deployer::addresses::{ERC7955_FACTORY, ERC7955_RUNTIME_HEX};
 use kardamom_deployer::{ContractId, Deployer, Op, encode_address_pair, encode_oracle_init_args};
 
-/// Factory owner; impersonated on anvil rather than key-signed.
-pub const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
-/// The L2 minter authorized on the lockbox (unused by these scenarios, which
-/// exercise the deposit/withdraw paths rather than minter-gated calls).
-pub const L2_MINTER: Address = address!("00000000000000000000000000000000000000BE");
-
-/// Anvil dev account #0 — the oracle's attester (and the account prefunded by
-/// `chains/dev-withdrawals.toml` on L2).
-pub const ATTESTER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
-pub const ATTESTER_ADDR: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-/// Anvil dev account #1 — the oracle's challenger, and the EOA these
-/// scenarios deposit from.
-pub const DEPOSITOR_KEY: &str =
-    "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-pub const DEPOSITOR_ADDR: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
-/// Anvil dev account #2 — the batcher EOA. It must be a REAL funded key: the
-/// DA path sends genuine EIP-4844 blob transactions, which cannot be
-/// impersonated.
-pub const BATCHER_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
-pub const BATCHER_ADDR: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
+pub use contracts::*;
 
 /// Short finalization window so a scenario can warp past it quickly (the
 /// production default is 86_400).
 pub const FINALIZATION_WINDOW: u64 = 60;
 
-sol! {
-    #[sol(rpc)]
-    contract ETHLockbox {
-        struct WithdrawalTransaction {
-            uint256 nonce;
-            address sender;
-            address target;
-            uint256 value;
-        }
-        function depositETH(address to, uint64 gasLimit, bytes calldata data) external payable;
-        function outputOracle() external view returns (address);
-        function finalizeWithdrawal(
-            WithdrawalTransaction calldata wtx,
-            uint256 outputIndex,
-            bytes32 stateRoot,
-            bytes32 withdrawalsRoot,
-            uint256 leafIndex,
-            bytes32[] calldata proof
-        ) external;
-        event DepositInitiated(
-            uint64 indexed depositNonce,
-            address indexed from,
-            address indexed to,
-            uint256 mint,
-            uint64 gasLimit,
-            bytes data
-        );
-    }
+/// The receipt type the wallet providers hand back.
+type L1TxReceipt = <alloy_network::Ethereum as alloy_network::Network>::ReceiptResponse;
 
-    #[sol(rpc)]
-    contract WithdrawalOutputOracle {
-        function outputCount() external view returns (uint256);
-        function outputRootAt(uint256 index) external view returns (bytes32);
-        function isFinalizable(uint256 index) external view returns (bool);
-    }
-
-    /// The L2 predeploy at `kardamom_types::withdrawals::MESSAGE_PASSER`.
-    /// No Rust binding exists in the workspace, so declare one here.
-    #[sol(rpc)]
-    contract L2ToL1MessagePasser {
-        function initiateWithdrawal(address target) external payable;
-        event MessagePassed(
-            uint256 indexed nonce,
-            address indexed sender,
-            address indexed target,
-            uint256 value,
-            bytes32 withdrawalHash
-        );
-    }
+/// Provider without a wallet (reads + `anvil_*` cheatcodes), tuned for tests
+/// (50 ms poll). Takes the URL by value and captures no lifetime, so the
+/// result is usable where `'static` is required (`deposit_logs` hands it to
+/// `L1Source`).
+fn provider_for(url: String) -> impl Provider + Clone {
+    let p = ProviderBuilder::new()
+        .disable_recommended_fillers()
+        .connect_http(url.parse().expect("valid anvil RPC url"));
+    p.client().set_poll_interval(Duration::from_millis(50));
+    p
 }
 
 /// A running anvil L1 with the bridge contracts deployed.
@@ -124,12 +70,7 @@ impl L1 {
             return Ok(None);
         };
 
-        let deploy_provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(anvil.endpoint_url());
-        deploy_provider
-            .client()
-            .set_poll_interval(Duration::from_millis(50));
+        let deploy_provider = provider_for(anvil.endpoint());
 
         let _: serde_json::Value = deploy_provider
             .raw_request(
@@ -234,11 +175,7 @@ impl L1 {
 
     /// Provider without a wallet (reads + anvil_* cheatcodes).
     pub fn provider(&self) -> impl Provider + Clone {
-        let p = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(self.anvil.endpoint_url());
-        p.client().set_poll_interval(Duration::from_millis(50));
-        p
+        provider_for(self.anvil.endpoint())
     }
 
     /// Provider that signs with `key`.
@@ -275,6 +212,23 @@ impl L1 {
         self.mine(2).await
     }
 
+    /// The `(block_hash, block_number, log_index)` of the `DepositInitiated`
+    /// log carried by a `depositETH` receipt (which must be successful).
+    fn deposit_log(&self, receipt: &L1TxReceipt) -> Result<(B256, u64, u64)> {
+        anyhow::ensure!(receipt.status(), "depositETH reverted");
+        let log = receipt
+            .inner
+            .logs()
+            .iter()
+            .find(|l| l.address() == self.lockbox)
+            .context("no DepositInitiated log from the lockbox")?;
+        Ok((
+            log.block_hash.context("log carries no block hash")?,
+            log.block_number.context("log carries no block number")?,
+            log.log_index.context("log carries no index")?,
+        ))
+    }
+
     /// `depositETH(to, gas_limit, "")` with `value` wei, from `DEPOSITOR_ADDR`.
     /// Returns the L1 block hash and log index the OP-style `source_hash` is
     /// derived from.
@@ -290,15 +244,7 @@ impl L1 {
             .get_receipt()
             .await
             .context("depositETH receipt")?;
-        anyhow::ensure!(receipt.status(), "depositETH reverted");
-        let log = receipt
-            .inner
-            .logs()
-            .iter()
-            .find(|l| l.address() == self.lockbox)
-            .context("no DepositInitiated log from the lockbox")?;
-        let block_hash = log.block_hash.context("log carries no block hash")?;
-        let log_index = log.log_index.context("log carries no index")?;
+        let (block_hash, _block_number, log_index) = self.deposit_log(&receipt)?;
         Ok((block_hash, log_index))
     }
 
@@ -316,11 +262,7 @@ impl L1 {
         value: U256,
     ) -> Result<Vec<(B256, u64, u64)>> {
         let provider = self.wallet(DEPOSITOR_KEY)?;
-        let raw = self.provider();
-        let _: serde_json::Value = raw
-            .raw_request("evm_setAutomine".into(), (false,))
-            .await
-            .context("evm_setAutomine(false)")?;
+        self.pause_block_production().await?;
 
         let lockbox = ETHLockbox::new(self.lockbox, &provider);
         let mut pending = Vec::new();
@@ -334,14 +276,12 @@ impl L1 {
             pending.push(p);
         }
 
-        let _: serde_json::Value = raw
+        let _: serde_json::Value = self
+            .provider()
             .raw_request("evm_mine".into(), ())
             .await
             .context("evm_mine (seal batch)")?;
-        let _: serde_json::Value = raw
-            .raw_request("evm_setAutomine".into(), (true,))
-            .await
-            .context("evm_setAutomine(true)")?;
+        self.resume_block_production().await?;
 
         let mut out = Vec::new();
         for p in pending {
@@ -349,42 +289,33 @@ impl L1 {
                 .get_receipt()
                 .await
                 .context("batched depositETH receipt")?;
-            anyhow::ensure!(receipt.status(), "batched depositETH reverted");
-            let log = receipt
-                .inner
-                .logs()
-                .iter()
-                .find(|l| l.address() == self.lockbox)
-                .context("no DepositInitiated log from the lockbox")?;
-            out.push((
-                log.block_hash.context("log carries no block hash")?,
-                log.block_number.context("log carries no block number")?,
-                log.log_index.context("log carries no index")?,
-            ));
+            out.push(self.deposit_log(&receipt)?);
         }
         Ok(out)
+    }
+
+    /// `evm_setAutomine` — the single switch behind
+    /// [`pause_block_production`](Self::pause_block_production) /
+    /// [`resume_block_production`](Self::resume_block_production).
+    async fn set_automine(&self, on: bool) -> Result<()> {
+        let _: serde_json::Value = self
+            .provider()
+            .raw_request("evm_setAutomine".into(), (on,))
+            .await
+            .with_context(|| format!("evm_setAutomine({on})"))?;
+        Ok(())
     }
 
     /// Stop L1 block production entirely (anvil runs with `block_time(1)`, so
     /// simply not calling [`mine`](Self::mine) does NOT make L1 idle).
     /// Pairs with [`resume_block_production`](Self::resume_block_production).
     pub async fn pause_block_production(&self) -> Result<()> {
-        let _: serde_json::Value = self
-            .provider()
-            .raw_request("evm_setAutomine".into(), (false,))
-            .await
-            .context("evm_setAutomine(false)")?;
-        Ok(())
+        self.set_automine(false).await
     }
 
     /// Resume automatic L1 block production.
     pub async fn resume_block_production(&self) -> Result<()> {
-        let _: serde_json::Value = self
-            .provider()
-            .raw_request("evm_setAutomine".into(), (true,))
-            .await
-            .context("evm_setAutomine(true)")?;
-        Ok(())
+        self.set_automine(true).await
     }
 
     /// Latest finalized L1 block number — the same view the da-watcher tails.
@@ -408,12 +339,9 @@ impl L1 {
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<kardamom_types::DepositLog>> {
-        // Built locally rather than via `provider()`: that returns an
+        // Via `provider_for` rather than `provider()`: the method returns an
         // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
-        let provider = ProviderBuilder::new()
-            .disable_recommended_fillers()
-            .connect_http(self.anvil.endpoint_url());
-        let source = kardamom_da_watcher::RpcL1Source::new(provider);
+        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
         kardamom_da_watcher::L1Source::deposit_logs(&source, self.lockbox, from_block, to_block)
             .await
             .context("read deposit logs")
