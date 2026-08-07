@@ -14,6 +14,26 @@
 NOMAD_ADDR_INT="${NOMAD_ADDR_INT:-http://192.168.56.10:4646}"
 CONTROL="${CONTROL:-kardamom-control-0}"
 
+# Shared log/fail (previously redefined per script). smoke.sh, smoke-load.sh
+# and local-cluster.sh keep their own definitions (their fail semantics differ:
+# "RESULT: FAIL — ..." is part of their output contract) — they do not source
+# this file's log/fail.
+#
+# FAIL_PREFIX: set BEFORE sourcing to brand the failure line (chaos.sh sets
+# "CHAOS FAIL" so its CI-log contract is unchanged).
+FAIL_PREFIX="${FAIL_PREFIX:-FAIL}"
+log() { echo "==> $*"; }
+fail() {
+  # BOTH streams (chaos.sh's dual-stream fail, kept verbatim): stderr for the
+  # exit path, stdout so the message lands in-order in the CI log next to the
+  # case's own lines (a fail seen only on a reordered/dropped stderr reads as
+  # a silent death — observed on run 30281 series: a case aborted with no
+  # visible CHAOS FAIL line).
+  echo "${FAIL_PREFIX}: $*"
+  echo "${FAIL_PREFIX}: $*" >&2
+  exit 1
+}
+
 # Run a command on the control node with NOMAD_ADDR set. $1 is a bash snippet
 # (may reference "$1".."$N"); remaining args are passed positionally.
 on_control() {

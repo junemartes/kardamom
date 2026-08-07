@@ -108,6 +108,14 @@ log()  { echo "==> $*"; }
 warn() { echo "WARN: $*" >&2; }
 fail() { echo "RESULT: FAIL — $*" >&2; exit 1; }
 
+# Shared node-class model + Prometheus scrape/parse helpers. Neither lib
+# defines log/fail — the "RESULT: FAIL" contract above stays this script's.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/cluster/scripts/lib-topology.sh
+source "${SCRIPT_DIR}/lib-topology.sh"
+# shellcheck source=deploy/cluster/scripts/lib-metrics.sh
+source "${SCRIPT_DIR}/lib-metrics.sh"
+
 # --- config -----------------------------------------------------------------
 RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 CHAIN_ID="${CHAIN_ID:-412346}"
@@ -123,11 +131,9 @@ GAS_PRICE="${GAS_PRICE:-1000000000}"
 VALUE="${VALUE:-1}"
 TO="${TO:-0x000000000000000000000000000000000000dEaD}"
 
-EXECUTOR_NODES="${EXECUTOR_NODES:-kardamom-executor-0 kardamom-executor-1 kardamom-executor-2}"
-SEALER_NODE="${SEALER_NODE:-kardamom-executor-0}"
-EXECUTOR_METRICS_PORT="${EXECUTOR_METRICS_PORT:-9004}"
+# EXECUTOR_NODES (env-string override honored), SEALER_NODE,
+# EXECUTOR_METRICS_PORT and EXECUTOR_BLOCK_METRIC come from lib-topology.sh.
 SEALER_METRICS_PORT="${SEALER_METRICS_PORT:-9004}"
-EXECUTOR_BLOCK_METRIC="${EXECUTOR_BLOCK_METRIC:-kardamom_executor_block_number}"
 SEALER_BLOCK_METRIC="${SEALER_BLOCK_METRIC:-kardamom_sealer_block_number}"
 METRICS_VIA_DOCKER="${METRICS_VIA_DOCKER:-1}"
 
@@ -194,7 +200,7 @@ cat <<EOF
     senders=${SMOKE_SENDERS}  nonce-start=${SMOKE_NONCE_START}
     target tx=${TX_TOTAL}  (duration=${SMOKE_DURATION_S}s tps=${SMOKE_TPS}${SMOKE_TX_COUNT:+  tx-count override=${SMOKE_TX_COUNT}})
     receipt-timeout=${SMOKE_RECEIPT_TIMEOUT_S}s  max-gap=${SMOKE_MAX_GAP}
-    executors=[${EXECUTOR_NODES}] sealer=[${SEALER_NODE}] via-docker=${METRICS_VIA_DOCKER}
+    executors=[${EXECUTOR_NODES_STR}] sealer=[${SEALER_NODE}] via-docker=${METRICS_VIA_DOCKER}
 EOF
 
 # ---------------------------------------------------------------------------
@@ -227,69 +233,38 @@ ingress_block_number() {
 # ---------------------------------------------------------------------------
 
 # Fetch a node's /metrics body. $1=node-container $2=ip $3=port
+# METRICS_VIA_DOCKER keeps its documented either/or semantics (1 = docker-exec
+# ONLY, 0 = direct bridge ONLY — no silent fallback to the other transport,
+# which could scrape the wrong endpoint and surface as a bogus verdict);
+# fetch_metrics (lib-metrics.sh) skips whichever leg gets an empty argument.
 scrape_metrics() {
   local node="$1" ip="$2" port="$3"
   if [[ "${METRICS_VIA_DOCKER}" == "1" ]]; then
-    docker exec "${node}" curl -fsS --max-time 5 "http://127.0.0.1:${port}/metrics" 2>/dev/null || true
+    fetch_metrics "" "${node}" "${port}" || true
   else
-    curl -fsS --max-time 5 "http://${ip}:${port}/metrics" 2>/dev/null || true
+    fetch_metrics "${ip}" "" "${port}" || true
   fi
 }
 
-# Pull the integer value of a single-series Prometheus gauge from a body.
-# $1=metrics-body  $2=metric-name. Prints the value (may be float-ish) or empty.
-metric_value() {
-  # Match lines like:  kardamom_executor_block_number{service="executor",...} 42
-  # Take the last whitespace-delimited field of the first matching sample line.
-  printf '%s' "$1" \
-    | grep -E "^${2}([{ ]|$)" \
-    | grep -v '^#' \
-    | head -1 \
-    | awk '{print $NF}'
-}
-
-# Integer-ize a possibly-scientific/float gauge value ("42", "42.0", "4.2e1").
-to_int() {
-  local v="$1"
-  [[ -z "${v}" ]] && { printf ''; return; }
-  awk -v x="${v}" 'BEGIN{ if (x=="" ) {print ""} else {printf "%d", x} }'
-}
-
 # Read a node's block-number metric as an integer (empty if unavailable).
+# prom_value (lib-metrics.sh) int-truncates float/scientific gauge renderings.
 # $1=node $2=ip $3=port $4=metric-name
 read_block_metric() {
-  local body val
+  local body
   body="$(scrape_metrics "$1" "$2" "$3")"
   [[ -z "${body}" ]] && { printf ''; return; }
-  val="$(metric_value "${body}" "$4")"
-  to_int "${val}"
+  prom_value "${body}" "$4" first
 }
 
 # Node -> IP map, generated from the node-class model in group_vars/all.yml
-# (the same single source of truth ci-cluster.sh materialises the cluster
-# from: <class>-<i> gets ip_prefix.<ip_start+i>). Only needed when
-# METRICS_VIA_DOCKER=0 (direct bridge scrapes); an unmappable node is a hard
-# error there — falling back to 127.0.0.1 would scrape the WRONG host and
-# surface as a bogus METRIC-MISSING.
-declare -A NODE_IP=()
-GROUP_VARS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ansible/group_vars/all.yml"
+# via lib-topology.sh's topology_load (the same single source of truth
+# ci-cluster.sh materialises the cluster from: <class>-<i> gets
+# ip_prefix.<ip_start+i>). Only needed when METRICS_VIA_DOCKER=0 (direct
+# bridge scrapes); an unmappable node is a hard error there — falling back to
+# 127.0.0.1 would scrape the WRONG host and surface as a bogus METRIC-MISSING.
 if [[ "${METRICS_VIA_DOCKER}" != "1" ]]; then
-  [[ -f "${GROUP_VARS}" ]] || fail "METRICS_VIA_DOCKER=0 needs ${GROUP_VARS} to derive node IPs"
-  while read -r _name _ip; do
-    [[ -z "${_name}" ]] && continue
-    NODE_IP["kardamom-${_name}"]="${_ip}"
-  done < <(python3 - "${GROUP_VARS}" <<'PY'
-# Same no-PyYAML regex parse as ci-cluster.sh / check-contract.py.
-import re, sys
-text = open(sys.argv[1]).read()
-pref = re.search(r'^ip_prefix:\s*"([\d.]+)"', text, re.M).group(1)
-for m in re.finditer(
-        r'^\s{2}(\w+):\s*\{\s*count:\s*(\d+),\s*ip_start:\s*(\d+)', text, re.M):
-    cls, count, ip_start = m.group(1), int(m.group(2)), int(m.group(3))
-    for i in range(count):
-        print(f"{cls}-{i} {pref}.{ip_start + i}")
-PY
-  )
+  topology_load \
+    || fail "METRICS_VIA_DOCKER=0 needs ${TOPOLOGY_GROUP_VARS} to derive node IPs"
 fi
 node_ip() {
   if [[ "${METRICS_VIA_DOCKER}" == "1" ]]; then
@@ -335,7 +310,7 @@ log "signed ${#RAW_TXS[@]} txs."
 # ---------------------------------------------------------------------------
 log "capturing baseline block metrics..."
 declare -A EXEC_BASE
-for node in ${EXECUTOR_NODES}; do
+for node in "${EXECUTOR_NODES[@]}"; do
   v="$(read_block_metric "${node}" "$(node_ip "${node}")" "${EXECUTOR_METRICS_PORT}" "${EXECUTOR_BLOCK_METRIC}")"
   EXEC_BASE["${node}"]="${v:-}"
   echo "    baseline ${EXECUTOR_BLOCK_METRIC}@${node} = ${v:-<unavailable>}"
@@ -507,7 +482,7 @@ METRIC_MISSING=0
 echo
 echo "---- keep-pace per executor ----"
 printf '%-16s %12s %12s %10s %8s %s\n' "node" "base_blk" "final_blk" "advanced" "gap" "verdict"
-for node in ${EXECUTOR_NODES}; do
+for node in "${EXECUTOR_NODES[@]}"; do
   fin="$(read_block_metric "${node}" "$(node_ip "${node}")" "${EXECUTOR_METRICS_PORT}" "${EXECUTOR_BLOCK_METRIC}")"
   base="${EXEC_BASE[$node]:-}"
 
