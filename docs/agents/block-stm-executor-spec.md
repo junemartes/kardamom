@@ -100,6 +100,44 @@ default when neither speaks:
    Block-STM that the correlation profile demands. Bounded damage:
    sequential throughput, i.e. today's.
 
+## The graph index — what a tx is keyed by
+
+Every tx contributes a set of ACCESS KEYS — each names a state cell (or
+semantically-merged cell group) with an access MODE (R/W) and a
+confidence. The DAG is built in ONE canonical-order pass over per-key
+last-access tables with standard RW semantics: readers share (no
+reader-reader edges), prior-writer -> reader, prior-readers +
+prior-writer -> writer. O(total keys), before anything executes.
+
+Key tiers, most-certain first:
+
+1. **Exact, from the envelope alone** — sender account (W: nonce +
+   gas balance; same-sender chains fall out automatically), recipient
+   account (W, when value > 0), created address (W, on CREATE — the
+   same-block deploy-then-call key; the burst-block lesson).
+2. **Computed instances** — stats supply the FORMULA, calldata the
+   VALUE: arg-derived `(contract, base_slot, arg)` (CLOB market, pool
+   pair — evaluate `keccak(arg ++ base)` against the tx's own
+   calldata) and principal-derived `(contract, base_slot, owner)`
+   (balances/allowances/shares — the principal is not always the
+   sender: `allowance(owner, spender)` keys on the owner ARG).
+3. **Semantic domains** — fixed slots every call of `(to, selector)`
+   touches regardless of caller/args (pool reserves, vault totals),
+   MERGED by measured co-access stability: slots that always co-write
+   are one contention key (reserve0/reserve1/cumulative = one domain,
+   not three). Keeps key counts small while matching the true
+   contention structure.
+4. **Boundaries** — Accumulator slots are EXCLUDED from the graph (a
+   fee sink as a key would chain every block; it bypasses via deferred
+   commutative folding). Everything unpredictable maps to the wildcard
+   key ⊤, which conflicts with all keys by definition — the `Tail`
+   lane expressed as a key, not a special case.
+
+Granularity is itself feedback-tuned per contract region: account-level
+(coarse) < slot-level (verbose) < domain-level (default). A domain that
+keeps convicting FALSE EDGES is too coarse and splits; keys that never
+disagree merge.
+
 **The objective is block wall time, never misprediction count.** A
 controller that minimizes mispredictions alone has a degenerate global
 optimum: chain everything — one thread, zero misses, zero speedup. The
