@@ -169,7 +169,15 @@ pub(super) fn run_session(
     egress_kind_filter: Option<Vec<u8>>,
     seams: SessionSeams,
 ) {
-    let mut s = SessionLoop::new(rt, cfg, initial, replay, subscribe, egress_kind_filter, seams);
+    let mut s = SessionLoop::new(
+        rt,
+        cfg,
+        initial,
+        replay,
+        subscribe,
+        egress_kind_filter,
+        seams,
+    );
     while !s.stop.load(Ordering::SeqCst) {
         // Whether THIS iteration moved anything (egress frames, offers, or
         // driver outbound frames) — drives the idle backoff.
