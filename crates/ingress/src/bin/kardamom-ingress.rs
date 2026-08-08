@@ -260,7 +260,8 @@ async fn main() -> Result<()> {
         }
         // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the
         // cluster session never contends with the tx_data publish / receipts work.
-        let cluster_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
+        let cluster_rt =
+            AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
         let (guard, mut observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
         // Blocking egress poll on a dedicated thread → durable count → bus.
@@ -592,5 +593,3 @@ impl IngressSubscription for LiveIngressSubscription {
         self.tx_errors.subscribe()
     }
 }
-
-

@@ -327,8 +327,7 @@ pub fn restore_or_fetch_checkpoint(
     peers: &[String],
     expected_genesis: Option<alloy_primitives::B256>,
 ) -> Result<Option<(u64, std::path::PathBuf)>> {
-    let restore =
-        || kardamom_state::restore_best_checkpoint(ckpt_dir, state_dir, expected_genesis);
+    let restore = || kardamom_state::restore_best_checkpoint(ckpt_dir, state_dir, expected_genesis);
     let mut restored = restore().context("restore local checkpoint")?;
     if restored.is_none()
         && !peers.is_empty()
@@ -343,7 +342,9 @@ pub fn restore_or_fetch_checkpoint(
 /// state cursor, or genesis for a fresh node. The cluster re-offers retained
 /// frames from the cursor on every session establishment, so tx_ordering is
 /// gapless across restarts AND session loss.
-pub fn cluster_replay_cursor(resume: Option<&crate::ResumePoint>) -> crate::reader::cluster::ReplayCursor {
+pub fn cluster_replay_cursor(
+    resume: Option<&crate::ResumePoint>,
+) -> crate::reader::cluster::ReplayCursor {
     match resume {
         Some(rp) => crate::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1),
         None => crate::reader::cluster::ReplayCursor::genesis(),

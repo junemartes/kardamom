@@ -17,13 +17,13 @@ use alloy_provider::ProviderBuilder;
 use anyhow::Context;
 use clap::Parser;
 
-use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_da_watcher::{
     DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, spawn as spawn_watcher,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
+use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::{BPosition, EpochRecord};
 
 #[derive(Debug, Parser)]
@@ -263,4 +263,3 @@ impl EpochPublisher for LiveTxDepositsPublisher {
         }
     }
 }
-

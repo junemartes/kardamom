@@ -193,7 +193,8 @@ async fn main() -> Result<()> {
     // from the tx_ordering MDC, its image dies, and the executor freezes
     // (reader stops, exec blocks reading). Isolating the publisher onto its own
     // thread keeps the subscription poll timely no matter the receipt load.
-    let rt_pub = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    let rt_pub =
+        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
 
     // --- State backend + crash-recovery decision (before the subscriptions,
     // because the tx_ordering subscription branches on whether we are resuming).

@@ -211,7 +211,8 @@ async fn main() -> anyhow::Result<()> {
     //
     // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the cluster
     // session never contends with the tx_data subscription on the main `rt`.
-    let cluster_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
+    let cluster_rt =
+        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn cluster AeronRuntime")?;
     let (cluster_guard, cluster_pub, cluster_egress) =
         kardamom_sequencer::outbound::cluster::cluster_ref_publisher_with_egress(
             cluster_rt,
@@ -341,7 +342,8 @@ async fn main() -> anyhow::Result<()> {
     // the main `rt`'s polling thread must stay dedicated to the tx_data
     // subscription (same isolation rationale as `cluster_rt` above; sharing
     // was observed to collapse the sequencer's sustainable ingest rate).
-    let receipts_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
+    let receipts_rt =
+        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
     // NOTE: in MDS mode each attached destination BINDS its UDP socket, so two
     // sequencer replicas on one host (seq-a + seq-b) would collide — MDS
     // receipts + co-located replicas needs per-group endpoint bases before it
@@ -456,7 +458,6 @@ async fn main() -> anyhow::Result<()> {
     drop(rt);
     Ok(())
 }
-
 
 type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
@@ -586,4 +587,3 @@ impl TxErrorPublisher for LiveTxErrorPub {
         }
     }
 }
-
