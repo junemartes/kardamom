@@ -1,5 +1,5 @@
-//! `kardamom-stm-p0` — Block-STM P0 report: oracle critical-path analysis
-//! + footprint-classifier grading over real workloads, offline, through
+//! `kardamom-stm-p0` — Block-STM P0 report: oracle critical-path analysis and
+//! footprint-classifier grading over real workloads, offline, through
 //! the real engine. (spec: docs/agents/block-stm-executor-spec.md)
 
 use alloy_primitives::U256;
