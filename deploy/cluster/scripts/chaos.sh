@@ -68,6 +68,7 @@
 #   CHAOS_RESTART_SLO_S      same-node restart SLO (default 30)
 #   CHAOS_RESCHEDULE_SLO_S   node-loss recovery SLO(default 120)
 #   CHAOS_LEADER_SLO_S       new-leader election SLO (default 30)
+#   CLUSTER_REJOIN_SLO_S     blank-member full-log-replay SLO (default 360)
 #   CHAOS_CASES              space-separated cases (default a representative subset)
 #   INJECT_DELAY             MIN secs of load before injecting (default 10)
 #   LOAD_FLOW_TIMEOUT_S      max extra secs to wait for load to actually flow
@@ -121,6 +122,14 @@ CHAOS_RESCHEDULE_SLO_S="${CHAOS_RESCHEDULE_SLO_S:-120}"
 # leader log line has to surface in the alloc's stdout AND nomad has to ship it,
 # so give it a generous window before we call it a failure.
 CHAOS_LEADER_SLO_S="${CHAOS_LEADER_SLO_S:-30}"
+# Budget for a WIPED cluster member to replay the log back to the head
+# (cluster-member-rejoin). Deliberately left at the 360s the case used before
+# its catch-up proof was corrected: the assertion got stricter, the time budget
+# did NOT get more generous. Blank-member replay measured ~12.5 blocks/s on the
+# dev host, so this covers the log this suite builds — a member that needs
+# longer is the O(lifetime-log) rejoin cost the audit tracks, and it should
+# fail here rather than surface as a stall in a later case.
+CLUSTER_REJOIN_SLO_S="${CLUSTER_REJOIN_SLO_S:-360}"
 CHAOS_CASES="${CHAOS_CASES:-graceful-executor hard-executor cluster-leader-kill node-failure-executor}"
 INJECT_DELAY="${INJECT_DELAY:-10}"
 LOAD_FLOW_TIMEOUT_S="${LOAD_FLOW_TIMEOUT_S:-60}"
