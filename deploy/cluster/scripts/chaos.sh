@@ -187,7 +187,8 @@ sealer_boundaries() {
   local i v best=""
   for i in "${!EXECUTOR_NODES[@]}"; do
     v="$(exec_metrics "${i}" \
-      | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
+      | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}' \
+      || true)"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
   [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
@@ -798,7 +799,8 @@ executor_progress() {
   local i v best=""
   for i in "${!EXECUTOR_NODES[@]}"; do
     v="$(exec_metrics "${i}" \
-      | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+      | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+      || true)"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
   [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
@@ -950,8 +952,13 @@ run_retention_overrun() { # <executor|validator>
   local p0 p1 t=0 live=0
   while [ "${t}" -lt 120 ]; do
     if [ "${kind}" = "executor" ]; then
+      # `|| true` is load-bearing (same as the reconvergence probe below):
+      # awk's early `exit` SIGPIPEs the scrape mid-body, and under pipefail
+      # that 141 kills the whole case with no fail() message. Empty p1 is
+      # defaulted right below.
       p1="$(exec_metrics "${RETENTION_VICTIM_EXEC_IDX}" \
-        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+        || true)"
     else
       p1="$(val_metric validator_committed_block)"
     fi
