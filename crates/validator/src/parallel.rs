@@ -442,6 +442,61 @@ pub fn build_seed<S: StateDatabase>(
 /// Execute one batch sequentially over `snapshot ∘ seed`. `first_index` is
 /// the batch's first bal index (1-based); receipts carry LOCAL cumulative
 /// gas.
+/// One canonical record through a block/batch execution scope — THE shared
+/// dispatch for the seeded-parallel batches and the sequential fallback.
+/// Txs run inside the scope; deposits run outside it (own commit semantics —
+/// the mint is durable even when the inner call reverts) with `delta`
+/// carrying this scope's earlier writes, and their writes are folded back
+/// into the scope cache so later records observe them (mirrors the actor's
+/// streaming path).
+///
+/// `parent` is whichever layer plays the parent role at the call site (the
+/// batch seed, or the pipelined-commit parent). The validator must dispatch
+/// records exactly like the executor: this helper and the actor's streaming
+/// arms are the two copies left — keep them in lockstep.
+#[allow(clippy::too_many_arguments)]
+fn exec_record_in_scope<'a, S: StateDatabase>(
+    scope: &mut kardamom_engine::executor::ExecScope<&'a S>,
+    snapshot: &'a S,
+    parent: Option<&PendingDelta>,
+    delta: &PendingDelta,
+    env: ExecEnv,
+    rec: &BufferedRecord,
+    idx_in_block: u64,
+    cumulative: u64,
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
+) -> Result<(Receipt, kardamom_engine::delta::WriteSet), ExecutorError> {
+    match rec {
+        BufferedRecord::Tx {
+            tx_idx,
+            envelope,
+            position,
+        } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, bal),
+        BufferedRecord::Deposit {
+            tx_idx,
+            deposit,
+            position,
+        } => {
+            let out = kardamom_engine::executor::execute_deposit_tx(
+                snapshot,
+                parent,
+                delta,
+                env,
+                *tx_idx,
+                *position,
+                deposit,
+                idx_in_block,
+                cumulative,
+                bal,
+            )?;
+            let mut layer = PendingDelta::new();
+            layer.apply(out.1.clone());
+            scope.seed_layer(&layer)?;
+            Ok(out)
+        }
+    }
+}
+
 pub fn execute_batch<S: StateDatabase>(
     snapshot: &S,
     seed: &PendingDelta,
@@ -472,49 +527,17 @@ pub fn execute_batch<S: StateDatabase>(
         // synthetic WriteSet path for deposits). Comparing a WriteSet
         // projection instead diverged on every live transfer — symmetric
         // construction is the only drift-proof comparison.
-        let (receipt, ws) = match rec {
-            BufferedRecord::Tx {
-                tx_idx,
-                envelope,
-                position,
-            } => scope.execute_tx(
-                *tx_idx,
-                *position,
-                envelope,
-                global_index_in_block,
-                cumulative,
-                Some((&mut batch_bal, bal_index)),
-            )?,
-            BufferedRecord::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            } => {
-                // Deposits run outside the scope (own commit semantics —
-                // the mint is durable even when the inner call reverts).
-                // The seed plays the parent role; `delta` carries this
-                // batch's earlier writes.
-                let out = kardamom_engine::executor::execute_deposit_tx(
-                    snapshot,
-                    Some(seed),
-                    &delta,
-                    env,
-                    *tx_idx,
-                    *position,
-                    deposit,
-                    global_index_in_block,
-                    cumulative,
-                    Some((&mut batch_bal, bal_index)),
-                )?;
-                // Fold the deposit's writes into the scope cache so later
-                // records in this batch observe them (mirrors the actor's
-                // streaming path and the sequential fallback).
-                let mut layer = PendingDelta::new();
-                layer.apply(out.1.clone());
-                scope.seed_layer(&layer)?;
-                out
-            }
-        };
+        let (receipt, ws) = exec_record_in_scope(
+            &mut scope,
+            snapshot,
+            Some(seed),
+            &delta,
+            env,
+            rec,
+            global_index_in_block,
+            cumulative,
+            Some((&mut batch_bal, bal_index)),
+        )?;
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
@@ -684,7 +707,7 @@ mod engine_tests {
     use alloy_primitives::{B256, TxKind, address};
     use alloy_signer_local::PrivateKeySigner;
     use kardamom_engine::exec_types::TxIndex;
-    use kardamom_engine::executor::execute_tx;
+    use kardamom_engine::executor::{execute_deposit_tx, execute_tx};
     use kardamom_engine::state::MockStateDatabase;
     use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, TxEnvelope};
 
@@ -830,8 +853,10 @@ mod engine_tests {
         delta
     }
 
-    /// One record through the free executor path (tx or deposit), the same
-    /// producer code the live executor runs.
+    /// One record through the FREE executor path (tx or deposit; a fresh
+    /// scope per call) — deliberately NOT `exec_record_in_scope`, so the
+    /// parity tests compare the shared production dispatch against an
+    /// independently-constructed reference instead of against itself.
     fn exec_record<S: StateDatabase>(
         snap: &S,
         parent: Option<&PendingDelta>,
@@ -1261,7 +1286,6 @@ mod engine_tests {
 // ---------------------------------------------------------------------------
 
 use kardamom_engine::actor::{BlockExec, BlockExecOutput};
-use kardamom_engine::executor::execute_deposit_tx;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1284,37 +1308,17 @@ pub fn execute_block_sequential<S: StateDatabase>(
     let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, parent, env)?;
     for (i, rec) in records.iter().enumerate() {
         let idx_in_block = i as u64;
-        let (receipt, ws) = match rec {
-            BufferedRecord::Tx {
-                tx_idx,
-                envelope,
-                position,
-            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
-            BufferedRecord::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            } => {
-                let out = execute_deposit_tx(
-                    snapshot,
-                    parent,
-                    &delta,
-                    env,
-                    *tx_idx,
-                    *position,
-                    deposit,
-                    idx_in_block,
-                    cumulative,
-                    None,
-                )?;
-                // Fold deposit writes into the scope cache (mirrors the
-                // actor's streaming path) so later txs observe them.
-                let mut layer = PendingDelta::new();
-                layer.apply(out.1.clone());
-                scope.seed_layer(&layer)?;
-                out
-            }
-        };
+        let (receipt, ws) = exec_record_in_scope(
+            &mut scope,
+            snapshot,
+            parent,
+            &delta,
+            env,
+            rec,
+            idx_in_block,
+            cumulative,
+            None,
+        )?;
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);

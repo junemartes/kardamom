@@ -159,6 +159,57 @@ pub fn read_manifest(checkpoint: &Path) -> Result<CheckpointManifest, StateError
     CheckpointManifest::parse(&text)
 }
 
+/// The two refusal checks every checkpoint image must pass before it can
+/// become this node's state — integrity (the bytes hash to what the source
+/// claims) and chain identity (the image belongs to this node's chain).
+/// Shared by the disk-restore path ([`verify_checkpoint`], hash claimed by
+/// the MANIFEST) and the peer-fetch path (hash claimed by the peer's
+/// headers): this is the recovery-C hardening, and a one-sided change here
+/// silently weakens whichever path stops getting it.
+///
+/// `image` names the image and `claimant` the source of the expected hash,
+/// for the refusal messages (tests assert on the CORRUPT / DIFFERENT CHAIN
+/// markers).
+pub(crate) fn check_image_identity(
+    image: &str,
+    claimant: &str,
+    got_keccak: B256,
+    want_keccak: B256,
+    image_genesis: B256,
+    expected_genesis: Option<B256>,
+) -> Result<(), StateError> {
+    if got_keccak != want_keccak {
+        return Err(StateError::Recovery(format!(
+            "checkpoint {image} is CORRUPT: image hashes to {got_keccak:#x}, \
+             {claimant} says {want_keccak:#x}"
+        )));
+    }
+    if let Some(want) = expected_genesis
+        && want != image_genesis
+    {
+        return Err(StateError::Recovery(format!(
+            "checkpoint {image} belongs to a DIFFERENT CHAIN: its genesis \
+             digest is {image_genesis:#x}, this node's is {want:#x}"
+        )));
+    }
+    Ok(())
+}
+
+/// Publish a staged checkpoint: manifest INSIDE the tmp entry, then one
+/// rename — image and manifest become visible atomically, so an observable
+/// checkpoint is always verifiable and self-contained under any copy
+/// mechanism. A crash before the rename leaves only the hidden tmp entry
+/// (swept by `sweep_stale_tmp` / re-fetched next time).
+pub(crate) fn publish_checkpoint(
+    tmp: &Path,
+    dest: &Path,
+    manifest: &CheckpointManifest,
+) -> Result<(), StateError> {
+    std::fs::write(tmp.join("MANIFEST"), manifest.encode())?;
+    std::fs::rename(tmp, dest)?;
+    Ok(())
+}
+
 /// Verify a checkpoint image against its manifest, and (when supplied)
 /// against the chain the caller expects. Returns the manifest.
 pub fn verify_checkpoint(
@@ -177,23 +228,14 @@ pub fn verify_checkpoint(
     let manifest = CheckpointManifest::parse(&text)?;
     let data = checkpoint_data_file(checkpoint)?;
     let got = file_keccak(&data)?;
-    if got != manifest.image_keccak {
-        return Err(StateError::Recovery(format!(
-            "checkpoint {} is CORRUPT: image hashes to {got:#x}, manifest says {:#x}",
-            checkpoint.display(),
-            manifest.image_keccak
-        )));
-    }
-    if let Some(want) = expected_genesis
-        && want != manifest.genesis_digest
-    {
-        return Err(StateError::Recovery(format!(
-            "checkpoint {} belongs to a DIFFERENT CHAIN: its genesis digest is \
-             {:#x}, this node's is {want:#x}",
-            checkpoint.display(),
-            manifest.genesis_digest
-        )));
-    }
+    check_image_identity(
+        &checkpoint.display().to_string(),
+        "manifest",
+        got,
+        manifest.image_keccak,
+        manifest.genesis_digest,
+        expected_genesis,
+    )?;
     Ok(manifest)
 }
 
@@ -221,17 +263,12 @@ pub fn create_checkpoint(
     let tmp = checkpoints_dir.join(format!(".{}.tmp", checkpoint_name(block)));
     let tmp_data = tmp.join("mdbx.dat");
     compact_to(env, &tmp_data)?;
-    // Manifest INSIDE the tmp dir, then one rename: image and manifest become
-    // visible atomically, so an observable checkpoint is always verifiable
-    // and self-contained under any copy mechanism. A crash before the rename
-    // leaves only the hidden tmp dir, swept by `sweep_stale_tmp`.
     let manifest = CheckpointManifest {
         block,
         image_keccak: file_keccak(&tmp_data)?,
         genesis_digest: stored_genesis_digest(env)?,
     };
-    std::fs::write(tmp.join("MANIFEST"), manifest.encode())?;
-    std::fs::rename(&tmp, &dest)?;
+    publish_checkpoint(&tmp, &dest, &manifest)?;
     info!(block, path = %dest.display(), "created state checkpoint");
     Ok(CheckpointInfo { block, path: dest })
 }
