@@ -1,0 +1,11 @@
+[package]
+name = "kardamom-footprint"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "kardamom_footprint"
+path = "src/lib.rs"
+
+[dependencies]
+alloy-primitives.workspace = true

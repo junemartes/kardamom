@@ -10,26 +10,8 @@ use kardamom_engine::{ExecEnv, PendingDelta, TxIndex};
 use kardamom_types::{BPosition, BlockBoundaryStart, StateDatabase, TxEnvelope};
 
 use super::Cell;
-
-/// One observed transaction: scheduling-time knowledge (sender, to,
-/// selector, args) + ground truth (reads, writes, gas).
-#[derive(Debug, Clone)]
-pub struct TxObs {
-    /// Global canonical index across the whole capture.
-    pub index: u64,
-    pub block: u64,
-    pub sender: Address,
-    pub to: Option<Address>,
-    pub selector: Option<[u8; 4]>,
-    /// First calldata words after the selector (ABI head), for derivation
-    /// candidates.
-    pub args: Vec<U256>,
-    pub gas: u64,
-    /// Native value attached (tier-1 recipient-account key when > 0).
-    pub has_value: bool,
-    pub reads: Vec<Cell>,
-    pub writes: Vec<Cell>,
-}
+// Re-exported so `capture::TxObs` keeps resolving for the stm-p0 bin.
+pub use super::TxObs;
 
 /// Decode scheduling-time fields off the raw envelope.
 fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {

@@ -4,9 +4,8 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use super::Cell;
-use super::capture::TxObs;
-use super::classifier::Stats;
+use crate::classifier::Stats;
+use crate::{Cell, TxObs};
 
 /// Per-block oracle numbers.
 #[derive(Debug, Clone)]
@@ -51,7 +50,7 @@ pub struct Grading {
 
 /// Build direct-conflict pair set per block via a cell -> touchers index.
 /// Conflict = two txs touch the same cell, at least one writing it.
-fn conflict_pairs(
+pub(crate) fn conflict_pairs(
     txs: &[&TxObs],
     cells_of: impl Fn(&TxObs) -> (BTreeSet<Cell>, BTreeSet<Cell>),
     exclude: &HashSet<Cell>,
@@ -102,7 +101,7 @@ fn conflict_pairs(
 
 /// Gas-weighted critical path over a direct-conflict pair set (canonical
 /// order is the topological order: edges only run low index -> high).
-fn critical_path(txs: &[&TxObs], pairs: &HashSet<(u64, u64)>) -> u64 {
+pub(crate) fn critical_path(txs: &[&TxObs], pairs: &HashSet<(u64, u64)>) -> u64 {
     let pos: HashMap<u64, usize> = txs.iter().enumerate().map(|(i, o)| (o.index, i)).collect();
     let mut preds: Vec<Vec<usize>> = vec![Vec::new(); txs.len()];
     for (a, b) in pairs {
@@ -118,7 +117,7 @@ fn critical_path(txs: &[&TxObs], pairs: &HashSet<(u64, u64)>) -> u64 {
     cp.into_iter().max().unwrap_or(0)
 }
 
-fn actual_cells(o: &TxObs) -> (BTreeSet<Cell>, BTreeSet<Cell>) {
+pub(crate) fn actual_cells(o: &TxObs) -> (BTreeSet<Cell>, BTreeSet<Cell>) {
     (
         o.reads.iter().copied().collect(),
         o.writes.iter().copied().collect(),

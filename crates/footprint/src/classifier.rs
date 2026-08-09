@@ -7,8 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 
-use super::Cell;
-use super::capture::TxObs;
+use crate::{Cell, TxObs};
 
 /// A derivation candidate available at scheduling time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -67,6 +66,13 @@ const CANDS: &[Cand] = &[
 ];
 const MAX_BASE: u8 = 32;
 
+/// Live-stats entry cap (spec "Stats footprint": bounded cardinality whose
+/// eviction is free BY CONSTRUCTION — a cold selector schedules as `Tail`
+/// with or without stats, so entries the cap refuses lose nothing). The P0
+/// working sets are tens of entries; Zipfian traffic keeps the hot set far
+/// below this.
+const MAX_SELECTORS: usize = 16_384;
+
 fn keccak_pair(key: U256, inner: B256) -> B256 {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(&key.to_be_bytes::<32>());
@@ -120,7 +126,8 @@ fn solve(obs: &TxObs, contract: Address, slot: B256) -> Option<Formula> {
     None
 }
 
-/// Aggregate stats over a training set of observations.
+/// Aggregate stats over observations. Batch (`learn`) for the offline lab,
+/// incremental (`learn_obs`) for the live shadow — one code path.
 #[derive(Debug, Default)]
 pub struct Stats {
     pub by_selector: HashMap<(Address, [u8; 4]), SelectorStats>,
@@ -129,33 +136,41 @@ pub struct Stats {
 impl Stats {
     pub fn learn(obs: &[TxObs]) -> Self {
         let mut s = Self::default();
-        // Memoize solved slots (same slot re-observed solves identically
-        // only when the candidate words match, so key the memo on the
-        // observation-specific words too — cheapest correct memo: none.
-        // Inversion is ~2k keccaks worst case per novel slot; fine offline.)
         for o in obs {
-            let (Some(to), Some(sel)) = (o.to, o.selector) else {
-                continue;
-            };
-            let e = s.by_selector.entry((to, sel)).or_default();
-            e.observations += 1;
-            for cell in o.reads.iter().chain(o.writes.iter()) {
-                match cell {
-                    Cell::Slot(addr, slot) => {
-                        e.slot_obs += 1;
-                        if let Some(f) = solve(o, *addr, *slot) {
-                            *e.formulas.entry(f).or_default() += 1;
-                        } else {
-                            *e.slot_seen.entry((*addr, *slot)).or_default() += 1;
-                        }
+            s.learn_obs(o);
+        }
+        s
+    }
+
+    /// Fold one observation into the stats. Inversion is ~2k keccaks worst
+    /// case per novel slot (memoization would have to key on the
+    /// observation's candidate words — the cheapest correct memo is none).
+    /// At the entry cap, unseen selectors are NOT inserted: they stay cold
+    /// and schedule as `Tail`, which is exactly what eviction would cost.
+    pub fn learn_obs(&mut self, o: &TxObs) {
+        let (Some(to), Some(sel)) = (o.to, o.selector) else {
+            return;
+        };
+        if self.by_selector.len() >= MAX_SELECTORS && !self.by_selector.contains_key(&(to, sel)) {
+            return;
+        }
+        let e = self.by_selector.entry((to, sel)).or_default();
+        e.observations += 1;
+        for cell in o.reads.iter().chain(o.writes.iter()) {
+            match cell {
+                Cell::Slot(addr, slot) => {
+                    e.slot_obs += 1;
+                    if let Some(f) = solve(o, *addr, *slot) {
+                        *e.formulas.entry(f).or_default() += 1;
+                    } else {
+                        *e.slot_seen.entry((*addr, *slot)).or_default() += 1;
                     }
-                    Cell::Account(a) => {
-                        *e.account_seen.entry(*a).or_default() += 1;
-                    }
+                }
+                Cell::Account(a) => {
+                    *e.account_seen.entry(*a).or_default() += 1;
                 }
             }
         }
-        s
     }
 
     /// Predict the cell set of a holdout observation from learned
@@ -224,5 +239,101 @@ impl Stats {
             }
         }
         (solved, fixedish, total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_primitives::address;
+
+    const TOKEN: Address = address!("00000000000000000000000000000000000000E0");
+    const SEL: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb]; // transfer(address,uint256)
+
+    /// Solidity mapping entry for `mapping at base slot p` keyed by `key`.
+    fn map_slot(key: U256, p: u8) -> B256 {
+        keccak_pair(key, B256::from(U256::from(p).to_be_bytes::<32>()))
+    }
+
+    fn word(a: Address) -> U256 {
+        U256::from_be_slice(a.as_slice())
+    }
+
+    /// A transfer-shaped obs: sender-derived write + arg0-derived write
+    /// (the two balances of an ERC20 transfer at base slot 3).
+    fn transfer_obs(index: u64, sender: Address, recipient: Address) -> TxObs {
+        TxObs {
+            index,
+            block: 1,
+            sender,
+            to: Some(TOKEN),
+            selector: Some(SEL),
+            args: vec![word(recipient), U256::from(100u64)],
+            gas: 30_000,
+            has_value: false,
+            reads: vec![Cell::Slot(TOKEN, map_slot(word(sender), 3))],
+            writes: vec![
+                Cell::Account(sender),
+                Cell::Slot(TOKEN, map_slot(word(sender), 3)),
+                Cell::Slot(TOKEN, map_slot(word(recipient), 3)),
+            ],
+        }
+    }
+
+    #[test]
+    fn inversion_solves_and_predicts_for_new_words() {
+        let a = address!("0000000000000000000000000000000000000A01");
+        let b = address!("0000000000000000000000000000000000000A02");
+        let mut stats = Stats::default();
+        stats.learn_obs(&transfer_obs(0, a, b));
+
+        // A NEVER-SEEN sender/recipient pair: the formula must instantiate
+        // with the new words, not replay the trained slots.
+        let c = address!("0000000000000000000000000000000000000A03");
+        let d = address!("0000000000000000000000000000000000000A04");
+        let holdout = transfer_obs(1, c, d);
+        let predicted = stats.predict(&holdout).expect("selector is trained");
+        assert!(predicted.contains(&Cell::Slot(TOKEN, map_slot(word(c), 3))));
+        assert!(predicted.contains(&Cell::Slot(TOKEN, map_slot(word(d), 3))));
+        assert!(predicted.contains(&Cell::Account(c)), "tier-1 sender");
+        // And NOT the trained pair's slots.
+        assert!(!predicted.contains(&Cell::Slot(TOKEN, map_slot(word(a), 3))));
+    }
+
+    #[test]
+    fn cold_selector_predicts_none_but_plain_transfer_is_tier1() {
+        let stats = Stats::default();
+        let a = address!("0000000000000000000000000000000000000A01");
+        let cold = transfer_obs(0, a, a);
+        assert!(stats.predict(&cold).is_none(), "unseen selector is cold");
+
+        let native = TxObs {
+            selector: None,
+            to: Some(a),
+            has_value: true,
+            ..transfer_obs(0, a, a)
+        };
+        let p = stats.predict(&native).expect("tier-1 never cold");
+        assert!(p.contains(&Cell::Account(a)));
+    }
+
+    #[test]
+    fn incremental_learning_matches_batch() {
+        let a = address!("0000000000000000000000000000000000000A01");
+        let b = address!("0000000000000000000000000000000000000A02");
+        let obs: Vec<TxObs> = (0..4)
+            .map(|i| transfer_obs(i, if i % 2 == 0 { a } else { b }, b))
+            .collect();
+        let batch = Stats::learn(&obs);
+        let mut inc = Stats::default();
+        for o in &obs {
+            inc.learn_obs(o);
+        }
+        let key = (TOKEN, SEL);
+        let (be, ie) = (&batch.by_selector[&key], &inc.by_selector[&key]);
+        assert_eq!(be.observations, ie.observations);
+        assert_eq!(be.formulas, ie.formulas);
+        assert_eq!(be.slot_seen, ie.slot_seen);
+        assert_eq!(be.account_seen, ie.account_seen);
     }
 }

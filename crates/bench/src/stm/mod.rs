@@ -10,22 +10,10 @@
 //! prediction hit-rates, over-merge cost, fee-sink identification.
 
 pub mod capture;
-pub mod classifier;
-pub mod oracle;
 pub mod uniswap;
 
-use alloy_primitives::{Address, B256};
-
-/// A state cell for conflict analysis. `Account` covers balance+nonce
-/// (their updates are read-modify-write, so same-address account writes
-/// always conflict); `Slot` is one storage slot.
-///
-/// Known approximation: pure BALANCE-opcode reads of third-party accounts
-/// are not visible in the capture (EIP-7928 attributes storage reads, not
-/// account reads) — such cross-tx edges are missed. They are second-order
-/// on our workloads (ERC20 flows read storage, not native balances).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Cell {
-    Account(Address),
-    Slot(Address, B256),
-}
+// The classifier / oracle / cell model moved to `kardamom-footprint` so the
+// live executor's P1 shadow (`kardamom-engine::shadow`) grades on EXACTLY
+// the code the P0 GO verdict was measured with. Re-exported here so the
+// `kardamom-stm-p0` bin's import surface is unchanged.
+pub use kardamom_footprint::{Cell, TxObs, classifier, oracle};
