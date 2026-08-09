@@ -235,12 +235,40 @@ candidate approaches:
   needs the collapsing SIBLING node, which is on no read path. (Account
   deletion is out of scope v0: selfdestruct is speccced out, and balance-0
   accounts don't leave the trie post-EIP-158 only if never created — treat
-  account-delete as `Unsupported` and fail closed if one occurs.) So capture
-  must be write-aware: the validator-side capturer walks the delta once,
-  and for every slot zeroed adds the would-be-orphaned sibling's subpath to
+  account-delete as `Unsupported` and fail closed if one occurs. Note
+  storage-zeroing does NOT structurally delete from the ACCOUNT trie — the
+  account leaf's `storage_root` field just changes value — so collapse
+  handling is a storage-trie-only concern.) So capture must be write-aware:
+  the validator-side capturer must add the would-be-orphaned siblings to
   `WitnessProofs`. Deterministic superset, verified in-guest like every
   other node (hash-linked into the pre-root), so a malicious prover cannot
   smuggle state through it.
+
+  **How capture finds the siblings — recompute-guided completion, not case
+  enumeration (2026-08-09).** Hand-walking the delta for collapse shapes on
+  the capture side would ENUMERATE the cases (branch→extension,
+  branch→leaf, root collapse, multi-delete cascades under one branch…) in a
+  second place — precisely where sparse implementations rot, and a
+  capture-side miss is unfixable in-guest (the proof just fails for honest
+  blocks). Instead, make the shared sparse-recompute function the single
+  owner of that knowledge: it already knows exactly which node it needs the
+  moment it needs one (`MissingNode(hash/path)`). Capture runs THE SAME
+  monomorphized sparse recompute the guest will run, over the candidate
+  node set, in a fixed-point loop: on `MissingNode`, fetch that node from
+  the full trie, add it to the set, retry. Terminates (bounded by trie
+  depth × writes), handles cascaded collapses for free, and yields
+  completeness BY CONSTRUCTION — the capture-side recompute succeeding is
+  the proof that the guest's identical recompute will. The collapse-case
+  test matrix then only targets the one sparse-recompute implementation,
+  and the randomized cross-check (below) covers capture and guest at once.
+  Cost note: the loop re-enters the recompute per missing node (worst case
+  one retry per deletion); if profiling ever cares, the recompute can
+  return ALL missing nodes per pass instead of the first.
+
+  Guest-side minimality stays a non-goal: extra hash-linked nodes in the
+  set cannot alter the recomputed root (they are reachable-or-ignored,
+  verified by hash on use); unreferenced junk only bloats witness bytes,
+  which the existing witness-size metrics already watch.
 - **(b) Port/depend on a sparse-trie implementation (reth's sparse trie).**
   Solves (a) generically but imports a large surface into the no_std
   boundary; reth's is not no_std today. Rejected for 3b unless (a)'s
@@ -250,10 +278,13 @@ candidate approaches:
   gap 3b exists to close. Rejected.
 
 Property obligation either way: sparse recompute MUST equal the full oracle.
-Randomized cross-check tests (arbitrary genesis + delta → sparse root ==
-`kardamom-state::state_root` of the post state) are the 3b acceptance gate,
-with deletion-collapse cases (branch→extension, branch→leaf, root collapse)
-enumerated explicitly — that's where sparse implementations rot.
+Randomized cross-check tests exercising the WHOLE pipeline shape — arbitrary
+genesis + delta → fixed-point capture → in-guest-shape verify + sparse
+recompute == `kardamom-state::state_root` of the post state — are the 3b
+acceptance gate, with deletion-collapse cases (branch→extension,
+branch→leaf, root collapse, cascaded multi-delete under one branch)
+enumerated explicitly against the one sparse-recompute implementation —
+that's where sparse implementations rot.
 
 ### Second open question: who computes `pre_state_root` live
 
