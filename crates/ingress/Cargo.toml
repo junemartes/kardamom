@@ -45,7 +45,7 @@ tracing.workspace = true
 
 [[bin]]
 name = "kardamom-ingress"
-path = "src/bin/kardamom-ingress.rs"
+path = "src/bin/kardamom-ingress/main.rs"
 
 [dev-dependencies]
 alloy-signer-local.workspace = true

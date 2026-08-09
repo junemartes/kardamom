@@ -180,6 +180,75 @@ pub enum RecorderKind {
     TxDeposits,
 }
 
+impl RecorderKind {
+    /// Stream label used in operator-facing failure messages
+    /// (`"start tx_data recording: ..."`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            RecorderKind::TxOrdering => "tx_ordering",
+            RecorderKind::TxData { .. } => "tx_data",
+            RecorderKind::TxDeposits => "tx_deposits",
+        }
+    }
+}
+
+/// Body of a dedicated stream-recorder thread — the recorder-thread +
+/// ready-barrier pattern shared by the producer binaries (`kardamom-ingress`
+/// records tx_data per shard; `kardamom-da-watcher` records tx_deposits):
+/// connect a thread-confined archive session, start recording
+/// `(channel, stream_id)`, report the startup outcome exactly once through
+/// `ready`, and hold the recording (and its archive session) alive until
+/// `stop` is set. The recording itself runs in the ArchivingMediaDriver; this
+/// thread only keeps the session connected and re-adopts an existing
+/// recording on restart.
+///
+/// `ready` receives `Ok(recording_id)` once the recording is confirmed
+/// active, or `Err(reason)` on any failure — including a `stop` during
+/// startup — so a waiting barrier never hangs. The callers block on that
+/// barrier BEFORE publishing anything (the F13.2 rule): crash recovery
+/// replays from record 0 and needs every envelope, so a birth-of-stream gap
+/// would permanently break executor crash recovery.
+pub fn record_stream_until_stopped(
+    aeron_dir: Option<&Path>,
+    aeron_cfg: &AeronConfig,
+    channel: &str,
+    stream_id: i32,
+    kind: RecorderKind,
+    stop: &std::sync::atomic::AtomicBool,
+    ready: impl FnOnce(Result<i64, String>),
+) -> Result<(), LogError> {
+    use std::sync::atomic::Ordering;
+
+    let session = match connect_archive(aeron_dir, aeron_cfg) {
+        Ok(s) => s,
+        Err(e) => {
+            ready(Err(format!("connect archive: {e}")));
+            return Err(e);
+        }
+    };
+    let mut should_stop = || stop.load(Ordering::SeqCst);
+    let recorder =
+        match Recorder::start_stream(session.archive, channel, stream_id, kind, &mut should_stop) {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                // Stopped before the recording materialised (shutdown during
+                // startup); report it so a waiting barrier doesn't hang.
+                ready(Err("stopped before the recording materialised".into()));
+                return Ok(());
+            }
+            Err(e) => {
+                ready(Err(format!("start {} recording: {e}", kind.label())));
+                return Err(e);
+            }
+        };
+    ready(Ok(recorder.recording_id()));
+    // Hold the recording (and its archive session) alive until shutdown.
+    while !stop.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    Ok(())
+}
+
 pub struct Recorder {
     /// Owned by the Recorder thread. `AeronArchive` is `!Send + !Sync`, so
     /// the field is intentionally not exposed as `Arc<Archive>`; the

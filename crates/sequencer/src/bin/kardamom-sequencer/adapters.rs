@@ -1,0 +1,68 @@
+//! Adapters: log::aeron_live handles → sequencer trait surface.
+
+use kardamom_log::aeron_live::{
+    TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
+};
+use kardamom_sequencer::epoch::EpochSubscriber;
+use kardamom_sequencer::error::SequencerError;
+use kardamom_sequencer::inbound::TxDataSubscriber;
+use kardamom_sequencer::outbound::TxErrorPublisher;
+use kardamom_types::{BPosition, EpochRecord, TxDataLoc, TxEnvelope, TxError};
+
+pub struct LiveTxDataSub {
+    handle: TxDataSubscriberHandle,
+}
+
+impl LiveTxDataSub {
+    pub fn new(handle: TxDataSubscriberHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl TxDataSubscriber for LiveTxDataSub {
+    fn poll(&mut self) -> Result<Option<(TxDataLoc, TxEnvelope)>, SequencerError> {
+        // try_recv is non-blocking. The Sequencer's run loop handles
+        // backoff when poll returns None.
+        Ok(self.handle.try_recv())
+    }
+}
+
+pub struct LiveEpochSub {
+    handle: TxDepositsSubscriberHandle,
+}
+
+impl LiveEpochSub {
+    pub fn new(handle: TxDepositsSubscriberHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl EpochSubscriber for LiveEpochSub {
+    fn poll(&mut self) -> Result<Option<(BPosition, EpochRecord)>, SequencerError> {
+        Ok(self.handle.try_recv())
+    }
+}
+
+/// Live `TxErrorPublisher` wrapping a `TxErrorsPublisherHandle`. Sequencer-
+/// emitted rejections (duplicate / past-nonce today) are published on the
+/// `tx_errors` Aeron channel; ingress consumes them to release parked
+/// clients early. Publish failures are logged and dropped — the canonical
+/// state has already advanced (or the tx was rejected), so there is nothing
+/// to roll back.
+pub struct LiveTxErrorPub {
+    handle: TxErrorsPublisherHandle,
+}
+
+impl LiveTxErrorPub {
+    pub fn new(handle: TxErrorsPublisherHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl TxErrorPublisher for LiveTxErrorPub {
+    fn publish_error(&mut self, e: TxError) {
+        if let Err(err) = self.handle.publish(&e) {
+            tracing::warn!(error = %err, "tx_errors publish failed (dropped)");
+        }
+    }
+}
