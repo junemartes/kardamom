@@ -47,6 +47,7 @@
 #   lib.sh                        control-node helpers + log/fail
 #   lib-topology.sh               node-class model (nodes/IPs/ports)
 #   lib-metrics.sh                fetch_metrics + prom_value (scrape/parse)
+#   validator-verdict.sh          divergence-log scan SHARED with ci-cluster.sh
 #   chaos-probes.sh               has_line/has_match + read-only probes
 #   chaos-asserts.sh              injectors, alloc-log evidence, assert_*
 #   chaos-cases-component.sh      graceful/hard-*, node-failure, restore drills
@@ -97,6 +98,11 @@ source "${SCRIPT_DIR}/lib-topology.sh"
 # Scrape + parse (fetch_metrics bridge-first probe, prom_value).
 # shellcheck source=deploy/cluster/scripts/lib-metrics.sh
 source "${SCRIPT_DIR}/lib-metrics.sh"
+# Shared validator divergence-log scan (divergence_scan + _dump_context): the
+# ONE implementation ci-cluster.sh's §7c verdict also uses — the cpu-squeeze
+# case consumes it with this suite's fail() contract.
+# shellcheck source=deploy/cluster/scripts/validator-verdict.sh
+source "${SCRIPT_DIR}/validator-verdict.sh"
 
 RPC_URL="${RPC_URL:-http://192.168.56.31:8545}"
 # Explicit chain-id (ingress eth_chainId returns a default ≠ the cluster chain).

@@ -381,24 +381,16 @@ run_cpu_squeeze() {
 
   # THE invariant: zero divergences — metric AND logs (the metric resets if
   # the validator restarted mid-squeeze; a pre-restart divergence still shows
-  # in the old alloc's log, exactly the 2026-08-03 signature).
+  # in the old alloc's log, exactly the 2026-08-03 signature). The alloc-log
+  # scan is the SHARED implementation in validator-verdict.sh (ci-cluster.sh's
+  # §7c verdict runs the same one; SIGPIPE doctrine documented there).
   local div
   div="$(val_metric validator_divergence_total)"; div="$(printf '%.0f' "${div:-0}")"
   [ "${div}" -eq 0 ] || fail "cpu-squeeze: validator counted ${div} divergence(s) under starvation"
-  local valloc vlogs
-  while read -r valloc; do
-    [ -z "${valloc}" ] && continue
-    vlogs="$(on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null || true)"
-    if has_line "${vlogs}" "halted on divergence"; then
-      echo "----- divergence context (alloc ${valloc}) -----" >&2
-      printf '%s\n' "${vlogs}" \
-        | grep -B3 -A10 "halted on divergence" >&2 || true
-      docker exec "${VALIDATOR_NODE}" sh -c \
-        'for f in /opt/kardamom/state/divergence-*.json; do [ -f "$f" ] && { echo "== $f"; head -c 4096 "$f"; echo; }; done' \
-        >&2 2>/dev/null || true
-      fail "cpu-squeeze: validator diverged under starvation (alloc ${valloc}; context above)"
-    fi
-  done < <(all_allocs validator)
+  if divergence_scan; then
+    divergence_dump_context
+    fail "cpu-squeeze: validator diverged under starvation (alloc ${DIVERGENCE_ALLOC}; context above)"
+  fi
   log "cpu-squeeze PASS: ${n_count} nodes starved ${SQUEEZE_S}s at ${SQUEEZE_CPUS_PER_NODE} CPUs, validator recovered (verified=${WARM_VERIFIED}, lag $(( WARM_EXEC - WARM_BLOCK ))), 0 divergences"
 }
 
