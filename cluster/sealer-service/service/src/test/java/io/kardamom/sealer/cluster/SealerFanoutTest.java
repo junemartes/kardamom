@@ -50,7 +50,7 @@ class SealerFanoutTest {
 
     private static long relayedCount(final StubSession s) {
         return s.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_RELAYED)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_RELAYED)
                 .count();
     }
 
@@ -82,13 +82,13 @@ class SealerFanoutTest {
 
     private void subscribe(final StubSession s) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putByte(0, SealerClusteredService.KIND_SUBSCRIBE);
+        buf.putByte(0, SealerWire.KIND_SUBSCRIBE);
         service.onSessionMessage(s, 0, buf, 0, 1, null);
     }
 
     private void replayRequest(final StubSession s, final long fromIndex, final long fromBlock) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putByte(0, SealerClusteredService.KIND_REPLAY_REQUEST);
+        buf.putByte(0, SealerWire.KIND_REPLAY_REQUEST);
         buf.putLong(1, fromIndex, ByteOrder.LITTLE_ENDIAN);
         buf.putLong(1 + Long.BYTES, fromBlock, ByteOrder.LITTLE_ENDIAN);
         service.onSessionMessage(s, 0, buf, 0, 17, null);
@@ -107,7 +107,7 @@ class SealerFanoutTest {
         for (final byte[] e : entries) total += 4 + e.length;
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_BATCH);
+        buf.putByte(pos, SealerWire.KIND_BATCH);
         pos += Byte.BYTES;
         buf.putShort(pos, (short) entries.length, ByteOrder.LITTLE_ENDIAN);
         pos += Short.BYTES;
@@ -126,16 +126,16 @@ class SealerFanoutTest {
 
     /** A complete single-record ingress frame (batch-embeddable). */
     private static byte[] recordFrame(final int idTag, final byte[] sender20, final long nonce) {
-        final byte[] out = new byte[SealerClusteredService.CANONICAL_ID_OFFSET
+        final byte[] out = new byte[SealerWire.CANONICAL_ID_OFFSET
                 + CanonicalSealerState.CANONICAL_ID_LEN + 1];
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(out.length);
-        buf.putByte(SealerClusteredService.KIND_OFFSET, SealerClusteredService.KIND_INGRESS_RECORD);
-        buf.putBytes(SealerClusteredService.SENDER_OFFSET, sender20);
-        buf.putLong(SealerClusteredService.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
+        buf.putByte(SealerWire.KIND_OFFSET, SealerWire.KIND_INGRESS_RECORD);
+        buf.putBytes(SealerWire.SENDER_OFFSET, sender20);
+        buf.putLong(SealerWire.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
         final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
         id[0] = (byte) idTag;
         id[31] = 0x5A;
-        buf.putBytes(SealerClusteredService.CANONICAL_ID_OFFSET, id);
+        buf.putBytes(SealerWire.CANONICAL_ID_OFFSET, id);
         buf.putByte(out.length - 1, (byte) idTag);
         buf.getBytes(0, out);
         return out;
@@ -158,11 +158,11 @@ class SealerFanoutTest {
         rawRecord(publisher, 21, s, 2);
         assertEquals(1, relayedCount(consumerA), "gap record must not relay");
         final List<byte[]> rejects = publisher.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_CONTIGUITY_REJECT)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_CONTIGUITY_REJECT)
                 .toList();
         assertEquals(1, rejects.size(), "offering session receives the reject");
         assertEquals(0, consumerA.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_CONTIGUITY_REJECT)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_CONTIGUITY_REJECT)
                 .count(), "consumers never see rejects");
         // Frame layout: [kind:1][sender:20][nonce:u64 LE][expected:u64 LE].
         final ExpandableArrayBuffer reject = new ExpandableArrayBuffer(rejects.get(0).length);
@@ -222,10 +222,10 @@ class SealerFanoutTest {
         subscribe(consumerA);
         service.onTimerEvent(SealerClusteredService.BOUNDARY_TIMER_CORRELATION_ID, 250);
         final long pubBoundaries = publisher.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_BOUNDARY)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_BOUNDARY)
                 .count();
         final long consBoundaries = consumerA.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_BOUNDARY)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_BOUNDARY)
                 .count();
         assertEquals(1, pubBoundaries, "boundaries broadcast to publisher-only sessions too");
         assertEquals(1, consBoundaries, "consumer receives the boundary tick");
@@ -394,7 +394,7 @@ class SealerFanoutTest {
 
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_ORIGIN_RECORD);
+        buf.putByte(pos, SealerWire.KIND_ORIGIN_RECORD);
         pos += Byte.BYTES;
         buf.putBytes(pos, id);
         pos += id.length;
@@ -407,7 +407,7 @@ class SealerFanoutTest {
         service.onSessionMessage(publisher, 0, buf, 0, pos, null);
 
         final byte[] frame = consumerA.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_RELAYED)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_RELAYED)
                 .findFirst()
                 .orElseThrow();
         // [kind:1][index:8][payloadLen:4][payload…]
@@ -434,7 +434,7 @@ class SealerFanoutTest {
         record(publisher, 9);
 
         final java.util.List<Long> indices = consumerA.offered.stream()
-                .filter(f -> f[0] == SealerClusteredService.EGRESS_KIND_RELAYED)
+                .filter(f -> f[0] == SealerWire.EGRESS_KIND_RELAYED)
                 .map(f -> new org.agrona.concurrent.UnsafeBuffer(f)
                         .getLong(1, java.nio.ByteOrder.LITTLE_ENDIAN))
                 .toList();
@@ -444,7 +444,7 @@ class SealerFanoutTest {
     private void originRecord(final StubSession from, final int n, final long origin, final int slots) {
         final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
         int pos = 0;
-        buf.putByte(pos, SealerClusteredService.KIND_ORIGIN_RECORD);
+        buf.putByte(pos, SealerWire.KIND_ORIGIN_RECORD);
         pos += Byte.BYTES;
         final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
         id[0] = (byte) n;
