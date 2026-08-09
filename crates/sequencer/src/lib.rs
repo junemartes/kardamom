@@ -29,13 +29,16 @@ pub mod epoch;
 pub mod error;
 pub mod inbound;
 pub mod metrics;
+mod nonce_decode;
 pub mod outbound;
 pub mod partition;
 pub mod pending;
 pub mod resync;
 pub mod sender;
 pub mod sequencer;
+pub mod shutdown;
 pub mod state;
+mod unconfirmed;
 
 pub use config::{BackpressurePolicy, SequencerConfig};
 pub use epoch::{EpochSubscriber, process_epoch};
