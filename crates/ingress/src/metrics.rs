@@ -24,6 +24,14 @@ pub const TX_ERROR_DUPLICATE_TOTAL: &str = "kardamom_ingress_tx_error_duplicate_
 /// records are being silently lost (see `crate::cluster`).
 pub const CLUSTER_FRAME_DROPPED_TOTAL: &str = "kardamom_ingress_cluster_frames_dropped_total";
 
+/// Increment [`TX_REJECTED_TOTAL`] with the given `reason` label. Single
+/// home for the submit-path rejection counter so every rejection is counted
+/// the same way (and call sites stay one line).
+#[inline]
+pub(crate) fn count_reject(reason: &'static str) {
+    metrics::counter!(TX_REJECTED_TOTAL, "reason" => reason).increment(1);
+}
+
 pub fn describe() {
     metrics::describe_counter!(TX_RECEIVED_TOTAL, "tx submissions received");
     metrics::describe_counter!(
