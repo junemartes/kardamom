@@ -45,6 +45,26 @@ inject_hard() { # <node-container(s), space-separated candidates> <task-name>
   KILLED_NODE="${node}"; KILLED_TASK="$2"; KILLED_CID="${cid}"
 }
 
+kill_node() { # <node-container(s)> — docker kill that trusts container STATE over the exit event
+  docker kill "$@" >/dev/null 2>&1 && return 0
+  # On a thrashed host docker kill can report "did not receive an exit event"
+  # AFTER the SIGKILL landed: dockerd's wait for the containerd exit event
+  # times out while the victim still dies with exit 137. Observed live
+  # (2026-08-09, loadavg ~30): both victims' FinishedAt within a second of
+  # the kill, error anyway, case failed with the victims already dead. Judge
+  # the kill by container state, not by the event — only a victim genuinely
+  # still running after a grace window is a failure.
+  local n t
+  for n in "$@"; do
+    t=0
+    while [ "$(docker inspect -f '{{.State.Running}}' "${n}" 2>/dev/null || echo unknown)" != "false" ]; do
+      if [ "${t}" -ge 30 ]; then fail "could not kill node ${n} (still running ${t}s after docker kill)"; fi
+      sleep 2; t=$(( t + 2 ))
+    done
+    log "kill_node: ${n} — exit event was late but the kill took (state=exited)"
+  done
+}
+
 # --- alloc-log evidence sources ---------------------------------------------
 
 # Concatenated logs of every alloc of a Nomad job (running or not). THE

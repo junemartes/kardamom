@@ -189,7 +189,7 @@ case_cluster_quorum_loss_recover() {
   # restart re-pulls images, so use CHAOS_RESCHEDULE_SLO_S for the rejoin.
   local victims=(kardamom-sealer-1 kardamom-sealer-2)
   log "cluster-quorum-loss-recover: docker kill TWO sealer nodes (${victims[*]}) → quorum lost (1/3 up)"
-  docker kill "${victims[@]}" >/dev/null || fail "could not kill sealer nodes ${victims[*]}"
+  kill_node "${victims[@]}"
   # Quorum lost → the pipeline must STALL (no commits, executor gauge flat).
   assert_executor_stalled 15
   log "cluster-quorum-loss-recover: docker start ${victims[0]} (quorum 2/3 returns)"
