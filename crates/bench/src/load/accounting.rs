@@ -9,6 +9,7 @@
 
 use serde::Serialize;
 
+use crate::load::config::LoadReport;
 use crate::load::engine::Counts;
 use crate::load::scrape::MetricsSnapshot;
 
@@ -110,6 +111,14 @@ fn delta(a: Option<u64>, b: Option<u64>) -> Option<i64> {
     }
 }
 
+/// `node`'s block gauge in `snap`, or `None` if it wasn't scraped.
+fn executor_block(snap: &MetricsSnapshot, node: &str) -> Option<u64> {
+    snap.executor_blocks
+        .iter()
+        .find(|(n, _)| n == node)
+        .and_then(|(_, b)| *b)
+}
+
 /// Evaluate the run into a [`Verdict`].
 #[must_use]
 pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
@@ -122,12 +131,7 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
     let sealer_adv = delta(sealer_base, sealer_fin).unwrap_or(0);
     let mut keep_pace = Vec::new();
     for (node, fin_blk) in &input.fin.executor_blocks {
-        let base_blk = input
-            .base
-            .executor_blocks
-            .iter()
-            .find(|(n, _)| n == node)
-            .and_then(|(_, b)| *b);
+        let base_blk = executor_block(input.base, node);
         let advanced = delta(base_blk, *fin_blk);
         let gap = match (sealer_fin, *fin_blk) {
             (Some(s), Some(e)) => Some(
@@ -146,12 +150,7 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
             // A restarted executor's gauge resets to 0, so `advanced` ≤ 0 can
             // mean "replaying after a kill", not frozen. If the recheck sample
             // shows the gauge moving past `fin`, it's recovering.
-            let recheck_blk = input.recheck.and_then(|r| {
-                r.executor_blocks
-                    .iter()
-                    .find(|(n, _)| n == node)
-                    .and_then(|(_, b)| *b)
-            });
+            let recheck_blk = input.recheck.and_then(|r| executor_block(r, node));
             if matches!((recheck_blk, *fin_blk), (Some(r), Some(f)) if r > f) {
                 verdict = "RECOVERING".to_string();
             } else {
@@ -258,6 +257,117 @@ pub fn evaluate(input: &EvalInput<'_>) -> Verdict {
         seq_backpressure,
         keep_pace,
     }
+}
+
+/// Per-ramp-step version of [`evaluate`]'s keep-pace gate: a cheap boolean
+/// over two step-boundary snapshots (frozen / lagging executors), with no
+/// restart-recheck and lenient on missing metrics — the full-window verdict
+/// with failure reasons stays [`evaluate`]'s job.
+pub(crate) fn step_gap_ok(s0: &MetricsSnapshot, s1: &MetricsSnapshot, max_gap: u64) -> bool {
+    let sealer_adv = match (s0.sealer_block, s1.sealer_block) {
+        (Some(a), Some(b)) => b > a,
+        _ => false,
+    };
+    for (node, b1) in &s1.executor_blocks {
+        let b0 = executor_block(s0, node);
+        // Missing metric → can't assert, stay lenient.
+        if let (Some(b0), Some(b1), Some(sealer)) = (b0, *b1, s1.sealer_block) {
+            if sealer_adv && b1 <= b0 {
+                return false; // frozen
+            }
+            if sealer.saturating_sub(b1) > max_gap {
+                return false; // lagging
+            }
+        }
+    }
+    true
+}
+
+/// Per-ramp-step version of [`evaluate`]'s sequencer-drop gate: did the
+/// drop/eviction counters grow over the step?
+pub(crate) fn step_seq_clean(s0: &MetricsSnapshot, s1: &MetricsSnapshot) -> bool {
+    let grew = |a: Option<u64>, b: Option<u64>| matches!((a, b), (Some(a), Some(b)) if b > a);
+    !grew(s0.seq_dropped_past, s1.seq_dropped_past) && !grew(s0.seq_evictions, s1.seq_evictions)
+}
+
+/// Render the report + verdict to stdout.
+#[allow(clippy::cast_precision_loss)]
+pub(crate) fn print_report(r: &LoadReport) {
+    println!(
+        "================= KARDAMOM-LOAD ({}) =================",
+        r.mode
+    );
+    println!(
+        "target_tps={}  discovered_max={}  soak_rate={}  duration={:.0}s",
+        r.target_tps, r.discovered_max_tps, r.soak_rate_tps, r.duration_secs
+    );
+    if !r.ramp.is_empty() {
+        println!("---- ramp ----");
+        for s in &r.ramp {
+            println!(
+                "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms step_mgas={:<8.1} gap_ok={:<5} seq_clean={:<5} {}",
+                s.rate,
+                s.accept_ratio,
+                s.lat_p50_us / 1000,
+                s.lat_p95_us / 1000,
+                s.lat_p99_us / 1000,
+                s.gas_used as f64 / 1e6,
+                s.gap_ok,
+                s.seq_clean,
+                if s.sustainable {
+                    "SUSTAINABLE"
+                } else {
+                    "UNSUSTAINABLE"
+                }
+            );
+        }
+    }
+    let v = &r.verdict;
+    if r.total_gas > 0 && r.duration_secs > 0.0 {
+        // total_gas spans ramp + soak; the soak window's own gas is the
+        // total minus what the ramp steps drained into their counters.
+        let ramp_gas: u64 = r.ramp.iter().map(|s| s.gas_used).sum();
+        let soak_gas = r.total_gas.saturating_sub(ramp_gas);
+        println!(
+            "gas: run_total={:.3} Ggas  soak={:.3} Ggas -> {:.4} Ggas/s ({:.1} Mgas/s) [{}]",
+            r.total_gas as f64 / 1e9,
+            soak_gas as f64 / 1e9,
+            soak_gas as f64 / 1e9 / r.duration_secs,
+            soak_gas as f64 / 1e6 / r.duration_secs,
+            r.workload,
+        );
+    }
+    println!(
+        "offered={}  accepted={}  receipted={}  missing={}  unlanded={}  bad_status={}",
+        v.offered, v.accepted, v.receipted, v.missing, v.unlanded, v.bad_status
+    );
+    println!(
+        "drop-accounting: inferred_ingress_drop={:?}  seq_dropped={:?}  seq_evicted={:?}  seq_backpressure={:?}",
+        v.inferred_ingress_drop, v.seq_dropped, v.seq_evicted, v.seq_backpressure
+    );
+    println!(
+        "receipt-latency p50={}ms p95={}ms p99={}ms max={}ms",
+        r.lat_p50_us / 1000,
+        r.lat_p95_us / 1000,
+        r.lat_p99_us / 1000,
+        r.lat_max_us / 1000
+    );
+    println!("---- keep-pace ----");
+    for k in &v.keep_pace {
+        println!(
+            "  {:<22} base={:?} final={:?} advanced={:?} gap={:?} {}",
+            k.node, k.base, k.final_block, k.advanced, k.gap, k.verdict
+        );
+    }
+    if v.pass {
+        println!("RESULT: PASS");
+    } else {
+        println!("RESULT: FAIL");
+        for f in &v.failures {
+            println!("  FAIL: {f}");
+        }
+    }
+    println!("=====================================================");
 }
 
 #[cfg(test)]

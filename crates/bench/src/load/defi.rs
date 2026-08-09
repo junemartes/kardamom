@@ -16,11 +16,17 @@
 //! compute the addresses without an RPC round-trip, and sender 0's op queue
 //! simply starts three nonces later.
 
+use std::time::{Duration, Instant};
+
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
 use alloy_network::TxSignerSync;
 use alloy_primitives::{Address, Bytes, TxKind, U256, keccak256};
+use jsonrpsee::core::client::ClientT;
+use jsonrpsee::http_client::HttpClient;
+use jsonrpsee::rpc_params;
 
+use crate::load::hex_u64;
 use crate::load::plan::PlannedTx;
 use crate::signers::DerivedSigner;
 
@@ -181,6 +187,88 @@ pub fn deployment_txs(
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
     Ok((txs, contracts))
+}
+
+/// Submit the deployment txs and wait until each is mined successfully.
+/// Land these before any load — every workload call targets their computed
+/// addresses, so a call arriving before its contract exists would revert and
+/// poison the verdict.
+///
+/// # Errors
+/// Errors if a submit is rejected, a deployment reverts, the chain stops
+/// advancing while a deploy is unmined, or an accepted deploy is never
+/// included within the hard cap.
+pub async fn deploy_and_confirm(client: &HttpClient, deploys: &[PlannedTx]) -> anyhow::Result<()> {
+    for d in deploys {
+        let _: alloy_primitives::B256 = client
+            .request("eth_sendRawTransaction", rpc_params![d.raw.clone()])
+            .await
+            .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
+    }
+    // A LIVENESS bound, expressed as one. This stage starts the moment
+    // the transfer soak's verdict lands, so the chain is still draining
+    // that backlog and the deploy queues behind it; how long that takes
+    // is a property of the runner, not of the code under test. A fixed
+    // wall-clock deadline therefore races the drain — it was 30s, then
+    // 180s, and CI still burned the whole 180s with the chain making
+    // steady progress the entire time.
+    //
+    // So: wait as long as the CHAIN IS ADVANCING, and fail only when it
+    // stops. A stalled pipeline is caught in seconds; a merely slow one
+    // is waited out. The overall cap stays as a backstop against waiting
+    // forever on a chain that advances but never includes this tx.
+    const STALL_LIMIT: Duration = Duration::from_secs(60);
+    const HARD_CAP: Duration = Duration::from_secs(600);
+    async fn head_block(client: &HttpClient) -> Option<u64> {
+        client
+            .request::<String, _>("eth_blockNumber", rpc_params![])
+            .await
+            .ok()
+            .and_then(|h| hex_u64(&h))
+    }
+    let started = Instant::now();
+    for d in deploys {
+        let mut last_block = head_block(client).await;
+        let mut last_progress = Instant::now();
+        loop {
+            let v: Option<serde_json::Value> = client
+                .request("eth_getTransactionReceipt", rpc_params![d.hash])
+                .await
+                .unwrap_or(None);
+            if let Some(r) = v {
+                anyhow::ensure!(
+                    r["status"].as_str() == Some("0x1"),
+                    "defi deploy reverted (nonce {}): {r}",
+                    d.nonce
+                );
+                break;
+            }
+            let now = head_block(client).await;
+            if now.is_some() && now != last_block {
+                last_block = now;
+                last_progress = Instant::now();
+            }
+            anyhow::ensure!(
+                last_progress.elapsed() < STALL_LIMIT,
+                "defi deploy not mined (nonce {}): chain STOPPED advancing — no new \
+                 block for {}s while waiting (head {:?})",
+                d.nonce,
+                STALL_LIMIT.as_secs(),
+                last_block
+            );
+            anyhow::ensure!(
+                started.elapsed() < HARD_CAP,
+                "defi deploy not mined (nonce {}) within {}s although the chain kept \
+                 advancing to {:?} — the tx was accepted but never included",
+                d.nonce,
+                HARD_CAP.as_secs(),
+                last_block
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+    tracing::info!("defi contracts deployed + confirmed");
+    Ok(())
 }
 
 /// Pre-sign per-sender queues of DeFi calls. Sender 0's nonces start after

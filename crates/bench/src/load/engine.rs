@@ -1,36 +1,33 @@
-//! Open-loop, rate-paced send engine + per-tx delivery tracker.
+//! Open-loop, rate-paced send engine.
 //!
 //! The ingress `eth_sendRawTransaction` parks the caller until the receipt
 //! arrives (on-offer ack), so submit RTT ≈ end-to-end latency. To drive load
 //! *open-loop* (rate set by a pacer, not by completions) we spawn each submit
 //! as its own task — bounded by an in-flight semaphore and collected in a
 //! [`tokio::task::JoinSet`] the caller joins before evaluating — rather than
-//! awaiting one before issuing the next. Every tx is tracked by its
-//! locally-computed hash to a receipt; submits that error are retried (after
-//! checking the tx didn't already land, so a duplicate isn't resubmitted),
-//! and a post-phase drain confirms any tx whose receipt hadn't landed inline.
-//! With `verify_receipts` (non-chaos soak) an accepted submit whose receipt
+//! awaiting one before issuing the next. Every tx is tracked (see
+//! [`Tracker`], in `load::tracker`) by its locally-computed hash to a
+//! receipt; submits that error are retried (after checking the tx didn't
+//! already land, so a duplicate isn't resubmitted), and a post-phase drain
+//! confirms any tx whose receipt hadn't landed inline. With
+//! `verify_receipts` (non-chaos soak) an accepted submit whose receipt
 //! can't be re-fetched stays pending and counts as `missing` if it never
 //! confirms — the independent must-deliver check.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use alloy_primitives::B256;
-use hdrhistogram::Histogram;
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::HttpClient;
 use jsonrpsee::rpc_params;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::load::json_hex_u64;
 use crate::load::plan::PlannedTx;
 
-const HIST_LOW_US: u64 = 1;
-const HIST_HIGH_US: u64 = 60_000_000;
-const HIST_SIGFIGS: u8 = 3;
+pub use crate::load::tracker::{Counts, Tracker};
 
 /// How a submit acks and how its receipt is observed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,240 +83,6 @@ impl Queues {
     }
 }
 
-/// Cumulative delivery counters (snapshot with [`Tracker::counts`]).
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Counts {
-    /// Submits attempted.
-    pub offered: u64,
-    /// Submits that returned a hash (ingress accepted; on-offer ⇒ receipted).
-    pub accepted: u64,
-    /// Txs confirmed via a receipt (inline or drained).
-    pub receipted: u64,
-    /// Receipts with a non-`0x1` status.
-    pub bad_status: u64,
-}
-
-struct Pending {
-    submit_ts: Instant,
-    accepted: bool,
-}
-
-/// Shared, thread-safe delivery tracker.
-pub struct Tracker {
-    offered: AtomicU64,
-    accepted: AtomicU64,
-    receipted: AtomicU64,
-    bad_status: AtomicU64,
-    /// Total gas consumed by receipted txs (the gas/s numerator — workload-
-    /// independent throughput, unlike tx/s).
-    gas_used: AtomicU64,
-    /// Per-ramp-step gas, reset by `take_step_gas`.
-    step_gas: AtomicU64,
-    lat_us: Mutex<Histogram<u64>>,
-    /// Per-ramp-step latency histogram, reset by [`Tracker::take_step_latencies`]
-    /// — per-step percentiles localize WHERE in the ramp the tail degrades
-    /// (the cumulative histogram smears early clean steps over late ones).
-    step_lat_us: Mutex<Histogram<u64>>,
-    pending: Mutex<HashMap<B256, Pending>>,
-    /// Subscribe mode only: receipts whose feed notification arrived before
-    /// their submit task registered in `pending` (feed vs ack race).
-    early: Mutex<HashMap<B256, u64>>,
-}
-
-impl Tracker {
-    /// Construct an empty tracker.
-    ///
-    /// # Errors
-    /// Errors if the latency histogram can't be allocated.
-    pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            offered: AtomicU64::new(0),
-            accepted: AtomicU64::new(0),
-            receipted: AtomicU64::new(0),
-            bad_status: AtomicU64::new(0),
-            gas_used: AtomicU64::new(0),
-            step_gas: AtomicU64::new(0),
-            lat_us: Mutex::new(Histogram::new_with_bounds(
-                HIST_LOW_US,
-                HIST_HIGH_US,
-                HIST_SIGFIGS,
-            )?),
-            step_lat_us: Mutex::new(Histogram::new_with_bounds(
-                HIST_LOW_US,
-                HIST_HIGH_US,
-                HIST_SIGFIGS,
-            )?),
-            pending: Mutex::new(HashMap::new()),
-            early: Mutex::new(HashMap::new()),
-        })
-    }
-
-    /// Feed-side confirmation (subscribe mode): settle the pending entry for
-    /// `hash`, or stash the status if the submit task hasn't registered yet.
-    pub fn confirm_from_feed(&self, hash: B256, status: u64, gas: u64) {
-        self.gas_used.fetch_add(gas, Ordering::Relaxed);
-        self.step_gas.fetch_add(gas, Ordering::Relaxed);
-        let settled = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&hash);
-        match settled {
-            Some(p) => self.confirm(status, p.submit_ts.elapsed()),
-            None => {
-                self.early
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(hash, status);
-            }
-        }
-    }
-
-    /// Submit-side registration (subscribe mode): park the accepted tx until
-    /// its feed notification, settling immediately if the notification won
-    /// the race.
-    fn await_feed(&self, hash: B256, submit_ts: Instant) {
-        self.pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(
-                hash,
-                Pending {
-                    submit_ts,
-                    accepted: true,
-                },
-            );
-        let early = self
-            .early
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&hash);
-        let Some(status) = early else { return };
-        if self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(&hash)
-            .is_some()
-        {
-            self.confirm(status, submit_ts.elapsed());
-        }
-    }
-
-    /// Snapshot the cumulative counters.
-    #[must_use]
-    pub fn counts(&self) -> Counts {
-        Counts {
-            offered: self.offered.load(Ordering::Relaxed),
-            accepted: self.accepted.load(Ordering::Relaxed),
-            receipted: self.receipted.load(Ordering::Relaxed),
-            bad_status: self.bad_status.load(Ordering::Relaxed),
-        }
-    }
-
-    /// Sample up to `n` still-pending entries `(hash, accepted, age)` — the
-    /// concrete identities behind `missing`/`unlanded`, for post-run
-    /// forensics (query each hash against each ingress replica directly to
-    /// distinguish per-replica stream loss from cache eviction from harness
-    /// accounting bugs).
-    #[must_use]
-    pub fn sample_pending(&self, n: usize) -> Vec<(B256, bool, Duration)> {
-        let p = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        p.iter()
-            .take(n)
-            .map(|(h, v)| (*h, v.accepted, v.submit_ts.elapsed()))
-            .collect()
-    }
-
-    /// `(missing_accepted, unlanded)` — leftover pending txs after the drain:
-    /// accepted-but-never-receipted (a durability failure) vs offered whose
-    /// submit failed and never landed.
-    #[must_use]
-    pub fn remaining_pending(&self) -> (u64, u64) {
-        let p = self
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut missing = 0u64;
-        let mut unlanded = 0u64;
-        for v in p.values() {
-            if v.accepted {
-                missing += 1;
-            } else {
-                unlanded += 1;
-            }
-        }
-        (missing, unlanded)
-    }
-
-    /// Drain the per-step gas counter (for per-step Mgas/s).
-    #[must_use]
-    pub fn take_step_gas(&self) -> u64 {
-        self.step_gas.swap(0, Ordering::Relaxed)
-    }
-
-    /// Total gas consumed by receipted txs.
-    pub fn total_gas(&self) -> u64 {
-        self.gas_used.load(Ordering::Relaxed)
-    }
-
-    /// Latency percentiles `(p50, p95, p99, max)` in microseconds over the
-    /// confirmed set.
-    pub fn latency_us(&self) -> (u64, u64, u64, u64) {
-        let h = self
-            .lat_us
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (
-            h.value_at_quantile(0.50),
-            h.value_at_quantile(0.95),
-            h.value_at_quantile(0.99),
-            h.max(),
-        )
-    }
-
-    /// Drain the per-step latency histogram: `(p50, p95, p99)` in µs for
-    /// everything confirmed since the previous call, then reset it.
-    #[must_use]
-    pub fn take_step_latency_us(&self) -> (u64, u64, u64) {
-        let mut h = self
-            .step_lat_us
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let out = (
-            h.value_at_quantile(0.50),
-            h.value_at_quantile(0.95),
-            h.value_at_quantile(0.99),
-        );
-        h.reset();
-        out
-    }
-
-    fn confirm(&self, status: u64, latency: Duration) {
-        self.confirm_with_gas(status, latency, 0);
-    }
-
-    /// Confirm with the receipt's gasUsed (the HTTP-refetch path).
-    fn confirm_with_gas(&self, status: u64, latency: Duration, gas: u64) {
-        self.gas_used.fetch_add(gas, Ordering::Relaxed);
-        self.step_gas.fetch_add(gas, Ordering::Relaxed);
-        self.receipted.fetch_add(1, Ordering::Relaxed);
-        if status != 1 {
-            self.bad_status.fetch_add(1, Ordering::Relaxed);
-        }
-        let us = u64::try_from(latency.as_micros()).unwrap_or(u64::MAX);
-        if let Ok(mut h) = self.lat_us.lock() {
-            let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
-        }
-        if let Ok(mut h) = self.step_lat_us.lock() {
-            let _ = h.record(us.clamp(HIST_LOW_US, HIST_HIGH_US));
-        }
-    }
-}
-
 /// Look up a receipt's `(status, gasUsed)`, or `None` if not mined yet.
 async fn receipt_status(client: &HttpClient, hash: B256) -> Option<(u64, u64)> {
     let v: Option<serde_json::Value> = client
@@ -327,13 +90,8 @@ async fn receipt_status(client: &HttpClient, hash: B256) -> Option<(u64, u64)> {
         .await
         .ok()?;
     let v = v?;
-    let status =
-        u64::from_str_radix(v.get("status")?.as_str()?.trim_start_matches("0x"), 16).ok()?;
-    let gas = v
-        .get("gasUsed")
-        .and_then(|g| g.as_str())
-        .and_then(|g| u64::from_str_radix(g.trim_start_matches("0x"), 16).ok())
-        .unwrap_or(0);
+    let status = json_hex_u64(&v["status"])?;
+    let gas = json_hex_u64(&v["gasUsed"]).unwrap_or(0);
     Some((status, gas))
 }
 
@@ -352,7 +110,7 @@ async fn submit_task(
         SubmitMode::Blocking => "eth_sendRawTransaction",
         SubmitMode::Subscribe => "kardamom_sendRawTransactionAsync",
     };
-    tracker.offered.fetch_add(1, Ordering::Relaxed);
+    tracker.note_offered();
     let t0 = Instant::now();
     let mut accepted = false;
     for attempt in 0..=retry {
@@ -374,7 +132,7 @@ async fn submit_task(
         }
     }
     if accepted {
-        tracker.accepted.fetch_add(1, Ordering::Relaxed);
+        tracker.note_accepted();
         if mode == SubmitMode::Subscribe {
             // The ack only means *published* — the receipt arrives on the
             // subscription feed (or the drain's polling settles it). No
@@ -400,17 +158,7 @@ async fn submit_task(
                 // No receipt for an accepted tx → keep it pending; the drain
                 // re-polls it, and a never-confirmed leftover is counted
                 // `missing` (must-deliver violated).
-                tracker
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(
-                        tx.hash,
-                        Pending {
-                            submit_ts: t0,
-                            accepted: true,
-                        },
-                    );
+                tracker.insert_pending(tx.hash, t0, true);
             }
             None => {
                 // Chaos mode: the ingress's in-memory receipt cache is
@@ -428,17 +176,7 @@ async fn submit_task(
         match receipt_status(&client, tx.hash).await {
             Some((status, gas)) => tracker.confirm_with_gas(status, t0.elapsed(), gas),
             None => {
-                tracker
-                    .pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(
-                        tx.hash,
-                        Pending {
-                            submit_ts: t0,
-                            accepted: false,
-                        },
-                    );
+                tracker.insert_pending(tx.hash, t0, false);
             }
         }
     }
@@ -540,34 +278,15 @@ pub async fn sweep_pending_once(
     tracker: &Arc<Tracker>,
     min_age: Duration,
 ) -> usize {
-    let pending: Vec<(B256, Instant)> = {
-        let p = tracker
-            .pending
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        p.iter()
-            .filter(|(_, v)| v.submit_ts.elapsed() >= min_age)
-            .map(|(h, v)| (*h, v.submit_ts))
-            .collect()
-    };
+    let pending = tracker.pending_older_than(min_age);
     for (hash, submit_ts) in pending {
-        if let Some((status, gas)) = receipt_status(client, hash).await {
-            let removed = tracker
-                .pending
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&hash)
-                .is_some();
-            if removed {
-                tracker.confirm_with_gas(status, submit_ts.elapsed(), gas);
-            }
+        if let Some((status, gas)) = receipt_status(client, hash).await
+            && tracker.remove_pending(&hash)
+        {
+            tracker.confirm_with_gas(status, submit_ts.elapsed(), gas);
         }
     }
-    tracker
-        .pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .len()
+    tracker.pending_len()
 }
 
 /// Poll outstanding (un-confirmed) txs until they receipt or `deadline`.
@@ -617,6 +336,7 @@ mod tests {
     use jsonrpsee::http_client::HttpClientBuilder;
     use jsonrpsee::server::{Server, ServerHandle};
     use jsonrpsee::types::ErrorObjectOwned;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     fn tx(sender: usize, nonce: u64) -> PlannedTx {
         PlannedTx {

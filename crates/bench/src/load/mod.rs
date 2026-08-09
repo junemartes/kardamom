@@ -12,13 +12,15 @@
 //!   undelivered receipts fail.
 
 pub mod accounting;
+pub mod config;
 pub mod defi;
 pub mod engine;
+mod feed;
 pub mod plan;
 pub mod scrape;
+mod tracker;
 
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -26,260 +28,24 @@ use alloy_primitives::{Address, U256};
 use jsonrpsee::core::client::ClientT;
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
-use serde::Serialize;
 use tokio::sync::Semaphore;
 
 use crate::config::{MAX_IN_FLIGHT_SLACK, REQUEST_TIMEOUT};
-use crate::load::accounting::{EvalInput, Verdict, evaluate};
+use crate::load::accounting::{EvalInput, evaluate, print_report, step_gap_ok, step_seq_clean};
 use crate::load::engine::{Queues, SubmitMode, Tracker, drain, join_submit_tasks, pacer};
+use crate::load::feed::receipt_feed_task;
 use crate::load::scrape::Scraper;
 
-/// Default Anvil/Hardhat test mnemonic (genesis prefunds accounts #0..#15).
-pub const ANVIL_MNEMONIC: &str = "test test test test test test test test test test test junk";
+pub use config::{ANVIL_MNEMONIC, Completeness, LoadConfig, LoadReport, RampStep, Workload};
 
-/// Which set of txs must be 100% receipted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Completeness {
-    /// Every tx ingress *accepted* must receipt (chaos-safe: a submit that
-    /// fails during an outage is retried, not held against must-deliver).
-    Accepted,
-    /// Every tx *offered* must receipt (strict; non-chaos soak only).
-    Offered,
+/// Parse a `0x`-prefixed JSON-RPC hex quantity into a `u64`.
+pub(crate) fn hex_u64(s: &str) -> Option<u64> {
+    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
-/// Full harness configuration (built by the CLI).
-#[derive(Debug, Clone)]
-pub struct LoadConfig {
-    /// Ingress JSON-RPC URL.
-    pub rpc: String,
-    /// L2 chain id (probed via `eth_chainId` when `None`).
-    pub chain_id: Option<u64>,
-    /// Soak duration.
-    pub duration: Duration,
-    /// Ramp ceiling / chaos-mode fixed rate (tx/s).
-    pub target_tps: u32,
-    /// Number of sender accounts.
-    pub senders: u32,
-    /// First account index in the mnemonic table (reserve low accounts).
-    pub sender_offset: u32,
-    /// Per-sender starting nonce.
-    pub nonce_start: u64,
-    /// BIP-39 mnemonic the senders derive from.
-    pub mnemonic: String,
-    /// Transfer sink address.
-    pub to: Address,
-    /// Wei per transfer.
-    pub value: U256,
-    /// Workload family: plain transfers, or the DeFi mix (CLOB + swap
-    /// pool + vault; see `load::defi`). DeFi deploys its contracts from
-    /// the FIRST sender before the ramp and reports gas-centric throughput.
-    pub workload: Workload,
-    /// Legacy gas price (wei).
-    pub gas_price: u128,
-    /// Max outstanding submits (open-loop back-pressure bound).
-    pub max_in_flight: u32,
-    /// Max allowed sealer-minus-executor block gap.
-    pub max_gap: u64,
-    /// How long to keep draining receipts after the send window.
-    pub drain_timeout: Duration,
-    /// Per-submit retry attempts on transient failure.
-    pub retry_submit: u32,
-    /// Ramp increment per step (tx/s).
-    pub ramp_step_tps: u32,
-    /// Seconds held per ramp step.
-    pub ramp_step_secs: u64,
-    /// Fraction of the discovered max to soak at.
-    pub soak_fraction: f64,
-    /// Completeness criterion.
-    pub completeness: Completeness,
-    /// Fail unless completeness is met.
-    pub assert_all_delivered: bool,
-    /// Chaos framing (skip ramp; tolerate transient blips).
-    pub chaos_mode: bool,
-    /// Fixed-rate framing: skip the ramp and soak at `target_tps` with the
-    /// STRICT (non-chaos) verdict. For CI invariant gating on weak/shared
-    /// hosts: edge discovery there measures the hypervisor, not the stack —
-    /// pass/fail becomes host luck (the load shard's 800→18 ceiling swings).
-    /// Correctness (zero loss, gaps, keep-pace) is rate-independent; gate on
-    /// it at a rate the weakest runner sustains, and leave performance
-    /// numbers to the perf suite on dedicated hardware.
-    pub fixed_rate: bool,
-    /// Services to scrape.
-    pub scrape: Vec<String>,
-    /// `docker exec` scrape vs direct.
-    pub metrics_via_docker: bool,
-    /// Submit via `kardamom_sendRawTransactionAsync` + receive receipts on a
-    /// `kardamom_subscribeReceipts` WebSocket feed, instead of the parked
-    /// `eth_sendRawTransaction`. In-flight txs then hold no connections.
-    pub subscribe: bool,
-    /// Blocking mode only: confirm receipts via the WebSocket feed instead
-    /// of a per-tx `eth_getTransactionReceipt` re-fetch after each accepted
-    /// submit. Halves the harness's HTTP request load (2 → 1 calls per tx —
-    /// at a 10k tx/s target the re-fetches alone are another 10k rps through
-    /// the proxy + ingress) with identical verification integrity: every
-    /// accepted tx still ends confirmed (feed), re-polled (drain), or
-    /// counted `missing`. No effect in subscribe mode (already feed-driven).
-    pub feed_confirm: bool,
-    /// Executor node-container names.
-    pub executor_nodes: Vec<String>,
-    /// Ingress node-container name.
-    pub ingress_node: String,
-    /// Sequencer node-container names.
-    pub sequencer_nodes: Vec<String>,
-    /// Optional JSON report path.
-    pub output: Option<PathBuf>,
-}
-
-/// Workload family driven by the harness.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Workload {
-    #[default]
-    Transfers,
-    Defi,
-}
-
-impl std::str::FromStr for Workload {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "transfers" => Ok(Self::Transfers),
-            "defi" => Ok(Self::Defi),
-            other => anyhow::bail!("unknown workload {other:?} (transfers|defi)"),
-        }
-    }
-}
-
-/// One ramp step's sustainability evaluation.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct RampStep {
-    /// Offered rate for this step (tx/s).
-    pub rate: u32,
-    /// Accepted / offered over the step.
-    pub accept_ratio: f64,
-    /// Executors advanced and stayed within `max_gap`.
-    pub gap_ok: bool,
-    /// No sequencer drops/evictions over the step.
-    pub seq_clean: bool,
-    /// All three signals held.
-    pub sustainable: bool,
-    /// Receipt latency over THIS step only (µs) — localizes where in the
-    /// ramp the tail degrades.
-    #[serde(default)]
-    pub lat_p50_us: u64,
-    #[serde(default)]
-    pub lat_p95_us: u64,
-    /// Gas consumed by receipts confirmed during this step (Mgas/s = this
-    /// over the step duration).
-    #[serde(default)]
-    pub gas_used: u64,
-    #[serde(default)]
-    pub lat_p99_us: u64,
-}
-
-/// Serialized harness report.
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct LoadReport {
-    /// `"soak"` or `"chaos"`.
-    pub mode: String,
-    /// Configured ramp ceiling / chaos rate.
-    pub target_tps: u32,
-    /// Highest sustainable ramp rate (== target in chaos mode).
-    pub discovered_max_tps: u32,
-    /// Rate the soak ran at.
-    pub soak_rate_tps: u32,
-    /// Soak duration in seconds.
-    pub duration_secs: f64,
-    /// Ramp curve.
-    pub ramp: Vec<RampStep>,
-    /// Receipt latency p50 (µs).
-    pub lat_p50_us: u64,
-    /// Receipt latency p95 (µs).
-    #[serde(default)]
-    pub lat_p95_us: u64,
-    /// Receipt latency p99 (µs).
-    pub lat_p99_us: u64,
-    /// Receipt latency max (µs).
-    pub lat_max_us: u64,
-    /// Total gas consumed by receipted txs over the soak window.
-    #[serde(default)]
-    pub total_gas: u64,
-    /// Workload the run drove (`transfers` or `defi`).
-    #[serde(default)]
-    pub workload: String,
-    /// Completeness + drop accounting + keep-pace.
-    pub verdict: Verdict,
-}
-
-/// Subscribe-mode receipt feed: one WebSocket subscription (filtered to the
-/// run's senders) confirming txs into the shared tracker. Reconnects forever
-/// — chaos restarts the ingress under it — and the drain's HTTP polling
-/// settles anything that slipped through a gap. Aborted by the caller.
-async fn receipt_feed_task(ws_url: String, senders: Vec<Address>, tracker: Arc<Tracker>) {
-    use jsonrpsee::core::client::{Subscription, SubscriptionClientT};
-    use jsonrpsee::ws_client::WsClientBuilder;
-
-    loop {
-        let client = match WsClientBuilder::default().build(&ws_url).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(error = %e, "receipt feed: ws connect failed; retrying");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
-        let sub: Result<Subscription<serde_json::Value>, _> = client
-            .subscribe(
-                "kardamom_subscribeReceipts",
-                rpc_params![Some(senders.clone())],
-                "kardamom_unsubscribeReceipts",
-            )
-            .await;
-        let mut sub = match sub {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::warn!(error = %e, "receipt feed: subscribe failed; retrying");
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-        };
-        tracing::info!("receipt feed: subscribed");
-        while let Some(item) = sub.next().await {
-            let Ok(v) = item else { continue };
-            match v["type"].as_str() {
-                Some("receipt") => {
-                    let r = &v["receipt"];
-                    let Some(hash) = r["transactionHash"]
-                        .as_str()
-                        .and_then(|s| s.parse::<alloy_primitives::B256>().ok())
-                    else {
-                        continue;
-                    };
-                    let status = r["status"]
-                        .as_str()
-                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or(0);
-                    let gas = r["gasUsed"]
-                        .as_str()
-                        .and_then(|s| u64::from_str_radix(s.trim_start_matches("0x"), 16).ok())
-                        .unwrap_or(0);
-                    tracker.confirm_from_feed(hash, status, gas);
-                }
-                Some("txError") => {
-                    tracing::warn!(payload = %v, "receipt feed: sequencer rejection");
-                }
-                Some("lagged") => {
-                    tracing::warn!(
-                        payload = %v,
-                        "receipt feed: lagged — drain will settle the gap"
-                    );
-                }
-                _ => {}
-            }
-        }
-        tracing::warn!("receipt feed: stream ended; reconnecting");
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
+/// [`hex_u64`] over a JSON string field (`Null`/missing/non-string → `None`).
+pub(crate) fn json_hex_u64(v: &serde_json::Value) -> Option<u64> {
+    v.as_str().and_then(hex_u64)
 }
 
 async fn preflight_chain_id(client: &HttpClient) -> anyhow::Result<u64> {
@@ -393,77 +159,7 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     // workload call targets their computed addresses, so a call arriving
     // before its contract exists would revert and poison the verdict.
     if let Some(deploys) = defi_deploys {
-        for d in &deploys {
-            let _: alloy_primitives::B256 = client
-                .request("eth_sendRawTransaction", rpc_params![d.raw.clone()])
-                .await
-                .map_err(|e| anyhow::anyhow!("defi deploy submit (nonce {}): {e}", d.nonce))?;
-        }
-        // A LIVENESS bound, expressed as one. This stage starts the moment
-        // the transfer soak's verdict lands, so the chain is still draining
-        // that backlog and the deploy queues behind it; how long that takes
-        // is a property of the runner, not of the code under test. A fixed
-        // wall-clock deadline therefore races the drain — it was 30s, then
-        // 180s, and CI still burned the whole 180s with the chain making
-        // steady progress the entire time.
-        //
-        // So: wait as long as the CHAIN IS ADVANCING, and fail only when it
-        // stops. A stalled pipeline is caught in seconds; a merely slow one
-        // is waited out. The overall cap stays as a backstop against waiting
-        // forever on a chain that advances but never includes this tx.
-        const STALL_LIMIT: Duration = Duration::from_secs(60);
-        const HARD_CAP: Duration = Duration::from_secs(600);
-        macro_rules! head_block {
-            () => {
-                client
-                    .request::<String, _>("eth_blockNumber", rpc_params![])
-                    .await
-                    .ok()
-                    .and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
-            };
-        }
-        let started = Instant::now();
-        for d in &deploys {
-            let mut last_block = head_block!();
-            let mut last_progress = Instant::now();
-            loop {
-                let v: Option<serde_json::Value> = client
-                    .request("eth_getTransactionReceipt", rpc_params![d.hash])
-                    .await
-                    .unwrap_or(None);
-                if let Some(r) = v {
-                    anyhow::ensure!(
-                        r["status"].as_str() == Some("0x1"),
-                        "defi deploy reverted (nonce {}): {r}",
-                        d.nonce
-                    );
-                    break;
-                }
-                let now = head_block!();
-                if now.is_some() && now != last_block {
-                    last_block = now;
-                    last_progress = Instant::now();
-                }
-                anyhow::ensure!(
-                    last_progress.elapsed() < STALL_LIMIT,
-                    "defi deploy not mined (nonce {}): chain STOPPED advancing — no new \
-                     block for {}s while waiting (head {:?})",
-                    d.nonce,
-                    STALL_LIMIT.as_secs(),
-                    last_block
-                );
-                anyhow::ensure!(
-                    started.elapsed() < HARD_CAP,
-                    "defi deploy not mined (nonce {}) within {}s although the chain kept \
-                     advancing to {:?} — the tx was accepted but never included",
-                    d.nonce,
-                    HARD_CAP.as_secs(),
-                    last_block
-                );
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        }
-        tracing::info!("defi contracts deployed + confirmed");
+        defi::deploy_and_confirm(&client, &deploys).await?;
     }
 
     let scraper = build_scraper(&cfg);
@@ -756,112 +452,4 @@ async fn ramp_to_max(
         rate = rate.saturating_add(cfg.ramp_step_tps.max(1));
     }
     discovered.max(cfg.ramp_step_tps.max(1))
-}
-
-fn step_gap_ok(s0: &scrape::MetricsSnapshot, s1: &scrape::MetricsSnapshot, max_gap: u64) -> bool {
-    let sealer_adv = match (s0.sealer_block, s1.sealer_block) {
-        (Some(a), Some(b)) => b > a,
-        _ => false,
-    };
-    for (node, b1) in &s1.executor_blocks {
-        let b0 = s0
-            .executor_blocks
-            .iter()
-            .find(|(n, _)| n == node)
-            .and_then(|(_, b)| *b);
-        // Missing metric → can't assert, stay lenient.
-        if let (Some(b0), Some(b1), Some(sealer)) = (b0, *b1, s1.sealer_block) {
-            if sealer_adv && b1 <= b0 {
-                return false; // frozen
-            }
-            if sealer.saturating_sub(b1) > max_gap {
-                return false; // lagging
-            }
-        }
-    }
-    true
-}
-
-fn step_seq_clean(s0: &scrape::MetricsSnapshot, s1: &scrape::MetricsSnapshot) -> bool {
-    let grew = |a: Option<u64>, b: Option<u64>| matches!((a, b), (Some(a), Some(b)) if b > a);
-    !grew(s0.seq_dropped_past, s1.seq_dropped_past) && !grew(s0.seq_evictions, s1.seq_evictions)
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn print_report(r: &LoadReport) {
-    println!(
-        "================= KARDAMOM-LOAD ({}) =================",
-        r.mode
-    );
-    println!(
-        "target_tps={}  discovered_max={}  soak_rate={}  duration={:.0}s",
-        r.target_tps, r.discovered_max_tps, r.soak_rate_tps, r.duration_secs
-    );
-    if !r.ramp.is_empty() {
-        println!("---- ramp ----");
-        for s in &r.ramp {
-            println!(
-                "  rate={:<6} accept={:.3} p50={}ms p95={}ms p99={}ms step_mgas={:<8.1} gap_ok={:<5} seq_clean={:<5} {}",
-                s.rate,
-                s.accept_ratio,
-                s.lat_p50_us / 1000,
-                s.lat_p95_us / 1000,
-                s.lat_p99_us / 1000,
-                s.gas_used as f64 / 1e6,
-                s.gap_ok,
-                s.seq_clean,
-                if s.sustainable {
-                    "SUSTAINABLE"
-                } else {
-                    "UNSUSTAINABLE"
-                }
-            );
-        }
-    }
-    let v = &r.verdict;
-    if r.total_gas > 0 && r.duration_secs > 0.0 {
-        // total_gas spans ramp + soak; the soak window's own gas is the
-        // total minus what the ramp steps drained into their counters.
-        let ramp_gas: u64 = r.ramp.iter().map(|s| s.gas_used).sum();
-        let soak_gas = r.total_gas.saturating_sub(ramp_gas);
-        println!(
-            "gas: run_total={:.3} Ggas  soak={:.3} Ggas -> {:.4} Ggas/s ({:.1} Mgas/s) [{}]",
-            r.total_gas as f64 / 1e9,
-            soak_gas as f64 / 1e9,
-            soak_gas as f64 / 1e9 / r.duration_secs,
-            soak_gas as f64 / 1e6 / r.duration_secs,
-            r.workload,
-        );
-    }
-    println!(
-        "offered={}  accepted={}  receipted={}  missing={}  unlanded={}  bad_status={}",
-        v.offered, v.accepted, v.receipted, v.missing, v.unlanded, v.bad_status
-    );
-    println!(
-        "drop-accounting: inferred_ingress_drop={:?}  seq_dropped={:?}  seq_evicted={:?}  seq_backpressure={:?}",
-        v.inferred_ingress_drop, v.seq_dropped, v.seq_evicted, v.seq_backpressure
-    );
-    println!(
-        "receipt-latency p50={}ms p95={}ms p99={}ms max={}ms",
-        r.lat_p50_us / 1000,
-        r.lat_p95_us / 1000,
-        r.lat_p99_us / 1000,
-        r.lat_max_us / 1000
-    );
-    println!("---- keep-pace ----");
-    for k in &v.keep_pace {
-        println!(
-            "  {:<22} base={:?} final={:?} advanced={:?} gap={:?} {}",
-            k.node, k.base, k.final_block, k.advanced, k.gap, k.verdict
-        );
-    }
-    if v.pass {
-        println!("RESULT: PASS");
-    } else {
-        println!("RESULT: FAIL");
-        for f in &v.failures {
-            println!("  FAIL: {f}");
-        }
-    }
-    println!("=====================================================");
 }
