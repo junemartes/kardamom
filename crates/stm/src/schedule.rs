@@ -24,7 +24,7 @@
 use std::collections::{HashMap, HashSet};
 
 use kardamom_footprint::classifier::Stats;
-use kardamom_footprint::{Cell, TxObs, envelope_view};
+use kardamom_footprint::{Cell, TxObs, decoded_view, envelope_view};
 use kardamom_types::TxEnvelope;
 
 /// A block's execution plan over local tx positions `0..n`. Every tx is in
@@ -44,6 +44,32 @@ pub struct BlockSchedule {
 /// Scheduling-time view of one tx (no ground truth — nothing has executed).
 pub fn scheduling_view(local_idx: u32, envelope: &TxEnvelope) -> TxObs {
     let (to, selector, args, has_value) = envelope_view(&envelope.raw_tx);
+    view_from_parts(local_idx, envelope, to, selector, args, has_value)
+}
+
+/// [`scheduling_view`] over a pre-decoded envelope (None = undecodable —
+/// the tier-1-only degenerate view, same as a failed decode).
+pub fn scheduling_view_decoded(
+    local_idx: u32,
+    envelope: &TxEnvelope,
+    decoded: Option<&alloy_consensus::TxEnvelope>,
+) -> TxObs {
+    let (to, selector, args, has_value) = match decoded {
+        Some(d) => decoded_view(d),
+        None => (None, None, Vec::new(), false),
+    };
+    view_from_parts(local_idx, envelope, to, selector, args, has_value)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn view_from_parts(
+    local_idx: u32,
+    envelope: &TxEnvelope,
+    to: Option<alloy_primitives::Address>,
+    selector: Option<[u8; 4]>,
+    args: Vec<alloy_primitives::U256>,
+    has_value: bool,
+) -> TxObs {
     TxObs {
         index: local_idx as u64,
         block: 0,
@@ -59,8 +85,14 @@ pub fn scheduling_view(local_idx: u32, envelope: &TxEnvelope) -> TxObs {
 }
 
 /// Build the pessimistic DAG for one block. `exclude` is the Accumulator
-/// boundary (the fee sink at minimum).
-pub fn build(stats: &Stats, envelopes: &[TxEnvelope], exclude: &HashSet<Cell>) -> BlockSchedule {
+/// boundary (the fee sink at minimum). `decoded[i]` is tx i's pre-decoded
+/// envelope (`None` = undecodable ⇒ tier-1 view, skipped at execution).
+pub fn build(
+    stats: &Stats,
+    envelopes: &[TxEnvelope],
+    decoded: &[Option<alloy_consensus::TxEnvelope>],
+    exclude: &HashSet<Cell>,
+) -> BlockSchedule {
     let n = envelopes.len();
     let mut s = BlockSchedule {
         children: vec![Vec::new(); n],
@@ -88,8 +120,8 @@ pub fn build(stats: &Stats, envelopes: &[TxEnvelope], exclude: &HashSet<Cell>) -
     };
 
     for (i, env) in envelopes.iter().enumerate() {
+        let view = scheduling_view_decoded(i as u32, env, decoded[i].as_ref());
         let i = i as u32;
-        let view = scheduling_view(i, env);
         match stats.predict(&view) {
             Some(cells) => {
                 // Everything after a barrier depends on it.
@@ -151,6 +183,13 @@ mod tests {
         Address::with_last_byte(i)
     }
 
+    fn decode_all(envs: &[TxEnvelope]) -> Vec<Option<alloy_consensus::TxEnvelope>> {
+        use alloy_eips::eip2718::Decodable2718;
+        envs.iter()
+            .map(|e| alloy_consensus::TxEnvelope::decode_2718(&mut &e.raw_tx[..]).ok())
+            .collect()
+    }
+
     #[test]
     fn same_sender_chains_distinct_senders_do_not() {
         let stats = Stats::default();
@@ -160,7 +199,7 @@ mod tests {
             envelope(addr(1)),
             envelope(addr(3)),
         ];
-        let s = build(&stats, &envs, &HashSet::new());
+        let s = build(&stats, &envs, &decode_all(&envs), &HashSet::new());
         assert_eq!(s.cold, 0, "tier-1 txs are never cold");
         assert_eq!(s.edges, 1, "only the sender chain 0->2");
         assert_eq!(s.children[0], vec![2]);
@@ -173,7 +212,7 @@ mod tests {
         let envs = vec![envelope(addr(1)), envelope(addr(1))];
         let mut exclude = HashSet::new();
         exclude.insert(Cell::Account(addr(1)));
-        let s = build(&stats, &envs, &exclude);
+        let s = build(&stats, &envs, &decode_all(&envs), &exclude);
         assert_eq!(s.edges, 0, "the shared sender cell was excluded");
     }
 
@@ -214,7 +253,12 @@ mod tests {
             cold_env,          // 2: barrier
             envelope(addr(3)), // 3: warm, must depend on 2
         ];
-        let s = build(&Stats::default(), &envs, &HashSet::new());
+        let s = build(
+            &Stats::default(),
+            &envs,
+            &decode_all(&envs),
+            &HashSet::new(),
+        );
         assert_eq!(s.cold, 1);
         // 0->2, 1->2 (barrier waits on all in-flight), 2->3 (everything
         // after waits on the barrier).

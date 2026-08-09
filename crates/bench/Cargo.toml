@@ -24,12 +24,17 @@ name = "kardamom-stm-p0"
 path = "src/bin/stm-p0.rs"
 
 [[bin]]
+name = "kardamom-stm-p2"
+path = "src/bin/stm-p2.rs"
+
+[[bin]]
 name = "kardamom-perf"
 path = "src/bin/perf.rs"
 
 [dependencies]
 kardamom-types.workspace = true
 kardamom-footprint = { path = "../footprint" }
+kardamom-stm = { path = "../stm" }
 kardamom-ingress = { path = "../ingress" }
 
 alloy-primitives.workspace = true

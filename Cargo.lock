@@ -3730,6 +3730,7 @@ dependencies = [
  "kardamom-engine",
  "kardamom-footprint",
  "kardamom-ingress",
+ "kardamom-stm",
  "kardamom-types",
  "kardamom-validator",
  "pprof",

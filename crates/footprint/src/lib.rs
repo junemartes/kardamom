@@ -61,11 +61,20 @@ pub struct TxObs {
 /// derivation-candidate views. Undecodable bytes yield the empty view
 /// (selector-less ⇒ tier-1-only prediction).
 pub fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
-    use alloy_consensus::Transaction;
     use alloy_eips::eip2718::Decodable2718;
     let Ok(env) = alloy_consensus::TxEnvelope::decode_2718(&mut &raw[..]) else {
         return (None, None, Vec::new(), false);
     };
+    decoded_view(&env)
+}
+
+/// [`envelope_view`] over an already-decoded envelope — callers that hold
+/// the decoded tx (the STM engine decodes once for schedule AND execution)
+/// skip the second RLP pass.
+pub fn decoded_view(
+    env: &alloy_consensus::TxEnvelope,
+) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
+    use alloy_consensus::Transaction;
     let has_value = env.value() > U256::ZERO;
     let to = env.to();
     let input = env.input();

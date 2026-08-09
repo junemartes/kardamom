@@ -127,6 +127,29 @@ struct MvView<'a, S: StateDatabase> {
     idx: u32,
     reads: Vec<ReadRecord>,
     sink_start: Option<AccountInfo>,
+    // Worker-local memos over the IMMUTABLE-for-the-block layers (base
+    // input; content-addressed code). Without them every MvCache miss
+    // re-walks the delta BTreeMaps and the snapshot — and worse, re-copies
+    // full contract bytecode per call. The multi-version lists themselves
+    // are never memoized (their answers depend on the reader's index).
+    base_accounts: std::collections::HashMap<alloy_primitives::Address, Option<AccountInfo>>,
+    base_storage: std::collections::HashMap<(alloy_primitives::Address, B256), U256>,
+    code_cache: std::collections::HashMap<B256, revm::state::Bytecode>,
+}
+
+impl<'a, S: StateDatabase> MvView<'a, S> {
+    fn new(mv: &'a MvCache, base: &'a BlockInput<'a, S>, sink_start: Option<AccountInfo>) -> Self {
+        Self {
+            mv,
+            base,
+            idx: 0,
+            reads: Vec::new(),
+            sink_start,
+            base_accounts: std::collections::HashMap::new(),
+            base_storage: std::collections::HashMap::new(),
+            code_cache: std::collections::HashMap::new(),
+        }
+    }
 }
 
 impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
@@ -154,17 +177,27 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             }));
         }
         self.reads.push(ReadRecord::Account(address, None));
-        self.base.basic_ref(address)
+        if let Some(a) = self.base_accounts.get(&address) {
+            return Ok(a.clone());
+        }
+        let a = self.base.basic_ref(address)?;
+        self.base_accounts.insert(address, a.clone());
+        Ok(a)
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        // Content-addressed: no version, no record.
-        if let Some(code) = self.mv.read_code(&code_hash) {
-            return Ok(revm::state::Bytecode::new_raw(
-                alloy_primitives::Bytes::copy_from_slice(&code),
-            ));
+        // Content-addressed: no version, no record — memo both sources
+        // (Bytecode clones are refcounted; the copy happens once).
+        if let Some(c) = self.code_cache.get(&code_hash) {
+            return Ok(c.clone());
         }
-        self.base.code_by_hash_ref(code_hash)
+        let c = if let Some(code) = self.mv.read_code(&code_hash) {
+            revm::state::Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(&code))
+        } else {
+            self.base.code_by_hash_ref(code_hash)?
+        };
+        self.code_cache.insert(code_hash, c.clone());
+        Ok(c)
     }
 
     fn storage(
@@ -178,7 +211,12 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             return Ok(v);
         }
         self.reads.push(ReadRecord::Slot(address, key, None));
-        self.base.storage_ref(address, index)
+        if let Some(v) = self.base_storage.get(&(address, key)) {
+            return Ok(*v);
+        }
+        let v = self.base.storage_ref(address, index)?;
+        self.base_storage.insert((address, key), v);
+        Ok(v)
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
@@ -227,7 +265,14 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
     let mut exclude = HashSet::new();
     exclude.insert(Cell::Account(FEE_SINK));
     let envelopes: Vec<TxEnvelope> = txs.iter().map(|(_, _, e)| e.clone()).collect();
-    let sched = schedule::build(stats, &envelopes, &exclude);
+    // ONE decode per tx, shared by schedule and workers (the schedule's
+    // envelope_view used to decode a second time — measured at ~1ms per
+    // 1000-tx block, pure waste).
+    let decoded: Vec<Option<alloy_consensus::TxEnvelope>> = txs
+        .iter()
+        .map(|(tx_idx, _, e)| decode_alloy_envelope(&e.raw_tx, *tx_idx).ok())
+        .collect();
+    let sched = schedule::build(stats, &envelopes, &decoded, &exclude);
     let input = BlockInput { snapshot, base };
     let sink_start_info = input
         .basic_ref(FEE_SINK)
@@ -238,8 +283,8 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
         .unwrap_or(U256::ZERO);
 
     let mv = MvCache::new();
-    let results: Vec<Mutex<Option<Result<TxResult, ExecutorError>>>> =
-        (0..n).map(|_| Mutex::new(None)).collect();
+    let results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>> =
+        (0..n).map(|_| std::sync::OnceLock::new()).collect();
     let indegree: Vec<AtomicU32> = sched.indegree.iter().map(|d| AtomicU32::new(*d)).collect();
     // Canonical-order-first ready policy: the lowest ready index runs
     // first — chains drain in order and read-then-published windows (the
@@ -255,6 +300,7 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
     let abort = AtomicBool::new(false);
 
     let worker_count = workers.max(1).min(n.max(1));
+    let t_sched_done = std::time::Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             scope.spawn(|| {
@@ -264,13 +310,7 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
                 // index/read-log are re-aimed per tx through `db_mut`.
                 // Nothing carries across `transact` calls except the DB
                 // itself — the same property ExecScope already relies on.
-                let view = MvView {
-                    mv: &mv,
-                    base: &input,
-                    idx: 0,
-                    reads: Vec::new(),
-                    sink_start: sink_start_info.clone(),
-                };
+                let view = MvView::new(&mv, &input, sink_start_info.clone());
                 let mut evm = Context::mainnet()
                     .with_db(view)
                     .with_block(env.block_env())
@@ -299,10 +339,11 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
                         *tx_idx,
                         *position,
                         envelope,
+                        decoded[job as usize].as_ref(),
                         sink_start_balance,
                     );
                     let errored = r.is_err();
-                    *results[job as usize].lock().expect("result poisoned") = Some(r);
+                    let _ = results[job as usize].set(r);
                     if errored {
                         abort.store(true, Ordering::SeqCst);
                         ready_cv.notify_all();
@@ -326,10 +367,12 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
         }
     });
 
+    let t_exec_wall = t_sched_done.elapsed();
+    let t_exec = std::time::Instant::now();
     // Collect: surface the first (local, fail-stop) execution error.
     let mut tx_results = Vec::with_capacity(n);
     for cell in results {
-        match cell.into_inner().expect("result poisoned") {
+        match cell.into_inner() {
             Some(Ok(r)) => tx_results.push(r),
             Some(Err(e)) => return Err(e),
             None => {
@@ -343,6 +386,8 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
     // Validation (spec: "Validation remains as the final invariant check"):
     // every recorded read must still be the highest version below the
     // reader. A conviction = the prediction missed a real conflict.
+    let t_collect = t_exec.elapsed();
+    let t_val = std::time::Instant::now();
     let validation_failures: usize = tx_results
         .iter()
         .enumerate()
@@ -353,6 +398,7 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
                 .count()
         })
         .sum();
+    let t_validate = t_val.elapsed();
     if validation_failures > 0 {
         // Invariant #3: discard, re-execute sequentially, count it.
         tracing::warn!(
@@ -390,6 +436,12 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
         receipts.push(r.receipt);
     }
 
+    if std::env::var("KARDAMOM_STM_PHASE_TIMING").is_ok() {
+        eprintln!(
+            "phase block={} n={} exec={:?} collect={:?} validate={:?}",
+            env.block_number, n, t_exec_wall, t_collect, t_validate
+        );
+    }
     Ok(StmOutcome {
         receipts,
         delta,
@@ -448,6 +500,7 @@ fn execute_one<S: StateDatabase>(
     tx_idx: TxIndex,
     position: BPosition,
     envelope: &TxEnvelope,
+    decoded: Option<&alloy_consensus::TxEnvelope>,
     sink_start_balance: U256,
 ) -> Result<TxResult, ExecutorError> {
     let skip = |reason: &str, nonce: u64, to: Option<alloy_primitives::Address>| {
@@ -469,9 +522,9 @@ fn execute_one<S: StateDatabase>(
         }
     };
 
-    let alloy_env = match decode_alloy_envelope(&envelope.raw_tx, tx_idx) {
-        Ok(e) => e,
-        Err(e) => return Ok(skip(&format!("undecodable raw_tx: {e}"), 0, None)),
+    let _ = tx_idx;
+    let Some(alloy_env) = decoded else {
+        return Ok(skip("undecodable raw_tx", 0, None));
     };
     use alloy_consensus::Transaction;
     let signer = envelope.sender;
@@ -487,7 +540,7 @@ fn execute_one<S: StateDatabase>(
         db.idx = local_idx;
         db.reads.clear();
     }
-    let tx_env = tx_env_from_alloy(&alloy_env, signer);
+    let tx_env = tx_env_from_alloy(alloy_env, signer);
     let outcome = match evm.transact(tx_env) {
         Ok(o) => o,
         Err(revm::context::result::EVMError::Transaction(reason)) => {
