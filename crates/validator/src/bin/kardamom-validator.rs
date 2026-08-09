@@ -722,6 +722,8 @@ async fn main() -> Result<()> {
             resume,
             // No BAL capture: the validator VERIFIES BALs, never publishes them.
             None,
+            // No footprint shadow either: P1 measures on the EXECUTOR role.
+            None,
             // Join-miss archive refetch (None on single-host/IPC runs).
             // Whole-block exec strategy (validator parallel path).
             block_exec,

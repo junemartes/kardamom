@@ -280,6 +280,8 @@ fn actor_receipts_match_naive_reference() {
             0,
             None,
             None,
+            // Footprint-shadow capture handoff (P1; off here).
+            None,
             // Whole-block exec strategy (validator parallel path).
             None,
             None,

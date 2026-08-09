@@ -54,3 +54,29 @@ pub struct TxObs {
     pub reads: Vec<Cell>,
     pub writes: Vec<Cell>,
 }
+
+/// Decode the scheduling-time fields off a raw 2718 envelope:
+/// `(to, selector, ABI-head words, has_value)`. Shared by the offline
+/// capture runner and the live shadow so both build identical
+/// derivation-candidate views. Undecodable bytes yield the empty view
+/// (selector-less ⇒ tier-1-only prediction).
+pub fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
+    use alloy_consensus::Transaction;
+    use alloy_eips::eip2718::Decodable2718;
+    let Ok(env) = alloy_consensus::TxEnvelope::decode_2718(&mut &raw[..]) else {
+        return (None, None, Vec::new(), false);
+    };
+    let has_value = env.value() > U256::ZERO;
+    let to = env.to();
+    let input = env.input();
+    let selector: Option<[u8; 4]> = input.get(..4).map(|s| s.try_into().unwrap());
+    let mut args = Vec::new();
+    if input.len() > 4 {
+        for chunk in input[4..].chunks(32).take(6) {
+            let mut w = [0u8; 32];
+            w[..chunk.len()].copy_from_slice(chunk);
+            args.push(U256::from_be_bytes(w));
+        }
+    }
+    (to, selector, args, has_value)
+}

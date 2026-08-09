@@ -271,6 +271,10 @@ impl Executor {
         initial_block: u64,
         resume: Option<ResumePoint>,
         bal_tx: Option<Sender<BalHandoff>>,
+        // P1 footprint shadow (`crate::shadow`): per-block capture handoff,
+        // executor role only, `None` everywhere else. Ignored on the
+        // whole-block (validator) path — captures ride the streaming arm.
+        shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
         block_exec: Option<BlockExec<S::Db>>,
         recovery: Option<crate::reader::JoinRecoveryFactory>,
         // Role-specific epoch check. `None` on the executor (it trusts the
@@ -319,6 +323,7 @@ impl Executor {
             initial_block,
             resume,
             bal_tx,
+            shadow_tx,
             block_exec,
             epoch_observer,
         );
@@ -396,6 +401,7 @@ fn spawn_exec<S, Q, P>(
     initial_block: u64,
     resume: Option<ResumePoint>,
     bal_tx: Option<Sender<BalHandoff>>,
+    shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     block_exec: Option<BlockExec<S::Db>>,
     mut epoch_observer: Option<Box<dyn crate::reader::EpochObserver>>,
 ) -> JoinHandle<Result<(), ExecutorError>>
@@ -464,6 +470,11 @@ where
             // the price of feeding both this and the streaming tx_receipts
             // publisher — flagged for saturation validation.
             let mut block_receipts: Vec<kardamom_types::Receipt> = Vec::new();
+            // P1 footprint shadow: per-block tx captures + serial-lane
+            // count, handed off (try_send, never blocking) at each
+            // boundary. Both stay empty when the shadow is off.
+            let mut shadow_captures: Vec<crate::shadow::ShadowTxCapture> = Vec::new();
+            let mut shadow_serial: u32 = 0;
             // Block-number bookkeeping. We treat blocks 1-indexed (genesis
             // is block 0). The exec thread assumes every block boundary it
             // sees is for the *current* in-flight block; it doesn't try to
@@ -646,6 +657,11 @@ where
                                 scope.insert(sc)
                             }
                         };
+                        // Shadow read capture: a default TouchSet only when
+                        // the shadow is on — the None path is free.
+                        let mut touches = shadow_tx
+                            .as_ref()
+                            .map(|_| kardamom_exec_core::executor::TouchSet::default());
                         let result = sc.execute_tx(
                             tx_idx,
                             position,
@@ -655,7 +671,7 @@ where
                             bal_tx
                                 .as_ref()
                                 .map(|_| (&mut block_bal, tx_index_in_block + 1)),
-                            None,
+                            touches.as_mut(),
                         );
                         if result.is_ok() {
                             tx_applied_ok.increment(1);
@@ -677,6 +693,17 @@ where
                         }
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
+                        // Shadow capture BEFORE the WriteSet is consumed:
+                        // envelope clone is a refcount, cell extraction one
+                        // pass over the (small) per-tx sets.
+                        if let Some(t) = touches.take() {
+                            shadow_captures.push(crate::shadow::ShadowTxCapture {
+                                envelope: envelope.clone(),
+                                gas_used: receipt.gas_used,
+                                touches: t,
+                                write_cells: crate::shadow::write_cells(&ws),
+                            });
+                        }
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
                         block_receipts.push(receipt.clone());
@@ -774,6 +801,11 @@ where
                         let (receipt, ws) = result?;
                         cumulative_gas_used = receipt.cumulative_gas_used;
                         tx_index_in_block += 1;
+                        // Shadow: deposits take the serial barrier lane
+                        // (spec strategy #1) — counted, not modeled.
+                        if shadow_tx.is_some() {
+                            shadow_serial += 1;
+                        }
                         delta.apply(ws);
                         *block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
                         block_receipts.push(receipt.clone());
@@ -974,6 +1006,34 @@ where
                                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                                     // Publisher gone mid-shutdown — not fatal.
                                 }
+                            }
+                        }
+                        // Footprint-shadow handoff: same never-block
+                        // discipline as the BAL. A dropped block costs one
+                        // block of measurement (counted), not the chain.
+                        // Empty blocks are skipped — nothing to grade.
+                        if let Some(stx) = shadow_tx.as_ref()
+                            && (!shadow_captures.is_empty() || shadow_serial > 0)
+                        {
+                            let blk = crate::shadow::ShadowBlock {
+                                block_number,
+                                captures: std::mem::take(&mut shadow_captures),
+                                serial_records: std::mem::take(&mut shadow_serial),
+                            };
+                            match stx.try_send(blk) {
+                                Ok(()) => {}
+                                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                                    metrics::counter!(
+                                        crate::metrics::FOOTPRINT_BLOCKS_TOTAL,
+                                        "outcome" => "dropped"
+                                    )
+                                    .increment(1);
+                                    tracing::warn!(
+                                        block = block_number,
+                                        "footprint-shadow handoff full; dropping this block's capture"
+                                    );
+                                }
+                                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
                             }
                         }
                         match parent.as_mut() {
@@ -1247,6 +1307,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
         drop(rx_e2c);
@@ -1283,6 +1344,91 @@ mod exec_tests {
             l1_origin: _,
             l2_timestamp: _,
         } = boundary;
+    }
+
+    /// P1 footprint shadow: with `shadow_tx` wired, each non-empty block
+    /// hands its per-tx captures (envelope + gas + read/write cells) to the
+    /// shadow channel at the boundary — and the handed-off block survives a
+    /// full `process_block` pass (grade + train) without touching execution
+    /// outputs.
+    #[test]
+    fn exec_hands_off_shadow_captures_at_boundary() {
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        let to = address!("00000000000000000000000000000000000ABCDE");
+
+        let snap = MockStateDatabase::builder()
+            .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+            .build();
+        let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+        let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+        let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+        let (stx, srx) = bounded::<crate::shadow::ShadowBlock>(8);
+
+        for (i, value) in [(0u64, 100u64), (1, 50)] {
+            tx_r2e
+                .send(ReaderToExec::Tx {
+                    tx_idx: TxIndex(i),
+                    envelope: legacy(&signer, to, i, value),
+                    position: pos(i as i32),
+                })
+                .unwrap();
+        }
+        tx_r2e
+            .send(ReaderToExec::Boundary(BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: pos(2),
+                l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
+            }))
+            .unwrap();
+        drop(tx_r2e);
+
+        let h = spawn_exec(
+            ExecutorConfig::default(),
+            rx_r2e,
+            tx_e2c,
+            StaticSnapshotSource(snap),
+            ImmediateCommit,
+            RecordingQueue(writer_log.clone()),
+            0,
+            None,
+            None,
+            Some(stx),
+            None,
+            None,
+        );
+        h.join().expect("no panic").expect("exec ok");
+        drop(rx_e2c);
+
+        let blk = srx.recv().expect("one shadow block handed off");
+        assert_eq!(blk.block_number, 1);
+        assert_eq!(blk.serial_records, 0);
+        assert_eq!(blk.captures.len(), 2);
+        for (i, c) in blk.captures.iter().enumerate() {
+            assert_eq!(c.envelope.sender, from);
+            // A value transfer writes both account tuples; zero gas price
+            // keeps the fee sink out (gas_price = 0 in `legacy`).
+            assert!(
+                c.write_cells
+                    .contains(&kardamom_footprint::Cell::Account(from))
+            );
+            assert!(
+                c.write_cells
+                    .contains(&kardamom_footprint::Cell::Account(to))
+            );
+            assert!(c.touches.slot_reads.is_empty(), "transfers read no slots");
+            assert!(c.gas_used > 0, "capture {i} carries gas");
+        }
+        assert!(srx.try_recv().is_err(), "exactly one block");
+
+        // The handed-off shape feeds the grading path end-to-end: native
+        // transfers are tier-1 (never cold) and same-sender ⇒ one chain.
+        let mut stats = kardamom_footprint::classifier::Stats::default();
+        let mut exclude = std::collections::HashSet::new();
+        exclude.insert(kardamom_footprint::Cell::Account(crate::shadow::FEE_SINK));
+        crate::shadow::process_block(blk, &mut stats, &exclude);
     }
 
     /// Pipelined commit: block N+1 executes against snapshot ∘ parent(N)
@@ -1353,6 +1499,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
             None,
             None,
@@ -1432,6 +1579,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1500,6 +1648,7 @@ mod exec_tests {
             },
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
             None,
             None,
@@ -1600,6 +1749,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1664,6 +1814,7 @@ mod exec_tests {
             Some(bal_tx),
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1726,6 +1877,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log),
             0,
+            None,
             None,
             None,
             None,
@@ -1817,6 +1969,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1889,6 +2042,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         h.join().expect("no panic").expect("exec ok");
 
@@ -1956,6 +2110,7 @@ mod exec_tests {
             None,
             None,
             None,
+            None,
         );
         let res = h.join().expect("no panic");
         assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -2003,6 +2158,7 @@ mod exec_tests {
             ImmediateCommit,
             RecordingQueue(writer_log.clone()),
             0,
+            None,
             None,
             None,
             None,

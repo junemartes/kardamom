@@ -3,36 +3,16 @@
 //! `storage_reads` (block-scoped in EIP-7928) attribute to the single tx
 //! inside it.
 
-use alloy_consensus::transaction::Transaction;
-use alloy_primitives::{Address, B256, U256};
+use alloy_primitives::B256;
 use kardamom_engine::executor::execute_tx;
 use kardamom_engine::{ExecEnv, PendingDelta, TxIndex};
 use kardamom_types::{BPosition, BlockBoundaryStart, StateDatabase, TxEnvelope};
 
 use super::Cell;
-// Re-exported so `capture::TxObs` keeps resolving for the stm-p0 bin.
+// Re-exported so `capture::TxObs` keeps resolving for the stm-p0 bin; the
+// scheduling-time view decoder is shared with the live shadow.
 pub use super::TxObs;
-
-/// Decode scheduling-time fields off the raw envelope.
-fn envelope_view(raw: &[u8]) -> (Option<Address>, Option<[u8; 4]>, Vec<U256>, bool) {
-    use alloy_eips::eip2718::Decodable2718;
-    let Ok(env) = alloy_consensus::TxEnvelope::decode_2718(&mut &raw[..]) else {
-        return (None, None, Vec::new(), false);
-    };
-    let has_value = env.value() > U256::ZERO;
-    let to = env.to();
-    let input = env.input();
-    let selector: Option<[u8; 4]> = input.get(..4).map(|s| s.try_into().unwrap());
-    let mut args = Vec::new();
-    if input.len() > 4 {
-        for chunk in input[4..].chunks(32).take(6) {
-            let mut w = [0u8; 32];
-            w[..chunk.len()].copy_from_slice(chunk);
-            args.push(U256::from_be_bytes(w));
-        }
-    }
-    (to, selector, args, has_value)
-}
+use kardamom_footprint::envelope_view;
 
 /// Execute `blocks` (each a list of signed envelopes) sequentially against
 /// `snap`, returning per-tx observations. Panics on execution errors —

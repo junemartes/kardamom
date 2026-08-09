@@ -316,6 +316,8 @@ fn m4_canonical_b_order_drives_receipts() {
             0,
             None,
             None,
+            // Footprint-shadow capture handoff (P1; off here).
+            None,
             // Whole-block exec strategy (validator parallel path).
             None,
             None,
@@ -481,6 +483,8 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             writer_q,
             0,
             None,
+            None,
+            // Footprint-shadow capture handoff (P1; off here).
             None,
             // Whole-block exec strategy (validator parallel path).
             None,

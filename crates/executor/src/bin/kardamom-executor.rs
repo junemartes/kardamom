@@ -467,6 +467,11 @@ async fn main() -> Result<()> {
         .context("spawn BAL publisher")?;
     // The legacy writer-queue tee is superseded by the publisher thread.
     let sw_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
+    // P1 footprint shadow (spec: block-stm-executor §P1): behind
+    // KARDAMOM_FOOTPRINT_SHADOW=1, the exec thread hands each block's tx
+    // captures to a grading thread (measurement only — execution stays
+    // sequential). None when the env flag is unset: zero cost.
+    let shadow_tx = kardamom_engine::shadow::spawn_from_env();
 
     let mut cfg = ExecutorConfig {
         chain_id,
@@ -503,6 +508,8 @@ async fn main() -> Result<()> {
             resume,
             // EIP-7928 capture handoff.
             Some(bal_tx),
+            // Footprint-shadow capture handoff (Some only under the flag).
+            shadow_tx,
             // Join-miss archive refetch (None on single-host/IPC runs).
             // Whole-block exec strategy (validator parallel path).
             None,

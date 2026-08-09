@@ -3835,6 +3835,7 @@ dependencies = [
  "dashmap",
  "kardamom-cluster-adapter",
  "kardamom-exec-core",
+ "kardamom-footprint",
  "kardamom-log",
  "kardamom-state",
  "kardamom-types",
@@ -3916,6 +3917,8 @@ dependencies = [
 name = "kardamom-footprint"
 version = "0.1.0"
 dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
  "alloy-primitives",
 ]
 

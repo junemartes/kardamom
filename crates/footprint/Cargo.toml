@@ -9,3 +9,5 @@ path = "src/lib.rs"
 
 [dependencies]
 alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+alloy-eips.workspace = true

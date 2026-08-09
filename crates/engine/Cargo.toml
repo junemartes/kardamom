@@ -21,6 +21,8 @@ kardamom-log = { workspace = true }
 # from the cluster egress — non-optional, there is no non-cluster path.
 kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-state = { path = "../state" }
+# P1 footprint shadow (`crate::shadow`): the P0 classifier/grader core.
+kardamom-footprint = { path = "../footprint" }
 serde = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true

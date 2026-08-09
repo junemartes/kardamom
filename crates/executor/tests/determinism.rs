@@ -168,6 +168,8 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             0,
             None,
             None,
+            // Footprint-shadow capture handoff (P1; off here).
+            None,
             // Whole-block exec strategy (validator parallel path).
             None,
             None,
