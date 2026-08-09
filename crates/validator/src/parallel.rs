@@ -1397,8 +1397,11 @@ fn dump_divergence_inputs(
     granularity: u16,
     err: &ExecutorError,
 ) {
-    let dir = std::path::Path::new("/opt/kardamom/state");
-    let path = dir.join(format!("divergence-{block}.json"));
+    // Same dir as the flight recorder's receipt-divergence dumper;
+    // overridable so tests (and dev hosts) can assert the artifact without
+    // /opt existing.
+    let dir = std::env::var("KARDAMOM_FLIGHT_DIR").unwrap_or_else(|_| "/opt/kardamom/state".into());
+    let path = std::path::Path::new(&dir).join(format!("divergence-{block}.json"));
     let mut payload = serde_json::json!({
         "block": block,
         "granularity": granularity,

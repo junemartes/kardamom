@@ -187,7 +187,8 @@ sealer_boundaries() {
   local i v best=""
   for i in "${!EXECUTOR_NODES[@]}"; do
     v="$(exec_metrics "${i}" \
-      | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}')"
+      | awk '/^kardamom_sealer_boundaries_emitted_total/{printf "%d", $NF; exit}' \
+      || true)"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
   [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
@@ -498,13 +499,13 @@ run_cpu_squeeze() {
   local div
   div="$(val_metric validator_divergence_total)"; div="$(printf '%.0f' "${div:-0}")"
   [ "${div}" -eq 0 ] || fail "cpu-squeeze: validator counted ${div} divergence(s) under starvation"
-  local valloc
+  local valloc vlogs
   while read -r valloc; do
     [ -z "${valloc}" ] && continue
-    if on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
-        | grep -q "halted on divergence"; then
+    vlogs="$(on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null || true)"
+    if has_line "${vlogs}" "halted on divergence"; then
       echo "----- divergence context (alloc ${valloc}) -----" >&2
-      on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+      printf '%s\n' "${vlogs}" \
         | grep -B3 -A10 "halted on divergence" >&2 || true
       docker exec "${VALIDATOR_NODE}" sh -c \
         'for f in /opt/kardamom/state/divergence-*.json; do [ -f "$f" ] && { echo "== $f"; head -c 4096 "$f"; echo; }; done' \
@@ -798,7 +799,8 @@ executor_progress() {
   local i v best=""
   for i in "${!EXECUTOR_NODES[@]}"; do
     v="$(exec_metrics "${i}" \
-      | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+      | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+      || true)"
     [ -n "${v}" ] && { [ -z "${best}" ] || [ "${v}" -gt "${best}" ]; } && best="${v}"
   done
   [ -n "${best}" ] && { printf '%s' "${best}"; return 0; }
@@ -950,8 +952,13 @@ run_retention_overrun() { # <executor|validator>
   local p0 p1 t=0 live=0
   while [ "${t}" -lt 120 ]; do
     if [ "${kind}" = "executor" ]; then
+      # `|| true` is load-bearing (same as the reconvergence probe below):
+      # awk's early `exit` SIGPIPEs the scrape mid-body, and under pipefail
+      # that 141 kills the whole case with no fail() message. Empty p1 is
+      # defaulted right below.
       p1="$(exec_metrics "${RETENTION_VICTIM_EXEC_IDX}" \
-        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }')"
+        | awk -v m="${EXECUTOR_BLOCK_METRIC}" '$0 ~ "^"m"([{ ]|$)" && $0 !~ /^#/ { printf "%d", $NF; exit }' \
+        || true)"
     else
       p1="$(val_metric validator_committed_block)"
     fi

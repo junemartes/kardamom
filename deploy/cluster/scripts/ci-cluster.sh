@@ -810,11 +810,16 @@ diverged="$(printf '%.0f' "${diverged:-0}")"
 # divergence still shows in the alloc log — catch it there too. Check EVERY
 # alloc of the job (not just the first): a rescheduled validator gets a new
 # alloc, and the "halted on divergence" line would live in the OLD alloc's log.
+# NEVER `producer | grep -q` under pipefail here: grep -q exits at the first
+# match, the producer takes SIGPIPE once the logs exceed the pipe buffer, and
+# the successful match is DISCARDED — a real divergence reads as absence
+# (chaos.sh header documents the observed failure; fixed there in #158).
+# Capture first, then substring-match in pure bash.
 divergence_logged=0
 while read -r valloc; do
   [[ -z "${valloc}" ]] && continue
-  if on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
-      | grep -q "halted on divergence"; then
+  vlogs="$(on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null || true)"
+  if [[ "${vlogs}" == *"halted on divergence"* ]]; then
     divergence_logged=1
     break
   fi
@@ -826,7 +831,7 @@ if (( divergence_logged == 1 )); then
   # divergence happened but not WHICH — the reason string only lived on
   # the ephemeral runner. Also surface any flight-recorder dumps.
   echo "----- divergence context (alloc ${valloc}) -----" >&2
-  on_control 'nomad alloc logs "$1" 2>/dev/null' "${valloc}" 2>/dev/null \
+  printf '%s\n' "${vlogs}" \
     | grep -B3 -A10 "halted on divergence" >&2 || true
   echo "----- flight-recorder dumps on validator node (if any) -----" >&2
   docker exec "${VALIDATOR_NODE}" sh -c \
