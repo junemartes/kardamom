@@ -523,9 +523,11 @@ pub fn execute_tx<S: StateDatabase>(
 /// sides), gas accounting unchanged. Loud by design: log + counter — a skip
 /// existing at all means an upstream guard (sequencer nonce fence, cluster
 /// dedup, resync floors) let an invalid record reach the canonical log.
+/// Public: the Block-STM engine (`kardamom-stm`) produces the identical
+/// skip artifact on its parallel path — one definition, one wire shape.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "std"), allow(unused_variables))]
-fn invalid_skip(
+pub fn invalid_skip(
     reason: &str,
     tx_position: BPosition,
     inbound_envelope: &TxEnvelope,
@@ -870,7 +872,10 @@ fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     ws
 }
 
-fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
+/// Public: the Block-STM engine (`kardamom-stm`) builds per-tx write sets
+/// from its own revm outcomes with exactly these emission rules — touched
+/// accounts, changed slots, created code only.
+pub fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state.iter() {
         // Only emit accounts revm marked as touched. Untouched entries are
@@ -913,7 +918,8 @@ fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
     ws
 }
 
-fn wire_log(log: &Log) -> WireLog {
+/// Public: the Block-STM engine mirrors the receipt log encoding.
+pub fn wire_log(log: &Log) -> WireLog {
     WireLog {
         address: log.address,
         topics: log.data.topics().to_vec(),

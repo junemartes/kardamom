@@ -1,0 +1,38 @@
+//! Block-STM engine, P2 (spec: `docs/agents/block-stm-executor-spec.md`).
+//!
+//! Pessimistic-by-prediction parallel execution over a multi-version cache:
+//! the footprint predictor (P0-measured, P1-shadow-validated) turns each
+//! block into a dependency DAG BEFORE anything executes — predicted overlap
+//! is authoritative ORDER, so conflicting txs never run concurrently and
+//! there are no abort storms to absorb. Parallelism comes from the
+//! workload's true structure (distinct pools / books / senders); cold or
+//! unpredictable txs take the serial `Tail` lane at the block's end.
+//!
+//! This crate is the OFFLINE milestone (P2a): the engine + its A/B
+//! validation harness seam. It is deliberately not wired into the live
+//! executor — that is P3 (`--parallel-execution`), which rides the
+//! determinism suite and the in-stack validator.
+//!
+//! Correctness stance (spec invariants):
+//! 1. Byte-identical receipts + delta vs sequential execution, enforced in
+//!    tests and by the A/B harness on every run.
+//! 2. Heuristics affect scheduling only: every recorded read is VALIDATED
+//!    against the multi-version cache after execution; any violation
+//!    discards the block and re-executes it sequentially
+//!    (`fallback` in [`execute::StmOutcome`] — invariant #3).
+//! 3. The `Accumulator` fee sink (P0: written by 100% of txs — a universal
+//!    serializer without this) is served DEFERRED: workers read the
+//!    block-start value, per-tx credits are folded as exact deltas, and the
+//!    canonical-order commit materializes absolute balances and fixes up
+//!    each write-set hash — receipts and delta land byte-identical to
+//!    sequential. (The BALANCE-opcode runtime guard is a P3 concern; the
+//!    P1 shadow already measures its trigger rate as ~zero, and the A/B
+//!    equivalence check catches any workload that violates the assumption.)
+
+pub mod execute;
+pub mod mv;
+pub mod schedule;
+
+/// The accumulator-marked fee sink (mirrors `kardamom_exec_core::block_env`:
+/// beneficiary = address(0), basefee = 0 — the V0 documented burn).
+pub const FEE_SINK: alloy_primitives::Address = alloy_primitives::Address::ZERO;

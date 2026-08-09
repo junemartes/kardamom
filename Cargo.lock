@@ -4078,6 +4078,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "kardamom-stm"
+version = "0.1.0"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips 2.0.5",
+ "alloy-network",
+ "alloy-primitives",
+ "alloy-signer-local",
+ "bytes",
+ "kardamom-exec-core",
+ "kardamom-footprint",
+ "kardamom-types",
+ "revm",
+ "tracing",
+]
+
+[[package]]
 name = "kardamom-types"
 version = "0.1.0"
 dependencies = [
