@@ -206,6 +206,11 @@ pub fn spawn_executor_at(
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-exec"]);
+    // P1 footprint shadow: ON for every e2e executor. Measurement-only
+    // (execution stays sequential; the handoff never blocks), and running
+    // it here is what gives the shadow thread real multi-process pipeline
+    // coverage in CI — its per-block summary lines land in executor.log.
+    cmd.env("KARDAMOM_FOOTPRINT_SHADOW", "1");
     with_log_config(&mut cmd, spec);
     // Join-miss refetch: only meaningful alongside a log config that lists
     // durability-archive endpoints (the archive-durability variant). Without
