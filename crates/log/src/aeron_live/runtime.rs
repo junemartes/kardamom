@@ -382,7 +382,37 @@ impl Drop for AeronRuntime {
     }
 }
 
+/// Routes Aeron C-client errors through `tracing` instead of the client's
+/// default raw-stderr print. The client can follow a fatal error (e.g. code
+/// 1000, driver keepalive timeout) by terminating the process, so this line
+/// is often the service's last — it must carry our timestamp and land in the
+/// service's own log to sequence the death against the other services'.
+struct TracingErrorHandler;
+
+impl rusteron_client::AeronErrorHandlerCallback for TracingErrorHandler {
+    fn handle_aeron_error_handler(&mut self, error_code: std::os::raw::c_int, msg: &str) {
+        error!(
+            code = error_code,
+            msg, "aeron client error; exiting (fail-fast, as aeron's default handler does)"
+        );
+        // The C default handler this replaces exits the process after its
+        // stderr print — and that contract must survive the swap: a client
+        // that lost its driver and lingers keeps its /metrics port up while
+        // every publication is closed, which reads as a live-but-stuck
+        // service to supervisors and probes (observed: wedged validator,
+        // frozen committed-block gauge). Die so the supervisor restarts us.
+        std::process::exit(1);
+    }
+}
+
 fn build_aeron(ctx: rusteron_client::AeronContext) -> Result<Rc<AeronClient>, LogError> {
+    let handler = rusteron_client::Handler::leak(TracingErrorHandler);
+    ctx.set_error_handler(Some(&handler))
+        .map_err(|e| LogError::Aeron(format!("set_error_handler: {e}")))?;
+    // The C side holds the leaked pointer for the client's (= process')
+    // lifetime; forgetting the wrapper suppresses its drop-time
+    // release()-was-never-called complaint.
+    std::mem::forget(handler);
     let aeron = AeronClient::new(&ctx).map_err(|e| LogError::Aeron(format!("Aeron::new: {e}")))?;
     aeron
         .start()

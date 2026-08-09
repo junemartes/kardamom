@@ -372,6 +372,10 @@ async fn main() -> Result<()> {
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
     }
+    // Present in the log ⇒ the clean-shutdown path ran to the writer stop;
+    // absent before exit ⇒ the process died uncleanly (mdbx env left
+    // unsteady — read-only consumers will see WANNA_RECOVERY).
+    tracing::info!("validator shutdown: state writer stopped");
     // Exit 2 is RESERVED for a proven divergence (the latch records before the
     // engine surfaces `Divergence`) — the page-the-humans signal. Any other
     // engine failure (a stream error, a replay-window overrun needing resync)
