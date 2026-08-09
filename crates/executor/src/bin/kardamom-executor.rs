@@ -403,6 +403,11 @@ async fn main() -> Result<()> {
     // The legacy writer-queue tee is superseded by the publisher thread.
     let sw_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
 
+    // `verify_record_identity` stays OFF here by decision, not omission:
+    // with the validator checking every record (3a.1), a forged envelope
+    // halts verification with proof, and sequencer-side rejection would buy
+    // defense-in-depth at an ecrecover per tx on the hot path. See the
+    // field's doc for the full trade.
     let mut cfg = ExecutorConfig {
         chain_id,
         ..ExecutorConfig::default()
