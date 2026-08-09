@@ -3,21 +3,12 @@ package io.kardamom.sealer.cluster;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
-import io.aeron.Aeron;
-import io.aeron.cluster.service.ClientSession;
-import io.aeron.cluster.service.Cluster;
-import java.nio.ByteOrder;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.List;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 import io.kardamom.sealer.CanonicalSealerState;
-import org.agrona.DirectBuffer;
+import io.kardamom.sealer.cluster.ClusterStubs.StubCluster;
+import io.kardamom.sealer.cluster.ClusterStubs.StubSession;
+import java.nio.ByteOrder;
+import java.util.List;
 import org.agrona.ExpandableArrayBuffer;
-import org.agrona.concurrent.IdleStrategy;
-import org.agrona.concurrent.YieldingIdleStrategy;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -62,36 +53,32 @@ class SealerFanoutTest {
         return s;
     }
 
+    /** Deliver a complete ingress frame to the service from {@code from}. */
+    private void deliver(final StubSession from, final byte[] frame) {
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        buf.putBytes(0, frame);
+        service.onSessionMessage(from, 0, buf, 0, frame.length, null);
+    }
+
     /**
      * One record from the shared test sender with nonce == {@code n}: tests
      * that emit records 0, 1, … stay guard-contiguous.
      */
     private void record(final StubSession from, final int n) {
-        final byte[] frame = recordFrame(n, sender(1), n);
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putBytes(0, frame);
-        service.onSessionMessage(from, 0, buf, 0, frame.length, null);
+        deliver(from, IngressFrames.recordFrame(n, sender(1), n));
     }
 
     private void rawRecord(final StubSession from, final int idTag, final byte[] sender20, final long nonce) {
-        final byte[] frame = recordFrame(idTag, sender20, nonce);
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putBytes(0, frame);
-        service.onSessionMessage(from, 0, buf, 0, frame.length, null);
+        deliver(from, IngressFrames.recordFrame(idTag, sender20, nonce));
     }
 
     private void subscribe(final StubSession s) {
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putByte(0, SealerWire.KIND_SUBSCRIBE);
-        service.onSessionMessage(s, 0, buf, 0, 1, null);
+        deliver(s, IngressFrames.subscribeFrame());
     }
 
     private void replayRequest(final StubSession s, final long fromIndex, final long fromBlock) {
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        buf.putByte(0, SealerWire.KIND_REPLAY_REQUEST);
-        buf.putLong(1, fromIndex, ByteOrder.LITTLE_ENDIAN);
-        buf.putLong(1 + Long.BYTES, fromBlock, ByteOrder.LITTLE_ENDIAN);
-        service.onSessionMessage(s, 0, buf, 0, 17, null);
+        service.onSessionMessage(s, 0, IngressFrames.replayRequest(fromIndex, fromBlock),
+                0, SealerWire.MIN_REPLAY_REQUEST_LEN, null);
     }
 
     @Test
@@ -124,26 +111,9 @@ class SealerFanoutTest {
                 "publisher-only session stays out of the fan-out");
     }
 
-    /** A complete single-record ingress frame (batch-embeddable). */
-    private static byte[] recordFrame(final int idTag, final byte[] sender20, final long nonce) {
-        final byte[] out = new byte[SealerWire.CANONICAL_ID_OFFSET
-                + CanonicalSealerState.CANONICAL_ID_LEN + 1];
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer(out.length);
-        buf.putByte(SealerWire.KIND_OFFSET, SealerWire.KIND_INGRESS_RECORD);
-        buf.putBytes(SealerWire.SENDER_OFFSET, sender20);
-        buf.putLong(SealerWire.NONCE_OFFSET, nonce, ByteOrder.LITTLE_ENDIAN);
-        final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
-        id[0] = (byte) idTag;
-        id[31] = 0x5A;
-        buf.putBytes(SealerWire.CANONICAL_ID_OFFSET, id);
-        buf.putByte(out.length - 1, (byte) idTag);
-        buf.getBytes(0, out);
-        return out;
-    }
-
     /** Batch-test entries keep the shared sender, nonce == idTag - 10. */
     private static byte[] recordFrame(final int n) {
-        return recordFrame(n, sender(1), n - 10);
+        return IngressFrames.recordFrame(n, sender(1), n - 10);
     }
 
     @Test
@@ -246,136 +216,6 @@ class SealerFanoutTest {
         assertEquals(1, relayedCount(consumerB), "broadcast reaches remaining sessions");
     }
 
-    // --- minimal stubs (same shape as SnapshotRestoreTest's) ----------------
-
-    private static final class StubSession implements ClientSession {
-        final long id;
-        final List<byte[]> offered = new ArrayList<>();
-        boolean closed;
-
-        StubSession(final long id) {
-            this.id = id;
-        }
-
-        public long id() {
-            return id;
-        }
-
-        public int responseStreamId() {
-            return 0;
-        }
-
-        public String responseChannel() {
-            return "aeron:ipc";
-        }
-
-        public byte[] encodedPrincipal() {
-            return new byte[0];
-        }
-
-        public void close() {
-            closed = true;
-        }
-
-        public boolean isClosing() {
-            return closed;
-        }
-
-        public long offer(final DirectBuffer buffer, final int offset, final int length) {
-            final byte[] copy = new byte[length];
-            buffer.getBytes(offset, copy);
-            offered.add(copy);
-            return length;
-        }
-
-        public long offer(final io.aeron.DirectBufferVector[] vectors) {
-            throw new UnsupportedOperationException();
-        }
-
-        public long tryClaim(final int length, final io.aeron.logbuffer.BufferClaim bufferClaim) {
-            throw new UnsupportedOperationException();
-        }
-    }
-
-    private static final class StubCluster implements Cluster {
-        final HashMap<Long, ClientSession> sessions = new HashMap<>();
-        final IdleStrategy idleStrategy = new YieldingIdleStrategy();
-
-        StubSession addSession(final long id) {
-            final StubSession session = new StubSession(id);
-            sessions.put(id, session);
-            return session;
-        }
-
-        public int memberId() {
-            return 0;
-        }
-
-        public Role role() {
-            return Role.LEADER;
-        }
-
-        public long logPosition() {
-            return 0;
-        }
-
-        public Aeron aeron() {
-            throw new UnsupportedOperationException();
-        }
-
-        public io.aeron.cluster.service.ClusteredServiceContainer.Context context() {
-            throw new UnsupportedOperationException();
-        }
-
-        public ClientSession getClientSession(final long clusterSessionId) {
-            return sessions.get(clusterSessionId);
-        }
-
-        public Collection<ClientSession> clientSessions() {
-            return sessions.values();
-        }
-
-        public void forEachClientSession(final Consumer<? super ClientSession> action) {
-            sessions.values().forEach(action);
-        }
-
-        public boolean closeClientSession(final long clusterSessionId) {
-            return sessions.remove(clusterSessionId) != null;
-        }
-
-        public long time() {
-            return 0;
-        }
-
-        public TimeUnit timeUnit() {
-            return TimeUnit.MILLISECONDS;
-        }
-
-        public boolean scheduleTimer(final long correlationId, final long deadline) {
-            return true;
-        }
-
-        public boolean cancelTimer(final long correlationId) {
-            return true;
-        }
-
-        public long offer(final DirectBuffer buffer, final int offset, final int length) {
-            throw new UnsupportedOperationException();
-        }
-
-        public long offer(final io.aeron.DirectBufferVector[] vectors) {
-            throw new UnsupportedOperationException();
-        }
-
-        public long tryClaim(final int length, final io.aeron.logbuffer.BufferClaim bufferClaim) {
-            throw new UnsupportedOperationException();
-        }
-
-        public IdleStrategy idleStrategy() {
-            return idleStrategy;
-        }
-    }
-
     /**
      * The relayed payload of an origin record must be EXACTLY
      * {@code [canonical_id:32][record_type][fields…]} — the same shape a plain
@@ -392,19 +232,7 @@ class SealerFanoutTest {
         id[0] = 0x7E;
         id[31] = 0x5A;
 
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        int pos = 0;
-        buf.putByte(pos, SealerWire.KIND_ORIGIN_RECORD);
-        pos += Byte.BYTES;
-        buf.putBytes(pos, id);
-        pos += id.length;
-        buf.putLong(pos, 4_242L, java.nio.ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putInt(pos, 3, java.nio.ByteOrder.LITTLE_ENDIAN); // slot count
-        pos += Integer.BYTES;
-        buf.putBytes(pos, fields);
-        pos += fields.length;
-        service.onSessionMessage(publisher, 0, buf, 0, pos, null);
+        deliver(publisher, IngressFrames.originRecordFrame(id, 4_242L, 3, fields));
 
         final byte[] frame = consumerA.offered.stream()
                 .filter(f -> f[0] == SealerWire.EGRESS_KIND_RELAYED)
@@ -442,21 +270,9 @@ class SealerFanoutTest {
     }
 
     private void originRecord(final StubSession from, final int n, final long origin, final int slots) {
-        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
-        int pos = 0;
-        buf.putByte(pos, SealerWire.KIND_ORIGIN_RECORD);
-        pos += Byte.BYTES;
         final byte[] id = new byte[CanonicalSealerState.CANONICAL_ID_LEN];
         id[0] = (byte) n;
         id[31] = 0x5A;
-        buf.putBytes(pos, id);
-        pos += id.length;
-        buf.putLong(pos, origin, java.nio.ByteOrder.LITTLE_ENDIAN);
-        pos += Long.BYTES;
-        buf.putInt(pos, slots, java.nio.ByteOrder.LITTLE_ENDIAN);
-        pos += Integer.BYTES;
-        buf.putByte(pos, (byte) n);
-        pos += Byte.BYTES;
-        service.onSessionMessage(from, 0, buf, 0, pos, null);
+        deliver(from, IngressFrames.originRecordFrame(id, origin, slots, new byte[] {(byte) n}));
     }
 }
