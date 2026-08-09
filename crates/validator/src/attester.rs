@@ -78,21 +78,15 @@ impl From<alloy_provider::PendingTransactionError> for AttesterError {
 
 /// Collect the withdrawal leaves initiated in `delta`'s block range, ordered by
 /// withdrawal nonce. Scans every receipt's logs for `MessagePassed` events from
-/// the `L2ToL1MessagePasser` predeploy. Returns the leaves in the canonical
-/// order the on-chain Merkle proof indexes into.
+/// the `L2ToL1MessagePasser` predeploy (the per-receipt scan is
+/// [`receipt_withdrawal_leaves`]). Returns the leaves in the canonical order
+/// the on-chain Merkle proof indexes into.
 pub fn collect_withdrawal_leaves(delta: &BlockDelta) -> Vec<B256> {
-    let mut found: Vec<(U256, B256)> = Vec::new();
-    for receipt in &delta.receipts {
-        for log in &receipt.logs {
-            if log.address != withdrawals::MESSAGE_PASSER {
-                continue;
-            }
-            if let Some((nonce, leaf)) = withdrawals::decode_message_passed(&log.topics, &log.data)
-            {
-                found.push((nonce, leaf));
-            }
-        }
-    }
+    let mut found: Vec<(U256, B256)> = delta
+        .receipts
+        .iter()
+        .flat_map(receipt_withdrawal_leaves)
+        .collect();
     found.sort_by_key(|(nonce, _)| *nonce);
     found.into_iter().map(|(_, leaf)| leaf).collect()
 }
