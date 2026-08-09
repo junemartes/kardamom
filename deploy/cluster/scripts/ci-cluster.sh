@@ -25,10 +25,16 @@ CLUSTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ROOT="$(cd "${CLUSTER_DIR}/../.." && pwd)"
 cd "${CLUSTER_DIR}"
 
-# Shared control-node helpers (on_control, running_alloc, all_allocs, ...) —
-# the same ones chaos.sh uses.
+# Shared control-node helpers (on_control, running_alloc, all_allocs, ...)
+# + log/fail — the same ones chaos.sh uses.
 # shellcheck source=deploy/cluster/scripts/lib.sh
 source "${SCRIPT_DIR}/lib.sh"
+# Node-class model (topology_load + the executor/validator node+port mirrors).
+# shellcheck source=deploy/cluster/scripts/lib-topology.sh
+source "${SCRIPT_DIR}/lib-topology.sh"
+# Prometheus scrape/parse helpers (fetch_metrics, prom_value).
+# shellcheck source=deploy/cluster/scripts/lib-metrics.sh
+source "${SCRIPT_DIR}/lib-metrics.sh"
 
 NET=kardamom-net
 SUBNET=192.168.56.0/24
@@ -44,29 +50,12 @@ SERVICES=(ingress sequencer executor validator da-watcher batcher)
 # each class we materialise `count` instances named <class>-<i>, each with a
 # static IP from the class's ip_start lane on ip_prefix.0/24. Scaling a class is
 # a one-line `count` change in group_vars; there is no node list / IP map / Ansible
-# inventory to hand-maintain here (the inventory is generated below too). Parsed
-# with a plain regex (no PyYAML), so it runs anywhere python3 does.
-NODES=(); declare -A NODE_IP=(); declare -A NODE_ROLE=(); declare -A NODE_TIER=()
-while read -r _name _ip _role _tier; do
-  [[ -z "${_name}" ]] && continue
-  NODES+=("${_name}"); NODE_IP[${_name}]="${_ip}"
-  NODE_ROLE[${_name}]="${_role}"; NODE_TIER[${_name}]="${_tier}"
-done < <(python3 - <<'PY'
-# Parse node_classes with a plain regex (no PyYAML dependency — same approach as
-# scripts/check-contract.py, so this runs anywhere python3 does). Each class line:
-#   <name>: { count: N, ip_start: M, tier: T }
-import re
-text = open('ansible/group_vars/all.yml').read()
-pref = re.search(r'^ip_prefix:\s*"([\d.]+)"', text, re.M).group(1)
-for m in re.finditer(
-        r'^\s{2}(\w+):\s*\{\s*count:\s*(\d+),\s*ip_start:\s*(\d+),\s*tier:\s*(\w+)',
-        text, re.M):
-    cls, count, ip_start, tier = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
-    for i in range(count):
-        print(f"{cls}-{i} {pref}.{ip_start + i} {cls} {tier}")
-PY
-)
-[[ "${#NODES[@]}" -gt 0 ]] || { echo "ERROR: no nodes generated from node_classes" >&2; exit 1; }
+# inventory to hand-maintain here (the inventory is generated below too). The
+# regex parse (no PyYAML) lives in lib-topology.sh's topology_load, shared with
+# smoke-load.sh; it populates NODES + NODE_IP/NODE_ROLE/NODE_TIER with
+# `declare -g` so the cleanup/diagnostics traps below can read them.
+topology_load \
+  || { echo "ERROR: no nodes generated from node_classes" >&2; exit 1; }
 
 # Generate the Ansible container inventory from the instances above: one group
 # per role (site.yml provisions `all` + `control`), every host carrying its
@@ -99,8 +88,6 @@ ansible_python_interpreter=/usr/bin/python3
 kardamom_in_container=true
 EOF
 }
-
-log() { echo "==> $*"; }
 
 # Push a locally-built image to the in-cluster registry.
 #
@@ -696,19 +683,18 @@ PK="0xea6c44ac03bff858b476bba40716402b03e41b8e97e276d1baec7c37d42484a0" \
 # `multiprocess_e2e_validator_syncs_and_keeps_up` smoke (removed with the
 # single-sealer full-pipeline e2e in the cluster-only migration).
 log "validator verdict: sync + keep-up + BAL cross-check (no divergence)"
-EXEC_NODES=(kardamom-executor-0 kardamom-executor-1 kardamom-executor-2)
-# The validator lives on the aux node (see validator.nomad.hcl — kept out of
-# the executor-chaos blast radius).
-VALIDATOR_NODES=(kardamom-aux-0)
-VALIDATOR_PORT=9006
-EXECUTOR_PORT=9004
+# EXECUTOR_NODES + VALIDATOR_NODES/VALIDATOR_PORT/EXECUTOR_PORT come from
+# lib-topology.sh (the validator lives on the aux node — see
+# validator.nomad.hcl, kept out of the executor-chaos blast radius).
 VALIDATOR_LAG_MAX="${VALIDATOR_LAG_MAX:-10}"
 VALIDATOR_SYNC_TIMEOUT_S="${VALIDATOR_SYNC_TIMEOUT_S:-180}"
 
-# Scrape one metric value (last sample wins; strips labels) from a node:port.
+# Scrape one metric value from a node:port (docker-exec path; the int value of
+# the first matching sample — every metric probed here is single-series).
 scrape_metric() { # <node> <port> <metric-name> -> value or ""
-  timeout 8 docker exec "$1" curl -fsS --max-time 5 "http://127.0.0.1:$2/metrics" 2>/dev/null \
-    | awk -v m="$3" '$0 ~ "^"m"([{ ])" {v=$NF} END {if (v != "") print v}'
+  local body
+  body="$(fetch_metrics "" "$1" "$2" || true)"
+  prom_value "${body}" "$3" first
 }
 
 # Retry window: a single-shot probe here raced slow container starts (fresh
@@ -730,7 +716,7 @@ log "validator found on ${VALIDATOR_NODE}"
 # Executor progress reference: any responding executor (state-machine replicas).
 executor_block() {
   local v
-  for n in "${EXEC_NODES[@]}"; do
+  for n in "${EXECUTOR_NODES[@]}"; do
     v="$(scrape_metric "$n" "${EXECUTOR_PORT}" kardamom_executor_block_number)"
     [[ -n "$v" ]] && { printf '%.0f\n' "$v"; return 0; }
   done
