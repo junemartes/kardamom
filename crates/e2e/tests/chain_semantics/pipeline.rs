@@ -95,3 +95,18 @@ async fn s5_queue_depth_recovers_after_client_aborts() {
         .await
         .expect("S5 canary");
 }
+
+/// W2 (docs/agents/l1-client-suite-port-spec.md): the RPC golden vectors —
+/// the whole v0 contract as data. Same vectors run as the Target-C
+/// `rpc-vectors` case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack; run via `just test-e2e-local` or with --ignored"]
+async fn rpc_golden_vectors_hold() {
+    let stack = LocalStack::launch(StackConfig::default())
+        .await
+        .expect("stack");
+    let t = target(&stack);
+    rpc_vectors::run(&t, rpc_vectors::Params::default())
+        .await
+        .expect("rpc-vectors");
+}

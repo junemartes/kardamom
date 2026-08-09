@@ -18,6 +18,7 @@ pub mod l1_batch;
 pub mod nonce_gap;
 pub mod nonce_unordered;
 pub mod rpc_liveness;
+pub mod rpc_vectors;
 
 use std::net::SocketAddr;
 use std::path::Path;
