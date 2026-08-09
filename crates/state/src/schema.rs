@@ -218,6 +218,31 @@ pub fn decode_tx_hash_value(bytes: &[u8]) -> Result<BPosition, StateError> {
     })
 }
 
+// ---------- table iteration ----------
+
+/// Walk every row of `db` in key order, calling `f(key, value)` per row.
+///
+/// The shared full-table cursor walk (integrity checks, recovery scans, the
+/// trie rebuild oracle): position at `first`, step with `next`, stop at the
+/// end — or early when `f` returns [`ControlFlow::Break`]. Errors from the
+/// cursor or from `f` propagate unchanged. Generic over the txn kind so RO
+/// and RW callers share one implementation.
+pub(crate) fn for_each_row<K: signet_libmdbx::TransactionKind>(
+    txn: &signet_libmdbx::tx::Tx<K>,
+    db: signet_libmdbx::Database,
+    mut f: impl FnMut(Vec<u8>, Vec<u8>) -> Result<std::ops::ControlFlow<()>, StateError>,
+) -> Result<(), StateError> {
+    let mut cur = txn.cursor(db)?;
+    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
+    while let Some((k, v)) = item {
+        if f(k, v)?.is_break() {
+            return Ok(());
+        }
+        item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

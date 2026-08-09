@@ -283,18 +283,14 @@ pub fn rebuild_root(txn: &RwTxSync, t: &TrieTables) -> Result<B256, StateError> 
     };
 
     let mut accts: Vec<(B256, TrieAccount)> = Vec::new();
-    {
-        let mut cur = txn.cursor(t.hashed_accounts)?;
-        let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-        while let Some((k, v)) = item {
-            let ah = B256::from_slice(&k);
-            let parts = cursor::decode_account_leaf(&v)?;
-            let mut acc = parts.to_trie_account();
-            acc.storage_root = storage_root_for(&ah)?;
-            accts.push((ah, acc));
-            item = cur.next::<Vec<u8>, Vec<u8>>()?;
-        }
-    }
+    crate::schema::for_each_row(txn, t.hashed_accounts, |k, v| {
+        let ah = B256::from_slice(&k);
+        let parts = cursor::decode_account_leaf(&v)?;
+        let mut acc = parts.to_trie_account();
+        acc.storage_root = storage_root_for(&ah)?;
+        accts.push((ah, acc));
+        Ok(std::ops::ControlFlow::Continue(()))
+    })?;
     Ok(root::state_root_unsorted(accts))
 }
 
@@ -367,19 +363,12 @@ pub fn storage_root(slots: impl IntoIterator<Item = (B256, U256)>) -> B256 {
 /// omitted. Addresses are raw; alloy-trie hashes them (secure trie). An empty
 /// account set yields [`EMPTY_ROOT_HASH`].
 pub fn state_root(accounts: impl IntoIterator<Item = (Address, AccountTrieParts)>) -> B256 {
-    root::state_root_unhashed(accounts.into_iter().filter(|(_, a)| !a.is_empty()).map(
-        |(addr, a)| {
-            (
-                addr,
-                TrieAccount {
-                    nonce: a.nonce,
-                    balance: a.balance,
-                    storage_root: a.canonical_storage_root(),
-                    code_hash: a.canonical_code_hash(),
-                },
-            )
-        },
-    ))
+    root::state_root_unhashed(
+        accounts
+            .into_iter()
+            .filter(|(_, a)| !a.is_empty())
+            .map(|(addr, a)| (addr, a.to_trie_account())),
+    )
 }
 
 #[cfg(test)]

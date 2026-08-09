@@ -13,14 +13,16 @@
 
 use kardamom_types::BPosition;
 
+use std::ops::ControlFlow;
+
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
     KEY_LAST_COMMITTED_BLOCK, KEY_LAST_COMMITTED_END_TX_POSITION, KEY_LAST_FSYNCED_B_POSITION,
-    decode_b_position, decode_u64,
+    read_meta_b_position, read_meta_u64,
 };
 use crate::schema::{
-    HeaderValue, TABLE_HEADERS, TABLE_META, decode_header_value, encode_block_key,
+    HeaderValue, TABLE_HEADERS, TABLE_META, decode_header_value, encode_block_key, for_each_row,
 };
 
 /// Cursors read out of the `meta` table at startup. The writer uses this to
@@ -43,20 +45,12 @@ pub fn read_recovery_point(env: &StateEnv) -> Result<RecoveryPoint, StateError> 
     let txn = env.raw().begin_ro_sync()?;
     let meta = txn.open_db(Some(TABLE_META))?;
 
-    let last_committed_block = match txn.get::<Vec<u8>>(meta.dbi(), KEY_LAST_COMMITTED_BLOCK)? {
-        Some(b) => decode_u64(&b)?,
-        None => 0,
-    };
+    let last_committed_block = read_meta_u64(&txn, meta, KEY_LAST_COMMITTED_BLOCK)?.unwrap_or(0);
     let last_committed_end_tx_position =
-        match txn.get::<Vec<u8>>(meta.dbi(), KEY_LAST_COMMITTED_END_TX_POSITION)? {
-            Some(b) => decode_b_position(&b)?,
-            None => BPosition::ZERO,
-        };
+        read_meta_b_position(&txn, meta, KEY_LAST_COMMITTED_END_TX_POSITION)?
+            .unwrap_or(BPosition::ZERO);
     let last_fsynced_b_position =
-        match txn.get::<Vec<u8>>(meta.dbi(), KEY_LAST_FSYNCED_B_POSITION)? {
-            Some(b) => decode_b_position(&b)?,
-            None => BPosition::ZERO,
-        };
+        read_meta_b_position(&txn, meta, KEY_LAST_FSYNCED_B_POSITION)?.unwrap_or(BPosition::ZERO);
     // The committed block's header row is written in the same txn as the meta
     // cursors, so present-cursor/absent-header means a corrupt env — surface
     // it rather than defaulting (a wrong timestamp silently diverges state).
@@ -124,62 +118,50 @@ pub fn bootstrap_trie_from_state(env: &StateEnv) -> Result<alloy_primitives::B25
 
     let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
     let mut accounts = Vec::new();
-    {
-        let mut cur = txn.cursor(accounts_db)?;
-        let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-        while let Some((k, v)) = item {
-            if k.len() != 20 {
-                return Err(StateError::Recovery(format!(
-                    "accounts key of length {} during trie bootstrap",
-                    k.len()
-                )));
-            }
-            let a = decode_account_value(&v)?;
-            accounts.push(kardamom_types::AccountChange {
-                address: Address::from_slice(&k),
-                nonce: a.nonce,
-                balance: a.balance,
-                code_hash: a.code_hash,
-            });
-            item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    for_each_row(&txn, accounts_db, |k, v| {
+        if k.len() != 20 {
+            return Err(StateError::Recovery(format!(
+                "accounts key of length {} during trie bootstrap",
+                k.len()
+            )));
         }
-    }
+        let a = decode_account_value(&v)?;
+        accounts.push(kardamom_types::AccountChange {
+            address: Address::from_slice(&k),
+            nonce: a.nonce,
+            balance: a.balance,
+            code_hash: a.code_hash,
+        });
+        Ok(ControlFlow::Continue(()))
+    })?;
 
     let storage_db = txn.open_db(Some(TABLE_STORAGE))?;
     let mut storage = Vec::new();
-    {
-        let mut cur = txn.cursor(storage_db)?;
-        let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-        while let Some((k, v)) = item {
-            if k.len() != 52 {
-                return Err(StateError::Recovery(format!(
-                    "storage key of length {} during trie bootstrap",
-                    k.len()
-                )));
-            }
-            let value: U256 = decode_storage_value(&v)?;
-            storage.push(kardamom_types::StorageChange {
-                address: Address::from_slice(&k[..20]),
-                key: B256::from_slice(&k[20..]),
-                value,
-            });
-            item = cur.next::<Vec<u8>, Vec<u8>>()?;
+    for_each_row(&txn, storage_db, |k, v| {
+        if k.len() != 52 {
+            return Err(StateError::Recovery(format!(
+                "storage key of length {} during trie bootstrap",
+                k.len()
+            )));
         }
-    }
+        let value: U256 = decode_storage_value(&v)?;
+        storage.push(kardamom_types::StorageChange {
+            address: Address::from_slice(&k[..20]),
+            key: B256::from_slice(&k[20..]),
+            value,
+        });
+        Ok(ControlFlow::Continue(()))
+    })?;
 
     let code_db = txn.open_db(Some(TABLE_CODE))?;
     let mut code = Vec::new();
-    {
-        let mut cur = txn.cursor(code_db)?;
-        let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-        while let Some((k, v)) = item {
-            code.push(kardamom_types::CodeEntry {
-                code_hash: B256::from_slice(&k),
-                code: v.into(),
-            });
-            item = cur.next::<Vec<u8>, Vec<u8>>()?;
-        }
-    }
+    for_each_row(&txn, code_db, |k, v| {
+        code.push(kardamom_types::CodeEntry {
+            code_hash: B256::from_slice(&k),
+            code: v.into(),
+        });
+        Ok(ControlFlow::Continue(()))
+    })?;
 
     let delta = kardamom_types::BlockDelta {
         block_number: 0,
@@ -210,11 +192,9 @@ pub fn bootstrap_trie_from_state(env: &StateEnv) -> Result<alloy_primitives::B25
 pub fn read_all_headers(env: &StateEnv) -> Result<Vec<(u64, HeaderValue)>, StateError> {
     let txn = env.raw().begin_ro_sync()?;
     let headers = txn.open_db(Some(TABLE_HEADERS))?;
-    let mut cur = txn.cursor(headers)?;
     let mut out = Vec::new();
     // Keys are block numbers big-endian, so mdbx's byte order IS block order.
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-    while let Some((k, v)) = item {
+    for_each_row(&txn, headers, |k, v| {
         if k.len() != 8 {
             return Err(StateError::BadEncoding {
                 table: TABLE_HEADERS,
@@ -224,8 +204,8 @@ pub fn read_all_headers(env: &StateEnv) -> Result<Vec<(u64, HeaderValue)>, State
         }
         let block_number = u64::from_be_bytes(k[..8].try_into().expect("8 bytes"));
         out.push((block_number, decode_header_value(&v)?));
-        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(out)
 }
 
