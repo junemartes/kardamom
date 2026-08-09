@@ -57,7 +57,7 @@ struct Cli {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().with_env_filter("info").init();
+    kardamom_obs::bin::init_tracing();
     let cli = Cli::parse();
 
     if cli.diff {

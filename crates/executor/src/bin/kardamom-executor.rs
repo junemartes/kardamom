@@ -152,13 +152,7 @@ struct Args {
 async fn main() -> Result<()> {
     bin_support::init_tracing();
     let args = Args::parse();
-    kardamom_obs::init(
-        "executor",
-        args.metrics_addr,
-        &args.host_id,
-        env!("CARGO_PKG_VERSION"),
-        option_env!("KARDAMOM_GIT_SHA").unwrap_or("unknown"),
-    )?;
+    kardamom_obs::init_service!("executor", args.metrics_addr, &args.host_id)?;
     kardamom_executor::metrics::describe();
     // The TOML supplies the optional `[cluster]` section (default disabled);
     // all other runtime tuning still comes from the CLI flags above. An empty
@@ -189,10 +183,7 @@ async fn main() -> Result<()> {
     if let Some(dir) = args.aeron_dir.as_ref() {
         aeron_cfg.aeron_dir = dir.clone();
     }
-    let rt = match args.aeron_dir.as_ref() {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
-        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
-    };
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
 
     // SEPARATE Aeron runtime/thread for the tx_receipts PUBLICATION. The
     // executor's single Aeron thread otherwise services both the tx_ordering
@@ -202,12 +193,8 @@ async fn main() -> Result<()> {
     // from the tx_ordering MDC, its image dies, and the executor freezes
     // (reader stops, exec blocks reading). Isolating the publisher onto its own
     // thread keeps the subscription poll timely no matter the receipt load.
-    let rt_pub = match args.aeron_dir.as_ref() {
-        Some(dir) => {
-            AeronRuntime::spawn_with_dir(dir).context("spawn receipts AeronRuntime with dir")?
-        }
-        None => AeronRuntime::spawn_default().context("spawn receipts AeronRuntime")?,
-    };
+    let rt_pub =
+        AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn receipts AeronRuntime")?;
 
     // --- State backend + crash-recovery decision (before the subscriptions,
     // because the tx_ordering subscription branches on whether we are resuming).
@@ -218,13 +205,7 @@ async fn main() -> Result<()> {
     // and a checkpoint is available, restore the newest one BEFORE opening the
     // env. Startup then sees a populated DB and resumes from the checkpoint's
     // block — replaying only the tail instead of re-syncing from genesis.
-    // Chain identity for checkpoint adoption: the digest of the genesis this
-    // node is configured with. A checkpoint from another chain (or corrupt
-    // bytes) is refused rather than adopted — see CheckpointManifest.
-    let expected_genesis = {
-        let (a, c) = bin_support::build_genesis_alloc(genesis.as_ref());
-        Some(kardamom_state::genesis_digest(&a, &c))
-    };
+    let expected_genesis = bin_support::expected_genesis_digest(genesis.as_ref());
     if let Some(ckpt_dir) = args.checkpoint_dir.as_ref() {
         // Serve this node's checkpoints to peers (the other side of the peer
         // fetch below). Best-effort infrastructure, but a bad bind address is
@@ -235,43 +216,18 @@ async fn main() -> Result<()> {
         }
         // Fresh iff the state dir has no mdbx data file — checked WITHOUT opening
         // the env (opening would itself create the data file and defeat restore).
+        // (Observed motivation for the ladder's quarantine rung: a copy that
+        // raced the writer's prune had no MANIFEST; every restart refused it
+        // and the fleet sat at 2/3.)
         let fresh = !kardamom_state::checkpoint::has_state_db(&args.state_dir)
             .context("probe state dir")?;
         if fresh {
-            // Newest-first with QUARANTINE on verification failure: a torn or
-            // foreign checkpoint costs one rung of the fallback ladder (older
-            // checkpoint -> peer fetch -> genesis), it must never crash-loop
-            // the node (observed: a copy that raced the writer's prune had no
-            // MANIFEST; every restart refused it and the fleet sat at 2/3).
-            let mut restored = kardamom_state::restore_best_checkpoint(
+            let restored = bin_support::restore_or_fetch_checkpoint(
                 ckpt_dir,
                 &args.state_dir,
+                &args.checkpoint_peers,
                 expected_genesis,
-            )
-            .context("restore local checkpoint")?;
-            // No restorable local checkpoint: fetch one from a peer replica
-            // before the first join. A fresh node joining an old chain can
-            // NOT re-sync from genesis — the cluster's canonical stream is
-            // retained only over a bounded window, so REPLAY_FROM(genesis)
-            // would be refused (REPLAY_UNAVAILABLE) once lifetime traffic
-            // exceeds it.
-            if restored.is_none()
-                && !args.checkpoint_peers.is_empty()
-                && kardamom_state::fetch_best_checkpoint(
-                    &args.checkpoint_peers,
-                    ckpt_dir,
-                    1,
-                    expected_genesis,
-                )
-                .is_some()
-            {
-                restored = kardamom_state::restore_best_checkpoint(
-                    ckpt_dir,
-                    &args.state_dir,
-                    expected_genesis,
-                )
-                .context("restore fetched checkpoint")?;
-            }
+            )?;
             match restored {
                 Some((block, path)) => {
                     tracing::info!(
@@ -370,35 +326,14 @@ async fn main() -> Result<()> {
     // rotation; the executor's skip-count + `DedupWindow` provide idempotency
     // across any reconnect overlap. (The single-sealer restart BoundaryMisaligned
     // can't occur: the cluster continues the committed count/block across leader
-    // failover.) The cluster-session guard (`LiveCluster`) + its dedicated Aeron
-    // runtime must outlive the executor loop, so bind the guard in the outer
-    // scope; it is dropped only after the `join` await below.
-    //
-    // DEDICATED cluster runtime (own Aeron thread, same aeron dir) so the cluster
-    // session never contends with the tx_data / receipts work on `rt` / `rt_pub`.
-    let cluster_rt = match args.aeron_dir.as_ref() {
-        Some(dir) => {
-            AeronRuntime::spawn_with_dir(dir).context("spawn cluster AeronRuntime with dir")?
-        }
-        None => AeronRuntime::spawn_default().context("spawn cluster AeronRuntime")?,
-    };
-    // Replay cursor: on crash recovery, resume the canonical stream from the
-    // persisted state cursor — the cluster re-offers retained frames from
-    // there on every session establishment, so tx_ordering is gapless across
-    // restarts AND session loss (no separate archive path needed).
-    let cluster_cursor = match &resume {
-        Some(rp) => {
-            kardamom_executor::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1)
-        }
-        None => kardamom_executor::reader::cluster::ReplayCursor::genesis(),
-    };
-    let (cluster_guard, cluster_sub) =
-        kardamom_executor::reader::cluster::cluster_tx_ordering_subscription(
-            cluster_rt,
-            file_cfg.cluster.to_live(),
-            cluster_cursor,
-        )
-        .context("connect cluster tx_ordering subscription")?;
+    // failover.) The cluster-session guard (`LiveCluster`) must outlive the
+    // executor loop, so bind the guard in the outer scope; it is dropped only
+    // after the `join` await below.
+    let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
+        args.aeron_dir.as_deref(),
+        file_cfg.cluster.to_live(),
+        bin_support::cluster_replay_cursor(resume.as_ref()),
+    )?;
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
     // The executor is the blessed emitter of the kardamom_sealer_* re-export
     // (default-on in the shared subscription; the validator suppresses it).
@@ -554,76 +489,19 @@ async fn main() -> Result<()> {
     if let Err(e) = writer.shutdown() {
         tracing::error!(error = %e, "state writer shutdown returned an error");
     }
-    // Replay-window overrun: the durable cursor fell below the cluster's
-    // retention floor, so resuming from it can never succeed — every restart
-    // would re-request the same refused REPLAY_FROM (a deterministic crash
-    // loop). Repair BEFORE exiting: fetch a peer checkpoint at/above the floor
-    // and park the stale DB; the next restart then takes the ordinary
-    // fresh-start restore path and resumes from the fetched checkpoint. Doing
-    // the repair at exit (rather than looping in-process) keeps a single
-    // startup path and stays crash-safe at every step — fetch is
-    // atomic-rename, and the DB is parked only after a qualifying checkpoint
-    // is already on disk.
-    if let Some(ExecutorError::ClusterReplayUnavailable {
-        from_index,
-        oldest_index,
-        oldest_block,
-    }) = &engine_error
-    {
-        let oldest_block = *oldest_block;
-        tracing::warn!(
-            from_index,
-            oldest_index,
-            oldest_block,
-            "cluster replay unavailable — attempting checkpoint fallback"
-        );
-        match (
-            args.checkpoint_dir.as_ref(),
-            args.checkpoint_peers.is_empty(),
-        ) {
-            (Some(ckpt_dir), false) => {
-                match kardamom_state::fetch_best_checkpoint(
-                    &args.checkpoint_peers,
-                    ckpt_dir,
-                    oldest_block,
-                    expected_genesis,
-                ) {
-                    Some(ckpt) => {
-                        kardamom_state::park_state_db(&args.state_dir)
-                            .context("park stale state DB")?;
-                        metrics::counter!(
-                            kardamom_executor::metrics::RESYNC_TOTAL,
-                            "outcome" => "peer-checkpoint"
-                        )
-                        .increment(1);
-                        tracing::info!(
-                            checkpoint_block = ckpt.block,
-                            "resync prepared: peer checkpoint staged, stale state parked; \
-                             restart will restore and resume from it"
-                        );
-                    }
-                    None => {
-                        metrics::counter!(
-                            kardamom_executor::metrics::RESYNC_TOTAL,
-                            "outcome" => "unrecoverable"
-                        )
-                        .increment(1);
-                        tracing::error!(
-                            oldest_block,
-                            "resync fallback failed: no peer checkpoint at or above the \
-                             retention floor — operator action required (restore a \
-                             checkpoint into --checkpoint-dir, or rebuild-from-L1 with \
-                             kardamom-reconstruct into --state-dir)"
-                        );
-                    }
-                }
-            }
-            _ => tracing::error!(
-                "resync fallback unavailable (--checkpoint-dir/--checkpoint-peers not \
-                 configured) — operator action required (rebuild-from-L1 with \
-                 kardamom-reconstruct, or restore a peer checkpoint manually)"
-            ),
-        }
+    // Replay-window overrun: repair BEFORE exiting so the restart resumes
+    // from a fetched peer checkpoint instead of crash-looping on the same
+    // refused REPLAY_FROM — see `bin_support::replay_unavailable_fallback`.
+    if let Some(outcome) = bin_support::replay_unavailable_fallback(
+        engine_error.as_ref(),
+        args.checkpoint_dir.as_deref(),
+        &args.checkpoint_peers,
+        &args.state_dir,
+        expected_genesis,
+        false,
+    )? {
+        metrics::counter!(kardamom_executor::metrics::RESYNC_TOTAL, "outcome" => outcome)
+            .increment(1);
     }
     // Non-zero exits so the orchestrator can tell a failed recovery / dead
     // pipeline from a clean shutdown (F13.4): exit status is the restart

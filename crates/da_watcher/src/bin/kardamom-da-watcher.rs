@@ -23,6 +23,7 @@ use kardamom_da_watcher::{
 use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
 use kardamom_log::config::LogConfig;
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
+use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::{BPosition, EpochRecord};
 
 #[derive(Debug, Parser)]
@@ -66,12 +67,7 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    kardamom_obs::bin::init_tracing();
 
     let args = Args::parse();
     let lockbox = Address::from_str(&args.lockbox)
@@ -98,10 +94,7 @@ fn main() -> anyhow::Result<()> {
     let resolved = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
     let channels = resolved.channels;
     let aeron_cfg = resolved.aeron;
-    let aeron_rt = match args.aeron_dir.as_ref() {
-        Some(dir) => AeronRuntime::spawn_with_dir(dir).context("spawn AeronRuntime with dir")?,
-        None => AeronRuntime::spawn_default().context("spawn AeronRuntime")?,
-    };
+    let aeron_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
     let tx_deposits_pub = TxDepositsPublisherHandle::open(&aeron_rt, &channels)
         .context("open TxDepositsPublisherHandle")?;
 
@@ -268,32 +261,5 @@ impl EpochPublisher for LiveTxDepositsPublisher {
                 }
             }
         }
-    }
-}
-
-/// Resolve on SIGTERM (how the orchestrator stops the job) or Ctrl-C.
-/// Mirrors `kardamom_engine::bin_support::wait_for_shutdown`; this binary
-/// cannot use that copy without depending on the whole engine crate.
-async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Ctrl-C received");
     }
 }

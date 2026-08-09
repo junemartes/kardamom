@@ -294,41 +294,175 @@ pub fn archive_join_recovery(
 }
 
 // ---------------------------------------------------------------------------
+// Cold-start checkpoint ladder + replay-window-overrun repair (executor and
+// validator; recovery-D #94 / #143). These were copy-pasted between the two
+// binaries and had begun to drift in comments — they are safety-critical
+// recovery logic and MUST stay one copy.
+// ---------------------------------------------------------------------------
+
+/// Chain identity for checkpoint adoption: the digest of the genesis this
+/// node is configured with. A checkpoint from another chain (or corrupt
+/// bytes) is refused rather than adopted — see `CheckpointManifest`.
+pub fn expected_genesis_digest(
+    genesis: Option<&kardamom_types::Genesis>,
+) -> Option<alloy_primitives::B256> {
+    let (a, c) = build_genesis_alloc(genesis);
+    Some(kardamom_state::genesis_digest(&a, &c))
+}
+
+/// The cold-start restore ladder: newest local checkpoint first (QUARANTINE
+/// on verification failure — a torn or foreign checkpoint costs one rung of
+/// the ladder, it must never crash-loop the node), then a one-shot peer
+/// fetch + retry. A fresh node joining an old chain can NOT re-sync from
+/// genesis — the cluster's canonical stream is retained only over a bounded
+/// window, so `REPLAY_FROM(genesis)` would be refused once lifetime traffic
+/// exceeds it.
+///
+/// Returns the restored `(block, checkpoint_path)`, or `None` for a genesis
+/// start. Role-specific follow-up (the validator's adoption marker, log
+/// wording) stays at the call site.
+pub fn restore_or_fetch_checkpoint(
+    ckpt_dir: &Path,
+    state_dir: &Path,
+    peers: &[String],
+    expected_genesis: Option<alloy_primitives::B256>,
+) -> Result<Option<(u64, std::path::PathBuf)>> {
+    let restore = || kardamom_state::restore_best_checkpoint(ckpt_dir, state_dir, expected_genesis);
+    let mut restored = restore().context("restore local checkpoint")?;
+    if restored.is_none()
+        && !peers.is_empty()
+        && kardamom_state::fetch_best_checkpoint(peers, ckpt_dir, 1, expected_genesis).is_some()
+    {
+        restored = restore().context("restore fetched checkpoint")?;
+    }
+    Ok(restored)
+}
+
+/// Replay cursor for the cluster canonical stream: resume from the persisted
+/// state cursor, or genesis for a fresh node. The cluster re-offers retained
+/// frames from the cursor on every session establishment, so tx_ordering is
+/// gapless across restarts AND session loss.
+pub fn cluster_replay_cursor(
+    resume: Option<&crate::ResumePoint>,
+) -> crate::reader::cluster::ReplayCursor {
+    match resume {
+        Some(rp) => crate::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1),
+        None => crate::reader::cluster::ReplayCursor::genesis(),
+    }
+}
+
+/// Spawn a DEDICATED cluster Aeron runtime (own thread, same aeron dir — the
+/// cluster session must never contend with tx_data/receipts work on the main
+/// runtimes) and connect the cluster tx_ordering subscription from `cursor`.
+/// The returned `LiveCluster` guard MUST outlive the engine loop.
+pub fn connect_cluster_ordering(
+    aeron_dir: Option<&Path>,
+    cfg: kardamom_cluster_adapter::LiveClusterConfig,
+    cursor: crate::reader::cluster::ReplayCursor,
+) -> Result<(
+    kardamom_cluster_adapter::LiveCluster,
+    crate::reader::cluster::ClusterTxOrderingSubscription<kardamom_cluster_adapter::LiveEgress>,
+)> {
+    let cluster_rt = AeronRuntime::spawn(aeron_dir).context("spawn cluster AeronRuntime")?;
+    crate::reader::cluster::cluster_tx_ordering_subscription(cluster_rt, cfg, cursor)
+        .context("connect cluster tx_ordering subscription")
+}
+
+/// Replay-window overrun repair, run at exit: the durable cursor fell below
+/// the cluster's retention floor, so resuming from it can never succeed —
+/// every restart would re-request the same refused `REPLAY_FROM` (a
+/// deterministic crash loop). Repair BEFORE exiting: fetch a peer checkpoint
+/// at/above the floor and park the stale DB; the next restart then takes the
+/// ordinary fresh-start restore path and resumes from the fetched
+/// checkpoint. Doing the repair at exit (rather than looping in-process)
+/// keeps a single startup path and stays crash-safe at every step — fetch is
+/// atomic-rename, and the DB is parked only after a qualifying checkpoint is
+/// already on disk.
+///
+/// `adopted_unverified` selects the validator's log wording (its adopted
+/// state is unverified through the checkpoint block — the #78 catch-up trust
+/// class). Returns the resync outcome label (`"peer-checkpoint"` /
+/// `"unrecoverable"`) for the caller's per-service metric, `None` when `err`
+/// is not a `ClusterReplayUnavailable`.
+pub fn replay_unavailable_fallback(
+    err: Option<&ExecutorError>,
+    checkpoint_dir: Option<&Path>,
+    checkpoint_peers: &[String],
+    state_dir: &Path,
+    expected_genesis: Option<alloy_primitives::B256>,
+    adopted_unverified: bool,
+) -> Result<Option<&'static str>> {
+    let Some(ExecutorError::ClusterReplayUnavailable {
+        from_index,
+        oldest_index,
+        oldest_block,
+    }) = err
+    else {
+        return Ok(None);
+    };
+    let oldest_block = *oldest_block;
+    tracing::warn!(
+        from_index,
+        oldest_index,
+        oldest_block,
+        "cluster replay unavailable — attempting peer-checkpoint fallback"
+    );
+    match (checkpoint_dir, checkpoint_peers.is_empty()) {
+        (Some(ckpt_dir), false) => {
+            match kardamom_state::fetch_best_checkpoint(
+                checkpoint_peers,
+                ckpt_dir,
+                oldest_block,
+                expected_genesis,
+            ) {
+                Some(ckpt) => {
+                    kardamom_state::park_state_db(state_dir).context("park stale state DB")?;
+                    if adopted_unverified {
+                        tracing::info!(
+                            checkpoint_block = ckpt.block,
+                            "resync prepared: peer checkpoint staged, stale state parked; \
+                             restart will adopt it (blocks through the checkpoint are \
+                             UNVERIFIED by this validator)"
+                        );
+                    } else {
+                        tracing::info!(
+                            checkpoint_block = ckpt.block,
+                            "resync prepared: peer checkpoint staged, stale state parked; \
+                             restart will restore and resume from it"
+                        );
+                    }
+                    Ok(Some("peer-checkpoint"))
+                }
+                None => {
+                    tracing::error!(
+                        oldest_block,
+                        "resync fallback failed: no peer checkpoint at or above the \
+                         retention floor — operator action required (restore a \
+                         checkpoint into --checkpoint-dir, or rebuild-from-L1 with \
+                         kardamom-reconstruct into --state-dir)"
+                    );
+                    Ok(Some("unrecoverable"))
+                }
+            }
+        }
+        _ => {
+            tracing::error!(
+                "resync fallback unavailable (--checkpoint-dir/--checkpoint-peers not \
+                 configured) — operator action required (rebuild-from-L1 with \
+                 kardamom-reconstruct, or restore a peer checkpoint manually)"
+            );
+            Ok(None)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Process scaffolding.
 // ---------------------------------------------------------------------------
 
-pub fn init_tracing() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-}
-
-pub async fn wait_for_shutdown() {
-    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{SignalKind, signal};
-        let mut sigterm = match signal(SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGTERM handler; falling back to Ctrl-C only");
-                let _ = tokio::signal::ctrl_c().await;
-                return;
-            }
-        };
-        tokio::select! {
-            _ = sigterm.recv() => tracing::info!("SIGTERM received"),
-            _ = tokio::signal::ctrl_c() => tracing::info!("Ctrl-C received"),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Ctrl-C received");
-    }
-}
+// Moved to `kardamom_obs::bin` so every service (not just the engine-shaped
+// ones) shares a single copy; re-exported here for the existing callers.
+pub use kardamom_obs::bin::{init_tracing, wait_for_shutdown};
 
 #[cfg(test)]
 mod tests {

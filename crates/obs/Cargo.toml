@@ -14,6 +14,7 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 # Single-threaded runtime for the dedicated obs-exporter thread (the exporter
 # never runs on the service's runtime — see `init`).
 tokio = { workspace = true, features = ["rt", "net", "time"] }

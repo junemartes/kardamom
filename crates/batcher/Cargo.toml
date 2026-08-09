@@ -46,7 +46,6 @@ zstd = "0.13"
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 metrics.workspace = true
 kardamom-obs = { path = "../obs" }
 
