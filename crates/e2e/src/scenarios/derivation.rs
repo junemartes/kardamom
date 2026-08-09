@@ -21,8 +21,7 @@ use std::time::Duration;
 use alloy_primitives::{Address, U256};
 use anyhow::{Context, Result};
 
-use super::Target;
-use super::bridge::await_l2_receipt;
+use super::{Target, assert_receipt_ok, await_l2_receipt, open_state_ro, receipt_placement};
 use crate::harness::l1::L1;
 use crate::harness::l2;
 
@@ -42,10 +41,7 @@ pub struct BlockOrigin {
 /// RPC (there is no `eth_getBlockByNumber`), so the state DB is the only
 /// place the origin is observable — which is itself worth knowing.
 pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
-    let env = kardamom_state::StateEnvBuilder::new(state_dir)
-        .read_only(true)
-        .open()
-        .context("open state dir read-only")?;
+    let env = open_state_ro(state_dir)?;
     let headers = kardamom_state::read_all_headers(&env).context("read headers table")?;
     Ok(headers
         .into_iter()
@@ -182,20 +178,8 @@ pub async fn deposits_lead_their_block_under_load(
 
     let source_hash = kardamom_da_watcher::source_hash(block_hash, log_index);
     let receipt = await_l2_receipt(t, source_hash, "the deposit").await?;
-    let block_number = u64::from_str_radix(
-        super::bridge::receipt_field(&receipt, "blockNumber")
-            .context("deposit receipt has no blockNumber")?
-            .trim_start_matches("0x"),
-        16,
-    )
-    .context("parse deposit blockNumber")?;
-    let tx_index = u64::from_str_radix(
-        super::bridge::receipt_field(&receipt, "transactionIndex")
-            .context("deposit receipt has no transactionIndex")?
-            .trim_start_matches("0x"),
-        16,
-    )
-    .context("parse deposit transactionIndex")?;
+    let (block_number, tx_index) =
+        receipt_placement(&receipt).context("place the deposit receipt")?;
 
     // Rule 3: index 0 of its block. Not "early", not "before the txs that
     // happened to arrive later" — first.
@@ -264,18 +248,7 @@ pub async fn multi_deposit_epoch_lands_in_log_order(
     for (block_hash, _l1_number, log_index) in &receipts {
         let sh = kardamom_da_watcher::source_hash(*block_hash, *log_index);
         let r = await_l2_receipt(t, sh, "a batched deposit").await?;
-        let bn = u64::from_str_radix(
-            super::bridge::receipt_field(&r, "blockNumber")
-                .context("no blockNumber")?
-                .trim_start_matches("0x"),
-            16,
-        )?;
-        let ti = u64::from_str_radix(
-            super::bridge::receipt_field(&r, "transactionIndex")
-                .context("no transactionIndex")?
-                .trim_start_matches("0x"),
-            16,
-        )?;
+        let (bn, ti) = receipt_placement(&r).context("place a batched deposit receipt")?;
         placements.push((*log_index, bn, ti));
     }
 
@@ -398,10 +371,7 @@ pub async fn every_l1_deposit_appears_exactly_once(
                     log.block_number, log.log_index
                 )
             })?;
-        anyhow::ensure!(
-            super::bridge::receipt_field(&receipt, "status") == Some("0x1"),
-            "deposit {sh} executed but reverted"
-        );
+        assert_receipt_ok(&receipt, &format!("deposit {sh}"))?;
         *seen.entry(sh).or_default() += 1;
     }
 

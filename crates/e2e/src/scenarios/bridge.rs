@@ -21,33 +21,15 @@ use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
 use anyhow::{Context, Result};
 
-use super::Target;
+use super::{
+    Target, assert_receipt_ok, await_l2_receipt, read_validator_state_root, receipt_field,
+};
 use crate::harness::l1::{self, ETHLockbox, L1, L2ToL1MessagePasser, WithdrawalOutputOracle};
 use crate::harness::l2::{self, DerivedSigner};
 use crate::harness::metrics::poll_until;
 
 /// 1 ETH.
 const DEPOSIT_WEI: u128 = 1_000_000_000_000_000_000;
-
-/// Wait for the L2 receipt of `tx_hash`, which for a deposit is its
-/// `source_hash`.
-pub(crate) async fn await_l2_receipt(
-    t: &Target,
-    hash: B256,
-    what: &str,
-) -> Result<serde_json::Value> {
-    poll_until(
-        &format!("L2 receipt for {what}"),
-        Duration::from_secs(60),
-        Duration::from_millis(250),
-        || async { Ok(t.rpc.receipt(hash).await.result.ok().flatten()) },
-    )
-    .await
-}
-
-pub(crate) fn receipt_field<'a>(r: &'a serde_json::Value, key: &str) -> Option<&'a str> {
-    r.get(key).and_then(|v| v.as_str())
-}
 
 pub struct DepositParams {
     /// Dev-mnemonic index of the fresh L2 account the deposit mints to. It
@@ -87,10 +69,7 @@ pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result
     // --- L2: the deposit surfaces as a receipt keyed by source_hash. ------
     let source_hash = kardamom_da_watcher::source_hash(block_hash, log_index);
     let receipt = await_l2_receipt(t, source_hash, "the deposit").await?;
-    anyhow::ensure!(
-        receipt_field(&receipt, "status") == Some("0x1"),
-        "deposit receipt not successful: {receipt}"
-    );
+    assert_receipt_ok(&receipt, "the deposit")?;
     anyhow::ensure!(
         receipt_field(&receipt, "effectiveGasPrice") == Some("0x0"),
         "deposit must execute at gas price 0: {receipt}"
@@ -113,10 +92,7 @@ pub async fn deposit_round_trip(t: &Target, l1: &L1, p: DepositParams) -> Result
         .map_err(|e| anyhow::anyhow!("spending the deposited funds failed: {e}"))?;
     anyhow::ensure!(hash == spend.hash, "spend hash mismatch");
     let spend_receipt = await_l2_receipt(t, spend.hash, "the spend").await?;
-    anyhow::ensure!(
-        receipt_field(&spend_receipt, "status") == Some("0x1"),
-        "spend reverted: {spend_receipt}"
-    );
+    assert_receipt_ok(&spend_receipt, "the spend")?;
 
     // The deposit itself is not a regular tx (no nonce, gas price 0), so the
     // applied counter moves by exactly the one spend beyond it.
@@ -192,10 +168,7 @@ pub async fn initiate_withdrawal(
     out.result
         .map_err(|e| anyhow::anyhow!("initiateWithdrawal failed: {e}"))?;
     let receipt = await_l2_receipt(t, tx.hash, "the withdrawal").await?;
-    anyhow::ensure!(
-        receipt_field(&receipt, "status") == Some("0x1"),
-        "initiateWithdrawal reverted: {receipt}"
-    );
+    assert_receipt_ok(&receipt, "initiateWithdrawal")?;
 
     // The MessagePassed log carries the nonce this withdrawal was assigned.
     let logs = receipt
@@ -390,21 +363,4 @@ pub async fn finalize_withdrawal(
         "replay changed the recipient's balance {after} -> {final_balance}"
     );
     Ok(())
-}
-
-/// The validator's currently-committed MPT state root, read from its live
-/// state DB with a READ-ONLY mdbx open (mdbx is multi-process: the reader
-/// takes an MVCC snapshot and never blocks or disturbs the writer).
-///
-/// This is the seam a future `eth_getProof`-style API or a root-carrying
-/// metric would replace. Today nothing exposes roots, which is precisely the
-/// user-facing gap this scenario documents: a real withdrawer cannot obtain
-/// the `stateRoot` argument `finalizeWithdrawal` demands.
-fn read_validator_state_root(state_dir: &std::path::Path) -> Result<Option<B256>> {
-    let env = kardamom_state::StateEnvBuilder::new(state_dir)
-        .read_only(true)
-        .open()
-        .context("open validator state dir read-only")?;
-    let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot validator state")?;
-    snap.state_root().context("read validator state root")
 }

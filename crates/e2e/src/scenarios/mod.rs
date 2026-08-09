@@ -20,8 +20,10 @@ pub mod nonce_unordered;
 pub mod rpc_liveness;
 
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
+use alloy_primitives::B256;
 use anyhow::{Context, Result};
 
 use crate::harness::l2::L2Client;
@@ -106,6 +108,77 @@ impl Target {
         )
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared receipt helpers — every scenario that inspects an L2 receipt goes
+// through these rather than open-coding the JSON poking.
+// ---------------------------------------------------------------------------
+
+/// Wait for the L2 receipt of `hash`, which for a deposit is its
+/// `source_hash`.
+pub async fn await_l2_receipt(t: &Target, hash: B256, what: &str) -> Result<serde_json::Value> {
+    metrics::poll_until(
+        &format!("L2 receipt for {what}"),
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        || async { Ok(t.rpc.receipt(hash).await.result.ok().flatten()) },
+    )
+    .await
+}
+
+/// A string field of receipt `r` (`"status"`, `"blockNumber"`, …).
+pub fn receipt_field<'a>(r: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    r.get(key).and_then(|v| v.as_str())
+}
+
+/// Where the chain placed the receipt's transaction:
+/// `(blockNumber, transactionIndex)`, hex-parsed.
+pub fn receipt_placement(r: &serde_json::Value) -> Result<(u64, u64)> {
+    let hex_u64 = |key: &str| -> Result<u64> {
+        let s = receipt_field(r, key).with_context(|| format!("receipt has no {key}: {r}"))?;
+        u64::from_str_radix(s.trim_start_matches("0x"), 16)
+            .with_context(|| format!("parse receipt {key} {s:?}"))
+    };
+    Ok((hex_u64("blockNumber")?, hex_u64("transactionIndex")?))
+}
+
+/// The transaction behind receipt `r` executed successfully (`status == 0x1`).
+pub fn assert_receipt_ok(r: &serde_json::Value, what: &str) -> Result<()> {
+    anyhow::ensure!(
+        receipt_field(r, "status") == Some("0x1"),
+        "{what}: receipt not successful (reverted): {r}"
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Shared state-DB reads — READ-ONLY mdbx opens of a live service's state dir
+// (mdbx is multi-process: the reader takes an MVCC snapshot and never blocks
+// or disturbs the writer).
+// ---------------------------------------------------------------------------
+
+/// Read-only mdbx open of a service's state dir.
+pub(crate) fn open_state_ro(dir: &Path) -> Result<kardamom_state::StateEnv> {
+    kardamom_state::StateEnvBuilder::new(dir)
+        .read_only(true)
+        .open()
+        .context("open state dir read-only")
+}
+
+/// The validator's currently-committed MPT state root, read from its live
+/// state DB.
+///
+/// This is the seam a future `eth_getProof`-style API or a root-carrying
+/// metric would replace. Today nothing exposes roots, which is precisely the
+/// user-facing gap the withdrawal scenario documents: a real withdrawer
+/// cannot obtain the `stateRoot` argument `finalizeWithdrawal` demands. For
+/// S8 it is the parity target: an INDEPENDENT computation, not anything the
+/// DA path produced.
+pub fn read_validator_state_root(state_dir: &Path) -> Result<Option<B256>> {
+    let env = open_state_ro(state_dir)?;
+    let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot validator state")?;
+    snap.state_root().context("read validator state root")
 }
 
 /// Snapshot of the sequencer health counters a semantics scenario requires

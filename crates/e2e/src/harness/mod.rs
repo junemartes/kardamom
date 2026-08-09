@@ -21,7 +21,7 @@ pub mod proc;
 pub mod sealer;
 pub mod services;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -122,10 +122,38 @@ pub struct LocalStack {
     /// Anvil + the bridge contracts (`StackConfig::l1`). Dropped last among
     /// the services so a scenario's L1 queries stay live until teardown.
     l1: Option<l1::L1>,
+    /// Resolved at launch and reused by [`Self::service_spec`], so a
+    /// restarted service runs from the SAME genesis…
+    genesis: PathBuf,
+    /// …and the same `--log-config` (the archive-durability `channels.toml`,
+    /// written once at launch) as the original bring-up.
+    log_config: Option<PathBuf>,
     root: tempfile::TempDir,
     keep: bool,
     shutdown_report: ShutdownReport,
     pub cfg: StackConfig,
+}
+
+/// The one place a service `ServiceSpec` is assembled — bring-up
+/// (`launch_with_l1`) and executor restart ([`LocalStack::service_spec`])
+/// both come through here, so the two cannot drift.
+fn assemble_spec<'a>(
+    root: &'a Path,
+    driver: &'a MediaDriver,
+    sealer: &'a SealerCluster,
+    shards: u32,
+    genesis: &'a Path,
+    log_config: Option<&'a Path>,
+) -> ServiceSpec<'a> {
+    ServiceSpec {
+        root,
+        aeron_dir: &driver.aeron_dir,
+        cluster_ingress_endpoints: &sealer.ingress_endpoints,
+        shards,
+        chain_id: DEV_CHAIN_ID,
+        genesis,
+        log_config,
+    }
 }
 
 impl LocalStack {
@@ -206,15 +234,14 @@ impl LocalStack {
             None
         };
 
-        let spec = ServiceSpec {
-            root: root.path(),
-            aeron_dir: &driver.aeron_dir,
-            cluster_ingress_endpoints: &sealer.ingress_endpoints,
-            shards: cfg.shards,
-            chain_id: DEV_CHAIN_ID,
-            genesis: &genesis,
-            log_config: log_config.as_deref(),
-        };
+        let spec = assemble_spec(
+            root.path(),
+            &driver,
+            &sealer,
+            cfg.shards,
+            &genesis,
+            log_config.as_deref(),
+        );
 
         let mut sequencers = Vec::with_capacity(cfg.shards as usize);
         for i in 0..cfg.shards {
@@ -251,6 +278,8 @@ impl LocalStack {
             sealer,
             driver,
             l1,
+            genesis,
+            log_config,
             root,
             keep,
             shutdown_report: ShutdownReport::default(),
@@ -357,27 +386,26 @@ impl LocalStack {
         self.executor.proc.kill();
     }
 
+    /// The [`ServiceSpec`] this stack launched its services from, rebuilt
+    /// from the launch-time state (same genesis, same `--log-config`).
+    fn service_spec(&self) -> ServiceSpec<'_> {
+        assemble_spec(
+            self.root.path(),
+            &self.driver,
+            &self.sealer,
+            self.cfg.shards,
+            &self.genesis,
+            self.log_config.as_deref(),
+        )
+    }
+
     /// Restart the executor against the SAME state dir and metrics port, so
     /// it takes the resume-from-persisted-cursor path rather than a genesis
     /// re-sync (and scenarios keep the address they already hold).
     pub fn restart_executor(&mut self) -> Result<()> {
-        let repo = services::repo_root();
-        let genesis = self.cfg.genesis.path(&repo);
-        let log_config = self
-            .cfg
-            .archive_durability
-            .then(|| self.root.path().join("channels.toml"));
-        let spec = ServiceSpec {
-            root: self.root.path(),
-            aeron_dir: &self.driver.aeron_dir,
-            cluster_ingress_endpoints: &self.sealer.ingress_endpoints,
-            shards: self.cfg.shards,
-            chain_id: DEV_CHAIN_ID,
-            genesis: &genesis,
-            log_config: log_config.as_deref(),
-        };
         let port = self.executor.metrics_addr.port();
-        self.executor = services::spawn_executor_at(&spec, Some(port))?;
+        let respawned = services::spawn_executor_at(&self.service_spec(), Some(port))?;
+        self.executor = respawned;
         Ok(())
     }
 
@@ -447,54 +475,7 @@ impl LocalStack {
             p.suspend();
         }
 
-        // Drain: wait until BOTH consumers have stopped advancing and the
-        // validator is no longer behind.
-        //
-        // NOT "the two gauges are equal". `EXEC_BLOCK_NUMBER` is the newest
-        // DURABLE block — set in the inflight sweep as the state writer
-        // settles — and commits are pipelined to depth 4 (#129), settling "at
-        // a later boundary's sweep, or at end of stream". The sealer is
-        // SIGSTOPped just above, so no later boundary is coming: the last few
-        // executed blocks stay unsettled until the SIGTERM BELOW ends the
-        // stream. Requiring equality here waits for something that cannot
-        // happen until after this loop, so it always burned the full 60s
-        // (observed: executor durable 3, validator committed 4, forever).
-        //
-        // The validator therefore sits legitimately AHEAD of the executor's
-        // durability gauge, and can never run ahead of what the executor
-        // actually executed — it verifies off that output. So "both stable,
-        // validator >= executor" is the honest settled condition; the
-        // executor flushes its pipeline on the clean exit that follows, and
-        // the offline phase then compares equal final blocks from the two
-        // persisted DBs.
-        let exec_addr = self.executor.metrics_addr;
-        let val_addr = self.validator.as_ref().map(|v| v.metrics_addr);
-        let deadline = std::time::Instant::now() + Duration::from_secs(60);
-        let mut last_exec = -1.0f64;
-        let mut last_val = -1.0f64;
-        loop {
-            let exec_block = metrics::scrape(exec_addr)
-                .await?
-                .value(crate::scenarios::EXEC_BLOCK_NUMBER)
-                .unwrap_or(0.0);
-            let val_block = match val_addr {
-                None => exec_block, // no validator: its half is vacuously settled
-                Some(addr) => metrics::scrape(addr)
-                    .await?
-                    .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
-                    .unwrap_or(0.0),
-            };
-            if exec_block == last_exec && val_block == last_val && val_block >= exec_block {
-                break; // both stable across one interval, validator not behind
-            }
-            last_exec = exec_block;
-            last_val = val_block;
-            anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "drain: executor/validator did not settle in 60s                  (executor durable {exec_block}, validator committed {val_block})"
-            );
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
+        self.drain_until_settled().await?;
 
         // Both consumers are caught up now, so SIGTERM
         // them and require a CLEAN exit from each. This doubles as the
@@ -524,6 +505,59 @@ impl LocalStack {
              TxReceiptsSubscriberHandle::into_receiver)"
         );
         Ok(())
+    }
+
+    /// Drain: wait until BOTH consumers have stopped advancing and the
+    /// validator is no longer behind. Called by [`Self::shutdown_graceful`]
+    /// after the producers are gone and the sealer is SIGSTOPped.
+    ///
+    /// NOT "the two gauges are equal". `EXEC_BLOCK_NUMBER` is the newest
+    /// DURABLE block — set in the inflight sweep as the state writer
+    /// settles — and commits are pipelined to depth 4 (#129), settling "at
+    /// a later boundary's sweep, or at end of stream". The sealer is
+    /// SIGSTOPped by the caller, so no later boundary is coming: the last few
+    /// executed blocks stay unsettled until the SIGTERM that FOLLOWS this
+    /// drain ends the stream. Requiring equality here waits for something
+    /// that cannot happen until after this loop, so it always burned the full
+    /// 60s (observed: executor durable 3, validator committed 4, forever).
+    ///
+    /// The validator therefore sits legitimately AHEAD of the executor's
+    /// durability gauge, and can never run ahead of what the executor
+    /// actually executed — it verifies off that output. So "both stable,
+    /// validator >= executor" is the honest settled condition; the
+    /// executor flushes its pipeline on the clean exit that follows, and
+    /// the offline phase then compares equal final blocks from the two
+    /// persisted DBs.
+    async fn drain_until_settled(&self) -> Result<()> {
+        let exec_addr = self.executor.metrics_addr;
+        let val_addr = self.validator.as_ref().map(|v| v.metrics_addr);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut last_exec = -1.0f64;
+        let mut last_val = -1.0f64;
+        loop {
+            let exec_block = metrics::scrape(exec_addr)
+                .await?
+                .value(crate::scenarios::EXEC_BLOCK_NUMBER)
+                .unwrap_or(0.0);
+            let val_block = match val_addr {
+                None => exec_block, // no validator: its half is vacuously settled
+                Some(addr) => metrics::scrape(addr)
+                    .await?
+                    .value(crate::scenarios::VALIDATOR_COMMITTED_BLOCK)
+                    .unwrap_or(0.0),
+            };
+            if exec_block == last_exec && val_block == last_val && val_block >= exec_block {
+                // Both stable across one interval, validator not behind.
+                return Ok(());
+            }
+            last_exec = exec_block;
+            last_val = val_block;
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "drain: executor/validator did not settle in 60s                  (executor durable {exec_block}, validator committed {val_block})"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
     }
 
     /// Which services honored SIGTERM during [`Self::shutdown_graceful`].

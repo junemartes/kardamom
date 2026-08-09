@@ -32,7 +32,6 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::time::Duration;
 
 use alloy_primitives::{Address, B256};
 use anyhow::{Context, Result};
@@ -42,10 +41,9 @@ use kardamom_batcher::da_store::FsBlobStore;
 use kardamom_batcher::l1::{post_batch, read_posted_batches, recover_blocks};
 use kardamom_types::{BPosition, TxEnvelope};
 
-use super::Target;
+use super::{Target, assert_receipt_ok, await_l2_receipt, receipt_placement};
 use crate::harness::l1::L1;
 use crate::harness::l2::{self, SignedTransfer};
-use crate::harness::metrics::poll_until;
 
 pub struct Params {
     pub senders: usize,
@@ -102,22 +100,13 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
     // executor's own, not the test's guess.
     let mut executed = Vec::with_capacity(planned.len());
     for tx in planned {
-        let receipt = poll_until(
-            &format!("receipt for {}", tx.hash),
-            Duration::from_secs(30),
-            Duration::from_millis(200),
-            || async { Ok(t.rpc.receipt(tx.hash).await.result.ok().flatten()) },
-        )
-        .await?;
-        let block_number = u64_field(&receipt, "blockNumber")
-            .with_context(|| format!("receipt for {} has no blockNumber", tx.hash))?;
-        let transaction_index = u64_field(&receipt, "transactionIndex")
-            .with_context(|| format!("receipt for {} has no transactionIndex", tx.hash))?;
-        anyhow::ensure!(
-            receipt.get("status").and_then(|v| v.as_str()) == Some("0x1"),
-            "tx {} reverted; DA parity needs a clean workload",
-            tx.hash
-        );
+        let receipt = await_l2_receipt(t, tx.hash, &format!("workload tx {}", tx.hash)).await?;
+        let (block_number, transaction_index) = receipt_placement(&receipt)
+            .with_context(|| format!("place receipt for {}", tx.hash))?;
+        assert_receipt_ok(
+            &receipt,
+            &format!("tx {} (DA parity needs a clean workload)", tx.hash),
+        )?;
         executed.push(Executed {
             tx,
             block_number,
@@ -159,11 +148,6 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
     }
     anyhow::ensure!(!blocks.is_empty(), "workload produced no blocks");
     Ok(blocks)
-}
-
-fn u64_field(v: &serde_json::Value, key: &str) -> Option<u64> {
-    let s = v.get(key)?.as_str()?;
-    u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
 /// Post `blocks` to the settlement contract as real EIP-4844 blob
@@ -262,19 +246,6 @@ pub fn reconstruct_and_compare(
         "kardamom-reconstruct ACCEPTED a wrong expected root — the parity gate is vacuous"
     );
     Ok(())
-}
-
-/// The validator's currently-committed state root (read-only open of its
-/// live DB — mdbx readers take an MVCC snapshot and never disturb the
-/// writer). This is S8's parity target: an INDEPENDENT computation, not
-/// anything the DA path produced.
-pub fn validator_root(state_dir: &Path) -> Result<Option<B256>> {
-    let env = kardamom_state::StateEnvBuilder::new(state_dir)
-        .read_only(true)
-        .open()
-        .context("open validator state dir read-only")?;
-    let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot validator state")?;
-    snap.state_root().context("read validator state root")
 }
 
 /// Verify that the L1 log alone yields the batches just posted (what a
