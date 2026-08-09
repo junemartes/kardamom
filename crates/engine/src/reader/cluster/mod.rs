@@ -288,6 +288,7 @@ pub fn cluster_tx_ordering_subscription(
 fn slot_width(msg: &TxOrderingMessage) -> u64 {
     match msg {
         TxOrderingMessage::Epoch(e) => wire::epoch_slots(e),
+        TxOrderingMessage::RemoteEpoch(r) => wire::remote_epoch_slots(r),
         TxOrderingMessage::TxRef(_)
         | TxOrderingMessage::DepositRef(_)
         | TxOrderingMessage::BoundaryStart(_) => 1,

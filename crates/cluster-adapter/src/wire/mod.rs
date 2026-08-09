@@ -116,6 +116,11 @@ pub const RT_TXREF: u8 = 0;
 pub const RT_DEPOSITREF: u8 = 1;
 /// An rkyv-encoded [`EpochRecord`]: the L1 origin's deposits, in log order.
 pub const RT_EPOCH: u8 = 2;
+/// An rkyv-encoded [`RemoteEpochRecord`]: one peer Kardamom chain's outbox
+/// batch, in seq order (`docs/specs/interop-outbox-messaging-spec.md`).
+/// Origin-advancing like `RT_EPOCH`, but tracked per peer in the sealer and
+/// never stamped into boundaries.
+pub const RT_REMOTE_EPOCH: u8 = 3;
 
 /// How many canonical slots an epoch occupies: **one for the epoch marker
 /// itself, plus one per deposit**.
@@ -138,6 +143,15 @@ pub const RT_EPOCH: u8 = 2;
 /// fail-stops on a mismatch.
 pub fn epoch_slots(epoch: &EpochRecord) -> u64 {
     1 + epoch.deposits.len() as u64
+}
+
+/// How many canonical slots a remote epoch occupies: **one for the marker,
+/// plus one per message** — the [`epoch_slots`] rule applied to the
+/// cross-chain batch. `derive_remote_epoch` rejects empty batches, so the
+/// range is always ≥ 2; the `1 +` stays for shape-uniformity with epochs and
+/// so a decoding bug surfaces as a slot mismatch, not an off-by-one.
+pub fn remote_epoch_slots(rec: &kardamom_types::xchain::RemoteEpochRecord) -> u64 {
+    1 + rec.messages.len() as u64
 }
 
 /// Canonical id length (a 32-byte hash). Matches Java `CANONICAL_ID_LEN`.

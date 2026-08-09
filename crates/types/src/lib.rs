@@ -38,6 +38,7 @@ pub mod watermark;
 pub mod wire;
 pub mod withdrawals;
 pub mod witness;
+pub mod xchain;
 
 pub use ack_policy::AckPolicy;
 pub use boundary::{BlockBoundary, BlockBoundaryStart};
@@ -47,7 +48,7 @@ pub use envelope::TxEnvelope;
 pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::{BPosition, TxDataLoc};
-pub use receipt::{Receipt, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, WireLog, tx_type_of};
+pub use receipt::{Receipt, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, TX_TYPE_XCHAIN, WireLog, tx_type_of};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;

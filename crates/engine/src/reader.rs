@@ -519,6 +519,28 @@ where
                             }
                         }
                     }
+                    TxOrderingMessage::RemoteEpoch(rec) => {
+                        // Cross-chain execution lands with `execute_xchain_tx`
+                        // (interop P1, in progress). Until the exec side is
+                        // wired, a remote epoch on the stream MUST halt the
+                        // engine: skipping it would fork this replica from any
+                        // replica that does execute it — the same fail-stop
+                        // posture as the legacy DepositRef below.
+                        tracing::error!(
+                            target: "kardamom_executor::reader",
+                            origin_chain_id = rec.origin_chain_id,
+                            first_seq = rec.first_seq,
+                            "RemoteEpoch on the canonical stream but cross-chain \
+                             execution is not wired on this build; halting"
+                        );
+                        return Err(ExecutorError::State(format!(
+                            "RemoteEpoch from chain {} (seq {}..={}) but cross-chain \
+                             execution is not wired on this build",
+                            rec.origin_chain_id,
+                            rec.first_seq,
+                            rec.last_seq()
+                        )));
+                    }
                     TxOrderingMessage::DepositRef(dep_ref) => {
                         // Retired by the epoch switch-over: deposits now
                         // travel INSIDE an epoch record, so there is no
