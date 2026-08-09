@@ -261,6 +261,11 @@ async fn main() -> Result<()> {
 
     let mut cfg = ExecutorConfig {
         chain_id,
+        // 3a.1: a validator ALWAYS re-derives record identity. The stream's
+        // sender/tx_hash are proxy claims, and verification that trusts them
+        // re-executes the very theft it exists to catch; the resulting
+        // RecordIdentity halt is classified as integrity (exit 2) below.
+        verify_record_identity: true,
         ..ExecutorConfig::default()
     };
     // ALWAYS bound the tx_data join wait — a verifier that loses an envelope
@@ -362,6 +367,9 @@ async fn main() -> Result<()> {
         Ok(Ok(())) => tracing::info!("validator main loop returned cleanly"),
         Ok(Err(e)) => {
             tracing::error!(error = %e, "validator main loop returned an error");
+            // A forged record identity is proof, not an outage: latch it so
+            // the exit-2 path below fires instead of the restart loop.
+            kardamom_validator::latch_integrity_failure(&divergence, &e);
             engine_error = Some(Some(e));
         }
         Err(e) => {
