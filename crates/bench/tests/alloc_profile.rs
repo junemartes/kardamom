@@ -193,6 +193,7 @@ fn defi_execution_allocation_profile() {
                 i,
                 cumulative,
                 None,
+                None,
             )
             .expect("execute");
         cumulative = r.cumulative_gas_used;

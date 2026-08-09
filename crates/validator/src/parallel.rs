@@ -484,6 +484,7 @@ pub fn execute_batch<S: StateDatabase>(
                 global_index_in_block,
                 cumulative,
                 Some((&mut batch_bal, bal_index)),
+                None,
             )?,
             BufferedRecord::Deposit {
                 tx_idx,
@@ -1289,7 +1290,15 @@ pub fn execute_block_sequential<S: StateDatabase>(
                 tx_idx,
                 envelope,
                 position,
-            } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, None)?,
+            } => scope.execute_tx(
+                *tx_idx,
+                *position,
+                envelope,
+                idx_in_block,
+                cumulative,
+                None,
+                None,
+            )?,
             BufferedRecord::Deposit {
                 tx_idx,
                 deposit,

@@ -177,6 +177,27 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
     }
 }
 
+/// Per-tx READ-touch capture for the footprint shadow scheduler
+/// (spec: block-stm-executor §P1). The block-level EIP-7928 BAL cannot
+/// attribute reads per tx — a slot read after another tx wrote it leaves no
+/// trace at all (revm keeps writer indexes only), and `storage_reads` is
+/// block-scoped — so the shadow captures the read side here, at the same
+/// point the BAL capture runs, from the same `outcome.state`. Writes need no
+/// capture: the returned `WriteSet` already carries them exactly.
+///
+/// `account_reads` holds accounts revm loaded but never TOUCHED — the
+/// BALANCE / EXTCODE* / STATICCALL / DELEGATECALL subject class. Note that
+/// plain CALL targets do NOT appear: EIP-161 marks even a zero-value CALL's
+/// recipient as touched (the state-clearing rule), which revm mirrors, so a
+/// call target is only visible through its storage reads / `WriteSet` entry.
+/// `slot_reads` holds every accessed slot whose value did not change, on
+/// touched and untouched accounts alike.
+#[derive(Debug, Default, Clone)]
+pub struct TouchSet {
+    pub account_reads: Vec<Address>,
+    pub slot_reads: Vec<(Address, B256)>,
+}
+
 /// Per-BLOCK execution scope: ONE `CacheDB` (layered over
 /// `parent ∘ snapshot`) that revm COMMITS into after each tx, and ONE EVM
 /// instance whose tx-env is swapped per transaction.
@@ -275,6 +296,8 @@ impl<S: StateDatabase> ExecScope<S> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // matches the free execute_tx's shape;
+    // see the equivalent allow there for the rationale.
     pub fn execute_tx(
         &mut self,
         tx_idx: TxIndex,
@@ -284,6 +307,9 @@ impl<S: StateDatabase> ExecScope<S> {
         cumulative_gas_used_before: u64,
         // EIP-7928 capture: see the free `execute_tx`.
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
+        // Footprint-shadow read capture: see [`TouchSet`]. `None` everywhere
+        // except the executor's streaming path with the shadow enabled.
+        touches: Option<&mut TouchSet>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
         // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
         // invalid — undecodable bytes, or a tx revm rejects at validation
@@ -384,6 +410,19 @@ impl<S: StateDatabase> ExecScope<S> {
                 bal.update_account(bal_index, *addr, account);
             }
         }
+        if let Some(t) = touches {
+            for (addr, account) in outcome.state.iter() {
+                if !account.is_touched() {
+                    t.account_reads.push(*addr);
+                }
+                for (key, slot) in account.storage.iter() {
+                    if slot.original_value == slot.present_value {
+                        t.slot_reads
+                            .push((*addr, B256::from(key.to_be_bytes::<32>())));
+                    }
+                }
+            }
+        }
         // Fold this tx's writes into the block cache: later txs read them
         // directly — no per-tx re-seeding (this WAS 84% of all allocation).
         revm::DatabaseCommit::commit(
@@ -473,6 +512,7 @@ pub fn execute_tx<S: StateDatabase>(
         tx_index_in_block,
         cumulative_gas_used_before,
         bal,
+        None,
     )
 }
 

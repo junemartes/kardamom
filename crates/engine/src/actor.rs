@@ -655,6 +655,7 @@ where
                             bal_tx
                                 .as_ref()
                                 .map(|_| (&mut block_bal, tx_index_in_block + 1)),
+                            None,
                         );
                         if result.is_ok() {
                             tx_applied_ok.increment(1);
