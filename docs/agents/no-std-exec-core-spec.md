@@ -135,10 +135,13 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
     on the riscv32 no_std gate). Forged hash/sender/signature aborts with
     `ExecutorError::RecordIdentity`. Deposit identity (`source_hash`) stays
     a trusted input until the witness is L1-anchored (derivation D/E).
-  - Spec pinned: `CHAIN_SPEC = SpecId::OSAKA` set explicitly on `CfgEnv`
-    (behavior-preserving — OSAKA is what `CfgEnv::default()` resolved to);
-    a regression test flags any future revm-default drift. Gap 1 (0x0A KZG
-    backend) remains open and documented on the constant.
+  - Spec pinned: `SpecId::OSAKA` set explicitly on `CfgEnv`. This landed
+    twice independently — this branch's `CHAIN_SPEC` and #165's W1b
+    `block_env::SPEC_ID` (the stronger form: `CfgEnv::new_with_spec` so the
+    gas table is built from the pin, full-struct-literal `BlockEnv`,
+    `cfg_pinning` golden tests). The rebase adopted #165's `SPEC_ID` as the
+    single constant. Gap 1 (0x0A KZG backend) remains open and documented
+    on it.
   - BLOCKHASH-returns-zero elevated to a documented consensus rule at the
     single adapter every profile flows through.
   - **The BAL is a proof input**: `execute_block_stateless` takes the
@@ -152,10 +155,128 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
     One-code-path invariant: guest, validator sequential fallback, and the
     executor's published artifact all run the same monomorphized exec-core
     functions — the proof attests exactly what the validator validates.
+- **PR 3a.1** — identity checks in the LIVE validator (the forged-sender
+  blind spot): `ExecutorConfig::verify_record_identity` runs
+  `exec_core::stateless::verify_record_identity` at record arrival in the
+  engine actor (one seam covering the validator's streaming AND whole-block
+  modes); the validator binary enables it unconditionally and classifies
+  `ExecutorError::RecordIdentity` as an INTEGRITY halt (divergence latch →
+  exit 2, the page-the-humans signal), not an availability restart. The
+  executor keeps the flag off: after 3a.1 a forged envelope in the canonical
+  stream cannot commit unnoticed — the validator halts with proof — so
+  sequencer-side checking is defense-in-depth with a latency cost, a
+  separate decision. Forged-envelope chaos test drives the real
+  `Executor::run` pipeline with a signature-vs-sender forgery (the theft
+  shape: envelope.sender = victim, signature by attacker) and asserts halt +
+  latch with the flag on, and — the documented blind spot — a committed
+  theft with it off.
 - **PR 3b** — witness MPT anchoring: account/storage proofs against
   `pre_state_root`, absence proofs, sparse post-state-root recompute over
-  `alloy-trie` in the guest.
+  `alloy-trie` in the guest. Design notes below.
 - **PR 3c** — the zkVM guest program (SP1/RISC Zero) + async prover harness
   behind a flag; guest-build kzg decision (gap 1).
 - **PR 4** — batch-boundary wiring: one proof per posted batch aligned with
   the live batcher's L1-as-truth cursor; L1 submission/verification.
+
+## Phase 3b design — MPT-anchoring the witness (design notes, 2026-08-08)
+
+Design only; no implementation yet. Status of the inputs it builds on:
+`ExecutionWitness.pre_state_root: Option<B256>` already exists on the wire
+type (phase 2 left the anchor point ready, currently unpopulated);
+`kardamom-state::{state_root, storage_root}` is the pure full-trie oracle the
+tests cross-check against; `alloy-trie` provides `no_std`
+`proof::verify_proof` (inclusion AND exclusion) and is already a dependency
+of the EEST runner's oracle path.
+
+### What 3b must add
+
+Today the witness is fail-closed but UNANCHORED: `WitnessDb` refuses reads
+the witness doesn't carry, but nothing ties what it DOES carry to the chain's
+actual pre-state — a prover could witness a fictional state and prove a
+fictional (internally consistent) block. 3b makes the witness
+self-authenticating against `pre_state_root`:
+
+1. **Proof transport.** A companion `WitnessProofs` (account-trie proof nodes
+   + per-account storage-trie proof nodes, deduplicated as a flat sorted
+   node set — MPT proofs share prefixes heavily) rather than per-entry proof
+   vectors. Keeps the phase-2 `ExecutionWitness` wire type intact; the
+   digest gains nothing (proof nodes are recomputable commitments, not
+   state).
+2. **In-guest verification, before execution.** For every witness account:
+   inclusion proof of `rlp(nonce, balance, storage_root, code_hash)` at
+   `keccak(address)` in the account trie — or an EXCLUSION proof for
+   `exists = false` entries. For every witness slot: inclusion/exclusion at
+   `keccak(key)` under that account's proven `storage_root` (explicit-zero
+   slots are exclusions). Code needs no proof: `keccak(bytes) == code_hash`
+   and the code_hash is inside the proven account leaf. Any verification
+   failure aborts before the first EVM step — same fail-closed philosophy as
+   `WitnessDb`, one error class (`WitnessUnanchored`).
+3. **Post-state root recompute (the open design question — see below).** The
+   proof's public outputs become `(pre_state_root, post_state_root,
+   bal_commitment, block_number)`: an inductive root chain from genesis,
+   which is exactly the piece S0 deliberately never committed on the wire
+   (BlockBoundary is slim). The L1 verifier contract holds the running root.
+
+### The open question: sparse post-root recompute
+
+The guest holds only the touched slice, so the full-trie oracle shape
+(`state_root` over every account) is unavailable by construction. The
+candidate approaches:
+
+- **(a) Partial-trie recompute over the carried proof nodes — the current
+  lean.** The union of all read/absence proof nodes forms a partial trie
+  rooted at `pre_state_root`. Apply the block's delta to that partial trie
+  and re-hash upward; the root is correct IFF every node the delta's writes
+  restructure is present. Reads already carry their own paths (execution
+  cannot write an account it never read under our capture — first-touch
+  records reads), and exclusion proofs carry the insertion point for fresh
+  keys. The gap is DELETION: a storage write to zero REMOVES the leaf, which
+  can collapse a branch node into an extension — correct re-hashing then
+  needs the collapsing SIBLING node, which is on no read path. (Account
+  deletion is out of scope v0: selfdestruct is speccced out, and balance-0
+  accounts don't leave the trie post-EIP-158 only if never created — treat
+  account-delete as `Unsupported` and fail closed if one occurs.) So capture
+  must be write-aware: the validator-side capturer walks the delta once,
+  and for every slot zeroed adds the would-be-orphaned sibling's subpath to
+  `WitnessProofs`. Deterministic superset, verified in-guest like every
+  other node (hash-linked into the pre-root), so a malicious prover cannot
+  smuggle state through it.
+- **(b) Port/depend on a sparse-trie implementation (reth's sparse trie).**
+  Solves (a) generically but imports a large surface into the no_std
+  boundary; reth's is not no_std today. Rejected for 3b unless (a)'s
+  implementation complexity surprises us.
+- **(c) Defer the post-root: prove only `bal_commitment` + delta digest.**
+  Punts the root chain to L1-side reconstruction — reintroduces the trusted
+  gap 3b exists to close. Rejected.
+
+Property obligation either way: sparse recompute MUST equal the full oracle.
+Randomized cross-check tests (arbitrary genesis + delta → sparse root ==
+`kardamom-state::state_root` of the post state) are the 3b acceptance gate,
+with deletion-collapse cases (branch→extension, branch→leaf, root collapse)
+enumerated explicitly — that's where sparse implementations rot.
+
+### Second open question: who computes `pre_state_root` live
+
+The validator must POPULATE `pre_state_root` at capture time to hand the
+prover an anchored witness. Computing the full root per block via the oracle
+is O(state) — fine for tests and the current cluster scale, wrong
+asymptotically. Options, to be decided at 3b implementation time against
+measured cluster state sizes: incremental trie maintenance in the state DB
+(the honest fix, real work), or full-oracle recompute behind a cadence knob
+(prove every Nth block first; the batcher's proof-per-batch cursor in PR 4
+already tolerates gaps). This decision gates NOTHING in the guest design —
+the guest only consumes the root.
+
+### Deferred alongside (unchanged by 3b)
+
+- Deposit `source_hash` re-derivation stays trusted until the witness is
+  L1-anchored (derivation phases D/E).
+- Cluster-level forged-envelope chaos case (byzantine-ingress injection):
+  3a.1's chaos test drives the real engine pipeline in-crate; a
+  cluster-suite case needs an injection vector that can place a forged
+  envelope on the live A-stream — either an env-gated forge hook in the
+  ingress binary (precedent: none today; the chaos suite is process-level
+  kill/wipe only) or a standalone Aeron publisher tool. Worth doing when the
+  chaos suite next grows; requires a `CHAOS_CASES` edit in
+  `cluster-e2e.yml`, which the bot cannot push (operator applies from a
+  `docs/ci/` draft).
