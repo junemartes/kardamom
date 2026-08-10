@@ -252,22 +252,34 @@ pub async fn finalize_withdrawal(
     // root is exactly what `finalizeWithdrawal` expects — it takes the
     // `state_root` as an explicit argument.
     let observed: std::sync::Arc<std::sync::Mutex<Vec<B256>>> = Default::default();
+    // Keep the most recent read error: a validator that died takes its mdbx
+    // env down unsteadily, and the resulting `MDBX_WANNA_RECOVERY` on the
+    // read-only open is the signal that separates "the stack fell over" from
+    // "the withdrawal was never attested". It used to surface directly
+    // because the poll read the root itself; now the sampler owns that read,
+    // so it has to carry the error out to the failure message.
+    let last_err: std::sync::Arc<std::sync::Mutex<Option<String>>> = Default::default();
     let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let sampler = {
         let observed = observed.clone();
+        let last_err = last_err.clone();
         let stop = sampler_stop.clone();
         let dir = validator_state_dir.to_path_buf();
         std::thread::Builder::new()
             .name("s2-root-sampler".into())
             .spawn(move || {
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Errors are expected and transient here (the env is
-                    // opened read-only while the validator writes); the poll
-                    // below surfaces the real failure.
-                    if let Ok(Some(r)) = read_validator_state_root(&dir) {
-                        let mut seen = observed.lock().expect("observed roots poisoned");
-                        if seen.last() != Some(&r) {
-                            seen.push(r);
+                    match read_validator_state_root(&dir) {
+                        Ok(Some(r)) => {
+                            let mut seen = observed.lock().expect("observed roots poisoned");
+                            if seen.last() != Some(&r) {
+                                seen.push(r);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            *last_err.lock().expect("sampler error poisoned") =
+                                Some(format!("{e:?}"));
                         }
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -309,11 +321,21 @@ pub async fn finalize_withdrawal(
     sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = sampler.join();
     let (output_index, state_root) = found.with_context(|| {
-        format!(
-            "no posted output commits to (any observed validator state root, withdrawals root) — \
-             the attester never covered the withdrawal's block (sampled {} distinct roots)",
-            observed.lock().expect("observed roots poisoned").len()
-        )
+        let roots = observed.lock().expect("observed roots poisoned").len();
+        match last_err.lock().expect("sampler error poisoned").as_deref() {
+            // A read error means the stack fell over, not that attestation
+            // is broken — say so instead of blaming the attester.
+            Some(e) => format!(
+                "could not track the validator's state roots ({roots} sampled before the last \
+                 failure) — the validator's state DB became unreadable, which is what an unclean \
+                 validator exit looks like: {e}"
+            ),
+            None => format!(
+                "no posted output commits to (any observed validator state root, withdrawals \
+                 root) — the attester never covered the withdrawal's block ({roots} distinct \
+                 roots sampled)"
+            ),
+        }
     })?;
 
     // --- L1: finalize after the window. -----------------------------------
