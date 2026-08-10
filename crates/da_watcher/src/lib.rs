@@ -45,7 +45,19 @@
 //! - Reorg handling. Finalized blocks do not reorg in normal Ethereum
 //!   operation; the watcher trusts finality.
 //! - L1-attributes / system txs (OP `is_system_transaction = true`).
+//!
+//! ## Interop
+//!
+//! [`interop`] is the second source adapter the spec's §6 asks this crate to
+//! grow: the same watch-derive-publish shape with a PEER KARDAMOM CHAIN as
+//! the origin instead of L1. It mirrors the layering above seam for seam
+//! (`RemoteChainSource` ↔ [`source::L1Source`], `RemoteEpochPublisher` ↔
+//! [`publisher::EpochPublisher`], `interop::watcher::process_once` ↔
+//! [`watcher::process_once`]) and shares nothing else — the derivation rule
+//! lives in `kardamom_types::xchain` for the same reason the deposit rule
+//! lives in `kardamom_types::epoch`.
 
+pub mod interop;
 pub mod metrics;
 pub mod publisher;
 pub mod rpc_source;

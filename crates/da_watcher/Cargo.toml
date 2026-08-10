@@ -7,12 +7,16 @@ edition.workspace = true
 default = []
 # Exposes the in-memory L1 source / epoch publisher fakes to other crates.
 testing = []
+# Exposes the interop test seam to other crates (e2e): the scripted mock
+# validator feed (a real jsonrpsee WS server) and the in-memory remote-epoch
+# publisher fake.
+test-support = []
 
 [dependencies]
 kardamom-types = { workspace = true }
 kardamom-obs = { path = "../obs" }
 
-alloy-primitives.workspace = true
+alloy-primitives = { workspace = true, features = ["serde"] }
 alloy-provider.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-rlp.workspace = true
@@ -20,7 +24,10 @@ alloy-sol-types.workspace = true
 
 bytes.workspace = true
 async-trait = "0.1"
+jsonrpsee = { workspace = true }
 metrics = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror.workspace = true
 tokio = { workspace = true }
 tracing.workspace = true
