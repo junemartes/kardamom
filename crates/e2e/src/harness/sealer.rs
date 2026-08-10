@@ -108,6 +108,13 @@ impl SealerCluster {
             ))
             .arg("-Dkardamom.cluster.ingressStreamId=101")
             .arg(format!("-Dkardamom.cluster.tickMs={tick_ms}"))
+            // The cluster node is an Aeron client too, so it walks off the
+            // same 10 s cliff when the driver conductor is starved — see
+            // `services::driver_timeout_ms`. Same value, Java's spelling.
+            .arg(format!(
+                "-Daeron.driver.timeout={}",
+                super::services::driver_timeout_ms()
+            ))
             .args([
                 "-cp",
                 &jar.display().to_string(),
