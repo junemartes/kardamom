@@ -241,6 +241,7 @@ fn run_mdbx_ab(
             let (mut busy, mut span, mut commit, mut feed, mut snap_us) =
                 (0u64, 0u64, 0u64, 0u64, 0u64);
             let (mut rt, mut rmv, mut rbase, mut rback) = (0u64, 0u64, 0u64, 0u64);
+            let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
             kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
@@ -302,6 +303,8 @@ fn run_mdbx_ab(
                         busy += out.busy_us;
                         span += out.parallel_span_us;
                         commit += out.commit_us;
+                        c_hash += out.commit_hash_us;
+                        c_delta += out.commit_delta_us;
                         feed += out.feed_us;
                         snap_us += snap_open;
                         rt += out.reads_total;
@@ -363,6 +366,12 @@ fn run_mdbx_ab(
                 println!("   (wounds: {wounds})");
             }
             if rt > 0 {
+                println!(
+                    "     commit: hash {:.1}ms | delta {:.1}ms | rest {:.1}ms",
+                    c_hash as f64 / 1000.0,
+                    c_delta as f64 / 1000.0,
+                    (commit as f64 - c_hash as f64 - c_delta as f64) / 1000.0,
+                );
                 println!(
                     "     evm {:.1}ms | publish {:.1}ms | other {:.1}ms",
                     evm_us as f64 / 1000.0,

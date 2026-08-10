@@ -356,6 +356,8 @@ pub struct StmOutcome {
     pub parallel_span_us: u64,
     pub ramp_us: u64,
     pub commit_us: u64,
+    pub commit_hash_us: u64,
+    pub commit_delta_us: u64,
     pub decode_us: u64,
     pub predict_us: u64,
     pub admit_us: u64,
@@ -554,6 +556,12 @@ pub struct Metrics {
     /// ALREADY dispatched: one still waiting could be queued after its
     /// own child).
     pub redundant_edges: std::sync::atomic::AtomicU64,
+    /// Commit-tail breakdown. The tail is SERIAL and flat in worker count
+    /// (~9.6ms of a 22ms transfers block), so whatever dominates it is a
+    /// fixed parallelization tax — the thing that caps speedup no matter
+    /// how many cores are available.
+    pub commit_hash_ns: std::sync::atomic::AtomicU64,
+    pub commit_delta_ns: std::sync::atomic::AtomicU64,
     /// WHOLE-admission nanoseconds (decode + predict + graph + dispatch).
     /// The feed is a single thread, so this is a hard serial floor on
     /// block latency — the number that says whether the scheduler or the
@@ -1373,62 +1381,124 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // SERIAL by definition: this is the block's tail, and no worker
         // count shortens it.
         let t_com = std::time::Instant::now();
+        let (mut hash_ns, mut delta_ns) = (0u64, 0u64);
         let mut receipts = Vec::with_capacity(n);
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
         let mut sink_running = ctx.sink_start_balance;
         let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
         // A tx after a re-executed one may also be stale: once ANY wound
-        // fires, later txs are re-checked against the live prefix by
-        // comparing their write set to a replay. Cheapest correct policy:
-        // re-execute every tx at or after the first wound.
+        // fires, later txs are re-checked against the live prefix.
         if let Some(first) = wounded_set.iter().copied().min() {
             for i in first..n {
                 wounded_set.insert(i);
             }
         }
-        // `layered` exists ONLY to re-execute a wounded tx against the
-        // exact prefix. Wounds are ~never, and maintaining it costs a full
-        // WriteSet clone plus a second delta insert per tx — 8000 of them
-        // on the block's serial tail. Build it only when it is needed.
         let repairing = !wounded_set.is_empty();
-        let mut layered = if repairing {
-            ctx.base.clone()
-        } else {
-            PendingDelta::new()
-        };
-        for (i, mut r) in tx_results.into_iter().enumerate() {
-            if wounded_set.contains(&i) {
-                let (tx_idx, position, envelope) = &txs[i];
-                let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
-                let (mut receipt, ws) = scope.execute_tx(
-                    *tx_idx, *position, envelope, i as u64, cumulative, None, None,
-                )?;
-                cumulative = receipt.cumulative_gas_used;
-                receipt.transaction_index = i as u64;
-                layered.apply(ws.clone());
-                delta.apply(ws);
-                receipts.push(receipt);
-                continue;
-            }
-            cumulative += r.receipt.gas_used;
-            r.receipt.cumulative_gas_used = cumulative;
-            sink_running += r.fee_delta;
-            if r.sink_touched {
-                if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
+
+        if !repairing {
+            // FAST PATH — the one that runs essentially always.
+            //
+            // The write-set hash is ~1.25us of keccak per tx and CANNOT be
+            // made cheaper (it is one permutation per 136 bytes of a
+            // contract the receipts depend on). On the serial commit tail
+            // it was 72% of that tail — the largest fixed parallelization
+            // tax in the engine, untouched by worker count.
+            //
+            // It does not have to be serial. The only thing forcing it
+            // there is the accumulator's absolute balance, and THAT is a
+            // prefix sum: computable in one cheap pass with no hashing, so
+            // afterwards every tx's hash is independent.
+            //
+            // Phase 1 (serial, ~ns/tx): cumulative gas + accumulator
+            // materialization.
+            for r in tx_results.iter_mut() {
+                cumulative += r.receipt.gas_used;
+                r.receipt.cumulative_gas_used = cumulative;
+                sink_running += r.fee_delta;
+                if r.sink_touched
+                    && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
+                {
                     entry.1.1 = sink_running;
                 }
-                // The ONLY hash of this write set (execution skipped it).
-                r.receipt.write_set_hash = r.ws.hash();
             }
-            if repairing {
+            // Phase 2 (parallel): hash. Scoped threads rather than the
+            // worker pool — this is a self-contained parallel map over an
+            // owned slice, and keeping it out of the pool's state machine
+            // is worth one spawn (~tens of us) against the milliseconds it
+            // removes from the tail.
+            let t_h = std::time::Instant::now();
+            let threads = ctx.queues.len().min(n.max(1));
+            if threads > 1 && n > 64 {
+                let chunk = n.div_ceil(threads);
+                std::thread::scope(|sc| {
+                    for part in tx_results.chunks_mut(chunk) {
+                        sc.spawn(move || {
+                            for r in part {
+                                if r.sink_touched {
+                                    r.receipt.write_set_hash = r.ws.hash();
+                                }
+                            }
+                        });
+                    }
+                });
+            } else {
+                for r in tx_results.iter_mut() {
+                    if r.sink_touched {
+                        r.receipt.write_set_hash = r.ws.hash();
+                    }
+                }
+            }
+            hash_ns += t_h.elapsed().as_nanos() as u64;
+            // Phase 3 (serial): fold the block delta in canonical order.
+            let t_d = std::time::Instant::now();
+            for r in tx_results {
+                delta.apply(r.ws);
+                receipts.push(r.receipt);
+            }
+            delta_ns += t_d.elapsed().as_nanos() as u64;
+        } else {
+            // REPAIR PATH: a wound fired, so txs from the first wound on
+            // re-execute against the exact materialized prefix. Strictly
+            // sequential by nature, and rare enough that its cost is not
+            // worth optimizing.
+            let mut layered = ctx.base.clone();
+            for (i, mut r) in tx_results.into_iter().enumerate() {
+                if wounded_set.contains(&i) {
+                    let (tx_idx, position, envelope) = &txs[i];
+                    let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
+                    let (mut receipt, ws) = scope.execute_tx(
+                        *tx_idx, *position, envelope, i as u64, cumulative, None, None,
+                    )?;
+                    cumulative = receipt.cumulative_gas_used;
+                    receipt.transaction_index = i as u64;
+                    layered.apply(ws.clone());
+                    delta.apply(ws);
+                    receipts.push(receipt);
+                    continue;
+                }
+                cumulative += r.receipt.gas_used;
+                r.receipt.cumulative_gas_used = cumulative;
+                sink_running += r.fee_delta;
+                if r.sink_touched {
+                    if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
+                        entry.1.1 = sink_running;
+                    }
+                    r.receipt.write_set_hash = r.ws.hash();
+                }
                 layered.apply(r.ws.clone());
+                delta.apply(r.ws);
+                receipts.push(r.receipt);
             }
-            delta.apply(r.ws);
-            receipts.push(r.receipt);
         }
 
         let t_commit = t_com.elapsed();
+        ctx.metrics
+            .commit_hash_ns
+            .fetch_add(hash_ns, Ordering::Relaxed);
+        ctx.metrics
+            .commit_delta_ns
+            .fetch_add(delta_ns, Ordering::Relaxed);
         if wounds > 0 {
             tracing::warn!(
                 block = ctx.env.block_number,
@@ -1479,6 +1549,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 if f == u64::MAX { 0 } else { f / 1_000 }
             },
             commit_us: t_commit.as_micros() as u64,
+            commit_hash_us: m.commit_hash_ns.load(Ordering::Relaxed) / 1_000,
+            commit_delta_us: m.commit_delta_ns.load(Ordering::Relaxed) / 1_000,
             decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
             predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
             admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,

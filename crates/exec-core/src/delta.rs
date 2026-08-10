@@ -78,17 +78,62 @@ impl WriteSet {
     /// width + endianness so two replicas on different architectures produce
     /// identical bytes.
     pub fn hash(&self) -> B256 {
-        // STREAMED into the hasher — the old buffer-then-hash allocated a
-        // per-tx Vec sized to the whole serialization (including full
-        // contract BYTECODE via the code section: 3.1KB/tx on CLOB
-        // workloads, the single largest allocation site post-ExecScope).
-        // The byte SEQUENCE is identical, so the hash is unchanged.
+        // The byte SEQUENCE is the consensus contract; how it reaches the
+        // sponge is not. Two earlier shapes were both wrong in different
+        // ways: building a per-tx `Vec` allocated (3.1KB/tx on CLOB
+        // workloads, the largest allocation site post-ExecScope), while
+        // streaming every field individually paid ~15 sponge calls per tx
+        // — measured at 1.4us/tx, and on the STM engine's SERIAL commit
+        // tail that was 72% of it, a fixed tax no worker count reduces.
+        //
+        // So: buffer into a fixed STACK array and absorb once. A write set
+        // too large for it (a CREATE carrying bytecode) falls back to
+        // streaming, where the per-call overhead is negligible next to the
+        // bytes involved.
         debug_assert!(
             self.accounts.windows(2).all(|w| w[0].0 < w[1].0)
                 && self.storage.windows(2).all(|w| w[0].0 < w[1].0),
             "WriteSet::finish() not called before hash()"
         );
+        // 3 accounts + 8 slots + tags is a typical DeFi tx; 512B covers
+        // the overwhelming majority without touching the heap.
+        const INLINE: usize = 512;
+        let need = 3
+            + 4
+            + self.accounts.len() * (20 + 8 + 32 + 32)
+            + 3
+            + 4
+            + self.storage.len() * (20 + 32 + 32)
+            + 3
+            + 4;
         let mut h = alloy_primitives::Keccak256::new();
+        if self.code.is_empty() && need <= INLINE {
+            let mut buf = [0u8; INLINE];
+            let mut n = 0usize;
+            let mut put = |src: &[u8], n: &mut usize| {
+                buf[*n..*n + src.len()].copy_from_slice(src);
+                *n += src.len();
+            };
+            put(b"ACC", &mut n);
+            put(&(self.accounts.len() as u32).to_be_bytes(), &mut n);
+            for (addr, (nonce, balance, code_hash)) in &self.accounts {
+                put(addr.as_slice(), &mut n);
+                put(&nonce.to_le_bytes(), &mut n);
+                put(&balance.to_be_bytes::<32>(), &mut n);
+                put(code_hash.as_slice(), &mut n);
+            }
+            put(b"STO", &mut n);
+            put(&(self.storage.len() as u32).to_be_bytes(), &mut n);
+            for ((addr, key), value) in &self.storage {
+                put(addr.as_slice(), &mut n);
+                put(key.as_slice(), &mut n);
+                put(&value.to_be_bytes::<32>(), &mut n);
+            }
+            put(b"COD", &mut n);
+            put(&0u32.to_be_bytes(), &mut n);
+            h.update(&buf[..n]);
+            return h.finalize();
+        }
         h.update(b"ACC");
         h.update((self.accounts.len() as u32).to_be_bytes());
         for (addr, (nonce, balance, code_hash)) in &self.accounts {
