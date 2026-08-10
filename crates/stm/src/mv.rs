@@ -20,6 +20,7 @@ use std::sync::RwLock;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
+use kardamom_exec_core::delta::WriteSet;
 
 /// One published account version: the (nonce, balance, code_hash) tuple a
 /// `WriteSet` carries.
@@ -39,6 +40,10 @@ pub type SeenVersion = Option<u32>;
 pub enum ReadRecord {
     Account(Address, SeenVersion),
     Slot(Address, B256, SeenVersion),
+    /// Bytecode lookup. Content-addressed, so there is no version — but a
+    /// MISS that a later CREATE fills is a real staleness: the reader
+    /// executed against absent code. `true` = served from the cache.
+    Code(B256, bool),
 }
 
 const SHARDS: usize = 64;
@@ -82,9 +87,46 @@ impl MvCache {
         }
     }
 
-    /// Publish one tx's account write. Sorted-insert keeps correctness even
-    /// if a prediction miss let writers race out of index order (validation
-    /// still convicts the miss).
+    /// Publish one tx's writes in the ONLY safe order: code and storage
+    /// first, ACCOUNTS LAST.
+    ///
+    /// A reader reaches a contract's code and storage only THROUGH its
+    /// account (revm loads `basic` → `code_by_hash` → `SLOAD`), so making
+    /// the account version the last thing published gives a
+    /// happens-before: whoever sees the new account finds its code and
+    /// storage already there. The reverse order (accounts first) let a
+    /// concurrent reader load a freshly-CREATEd account carrying
+    /// `code_hash = H`, miss `H` in the cache, fall back to the snapshot,
+    /// and execute against EMPTY code — a silent divergence that read
+    /// validation cannot see (its account read was legitimately current,
+    /// and code reads carry no version). `skip_account` is the fee sink
+    /// (Accumulator: never published).
+    pub fn publish_write_set(&self, idx: u32, ws: &WriteSet, skip_account: Address) {
+        for (hash, code) in ws.code.iter() {
+            self.publish_code(*hash, Bytes::clone(code));
+        }
+        for ((addr, key), value) in ws.storage.iter() {
+            self.publish_slot(idx, *addr, *key, *value);
+        }
+        for (addr, (nonce, balance, code_hash)) in ws.accounts.iter() {
+            if *addr == skip_account {
+                continue;
+            }
+            self.publish_account(
+                idx,
+                *addr,
+                AccountVersion {
+                    nonce: *nonce,
+                    balance: *balance,
+                    code_hash: *code_hash,
+                },
+            );
+        }
+    }
+
+    /// Publish one tx's account write. Sorted-insert keeps correctness
+    /// even if a prediction miss let writers race out of index order
+    /// (validation still convicts the miss).
     pub fn publish_account(&self, idx: u32, addr: Address, v: AccountVersion) {
         let mut g = self.accounts[shard_of(addr.as_slice())]
             .write()
@@ -139,6 +181,10 @@ impl MvCache {
         self.code.read().expect("mv poisoned").get(hash).cloned()
     }
 
+    fn has_code(&self, hash: &B256) -> bool {
+        self.code.read().expect("mv poisoned").contains_key(hash)
+    }
+
     /// Replay one read record against the final lists: does the version the
     /// tx observed still equal the highest version below it? A mismatch
     /// means a lower-index tx published AFTER the read — false independence.
@@ -150,6 +196,9 @@ impl MvCache {
             ReadRecord::Slot(addr, key, seen) => {
                 self.read_slot(idx, addr, key).map(|(i, _)| i) == *seen
             }
+            // A miss that the cache can now serve means the reader ran
+            // against code a concurrent CREATE had not published yet.
+            ReadRecord::Code(hash, hit) => *hit || !self.has_code(hash),
         }
     }
 }
@@ -191,6 +240,70 @@ mod tests {
         mv.publish_slot(3, a, k, U256::from(30u64));
         assert_eq!(mv.read_slot(5, &a, &k).unwrap(), (3, U256::from(30u64)));
         assert_eq!(mv.read_slot(10, &a, &k).unwrap(), (9, U256::from(90u64)));
+    }
+
+    /// REGRESSION (silent divergence): a reader that can see a
+    /// freshly-CREATEd account MUST be able to see its code. Publishing
+    /// accounts before code let a concurrent tx load the account, miss the
+    /// hash, fall back to the snapshot, and execute against EMPTY code —
+    /// and validation could not catch it (the account read was current;
+    /// code reads carry no version). The ordered publish is the fix; this
+    /// hammers the window a wrong order would open.
+    #[test]
+    fn account_version_never_precedes_its_code() {
+        use kardamom_exec_core::delta::WriteSet;
+        let mv = std::sync::Arc::new(MvCache::new());
+        let created = Address::with_last_byte(0xC1);
+        let code = Bytes::from_static(&[0x60, 0x00, 0x54, 0x00]);
+        let hash = alloy_primitives::keccak256(&code);
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let reader = {
+            let mv = mv.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut observed = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some((_, a)) = mv.read_account(1, &created) {
+                        assert!(
+                            mv.read_code(&a.code_hash).is_some(),
+                            "account visible with code_hash {:?} but its code is not",
+                            a.code_hash
+                        );
+                        observed += 1;
+                    }
+                }
+                observed
+            })
+        };
+
+        // Publish the same CREATE write set repeatedly into fresh caches
+        // so the reader keeps racing the window.
+        for _ in 0..2_000 {
+            let mut ws = WriteSet::default();
+            ws.accounts.push((created, (1, U256::ZERO, hash)));
+            ws.code.push((hash, code.clone()));
+            ws.finish();
+            mv.publish_write_set(0, &ws, Address::repeat_byte(0xEE));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        reader.join().expect("reader must not panic");
+    }
+
+    #[test]
+    fn code_miss_is_convicted_when_a_create_fills_it() {
+        let mv = MvCache::new();
+        let hash = B256::with_last_byte(9);
+        // Served from the base layer (cache miss) — valid while the cache
+        // stays empty.
+        let rec = ReadRecord::Code(hash, false);
+        assert!(mv.validate(3, &rec));
+        // A concurrent CREATE published it: the reader ran against absent
+        // code and must be wounded.
+        mv.publish_code(hash, Bytes::from_static(&[0x00]));
+        assert!(!mv.validate(3, &rec));
+        // A read that HIT the cache is never stale.
+        assert!(mv.validate(3, &ReadRecord::Code(hash, true)));
     }
 
     #[test]

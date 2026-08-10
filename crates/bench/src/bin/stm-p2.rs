@@ -60,6 +60,10 @@ struct Args {
     /// Print per-block lines.
     #[arg(long, default_value_t = false)]
     per_block: bool,
+    /// DAG prune batch sizes to sweep (completions applied per graph-lock
+    /// acquisition; 1 = update on every completion).
+    #[arg(long, default_value = "1")]
+    prune_batch: String,
 }
 
 fn records(base_idx: u64, envs: &[TxEnvelope]) -> Vec<(TxIndex, BPosition, TxEnvelope)> {
@@ -338,35 +342,90 @@ fn main() -> anyhow::Result<()> {
     // ---- Sweep: ONE persistent pool per worker count, blocks streamed
     // through it — no per-block thread cost, matching the executor
     // pipeline shape.
-    let mut wall_stm: Vec<f64> = vec![0.0; worker_counts.len()];
-    let mut fallbacks: Vec<usize> = vec![0; worker_counts.len()];
+    let batches: Vec<usize> = a
+        .prune_batch
+        .split(',')
+        .map(|s| s.trim().parse().expect("prune-batch csv"))
+        .collect();
+    struct Row {
+        workers: usize,
+        batch: usize,
+        wall: f64,
+        fallbacks: usize,
+        feed_us: u64,
+        decode_us: u64,
+        predict_us: u64,
+        admit_us: u64,
+        prune_us: u64,
+        prune_calls: u64,
+        prune_forced: u64,
+        avg_batch: f64,
+        idle_us: u64,
+    }
+    let mut rows: Vec<Row> = Vec::new();
     let (mut agg_edges, mut agg_cold) = (0usize, 0usize);
-    for (wi, &w) in worker_counts.iter().enumerate() {
-        kardamom_stm::execute::with_pool(&snap, w, |pool| -> anyhow::Result<()> {
-            for case in &cases {
-                let base = case.base.clone();
-                let t = Instant::now();
-                let out = pool.run_block(base, case.env, &case.recs, &case.stats)?;
-                let ms = t.elapsed().as_secs_f64() * 1e3;
-                assert_identical(
-                    &case.seq_receipts,
-                    &case.seq_delta,
-                    &out.receipts,
-                    &out.delta,
-                    case.env.block_number,
-                    w,
-                );
-                if case.is_flow {
-                    wall_stm[wi] += ms;
-                    fallbacks[wi] += out.fallback as usize;
-                    if wi == 0 {
-                        agg_edges += out.edges;
-                        agg_cold += out.cold;
+    for &w in &worker_counts {
+        for &batch in &batches {
+            let cfg = kardamom_stm::execute::PoolConfig {
+                workers: w,
+                prune_batch: batch,
+            };
+            let mut row = Row {
+                workers: w,
+                batch,
+                wall: 0.0,
+                fallbacks: 0,
+                feed_us: 0,
+                decode_us: 0,
+                predict_us: 0,
+                admit_us: 0,
+                prune_us: 0,
+                prune_calls: 0,
+                prune_forced: 0,
+                avg_batch: 0.0,
+                idle_us: 0,
+            };
+            let mut batch_weight = 0f64;
+            kardamom_stm::execute::with_pool(&snap, cfg, |pool| -> anyhow::Result<()> {
+                for case in &cases {
+                    let base = case.base.clone();
+                    let t = Instant::now();
+                    let out = pool.run_block(base, case.env, &case.recs, &case.stats)?;
+                    let ms = t.elapsed().as_secs_f64() * 1e3;
+                    assert_identical(
+                        &case.seq_receipts,
+                        &case.seq_delta,
+                        &out.receipts,
+                        &out.delta,
+                        case.env.block_number,
+                        w,
+                    );
+                    if case.is_flow {
+                        row.wall += ms;
+                        row.fallbacks += out.fallback as usize;
+                        row.feed_us += out.feed_us;
+                        row.decode_us += out.decode_us;
+                        row.predict_us += out.predict_us;
+                        row.admit_us += out.admit_us;
+                        row.prune_us += out.prune_us;
+                        row.prune_calls += out.prune_calls;
+                        row.prune_forced += out.prune_forced;
+                        row.idle_us += out.idle_us;
+                        row.avg_batch += out.avg_batch * out.prune_calls as f64;
+                        batch_weight += out.prune_calls as f64;
+                        if rows.is_empty() {
+                            agg_edges += out.edges;
+                            agg_cold += out.cold;
+                        }
                     }
                 }
+                Ok(())
+            })?;
+            if batch_weight > 0.0 {
+                row.avg_batch /= batch_weight;
             }
-            Ok(())
-        })?;
+            rows.push(row);
+        }
     }
 
     println!(
@@ -382,16 +441,37 @@ fn main() -> anyhow::Result<()> {
         agg_edges,
         agg_cold,
     );
-    for (wi, &w) in worker_counts.iter().enumerate() {
+    println!(
+        "{:>3} {:>6} {:>9} {:>8} {:>9} {:>10} {:>10} {:>7} {:>9} {:>9} {:>6}",
+        "w",
+        "batch",
+        "wall_ms",
+        "speedup",
+        "mgas/s",
+        "feed_us",
+        "decode_us",
+        "pred_us",
+        "prune_us",
+        "idle_us",
+        "wound"
+    );
+    for r in &rows {
         println!(
-            "workers={:<2} wall={:>7.0}ms speedup={:>5.2}x mgas/s={:>6.0} fallbacks={}",
-            w,
-            wall_stm[wi],
-            wall_seq / wall_stm[wi],
-            flow_gas as f64 / 1e6 / (wall_stm[wi] / 1e3),
-            fallbacks[wi],
+            "{:>3} {:>6} {:>9.0} {:>7.2}x {:>9.0} {:>10} {:>10} {:>7} {:>9} {:>9} {:>6}",
+            r.workers,
+            r.batch,
+            r.wall,
+            wall_seq / r.wall,
+            flow_gas as f64 / 1e6 / (r.wall / 1e3),
+            r.feed_us,
+            r.decode_us,
+            r.predict_us,
+            r.prune_us,
+            r.idle_us,
+            r.fallbacks,
         );
     }
+    let _ = |r: &Row| r.avg_batch;
     println!("BYTE-IDENTICAL: every block, every worker count — verified");
     Ok(())
 }

@@ -175,7 +175,17 @@ fn trained_contention_chains_and_matches() {
             !out.fallback,
             "trained fixed-slot conflict must schedule as a chain, not convict"
         );
-        assert!(out.edges >= 2, "the counter chain must exist");
+        // The new expression of "the counter chain exists": all three
+        // contending txs hash to the SAME domain, so they land on ONE
+        // worker queue and execute in canonical FIFO order — no
+        // cross-thread coordination needed for the common conflict.
+        assert_eq!(
+            out.dispatch.iter().filter(|c| **c > 0).count(),
+            1,
+            "same-domain txs must share one thread: {:?}",
+            out.dispatch
+        );
+        assert_eq!(out.wounds, 0, "an ordered domain must never wound");
         assert_identical(
             &seq,
             &out.receipts,

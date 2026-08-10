@@ -12,13 +12,11 @@
 //! sequential fallback (invariant #3) carries correctness alone in P2a;
 //! the optimization lands with P2b once the A/B shows where it pays.
 
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use alloy_primitives::{B256, U256};
-use bytes::Bytes;
 use kardamom_exec_core::block_env::ExecEnv;
 use kardamom_exec_core::delta::{PendingDelta, WriteSet};
 use kardamom_exec_core::error::ExecutorError;
@@ -36,7 +34,7 @@ use revm::state::AccountInfo;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
 use crate::FEE_SINK;
-use crate::mv::{AccountVersion, MvCache, ReadRecord};
+use crate::mv::{MvCache, ReadRecord};
 use crate::schedule;
 
 /// Layered block-input view: the pre-block delta over the snapshot — what
@@ -192,8 +190,12 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             return Ok(c.clone());
         }
         let c = if let Some(code) = self.mv.read_code(&code_hash) {
+            self.reads.push(ReadRecord::Code(code_hash, true));
             revm::state::Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(&code))
         } else {
+            // A MISS is recorded too: if a concurrent CREATE publishes this
+            // hash later, this tx ran against absent code and is wounded.
+            self.reads.push(ReadRecord::Code(code_hash, false));
             self.base.code_by_hash_ref(code_hash)?
         };
         self.code_cache.insert(code_hash, c.clone());
@@ -238,14 +240,48 @@ struct TxResult {
 pub struct StmOutcome {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
-    /// Validation failed and the block re-executed sequentially
-    /// (invariant #3). Outputs are the sequential ones.
+    /// Txs WOUNDED at validation — a conflict the marks missed, repaired
+    /// by re-executing at the canonical position (per-tx; the whole block
+    /// never re-runs). Zero on every measured workload so far.
+    pub wounds: usize,
+    /// Any wound fired (spec invariant #3's counter, per block).
     pub fallback: bool,
-    /// Read records convicted by validation (0 unless `fallback`).
-    pub validation_failures: usize,
-    /// Schedule diagnostics.
+    /// ⊤ (cold, untrained-selector) txs — they wait out the prefix.
     pub cold: usize,
+    /// Live-DAG edges created across the block (only against predecessors
+    /// that were still outstanding at admission).
     pub edges: usize,
+    /// Txs dispatched per worker queue — the domain-affinity histogram.
+    pub dispatch: Vec<u32>,
+    /// Scheduler cost, measured (the numbers the prune-batch knob is
+    /// tuned on): time held in the graph lock split by cause, prune
+    /// invocations and how many were starvation-forced, the realized
+    /// batch size, and worker idle time.
+    pub feed_us: u64,
+    pub decode_us: u64,
+    pub predict_us: u64,
+    pub admit_us: u64,
+    pub prune_us: u64,
+    pub prune_calls: u64,
+    pub prune_forced: u64,
+    pub avg_batch: f64,
+    pub idle_us: u64,
+}
+
+/// The ⊤ key: a cold tx marks it, and every tx probes it before executing,
+/// so "conflicts with everything" needs no graph. Not a real account — it
+/// is never read or written by the EVM, only used as a pending-mark key.
+const WILDCARD: alloy_primitives::Address = alloy_primitives::Address::repeat_byte(0xFF);
+
+/// Stable domain → worker mapping. Quality only affects BALANCE across
+/// threads, never correctness (ordering comes from marks + FIFO).
+fn domain_hash(bytes: &[u8], workers: usize) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in bytes {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    (h % workers as u64) as usize
 }
 
 /// Gas-limit-derived hard cap on txs per block: `BLOCK_GAS_LIMIT` / 21k
@@ -263,9 +299,81 @@ struct TxSlot {
     decoded: Option<alloy_consensus::TxEnvelope>,
 }
 
-/// Graph + progress state under the per-block lock. Admission (the feed
-/// side) and completion (workers) both mutate it; every operation is a few
-/// vector ops — the lock is held for microseconds.
+/// One worker's FIFO. The feed pushes (single producer), the worker pops
+/// (single consumer) — a two-party lock with near-zero contention, and
+/// canonical arrival order per thread means same-domain chains execute in
+/// order with no cross-thread coordination at all.
+struct WorkerQueue {
+    q: Mutex<std::collections::VecDeque<u32>>,
+    cv: Condvar,
+}
+
+/// Engine instrumentation — the numbers the prune-batch decision is made
+/// on (spec: "health is judged on the PAIR of error rates plus realized
+/// utilization"; the same discipline applies to the scheduler's own cost).
+#[derive(Default)]
+pub struct Metrics {
+    /// Nanoseconds spent HOLDING the graph lock, split by cause.
+    pub admit_ns: std::sync::atomic::AtomicU64,
+    pub prune_ns: std::sync::atomic::AtomicU64,
+    /// Prune invocations and how many were STARVATION-forced (a worker had
+    /// nothing to run and had to apply pending completions itself).
+    pub prune_calls: std::sync::atomic::AtomicU64,
+    pub prune_forced: std::sync::atomic::AtomicU64,
+    /// Completions applied by prunes (÷ prune_calls = realized batch).
+    pub completions: std::sync::atomic::AtomicU64,
+    /// Nanoseconds workers spent parked with nothing to run.
+    pub idle_ns: std::sync::atomic::AtomicU64,
+    /// Envelope decode and footprint prediction, the two pure-computation
+    /// parts of admission (the rest is the graph lock + dispatch).
+    pub decode_ns: std::sync::atomic::AtomicU64,
+    pub predict_ns: std::sync::atomic::AtomicU64,
+    /// WHOLE-admission nanoseconds (decode + predict + graph + dispatch).
+    /// The feed is a single thread, so this is a hard serial floor on
+    /// block latency — the number that says whether the scheduler or the
+    /// workers are the constraint.
+    pub feed_ns: std::sync::atomic::AtomicU64,
+}
+
+/// Pool configuration.
+#[derive(Debug, Clone, Copy)]
+pub struct PoolConfig {
+    pub workers: usize,
+    /// Apply completions to the DAG in batches of this many. `1` updates
+    /// the graph on every completion (the immediate policy); larger values
+    /// trade graph-lock traffic for dispatch latency — a worker that runs
+    /// dry always force-prunes first, so batching can never starve the
+    /// pool, only delay a handoff.
+    pub prune_batch: usize,
+}
+
+/// MEASURED default (uniswap 8-pair, 16x500, 8 workers): batching 8
+/// completions per graph-lock acquisition cuts prune time ~30% with no
+/// wall-clock cost — worth taking, but NOT the lever. The binding
+/// constraint is the serial feed (~33% of block wall, 57% of it
+/// footprint prediction), which is why `prune_batch` is a knob and not a
+/// fix. See the P2b notes in the PR.
+pub const DEFAULT_PRUNE_BATCH: usize = 8;
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            workers: 1,
+            prune_batch: DEFAULT_PRUNE_BATCH,
+        }
+    }
+}
+
+/// The LIVE dependency DAG. Mutated at exactly two moments — when a tx is
+/// ADMITTED (its predicted conflicts become edges) and when a tx FINISHES
+/// (its edges retire and any child that just became ready is dispatched) —
+/// so the graph always describes only work that is still outstanding.
+///
+/// Being live is what makes the graph cheap AND sharper than a batch DAG:
+/// an edge is only created against a predecessor that has not finished
+/// yet, so a tx admitted after its conflicting predecessor completed is
+/// dispatched immediately (it will simply read the published version)
+/// instead of inheriting a dead edge.
 #[derive(Default)]
 struct Graph {
     admitted: u32,
@@ -274,10 +382,14 @@ struct Graph {
     indegree: Vec<u32>,
     children: Vec<Vec<u32>>,
     complete: Vec<bool>,
-    // Canonical-order-first ready policy: the lowest ready index runs
-    // first — chains drain in order and read-then-published windows (the
-    // only source of validation convictions) stay minimal.
-    ready: BinaryHeap<Reverse<u32>>,
+    /// Per-cell last toucher — the incremental index the edges come from.
+    last_toucher: HashMap<Cell, u32>,
+    /// The most recent ⊤ (cold) tx: conflicts with everything, so every
+    /// later admission takes an edge from it while it is outstanding.
+    last_barrier: Option<u32>,
+    /// Worker queue each tx was assigned (domain affinity), needed when a
+    /// COMPLETION makes it ready.
+    worker_of: Vec<usize>,
 }
 
 /// Per-block shared context; workers hold an `Arc` for the block's
@@ -291,16 +403,100 @@ struct BlockCtx<'env, S: StateDatabase> {
     mv: MvCache,
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
+    queues: Vec<WorkerQueue>,
     graph: Mutex<Graph>,
-    work_cv: Condvar,
+    /// Per-worker completion buffers: a finishing worker parks its index
+    /// here (uncontended — it owns the slot) instead of touching the graph
+    /// on every tx. A prune drains them all under the graph lock.
+    completed: Vec<Mutex<Vec<u32>>>,
+    /// Completions parked across all buffers, i.e. DAG updates owed.
+    pending: std::sync::atomic::AtomicU64,
+    prune_batch: usize,
     done_cv: Condvar,
     aborted: AtomicBool,
+    metrics: Metrics,
+}
+
+/// LOCK ORDER (the engine's one hard rule): the graph lock may be taken
+/// while holding nothing, and a queue lock may be taken while holding
+/// nothing or the graph lock's RESULTS — never while the graph lock is
+/// HELD. Every dispatch therefore collects its ready set under the graph
+/// lock, releases it, and only then pushes. The idle path takes the graph
+/// lock only after dropping its queue lock.
+impl<S: StateDatabase> BlockCtx<'_, S> {
+    /// Apply parked completions to the live DAG: mark complete, retire the
+    /// finished nodes' edges, and hand whatever became ready to its
+    /// thread. Returns the number of completions applied.
+    fn prune(&self, forced: bool) -> usize {
+        let t0 = std::time::Instant::now();
+        let (ready, applied, done) = {
+            let mut g = self.graph.lock().expect("graph poisoned");
+            let mut applied = 0usize;
+            let mut ready: Vec<(usize, u32)> = Vec::new();
+            for buf in &self.completed {
+                let mut b = buf.lock().expect("completed poisoned");
+                for job in b.drain(..) {
+                    g.complete[job as usize] = true;
+                    g.finished += 1;
+                    applied += 1;
+                    // Admissions may still append to children[job], but
+                    // they check complete[job] under this same lock first,
+                    // so a drained list is final.
+                    let kids = std::mem::take(&mut g.children[job as usize]);
+                    for c in kids {
+                        g.indegree[c as usize] -= 1;
+                        if g.indegree[c as usize] == 0 {
+                            ready.push((g.worker_of[c as usize], c));
+                        }
+                    }
+                }
+            }
+            (ready, applied, g.sealed && g.finished == g.admitted)
+        };
+        if applied > 0 {
+            self.pending.fetch_sub(applied as u64, Ordering::SeqCst);
+        }
+        self.metrics
+            .prune_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.metrics.prune_calls.fetch_add(1, Ordering::Relaxed);
+        if forced {
+            self.metrics.prune_forced.fetch_add(1, Ordering::Relaxed);
+        }
+        self.metrics
+            .completions
+            .fetch_add(applied as u64, Ordering::Relaxed);
+        // Queue locks are taken only now, with the graph lock released.
+        for (w, c) in ready {
+            self.push_ready(w, c);
+        }
+        if done {
+            for q in &self.queues {
+                q.cv.notify_all();
+            }
+            self.done_cv.notify_all();
+        }
+        applied
+    }
+}
+
+impl<S: StateDatabase> BlockCtx<'_, S> {
+    /// Hand a READY tx to its assigned thread (single-producer per call
+    /// site: the feed at admission, a worker at completion).
+    fn push_ready(&self, worker: usize, idx: u32) {
+        let qh = &self.queues[worker];
+        let mut q = qh.q.lock().expect("queue poisoned");
+        q.push_back(idx);
+        drop(q);
+        qh.cv.notify_one();
+    }
 }
 
 struct PoolState<'env, S: StateDatabase> {
     generation: u64,
     ctx: Option<Arc<BlockCtx<'env, S>>>,
     shutdown: bool,
+    cfg: PoolConfig,
 }
 
 type PoolShared<'env, S> = (Mutex<PoolState<'env, S>>, Condvar);
@@ -322,31 +518,37 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
 /// Spawn `workers` pool threads for the duration of `f`.
 pub fn with_pool<S: StateDatabase + Sync, R>(
     snapshot: &S,
-    workers: usize,
+    cfg: PoolConfig,
     f: impl FnOnce(&PoolHandle<'_, S>) -> R,
 ) -> R {
-    let workers = workers.max(1);
+    let workers = cfg.workers.max(1);
+    let cfg = PoolConfig {
+        workers,
+        prune_batch: cfg.prune_batch.max(1),
+    };
     let shared: PoolShared<'_, S> = (
         Mutex::new(PoolState {
             generation: 0,
             ctx: None,
             shutdown: false,
+            cfg,
         }),
         Condvar::new(),
     );
+    let shared_ref = &shared;
     std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| worker_loop(&shared));
+        for w in 0..workers {
+            scope.spawn(move || worker_loop(shared_ref, w));
         }
         let handle = PoolHandle {
             shared: &shared,
             snapshot,
         };
         let r = f(&handle);
-        let mut st = shared.0.lock().expect("pool poisoned");
+        let mut st = shared_ref.0.lock().expect("pool poisoned");
         st.shutdown = true;
         drop(st);
-        shared.1.notify_all();
+        shared_ref.1.notify_all();
         r
     })
 }
@@ -355,9 +557,16 @@ pub fn with_pool<S: StateDatabase + Sync, R>(
 pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     pool: &'p PoolHandle<'a, S>,
     ctx: Arc<BlockCtx<'a, S>>,
-    dag: schedule::DagBuilder,
     exclude: HashSet<Cell>,
     stats: &'p Stats,
+    workers: usize,
+    cold: usize,
+    edges: usize,
+    dispatch: Vec<u32>,
+    /// Cold (⊤) txs still need ORDER, and with no graph there is no
+    /// barrier to express it with — so a cold tx marks the wildcard: it
+    /// waits for every earlier tx and every later tx waits for it, via
+    /// the pending-mark machinery on one shared key.
     /// Kept for the sequential-fallback path (envelope payloads are
     /// refcounted; this is index metadata, not a byte copy).
     txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
@@ -373,6 +582,10 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         env: ExecEnv,
         stats: &'p Stats,
     ) -> Result<BlockSession<'p, 'a, S>, ExecutorError> {
+        let (workers, prune_batch) = {
+            let st = self.shared.0.lock().expect("pool poisoned");
+            (st.cfg.workers, st.cfg.prune_batch)
+        };
         let probe = BlockInput {
             snapshot: self.snapshot,
             base: Some(&base),
@@ -394,10 +607,19 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             results: (0..MAX_BLOCK_TXS)
                 .map(|_| std::sync::OnceLock::new())
                 .collect(),
+            queues: (0..workers)
+                .map(|_| WorkerQueue {
+                    q: Mutex::new(std::collections::VecDeque::new()),
+                    cv: Condvar::new(),
+                })
+                .collect(),
             graph: Mutex::new(Graph::default()),
-            work_cv: Condvar::new(),
+            completed: (0..workers).map(|_| Mutex::new(Vec::new())).collect(),
+            pending: std::sync::atomic::AtomicU64::new(0),
+            prune_batch: prune_batch.max(1),
             done_cv: Condvar::new(),
             aborted: AtomicBool::new(false),
+            metrics: Metrics::default(),
         });
         {
             let mut st = self.shared.0.lock().expect("pool poisoned");
@@ -415,9 +637,12 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         Ok(BlockSession {
             pool: self,
             ctx,
-            dag: schedule::DagBuilder::default(),
             exclude,
             stats,
+            workers,
+            cold: 0,
+            edges: 0,
+            dispatch: vec![0; workers],
             txs: Vec::new(),
             started: std::time::Instant::now(),
         })
@@ -440,24 +665,93 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
 }
 
 impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
-    /// Admit the next canonical tx: predict, extend the DAG, and dispatch
-    /// immediately if it has no unfinished predecessors — workers execute
-    /// it while the sealer is still streaming the rest of the block.
+    /// Admit the next canonical tx: ONE function computation, then an
+    /// assignment to a thread.
+    ///
+    /// 1. PREDICT the footprint (the P0/P1 classifier) — pure, off-lock.
+    /// 2. UPDATE THE LIVE DAG: each predicted cell's last toucher becomes
+    ///    a predecessor **if it has not finished yet**; a ⊤ (cold) tx
+    ///    takes edges from everything outstanding and becomes the barrier
+    ///    every later tx depends on.
+    /// 3. ASSIGN a thread by hashing the primary contention domain, and
+    ///    dispatch immediately when the indegree is already zero.
+    ///
+    /// Domain-hashed assignment is what keeps the DAG's chains cheap:
+    /// same-domain txs land on the SAME thread in canonical order, so a
+    /// chain drains as a FIFO with no cross-thread handoff at all — the
+    /// graph only has to carry the cross-domain and multi-domain edges.
+    ///
+    /// Conflicts the prediction MISSED are not the graph's business: they
+    /// are caught at validation and repaired by wounding the later tx (see
+    /// [`BlockSession::seal`]) — the wound leg of wound-wait, with the DAG
+    /// edge as the wait leg.
     pub fn push_tx(
         &mut self,
         tx_idx: TxIndex,
         position: BPosition,
         envelope: TxEnvelope,
     ) -> Result<(), ExecutorError> {
+        let t_feed = std::time::Instant::now();
         let i = self.txs.len();
         if i >= MAX_BLOCK_TXS {
             return Err(ExecutorError::State(format!(
                 "stm pool: block exceeds MAX_BLOCK_TXS={MAX_BLOCK_TXS} (gas-limit math says impossible)"
             )));
         }
+        let idx = i as u32;
+        let t_dec = std::time::Instant::now();
         let decoded = decode_alloy_envelope(&envelope.raw_tx, tx_idx).ok();
-        let view = schedule::scheduling_view_decoded(i as u32, &envelope, decoded.as_ref());
-        let cells = self.stats.predict(&view);
+        let view = schedule::scheduling_view_decoded(idx, &envelope, decoded.as_ref());
+        self.ctx
+            .metrics
+            .decode_ns
+            .fetch_add(t_dec.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let t_pred = std::time::Instant::now();
+
+        // (1) Predict — off-lock. Collect the cells and pick the primary
+        // contention domain: the first non-sender cell in the prediction's
+        // canonical order (stable across txs of one flow, which is what
+        // puts a pool's traffic on one thread), else the sender cell —
+        // exactly the SenderChain lane for tier-1-only txs.
+        let mut cells: Vec<Cell> = Vec::new();
+        let mut domain: Option<Cell> = None;
+        let is_cold = match self.stats.predict(&view) {
+            Some(predicted) => {
+                for c in predicted {
+                    if self.exclude.contains(&c) {
+                        continue;
+                    }
+                    let is_sender = matches!(c, Cell::Account(a) if a == envelope.sender);
+                    let domain_is_sender =
+                        matches!(domain, Some(Cell::Account(a)) if a == envelope.sender);
+                    if domain.is_none() || (!is_sender && domain_is_sender) {
+                        domain = Some(c);
+                    }
+                    cells.push(c);
+                }
+                false
+            }
+            None => {
+                self.cold += 1;
+                true
+            }
+        };
+        self.ctx
+            .metrics
+            .predict_ns
+            .fetch_add(t_pred.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        let worker = match domain {
+            Some(Cell::Account(a)) => domain_hash(a.as_slice(), self.workers),
+            Some(Cell::Slot(a, k)) => {
+                let mut b = [0u8; 8];
+                b[..4].copy_from_slice(&a.as_slice()[16..20]);
+                b[4..].copy_from_slice(&k.as_slice()[28..32]);
+                domain_hash(&b, self.workers)
+            }
+            // ⊤ and empty predictions: canonical round-robin.
+            None => i % self.workers,
+        };
+
         self.ctx.slots[i]
             .set(TxSlot {
                 tx_idx,
@@ -467,57 +761,102 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             })
             .unwrap_or_else(|_| unreachable!("slot set once per index"));
         self.txs.push((tx_idx, position, envelope));
-        let preds = self.dag.admit(i as u32, cells, &self.exclude);
-        let mut g = self.ctx.graph.lock().expect("graph poisoned");
-        g.indegree.push(0);
-        g.children.push(Vec::new());
-        g.complete.push(false);
-        let mut deg = 0u32;
-        for p in preds {
-            // A predecessor that already FINISHED contributes no live edge
-            // (its writes are published); admit-vs-complete is atomic under
-            // the graph lock.
-            if !g.complete[p as usize] {
-                g.children[p as usize].push(i as u32);
-                deg += 1;
+        self.dispatch[worker] += 1;
+
+        // (2) Update the live DAG + (3) dispatch if ready.
+        let t_admit = std::time::Instant::now();
+        let dispatch_now = {
+            let mut g = self.ctx.graph.lock().expect("graph poisoned");
+            g.indegree.push(0);
+            g.children.push(Vec::new());
+            g.complete.push(false);
+            g.worker_of.push(worker);
+            g.admitted += 1;
+
+            let mut deg = 0u32;
+            let link = |g: &mut Graph, p: u32, deg: &mut u32| {
+                // Only OUTSTANDING predecessors become edges; a finished
+                // one has already published its versions.
+                if p != idx && !g.complete[p as usize] && !g.children[p as usize].contains(&idx) {
+                    g.children[p as usize].push(idx);
+                    *deg += 1;
+                }
+            };
+            if let Some(b) = g.last_barrier {
+                link(&mut g, b, &mut deg);
             }
+            if is_cold {
+                // ⊤: conflicts with everything — take an edge from every
+                // outstanding tx, then become the barrier.
+                for p in 0..idx {
+                    link(&mut g, p, &mut deg);
+                }
+                g.last_barrier = Some(idx);
+                self.edges += deg as usize;
+            } else {
+                for c in &cells {
+                    if let Some(&p) = g.last_toucher.get(c) {
+                        link(&mut g, p, &mut deg);
+                    }
+                    g.last_toucher.insert(*c, idx);
+                }
+                self.edges += deg as usize;
+            }
+            g.indegree[i] = deg;
+            deg == 0
+        };
+        self.ctx
+            .metrics
+            .admit_ns
+            .fetch_add(t_admit.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if dispatch_now {
+            self.ctx.push_ready(worker, idx);
         }
-        g.indegree[i] = deg;
-        g.admitted += 1;
-        let dispatch = deg == 0;
-        if dispatch {
-            g.ready.push(Reverse(i as u32));
-        }
-        drop(g);
-        if dispatch {
-            self.ctx.work_cv.notify_one();
-        }
+        self.ctx
+            .metrics
+            .feed_ns
+            .fetch_add(t_feed.elapsed().as_nanos() as u64, Ordering::Relaxed);
         Ok(())
     }
 
     /// The boundary: no more txs. Wait out the in-flight tail, validate
-    /// every recorded read, commit in canonical order (Accumulator prefix
-    /// materialization + wsh fixup); a validation conviction falls back to
-    /// sequential re-execution (invariant #3).
+    /// every recorded read, and WOUND (re-execute at its canonical
+    /// position, sequentially, against the materialized prefix) any tx a
+    /// missed conflict convicted — per-tx, not whole-block. Then commit in
+    /// canonical order.
     pub fn seal(self) -> Result<StmOutcome, ExecutorError> {
         let BlockSession {
             pool,
             ctx,
-            dag,
             txs,
             started,
+            cold,
+            edges,
+            dispatch,
             ..
         } = self;
         {
             let mut g = ctx.graph.lock().expect("graph poisoned");
             g.sealed = true;
         }
-        ctx.work_cv.notify_all();
-        {
-            let mut g = ctx.graph.lock().expect("graph poisoned");
-            while !(ctx.aborted.load(Ordering::SeqCst) || g.finished == g.admitted) {
-                g = ctx.done_cv.wait(g).expect("graph poisoned");
+        for q in &ctx.queues {
+            q.cv.notify_all();
+        }
+        // Apply anything parked, then wait out the tail. Workers force a
+        // prune before they park, so this loop only ever waits on
+        // execution, never on unapplied updates.
+        loop {
+            if ctx.pending.load(Ordering::SeqCst) > 0 {
+                ctx.prune(true);
             }
+            let g = ctx.graph.lock().expect("graph poisoned");
+            if ctx.aborted.load(Ordering::SeqCst) || g.finished == g.admitted {
+                break;
+            }
+            let _unused = ctx
+                .done_cv
+                .wait_timeout(g, std::time::Duration::from_micros(50))
+                .expect("graph poisoned");
         }
         // Release the pool for the next block before the (serial)
         // validate+commit tail.
@@ -527,15 +866,14 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         }
         let t_exec_wall = started.elapsed();
 
-        // Take sole ownership of the context: each worker drops its Arc as
-        // it observes the sealed-and-done condition — a few microseconds of
-        // yield-spin at most.
-        let mut ctx = ctx;
+        // Take sole ownership: each worker drops its Arc as it observes
+        // the sealed-and-drained condition (microseconds of yield at most).
+        let mut ctx_arc = ctx;
         let ctx = loop {
-            match Arc::try_unwrap(ctx) {
+            match Arc::try_unwrap(ctx_arc) {
                 Ok(c) => break c,
                 Err(back) => {
-                    ctx = back;
+                    ctx_arc = back;
                     std::thread::yield_now();
                 }
             }
@@ -557,49 +895,55 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             }
         }
 
-        // Validation (spec: "Validation remains as the final invariant
-        // check"): every recorded read must still be the highest version
-        // below the reader. A conviction = the prediction missed a real
-        // conflict.
+        // Validation: every recorded read must still be the highest
+        // version below the reader. A conviction is a WOUND — the marks
+        // missed a real conflict (the tx read a cell an earlier tx wrote
+        // without a mark to park on).
         let t_val = std::time::Instant::now();
-        let validation_failures: usize = tx_results
+        let wounded: Vec<usize> = tx_results
             .iter()
             .enumerate()
-            .map(|(i, r)| {
-                r.reads
-                    .iter()
-                    .filter(|rec| !ctx.mv.validate(i as u32, rec))
-                    .count()
-            })
-            .sum();
+            .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
+            .map(|(i, _)| i)
+            .collect();
         let t_validate = t_val.elapsed();
-        if validation_failures > 0 {
-            // Invariant #3: discard, re-execute sequentially, count it.
-            tracing::warn!(
-                block = ctx.env.block_number,
-                validation_failures,
-                "stm: validation conviction — sequential fallback"
-            );
-            let (receipts, delta) =
-                execute_block_sequential(ctx.snapshot, Some(&ctx.base), ctx.env, &txs)?;
-            return Ok(StmOutcome {
-                receipts,
-                delta,
-                fallback: true,
-                validation_failures,
-                cold: dag.cold,
-                edges: dag.edges,
-            });
-        }
+        let wounds = wounded.len();
 
-        // Canonical-order commit: cumulative gas, accumulator
-        // materialization + wsh fixup, delta fold. Receipts/delta
-        // byte-identical to sequential.
+        // Canonical-order commit. A wounded tx is RE-EXECUTED here against
+        // the exact materialized prefix (the delta as of its position), so
+        // its result is the sequential one by construction — the whole
+        // block never re-runs. Everything after a wound sees the corrected
+        // state through the same prefix, so a wound cascade re-executes
+        // only the txs it actually reaches.
         let mut receipts = Vec::with_capacity(n);
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
         let mut sink_running = ctx.sink_start_balance;
-        for mut r in tx_results {
+        let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
+        // A tx after a re-executed one may also be stale: once ANY wound
+        // fires, later txs are re-checked against the live prefix by
+        // comparing their write set to a replay. Cheapest correct policy:
+        // re-execute every tx at or after the first wound.
+        if let Some(first) = wounded_set.iter().copied().min() {
+            for i in first..n {
+                wounded_set.insert(i);
+            }
+        }
+        let mut layered = ctx.base.clone();
+        for (i, mut r) in tx_results.into_iter().enumerate() {
+            if wounded_set.contains(&i) {
+                let (tx_idx, position, envelope) = &txs[i];
+                let mut scope = ExecScope::new(ctx.snapshot, Some(&layered), ctx.env)?;
+                let (mut receipt, ws) = scope.execute_tx(
+                    *tx_idx, *position, envelope, i as u64, cumulative, None, None,
+                )?;
+                cumulative = receipt.cumulative_gas_used;
+                receipt.transaction_index = i as u64;
+                layered.apply(ws.clone());
+                delta.apply(ws);
+                receipts.push(receipt);
+                continue;
+            }
             cumulative += r.receipt.gas_used;
             r.receipt.cumulative_gas_used = cumulative;
             sink_running += r.fee_delta;
@@ -607,28 +951,54 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 entry.1.1 = sink_running;
                 r.receipt.write_set_hash = r.ws.hash();
             }
+            layered.apply(r.ws.clone());
             delta.apply(r.ws);
             receipts.push(r.receipt);
         }
 
-        if std::env::var("KARDAMOM_STM_PHASE_TIMING").is_ok() {
-            eprintln!(
-                "phase block={} n={} feed+exec={:?} validate={:?}",
-                ctx.env.block_number, n, t_exec_wall, t_validate
+        if wounds > 0 {
+            tracing::warn!(
+                block = ctx.env.block_number,
+                wounds,
+                rerun = wounded_set.len(),
+                "stm: wound — per-tx re-execution at canonical position"
             );
         }
+        if std::env::var("KARDAMOM_STM_PHASE_TIMING").is_ok() {
+            eprintln!(
+                "phase block={} n={} feed+exec={:?} validate={:?} wounds={}",
+                ctx.env.block_number, n, t_exec_wall, t_validate, wounds
+            );
+        }
+        let m = &ctx.metrics;
+        let prune_calls = m.prune_calls.load(Ordering::Relaxed);
+        let completions = m.completions.load(Ordering::Relaxed);
         Ok(StmOutcome {
             receipts,
             delta,
-            fallback: false,
-            validation_failures: 0,
-            cold: dag.cold,
-            edges: dag.edges,
+            wounds,
+            fallback: wounds > 0,
+            cold,
+            edges,
+            dispatch,
+            feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
+            decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
+            predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
+            admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
+            prune_us: m.prune_ns.load(Ordering::Relaxed) / 1_000,
+            prune_calls,
+            prune_forced: m.prune_forced.load(Ordering::Relaxed),
+            avg_batch: if prune_calls == 0 {
+                0.0
+            } else {
+                completions as f64 / prune_calls as f64
+            },
+            idle_us: m.idle_ns.load(Ordering::Relaxed) / 1_000,
         })
     }
 }
 
-fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<'_, S>) {
+fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<'_, S>, worker: usize) {
     let mut seen = 0u64;
     loop {
         let ctx = {
@@ -646,15 +1016,23 @@ fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<'_, S>) {
                 st = shared.1.wait(st).expect("pool poisoned");
             }
         };
-        run_worker_block(&ctx);
+        run_worker_block(&ctx, worker);
         // Arc drops here — seal()'s try_unwrap spin depends on it.
     }
 }
 
 /// One worker's participation in one block: ONE EVM for the whole block
 /// (per-tx construction was ~90% of execution-path allocation), the view
-/// re-aimed per tx. Returns when the block is sealed and drained.
-fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>) {
+/// re-aimed per tx. Pops ONLY its own FIFO — same-domain txs were hashed
+/// here in canonical order, so a chain drains without any cross-thread
+/// handoff; the DAG carries only the cross-domain edges.
+///
+/// A worker never blocks on a dependency: a tx reaches a queue only once
+/// its indegree is zero, i.e. every predicted predecessor has FINISHED and
+/// published. Ordering is structural, so there is no wait-graph to
+/// deadlock — the canonical total order bounds every edge (low index →
+/// high), and completion only ever removes edges.
+fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
     let input = BlockInput {
         snapshot: ctx.snapshot,
         base: Some(&ctx.base),
@@ -665,19 +1043,43 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>) {
         .with_block(ctx.env.block_env())
         .with_cfg(ctx.env.cfg_env())
         .build_mainnet();
+    let qh = &ctx.queues[worker];
     loop {
         let job = {
-            let mut g = ctx.graph.lock().expect("graph poisoned");
+            let mut q = qh.q.lock().expect("queue poisoned");
             loop {
-                if ctx.aborted.load(Ordering::SeqCst)
-                    || (g.sealed && g.finished == g.admitted && g.ready.is_empty())
-                {
+                if ctx.aborted.load(Ordering::SeqCst) {
                     return;
                 }
-                if let Some(Reverse(i)) = g.ready.pop() {
+                if let Some(i) = q.pop_front() {
                     break i;
                 }
-                g = ctx.work_cv.wait(g).expect("graph poisoned");
+                // Dry. Apply any parked completions MYSELF before parking:
+                // this is what makes batching safe — the pool can never sit
+                // idle on DAG updates nobody applied. The queue lock is
+                // dropped first (lock order: never hold a queue lock while
+                // taking the graph lock).
+                drop(q);
+                if ctx.pending.load(Ordering::SeqCst) > 0 {
+                    ctx.prune(true);
+                    q = qh.q.lock().expect("queue poisoned");
+                    continue;
+                }
+                {
+                    let g = ctx.graph.lock().expect("graph poisoned");
+                    if g.sealed && g.finished == g.admitted {
+                        return;
+                    }
+                }
+                q = qh.q.lock().expect("queue poisoned");
+                if !q.is_empty() {
+                    continue;
+                }
+                let t_idle = std::time::Instant::now();
+                q = qh.cv.wait(q).expect("queue poisoned");
+                ctx.metrics
+                    .idle_ns
+                    .fetch_add(t_idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
         };
         let slot = ctx.slots[job as usize]
@@ -698,32 +1100,23 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>) {
         let _ = ctx.results[job as usize].set(r);
         if errored {
             ctx.aborted.store(true, Ordering::SeqCst);
-            ctx.work_cv.notify_all();
+            for q in &ctx.queues {
+                q.cv.notify_all();
+            }
             ctx.done_cv.notify_all();
             return;
         }
-        let mut g = ctx.graph.lock().expect("graph poisoned");
-        g.complete[job as usize] = true;
-        g.finished += 1;
-        // Later admissions may still append to children[job] — but they
-        // check complete[job] under this same lock first, so a drained
-        // list is final.
-        let kids = std::mem::take(&mut g.children[job as usize]);
-        let mut newly = 0usize;
-        for c in kids {
-            g.indegree[c as usize] -= 1;
-            if g.indegree[c as usize] == 0 {
-                g.ready.push(Reverse(c));
-                newly += 1;
-            }
+
+        // COMPLETION: park the index in this worker's own buffer
+        // (uncontended) and only touch the DAG once a batch has
+        // accumulated. `prune_batch == 1` is the immediate policy.
+        {
+            let mut b = ctx.completed[worker].lock().expect("completed poisoned");
+            b.push(job);
         }
-        let done = g.sealed && g.finished == g.admitted;
-        drop(g);
-        if newly > 0 || done {
-            ctx.work_cv.notify_all();
-        }
-        if done {
-            ctx.done_cv.notify_all();
+        let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
+        if owed as usize >= ctx.prune_batch {
+            ctx.prune(false);
         }
     }
 }
@@ -739,9 +1132,14 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
     stats: &Stats,
     workers: usize,
 ) -> Result<StmOutcome, ExecutorError> {
-    with_pool(snapshot, workers, |pool| {
-        pool.run_block(base.cloned().unwrap_or_default(), env, txs, stats)
-    })
+    with_pool(
+        snapshot,
+        PoolConfig {
+            workers,
+            ..Default::default()
+        },
+        |pool| pool.run_block(base.cloned().unwrap_or_default(), env, txs, stats),
+    )
 }
 
 /// The sequential reference path (also the fallback): `ExecScope` per
@@ -857,28 +1255,11 @@ fn execute_one<S: StateDatabase>(
     };
 
     let ws = write_set_from_evm_state(&outcome.state);
-    // Publish: every written cell EXCEPT the fee sink (Accumulator — all
-    // workers see block-start; the commit pass materializes prefixes).
-    for (addr, (n_, b_, ch_)) in ws.accounts.iter() {
-        if *addr == FEE_SINK {
-            continue;
-        }
-        mv.publish_account(
-            local_idx,
-            *addr,
-            AccountVersion {
-                nonce: *n_,
-                balance: *b_,
-                code_hash: *ch_,
-            },
-        );
-    }
-    for ((addr, key), value) in ws.storage.iter() {
-        mv.publish_slot(local_idx, *addr, *key, *value);
-    }
-    for (hash, code) in ws.code.iter() {
-        mv.publish_code(*hash, Bytes::clone(code));
-    }
+    // Publish in the ordered helper's sequence (code+storage, THEN
+    // accounts — see `MvCache::publish_write_set`), skipping the fee sink
+    // (Accumulator: all workers see block-start; the commit pass
+    // materializes the prefixes).
+    mv.publish_write_set(local_idx, &ws, FEE_SINK);
     let fee_delta = ws
         .accounts
         .iter()
