@@ -13,7 +13,6 @@
 //! Wall-clock numbers are indicative (shared dev host); the assertion is
 //! the point — the speedup column is the shape, not a benchmark citation.
 
-use std::collections::HashSet;
 use std::time::Instant;
 
 use alloy_primitives::U256;
@@ -28,7 +27,7 @@ use kardamom_engine::executor::{ExecScope, TouchSet};
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_footprint::classifier::Stats;
 use kardamom_footprint::{Cell, TxObs, envelope_view};
-use kardamom_stm::execute::{execute_block_sequential, execute_block_stm};
+use kardamom_stm::execute::execute_block_sequential;
 use kardamom_types::{BPosition, Receipt, TxEnvelope};
 
 const ANVIL_MNEMONIC: &str = "test test test test test test test test test test test junk";
@@ -224,38 +223,33 @@ fn main() -> anyhow::Result<()> {
     let mut all_blocks = setup_blocks;
     all_blocks.extend(flow_blocks);
 
-    let mut delta = PendingDelta::new();
-    let mut stats = Stats::default();
-    let mut exclude = HashSet::new();
-    exclude.insert(Cell::Account(kardamom_stm::FEE_SINK));
-    let mut global_idx = 0u64;
-
-    let mut wall_seq = 0f64;
-    let mut wall_stm: Vec<f64> = vec![0.0; worker_counts.len()];
-    let mut fallbacks: Vec<usize> = vec![0; worker_counts.len()];
-    let mut flow_gas = 0u64;
-    let (mut agg_edges, mut agg_cold, mut flow_txs) = (0usize, 0usize, 0usize);
-
     eprintln!(
         "==> A/B over {} blocks ({} setup) workers={:?}",
         all_blocks.len(),
         n_setup,
         worker_counts
     );
-    if a.per_block {
-        println!(
-            "{:>5} {:>5} {:>5} {:>7} {:>9}  {}",
-            "block",
-            "txs",
-            "cold",
-            "edges",
-            "seq_ms",
-            worker_counts
-                .iter()
-                .map(|w| format!("{:>8}", format!("w{w}_ms")))
-                .collect::<String>()
-        );
+
+    // ---- Pass 0: timed sequential baseline + caches -------------------
+    // Per block: the pre-block delta (base), the canonical outputs, and a
+    // SNAPSHOT of the stats as they stood before the block (so every STM
+    // sweep sees the exact inputs the streaming executor would).
+    struct BlockCase {
+        env: ExecEnv,
+        recs: Vec<(TxIndex, BPosition, TxEnvelope)>,
+        base: PendingDelta,
+        stats: Stats,
+        seq_receipts: Vec<Receipt>,
+        seq_delta: PendingDelta,
+        is_flow: bool,
     }
+    let mut cases: Vec<BlockCase> = Vec::with_capacity(all_blocks.len());
+    let mut delta = PendingDelta::new();
+    let mut stats = Stats::default();
+    let mut global_idx = 0u64;
+    let mut wall_seq = 0f64;
+    let mut flow_gas = 0u64;
+    let mut flow_txs = 0usize;
 
     for (bi, blk) in all_blocks.iter().enumerate() {
         let is_flow = bi >= n_setup;
@@ -266,39 +260,23 @@ fn main() -> anyhow::Result<()> {
         };
         let recs = records(global_idx, blk);
         global_idx += blk.len() as u64;
+        let base = delta.clone();
+        let stats_before = stats.clone();
 
-        // 1. Timed sequential baseline.
         let t0 = Instant::now();
         let (seq_receipts, seq_delta) = execute_block_sequential(&snap, Some(&delta), env, &recs)?;
         let seq_ms = t0.elapsed().as_secs_f64() * 1e3;
-
-        // 2. Timed STM per worker count, byte-compared.
-        let mut stm_ms = Vec::with_capacity(worker_counts.len());
-        for (wi, &w) in worker_counts.iter().enumerate() {
-            let t = Instant::now();
-            let out = execute_block_stm(&snap, Some(&delta), env, &recs, &stats, w)?;
-            let ms = t.elapsed().as_secs_f64() * 1e3;
-            assert_identical(
-                &seq_receipts,
-                &seq_delta,
-                &out.receipts,
-                &out.delta,
-                env.block_number,
-                w,
-            );
-            if is_flow {
-                wall_stm[wi] += ms;
-                fallbacks[wi] += out.fallback as usize;
-                if wi == 0 {
-                    agg_edges += out.edges;
-                    agg_cold += out.cold;
-                }
-            }
-            stm_ms.push(ms);
+        if is_flow {
+            wall_seq += seq_ms;
+            flow_gas += seq_receipts
+                .last()
+                .map(|r| r.cumulative_gas_used)
+                .unwrap_or(0);
+            flow_txs += recs.len();
         }
 
-        // 3. Untimed capture pass: train the stats for the NEXT block
-        //    (prior-blocks-only, like the live shadow).
+        // Untimed capture pass: train the stats for the NEXT block
+        // (prior-blocks-only, like the live shadow).
         {
             let mut scope = ExecScope::new(&snap, Some(&delta), env)?;
             let mut cumulative = 0u64;
@@ -345,30 +323,50 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        if is_flow {
-            wall_seq += seq_ms;
-            flow_gas += seq_receipts
-                .last()
-                .map(|r| r.cumulative_gas_used)
-                .unwrap_or(0);
-            flow_txs += recs.len();
-        }
-        if a.per_block {
-            println!(
-                "{:>5} {:>5} {:>5} {:>7} {:>9.1}  {}",
-                env.block_number,
-                recs.len(),
-                if is_flow { "-" } else { "s" },
-                "-",
-                seq_ms,
-                stm_ms
-                    .iter()
-                    .map(|m| format!("{m:>8.1}"))
-                    .collect::<String>()
-            );
-        }
-
         delta.merge_from(&seq_delta);
+        cases.push(BlockCase {
+            env,
+            recs,
+            base,
+            stats: stats_before,
+            seq_receipts,
+            seq_delta,
+            is_flow,
+        });
+    }
+
+    // ---- Sweep: ONE persistent pool per worker count, blocks streamed
+    // through it — no per-block thread cost, matching the executor
+    // pipeline shape.
+    let mut wall_stm: Vec<f64> = vec![0.0; worker_counts.len()];
+    let mut fallbacks: Vec<usize> = vec![0; worker_counts.len()];
+    let (mut agg_edges, mut agg_cold) = (0usize, 0usize);
+    for (wi, &w) in worker_counts.iter().enumerate() {
+        kardamom_stm::execute::with_pool(&snap, w, |pool| -> anyhow::Result<()> {
+            for case in &cases {
+                let base = case.base.clone();
+                let t = Instant::now();
+                let out = pool.run_block(base, case.env, &case.recs, &case.stats)?;
+                let ms = t.elapsed().as_secs_f64() * 1e3;
+                assert_identical(
+                    &case.seq_receipts,
+                    &case.seq_delta,
+                    &out.receipts,
+                    &out.delta,
+                    case.env.block_number,
+                    w,
+                );
+                if case.is_flow {
+                    wall_stm[wi] += ms;
+                    fallbacks[wi] += out.fallback as usize;
+                    if wi == 0 {
+                        agg_edges += out.edges;
+                        agg_cold += out.cold;
+                    }
+                }
+            }
+            Ok(())
+        })?;
     }
 
     println!(

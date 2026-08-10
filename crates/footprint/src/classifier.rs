@@ -128,7 +128,7 @@ fn solve(obs: &TxObs, contract: Address, slot: B256) -> Option<Formula> {
 
 /// Aggregate stats over observations. Batch (`learn`) for the offline lab,
 /// incremental (`learn_obs`) for the live shadow — one code path.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Stats {
     pub by_selector: HashMap<(Address, [u8; 4]), SelectorStats>,
 }

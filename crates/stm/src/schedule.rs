@@ -84,9 +84,78 @@ fn view_from_parts(
     }
 }
 
-/// Build the pessimistic DAG for one block. `exclude` is the Accumulator
-/// boundary (the fee sink at minimum). `decoded[i]` is tx i's pre-decoded
-/// envelope (`None` = undecodable ⇒ tier-1 view, skipped at execution).
+/// INCREMENTAL DAG construction — the pipeline shape: the sealer streams
+/// canonical records in order, so when tx i arrives every predecessor it
+/// can have is already admitted; `admit` returns i's full predecessor set
+/// immediately and execution may start before i+1 exists. Pure bookkeeping,
+/// no locks — the engine integrates it under its per-block graph lock.
+#[derive(Debug, Default)]
+pub struct DagBuilder {
+    // Per-cell last toucher: chain in canonical order. Reader/writer modes
+    // are not split (predictions don't either — conservative, the same
+    // over-merge the P0 grading priced at ~0% on trained selectors).
+    last_toucher: HashMap<Cell, u32>,
+    // Wildcard bookkeeping: the last barrier, and the txs admitted since
+    // (each already depends on that barrier transitively).
+    last_barrier: Option<u32>,
+    since_barrier: Vec<u32>,
+    pub cold: usize,
+    pub edges: usize,
+}
+
+impl DagBuilder {
+    /// Admit tx i (must be called in canonical order) and return its
+    /// DEDUPED predecessor list. `cells` = the prediction (None = cold ⇒
+    /// barrier).
+    pub fn admit(
+        &mut self,
+        i: u32,
+        cells: Option<impl IntoIterator<Item = Cell>>,
+        exclude: &HashSet<Cell>,
+    ) -> Vec<u32> {
+        let mut preds: Vec<u32> = Vec::new();
+        match cells {
+            Some(cells) => {
+                if let Some(b) = self.last_barrier {
+                    preds.push(b);
+                }
+                for c in cells {
+                    if exclude.contains(&c) {
+                        continue;
+                    }
+                    if let Some(&p) = self.last_toucher.get(&c)
+                        && p != i
+                    {
+                        preds.push(p);
+                    }
+                    self.last_toucher.insert(c, i);
+                }
+                self.since_barrier.push(i);
+            }
+            None => {
+                // ⊤: barrier. Depends on every tx since the previous
+                // barrier (those cover the previous barrier transitively);
+                // with none in between, on the previous barrier itself.
+                self.cold += 1;
+                if self.since_barrier.is_empty() {
+                    if let Some(b) = self.last_barrier {
+                        preds.push(b);
+                    }
+                } else {
+                    preds.extend(self.since_barrier.iter().copied());
+                }
+                self.last_barrier = Some(i);
+                self.since_barrier.clear();
+            }
+        }
+        preds.sort_unstable();
+        preds.dedup();
+        self.edges += preds.len();
+        preds
+    }
+}
+
+/// Batch convenience over [`DagBuilder`] (tests, offline analysis).
 pub fn build(
     stats: &Stats,
     envelopes: &[TxEnvelope],
@@ -99,65 +168,17 @@ pub fn build(
         indegree: vec![0; n],
         ..Default::default()
     };
-
-    // Per-cell last toucher: chain in canonical order. Reader/writer modes
-    // are not split (predictions don't either — conservative, the same
-    // over-merge the P0 grading priced at ~0% on trained selectors).
-    let mut last_toucher: HashMap<Cell, u32> = HashMap::new();
-    // Dedup parallel edges (a tx pair sharing several cells).
-    let mut edge_seen: HashSet<(u32, u32)> = HashSet::new();
-    // Wildcard bookkeeping: the last barrier, and the txs admitted since
-    // (each already depends on that barrier transitively).
-    let mut last_barrier: Option<u32> = None;
-    let mut since_barrier: Vec<u32> = Vec::new();
-
-    let add_edge = |s: &mut BlockSchedule, edge_seen: &mut HashSet<(u32, u32)>, p: u32, c: u32| {
-        if p != c && edge_seen.insert((p, c)) {
-            s.children[p as usize].push(c);
-            s.indegree[c as usize] += 1;
-            s.edges += 1;
-        }
-    };
-
+    let mut dag = DagBuilder::default();
     for (i, env) in envelopes.iter().enumerate() {
         let view = scheduling_view_decoded(i as u32, env, decoded[i].as_ref());
-        let i = i as u32;
-        match stats.predict(&view) {
-            Some(cells) => {
-                // Everything after a barrier depends on it.
-                if let Some(b) = last_barrier {
-                    add_edge(&mut s, &mut edge_seen, b, i);
-                }
-                for c in cells {
-                    if exclude.contains(&c) {
-                        continue;
-                    }
-                    if let Some(&p) = last_toucher.get(&c) {
-                        add_edge(&mut s, &mut edge_seen, p, i);
-                    }
-                    last_toucher.insert(c, i);
-                }
-                since_barrier.push(i);
-            }
-            None => {
-                // ⊤: barrier. Depends on every tx since the previous
-                // barrier (those cover the previous barrier transitively);
-                // with none in between, on the previous barrier itself.
-                s.cold += 1;
-                if since_barrier.is_empty() {
-                    if let Some(b) = last_barrier {
-                        add_edge(&mut s, &mut edge_seen, b, i);
-                    }
-                } else {
-                    for &p in &since_barrier {
-                        add_edge(&mut s, &mut edge_seen, p, i);
-                    }
-                }
-                last_barrier = Some(i);
-                since_barrier.clear();
-            }
+        let preds = dag.admit(i as u32, stats.predict(&view), exclude);
+        for p in preds {
+            s.children[p as usize].push(i as u32);
+            s.indegree[i] += 1;
         }
     }
+    s.cold = dag.cold;
+    s.edges = dag.edges;
     s
 }
 
