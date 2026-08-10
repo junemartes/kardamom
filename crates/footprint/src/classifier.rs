@@ -126,6 +126,38 @@ fn solve(obs: &TxObs, contract: Address, slot: B256) -> Option<Formula> {
     None
 }
 
+/// A SCHEDULING key: the identity of a contention domain, named
+/// symbolically instead of by its keccak-derived slot address.
+///
+/// The scheduler only ever asks "do these two txs touch the same cell?" —
+/// and two calls touch the same mapping entry exactly when their
+/// `(contract, base_slot, key words)` agree. Hashing that tuple into the
+/// real slot address answers the same question at the cost of a keccak per
+/// predicted cell per tx (measured: 3.0us/tx, 57% of the serial feed and
+/// ~20% of a uniswap tx's whole execution time). Real slot addresses are
+/// needed only by VALIDATION, which reads the actual keys revm used and
+/// never consults a prediction — so the hot path can stay symbolic.
+///
+/// Collision behavior differs in the SAFE direction: distinct tuples never
+/// alias (keccak could, astronomically rarely), while a fixed slot that
+/// happens to equal some mapping entry's address is no longer recognized
+/// as the same domain — a missed edge, which the wound repairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum DomainKey {
+    /// Account cell (balance+nonce): tier-1 sender/recipient, fee sink.
+    Account(Address),
+    /// A slot whose address is known outright (tier-3 fixed slots).
+    Fixed(Address, B256),
+    /// A mapping entry named by its formula and this tx's key words —
+    /// keccak-free.
+    Derived {
+        contract: Address,
+        base: u8,
+        outer: U256,
+        inner: Option<U256>,
+    },
+}
+
 /// Aggregate stats over observations. Batch (`learn`) for the offline lab,
 /// incremental (`learn_obs`) for the live shadow — one code path.
 #[derive(Debug, Default, Clone)]
@@ -223,6 +255,66 @@ impl Stats {
         Some(cells)
     }
 
+    /// Predict the SCHEDULING domains of a tx — the hot-path predictor.
+    /// Same structure as [`Stats::predict`] (same tiers, same cold
+    /// semantics: `None` = untrained selector = ⊤), but it names mapping
+    /// entries symbolically instead of hashing them, which is what keeps
+    /// admission cheap enough to stay off the critical path.
+    pub fn predict_domains(&self, o: &TxObs) -> Option<Vec<DomainKey>> {
+        let mut keys: Vec<DomainKey> = Vec::with_capacity(8);
+        keys.push(DomainKey::Account(o.sender));
+        if o.has_value
+            && let Some(to) = o.to
+        {
+            keys.push(DomainKey::Account(to));
+        }
+        let (Some(to), Some(sel)) = (o.to, o.selector) else {
+            // Selector-less (native transfer / create): tier-1 is the
+            // whole footprint — exact, never cold.
+            keys.sort_unstable();
+            keys.dedup();
+            return Some(keys);
+        };
+        let e = self.by_selector.get(&(to, sel))?;
+        for ((addr, slot), n) in &e.slot_seen {
+            if *n * 10 >= e.observations * 6 {
+                keys.push(DomainKey::Fixed(*addr, *slot));
+            }
+        }
+        for (f, n) in &e.formulas {
+            if *n == 0 {
+                continue;
+            }
+            let Some(outer) = cand_word(o, f.outer) else {
+                continue;
+            };
+            let inner = match f.inner {
+                None => None,
+                Some(ic) => match cand_word(o, ic) {
+                    Some(k) => Some(k),
+                    // The formula needs a word this tx does not carry:
+                    // skip the key rather than invent one (a missed edge
+                    // is wound-repairable; a wrong one is silent).
+                    None => continue,
+                },
+            };
+            keys.push(DomainKey::Derived {
+                contract: f.contract,
+                base: f.base,
+                outer,
+                inner,
+            });
+        }
+        for (a, n) in &e.account_seen {
+            if *n * 10 >= e.observations * 6 {
+                keys.push(DomainKey::Account(*a));
+            }
+        }
+        keys.sort_unstable();
+        keys.dedup();
+        Some(keys)
+    }
+
     /// Share summary across all selectors: (fixed+derived slot-obs,
     /// unpredictable slot-obs is implicit) — for the report.
     pub fn class_shares(&self) -> (u64, u64, u64) {
@@ -315,6 +407,67 @@ mod tests {
         };
         let p = stats.predict(&native).expect("tier-1 never cold");
         assert!(p.contains(&Cell::Account(a)));
+    }
+
+    /// The symbolic keys must agree with the hashed ones on the ONE
+    /// question the scheduler asks: do two txs share a domain? Same
+    /// mapping entry ⇒ equal keys; different entry ⇒ different keys —
+    /// without computing a single keccak.
+    #[test]
+    fn domain_keys_agree_with_hashed_cells_on_conflicts() {
+        let a = address!("0000000000000000000000000000000000000A01");
+        let b = address!("0000000000000000000000000000000000000A02");
+        let mut stats = Stats::default();
+        stats.learn_obs(&transfer_obs(0, a, b));
+
+        let c = address!("0000000000000000000000000000000000000A03");
+        // Two txs sending to the SAME recipient share the recipient's
+        // balance entry; the sender entries differ.
+        let x = transfer_obs(1, a, c);
+        let y = transfer_obs(2, b, c);
+        let (dx, dy) = (
+            stats.predict_domains(&x).unwrap(),
+            stats.predict_domains(&y).unwrap(),
+        );
+        let shared: Vec<_> = dx.iter().filter(|k| dy.contains(k)).collect();
+        assert!(
+            !shared.is_empty(),
+            "same recipient entry must produce a shared domain key"
+        );
+        // And the hashed predictor agrees on the intersection being
+        // non-empty for exactly this reason.
+        let (cx, cy) = (stats.predict(&x).unwrap(), stats.predict(&y).unwrap());
+        assert!(cx.intersection(&cy).next().is_some());
+    }
+
+    #[test]
+    fn domain_keys_separate_independent_txs() {
+        // Train on SEVERAL distinct senders: with one observation the
+        // `account_seen` rule would generalize that single trainer's own
+        // account as a hot cell for everybody (the hashed predictor does
+        // the same) — real traffic never looks like that.
+        let mut stats = Stats::default();
+        for i in 0..5u8 {
+            let mut s = [0u8; 20];
+            s[19] = 0xA0 + i;
+            let mut r = [0u8; 20];
+            r[19] = 0xD0 + i;
+            stats.learn_obs(&transfer_obs(i as u64, Address::from(s), Address::from(r)));
+        }
+        let (s1, r1) = (
+            address!("0000000000000000000000000000000000000B01"),
+            address!("0000000000000000000000000000000000000B02"),
+        );
+        let (s2, r2) = (
+            address!("0000000000000000000000000000000000000B03"),
+            address!("0000000000000000000000000000000000000B04"),
+        );
+        let d1 = stats.predict_domains(&transfer_obs(1, s1, r1)).unwrap();
+        let d2 = stats.predict_domains(&transfer_obs(2, s2, r2)).unwrap();
+        assert!(
+            d1.iter().all(|k| !d2.contains(k)),
+            "disjoint senders/recipients must share no domain: {d1:?} vs {d2:?}"
+        );
     }
 
     #[test]

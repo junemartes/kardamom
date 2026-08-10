@@ -26,7 +26,7 @@ use kardamom_exec_core::executor::{
     write_set_from_evm_state,
 };
 use kardamom_footprint::Cell;
-use kardamom_footprint::classifier::Stats;
+use kardamom_footprint::classifier::{DomainKey, Stats};
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::DatabaseRef;
@@ -382,8 +382,10 @@ struct Graph {
     indegree: Vec<u32>,
     children: Vec<Vec<u32>>,
     complete: Vec<bool>,
-    /// Per-cell last toucher — the incremental index the edges come from.
-    last_toucher: HashMap<Cell, u32>,
+    /// Per-DOMAIN last toucher — the incremental index the edges come
+    /// from. Keyed symbolically (no keccak on the hot path); see
+    /// [`DomainKey`].
+    last_toucher: HashMap<DomainKey, u32>,
     /// The most recent ⊤ (cold) tx: conflicts with everything, so every
     /// later admission takes an edge from it while it is outstanding.
     last_barrier: Option<u32>,
@@ -713,17 +715,17 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // canonical order (stable across txs of one flow, which is what
         // puts a pool's traffic on one thread), else the sender cell —
         // exactly the SenderChain lane for tier-1-only txs.
-        let mut cells: Vec<Cell> = Vec::new();
-        let mut domain: Option<Cell> = None;
-        let is_cold = match self.stats.predict(&view) {
+        let mut cells: Vec<DomainKey> = Vec::new();
+        let mut domain: Option<DomainKey> = None;
+        let is_cold = match self.stats.predict_domains(&view) {
             Some(predicted) => {
                 for c in predicted {
-                    if self.exclude.contains(&c) {
+                    if c == DomainKey::Account(FEE_SINK) {
                         continue;
                     }
-                    let is_sender = matches!(c, Cell::Account(a) if a == envelope.sender);
+                    let is_sender = matches!(c, DomainKey::Account(a) if a == envelope.sender);
                     let domain_is_sender =
-                        matches!(domain, Some(Cell::Account(a)) if a == envelope.sender);
+                        matches!(domain, Some(DomainKey::Account(a)) if a == envelope.sender);
                     if domain.is_none() || (!is_sender && domain_is_sender) {
                         domain = Some(c);
                     }
@@ -741,11 +743,25 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             .predict_ns
             .fetch_add(t_pred.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let worker = match domain {
-            Some(Cell::Account(a)) => domain_hash(a.as_slice(), self.workers),
-            Some(Cell::Slot(a, k)) => {
+            Some(DomainKey::Account(a)) => domain_hash(a.as_slice(), self.workers),
+            Some(DomainKey::Fixed(a, k)) => {
                 let mut b = [0u8; 8];
                 b[..4].copy_from_slice(&a.as_slice()[16..20]);
                 b[4..].copy_from_slice(&k.as_slice()[28..32]);
+                domain_hash(&b, self.workers)
+            }
+            Some(DomainKey::Derived {
+                contract,
+                base,
+                outer,
+                ..
+            }) => {
+                // The instance IS the domain: a pool pair, a CLOB market,
+                // a user's balance entry. Hash contract+base+key word.
+                let mut b = [0u8; 9];
+                b[..4].copy_from_slice(&contract.as_slice()[16..20]);
+                b[4] = base;
+                b[5..].copy_from_slice(&outer.to_be_bytes::<32>()[28..32]);
                 domain_hash(&b, self.workers)
             }
             // ⊤ and empty predictions: canonical round-robin.
