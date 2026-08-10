@@ -348,6 +348,7 @@ struct TxResult {
 }
 
 /// Outcome of one block through the STM engine.
+#[derive(Default)]
 pub struct StmOutcome {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
@@ -357,6 +358,14 @@ pub struct StmOutcome {
     pub wounds: usize,
     /// Any wound fired (spec invariant #3's counter, per block).
     pub fallback: bool,
+    /// The pool DECLINED this block and ran it sequentially, because the
+    /// work per transaction was too small for parallel execution to pay
+    /// for its own coordination. See `PARALLEL_WORTH_NS`.
+    pub declined: bool,
+    /// Mean per-tx execution time this block taught the pool — the input
+    /// to the next block's decline decision. Non-zero after a DECLINED
+    /// block too: that is what keeps the gate from being a trap door.
+    pub learned_tx_ns: u64,
     /// ⊤ (cold, untrained-selector) txs — they wait out the prefix.
     pub cold: usize,
     /// Live-DAG edges created across the block (only against predecessors
@@ -493,6 +502,27 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 /// it helped only the oversubscribed case (12 workers on 12 cores) and
 /// cost 20-35% everywhere else. Do not run more workers than cores minus
 /// the feed thread; that is the real fix for oversubscription.
+/// Mean per-tx execution time below which the pool DECLINES a block and
+/// runs it sequentially.
+///
+/// Parallel execution buys down only the execution span; it cannot buy
+/// down the serial feed (~0.4us/tx of admission) or the commit tail, and
+/// it adds cross-core traffic to every read and publish. Below some
+/// amount of work per transaction those fixed costs exceed anything more
+/// cores can return, and the honest thing is not to compete.
+///
+/// MEASURED on the two ends of the workload range (mdbx-backed, 8000 txs):
+/// plain transfers cost ~2.5us/tx and lose (0.87x at 8 workers), while
+/// uniswap swaps cost ~18us/tx and win (1.81x). The threshold sits
+/// between them, nearer the losing end so that a workload only forfeits
+/// parallelism when it clearly cannot benefit.
+///
+/// This is a FLOOR, not a verdict on transfers: the costs it defends
+/// against — the single-threaded feed and the serial delta fold — are
+/// implementation limits, and if they come down this constant should come
+/// down with them.
+const PARALLEL_WORTH_NS: u64 = 8_000;
+
 const SPIN_BEFORE_PARK: u32 = 256;
 
 /// Mean per-tx execution time above which moving a ready tx to an idle
@@ -623,6 +653,11 @@ pub struct PoolConfig {
     /// dry always force-prunes first, so batching can never starve the
     /// pool, only delay a handoff.
     pub prune_batch: usize,
+    /// Mean per-tx execution time below which the pool DECLINES a block
+    /// and runs it sequentially. See `PARALLEL_WORTH_NS` for the measured
+    /// default. Injectable so the policy is testable without depending on
+    /// how loaded the machine is, and tunable per deployment.
+    pub parallel_worth_ns: u64,
 }
 
 /// MEASURED default (uniswap 8-pair, 16x500, 8 workers): batching 8
@@ -638,6 +673,7 @@ impl Default for PoolConfig {
         Self {
             workers: 1,
             prune_batch: DEFAULT_PRUNE_BATCH,
+            parallel_worth_ns: PARALLEL_WORTH_NS,
         }
     }
 }
@@ -913,6 +949,7 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// Mean per-tx execution time of the last block, feeding the stealing
     /// policy. Feed-thread-owned, so a `Cell` suffices.
     avg_tx_ns: std::cell::Cell<u64>,
+    parallel_worth_ns: u64,
     /// THE ARENA. Allocated once for the pool's lifetime and reused by
     /// every block: a node is addressed by its index, so nothing here is
     /// ever allocated, freed, or reference-counted per transaction. This
@@ -939,6 +976,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let cfg = PoolConfig {
         workers,
         prune_batch: cfg.prune_batch.max(1),
+        ..cfg
     };
     let shared: PoolShared<S> = (
         Mutex::new(PoolState {
@@ -957,6 +995,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         let handle = PoolHandle {
             shared: shared_ref,
             avg_tx_ns: std::cell::Cell::new(0),
+            parallel_worth_ns: cfg.parallel_worth_ns,
             arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
@@ -1124,11 +1163,57 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         stats: &Stats,
     ) -> Result<StmOutcome, ExecutorError> {
         debug_assert_eq!(txs.len(), prepared.len(), "one Prepared per tx");
+        if !self.parallel_worth_it() {
+            return self.decline(&snapshots[0], base, env, txs);
+        }
         let mut sess = self.begin_block_per_worker(snapshots, base, env, stats)?;
         for ((t, p, e), prep) in txs.iter().zip(prepared) {
             sess.push_prepared(*t, *p, e.clone(), prep)?;
         }
         sess.seal()
+    }
+
+    /// Would parallel execution pay for itself on this workload?
+    ///
+    /// Uses the mean per-tx execution time learned from previous blocks —
+    /// the same statistic the stealing policy runs on. A fresh pool has no
+    /// measurement yet and is given the benefit of the doubt; one block is
+    /// enough to correct course.
+    fn parallel_worth_it(&self) -> bool {
+        let avg = self.avg_tx_ns.get();
+        avg == 0 || avg >= self.parallel_worth_ns
+    }
+
+    /// Run the block on this thread, through the SAME code path the
+    /// sequential executor uses — not a reimplementation of it.
+    fn decline(
+        &self,
+        snapshot: &S,
+        base: PendingDelta,
+        env: ExecEnv,
+        txs: &[(TxIndex, BPosition, TxEnvelope)],
+    ) -> Result<StmOutcome, ExecutorError> {
+        let started = std::time::Instant::now();
+        let (receipts, delta) = execute_block_sequential(snapshot, Some(&base), env, txs)?;
+        // KEEP MEASURING while declining. Without this the gate is a trap
+        // door: `avg_tx_ns` would hold the value that caused the decline
+        // forever, and a pool that once saw cheap transfers would refuse
+        // to parallelize a heavy contract block later in the same run.
+        // Sequential per-tx cost slightly OVERSTATES the pool's own (it
+        // hashes each write set inline, which the pool defers to its
+        // parallel commit phase), so the bias is toward re-entering
+        // parallel execution rather than staying out.
+        if !txs.is_empty() {
+            self.avg_tx_ns
+                .set(started.elapsed().as_nanos() as u64 / txs.len() as u64);
+        }
+        Ok(StmOutcome {
+            receipts,
+            delta,
+            declined: true,
+            learned_tx_ns: self.avg_tx_ns.get(),
+            ..Default::default()
+        })
     }
 
     /// Batch convenience: feed the whole block, seal, return the outcome.
@@ -1140,6 +1225,9 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         txs: &[(TxIndex, BPosition, TxEnvelope)],
         stats: &Stats,
     ) -> Result<StmOutcome, ExecutorError> {
+        if !self.parallel_worth_it() {
+            return self.decline(&snapshots[0], base, env, txs);
+        }
         let mut sess = self.begin_block_per_worker(snapshots, base, env, stats)?;
         for (t, p, e) in txs {
             sess.push_tx(*t, *p, e.clone())?;
@@ -1613,6 +1701,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             delta,
             wounds,
             fallback: wounds > 0,
+            declined: false,
+            learned_tx_ns: pool.avg_tx_ns.get(),
             cold,
             edges,
             dispatch,

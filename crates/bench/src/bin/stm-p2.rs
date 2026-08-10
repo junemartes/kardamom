@@ -234,6 +234,7 @@ fn run_mdbx_ab(
             let cfg = kardamom_stm::execute::PoolConfig {
                 workers: w,
                 prune_batch: batch,
+                ..Default::default()
             };
             let mut stats = Stats::default();
             let mut global_idx = 0u64;
@@ -672,6 +673,7 @@ fn main() -> anyhow::Result<()> {
             let cfg = kardamom_stm::execute::PoolConfig {
                 workers: w,
                 prune_batch: batch,
+                ..Default::default()
             };
             let mut row = Row {
                 workers: w,

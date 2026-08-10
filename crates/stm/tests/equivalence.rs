@@ -360,6 +360,7 @@ fn each_tx_occupies_one_node_and_exits_once() {
         PoolConfig {
             workers: 4,
             prune_batch: 8,
+            ..Default::default()
         },
         |pool| {
             pool.run_block(
@@ -405,6 +406,7 @@ fn every_block_drains() {
         PoolConfig {
             workers: 4,
             prune_batch: 8,
+            ..Default::default()
         },
         |pool| {
             pool.run_block(
@@ -424,4 +426,122 @@ fn every_block_drains() {
     );
     assert_eq!(out.cold, 2);
     assert_identical(&seq, &out.receipts, &out.delta, "drain");
+}
+
+/// The pool must never be a pessimization. Plain transfers cost far less
+/// per transaction than parallel execution costs to coordinate, so once
+/// the pool has MEASURED that, it declines the block and runs it
+/// sequentially — and the result is still byte-identical, because
+/// declining routes through the sequential executor itself rather than a
+/// second implementation of it.
+///
+/// The threshold is INJECTED rather than left at its measured default:
+/// the gate is a timing decision, and a test that depends on how loaded
+/// the machine is would pass alone and fail in a parallel test run — as
+/// the first version of this test did.
+#[test]
+fn cheap_blocks_are_declined_and_still_match() {
+    use kardamom_stm::execute::{PoolConfig, with_pool};
+    let sg = signers(6);
+    let database = db(&sg);
+    let first = records(
+        (0..6usize)
+            .map(|i| tx(&sg[i], 0, TxKind::Call(sg[(i + 1) % 6].address()), 100, &[]))
+            .collect(),
+    );
+    let second = records(
+        (0..6usize)
+            .map(|i| tx(&sg[i], 1, TxKind::Call(sg[(i + 2) % 6].address()), 10, &[]))
+            .collect(),
+    );
+
+    let (r1, d1) = execute_block_sequential(&database, None, env(), &first).unwrap();
+    let seq2 = execute_block_sequential(&database, Some(&d1), env(), &second).unwrap();
+
+    let (declined, learned, receipts, delta) = with_pool(
+        PoolConfig {
+            workers: 4,
+            prune_batch: 8,
+            // No amount of work per tx is ever "worth it" — so the only
+            // block that runs in parallel is the one taken before any
+            // measurement exists.
+            parallel_worth_ns: u64::MAX,
+        },
+        |pool| {
+            let out1 = pool
+                .run_block(
+                    vec![database.clone(); 4],
+                    PendingDelta::new(),
+                    env(),
+                    &first,
+                    &Stats::default(),
+                )
+                .expect("first block");
+            assert!(!out1.declined, "a fresh pool has nothing to decline on");
+            assert_identical(&(r1.clone(), d1.clone()), &out1.receipts, &out1.delta, "b1");
+
+            let out2 = pool
+                .run_block(
+                    vec![database.clone(); 4],
+                    out1.delta.clone(),
+                    env(),
+                    &second,
+                    &Stats::default(),
+                )
+                .expect("second block");
+            (out2.declined, out2.learned_tx_ns, out2.receipts, out2.delta)
+        },
+    );
+
+    assert!(declined, "the pool should have declined rather than lose");
+    assert_identical(&seq2, &receipts, &delta, "declined block");
+    // The trap door: a declined block MUST still teach the pool what a
+    // transaction costs, or one cheap block disables the engine for the
+    // rest of the run.
+    assert!(
+        learned > 0,
+        "declining stopped the measurement — the gate can never reopen"
+    );
+}
+
+/// With the gate wide open the pool always executes in parallel, so the
+/// decline path is a policy and not a silent behaviour change.
+#[test]
+fn an_open_gate_never_declines() {
+    use kardamom_stm::execute::{PoolConfig, with_pool};
+    let sg = signers(6);
+    let database = db(&sg);
+    let block = records(
+        (0..6usize)
+            .map(|i| tx(&sg[i], 0, TxKind::Call(sg[(i + 1) % 6].address()), 100, &[]))
+            .collect(),
+    );
+    let seq = execute_block_sequential(&database, None, env(), &block).unwrap();
+
+    with_pool(
+        PoolConfig {
+            workers: 4,
+            prune_batch: 8,
+            parallel_worth_ns: 0,
+        },
+        |pool| {
+            let mut base = PendingDelta::new();
+            for round in 0..3 {
+                let out = pool
+                    .run_block(
+                        vec![database.clone(); 4],
+                        base.clone(),
+                        env(),
+                        &block,
+                        &Stats::default(),
+                    )
+                    .expect("block");
+                assert!(!out.declined, "round {round} declined with the gate open");
+                if round == 0 {
+                    assert_identical(&seq, &out.receipts, &out.delta, "open gate");
+                }
+                base = out.delta.clone();
+            }
+        },
+    );
 }
