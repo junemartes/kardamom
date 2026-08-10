@@ -40,6 +40,32 @@ pub struct BlockOrigin {
 /// same seam `read_validator_state_root` uses. Nothing exposes headers over
 /// RPC (there is no `eth_getBlockByNumber`), so the state DB is the only
 /// place the origin is observable — which is itself worth knowing.
+/// [`read_block_origins`], but wait until the header for `block_number` has
+/// actually been committed.
+///
+/// A receipt is published at EXECUTION time; the header lands only when the
+/// block COMMITS at the next sealer boundary. Anything that learns a block
+/// number from a receipt and then reads the headers table is therefore racing
+/// that commit, and must wait rather than assume.
+pub async fn await_block_origins_through(
+    state_dir: &Path,
+    block_number: u64,
+) -> Result<Vec<BlockOrigin>> {
+    crate::harness::metrics::poll_until(
+        &format!("the committed header for block {block_number}"),
+        Duration::from_secs(30),
+        Duration::from_millis(200),
+        || async {
+            let blocks = read_block_origins(state_dir)?;
+            Ok(blocks
+                .iter()
+                .any(|b| b.block_number == block_number)
+                .then_some(blocks))
+        },
+    )
+    .await
+}
+
 pub fn read_block_origins(state_dir: &Path) -> Result<Vec<BlockOrigin>> {
     let env = open_state_ro(state_dir)?;
     let headers = kardamom_state::read_all_headers(&env).context("read headers table")?;
@@ -189,7 +215,13 @@ pub async fn deposits_lead_their_block_under_load(
     );
 
     // And the block it leads is the one whose origin is the epoch's.
-    let blocks = read_block_origins(state_dir)?;
+    //
+    // The receipt we just placed is published when the tx EXECUTES, but the
+    // block's header is persisted only when that block COMMITS at the next
+    // sealer boundary — so reading the state DB the instant a receipt lands
+    // races the commit, and lost that race intermittently ("no header for
+    // block N"). Wait for the header instead of assuming it is already there.
+    let blocks = await_block_origins_through(state_dir, block_number).await?;
     let this = blocks
         .iter()
         .find(|b| b.block_number == block_number)
