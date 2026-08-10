@@ -119,6 +119,31 @@ final class IngressFrames {
     }
 
     /**
+     * A complete {@code KIND_REMOTE_ORIGIN_RECORD} frame
+     * {@code [kind:5][canonical_id:32][origin_chain_id:u64 LE][anchor_number:u64 LE]
+     * [slot_count:u32 LE][payload…]}. Built from the {@link SealerWire}
+     * constants; {@link RemoteOriginFrameTest} pins those constants to the
+     * literal offsets the Rust encoder writes.
+     */
+    static byte[] remoteOriginRecordFrame(
+            final byte[] id32,
+            final long originChainId,
+            final long anchorNumber,
+            final int slots,
+            final byte[] payload) {
+        final ExpandableArrayBuffer buf = new ExpandableArrayBuffer();
+        buf.putByte(SealerWire.KIND_OFFSET, SealerWire.KIND_REMOTE_ORIGIN_RECORD);
+        buf.putBytes(SealerWire.REMOTE_ID_OFFSET, id32);
+        buf.putLong(SealerWire.REMOTE_CHAIN_ID_OFFSET, originChainId, ByteOrder.LITTLE_ENDIAN);
+        buf.putLong(SealerWire.REMOTE_ANCHOR_OFFSET, anchorNumber, ByteOrder.LITTLE_ENDIAN);
+        buf.putInt(SealerWire.REMOTE_SLOT_COUNT_OFFSET, slots, ByteOrder.LITTLE_ENDIAN);
+        buf.putBytes(SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN, payload);
+        final byte[] out = new byte[SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN + payload.length];
+        buf.getBytes(0, out);
+        return out;
+    }
+
+    /**
      * A complete {@code KIND_ORIGIN_RECORD} frame
      * {@code [kind:4][canonical_id:32][l1_origin:u64 LE][slot_count:u32 LE][payload…]}.
      */

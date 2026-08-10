@@ -10,6 +10,7 @@ import io.aeron.logbuffer.Header;
 import io.kardamom.sealer.Boundary;
 import io.kardamom.sealer.CanonicalSealerState;
 import io.kardamom.sealer.OriginAdvance;
+import io.kardamom.sealer.RemoteOriginAdvance;
 import java.nio.ByteOrder;
 import java.util.Optional;
 import org.agrona.DirectBuffer;
@@ -199,6 +200,13 @@ public final class SealerClusteredService implements ClusteredService {
                 onOriginRecord(buffer, offset, length);
                 maybeReviveBoundaryClock();
                 return;
+            case SealerWire.KIND_REMOTE_ORIGIN_RECORD:
+                // Its OWN kind, so the branch is taken on the tag alone: the
+                // service never peeks into the payload to tell a peer's message
+                // batch from an L1 epoch.
+                onRemoteOriginRecord(buffer, offset, length);
+                maybeReviveBoundaryClock();
+                return;
             case SealerWire.KIND_BATCH:
                 onBatch(session, buffer, offset, length);
                 return;
@@ -300,6 +308,65 @@ public final class SealerClusteredService implements ClusteredService {
         }
         if (advance.isEmpty()) {
             return; // duplicate epoch from a racing sequencer
+        }
+        advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
+        egress.offerRelayed(advance.get().relayed());
+    }
+
+    /**
+     * Handle a {@link SealerWire#KIND_REMOTE_ORIGIN_RECORD} frame: strip the
+     * peer identity ({@code origin_chain_id}), that peer's anchor position and
+     * the slot count, relay the remaining payload verbatim, and offer the
+     * forced boundary FIRST so the batch leads the block it opens rather than
+     * trailing the one it closes.
+     *
+     * <p>Same shape as {@link #onOriginRecord} with one extra u64 in the
+     * header; the peer position it feeds the state machine is used for dedup's
+     * companion checks only and is NEVER stamped into a boundary (see
+     * {@link CanonicalSealerState#onRemoteOriginRecord}).</p>
+     */
+    private void onRemoteOriginRecord(final DirectBuffer buffer, final int offset, final int length) {
+        if (length < SealerWire.MIN_REMOTE_ORIGIN_RECORD_LEN) {
+            onMalformedFrame("remote-origin-record", length);
+            return;
+        }
+        buffer.getBytes(offset + SealerWire.REMOTE_ID_OFFSET, canonicalIdScratch);
+        final long originChainId =
+                buffer.getLong(offset + SealerWire.REMOTE_CHAIN_ID_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long anchorNumber =
+                buffer.getLong(offset + SealerWire.REMOTE_ANCHOR_OFFSET, ByteOrder.LITTLE_ENDIAN);
+        final long slotCount =
+                buffer.getInt(offset + SealerWire.REMOTE_SLOT_COUNT_OFFSET, ByteOrder.LITTLE_ENDIAN)
+                        & 0xFFFF_FFFFL;
+
+        // Same relay shape as an epoch: [canonical_id:32][record_type][fields…],
+        // measured from the END of the header so no slack lands where rkyv
+        // looks for its root.
+        final int tailLength = length - (SealerWire.REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES);
+        final byte[] payload = new byte[CanonicalSealerState.CANONICAL_ID_LEN + tailLength];
+        buffer.getBytes(
+                offset + SealerWire.REMOTE_ID_OFFSET, payload, 0, CanonicalSealerState.CANONICAL_ID_LEN);
+        if (tailLength > 0) {
+            buffer.getBytes(
+                    offset + SealerWire.REMOTE_SLOT_COUNT_OFFSET + Integer.BYTES,
+                    payload,
+                    CanonicalSealerState.CANONICAL_ID_LEN,
+                    tailLength);
+        }
+
+        final Optional<RemoteOriginAdvance> advance;
+        try {
+            advance = state.onRemoteOriginRecord(
+                canonicalIdScratch, originChainId, anchorNumber, slotCount, payload, cluster.time());
+        } catch (final IllegalArgumentException ex) {
+            // A non-advancing peer position is a producer bug, exactly like a
+            // non-advancing L1 origin. Every member rejects it identically (the
+            // check reads only replicated state), so dropping is deterministic.
+            onMalformedFrame("remote-origin-record-regression", length);
+            return;
+        }
+        if (advance.isEmpty()) {
+            return; // duplicate batch from a racing watcher
         }
         advance.get().forcedBoundary().ifPresent(egress::offerBoundary);
         egress.offerRelayed(advance.get().relayed());
