@@ -234,39 +234,87 @@ pub async fn finalize_withdrawal(
     } = ticket;
 
     let oracle = WithdrawalOutputOracle::new(l1.oracle, l1.provider());
-    // Wait until some posted output commits to (validator's current root,
-    // our withdrawals root). Both sides settle asynchronously — the validator
-    // finishes committing, then the attester posts — so poll the pair.
-    let (output_index, state_root) = poll_until(
+
+    // The attester carries this withdrawal's leaf in exactly ONE posted
+    // output: a post pairs the arriving state root with `leaves_through`,
+    // then `mark_attested` DROPS those leaves (and `on_leaves` refuses to
+    // re-add them for an already-attested block). So there is a single
+    // (state_root, withdrawals_root) pair on chain that can ever match, and
+    // its root is whichever one the feeder happened to deliver alongside —
+    // not necessarily the root that is still head by the time we look.
+    //
+    // Sampling only the CURRENT head root therefore raced: once a later
+    // block committed, the head moved off the attested root and no future
+    // post could match, so the remaining poll budget was dead time.
+    // Instead, remember every root the validator is observed at (cheap,
+    // 100 ms cadence, off the poll's own cadence so a fast block can't slip
+    // between two samples) and test them all. Proving against a historical
+    // root is exactly what `finalizeWithdrawal` expects — it takes the
+    // `state_root` as an explicit argument.
+    let observed: std::sync::Arc<std::sync::Mutex<Vec<B256>>> = Default::default();
+    let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let observed = observed.clone();
+        let stop = sampler_stop.clone();
+        let dir = validator_state_dir.to_path_buf();
+        std::thread::Builder::new()
+            .name("s2-root-sampler".into())
+            .spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Errors are expected and transient here (the env is
+                    // opened read-only while the validator writes); the poll
+                    // below surfaces the real failure.
+                    if let Ok(Some(r)) = read_validator_state_root(&dir) {
+                        let mut seen = observed.lock().expect("observed roots poisoned");
+                        if seen.last() != Some(&r) {
+                            seen.push(r);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+            .context("spawn S2 root sampler")?
+    };
+
+    let found = poll_until(
         "an attested output committing to this withdrawal",
         Duration::from_secs(90),
         Duration::from_millis(500),
         || async {
-            let Some(root) = read_validator_state_root(validator_state_dir)? else {
-                return Ok(None);
-            };
-            let expected = kardamom_types::withdrawals::output_root(root, withdrawals_root);
             let count = oracle
                 .outputCount()
                 .call()
                 .await
                 .unwrap_or(U256::ZERO)
                 .to::<u64>();
-            // Newest first: the withdrawal's block is at the head.
+            // Newest first: the withdrawal's block is near the head.
             for i in (0..count).rev() {
                 let idx = U256::from(i);
-                if oracle.outputRootAt(idx).call().await.ok() == Some(expected) {
-                    return Ok(Some((idx, root)));
+                let Ok(posted) = oracle.outputRootAt(idx).call().await else {
+                    continue;
+                };
+                let roots = observed.lock().expect("observed roots poisoned").clone();
+                for root in roots.iter().rev() {
+                    let expected =
+                        kardamom_types::withdrawals::output_root(*root, withdrawals_root);
+                    if posted == expected {
+                        return Ok(Some((idx, *root)));
+                    }
                 }
             }
             Ok(None)
         },
     )
-    .await
-    .context(
-        "no posted output commits to (validator state root, withdrawals root) — the attester never \
-         covered the withdrawal's block",
-    )?;
+    .await;
+    sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = sampler.join();
+    let (output_index, state_root) = found.with_context(|| {
+        format!(
+            "no posted output commits to (any observed validator state root, withdrawals root) — \
+             the attester never covered the withdrawal's block (sampled {} distinct roots)",
+            observed.lock().expect("observed roots poisoned").len()
+        )
+    })?;
 
     // --- L1: finalize after the window. -----------------------------------
     l1.warp_past_window().await?;
