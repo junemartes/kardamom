@@ -205,6 +205,17 @@ pub struct AttestState {
     last_attested: u64,
     /// Post cadence in blocks.
     interval: u64,
+    /// Lowest block THIS PROCESS attested (set on its first successful post).
+    ///
+    /// It separates the two ways leaves can arrive for an already-attested
+    /// block. At or above it, we posted that output ourselves and provably
+    /// did not have these leaves at the time — every block's leaves are
+    /// submitted exactly once by [`AttestingReceiptSink`] — so they were
+    /// omitted and must be carried forward. Below it, coverage predates this
+    /// process (the oracle resume point, or a replayed receipt stream
+    /// re-collecting blocks an earlier run already attested) and the leaves
+    /// are genuinely redundant: re-adding them would double-count.
+    own_attest_floor: Option<u64>,
 }
 
 impl AttestState {
@@ -213,15 +224,51 @@ impl AttestState {
             pending: BTreeMap::new(),
             last_attested,
             interval: interval.max(1),
+            own_attest_floor: None,
         }
     }
 
-    /// Record a committed block's withdrawal leaves. Blocks at/below the
-    /// attested floor are already covered by an on-chain output and dropped.
+    /// Record a committed block's withdrawal leaves.
+    ///
+    /// Leaves and state roots reach the attester through INDEPENDENT
+    /// pipelines — leaves from the executor's tx_receipts stream (via
+    /// [`AttestingReceiptSink`]), roots from this validator's own commit —
+    /// with no ordering guarantee between them. When the root for block N
+    /// won that race, N was posted with `leaves=0`, `last_attested` advanced
+    /// to N, and N's leaves then arrived to a floor that had already passed
+    /// them: they used to be DROPPED, and the withdrawal became permanently
+    /// unattestable (no later output can carry them — nothing re-collects
+    /// them — so `finalizeWithdrawal` had no output to prove against, and
+    /// the funds were stranded).
+    ///
+    /// Carry them forward instead, onto the first not-yet-attested block, so
+    /// the next output covers them. That is the same remedy the post-failure
+    /// path already relies on ("keep the leaves pending and retry at the next
+    /// cadence point"), and it is consistent by construction: an output at
+    /// block M commits to the withdrawals tree of everything through M.
     pub fn on_leaves(&mut self, block: u64, leaves: Vec<B256>) {
-        if block > self.last_attested && !leaves.is_empty() {
-            self.pending.insert(block, leaves);
+        if leaves.is_empty() {
+            return;
         }
+        if block > self.last_attested {
+            self.pending.insert(block, leaves);
+            return;
+        }
+        // Below our own floor the coverage predates this process, so these
+        // are a genuine re-collection and adding them would double-count.
+        if self.own_attest_floor.is_none_or(|floor| block < floor) {
+            return;
+        }
+        let carry = self.last_attested + 1;
+        tracing::warn!(
+            block,
+            last_attested = self.last_attested,
+            carried_to = carry,
+            count = leaves.len(),
+            "withdrawal leaves arrived after their block was attested (the state root won the \
+             race against the receipt stream); carrying them into the next output"
+        );
+        self.pending.entry(carry).or_default().extend(leaves);
     }
 
     /// True once `block`'s state root warrants a new output.
@@ -242,6 +289,9 @@ impl AttestState {
 
     /// A successful post covered everything up to `block`.
     pub fn mark_attested(&mut self, block: u64) {
+        // Record where THIS process' own coverage begins, before the floor
+        // moves — see `own_attest_floor`.
+        self.own_attest_floor.get_or_insert(self.last_attested + 1);
         self.last_attested = block;
         self.pending = self.pending.split_off(&(block + 1));
     }
@@ -556,9 +606,57 @@ mod tests {
         assert!(!st.due(11));
         assert!(st.due(12));
 
-        // Stale leaves (block already attested) are ignored.
+        // Leaves for a block WE attested, arriving after the fact: the output
+        // we posted could not have carried them, so they ride into the next
+        // one rather than being lost.
         st.on_leaves(7, vec![l(9)]);
-        assert!(st.leaves_through(12).is_empty());
+        assert_eq!(st.leaves_through(12), vec![l(9)]);
+    }
+
+    /// The race this guards: the state root for a block can reach the
+    /// attester before that block's leaves do (independent pipelines — roots
+    /// from the validator's own commit, leaves from the executor's
+    /// tx_receipts stream). The output then goes out with `leaves=0`, and the
+    /// leaves must NOT be dropped on arrival or the withdrawal becomes
+    /// permanently unattestable and its funds are stranded.
+    #[test]
+    fn leaves_losing_the_race_to_their_root_are_carried_forward() {
+        let l = |n: u64| B256::from(U256::from(n));
+        let mut st = AttestState::new(0, 1);
+
+        // Root for block 4 arrives first: posted with nothing.
+        assert!(st.leaves_through(4).is_empty());
+        st.mark_attested(4);
+
+        // Block 4's leaves show up late — they belong to an output we already
+        // posted without them, so the next output must cover them.
+        st.on_leaves(4, vec![l(1)]);
+        assert_eq!(st.leaves_through(5), vec![l(1)]);
+        st.mark_attested(5);
+        assert!(st.leaves_through(9).is_empty());
+    }
+
+    /// The case the drop exists for, which must still drop: leaves
+    /// re-collected for blocks covered BEFORE this process started (oracle
+    /// resume point, or a replayed receipt stream). Carrying those forward
+    /// would double-count them into a later output's withdrawals tree.
+    #[test]
+    fn re_collected_leaves_below_our_own_floor_stay_dropped() {
+        let l = |n: u64| B256::from(U256::from(n));
+        // Resuming: the oracle says blocks through 10 are already attested.
+        let mut st = AttestState::new(10, 1);
+        st.on_leaves(6, vec![l(1)]);
+        assert!(st.leaves_through(20).is_empty(), "no own floor yet ⇒ drop");
+
+        // Attest 12 ourselves; our own coverage starts at 11.
+        st.on_leaves(12, vec![l(2)]);
+        st.mark_attested(12);
+        // Still below our floor ⇒ still dropped.
+        st.on_leaves(9, vec![l(3)]);
+        assert!(st.leaves_through(20).is_empty());
+        // At/above our floor ⇒ carried.
+        st.on_leaves(11, vec![l(4)]);
+        assert_eq!(st.leaves_through(20), vec![l(4)]);
     }
 
     #[test]
