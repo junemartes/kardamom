@@ -13,7 +13,7 @@
 //! the optimization lands with P2b once the A/B shows where it pays.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 use alloy_primitives::{B256, U256};
@@ -268,6 +268,50 @@ pub struct StmOutcome {
     pub idle_us: u64,
 }
 
+/// FNV-1a `BuildHasher` for the scheduler's internal maps.
+///
+/// `DomainKey`s are already high-entropy (addresses, hashes, key words),
+/// so the standard library's SipHash — chosen to resist adversarial key
+/// collisions in maps whose keys come from untrusted input — buys nothing
+/// here and costs real time on a path measured in hundreds of nanoseconds
+/// per tx. A collision-heavy map would only cost scheduling throughput,
+/// never correctness: edges are still exact (the key COMPARISON is
+/// unchanged), and a mispredicted schedule is wound-repairable.
+#[derive(Default, Clone, Copy)]
+struct FnvBuild;
+
+struct Fnv(u64);
+
+impl std::hash::BuildHasher for FnvBuild {
+    type Hasher = Fnv;
+    fn build_hasher(&self) -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= *b as u64;
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.write(&n.to_le_bytes());
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write(&n.to_le_bytes());
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.write(&[n]);
+    }
+}
+
+type FastMap<K, V> = HashMap<K, V, FnvBuild>;
+
 /// The ⊤ key: a cold tx marks it, and every tx probes it before executing,
 /// so "conflicts with everything" needs no graph. Not a real account — it
 /// is never read or written by the EVM, only used as a pending-mark key.
@@ -364,34 +408,35 @@ impl Default for PoolConfig {
     }
 }
 
-/// The LIVE dependency DAG. Mutated at exactly two moments — when a tx is
-/// ADMITTED (its predicted conflicts become edges) and when a tx FINISHES
-/// (its edges retire and any child that just became ready is dispatched) —
-/// so the graph always describes only work that is still outstanding.
+/// One tx's node in the LIVE dependency DAG — and its REGISTRATION POINT.
 ///
-/// Being live is what makes the graph cheap AND sharper than a batch DAG:
-/// an edge is only created against a predecessor that has not finished
-/// yet, so a tx admitted after its conflicting predecessor completed is
-/// dispatched immediately (it will simply read the published version)
-/// instead of inheriting a dead edge.
+/// The lock-free trick that removes the global admission lock: a node is
+/// "still in flight" exactly while its `children` list is OPEN. Admission
+/// registers an edge by pushing into a predecessor's open list; the
+/// predecessor's completion CLOSES the list (`None`) and drains it. Both
+/// happen under that ONE node's tiny mutex, so "is p outstanding?" and
+/// "register my edge on p" are a single atomic step — which is precisely
+/// the guarantee a `Weak::upgrade` cannot give on its own (dropping the
+/// last strong reference does not order against a concurrent
+/// registration, so an edge could be registered onto a list already
+/// drained, and its child would then wait forever for a decrement nobody
+/// will send).
+///
+/// Contention is nil: only the single feed thread pushes, and only the
+/// one worker that executed p closes. There is no structure any two
+/// threads contend on for the whole block.
 #[derive(Default)]
-struct Graph {
-    admitted: u32,
-    finished: u32,
-    sealed: bool,
-    indegree: Vec<u32>,
-    children: Vec<Vec<u32>>,
-    complete: Vec<bool>,
-    /// Per-DOMAIN last toucher — the incremental index the edges come
-    /// from. Keyed symbolically (no keccak on the hot path); see
-    /// [`DomainKey`].
-    last_toucher: HashMap<DomainKey, u32>,
-    /// The most recent ⊤ (cold) tx: conflicts with everything, so every
-    /// later admission takes an edge from it while it is outstanding.
-    last_barrier: Option<u32>,
-    /// Worker queue each tx was assigned (domain affinity), needed when a
-    /// COMPLETION makes it ready.
-    worker_of: Vec<usize>,
+struct Node {
+    /// `Some` = outstanding, accepting edges. `None` = finished, published.
+    children: Mutex<Option<Vec<u32>>>,
+    /// Outstanding predecessors. Carries a +1 ADMISSION GUARD while the
+    /// feed is still registering this tx's edges, so a predecessor that
+    /// finishes mid-admission cannot drive the count to zero early and
+    /// dispatch a half-linked tx.
+    indegree: AtomicU32,
+    /// The thread this tx was assigned. Written before any edge naming it
+    /// exists, so whoever dispatches it reads a settled value.
+    worker: std::sync::atomic::AtomicUsize,
 }
 
 /// Per-block shared context; workers hold an `Arc` for the block's
@@ -406,7 +451,15 @@ struct BlockCtx<'env, S: StateDatabase> {
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
-    graph: Mutex<Graph>,
+    /// Pre-allocated so the array NEVER reallocates: workers index it
+    /// concurrently while the feed is still admitting. `MAX_BLOCK_TXS` is
+    /// the gas-limit bound, so this is a fixed, provably sufficient size.
+    nodes: Vec<Node>,
+    /// Admitted (feed-only writer) and finished (workers) counts; the
+    /// block is drained when sealed and the two agree.
+    admitted: AtomicU32,
+    finished: AtomicU32,
+    sealed: AtomicBool,
     /// Per-worker completion buffers: a finishing worker parks its index
     /// here (uncontended — it owns the slot) instead of touching the graph
     /// on every tx. A prune drains them all under the graph lock.
@@ -426,37 +479,58 @@ struct BlockCtx<'env, S: StateDatabase> {
 /// lock, releases it, and only then pushes. The idle path takes the graph
 /// lock only after dropping its queue lock.
 impl<S: StateDatabase> BlockCtx<'_, S> {
-    /// Apply parked completions to the live DAG: mark complete, retire the
-    /// finished nodes' edges, and hand whatever became ready to its
-    /// thread. Returns the number of completions applied.
+    /// Hand a READY tx to its assigned thread. Called only with no node
+    /// mutex held (lock order: node registration points are leaves).
+    fn push_ready(&self, worker: usize, idx: u32) {
+        let qh = &self.queues[worker];
+        let mut q = qh.q.lock().expect("queue poisoned");
+        q.push_back(idx);
+        drop(q);
+        qh.cv.notify_one();
+    }
+
+    /// Apply parked completions to the live DAG: CLOSE each finished
+    /// node's registration point, retire the edges that were registered
+    /// while it was open, and hand whatever became ready to its thread.
+    /// Takes no global lock — only the finished nodes' own mutexes.
     fn prune(&self, forced: bool) -> usize {
         let t0 = std::time::Instant::now();
-        let (ready, applied, done) = {
-            let mut g = self.graph.lock().expect("graph poisoned");
-            let mut applied = 0usize;
-            let mut ready: Vec<(usize, u32)> = Vec::new();
-            for buf in &self.completed {
+        let mut applied = 0usize;
+        let mut ready: Vec<(usize, u32)> = Vec::new();
+        for buf in &self.completed {
+            let drained: Vec<u32> = {
                 let mut b = buf.lock().expect("completed poisoned");
-                for job in b.drain(..) {
-                    g.complete[job as usize] = true;
-                    g.finished += 1;
-                    applied += 1;
-                    // Admissions may still append to children[job], but
-                    // they check complete[job] under this same lock first,
-                    // so a drained list is final.
-                    let kids = std::mem::take(&mut g.children[job as usize]);
-                    for c in kids {
-                        g.indegree[c as usize] -= 1;
-                        if g.indegree[c as usize] == 0 {
-                            ready.push((g.worker_of[c as usize], c));
-                        }
+                if b.is_empty() {
+                    continue;
+                }
+                std::mem::take(&mut *b)
+            };
+            for job in drained {
+                applied += 1;
+                // CLOSE: after this, admission can no longer register an
+                // edge on `job` — it observes the closed list and skips,
+                // which is correct because `job` has already published.
+                let kids = {
+                    let mut c = self.nodes[job as usize]
+                        .children
+                        .lock()
+                        .expect("children poisoned");
+                    c.take().unwrap_or_default()
+                };
+                for c in kids {
+                    if self.nodes[c as usize]
+                        .indegree
+                        .fetch_sub(1, Ordering::AcqRel)
+                        == 1
+                    {
+                        ready.push((self.nodes[c as usize].worker.load(Ordering::Acquire), c));
                     }
                 }
             }
-            (ready, applied, g.sealed && g.finished == g.admitted)
-        };
+        }
         if applied > 0 {
             self.pending.fetch_sub(applied as u64, Ordering::SeqCst);
+            self.finished.fetch_add(applied as u32, Ordering::SeqCst);
         }
         self.metrics
             .prune_ns
@@ -468,11 +542,10 @@ impl<S: StateDatabase> BlockCtx<'_, S> {
         self.metrics
             .completions
             .fetch_add(applied as u64, Ordering::Relaxed);
-        // Queue locks are taken only now, with the graph lock released.
         for (w, c) in ready {
             self.push_ready(w, c);
         }
-        if done {
+        if self.drained() {
             for q in &self.queues {
                 q.cv.notify_all();
             }
@@ -480,17 +553,10 @@ impl<S: StateDatabase> BlockCtx<'_, S> {
         }
         applied
     }
-}
 
-impl<S: StateDatabase> BlockCtx<'_, S> {
-    /// Hand a READY tx to its assigned thread (single-producer per call
-    /// site: the feed at admission, a worker at completion).
-    fn push_ready(&self, worker: usize, idx: u32) {
-        let qh = &self.queues[worker];
-        let mut q = qh.q.lock().expect("queue poisoned");
-        q.push_back(idx);
-        drop(q);
-        qh.cv.notify_one();
+    fn drained(&self) -> bool {
+        self.sealed.load(Ordering::SeqCst)
+            && self.finished.load(Ordering::SeqCst) == self.admitted.load(Ordering::SeqCst)
     }
 }
 
@@ -564,6 +630,15 @@ pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     workers: usize,
     cold: usize,
     edges: usize,
+    /// Per-DOMAIN last toucher — the index the edges come from. FEED-OWNED
+    /// (admission is single-threaded and prune never reads it), so it
+    /// lives here rather than in the shared graph: keeping it out of the
+    /// critical section removes ~8 hashmap operations per tx from the
+    /// lock. Keyed symbolically — no keccak on the hot path.
+    last_toucher: FastMap<DomainKey, u32>,
+    /// The most recent ⊤ (cold) tx: conflicts with everything, so every
+    /// later admission takes an edge from it while it is outstanding.
+    last_barrier: Option<u32>,
     dispatch: Vec<u32>,
     /// Cold (⊤) txs still need ORDER, and with no graph there is no
     /// barrier to express it with — so a cold tx marks the wildcard: it
@@ -615,7 +690,10 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                     cv: Condvar::new(),
                 })
                 .collect(),
-            graph: Mutex::new(Graph::default()),
+            nodes: (0..MAX_BLOCK_TXS).map(|_| Node::default()).collect(),
+            admitted: AtomicU32::new(0),
+            finished: AtomicU32::new(0),
+            sealed: AtomicBool::new(false),
             completed: (0..workers).map(|_| Mutex::new(Vec::new())).collect(),
             pending: std::sync::atomic::AtomicU64::new(0),
             prune_batch: prune_batch.max(1),
@@ -644,6 +722,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             workers,
             cold: 0,
             edges: 0,
+            last_toucher: FastMap::default(),
+            last_barrier: None,
             dispatch: vec![0; workers],
             txs: Vec::new(),
             started: std::time::Instant::now(),
@@ -780,47 +860,66 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         self.dispatch[worker] += 1;
 
         // (2) Update the live DAG + (3) dispatch if ready.
-        let t_admit = std::time::Instant::now();
-        let dispatch_now = {
-            let mut g = self.ctx.graph.lock().expect("graph poisoned");
-            g.indegree.push(0);
-            g.children.push(Vec::new());
-            g.complete.push(false);
-            g.worker_of.push(worker);
-            g.admitted += 1;
+        // Candidate predecessors come from the FEED-OWNED last-toucher
+        // index — no lock needed, because admission is single-threaded and
+        // prune never reads it.
+        let mut preds: Vec<u32> = Vec::with_capacity(cells.len() + 1);
+        if let Some(b) = self.last_barrier {
+            preds.push(b);
+        }
+        if is_cold {
+            // ⊤: conflicts with everything — every outstanding tx is a
+            // candidate predecessor, and this tx becomes the barrier.
+            preds.clear();
+            preds.extend(0..idx);
+            self.last_barrier = Some(idx);
+            self.last_toucher.clear();
+        } else {
+            for c in &cells {
+                if let Some(p) = self.last_toucher.insert(*c, idx) {
+                    preds.push(p);
+                }
+            }
+            preds.sort_unstable();
+            preds.dedup();
+        }
 
-            let mut deg = 0u32;
-            let link = |g: &mut Graph, p: u32, deg: &mut u32| {
-                // Only OUTSTANDING predecessors become edges; a finished
-                // one has already published its versions.
-                if p != idx && !g.complete[p as usize] && !g.children[p as usize].contains(&idx) {
-                    g.children[p as usize].push(idx);
-                    *deg += 1;
-                }
-            };
-            if let Some(b) = g.last_barrier {
-                link(&mut g, b, &mut deg);
+        let t_admit = std::time::Instant::now();
+        // NO GLOBAL LOCK. Open this node's registration point, seed the
+        // admission guard, then register on each predecessor that is still
+        // open. The guard (+1) means a predecessor finishing mid-admission
+        // can never drive the count to zero and dispatch a half-linked tx;
+        // dropping it at the end is what actually releases this tx.
+        {
+            let node = &self.ctx.nodes[i];
+            node.worker.store(worker, Ordering::Release);
+            node.indegree.store(1, Ordering::Release);
+            *node.children.lock().expect("children poisoned") = Some(Vec::new());
+        }
+        self.ctx.admitted.fetch_add(1, Ordering::SeqCst);
+        let mut deg = 0u32;
+        for p in preds {
+            if p == idx {
+                continue;
             }
-            if is_cold {
-                // ⊤: conflicts with everything — take an edge from every
-                // outstanding tx, then become the barrier.
-                for p in 0..idx {
-                    link(&mut g, p, &mut deg);
-                }
-                g.last_barrier = Some(idx);
-                self.edges += deg as usize;
-            } else {
-                for c in &cells {
-                    if let Some(&p) = g.last_toucher.get(c) {
-                        link(&mut g, p, &mut deg);
-                    }
-                    g.last_toucher.insert(*c, idx);
-                }
-                self.edges += deg as usize;
+            let mut c = self.ctx.nodes[p as usize]
+                .children
+                .lock()
+                .expect("children poisoned");
+            if let Some(list) = c.as_mut() {
+                // Increment BEFORE publishing the edge: the matching
+                // decrement can only happen once this child is visible in
+                // p's list, so the add always precedes its own subtract.
+                self.ctx.nodes[i].indegree.fetch_add(1, Ordering::AcqRel);
+                list.push(idx);
+                deg += 1;
             }
-            g.indegree[i] = deg;
-            deg == 0
-        };
+            // else: p already finished and published — no edge needed.
+        }
+        self.edges += deg as usize;
+        // Drop the admission guard; if every registered predecessor has
+        // already retired, this tx is ours to dispatch.
+        let dispatch_now = self.ctx.nodes[i].indegree.fetch_sub(1, Ordering::AcqRel) == 1;
         self.ctx
             .metrics
             .admit_ns
@@ -851,28 +950,19 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             dispatch,
             ..
         } = self;
-        {
-            let mut g = ctx.graph.lock().expect("graph poisoned");
-            g.sealed = true;
-        }
+        ctx.sealed.store(true, Ordering::SeqCst);
         for q in &ctx.queues {
             q.cv.notify_all();
         }
         // Apply anything parked, then wait out the tail. Workers force a
         // prune before they park, so this loop only ever waits on
         // execution, never on unapplied updates.
-        loop {
+        while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
             if ctx.pending.load(Ordering::SeqCst) > 0 {
                 ctx.prune(true);
+                continue;
             }
-            let g = ctx.graph.lock().expect("graph poisoned");
-            if ctx.aborted.load(Ordering::SeqCst) || g.finished == g.admitted {
-                break;
-            }
-            let _unused = ctx
-                .done_cv
-                .wait_timeout(g, std::time::Duration::from_micros(50))
-                .expect("graph poisoned");
+            std::thread::yield_now();
         }
         // Release the pool for the next block before the (serial)
         // validate+commit tail.
@@ -1081,11 +1171,8 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
                     q = qh.q.lock().expect("queue poisoned");
                     continue;
                 }
-                {
-                    let g = ctx.graph.lock().expect("graph poisoned");
-                    if g.sealed && g.finished == g.admitted {
-                        return;
-                    }
+                if ctx.drained() {
+                    return;
                 }
                 q = qh.q.lock().expect("queue poisoned");
                 if !q.is_empty() {
