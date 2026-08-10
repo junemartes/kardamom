@@ -253,6 +253,11 @@ pub struct StmOutcome {
     pub edges: usize,
     /// Txs dispatched per worker queue — the domain-affinity histogram.
     pub dispatch: Vec<u32>,
+    /// Nodes observed leaving the graph more than once. ALWAYS ZERO —
+    /// asserted by the test suite and worth an alert in production: a
+    /// non-zero value means a tx completed twice and the edges registered
+    /// in between were stranded.
+    pub double_exit: u32,
     /// Scheduler cost, measured (the numbers the prune-batch knob is
     /// tuned on): time held in the graph lock split by cause, prune
     /// invocations and how many were starvation-forced, the realized
@@ -327,6 +332,12 @@ fn domain_hash(bytes: &[u8], workers: usize) -> usize {
     }
     (h % workers as u64) as usize
 }
+
+/// How long `seal` waits for a block to drain before declaring a
+/// scheduler bug. Generous by orders of magnitude: a 30M-gas block is
+/// milliseconds of execution, so anything past this is a stranded edge,
+/// not slow work.
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Gas-limit-derived hard cap on txs per block: `BLOCK_GAS_LIMIT` / 21k
 /// intrinsic gas = 1,428, with ~2.8x headroom. Slots are pre-allocated per
@@ -469,6 +480,10 @@ struct BlockCtx<'env, S: StateDatabase> {
     prune_batch: usize,
     done_cv: Condvar,
     aborted: AtomicBool,
+    /// Nodes observed leaving the graph more than once — always zero; a
+    /// non-zero value is a scheduler bug surfaced at seal rather than a
+    /// silently stranded edge.
+    double_exit: AtomicU32,
     metrics: Metrics,
 }
 
@@ -510,12 +525,31 @@ impl<S: StateDatabase> BlockCtx<'_, S> {
                 // CLOSE: after this, admission can no longer register an
                 // edge on `job` — it observes the closed list and skips,
                 // which is correct because `job` has already published.
+                // LEAVE ONCE. Closing is the node's exit from the graph;
+                // a second close would mean the tx completed twice, and
+                // silently draining an empty list would strand every edge
+                // registered in between. Debug-assert the invariant and
+                // count a violation loudly in release.
                 let kids = {
                     let mut c = self.nodes[job as usize]
                         .children
                         .lock()
                         .expect("children poisoned");
-                    c.take().unwrap_or_default()
+                    match c.take() {
+                        Some(k) => k,
+                        None => {
+                            debug_assert!(
+                                false,
+                                "stm: tx index {job} left the graph twice (completion must happen exactly once)"
+                            );
+                            tracing::error!(
+                                tx = job,
+                                "stm: tx left the graph twice — scheduler invariant violated"
+                            );
+                            self.double_exit.fetch_add(1, Ordering::SeqCst);
+                            Vec::new()
+                        }
+                    }
                 };
                 for c in kids {
                     if self.nodes[c as usize]
@@ -699,6 +733,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             prune_batch: prune_batch.max(1),
             done_cv: Condvar::new(),
             aborted: AtomicBool::new(false),
+            double_exit: AtomicU32::new(0),
             metrics: Metrics::default(),
         });
         {
@@ -891,10 +926,22 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // can never drive the count to zero and dispatch a half-linked tx;
         // dropping it at the end is what actually releases this tx.
         {
+            // REGISTER ONCE. Unreachable through the public API — the
+            // local index comes from this session's own counter, so no
+            // caller can name an occupied slot — but asserted anyway,
+            // because a refactor that reused indices would otherwise
+            // resurrect a closed registration point and hang whichever
+            // child registered on it, with no diagnostic.
             let node = &self.ctx.nodes[i];
             node.worker.store(worker, Ordering::Release);
             node.indegree.store(1, Ordering::Release);
-            *node.children.lock().expect("children poisoned") = Some(Vec::new());
+            let mut c = node.children.lock().expect("children poisoned");
+            if c.is_some() {
+                return Err(ExecutorError::State(format!(
+                    "stm: tx index {i} admitted twice (registration must happen exactly once)"
+                )));
+            }
+            *c = Some(Vec::new());
         }
         self.ctx.admitted.fetch_add(1, Ordering::SeqCst);
         let mut deg = 0u32;
@@ -957,10 +1004,40 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // Apply anything parked, then wait out the tail. Workers force a
         // prune before they park, so this loop only ever waits on
         // execution, never on unapplied updates.
+        // WATCHDOG. Every admitted tx must leave the graph exactly once,
+        // so this loop terminates — unless a scheduler bug strands an
+        // edge (a decrement that never arrives), in which case the naive
+        // version would spin forever and the executor would be frozen but
+        // alive: metrics up, chain stopped, no diagnosis. The engine
+        // instead fail-stops with the graph's state, which crash-recovery
+        // replays cleanly.
+        let deadline = std::time::Instant::now() + STALL_TIMEOUT;
         while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
             if ctx.pending.load(Ordering::SeqCst) > 0 {
                 ctx.prune(true);
                 continue;
+            }
+            if std::time::Instant::now() > deadline {
+                let admitted = ctx.admitted.load(Ordering::SeqCst);
+                let finished = ctx.finished.load(Ordering::SeqCst);
+                let stuck: Vec<(u32, u32)> = (0..admitted)
+                    .filter(|i| ctx.results[*i as usize].get().is_none())
+                    .map(|i| (i, ctx.nodes[i as usize].indegree.load(Ordering::SeqCst)))
+                    .take(16)
+                    .collect();
+                tracing::error!(
+                    block = ctx.env.block_number,
+                    admitted,
+                    finished,
+                    double_exit = ctx.double_exit.load(Ordering::SeqCst),
+                    ?stuck,
+                    "stm: block failed to drain — scheduler invariant violated"
+                );
+                return Err(ExecutorError::State(format!(
+                    "stm: block {} failed to drain after {:?}: admitted={admitted} \
+                     finished={finished} stuck(idx,indegree)={stuck:?}",
+                    ctx.env.block_number, STALL_TIMEOUT
+                )));
             }
             std::thread::yield_now();
         }
@@ -1087,6 +1164,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             cold,
             edges,
             dispatch,
+            double_exit: ctx.double_exit.load(Ordering::SeqCst),
             feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
             decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
             predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,

@@ -331,3 +331,87 @@ fn base_delta_layer_is_visible() {
     assert!(!out.fallback);
     assert_identical(&seq, &out.receipts, &out.delta, "base layer");
 }
+
+/// The scheduler's structural invariant: every admitted tx occupies
+/// exactly ONE node and leaves the graph exactly ONCE. Registering twice
+/// is unreachable through the public API (the local index comes from the
+/// session's own counter, so no caller can name an occupied slot), and
+/// leaving twice is counted rather than assumed — `double_exit` must be
+/// zero, because a second exit would strand every edge registered in
+/// between and hang the block.
+#[test]
+fn each_tx_occupies_one_node_and_exits_once() {
+    use kardamom_stm::execute::{PoolConfig, with_pool};
+    let sg = signers(4);
+    let database = db(&sg);
+    // Same sender repeatedly (one chain), distinct senders (independent),
+    // and cold calls (barriers) — every admission path in one block.
+    let envs = vec![
+        tx(&sg[0], 0, TxKind::Call(sg[1].address()), 10, &[]),
+        tx(&sg[0], 1, TxKind::Call(sg[2].address()), 10, &[]),
+        tx(&sg[1], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
+        tx(&sg[2], 0, TxKind::Call(sg[3].address()), 10, &[]),
+        tx(&sg[3], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
+        tx(&sg[0], 2, TxKind::Call(sg[3].address()), 10, &[]),
+    ];
+    let n = envs.len();
+    let recs = records(envs);
+    let out = with_pool(
+        &database,
+        PoolConfig {
+            workers: 4,
+            prune_batch: 8,
+        },
+        |pool| {
+            pool.run_block(PendingDelta::new(), env(), &recs, &Stats::default())
+                .expect("block must drain")
+        },
+    );
+    assert_eq!(out.receipts.len(), n, "one receipt per admitted tx");
+    assert_eq!(
+        out.dispatch.iter().sum::<u32>(),
+        n as u32,
+        "each tx dispatched exactly once: {:?}",
+        out.dispatch
+    );
+    assert_eq!(out.double_exit, 0, "no tx may leave the graph twice");
+}
+
+/// Every admitted tx leaves the graph, so a block always drains — and if a
+/// future change ever strands an edge, `seal` fail-stops with diagnostics
+/// instead of freezing the exec thread. This pins the healthy path: a
+/// block with barriers, chains and independent work drains promptly.
+#[test]
+fn every_block_drains() {
+    use kardamom_stm::execute::{PoolConfig, with_pool};
+    let sg = signers(4);
+    let database = db(&sg);
+    let envs = vec![
+        tx(&sg[0], 0, TxKind::Call(sg[1].address()), 100, &[]),
+        tx(&sg[1], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL), // cold ⇒ barrier
+        tx(&sg[2], 0, TxKind::Call(sg[3].address()), 50, &[]),
+        tx(&sg[0], 1, TxKind::Call(sg[2].address()), 25, &[]),
+        tx(&sg[3], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL), // second barrier
+    ];
+    let recs = records(envs);
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let started = std::time::Instant::now();
+    let out = with_pool(
+        &database,
+        PoolConfig {
+            workers: 4,
+            prune_batch: 8,
+        },
+        |pool| {
+            pool.run_block(PendingDelta::new(), env(), &recs, &Stats::default())
+                .expect("block must drain")
+        },
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "block took {:?} — the watchdog would have fired",
+        started.elapsed()
+    );
+    assert_eq!(out.cold, 2);
+    assert_identical(&seq, &out.receipts, &out.delta, "drain");
+}
