@@ -24,13 +24,16 @@
 //! right after dispatch returns, so the SVG is bounded to the same window
 //! as the `tracing-flame` recording.
 
+mod flame;
+mod inprocess;
+
 use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
+use jsonrpsee::http_client::HttpClient;
 use tracing_flame::{FlameLayer, FlushGuard};
 use tracing_subscriber::Layer;
 use tracing_subscriber::filter::FilterFn;
@@ -38,14 +41,17 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, fmt};
 
-use kardamom_ingress::{IngressConfig, IngressHandle, IngressProxy, MockChannels};
-use kardamom_types::{AckPolicy, BPosition, Receipt};
-
 use crate::Benchmark;
 use crate::benchmark::Outputs;
-use crate::config::{MAX_IN_FLIGHT_SLACK, PPROF_HZ, REQUEST_TIMEOUT};
+use crate::config::PPROF_HZ;
 use crate::report::{self, ReportInputs};
 use crate::workflow::BenchWorkflow;
+
+use flame::{
+    filter_to_ingress, flamegraph_options, merge_folded_text, pprof_report_to_folded_text,
+};
+
+pub use inprocess::{InProcessIngress, spawn_inprocess_ingress};
 
 /// In-process node + RPC server + benchmark dispatcher, with the
 /// flame/pprof recordings scoped to the dispatch window.
@@ -304,226 +310,6 @@ impl<W: BenchWorkflow> Harness<W> {
     }
 }
 
-/// Spin up an in-process [`IngressProxy`] over in-memory [`MockChannels`] plus
-/// a trivial "fake executor" that turns every published `TxEnvelope` straight
-/// into a success `Receipt`. Returns a jsonrpsee client pointed at the proxy's
-/// ephemeral loopback port and a handle that stops everything on
-/// [`InProcessIngress::shutdown`].
-///
-/// This is the decoupled stand-in backing the profiling [`Harness`] and the
-/// crate's smoke tests after `kardamom-node` was removed: it exercises the real
-/// ingress hot path (sig recovery, routing, RPC framing, receipt release)
-/// without a live Aeron media driver or the real sequencer/executor/sealer. The
-/// full in-process Aeron pipeline harness is tracked as a follow-up.
-///
-/// `ack_policy` is forced to [`AckPolicy::OnOffer`] so a submission is released
-/// on receipt arrival alone — there is no recorder/quorum watermark here.
-pub async fn spawn_inprocess_ingress(
-    chain_id: u64,
-    shards: u32,
-    max_in_flight: usize,
-) -> anyhow::Result<(HttpClient, InProcessIngress)> {
-    let (mock, shard_rxs) = MockChannels::new(shards as usize);
-    let receipt_tx = mock.receipt_bus.clone();
-
-    // One fake-executor task per shard: drain published envelopes and reflect a
-    // success receipt back onto the receipt bus so the proxy releases the
-    // parked submission. `from`/`nonce` mirror exactly what the proxy parked on
-    // (it keys pending submissions by `(sender, nonce)`).
-    let mut fake_exec = Vec::with_capacity(shard_rxs.len());
-    for (shard, mut rx) in shard_rxs.into_iter().enumerate() {
-        let receipt_tx = receipt_tx.clone();
-        fake_exec.push(tokio::spawn(async move {
-            let mut idx: i32 = 0;
-            while let Some(env) = rx.recv().await {
-                idx = idx.wrapping_add(1);
-                let nonce = decode_nonce(env.raw_tx.as_ref()).unwrap_or(0);
-                let receipt = Receipt {
-                    tx_idx: BPosition {
-                        term_id: shard as i32,
-                        term_offset: idx,
-                    },
-                    tx_hash: env.tx_hash,
-                    status: true,
-                    gas_used: 21_000,
-                    nonce,
-                    from: env.sender,
-                    ..Default::default()
-                };
-                // A send error means the broadcast bus has no receivers, i.e.
-                // the proxy is gone — nothing left to release.
-                if receipt_tx.send(receipt).is_err() {
-                    break;
-                }
-            }
-        }));
-    }
-
-    let cfg = IngressConfig {
-        chain_id,
-        partition_count_m: shards,
-        ack_policy: AckPolicy::OnOffer,
-        ..IngressConfig::default()
-    };
-    let proxy = IngressProxy::new(cfg, mock.clone(), mock);
-    let handle = proxy.start().await?;
-
-    let url = format!("http://{}", handle.jsonrpc_addr);
-    let client = HttpClientBuilder::default()
-        .request_timeout(REQUEST_TIMEOUT)
-        .max_concurrent_requests(max_in_flight + MAX_IN_FLIGHT_SLACK)
-        .build(&url)?;
-    Ok((client, InProcessIngress { handle, fake_exec }))
-}
-
-/// Owns the in-process ingress server and the fake-executor reflector tasks.
-/// Call [`InProcessIngress::shutdown`] (or drop it) to tear them down.
-pub struct InProcessIngress {
-    handle: IngressHandle,
-    fake_exec: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl InProcessIngress {
-    /// Stop the jsonrpsee server and abort the fake-executor tasks.
-    pub async fn shutdown(self) {
-        let _ = self.handle.jsonrpc_handle.stop();
-        self.handle.jsonrpc_handle.stopped().await;
-        for h in self.fake_exec {
-            h.abort();
-        }
-    }
-}
-
-/// Decode the tx nonce from raw envelope bytes the same way the ingress proxy
-/// does (`alloy_consensus::TxEnvelope::decode`), so the synthesized receipt's
-/// `(from, nonce)` matches the parked-submission key. Returns `None` if the
-/// bytes don't decode (the proxy would already have rejected such a tx).
-fn decode_nonce(raw: &[u8]) -> Option<u64> {
-    use alloy_consensus::transaction::Transaction;
-    use alloy_rlp::Decodable;
-    let mut slice = raw;
-    alloy_consensus::TxEnvelope::decode(&mut slice)
-        .ok()
-        .map(|env| env.nonce())
-}
-
-/// Inferno-flamegraph options shared by the tracing-flame and pprof
-/// renderers. `min_width = 0.0` keeps narrow frames visible (matches
-/// `inferno-flamegraph --minwidth 0`); `image_width = 2000` is enough
-/// resolution for the dispatch-window stacks without bloating the SVG.
-fn flamegraph_options() -> pprof::flamegraph::Options<'static> {
-    let mut opts = pprof::flamegraph::Options::default();
-    opts.min_width = 0.0;
-    opts.image_width = Some(2_000);
-    opts
-}
-
-/// Substring matched against demangled symbol names to decide whether a
-/// pprof stack belongs to the ingress proxy. Matches
-/// `kardamom_ingress::proxy::...`, `kardamom_ingress::sig_verify::...`, etc.
-const INGRESS_FRAME_NEEDLE: &str = "kardamom_ingress";
-
-struct FilteredReport {
-    report: pprof::Report,
-    kept_count: isize,
-    dropped_count: isize,
-}
-
-/// Walk `report.data` and keep only entries whose `Frames` contains at
-/// least one symbol whose demangled name contains `INGRESS_FRAME_NEEDLE`.
-/// Samples that land entirely in bench-side / jsonrpsee-client / tokio /
-/// hyper code are dropped.
-fn filter_to_ingress(report: &pprof::Report) -> FilteredReport {
-    let mut kept = std::collections::HashMap::new();
-    let mut kept_count: isize = 0;
-    let mut dropped_count: isize = 0;
-    for (frames, count) in &report.data {
-        if frames_contains_ingress(frames) {
-            kept.insert(frames.clone(), *count);
-            kept_count += *count;
-        } else {
-            dropped_count += *count;
-        }
-    }
-    FilteredReport {
-        report: pprof::Report {
-            data: kept,
-            timing: report.timing.clone(),
-        },
-        kept_count,
-        dropped_count,
-    }
-}
-
-fn frames_contains_ingress(frames: &pprof::Frames) -> bool {
-    frames.frames.iter().any(|frame| {
-        frame
-            .iter()
-            .any(|sym| sym.name().contains(INGRESS_FRAME_NEEDLE))
-    })
-}
-
-/// Render a `pprof::Report` to inferno-flamegraph folded text, using the
-/// same `thread_name;leaf;...;root count` layout that `Report::flamegraph`
-/// builds internally. Output gets piped through `merge_folded_text` to
-/// drop the thread prefix.
-fn pprof_report_to_folded_text(report: &pprof::Report) -> String {
-    use std::fmt::Write;
-    let mut out = String::new();
-    for (key, value) in &report.data {
-        let mut line = key.thread_name_or_id();
-        for frame in key.frames.iter().rev() {
-            for symbol in frame.iter().rev() {
-                write!(&mut line, ";{symbol}").unwrap();
-            }
-        }
-        write!(&mut line, " {value}").unwrap();
-        out.push_str(&line);
-        out.push('\n');
-    }
-    out
-}
-
-/// Inferno-flamegraph folded format is `"<thread>;<leaf>;...;<root> count"`.
-/// This drops the `<thread>;` prefix, buckets by the remaining stack, and
-/// sums counts. Used both for the `tracing-flame` `.folded` file and for
-/// the on-CPU pprof report — both produce folded text with a per-thread
-/// prefix, so the same merge collapses both correctly.
-///
-/// Lines with no `;` after the thread label (bare-root samples like
-/// `ThreadId(N)-tokio-rt-worker 1234`) are dropped, matching the old
-/// `grep ';'` recipe from the docs.
-fn merge_folded_text(input: &str) -> String {
-    use std::collections::BTreeMap;
-    let mut merged: BTreeMap<String, u64> = BTreeMap::new();
-    for line in input.lines() {
-        let Some((stack, count_str)) = line.rsplit_once(' ') else {
-            continue;
-        };
-        let Ok(count) = count_str.parse::<u64>() else {
-            continue;
-        };
-        let Some((_, rest)) = stack.split_once(';') else {
-            continue;
-        };
-        // tracing-flame uses `"; "` as the separator after the thread
-        // label, so the rest has a leading space we trim defensively.
-        let rest = rest.trim_start();
-        if rest.is_empty() {
-            continue;
-        }
-        *merged.entry(rest.to_string()).or_insert(0) += count;
-    }
-    let mut out = String::with_capacity(input.len());
-    for (stack, count) in &merged {
-        out.push_str(stack);
-        out.push(' ');
-        out.push_str(&count.to_string());
-        out.push('\n');
-    }
-    out
-}
-
 /// RAII guard tying an `AtomicBool` to a lexical scope. Stores `true` on
 /// `enter`, restores `false` on drop — including on `?` early-return from
 /// the surrounding `await`, which is the whole point.
@@ -541,57 +327,5 @@ impl<'a> ActiveScope<'a> {
 impl Drop for ActiveScope<'_> {
     fn drop(&mut self) {
         self.flag.store(false, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn merge_folded_text_collapses_per_thread_prefix() {
-        let input = "\
-ThreadId(1)-tokio-worker;decode;execute 100
-ThreadId(2)-tokio-worker;decode;execute 250
-ThreadId(3)-tokio-worker;decode;execute 50
-";
-        let out = merge_folded_text(input);
-        // All three lines collapse into one with the prefix dropped and
-        // counts summed.
-        assert_eq!(out.trim(), "decode;execute 400");
-    }
-
-    #[test]
-    fn merge_folded_text_drops_bare_root_samples() {
-        let input = "\
-ThreadId(1)-tokio-worker 9999
-ThreadId(2)-tokio-worker 5555
-";
-        let out = merge_folded_text(input);
-        // Neither line has a `;` — both are bare-root samples and get
-        // dropped (matching the legacy `grep ';'` recipe).
-        assert_eq!(out.trim(), "");
-    }
-
-    #[test]
-    fn merge_folded_text_skips_unparseable_count() {
-        let input = "\
-thr;a;b not_a_number
-thr;a;b 42
-";
-        let out = merge_folded_text(input);
-        assert_eq!(out.trim(), "a;b 42");
-    }
-
-    #[test]
-    fn merge_folded_text_sums_within_a_thread() {
-        let input = "\
-ThreadId(1);a;b 10
-ThreadId(1);a;b 20
-ThreadId(1);a;c 5
-";
-        let out = merge_folded_text(input);
-        // Output is BTreeMap-sorted so deterministic for assertion.
-        assert_eq!(out, "a;b 30\na;c 5\n");
     }
 }
