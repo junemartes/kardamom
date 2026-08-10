@@ -25,7 +25,6 @@ use kardamom_exec_core::executor::{
     ExecScope, SnapshotRef, decode_alloy_envelope, invalid_skip, tx_env_from_alloy, wire_log,
     write_set_from_evm_state,
 };
-use kardamom_footprint::Cell;
 use kardamom_footprint::classifier::{DomainKey, Stats};
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
@@ -319,13 +318,9 @@ impl std::hash::Hasher for Fnv {
 
 type FastMap<K, V> = HashMap<K, V, FnvBuild>;
 
-/// The ⊤ key: a cold tx marks it, and every tx probes it before executing,
-/// so "conflicts with everything" needs no graph. Not a real account — it
-/// is never read or written by the EVM, only used as a pending-mark key.
-const WILDCARD: alloy_primitives::Address = alloy_primitives::Address::repeat_byte(0xFF);
-
 /// Stable domain → worker mapping. Quality only affects BALANCE across
-/// threads, never correctness (ordering comes from marks + FIFO).
+/// threads, never correctness: ordering comes from the DAG's edges, and
+/// an idle worker may steal from any queue.
 fn domain_hash(bytes: &[u8], workers: usize) -> usize {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -775,7 +770,6 @@ pub fn with_pool<S: StateDatabase + Sync, R>(
 pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     pool: &'p PoolHandle<'a, S>,
     ctx: Arc<BlockCtx<'a, S>>,
-    exclude: HashSet<Cell>,
     stats: &'p Stats,
     workers: usize,
     cold: usize,
@@ -863,12 +857,9 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             st.generation += 1;
         }
         self.shared.1.notify_all();
-        let mut exclude = HashSet::new();
-        exclude.insert(Cell::Account(FEE_SINK));
         Ok(BlockSession {
             pool: self,
             ctx,
-            exclude,
             stats,
             workers,
             cold: 0,
