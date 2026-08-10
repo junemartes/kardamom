@@ -22,7 +22,7 @@ use kardamom_da_watcher::{
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
 use kardamom_log::config::LogConfig;
-use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
+use kardamom_log::recorder::{RecorderKind, record_stream_until_stopped};
 use kardamom_obs::bin::wait_for_shutdown;
 use kardamom_types::{BPosition, EpochRecord};
 
@@ -118,12 +118,25 @@ fn main() -> anyhow::Result<()> {
         let handle = std::thread::Builder::new()
             .name("da-watcher-tx-deposits-recorder".into())
             .spawn(move || {
-                if let Err(e) = run_tx_deposits_recorder(
+                // Shared recorder-thread body (kardamom_log::recorder): connect
+                // a thread-confined archive session, record tx_deposits, report
+                // the startup outcome on `ready`, hold until `stop`.
+                if let Err(e) = record_stream_until_stopped(
                     aeron_dir.as_deref(),
-                    &channels,
                     &aeron_cfg,
-                    stop,
-                    ready_tx,
+                    &channels.tx_deposits_channel,
+                    channels.tx_deposits_stream_id,
+                    RecorderKind::TxDeposits,
+                    &stop,
+                    |outcome| {
+                        if let Ok(recording_id) = &outcome {
+                            tracing::info!(
+                                recording_id = *recording_id,
+                                "da-watcher: recording tx_deposits"
+                            );
+                        }
+                        let _ = ready_tx.send(outcome);
+                    },
                 ) {
                     tracing::error!(error = %e, "tx_deposits recorder exited with error");
                 }
@@ -181,56 +194,6 @@ fn main() -> anyhow::Result<()> {
         let _ = h.join();
     }
     drop(aeron_rt);
-    Ok(())
-}
-
-/// Connect a thread-confined archive session and record the tx_deposits
-/// publication until `stop` is set, reporting the startup outcome on `ready`
-/// (the F13.2 barrier the binary blocks on before publishing any deposit).
-/// The recording runs in the ArchivingMediaDriver; this thread keeps the
-/// session connected (and re-adopts an existing recording on restart).
-fn run_tx_deposits_recorder(
-    aeron_dir: Option<&std::path::Path>,
-    channels: &kardamom_log::config::ChannelsConfig,
-    aeron_cfg: &kardamom_log::config::AeronConfig,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ready: std::sync::mpsc::Sender<Result<i64, String>>,
-) -> anyhow::Result<()> {
-    let session = match connect_archive(aeron_dir, aeron_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = ready.send(Err(format!("connect archive: {e}")));
-            return Err(e).context("connect archive");
-        }
-    };
-    let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
-    let recorder = match Recorder::start_stream(
-        session.archive,
-        &channels.tx_deposits_channel,
-        channels.tx_deposits_stream_id,
-        RecorderKind::TxDeposits,
-        &mut should_stop,
-    ) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            // Stopped before the recording materialised (shutdown during
-            // startup); report it so the waiting barrier doesn't hang.
-            let _ = ready.send(Err("stopped before the recording materialised".into()));
-            return Ok(());
-        }
-        Err(e) => {
-            let _ = ready.send(Err(format!("start tx_deposits recording: {e}")));
-            return Err(e).context("start tx_deposits recording");
-        }
-    };
-    tracing::info!(
-        recording_id = recorder.recording_id(),
-        "da-watcher: recording tx_deposits"
-    );
-    let _ = ready.send(Ok(recorder.recording_id()));
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
     Ok(())
 }
 

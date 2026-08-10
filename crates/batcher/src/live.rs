@@ -22,14 +22,17 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use alloy_network::EthereumWallet;
 use alloy_primitives::Address;
-use alloy_provider::Provider;
+use alloy_provider::{Provider, ProviderBuilder};
+use alloy_signer_local::PrivateKeySigner;
 use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, RecvTimeoutError};
 use metrics::{counter, gauge};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
+use kardamom_engine::bin_support;
 use kardamom_engine::reader::ReaderToExec;
 
 use crate::batch::{BatchAccumulator, ClosedBlock};
@@ -37,6 +40,14 @@ use crate::batcher::{BatcherConfig, PostedBatch, metric_names, pack_blocks};
 use crate::da_store::FsBlobStore;
 use crate::l1::{post_batch, read_posted_batches};
 use crate::settlement::IKardamomL2Settlement;
+
+/// Top-level config the batcher deserializes from `--config` in live mode.
+/// Same `[cluster]` section shape as the executor's / validator's.
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+#[serde(default)]
+pub struct BatcherFileConfig {
+    pub cluster: kardamom_engine::reader::cluster::ClusterConfig,
+}
 
 /// Live-mode metric names, alongside [`metric_names`]. In live mode
 /// `kardamom_batcher_batches_posted_total` / `_blobs_posted_total` count
@@ -109,16 +120,40 @@ pub struct L1Truth {
     pub covered_through_block: u64,
 }
 
+/// The settlement contract's CAS counter (`lastBatchIndex`). Shared by
+/// [`read_l1_truth`] and the offline post path (which needs only the counter,
+/// not the `BatchPosted` event scan).
+pub async fn read_last_batch_index<P: Provider>(provider: &P, settlement: Address) -> Result<u64> {
+    IKardamomL2Settlement::new(settlement, provider)
+        .lastBatchIndex()
+        .call()
+        .await
+        .context("read lastBatchIndex")
+}
+
+/// Parse the batcher key and connect the wallet-backed L1 provider + the
+/// local DA blob store — the signer/provider/blob-store setup shared by the
+/// live service and the offline `--dry-run=false` post path.
+pub async fn connect_l1(
+    rpc: &str,
+    key: &str,
+    da_dir: &Path,
+) -> Result<(impl Provider + 'static, FsBlobStore)> {
+    let signer: PrivateKeySigner = key.parse().context("parse --l1-key")?;
+    let provider = ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect(rpc)
+        .await
+        .with_context(|| format!("connect L1 RPC {rpc}"))?;
+    let da_store = FsBlobStore::open(da_dir)?;
+    Ok((provider, da_store))
+}
+
 /// Read the settlement contract's view. The event scan runs from L1 block 0 —
 /// fine against the dev-cluster anvil; a long-lived L1 wants a deployment
 /// block hint here.
 pub async fn read_l1_truth<P: Provider>(provider: &P, settlement: Address) -> Result<L1Truth> {
-    let contract = IKardamomL2Settlement::new(settlement, provider);
-    let last = contract
-        .lastBatchIndex()
-        .call()
-        .await
-        .context("read lastBatchIndex")?;
+    let last = read_last_batch_index(provider, settlement).await?;
     if last == 0 {
         return Ok(L1Truth {
             last_batch_index: 0,
@@ -385,6 +420,166 @@ pub fn run_feed<P: Provider>(
             }
         }
     }
+}
+
+/// Everything [`run`] needs from the CLI, already validated: the binary
+/// checks the L1 flag tuple / `--config` / `--cursor-file` presence first so
+/// its error messages can name the exact flag combination.
+#[derive(Debug, Clone)]
+pub struct LiveArgs {
+    pub rpc: String,
+    pub key: String,
+    pub settlement: Address,
+    pub da_store: PathBuf,
+    /// TOML supplying the `[cluster]` section ([`BatcherFileConfig`]).
+    pub config: PathBuf,
+    pub cursor_file: PathBuf,
+    pub log_config: Option<PathBuf>,
+    pub aeron_dir: Option<PathBuf>,
+    pub shards: u8,
+    pub cluster_egress_endpoint: Option<String>,
+    pub replay_destination_endpoint: Option<String>,
+    pub archive_control_response_endpoint: Option<String>,
+    pub blocks_per_batch: usize,
+    pub compress: bool,
+    pub flush_ms: u64,
+    pub l1_retries: u32,
+}
+
+/// Live service mode (#39): the batcher as a third cluster-egress consumer.
+/// Front-end wiring mirrors the validator: M tx_data subscriptions +
+/// tx_deposits feeding the join buffers, archive refetch on join miss, and
+/// the canonical ordering from the Aeron Cluster egress with the replay
+/// request seeded from the durable cursor. Runs until SIGTERM/Ctrl-C or a
+/// feed-loop fail-stop.
+pub async fn run(args: LiveArgs) -> Result<()> {
+    use kardamom_engine::reader::{
+        JoinBuffer, ReaderConfig, spawn_tx_data_reader, spawn_tx_ordering_reader,
+    };
+    use kardamom_log::aeron_live::AeronRuntime;
+    use kardamom_log::config::LogConfig;
+
+    // --- L1 side: provider, truth, cursor reconcile. -----------------------
+    let (provider, da_store) = connect_l1(&args.rpc, &args.key, &args.da_store).await?;
+    let settlement = args.settlement;
+    let l1_truth = read_l1_truth(&provider, settlement).await?;
+    let (cursor, skip_through_block) = reconcile(BatchCursor::load(&args.cursor_file)?, l1_truth)?;
+    info!(
+        %settlement,
+        last_batch_index = l1_truth.last_batch_index,
+        covered_through_block = l1_truth.covered_through_block,
+        replay_from_index = cursor.next_index,
+        replay_from_block = cursor.next_block,
+        skip_through_block,
+        "live batcher starting"
+    );
+
+    // --- Ordering source: the engine reader stack. -------------------------
+    let raw = std::fs::read_to_string(&args.config).context("read batcher config")?;
+    let mut file_cfg: BatcherFileConfig = toml::from_str(&raw).context("parse batcher config")?;
+    if let Some(ep) = args.cluster_egress_endpoint.as_deref() {
+        file_cfg.cluster.egress_channel = format!("aeron:udp?endpoint={ep}");
+    }
+    let log_cfg = LogConfig::resolve(args.log_config.as_deref()).context("resolve log config")?;
+    let channels = log_cfg.channels;
+    let mut aeron_cfg = log_cfg.aeron;
+    if let Some(dir) = args.aeron_dir.as_ref() {
+        aeron_cfg.aeron_dir = dir.clone();
+    }
+    let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
+    let a_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let join_recovery = bin_support::archive_join_recovery(
+        &channels,
+        &aeron_cfg,
+        args.aeron_dir.as_deref(),
+        args.archive_control_response_endpoint.as_deref(),
+        args.replay_destination_endpoint.as_deref(),
+    );
+
+    // Dedicated cluster runtime, exactly as in the executor/validator: the
+    // cluster session must never contend with the tx_data work on `rt`. The
+    // guard must outlive the feed loop.
+    let (_cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
+        args.aeron_dir.as_deref(),
+        file_cfg.cluster.to_live(),
+        kardamom_engine::reader::cluster::ReplayCursor::new(cursor.next_index, cursor.next_block),
+    )?;
+    // The kardamom_sealer_* re-export is the executor's job.
+    let b_sub = cluster_sub.suppress_sealer_metrics();
+    info!("kardamom-batcher: tx_ordering via Aeron Cluster");
+
+    let join_buffer = JoinBuffer::new();
+    let mut reader_handles = Vec::new();
+    for a_sub in a_subs {
+        reader_handles.push(spawn_tx_data_reader(a_sub, join_buffer.clone()));
+    }
+    // No tx_deposits reader: deposits ride inside the epoch record on the
+    // canonical stream, so there is nothing to join against.
+    let (feed_tx, feed_rx) = crossbeam_channel::bounded(1 << 14);
+    // The default 100 ms join timeout is an IPC-locality assumption; on the
+    // cluster's UDP multicast a transient frame drop takes the archive
+    // refetch (which only engages after `join_refetch_after` = 10 s) to
+    // repair. The executor/validator learned this in #84/#89 — same bounded
+    // budget here, else the batcher dies before refetch can ever fire.
+    let reader_cfg = ReaderConfig {
+        join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
+        ..ReaderConfig::default()
+    };
+    let ordering_handle = spawn_tx_ordering_reader(
+        b_sub,
+        join_buffer,
+        reader_cfg,
+        feed_tx,
+        kardamom_engine::TxIndex(cursor.next_index),
+        join_recovery,
+    );
+
+    // --- Feed loop on a blocking thread. -----------------------------------
+    let sender = LiveSender::new(
+        tokio::runtime::Handle::current(),
+        provider,
+        settlement,
+        da_store,
+        l1_truth.last_batch_index,
+        args.l1_retries,
+        args.cursor_file,
+    );
+    let feed_cfg = FeedConfig {
+        blocks_per_batch: args.blocks_per_batch,
+        compress: args.compress,
+        flush: Duration::from_millis(args.flush_ms),
+        skip_through_block,
+    };
+    let mut feed = tokio::task::spawn_blocking(move || run_feed(feed_rx, sender, feed_cfg));
+    let feed_result = tokio::select! {
+        r = &mut feed => r.context("feed thread panicked")?,
+        () = bin_support::wait_for_shutdown() => {
+            // Exit cleanly: the cursor is reconciled against L1 truth on every
+            // restart, so tearing down mid-batch loses nothing.
+            info!("shutdown signal received; stopping live batcher");
+            return Ok(());
+        }
+    };
+
+    // The feed loop only returns on failure (channel closed or post
+    // fail-stop). Surface the reader threads' errors for context before
+    // propagating — the channel-closed case's root cause lives there.
+    if let Err(e) = &feed_result {
+        warn!(error = %format!("{e:#}"), "feed loop exited");
+        if ordering_handle.is_finished()
+            && let Ok(Err(re)) = ordering_handle.join()
+        {
+            bail!("tx_ordering reader failed: {re:#} (feed loop: {e:#})");
+        }
+        for h in reader_handles {
+            if h.is_finished()
+                && let Ok(Err(re)) = h.join()
+            {
+                bail!("stream reader failed: {re:#} (feed loop: {e:#})");
+            }
+        }
+    }
+    feed_result
 }
 
 #[cfg(test)]

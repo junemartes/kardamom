@@ -16,6 +16,7 @@
 //! Stateless w.r.t. canonical truth — adding or removing a proxy is safe at
 //! any time.
 
+pub mod aeron_adapters;
 pub mod binary;
 pub mod channels;
 pub mod cluster;

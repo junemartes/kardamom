@@ -5,7 +5,7 @@ edition.workspace = true
 
 [[bin]]
 name = "kardamom-sequencer"
-path = "src/bin/kardamom-sequencer.rs"
+path = "src/bin/kardamom-sequencer/main.rs"
 
 
 [features]

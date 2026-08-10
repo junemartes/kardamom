@@ -5,6 +5,12 @@
 //! block-boundary streams. Wires them into an [`IngressProxy`] and starts
 //! its JSON-RPC server (plus optional TCP/UDS binary protocol listeners).
 //! Idles on SIGTERM / Ctrl-C.
+//!
+//! The live Aeron adapters behind the proxy's channel traits live in
+//! `kardamom_ingress::aeron_adapters`; the tx_data archive-recorder threads
+//! (and their F13.2 ready barrier) in [`recorders`].
+
+mod recorders;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -12,24 +18,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use clap::Parser;
-use kardamom_ingress::channels::{IngressPublication, IngressSubscription};
+use kardamom_ingress::aeron_adapters::{LiveIngressPublication, LiveIngressSubscription};
 use kardamom_ingress::cluster::cluster_watermark_observer;
 use kardamom_ingress::config::{IngressConfig, IngressFileConfig};
-use kardamom_ingress::error::IngressError;
 use kardamom_ingress::proxy::IngressProxy;
-use kardamom_log::aeron_live::{
-    AeronRuntime, FsyncWatermarkSubscriberHandle, TxDataPublisherHandle, TxErrorsSubscriberHandle,
-    TxReceiptsBoundarySubscriberHandle, TxReceiptsSubscriberHandle,
-};
-use kardamom_log::config::{AeronConfig, ChannelsConfig, LogConfig};
-use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
+use kardamom_log::aeron_live::AeronRuntime;
+use kardamom_log::config::LogConfig;
 use kardamom_obs::bin::wait_for_shutdown;
-use kardamom_types::{
-    BlockBoundary, FsyncWatermark, QuorumWatermark, Receipt, TxEnvelope, TxError,
-};
-use tokio::sync::broadcast;
+use kardamom_types::QuorumWatermark;
+
+use recorders::{spawn_tx_data_recorders, wait_for_recorders};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -265,7 +264,7 @@ async fn main() -> Result<()> {
         let (guard, mut observer) =
             cluster_watermark_observer(cluster_rt, live).context("connect cluster watermark")?;
         // Blocking egress poll on a dedicated thread → durable count → bus.
-        let wm_tx = subscription.watermarks.clone();
+        let wm_tx = subscription.watermark_sender();
         std::thread::Builder::new()
             .name("cluster-watermark".into())
             .spawn(move || {
@@ -294,302 +293,4 @@ async fn main() -> Result<()> {
     }
     drop(rt);
     Ok(())
-}
-
-/// Spawn one archive recorder thread per tx_data shard. Each connects its own
-/// (thread-confined) archive session, starts recording its shard's tx_data
-/// publication, reports its startup outcome on `ready`, and holds the
-/// recording alive until `stop` is set. The recording itself runs in the
-/// ArchivingMediaDriver; the thread only keeps the session connected and
-/// re-adopts an existing recording on restart.
-fn spawn_tx_data_recorders(
-    aeron_dir: Option<PathBuf>,
-    channels: ChannelsConfig,
-    aeron_cfg: AeronConfig,
-    shards: u8,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
-) -> Vec<std::thread::JoinHandle<()>> {
-    (0..shards)
-        .map(|sid| {
-            let aeron_dir = aeron_dir.clone();
-            let channels = channels.clone();
-            let aeron_cfg = aeron_cfg.clone();
-            let stop = stop.clone();
-            let ready = ready.clone();
-            std::thread::Builder::new()
-                .name(format!("ingress-tx-data-recorder-{sid}"))
-                .spawn(move || {
-                    if let Err(e) = run_tx_data_recorder(
-                        aeron_dir.as_deref(),
-                        &channels,
-                        &aeron_cfg,
-                        sid,
-                        stop,
-                        ready,
-                    ) {
-                        tracing::error!(shard = sid, error = %e, "tx_data recorder exited with error");
-                    }
-                })
-                .expect("spawn tx_data recorder thread")
-        })
-        .collect()
-}
-
-/// Block until every one of the `shards` recorder threads has reported on
-/// `ready`, failing on the first reported error (or on timeout). This is the
-/// F13.2 barrier: publish/RPC must not start before the recordings are active.
-fn wait_for_recorders(
-    ready: &std::sync::mpsc::Receiver<(u8, Result<i64, String>)>,
-    shards: u8,
-) -> Result<()> {
-    // Generous per-recorder budget: the publications are already open, so the
-    // recording normally materialises within one catalog-poll tick (~500ms);
-    // the timeout only bounds a wedged/unreachable archive.
-    const RECORDER_READY_TIMEOUT: Duration = Duration::from_secs(60);
-    for _ in 0..shards {
-        match ready.recv_timeout(RECORDER_READY_TIMEOUT) {
-            Ok((sid, Ok(recording_id))) => {
-                tracing::info!(
-                    shard = sid,
-                    recording_id,
-                    "tx_data recording confirmed active"
-                );
-            }
-            Ok((sid, Err(e))) => {
-                anyhow::bail!("tx_data recorder for shard {sid} failed to start: {e}");
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "timed out ({RECORDER_READY_TIMEOUT:?}) waiting for a tx_data recording \
-                     to become active: {e}"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn run_tx_data_recorder(
-    aeron_dir: Option<&std::path::Path>,
-    channels: &ChannelsConfig,
-    aeron_cfg: &AeronConfig,
-    sid: u8,
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    ready: std::sync::mpsc::Sender<(u8, Result<i64, String>)>,
-) -> Result<()> {
-    let session = match connect_archive(aeron_dir, aeron_cfg) {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = ready.send((sid, Err(format!("connect archive: {e}"))));
-            return Err(e).context("connect archive");
-        }
-    };
-    let mut should_stop = || stop.load(std::sync::atomic::Ordering::SeqCst);
-    let recorder = match Recorder::start_stream(
-        session.archive,
-        &channels.tx_data_channel(sid),
-        channels.tx_data_stream_id(sid),
-        RecorderKind::TxData { sequencer_id: sid },
-        &mut should_stop,
-    ) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
-            // Stopped before the recording materialised (shutdown during
-            // startup); report it so a waiting barrier doesn't hang.
-            let _ = ready.send((sid, Err("stopped before the recording materialised".into())));
-            return Ok(());
-        }
-        Err(e) => {
-            let _ = ready.send((sid, Err(format!("start tx_data recording: {e}"))));
-            return Err(e).context("start tx_data recording");
-        }
-    };
-    tracing::info!(
-        shard = sid,
-        recording_id = recorder.recording_id(),
-        "ingress: recording tx_data shard"
-    );
-    let _ = ready.send((sid, Ok(recorder.recording_id())));
-    // Hold the recording (and its archive session) alive until shutdown.
-    while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// IngressPublication adapter over M TxDataPublisherHandle.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct LiveIngressPublication {
-    tx_data: Vec<TxDataPublisherHandle>,
-}
-
-impl LiveIngressPublication {
-    fn open(
-        rt: &AeronRuntime,
-        channels: &kardamom_log::config::ChannelsConfig,
-        shards: u8,
-    ) -> Result<Self, IngressError> {
-        let mut tx_data = Vec::with_capacity(shards as usize);
-        for sid in 0..shards {
-            let h = TxDataPublisherHandle::open(rt, channels, sid)
-                .map_err(|e| IngressError::Internal(format!("open tx_data[{sid}]: {e}")))?;
-            tx_data.push(h);
-        }
-        Ok(Self { tx_data })
-    }
-}
-
-#[async_trait]
-impl IngressPublication for LiveIngressPublication {
-    async fn publish_tx_data(
-        &self,
-        shard: usize,
-        envelope: TxEnvelope,
-    ) -> Result<(), IngressError> {
-        let pub_handle = self
-            .tx_data
-            .get(shard)
-            .ok_or_else(|| IngressError::Internal(format!("shard {shard} out of range")))?
-            .clone();
-        // The Aeron publish blocks via the runtime's command channel; do
-        // it off the reactor thread so we don't stall the JSON-RPC server.
-        tokio::task::spawn_blocking(move || pub_handle.publish(&envelope))
-            .await
-            .map_err(|e| IngressError::Internal(format!("publish_tx_data join: {e}")))?
-            .map(|_| ())
-            .map_err(|e| IngressError::Internal(format!("publish_tx_data: {e}")))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// IngressSubscription adapter. Pumps each log handle's mpsc receiver into a
-// tokio::sync::broadcast::Sender so the proxy's broadcast::Receiver-based
-// trait surface can fan out to multiple watchers.
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct LiveIngressSubscription {
-    receipts: broadcast::Sender<Receipt>,
-    watermarks: broadcast::Sender<QuorumWatermark>,
-    local_fsync: broadcast::Sender<FsyncWatermark>,
-    block_boundaries: broadcast::Sender<BlockBoundary>,
-    tx_errors: broadcast::Sender<TxError>,
-}
-
-impl LiveIngressSubscription {
-    fn open(
-        rt: &AeronRuntime,
-        channels: &kardamom_log::config::ChannelsConfig,
-        recorder_id: u8,
-        executor_count: u32,
-    ) -> Result<Self, IngressError> {
-        let (receipts_tx, _) = broadcast::channel::<Receipt>(1024);
-        let (watermarks_tx, _) = broadcast::channel::<QuorumWatermark>(1024);
-        let (local_fsync_tx, _) = broadcast::channel::<FsyncWatermark>(1024);
-        let (block_boundaries_tx, _) = broadcast::channel::<BlockBoundary>(1024);
-        let (tx_errors_tx, _) = broadcast::channel::<TxError>(1024);
-
-        let mds = channels.tx_receipts_mds_enabled();
-        if mds {
-            tracing::info!(
-                executor_count,
-                control_channel = %channels.tx_receipts_control_channel,
-                "tx_receipts MDS fan-in: aggregating per-replica executor endpoints"
-            );
-        }
-
-        // tx_receipts → Receipt fan-out.
-        //
-        // MDS (fan-in): open ONE control-mode=manual subscription on
-        // `tx_receipts_control_channel` and attach each executor replica's
-        // unicast endpoint (0..executor_count) as a destination. N executors
-        // replay the SAME canonical order and emit IDENTICAL receipts, so the
-        // proxy dedups by tx hash downstream (first-wins) — this layer just
-        // aggregates the streams. Legacy IPC: a plain subscription on the
-        // shared `tx_receipts_channel`.
-        let receipts_sub = TxReceiptsSubscriberHandle::open_auto(rt, channels, executor_count)
-            .map_err(|e| IngressError::Internal(format!("open tx_receipts: {e}")))?;
-        // `into_receiver()`: the handle's AeronRuntime clone must NOT travel
-        // into the pump task — that ownership cycle keeps the runtime alive
-        // forever (see `TxReceiptsSubscriberHandle::into_receiver`). Harmless
-        // here today only because `main` returns without joining on the
-        // streams; it made the validator unkillable by SIGTERM.
-        let mut receipts_rx = receipts_sub.into_receiver();
-        let tx = receipts_tx.clone();
-        tokio::spawn(async move {
-            while let Some((_pos, r)) = receipts_rx.recv().await {
-                let _ = tx.send(r);
-            }
-        });
-
-        // Quorum/durable watermark: in the cluster-only topology this bus is fed
-        // by the Aeron Cluster egress observer spawned in `main` (cluster mode
-        // replaced the standalone sealer that used to publish it on Aeron), not
-        // by an Aeron `quorum_watermark` subscription here. The bus + its
-        // `subscribe_watermark()` surface are unchanged; only the producer moved.
-
-        // Per-recorder fsync watermark
-        let mut fsync_sub = FsyncWatermarkSubscriberHandle::open(rt, channels, recorder_id)
-            .map_err(|e| IngressError::Internal(format!("open fsync watermark: {e}")))?;
-        let tx = local_fsync_tx.clone();
-        tokio::spawn(async move {
-            while let Some((_pos, w)) = fsync_sub.recv().await {
-                let _ = tx.send(w);
-            }
-        });
-
-        // tx_receipts → BlockBoundary fan-out (the `tx_receipts_stream_id + 1`
-        // side-stream). Same MDS vs IPC branch as the receipt stream above:
-        // attach the same per-replica executor endpoints to the boundary MDS
-        // subscription.
-        let mut boundary_sub =
-            TxReceiptsBoundarySubscriberHandle::open_auto(rt, channels, executor_count)
-                .map_err(|e| IngressError::Internal(format!("open tx_receipts boundaries: {e}")))?;
-        let tx = block_boundaries_tx.clone();
-        tokio::spawn(async move {
-            while let Some((_pos, b)) = boundary_sub.recv().await {
-                let _ = tx.send(b);
-            }
-        });
-
-        // tx_errors → TxError fan-out
-        let mut errors_sub = TxErrorsSubscriberHandle::open(rt, channels)
-            .map_err(|e| IngressError::Internal(format!("open tx_errors: {e}")))?;
-        let tx = tx_errors_tx.clone();
-        tokio::spawn(async move {
-            while let Some((_pos, e)) = errors_sub.recv().await {
-                let _ = tx.send(e);
-            }
-        });
-
-        Ok(Self {
-            receipts: receipts_tx,
-            watermarks: watermarks_tx,
-            local_fsync: local_fsync_tx,
-            block_boundaries: block_boundaries_tx,
-            tx_errors: tx_errors_tx,
-        })
-    }
-}
-
-impl IngressSubscription for LiveIngressSubscription {
-    fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt> {
-        self.receipts.subscribe()
-    }
-    fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark> {
-        self.watermarks.subscribe()
-    }
-    fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark> {
-        self.local_fsync.subscribe()
-    }
-    fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary> {
-        self.block_boundaries.subscribe()
-    }
-    fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError> {
-        self.tx_errors.subscribe()
-    }
 }
