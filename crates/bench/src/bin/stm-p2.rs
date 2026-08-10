@@ -353,6 +353,7 @@ fn main() -> anyhow::Result<()> {
         wall: f64,
         fallbacks: usize,
         feed_us: u64,
+        redundant: u64,
         decode_us: u64,
         predict_us: u64,
         admit_us: u64,
@@ -376,6 +377,7 @@ fn main() -> anyhow::Result<()> {
                 wall: 0.0,
                 fallbacks: 0,
                 feed_us: 0,
+                redundant: 0,
                 decode_us: 0,
                 predict_us: 0,
                 admit_us: 0,
@@ -404,6 +406,7 @@ fn main() -> anyhow::Result<()> {
                         row.wall += ms;
                         row.fallbacks += out.fallback as usize;
                         row.feed_us += out.feed_us;
+                        row.redundant += out.redundant_edges;
                         row.decode_us += out.decode_us;
                         row.predict_us += out.predict_us;
                         row.admit_us += out.admit_us;
@@ -468,7 +471,7 @@ fn main() -> anyhow::Result<()> {
             r.predict_us,
             r.prune_us,
             r.idle_us,
-            r.fallbacks,
+            r.redundant,
         );
     }
     let _ = |r: &Row| r.avg_batch;

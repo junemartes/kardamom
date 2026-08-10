@@ -263,6 +263,7 @@ pub struct StmOutcome {
     /// invocations and how many were starvation-forced, the realized
     /// batch size, and worker idle time.
     pub feed_us: u64,
+    pub redundant_edges: u64,
     pub decode_us: u64,
     pub predict_us: u64,
     pub admit_us: u64,
@@ -383,6 +384,13 @@ pub struct Metrics {
     /// parts of admission (the rest is the graph lock + dispatch).
     pub decode_ns: std::sync::atomic::AtomicU64,
     pub predict_ns: std::sync::atomic::AtomicU64,
+    /// Edges whose predecessor was assigned to the SAME thread AND was
+    /// already dispatched — the FIFO queue already orders those, so the
+    /// edge enforces nothing. Measured to decide whether eliding them is
+    /// worth the subtlety (the elision is only sound for predecessors
+    /// ALREADY dispatched: one still waiting could be queued after its
+    /// own child).
+    pub redundant_edges: std::sync::atomic::AtomicU64,
     /// WHOLE-admission nanoseconds (decode + predict + graph + dispatch).
     /// The feed is a single thread, so this is a hard serial floor on
     /// block latency — the number that says whether the scheduler or the
@@ -438,8 +446,14 @@ impl Default for PoolConfig {
 /// threads contend on for the whole block.
 #[derive(Default)]
 struct Node {
-    /// `Some` = outstanding, accepting edges. `None` = finished, published.
-    children: Mutex<Option<Vec<u32>>>,
+    /// True while this tx is outstanding and accepting edges. Flipped
+    /// under `children`'s lock, which is what makes "is p outstanding?"
+    /// and "register my edge on p" one atomic step.
+    open: AtomicBool,
+    /// Children registered while open. Drained IN PLACE at close so the
+    /// buffer keeps its capacity for the next block that reuses this
+    /// arena slot — steady-state allocation is zero.
+    children: Mutex<Vec<u32>>,
     /// Outstanding predecessors. Carries a +1 ADMISSION GUARD while the
     /// feed is still registering this tx's edges, so a predecessor that
     /// finishes mid-admission cannot drive the count to zero early and
@@ -462,10 +476,10 @@ struct BlockCtx<'env, S: StateDatabase> {
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
-    /// Pre-allocated so the array NEVER reallocates: workers index it
-    /// concurrently while the feed is still admitting. `MAX_BLOCK_TXS` is
-    /// the gas-limit bound, so this is a fixed, provably sufficient size.
-    nodes: Vec<Node>,
+    /// The pool's arena (see [`PoolHandle::arena`]) — shared, never
+    /// reallocated, indexed concurrently while the feed is still
+    /// admitting.
+    nodes: Arc<Vec<Node>>,
     /// Admitted (feed-only writer) and finished (workers) counts; the
     /// block is drained when sealed and the two agree.
     admitted: AtomicU32,
@@ -522,44 +536,31 @@ impl<S: StateDatabase> BlockCtx<'_, S> {
             };
             for job in drained {
                 applied += 1;
-                // CLOSE: after this, admission can no longer register an
-                // edge on `job` — it observes the closed list and skips,
-                // which is correct because `job` has already published.
-                // LEAVE ONCE. Closing is the node's exit from the graph;
-                // a second close would mean the tx completed twice, and
-                // silently draining an empty list would strand every edge
-                // registered in between. Debug-assert the invariant and
-                // count a violation loudly in release.
-                let kids = {
-                    let mut c = self.nodes[job as usize]
-                        .children
-                        .lock()
-                        .expect("children poisoned");
-                    match c.take() {
-                        Some(k) => k,
-                        None => {
-                            debug_assert!(
-                                false,
-                                "stm: tx index {job} left the graph twice (completion must happen exactly once)"
-                            );
-                            tracing::error!(
-                                tx = job,
-                                "stm: tx left the graph twice — scheduler invariant violated"
-                            );
-                            self.double_exit.fetch_add(1, Ordering::SeqCst);
-                            Vec::new()
-                        }
-                    }
-                };
-                for c in kids {
-                    if self.nodes[c as usize]
-                        .indegree
-                        .fetch_sub(1, Ordering::AcqRel)
-                        == 1
-                    {
-                        ready.push((self.nodes[c as usize].worker.load(Ordering::Acquire), c));
+                // LEAVE ONCE. Closing IS the node's exit from the graph;
+                // a second close would strand every edge registered in
+                // between, so it is asserted rather than assumed. The
+                // list is drained IN PLACE so its capacity survives for
+                // the next block that reuses this arena slot.
+                let node = &self.nodes[job as usize];
+                let mut list = node.children.lock().expect("children poisoned");
+                if !node.open.swap(false, Ordering::AcqRel) {
+                    debug_assert!(
+                        false,
+                        "stm: tx left the graph twice (completion must happen exactly once)"
+                    );
+                    tracing::error!(
+                        tx = job,
+                        "stm: tx left the graph twice — scheduler invariant violated"
+                    );
+                    self.double_exit.fetch_add(1, Ordering::SeqCst);
+                }
+                for c in list.iter() {
+                    let child = &self.nodes[*c as usize];
+                    if child.indegree.fetch_sub(1, Ordering::AcqRel) == 1 {
+                        ready.push((child.worker.load(Ordering::Acquire), *c));
                     }
                 }
+                list.clear();
             }
         }
         if applied > 0 {
@@ -615,6 +616,21 @@ type PoolShared<'env, S> = (Mutex<PoolState<'env, S>>, Condvar);
 pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     shared: &'a PoolShared<'a, S>,
     snapshot: &'a S,
+    /// THE ARENA. Allocated once for the pool's lifetime and reused by
+    /// every block: a node is addressed by its index, so nothing here is
+    /// ever allocated, freed, or reference-counted per transaction. This
+    /// is the whole reason the graph is not an `Arc` graph — `Arc` gives
+    /// the same semantics but demands one heap allocation per node plus
+    /// refcount traffic on every clone, which measured 4.3ms -> 38.9ms of
+    /// release cost per 8000 txs. Here a "weak reference" is the index,
+    /// and liveness is the node's own state (`children == None` means it
+    /// already left the graph).
+    ///
+    /// Sized by the gas limit (`MAX_BLOCK_TXS`), so it cannot overflow;
+    /// `reset` clears only the prefix a block actually used, and the
+    /// children vectors KEEP THEIR CAPACITY, so steady-state allocation
+    /// across blocks is zero.
+    arena: Arc<Vec<Node>>,
 }
 
 /// Spawn `workers` pool threads for the duration of `f`.
@@ -643,8 +659,9 @@ pub fn with_pool<S: StateDatabase + Sync, R>(
             scope.spawn(move || worker_loop(shared_ref, w));
         }
         let handle = PoolHandle {
-            shared: &shared,
+            shared: shared_ref,
             snapshot,
+            arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
         let mut st = shared_ref.0.lock().expect("pool poisoned");
@@ -724,7 +741,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                     cv: Condvar::new(),
                 })
                 .collect(),
-            nodes: (0..MAX_BLOCK_TXS).map(|_| Node::default()).collect(),
+            nodes: self.arena.clone(),
             admitted: AtomicU32::new(0),
             finished: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
@@ -936,12 +953,13 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             node.worker.store(worker, Ordering::Release);
             node.indegree.store(1, Ordering::Release);
             let mut c = node.children.lock().expect("children poisoned");
-            if c.is_some() {
+            if node.open.load(Ordering::Acquire) {
                 return Err(ExecutorError::State(format!(
                     "stm: tx index {i} admitted twice (registration must happen exactly once)"
                 )));
             }
-            *c = Some(Vec::new());
+            c.clear();
+            node.open.store(true, Ordering::Release);
         }
         self.ctx.admitted.fetch_add(1, Ordering::SeqCst);
         let mut deg = 0u32;
@@ -949,17 +967,23 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             if p == idx {
                 continue;
             }
-            let mut c = self.ctx.nodes[p as usize]
-                .children
-                .lock()
-                .expect("children poisoned");
-            if let Some(list) = c.as_mut() {
+            let pn = &self.ctx.nodes[p as usize];
+            let mut list = pn.children.lock().expect("children poisoned");
+            if pn.open.load(Ordering::Acquire) {
                 // Increment BEFORE publishing the edge: the matching
                 // decrement can only happen once this child is visible in
                 // p's list, so the add always precedes its own subtract.
                 self.ctx.nodes[i].indegree.fetch_add(1, Ordering::AcqRel);
                 list.push(idx);
                 deg += 1;
+                if pn.worker.load(Ordering::Acquire) == worker
+                    && pn.indegree.load(Ordering::Acquire) == 0
+                {
+                    self.ctx
+                        .metrics
+                        .redundant_edges
+                        .fetch_add(1, Ordering::Relaxed);
+                }
             }
             // else: p already finished and published — no edge needed.
         }
@@ -1166,6 +1190,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             dispatch,
             double_exit: ctx.double_exit.load(Ordering::SeqCst),
             feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
+            redundant_edges: m.redundant_edges.load(Ordering::Relaxed),
             decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
             predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
             admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
