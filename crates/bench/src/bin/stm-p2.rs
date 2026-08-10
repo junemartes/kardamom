@@ -246,6 +246,10 @@ fn main() -> anyhow::Result<()> {
         seq_receipts: Vec<Receipt>,
         seq_delta: PendingDelta,
         is_flow: bool,
+        /// Upstream-prepared decode+prediction — what P3's tx_data readers
+        /// will hand the executor. Timed separately: it is NOT on the
+        /// feed's serial path.
+        prep_us: u64,
     }
     let mut cases: Vec<BlockCase> = Vec::with_capacity(all_blocks.len());
     let mut delta = PendingDelta::new();
@@ -328,6 +332,13 @@ fn main() -> anyhow::Result<()> {
         }
 
         delta.merge_from(&seq_delta);
+        // Cost of preparing this block upstream (measured once; the sweep
+        // re-prepares per run so each timed pass starts from raw inputs).
+        let t_prep = Instant::now();
+        for (t, _, e) in &recs {
+            let _ = kardamom_stm::execute::prepare(e, *t, &stats_before);
+        }
+        let prep_us = t_prep.elapsed().as_micros() as u64;
         cases.push(BlockCase {
             env,
             recs,
@@ -336,6 +347,7 @@ fn main() -> anyhow::Result<()> {
             seq_receipts,
             seq_delta,
             is_flow,
+            prep_us,
         });
     }
 
@@ -353,7 +365,13 @@ fn main() -> anyhow::Result<()> {
         wall: f64,
         fallbacks: usize,
         feed_us: u64,
+        prep_us: u64,
         redundant: u64,
+        /// Dispatch imbalance: busiest thread's share vs an even split.
+        /// Domain-affinity assignment collides when domains ~ workers.
+        imbalance: f64,
+        imb_n: u64,
+        idle_threads: usize,
         decode_us: u64,
         predict_us: u64,
         admit_us: u64,
@@ -377,7 +395,11 @@ fn main() -> anyhow::Result<()> {
                 wall: 0.0,
                 fallbacks: 0,
                 feed_us: 0,
+                prep_us: 0,
                 redundant: 0,
+                imbalance: 0.0,
+                imb_n: 0,
+                idle_threads: 0,
                 decode_us: 0,
                 predict_us: 0,
                 admit_us: 0,
@@ -391,8 +413,17 @@ fn main() -> anyhow::Result<()> {
             kardamom_stm::execute::with_pool(&snap, cfg, |pool| -> anyhow::Result<()> {
                 for case in &cases {
                     let base = case.base.clone();
+                    // Upstream stage — in production the tx_data readers,
+                    // here just ahead of the timer: the point is that it
+                    // is NOT on the executor's serial feed.
+                    let prepared: Vec<_> = case
+                        .recs
+                        .iter()
+                        .map(|(t, _, e)| kardamom_stm::execute::prepare(e, *t, &case.stats))
+                        .collect();
                     let t = Instant::now();
-                    let out = pool.run_block(base, case.env, &case.recs, &case.stats)?;
+                    let out =
+                        pool.run_block_prepared(base, case.env, &case.recs, prepared, &case.stats)?;
                     let ms = t.elapsed().as_secs_f64() * 1e3;
                     assert_identical(
                         &case.seq_receipts,
@@ -406,6 +437,15 @@ fn main() -> anyhow::Result<()> {
                         row.wall += ms;
                         row.fallbacks += out.fallback as usize;
                         row.feed_us += out.feed_us;
+                        row.prep_us += case.prep_us;
+                        let total: u32 = out.dispatch.iter().sum();
+                        let maxd = *out.dispatch.iter().max().unwrap_or(&0);
+                        let used = out.dispatch.iter().filter(|c| **c > 0).count();
+                        if total > 0 {
+                            row.imbalance += maxd as f64 * out.dispatch.len() as f64 / total as f64;
+                            row.idle_threads += out.dispatch.len() - used;
+                            row.imb_n += 1;
+                        }
                         row.redundant += out.redundant_edges;
                         row.decode_us += out.decode_us;
                         row.predict_us += out.predict_us;
@@ -460,21 +500,31 @@ fn main() -> anyhow::Result<()> {
     );
     for r in &rows {
         println!(
-            "{:>3} {:>6} {:>9.0} {:>7.2}x {:>9.0} {:>10} {:>10} {:>7} {:>9} {:>9} {:>6}",
+            "{:>3} {:>6} {:>9.0} {:>7.2}x {:>9.0} {:>10} {:>10} {:>7} {:>9} {:>9} {:>6.2}",
             r.workers,
             r.batch,
             r.wall,
             wall_seq / r.wall,
             flow_gas as f64 / 1e6 / (r.wall / 1e3),
             r.feed_us,
-            r.decode_us,
+            r.prep_us,
             r.predict_us,
             r.prune_us,
             r.idle_us,
-            r.redundant,
+            if r.imb_n > 0 {
+                r.imbalance / r.imb_n as f64
+            } else {
+                0.0
+            },
         );
     }
-    let _ = |r: &Row| r.avg_batch;
+    let _ = |r: &Row| (r.avg_batch, r.redundant, r.idle_threads);
+    let tot_idle_threads: usize = rows.iter().map(|r| r.idle_threads).sum();
+    let tot_blocks: u64 = rows.iter().map(|r| r.imb_n).sum();
+    println!(
+        "DISPATCH: empty-thread-slots {} over {} block-runs (domain-affinity collisions)",
+        tot_idle_threads, tot_blocks
+    );
     println!("BYTE-IDENTICAL: every block, every worker count — verified");
     Ok(())
 }

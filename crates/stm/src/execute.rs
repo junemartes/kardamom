@@ -264,6 +264,7 @@ pub struct StmOutcome {
     /// batch size, and worker idle time.
     pub feed_us: u64,
     pub redundant_edges: u64,
+    pub steals: u64,
     pub decode_us: u64,
     pub predict_us: u64,
     pub admit_us: u64,
@@ -340,6 +341,73 @@ fn domain_hash(bytes: &[u8], workers: usize) -> usize {
 /// not slow work.
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Everything about a tx that can be derived WITHOUT touching the graph:
+/// the RLP decode and the footprint prediction. Both are pure functions of
+/// the envelope bytes and the stats snapshot, so they do not belong on the
+/// executor's single feed thread — the pipeline computes them upstream,
+/// where the work is already sharded.
+///
+/// In the live executor (P3) this is produced by the M tx_data reader
+/// threads, which touch every envelope anyway and run BEFORE the canonical
+/// order arrives (the join buffer exists precisely because tx_data leads
+/// tx_ordering), so the work lands in slack that already exists.
+pub struct Prepared {
+    /// `None` when the envelope does not decode — the #92 skip path.
+    pub decoded: Option<alloy_consensus::TxEnvelope>,
+    /// Predicted contention domains, fee sink already excluded.
+    pub domains: Vec<DomainKey>,
+    /// The domain that decides which thread runs this tx.
+    pub primary: Option<DomainKey>,
+    /// ⊤: untrained selector — orders behind everything outstanding.
+    pub cold: bool,
+}
+
+/// Decode + predict, off the feed thread. `stats` must be a snapshot
+/// trained on PRIOR blocks only (in the live executor: an `Arc<Stats>`
+/// swapped at each boundary, so readers never take a lock).
+///
+/// Getting this wrong is not a correctness event: a bad prediction costs a
+/// mis-schedule, which surfaces as a wound and re-executes that one tx at
+/// its canonical position. That is what makes it safe to compute here,
+/// concurrently, ahead of canonical order.
+pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepared {
+    let decoded = decode_alloy_envelope(&envelope.raw_tx, tx_idx).ok();
+    // The local index is irrelevant to prediction (it only labels the
+    // observation), so preparation needs no position in the block.
+    let view = schedule::scheduling_view_decoded(0, envelope, decoded.as_ref());
+    let mut domains: Vec<DomainKey> = Vec::new();
+    let mut primary: Option<DomainKey> = None;
+    let cold = match stats.predict_domains(&view) {
+        Some(predicted) => {
+            for c in predicted {
+                if c == DomainKey::Account(FEE_SINK) {
+                    continue;
+                }
+                // The primary contention domain is the first non-sender
+                // cell in canonical order (stable across txs of one flow,
+                // which is what puts a pool's traffic on one thread),
+                // falling back to the sender cell — the SenderChain lane
+                // for tier-1-only txs.
+                let is_sender = matches!(c, DomainKey::Account(a) if a == envelope.sender);
+                let primary_is_sender =
+                    matches!(primary, Some(DomainKey::Account(a)) if a == envelope.sender);
+                if primary.is_none() || (!is_sender && primary_is_sender) {
+                    primary = Some(c);
+                }
+                domains.push(c);
+            }
+            false
+        }
+        None => true,
+    };
+    Prepared {
+        decoded,
+        domains,
+        primary,
+        cold,
+    }
+}
+
 /// Gas-limit-derived hard cap on txs per block: `BLOCK_GAS_LIMIT` / 21k
 /// intrinsic gas = 1,428, with ~2.8x headroom. Slots are pre-allocated per
 /// block so workers address them lock-free while the feed is still
@@ -380,6 +448,8 @@ pub struct Metrics {
     pub completions: std::sync::atomic::AtomicU64,
     /// Nanoseconds workers spent parked with nothing to run.
     pub idle_ns: std::sync::atomic::AtomicU64,
+    /// Ready txs taken from another thread's queue to fix imbalance.
+    pub steals: std::sync::atomic::AtomicU64,
     /// Envelope decode and footprint prediction, the two pure-computation
     /// parts of admission (the rest is the graph lock + dispatch).
     pub decode_ns: std::sync::atomic::AtomicU64,
@@ -508,6 +578,35 @@ struct BlockCtx<'env, S: StateDatabase> {
 /// lock, releases it, and only then pushes. The idle path takes the graph
 /// lock only after dropping its queue lock.
 impl<S: StateDatabase> BlockCtx<'_, S> {
+    /// Steal one ready tx from the longest other queue.
+    ///
+    /// SAFE BY CONSTRUCTION, and worth spelling out: a tx only ever
+    /// reaches a queue once its indegree hit zero, i.e. every predicted
+    /// predecessor has finished and published — including its
+    /// same-domain ones, which get real edges like any other. So queue
+    /// position carries NO ordering obligation; the domain-hashed
+    /// assignment is a locality hint, not a correctness mechanism, and
+    /// any thread may run any ready tx.
+    ///
+    /// Taken from the BACK, leaving the owner its front: the owner's
+    /// front is the oldest (most likely to have warm state), and the two
+    /// ends rarely contend.
+    fn steal(&self, thief: usize) -> Option<u32> {
+        let mut best: Option<(usize, usize)> = None;
+        for (w, qh) in self.queues.iter().enumerate() {
+            if w == thief {
+                continue;
+            }
+            let len = qh.q.lock().expect("queue poisoned").len();
+            if len > 1 && best.is_none_or(|(_, b)| len > b) {
+                best = Some((w, len));
+            }
+        }
+        let (victim, _) = best?;
+        let mut q = self.queues[victim].q.lock().expect("queue poisoned");
+        q.pop_back()
+    }
+
     /// Hand a READY tx to its assigned thread. Called only with no node
     /// mutex held (lock order: node registration points are leaves).
     fn push_ready(&self, worker: usize, idx: u32) {
@@ -782,6 +881,25 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         })
     }
 
+    /// Feed a block whose txs were PREPARED upstream (decode + predict
+    /// already done, off this thread) — the pipelined shape P3's tx_data
+    /// readers will use.
+    pub fn run_block_prepared(
+        &self,
+        base: PendingDelta,
+        env: ExecEnv,
+        txs: &[(TxIndex, BPosition, TxEnvelope)],
+        prepared: Vec<Prepared>,
+        stats: &Stats,
+    ) -> Result<StmOutcome, ExecutorError> {
+        debug_assert_eq!(txs.len(), prepared.len(), "one Prepared per tx");
+        let mut sess = self.begin_block(base, env, stats)?;
+        for ((t, p, e), prep) in txs.iter().zip(prepared) {
+            sess.push_prepared(*t, *p, e.clone(), prep)?;
+        }
+        sess.seal()
+    }
+
     /// Batch convenience: feed the whole block, seal, return the outcome.
     pub fn run_block(
         &self,
@@ -825,6 +943,28 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         position: BPosition,
         envelope: TxEnvelope,
     ) -> Result<(), ExecutorError> {
+        // Convenience path: prepare inline. The pipelined caller (P3's
+        // tx_data readers) calls `prepare` upstream and `push_prepared`
+        // here, keeping decode+predict off this serial thread entirely.
+        let t_prep = std::time::Instant::now();
+        let prep = prepare(&envelope, tx_idx, self.stats);
+        let dt = t_prep.elapsed().as_nanos() as u64;
+        self.ctx.metrics.decode_ns.fetch_add(dt, Ordering::Relaxed);
+        self.push_prepared(tx_idx, position, envelope, prep)
+    }
+
+    /// Admit a tx whose decode and prediction were computed UPSTREAM (see
+    /// [`prepare`]). This is the executor's real hot path: everything left
+    /// here is graph work, which must stay serial and in canonical order
+    /// because an edge is "the previous tx that touched this domain".
+    pub fn push_prepared(
+        &mut self,
+        tx_idx: TxIndex,
+        position: BPosition,
+        envelope: TxEnvelope,
+        prep: Prepared,
+    ) -> Result<(), ExecutorError> {
+        let _ = tx_idx;
         let t_feed = std::time::Instant::now();
         let i = self.txs.len();
         if i >= MAX_BLOCK_TXS {
@@ -833,47 +973,16 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             )));
         }
         let idx = i as u32;
-        let t_dec = std::time::Instant::now();
-        let decoded = decode_alloy_envelope(&envelope.raw_tx, tx_idx).ok();
-        let view = schedule::scheduling_view_decoded(idx, &envelope, decoded.as_ref());
-        self.ctx
-            .metrics
-            .decode_ns
-            .fetch_add(t_dec.elapsed().as_nanos() as u64, Ordering::Relaxed);
-        let t_pred = std::time::Instant::now();
+        let Prepared {
+            decoded,
+            domains: cells,
+            primary: domain,
+            cold: is_cold,
+        } = prep;
+        if is_cold {
+            self.cold += 1;
+        }
 
-        // (1) Predict — off-lock. Collect the cells and pick the primary
-        // contention domain: the first non-sender cell in the prediction's
-        // canonical order (stable across txs of one flow, which is what
-        // puts a pool's traffic on one thread), else the sender cell —
-        // exactly the SenderChain lane for tier-1-only txs.
-        let mut cells: Vec<DomainKey> = Vec::new();
-        let mut domain: Option<DomainKey> = None;
-        let is_cold = match self.stats.predict_domains(&view) {
-            Some(predicted) => {
-                for c in predicted {
-                    if c == DomainKey::Account(FEE_SINK) {
-                        continue;
-                    }
-                    let is_sender = matches!(c, DomainKey::Account(a) if a == envelope.sender);
-                    let domain_is_sender =
-                        matches!(domain, Some(DomainKey::Account(a)) if a == envelope.sender);
-                    if domain.is_none() || (!is_sender && domain_is_sender) {
-                        domain = Some(c);
-                    }
-                    cells.push(c);
-                }
-                false
-            }
-            None => {
-                self.cold += 1;
-                true
-            }
-        };
-        self.ctx
-            .metrics
-            .predict_ns
-            .fetch_add(t_pred.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let worker = match domain {
             Some(DomainKey::Account(a)) => domain_hash(a.as_slice(), self.workers),
             Some(DomainKey::Fixed(a, k)) => {
@@ -1191,6 +1300,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             double_exit: ctx.double_exit.load(Ordering::SeqCst),
             feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
             redundant_edges: m.redundant_edges.load(Ordering::Relaxed),
+            steals: m.steals.load(Ordering::Relaxed),
             decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
             predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
             admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
@@ -1276,6 +1386,14 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
                 }
                 if ctx.drained() {
                     return;
+                }
+                // Domain hashing collides when domains ~ workers (measured:
+                // the busiest thread took 1.7-2.3x its even share, and
+                // ~1.25 threads per block got nothing at all), so an idle
+                // worker helps the busiest one rather than parking.
+                if let Some(stolen) = ctx.steal(worker) {
+                    ctx.metrics.steals.fetch_add(1, Ordering::Relaxed);
+                    break stolen;
                 }
                 q = qh.q.lock().expect("queue poisoned");
                 if !q.is_empty() {
