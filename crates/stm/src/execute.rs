@@ -454,6 +454,10 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 /// Spins before a dry worker parks. Sized so the spin costs far less than
 /// the park/unpark syscall pair it avoids, while still yielding promptly
 /// when a block really is drained.
+/// MEASURED: yielding partway through the spin was tried and REVERTED —
+/// it helped only the oversubscribed case (12 workers on 12 cores) and
+/// cost 20-35% everywhere else. Do not run more workers than cores minus
+/// the feed thread; that is the real fix for oversubscription.
 const SPIN_BEFORE_PARK: u32 = 256;
 
 /// Longest a parked worker sleeps before re-checking its queue and the
@@ -657,9 +661,14 @@ struct BlockCtx<S: StateDatabase> {
     finished: AtomicU32,
     sealed: AtomicBool,
     /// Per-worker completion buffers: a finishing worker parks its index
-    /// here (uncontended — it owns the slot) instead of touching the graph
-    /// on every tx. A prune drains them all under the graph lock.
+    /// here (uncontended — it owns the slot) instead of retiring edges on
+    /// every tx; a prune drains them.
     completed: Vec<Mutex<Vec<u32>>>,
+    /// Length of each buffer, readable WITHOUT taking its mutex. A prune
+    /// otherwise locks every worker's buffer just to find it empty, and
+    /// spinning workers force-prune often — measured at ~2us/tx on
+    /// micro-gas workloads, the largest single overhead there.
+    completed_len: Vec<AtomicU32>,
     /// Completions parked across all buffers, i.e. DAG updates owed.
     pending: std::sync::atomic::AtomicU64,
     prune_batch: usize,
@@ -733,12 +742,17 @@ impl<S: StateDatabase> BlockCtx<S> {
         let t0 = std::time::Instant::now();
         let mut applied = 0usize;
         let mut ready: Vec<(usize, u32)> = Vec::new();
-        for buf in &self.completed {
+        for (w, buf) in self.completed.iter().enumerate() {
+            // Skip untouched buffers without paying for their mutex.
+            if self.completed_len[w].load(Ordering::Acquire) == 0 {
+                continue;
+            }
             let drained: Vec<u32> = {
                 let mut b = buf.lock().expect("completed poisoned");
                 if b.is_empty() {
                     continue;
                 }
+                self.completed_len[w].fetch_sub(b.len() as u32, Ordering::AcqRel);
                 std::mem::take(&mut *b)
             };
             for job in drained {
@@ -978,6 +992,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             finished: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
             completed: (0..workers).map(|_| Mutex::new(Vec::new())).collect(),
+            completed_len: (0..workers).map(|_| AtomicU32::new(0)).collect(),
             pending: std::sync::atomic::AtomicU64::new(0),
             prune_batch: prune_batch.max(1),
             started: std::time::Instant::now(),
@@ -1650,6 +1665,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         {
             let mut b = ctx.completed[worker].lock().expect("completed poisoned");
             b.push(job);
+            ctx.completed_len[worker].fetch_add(1, Ordering::Release);
         }
         let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
         if owed as usize >= ctx.prune_batch {
