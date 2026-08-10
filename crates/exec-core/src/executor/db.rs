@@ -103,10 +103,14 @@ impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
     }
 
     fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
-        // The shipped kardamom-types StateDatabase trait does not expose
-        // block_hash. v0 callers (BLOCKHASH opcode in executed contracts)
-        // observe the zero hash — historically what an executor without an
-        // ancestor cache returns until S6 wires one in.
+        // CONSENSUS RULE (v0, pinned by phase 3): BLOCKHASH returns the zero
+        // hash for EVERY height. The kardamom-types StateDatabase trait
+        // exposes no block_hash and no ancestor cache exists; every execution
+        // profile — live executor, validator re-exec, stateless guest — flows
+        // through this one adapter, so the rule holds uniformly and a proof
+        // replays it exactly. Introducing a real ancestor chain is a
+        // deliberate consensus change (new spec + coordinated release), not
+        // a wiring fix.
         Ok(B256::ZERO)
     }
 }

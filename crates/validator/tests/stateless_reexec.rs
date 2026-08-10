@@ -167,17 +167,19 @@ fn oracle_root(delta: &PendingDelta) -> B256 {
 fn stateless_replay_reproduces_recorded_execution() {
     let recs = records();
 
-    // Reference execution + witness capture in one pass (the recorder is a
-    // transparent decorator — asserted implicitly by the replay equality).
+    // Reference execution + witness + BAL capture in one pass (the recorder
+    // is a transparent decorator — asserted implicitly by replay equality).
     let snap = genesis();
-    let (reference, witness) = capture_block_witness(&snap, None, &recs, env()).unwrap();
+    let (reference, witness, raw_bal) = capture_block_witness(&snap, None, &recs, env()).unwrap();
     assert!(
         reference.receipts.iter().all(|r| r.status),
         "setup: every record must execute successfully"
     );
+    assert!(!raw_bal.is_empty(), "setup: block must produce a BAL");
 
-    // Stateless replay: witness only, no state DB.
-    let stateless = reexecute_stateless(&witness, None, &recs, env()).unwrap();
+    // Stateless replay: witness only, no state DB — with the published BAL
+    // as a PROOF INPUT (granularity 1 = per-tx frames).
+    let stateless = reexecute_stateless(&witness, None, &recs, env(), &raw_bal, 1).unwrap();
 
     assert_eq!(reference.receipts, stateless.receipts, "receipts diverged");
     assert_eq!(
@@ -239,15 +241,54 @@ fn stateless_replay_reproduces_recorded_execution() {
             .any(|s| s.address == CONTRACT && s.key == B256::ZERO && s.value == U256::from(7u64))
     );
 
-    // Digest is stable across capture repetitions (canonical ordering).
-    let (_, witness2) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
+    // Digest is stable across capture repetitions (canonical ordering), and
+    // so is the BAL commitment the proof would bind as a public output.
+    let (_, witness2, raw_bal2) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
     assert_eq!(witness.digest(), witness2.digest());
+    assert_eq!(
+        kardamom_engine::stateless::bal_commitment(&raw_bal),
+        kardamom_engine::stateless::bal_commitment(&raw_bal2)
+    );
+
+    // Quantized frames (K > 1) verify through the same shared ladder.
+    let quantized = kardamom_engine::bal_ladder::quantize(raw_bal.clone(), 2);
+    reexecute_stateless(&witness, None, &recs, env(), &quantized, 2)
+        .expect("stateless replay must verify against a K=2-quantized frame");
+}
+
+#[test]
+fn forged_bal_fails_closed() {
+    let recs = records();
+    let (_, witness, raw_bal) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
+
+    // Bump one claimed post-balance: the recomputed BAL can no longer equal
+    // the input, and the replay must refuse to attest it.
+    let mut forged = raw_bal.clone();
+    let mut tampered = false;
+    for acct in forged.iter_mut() {
+        if let Some(c) = acct.balance_changes.first_mut() {
+            c.post_balance += alloy_primitives::U256::from(1u64);
+            tampered = true;
+            break;
+        }
+    }
+    assert!(tampered, "setup: no balance change to tamper with");
+    let err = reexecute_stateless(&witness, None, &recs, env(), &forged, 1);
+    assert!(
+        matches!(err, Err(kardamom_engine::ExecutorError::Divergence(_))),
+        "forged BAL must be refused as a divergence, got: {err:?}"
+    );
+
+    // Granularity mismatch is ALSO a refusal: a K=2 frame never equals a
+    // per-tx recomputation quantized at K=1.
+    let quantized = kardamom_engine::bal_ladder::quantize(raw_bal, 2);
+    assert!(reexecute_stateless(&witness, None, &recs, env(), &quantized, 1).is_err());
 }
 
 #[test]
 fn incomplete_witness_fails_closed() {
     let recs = records();
-    let (_, witness) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
+    let (_, witness, bal) = capture_block_witness(&genesis(), None, &recs, env()).unwrap();
 
     // Drop the sender's account entry: the replay must ERROR, not execute
     // against a defaulted account.
@@ -255,16 +296,16 @@ fn incomplete_witness_fails_closed() {
     tampered
         .accounts
         .retain(|a| a.address != signer().address());
-    let err = reexecute_stateless(&tampered, None, &recs, env());
+    let err = reexecute_stateless(&tampered, None, &recs, env(), &bal, 1);
     assert!(err.is_err(), "replay over an incomplete witness must fail");
 
     // Drop the contract's read slot: same contract.
     let mut tampered = witness.clone();
     tampered.storage.retain(|s| s.address != CONTRACT);
-    assert!(reexecute_stateless(&tampered, None, &recs, env()).is_err());
+    assert!(reexecute_stateless(&tampered, None, &recs, env(), &bal, 1).is_err());
 
     // Drop the contract code: same contract.
     let mut tampered = witness;
     tampered.code.clear();
-    assert!(reexecute_stateless(&tampered, None, &recs, env()).is_err());
+    assert!(reexecute_stateless(&tampered, None, &recs, env(), &bal, 1).is_err());
 }

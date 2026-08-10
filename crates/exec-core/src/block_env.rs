@@ -28,6 +28,13 @@ use revm::primitives::hardfork::SpecId;
 /// This must be assigned explicitly: `CfgEnv::default()` inherits revm's
 /// `SpecId::default()`, which tracks whatever fork upstream considers current
 /// — semantics would shift under a routine `cargo update` with no diff here.
+///
+/// Known spec-surface caveat (zk guest builds, phase 3): the 0x0A KZG
+/// point-evaluation precompile is active at OSAKA but revm only provides it
+/// via `c-kzg` (C, unavailable on no_std/zkVM targets) — the only precompile
+/// without a pure-Rust fallback. Resolving that (Rust kzg backend, or
+/// speccing 0x0A out) is a prerequisite for proving blocks that CALL 0x0A;
+/// blocks that don't are unaffected.
 pub const SPEC_ID: SpecId = SpecId::OSAKA;
 
 /// Fixed per-block gas limit (v0: no dynamic adjustment).

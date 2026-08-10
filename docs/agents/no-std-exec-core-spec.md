@@ -120,8 +120,42 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
   - Capture runs BELOW the parent/seed layers, so pipelined-commit parent
     reads surface as ordinary witness entries; per-batch capture at K > 1
     composes with claim seeds but the phase-2 contract is block-granular.
-- **PR 3** — zkVM guest program + async prover harness behind a flag;
-  resolve gaps 1–4 above; sparse post-state-root recompute over
-  `alloy-trie`.
+- **PR 3a (delivered)** — the `no_std` stateless block driver + in-guest
+  soundness hardening:
+  - `kardamom-exec-core::stateless` — `execute_block` (the single-scope
+    sequential driver, hoisted verbatim from the validator; the validator's
+    `execute_block_sequential` now DELEGATES here, so live re-execution and
+    the guest link one code path by construction) and
+    `execute_block_stateless` (the guest entry: identity verification +
+    fail-closed `WitnessDb`). `BufferedRecord`/`BlockExecOutput` moved with
+    it (re-exported from `engine::actor` at their old paths).
+  - `verify_record_identity` closes the S0 trust boundary in-guest:
+    `tx_hash = keccak256(raw_tx)` recomputed, `sender` recovered from the
+    secp256k1 signature via pure-Rust k256 (`alloy-consensus/k256`, compiles
+    on the riscv32 no_std gate). Forged hash/sender/signature aborts with
+    `ExecutorError::RecordIdentity`. Deposit identity (`source_hash`) stays
+    a trusted input until the witness is L1-anchored (derivation D/E).
+  - Spec pinned: `CHAIN_SPEC = SpecId::OSAKA` set explicitly on `CfgEnv`
+    (behavior-preserving — OSAKA is what `CfgEnv::default()` resolved to);
+    a regression test flags any future revm-default drift. Gap 1 (0x0A KZG
+    backend) remains open and documented on the constant.
+  - BLOCKHASH-returns-zero elevated to a documented consensus rule at the
+    single adapter every profile flows through.
+  - **The BAL is a proof input**: `execute_block_stateless` takes the
+    published frame's access list + granularity, re-derives its own through
+    the SAME capture hooks the live executor publishes from
+    (`execute_block_with_bal`), quantizes through the shared `bal_ladder`,
+    and fail-stops on structural inequality (`ExecutorError::Divergence` —
+    the same class the live validator halts on). `bal_commitment` =
+    keccak256 of the canonical RLP (byte-identical to `BalFrame.bal_rlp`)
+    is the public output an L1 verifier checks against the posted frame.
+    One-code-path invariant: guest, validator sequential fallback, and the
+    executor's published artifact all run the same monomorphized exec-core
+    functions — the proof attests exactly what the validator validates.
+- **PR 3b** — witness MPT anchoring: account/storage proofs against
+  `pre_state_root`, absence proofs, sparse post-state-root recompute over
+  `alloy-trie` in the guest.
+- **PR 3c** — the zkVM guest program (SP1/RISC Zero) + async prover harness
+  behind a flag; guest-build kzg decision (gap 1).
 - **PR 4** — batch-boundary wiring: one proof per posted batch aligned with
   the live batcher's L1-as-truth cursor; L1 submission/verification.

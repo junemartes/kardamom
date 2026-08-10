@@ -46,7 +46,11 @@ std = [
 kardamom-types = { path = "../types", default-features = false }
 revm = { version = "38", default-features = false }
 alloy-primitives = { version = "1.6", default-features = false }
-alloy-consensus = { version = "2.0", default-features = false }
+# `k256` (pure-Rust secp256k1) powers the stateless driver's in-guest sender
+# recovery — NOT the C `secp256k1` backend the workspace enables elsewhere,
+# which cannot build on no_std/zkVM targets. Feature-unified std builds get
+# both; the guest build gets k256 alone.
+alloy-consensus = { version = "2.0", default-features = false, features = ["k256"] }
 alloy-eips = { version = "2.0", default-features = false }
 alloy-eip7928 = { version = "0.3", default-features = false, features = ["rlp"] }
 alloy-rlp = { version = "0.3", default-features = false }

@@ -355,35 +355,17 @@ const CLAIM_WAIT: Duration = Duration::from_millis(250);
 
 /// Sequential re-execution of a whole block — the always-available fallback
 /// when the block's BAL claims don't arrive in time. Identical semantics to
-/// the engine's streaming path.
+/// the engine's streaming path. The body was hoisted into the `no_std` exec
+/// core with phase 3 (the zk guest links the same driver); this delegation
+/// is the seam that keeps live-validator and stateless execution one code
+/// path by construction.
 pub fn execute_block_sequential<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
     records: &[BufferedRecord],
     env: ExecEnv,
 ) -> Result<BlockExecOutput, ExecutorError> {
-    let mut delta = PendingDelta::new();
-    let mut receipts = Vec::with_capacity(records.len());
-    let mut cumulative = 0u64;
-    let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, parent, env)?;
-    for (i, rec) in records.iter().enumerate() {
-        let idx_in_block = i as u64;
-        let (receipt, ws) = exec_record_in_scope(
-            &mut scope,
-            snapshot,
-            parent,
-            &delta,
-            env,
-            rec,
-            idx_in_block,
-            cumulative,
-            None,
-        )?;
-        cumulative = receipt.cumulative_gas_used;
-        delta.apply(ws);
-        receipts.push(receipt);
-    }
-    Ok(BlockExecOutput { receipts, delta })
+    kardamom_engine::stateless::execute_block(snapshot, parent, records, env)
 }
 
 /// Build the validator's whole-block execution strategy: seeded parallel

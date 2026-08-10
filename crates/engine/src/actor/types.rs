@@ -2,12 +2,11 @@
 //! configuration, the BAL and whole-block-execution hand-off shapes, and the
 //! internal exec → commit envelope.
 
-use kardamom_types::{BPosition, BlockBoundary, Receipt};
+use kardamom_types::BlockBoundary;
 
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
-use crate::exec_types::TxIndex;
 use crate::reader::ReaderConfig;
 
 /// Where a restarted executor resumes from, derived from the persisted state
@@ -68,31 +67,11 @@ pub type BalHandoff = (
     revm::state::bal::Bal,
 );
 
-/// One canonical record buffered for whole-block execution (validator
-/// parallel path). Mirrors [`crate::reader::ReaderToExec`]'s payload arms.
-/// Clone is cheap: envelope/deposit byte payloads are refcounted `Bytes`
-/// (the validator's flight ring keeps recent blocks' records for
-/// receipt-divergence dumps).
-#[derive(Clone)]
-pub enum BufferedRecord {
-    Tx {
-        tx_idx: TxIndex,
-        envelope: kardamom_types::TxEnvelope,
-        position: BPosition,
-    },
-    Deposit {
-        tx_idx: TxIndex,
-        deposit: kardamom_types::Deposit,
-        position: BPosition,
-    },
-}
-
-/// What a block-execution strategy returns: the block's receipts in block
-/// order (block-cumulative gas already correct) and its merged writes.
-pub struct BlockExecOutput {
-    pub receipts: Vec<Receipt>,
-    pub delta: PendingDelta,
-}
+// Buffered-record + block-output types moved to the `no_std` exec core with
+// the phase-3 stateless driver (they ARE its input/output shapes); re-exported
+// here so every pre-move path keeps resolving. They still mirror
+// [`crate::reader::ReaderToExec`]'s payload arms.
+pub use kardamom_exec_core::stateless::{BlockExecOutput, BufferedRecord};
 
 /// Optional whole-block execution strategy. `None` (the executor) keeps the
 /// per-tx streaming path untouched. `Some` (the validator's parallel
