@@ -414,7 +414,10 @@ impl EpochPublisher for LiveTxDepositsPublisher {
             Ok(pos) => Ok(pos),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("back-pressure") {
+                // Aeron's own token, via `offer_code_str` — matching on
+                // prose ("back-pressure") never fires, so every stall used to
+                // report as Transport.
+                if msg.contains("BACK_PRESSURED") {
                     Err(PublishError::Backpressure)
                 } else {
                     Err(PublishError::Transport(msg))
@@ -452,7 +455,10 @@ impl RemoteEpochPublisher for LiveRemoteEpochsPublisher {
             Ok(pos) => Ok(pos),
             Err(e) => {
                 let msg = e.to_string();
-                if msg.contains("back-pressure") {
+                // Aeron's own token, via `offer_code_str` — matching on
+                // prose ("back-pressure") never fires, so every stall used to
+                // report as Transport.
+                if msg.contains("BACK_PRESSURED") {
                     Err(PublishError::Backpressure)
                 } else {
                     Err(PublishError::Transport(msg))

@@ -1,0 +1,51 @@
+# DRAFT — operator action required.
+#
+# The bot token cannot push `.github/workflows/*.yml`, so this change is staged
+# here. Apply it by hand to `.github/workflows/ci.yml`.
+#
+# WHAT: the `sealer-test` job runs only `:service:test`, so the entire `:core`
+# POJO suite has never run in CI — `CanonicalSealerStateTest`,
+# `ContiguityGuardTest`, `OriginRecordTest`, and (added on
+# feat/interop-xchain-p1) `RemoteOriginRecordTest`, 42 tests in total. The job's
+# own comment claims it covers the contiguity guard; it does not. Those tests
+# cover the replicated state machine, so a regression there splits a cluster
+# rather than failing a build.
+#
+# WHY NOW: the interop work adds the per-peer remote-origin map to that state
+# machine (and to the snapshot, v4), and its tests land in `:core`.
+#
+# CHANGE: run both source sets. `./gradlew test` aggregates every subproject's
+# test task, so `:core:test` and `:service:test` both run.
+#
+#   -        run: ./gradlew :service:test --no-daemon
+#   +        run: ./gradlew test --no-daemon
+#
+# The report-upload path should widen to match, since `:core` writes its own
+# reports directory:
+#
+#   -          path: cluster/sealer-service/service/build/reports/tests/test
+#   +          path: cluster/sealer-service/*/build/reports/tests/test
+#
+# Resulting job (replace the existing `sealer-test:` block verbatim):
+
+  sealer-test:
+    name: sealer tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      # Both source sets: :core holds the replicated-state-machine POJO tests
+      # (contiguity guard, origin records, per-peer remote origins), :service
+      # holds the in-JVM cluster tests.
+      - name: Run sealer JUnit suite
+        working-directory: cluster/sealer-service
+        run: ./gradlew test --no-daemon
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sealer-test-reports
+          path: cluster/sealer-service/*/build/reports/tests/test
