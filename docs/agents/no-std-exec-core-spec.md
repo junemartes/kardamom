@@ -368,3 +368,17 @@ proving cannot slow the chain.
   chaos suite next grows; requires a `CHAOS_CASES` edit in
   `cluster-e2e.yml`, which the bot cannot push (operator applies from a
   `docs/ci/` draft).
+- One record-dispatch copy still sits outside exec-core. Rebasing this
+  series onto main's DRY wave (#179) surfaced
+  `validator::parallel::exec_record_in_scope` — the same
+  Tx-vs-Deposit dispatch (execute_tx / execute_deposit_tx + `seed_layer`
+  fold) that `exec_core::stateless::execute_block_inner` performs. 3a's
+  delegation removed its sequential-fallback caller, so it now serves only
+  `execute_batch` (the parallel claim-seeded path) — no dead code, and the
+  one-code-path invariant as stated still holds, because that invariant
+  names the guest, the sequential fallback, and the executor's artifact.
+  But the BATCH path remains a second copy of consensus-critical dispatch,
+  which is exactly what #179 was collapsing. The fix is small and belongs
+  in its own change, not in a rebase: publish the per-record step from
+  exec-core and have `exec_record_in_scope` delegate to it, putting the
+  parallel path under the same invariant.
