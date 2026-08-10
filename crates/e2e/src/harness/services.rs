@@ -18,6 +18,40 @@ use anyhow::{Context, Result};
 
 use super::proc::{Proc, free_tcp_port, free_udp_port};
 
+/// How long an Aeron client tolerates a media driver that has stopped
+/// updating its keepalive before declaring it dead and terminating.
+///
+/// Aeron's default is 10 s, which is a hair-trigger for a test stack: a
+/// chain-semantics run is 2 JVMs plus 4–6 service processes on a 2-core CI
+/// runner, and when the box is oversubscribed the driver conductor simply
+/// does not get scheduled for a while. That is not a dead driver, but at the
+/// default every client decides it is one AT THE SAME TIME and the whole
+/// stack tears itself down — which surfaces as unrelated-looking scenario
+/// failures (a validator that "made no progress", a state DB left unsteady
+/// so read-only opens hit MDBX_WANNA_RECOVERY). Instrumenting the driver JVM
+/// showed a 15 s safepoint gap with ZERO GC: pure scheduling starvation.
+///
+/// 30 s rides out those stalls while still catching a genuinely dead driver
+/// well inside any scenario timeout. Deployments are untouched — this is the
+/// test harness only — and an outer `AERON_DRIVER_TIMEOUT` still wins, so CI
+/// or a developer can tune it without a rebuild.
+const DEFAULT_DRIVER_TIMEOUT_MS: &str = "30000";
+
+/// The driver timeout the harness gives its children, in milliseconds.
+/// Honours an inherited `AERON_DRIVER_TIMEOUT` if one is already set.
+pub fn driver_timeout_ms() -> String {
+    std::env::var("AERON_DRIVER_TIMEOUT").unwrap_or_else(|_| DEFAULT_DRIVER_TIMEOUT_MS.to_string())
+}
+
+/// Environment every spawned Rust service shares. One place, so the services
+/// cannot drift apart on it.
+fn common_service_env(cmd: &mut Command) {
+    cmd.env("RUST_LOG", "info");
+    // Read natively by the Aeron C client in `aeron_context_init`; we never
+    // call `set_driver_timeout_ms`, so nothing overrides it.
+    cmd.env("AERON_DRIVER_TIMEOUT", driver_timeout_ms());
+}
+
 /// `target/<profile>` directory containing the prebuilt service binaries.
 pub fn bin_dir() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("current_exe")?;
@@ -109,7 +143,7 @@ pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned
     with_log_config(&mut cmd, spec);
     cmd.args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-da-watcher"]);
-    cmd.env("RUST_LOG", "info");
+    common_service_env(&mut cmd);
     let proc = Proc::spawn("da-watcher", cmd, spec.root.join("da-watcher.log"))?;
     Ok(Spawned {
         proc,
@@ -153,7 +187,7 @@ pub fn spawn_sequencer(spec: &ServiceSpec<'_>, index: u32) -> Result<Spawned> {
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", &format!("e2e-seq-{index}")]);
     with_log_config(&mut cmd, spec);
-    cmd.env("RUST_LOG", "info");
+    common_service_env(&mut cmd);
     let proc = Proc::spawn(
         &format!("sequencer-{index}"),
         cmd,
@@ -221,7 +255,7 @@ pub fn spawn_executor_at(
             &format!("127.0.0.1:{}", free_udp_port()?),
         ]);
     }
-    cmd.env("RUST_LOG", "info");
+    common_service_env(&mut cmd);
     // A respawn logs to its own file so the pre-crash log survives for
     // post-mortem (Proc::spawn truncates).
     let log = if fixed_metrics_port.is_some() {
@@ -288,7 +322,7 @@ pub fn spawn_validator(
             // as a failure in every bridge scenario, not just S11.
             .args(["--lockbox", &l1.lockbox]);
     }
-    cmd.env("RUST_LOG", "info");
+    common_service_env(&mut cmd);
     let proc = Proc::spawn("validator", cmd, spec.root.join("validator.log"))?;
     Ok(Spawned {
         proc,
@@ -349,7 +383,7 @@ pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<Sp
     if spec.log_config.is_some() {
         cmd.arg("--archive-durability");
     }
-    cmd.env("RUST_LOG", "info");
+    common_service_env(&mut cmd);
     let proc = Proc::spawn("ingress", cmd, spec.root.join("ingress.log"))?;
     Ok(SpawnedIngress {
         proc,
