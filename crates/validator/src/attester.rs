@@ -205,6 +205,21 @@ pub struct AttestState {
     last_attested: u64,
     /// Post cadence in blocks.
     interval: u64,
+    /// Lowest block THIS PROCESS attested (set on its first successful post).
+    ///
+    /// Purely a diagnostic discriminator: it tells an EXPECTED re-collection
+    /// (a replayed receipt stream re-delivering blocks an earlier run already
+    /// attested — everything below this floor) apart from an IMPOSSIBLE one
+    /// (at or above it, where the completeness gate should have held). See
+    /// [`on_leaves`](Self::on_leaves).
+    own_attest_floor: Option<u64>,
+    /// Highest block whose receipts are known COMPLETE, i.e. whose
+    /// `BlockBoundary` we have seen on the tx_receipts stream. A block's
+    /// state root may not be attested until this reaches it — otherwise the
+    /// output could go out before the block's withdrawals were known.
+    receipts_through: u64,
+    /// State roots waiting for `receipts_through` to reach their block.
+    roots: BTreeMap<u64, B256>,
 }
 
 impl AttestState {
@@ -213,15 +228,76 @@ impl AttestState {
             pending: BTreeMap::new(),
             last_attested,
             interval: interval.max(1),
+            own_attest_floor: None,
+            receipts_through: 0,
+            roots: BTreeMap::new(),
         }
     }
 
-    /// Record a committed block's withdrawal leaves. Blocks at/below the
-    /// attested floor are already covered by an on-chain output and dropped.
-    pub fn on_leaves(&mut self, block: u64, leaves: Vec<B256>) {
-        if block > self.last_attested && !leaves.is_empty() {
-            self.pending.insert(block, leaves);
+    /// Buffer a committed block's state root. It becomes attestable only once
+    /// the receipt stream has confirmed that block's receipts are complete —
+    /// see [`next_attestable`](Self::next_attestable).
+    pub fn on_root(&mut self, block: u64, state_root: B256) {
+        if block > self.last_attested {
+            self.roots.insert(block, state_root);
         }
+    }
+
+    /// The block to attest now, if any: the highest buffered root whose
+    /// receipts are complete and whose block satisfies the post cadence.
+    /// Attesting the highest rather than each in turn is safe and cheaper —
+    /// an output at block B commits to every withdrawal through B — and it
+    /// keeps one L1 transaction per catch-up burst.
+    pub fn next_attestable(&self) -> Option<(u64, B256)> {
+        self.roots
+            .range(..=self.receipts_through)
+            .next_back()
+            .filter(|(block, _)| self.due(**block))
+            .map(|(block, root)| (*block, *root))
+    }
+
+    /// Record a committed block's withdrawal leaves. Every submission — even
+    /// an empty one — marks that block's receipts COMPLETE, which is what
+    /// releases its state root for attestation.
+    ///
+    /// Leaves for a block we have already attested fall in one of two cases,
+    /// separated by [`own_attest_floor`](Self::own_attest_floor):
+    ///
+    /// - **Below our floor: expected.** After a restart the attester resumes
+    ///   at the oracle's attested height while the validator replays the
+    ///   receipt stream from its own (possibly older) cursor, so it
+    ///   re-collects leaves for blocks an earlier run already covered. Those
+    ///   are redundant and dropped; re-adding them would double-count them
+    ///   into a later output's tree.
+    /// - **At or above our floor: a bug.** We attest a block only after its
+    ///   receipts are complete, so leaves for it cannot still be in flight.
+    ///   Reaching here means that gate failed. Say so loudly — and still keep
+    ///   the leaves, because the alternative is silently stranding a user's
+    ///   withdrawal on top of the defect.
+    pub fn on_leaves(&mut self, block: u64, leaves: Vec<B256>) {
+        self.receipts_through = self.receipts_through.max(block);
+        if leaves.is_empty() {
+            return;
+        }
+        if block > self.last_attested {
+            self.pending.insert(block, leaves);
+            return;
+        }
+        if self.own_attest_floor.is_none_or(|floor| block < floor) {
+            return;
+        }
+        let carry = self.last_attested + 1;
+        tracing::error!(
+            block,
+            last_attested = self.last_attested,
+            receipts_through = self.receipts_through,
+            carried_to = carry,
+            count = leaves.len(),
+            "BUG: withdrawal leaves arrived for a block this process already attested — a block \
+             must not be attested until its receipts are complete. Carrying them into the next \
+             output so the withdrawal is not stranded, but the completeness gate is broken"
+        );
+        self.pending.entry(carry).or_default().extend(leaves);
     }
 
     /// True once `block`'s state root warrants a new output.
@@ -242,8 +318,12 @@ impl AttestState {
 
     /// A successful post covered everything up to `block`.
     pub fn mark_attested(&mut self, block: u64) {
+        // Record where THIS process' own coverage begins, before the floor
+        // moves — see `own_attest_floor`.
+        self.own_attest_floor.get_or_insert(self.last_attested + 1);
         self.last_attested = block;
         self.pending = self.pending.split_off(&(block + 1));
+        self.roots = self.roots.split_off(&(block + 1));
     }
 
     pub fn last_attested(&self) -> u64 {
@@ -355,14 +435,30 @@ impl<P: TxReceiptsPublication> AttestingReceiptSink<P> {
     }
 
     /// Flush every block up to and including `block` to the attester.
+    ///
+    /// The boundary block is ALWAYS submitted, even with no leaves. On the
+    /// tx_receipts stream every receipt for a block precedes that block's
+    /// `BlockBoundary`, so this submission is the attester's proof that
+    /// receipts through `block` are complete — which is what lets it hold a
+    /// state root back until it can be paired with the full leaf set for its
+    /// block (see [`AttestState::on_root`]). An empty submission is not a
+    /// no-op: "this block had no withdrawals" is exactly the fact the
+    /// attester needs to attest it.
     fn flush_through(&mut self, block: u64) {
         let tail = self.pending.split_off(&(block + 1));
-        let flushed = std::mem::replace(&mut self.pending, tail);
+        let mut flushed = std::mem::replace(&mut self.pending, tail);
+        let own = flushed.remove(&block).unwrap_or_default();
+        // Ascending, and the boundary block last, so the completeness marker
+        // never overtakes leaves for the blocks it covers.
         for (b, mut leaves) in flushed {
             leaves.sort_by_key(|(nonce, _)| *nonce);
             self.handle
                 .submit_leaves(b, leaves.into_iter().map(|(_, leaf)| leaf).collect());
         }
+        let mut own = own;
+        own.sort_by_key(|(nonce, _)| *nonce);
+        self.handle
+            .submit_leaves(block, own.into_iter().map(|(_, leaf)| leaf).collect());
     }
 }
 
@@ -427,33 +523,35 @@ pub fn spawn_attester(
         while let Some(msg) = rx.recv().await {
             match msg {
                 AttesterMsg::Leaves { block, leaves } => state.on_leaves(block, leaves),
-                AttesterMsg::Root { block, state_root } => {
-                    if !state.due(block) {
-                        continue;
-                    }
-                    let leaves = state.leaves_through(block);
-                    let output = build_output(state_root, &leaves);
-                    match poster.propose_output(output.output_root, block).await {
-                        Ok(tx_hash) => {
-                            tracing::info!(
-                                l2_block = block,
-                                leaves = leaves.len(),
-                                output_root = %output.output_root,
-                                l1_tx = %tx_hash,
-                                "attester posted output"
-                            );
-                            state.mark_attested(block);
-                        }
-                        Err(e) => {
-                            // Keep the leaves pending (carry them forward) and
-                            // retry at the next cadence point.
-                            tracing::warn!(
-                                l2_block = block,
-                                error = %e,
-                                "attester failed to post output; will retry with accumulated leaves"
-                            );
-                        }
-                    }
+                AttesterMsg::Root { block, state_root } => state.on_root(block, state_root),
+            }
+            // A root is only attestable once the receipt stream has confirmed
+            // its block's receipts are complete, so either message can be the
+            // one that releases it.
+            let Some((block, state_root)) = state.next_attestable() else {
+                continue;
+            };
+            let leaves = state.leaves_through(block);
+            let output = build_output(state_root, &leaves);
+            match poster.propose_output(output.output_root, block).await {
+                Ok(tx_hash) => {
+                    tracing::info!(
+                        l2_block = block,
+                        leaves = leaves.len(),
+                        output_root = %output.output_root,
+                        l1_tx = %tx_hash,
+                        "attester posted output"
+                    );
+                    state.mark_attested(block);
+                }
+                Err(e) => {
+                    // Keep the leaves AND the root pending (carry them
+                    // forward) and retry at the next cadence point.
+                    tracing::warn!(
+                        l2_block = block,
+                        error = %e,
+                        "attester failed to post output; will retry with accumulated leaves"
+                    );
                 }
             }
         }
@@ -556,9 +654,118 @@ mod tests {
         assert!(!st.due(11));
         assert!(st.due(12));
 
-        // Stale leaves (block already attested) are ignored.
+        // Leaves for a block WE attested cannot happen once the completeness
+        // gate holds; should it ever happen, they are kept rather than
+        // silently stranding the withdrawal.
         st.on_leaves(7, vec![l(9)]);
-        assert!(st.leaves_through(12).is_empty());
+        assert_eq!(st.leaves_through(12), vec![l(9)]);
+    }
+
+    /// Belt-and-braces for a state the completeness gate makes unreachable:
+    /// if leaves for an already-attested block ever DID arrive, stranding a
+    /// user's withdrawal is the worst possible response, so they are kept
+    /// (and screamed about — see `on_leaves`).
+    #[test]
+    fn leaves_for_an_already_attested_block_are_kept_not_dropped() {
+        let l = |n: u64| B256::from(U256::from(n));
+        let mut st = AttestState::new(0, 1);
+
+        // Root for block 4 arrives first: posted with nothing.
+        assert!(st.leaves_through(4).is_empty());
+        st.mark_attested(4);
+
+        // Block 4's leaves show up late — they belong to an output we already
+        // posted without them, so the next output must cover them.
+        st.on_leaves(4, vec![l(1)]);
+        assert_eq!(st.leaves_through(5), vec![l(1)]);
+        st.mark_attested(5);
+        assert!(st.leaves_through(9).is_empty());
+    }
+
+    /// The invariant the whole design rests on: a block's root is NOT
+    /// attestable until the receipt stream has confirmed that block's
+    /// receipts are complete. Without this the output can go out before the
+    /// block's withdrawals are known, and those withdrawals then have no
+    /// output to prove against.
+    #[test]
+    fn a_root_is_not_attestable_until_its_receipts_are_complete() {
+        let l = |n: u64| B256::from(U256::from(n));
+        let root = B256::repeat_byte(7);
+        let mut st = AttestState::new(0, 1);
+
+        // Root arrives first — nothing to attest yet, receipts are unknown.
+        st.on_root(4, root);
+        assert_eq!(st.next_attestable(), None, "root must wait for receipts");
+
+        // Receipts for an EARLIER block don't release it.
+        st.on_leaves(3, vec![]);
+        assert_eq!(st.next_attestable(), None);
+
+        // Block 4's own boundary (carrying its withdrawal) releases it, and
+        // the output that goes out now covers that withdrawal.
+        st.on_leaves(4, vec![l(1)]);
+        assert_eq!(st.next_attestable(), Some((4, root)));
+        assert_eq!(st.leaves_through(4), vec![l(1)]);
+    }
+
+    /// A quiet block still has to release its root: "no withdrawals here" is
+    /// a fact the attester needs, so an empty submission must count as
+    /// completeness rather than being ignored.
+    #[test]
+    fn an_empty_boundary_still_releases_its_root() {
+        let root = B256::repeat_byte(9);
+        let mut st = AttestState::new(0, 1);
+        st.on_root(6, root);
+        st.on_leaves(6, vec![]);
+        assert_eq!(st.next_attestable(), Some((6, root)));
+    }
+
+    /// Catch-up: several roots buffered behind a lagging receipt stream
+    /// collapse into ONE output at the highest complete block, which still
+    /// covers every withdrawal beneath it.
+    #[test]
+    fn buffered_roots_collapse_into_one_output_on_catch_up() {
+        let l = |n: u64| B256::from(U256::from(n));
+        let mut st = AttestState::new(0, 1);
+        st.on_root(1, B256::repeat_byte(1));
+        st.on_root(2, B256::repeat_byte(2));
+        st.on_root(3, B256::repeat_byte(3));
+        assert_eq!(st.next_attestable(), None);
+
+        st.on_leaves(1, vec![l(1)]);
+        st.on_leaves(2, vec![]);
+        assert_eq!(st.next_attestable(), Some((2, B256::repeat_byte(2))));
+        assert_eq!(st.leaves_through(2), vec![l(1)]);
+
+        st.mark_attested(2);
+        // Block 3's root is still buffered and becomes attestable when its
+        // own receipts land.
+        assert_eq!(st.next_attestable(), None);
+        st.on_leaves(3, vec![l(2)]);
+        assert_eq!(st.next_attestable(), Some((3, B256::repeat_byte(3))));
+    }
+
+    /// The case the drop exists for, which must still drop: leaves
+    /// re-collected for blocks covered BEFORE this process started (oracle
+    /// resume point, or a replayed receipt stream). Carrying those forward
+    /// would double-count them into a later output's withdrawals tree.
+    #[test]
+    fn re_collected_leaves_below_our_own_floor_stay_dropped() {
+        let l = |n: u64| B256::from(U256::from(n));
+        // Resuming: the oracle says blocks through 10 are already attested.
+        let mut st = AttestState::new(10, 1);
+        st.on_leaves(6, vec![l(1)]);
+        assert!(st.leaves_through(20).is_empty(), "no own floor yet ⇒ drop");
+
+        // Attest 12 ourselves; our own coverage starts at 11.
+        st.on_leaves(12, vec![l(2)]);
+        st.mark_attested(12);
+        // Still below our floor ⇒ still dropped.
+        st.on_leaves(9, vec![l(3)]);
+        assert!(st.leaves_through(20).is_empty());
+        // At/above our floor ⇒ carried.
+        st.on_leaves(11, vec![l(4)]);
+        assert_eq!(st.leaves_through(20), vec![l(4)]);
     }
 
     #[test]
