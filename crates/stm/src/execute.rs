@@ -1519,6 +1519,14 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             }
             hash_ns += t_h.elapsed().as_nanos() as u64;
             // Phase 3 (serial): fold the block delta in canonical order.
+            //
+            // Parallelising this was tried and REVERTED. The fold is
+            // associative ("later tx wins" per cell), so chunks can be
+            // folded independently and merged in order — but the merge
+            // costs back what the parallel build saves, and it measured
+            // neutral-to-worse (commit 14.7ms -> 16.3ms). The fold touches
+            // a few hundred distinct cells however many txs wrote them, so
+            // there is less serial work here than the tx count suggests.
             let t_d = std::time::Instant::now();
             for r in tx_results {
                 delta.apply(r.ws);
