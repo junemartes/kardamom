@@ -32,6 +32,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use kardamom_engine::ExecutorError;
+
 /// L1 output attester: collects `MessagePassed` leaves from re-executed
 /// blocks, builds the per-output withdrawals root, posts to the L1 oracle.
 pub mod flight;
@@ -78,5 +80,24 @@ impl Divergence {
 
     pub fn reason(&self) -> Option<String> {
         self.reason.lock().unwrap().clone()
+    }
+}
+
+/// Exit-semantics classification for the engine loop's terminal error (spec:
+/// no-std-exec-core, 3a.1). A [`ExecutorError::RecordIdentity`] failure is
+/// proof in hand — keccak/ecrecover refuted the canonical stream's claimed
+/// identity — the same class as a proven divergence, so it must latch (exit
+/// 2, page the humans) rather than exit 1 into the supervisor's restart
+/// loop, where a forging sequencer would be retried forever as an outage.
+/// No `Divergence` arm is needed: every validator seam that proves one
+/// records it before surfacing the error. Everything else is availability.
+/// Returns whether the error latched.
+pub fn latch_integrity_failure(divergence: &Divergence, err: &ExecutorError) -> bool {
+    match err {
+        ExecutorError::RecordIdentity(reason) => {
+            divergence.record(format!("record identity forged: {reason}"));
+            true
+        }
+        _ => false,
     }
 }

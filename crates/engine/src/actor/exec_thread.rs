@@ -341,6 +341,15 @@ where
         position: BPosition,
     ) -> Result<Flow, ExecutorError> {
         self.check_in_order("Tx", tx_idx, position)?;
+        // One seam for BOTH execution modes: checked at arrival, before the
+        // streaming/whole-block branch, so a forged envelope can neither
+        // execute now nor hide in the block buffer.
+        if self.cfg.verify_record_identity
+            && let Err(e) = crate::stateless::verify_record_identity(&envelope)
+        {
+            tracing::error!(block = self.current_block, ?position, ?tx_idx, error = ?e, "exec ERROR: record identity forged");
+            return Err(e);
+        }
         if self.block_exec.is_some() {
             // Whole-block strategy: defer to the boundary so
             // batches can execute concurrently.

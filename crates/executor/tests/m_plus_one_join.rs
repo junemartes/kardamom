@@ -468,6 +468,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
             join_poll_interval: Duration::from_micros(100),
             ..ReaderConfig::default()
         },
+        ..ExecutorConfig::default()
     };
 
     let join = thread::spawn(move || {

@@ -4095,6 +4095,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "crossbeam-channel",
  "kardamom-da-watcher",
  "kardamom-deployer",
  "kardamom-engine",
