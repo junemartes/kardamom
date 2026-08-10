@@ -47,16 +47,23 @@ pub enum ReadRecord {
     Code(B256, bool),
 }
 
+/// Shard count. Widening this to 1024 was tried and REVERTED: the theory
+/// was that ~180 live cells over 64 shards made workers bounce each
+/// other's lock lines, but it measured neutral (78ms vs 76ms), so the
+/// contention is not shard collisions and the extra 64KB/block bought
+/// nothing.
 const SHARDS: usize = 64;
 
 fn shard_of(bytes: &[u8]) -> usize {
-    // Cheap stable shard: fold a few bytes. Distribution quality is
-    // irrelevant beyond avoiding one hot lock.
-    let mut h = 0usize;
-    for b in bytes.iter().take(8) {
-        h = h.wrapping_mul(31).wrapping_add(*b as usize);
+    // Addresses and slot keys are high-entropy in their LOW bytes (they
+    // are hashes or counters), and folding only the first 8 was clustering
+    // structured addresses. Fold the tail instead.
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in bytes.iter().rev().take(8) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
     }
-    h % SHARDS
+    (h % SHARDS as u64) as usize
 }
 
 /// A cell's version list: `(tx_index, value)`, sorted by index.
