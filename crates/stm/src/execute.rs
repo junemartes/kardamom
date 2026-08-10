@@ -538,6 +538,11 @@ struct WorkerQueue {
 /// Engine instrumentation — the numbers the prune-batch decision is made
 /// on (spec: "health is judged on the PAIR of error rates plus realized
 /// utilization"; the same discipline applies to the scheduler's own cost).
+/// One completion counter per worker, each on its OWN cache line.
+#[derive(Default)]
+#[repr(align(64))]
+pub(crate) struct PaddedLen(pub(crate) AtomicU32);
+
 #[derive(Default)]
 pub struct Metrics {
     /// Nanoseconds spent HOLDING the graph lock, split by cause.
@@ -715,7 +720,11 @@ struct BlockCtx<S: StateDatabase> {
     /// otherwise locks every worker's buffer just to find it empty, and
     /// spinning workers force-prune often — measured at ~2us/tx on
     /// micro-gas workloads, the largest single overhead there.
-    completed_len: Vec<AtomicU32>,
+    /// PADDED to a cache line each. These are RMW'd by every worker on
+    /// every completion and read by every prune; packed as a plain
+    /// `Vec<AtomicU32>` all eight counters shared ONE line, so each
+    /// completion invalidated it for every other worker.
+    completed_len: Vec<PaddedLen>,
     /// Completions parked across all buffers, i.e. DAG updates owed.
     pending: std::sync::atomic::AtomicU64,
     prune_batch: usize,
@@ -807,7 +816,7 @@ impl<S: StateDatabase> BlockCtx<S> {
         let mut ready: Vec<(usize, u32)> = Vec::new();
         for (w, buf) in self.completed.iter().enumerate() {
             // Skip untouched buffers without paying for their mutex.
-            if self.completed_len[w].load(Ordering::Acquire) == 0 {
+            if self.completed_len[w].0.load(Ordering::Acquire) == 0 {
                 continue;
             }
             let drained: Vec<u32> = {
@@ -815,7 +824,9 @@ impl<S: StateDatabase> BlockCtx<S> {
                 if b.is_empty() {
                     continue;
                 }
-                self.completed_len[w].fetch_sub(b.len() as u32, Ordering::AcqRel);
+                self.completed_len[w]
+                    .0
+                    .fetch_sub(b.len() as u32, Ordering::AcqRel);
                 std::mem::take(&mut *b)
             };
             for job in drained {
@@ -1055,7 +1066,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             finished: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
             completed: (0..workers).map(|_| Mutex::new(Vec::new())).collect(),
-            completed_len: (0..workers).map(|_| AtomicU32::new(0)).collect(),
+            completed_len: (0..workers).map(|_| PaddedLen::default()).collect(),
             pending: std::sync::atomic::AtomicU64::new(0),
             prune_batch: prune_batch.max(1),
             started: std::time::Instant::now(),
@@ -1705,12 +1716,22 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
     // worker writing the same cache lines — instrumentation generating the
     // very cross-core traffic it was measuring.
     let mut local_busy_ns: u64 = 0;
+    let mut local_first_ns: u64 = u64::MAX;
+    let mut local_last_ns: u64 = 0;
     macro_rules! leave {
         ($evm:expr) => {{
             revm::context_interface::ContextTr::db_mut(&mut *$evm).flush_counters();
             ctx.metrics
                 .busy_ns
                 .fetch_add(local_busy_ns, Ordering::Relaxed);
+            if local_first_ns != u64::MAX {
+                ctx.metrics
+                    .first_dispatch_ns
+                    .fetch_min(local_first_ns, Ordering::Relaxed);
+                ctx.metrics
+                    .last_done_ns
+                    .fetch_max(local_last_ns, Ordering::Relaxed);
+            }
             return;
         }};
     }
@@ -1793,7 +1814,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         let slot = ctx.slots[job as usize]
             .get()
             .expect("slot set before its index is dispatched");
-        let t_busy = std::time::Instant::now();
+        let t_busy_at = ctx.started.elapsed().as_nanos() as u64;
         let r = execute_one(
             &mut evm,
             &ctx.mv,
@@ -1806,15 +1827,15 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             slot.decoded.as_ref(),
             ctx.sink_start_balance,
         );
-        let busy = t_busy.elapsed();
-        local_busy_ns += busy.as_nanos() as u64;
-        ctx.metrics.first_dispatch_ns.fetch_min(
-            ctx.started.elapsed().as_nanos() as u64 - busy.as_nanos() as u64,
-            Ordering::Relaxed,
-        );
-        ctx.metrics
-            .last_done_ns
-            .fetch_max(ctx.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        // Timestamps stay WORKER-LOCAL and fold once per block. Stamping
+        // them globally cost two clock reads and two contended RMWs per
+        // transaction — on a 2.7us transfer, the instrumentation was a
+        // measurable share of the work it claimed to measure.
+        let done_at = ctx.started.elapsed().as_nanos() as u64;
+        let busy_ns = done_at.saturating_sub(t_busy_at);
+        local_busy_ns += busy_ns;
+        local_first_ns = local_first_ns.min(t_busy_at);
+        local_last_ns = local_last_ns.max(done_at);
         let errored = r.is_err();
         let _ = ctx.results[job as usize].set(r);
         if errored {
@@ -1832,7 +1853,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         {
             let mut b = ctx.completed[worker].lock().expect("completed poisoned");
             b.push(job);
-            ctx.completed_len[worker].fetch_add(1, Ordering::Release);
+            ctx.completed_len[worker].0.fetch_add(1, Ordering::Release);
         }
         let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
         if owed as usize >= ctx.prune_batch {
