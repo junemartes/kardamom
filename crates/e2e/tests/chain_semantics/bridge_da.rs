@@ -25,7 +25,7 @@ async fn s1_bridge_deposit_round_trip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
 async fn s2_bridge_withdrawal_round_trip() {
-    let stack = launch_l1_or_skip!(StackConfig {
+    let mut stack = launch_l1_or_skip!(StackConfig {
         l1: true,
         validator: true,
         genesis: e2e::harness::Genesis::DevWithdrawals,
@@ -48,10 +48,20 @@ async fn s2_bridge_withdrawal_round_trip() {
     // boundary — freezing on receipt strands it in an uncommitted block. The
     // chain quiesces by itself (empty boundaries do not commit), so the
     // validator's head root settles on the withdrawal's block.
-    let l1 = stack.l1().expect("l1");
-    bridge::finalize_withdrawal(l1, ticket, &val_dir)
-        .await
-        .expect("S2 finalize");
+    let finalize = {
+        let l1 = stack.l1().expect("l1");
+        bridge::finalize_withdrawal(l1, ticket, &val_dir).await
+    };
+    // The S2 failure family hinges on whether the validator was still alive
+    // when the read-only state open ran (dead validator + unsteady mdbx
+    // metas ⇒ infra cascade; alive validator ⇒ product bug) — capture that
+    // discriminator in the panic itself.
+    if let Err(e) = finalize {
+        panic!(
+            "S2 finalize failed (validator alive: {:?}): {e:?}",
+            stack.validator_alive()
+        );
+    }
 }
 
 /// S8: what the batcher posts to L1, re-executed from L1 alone, must equal

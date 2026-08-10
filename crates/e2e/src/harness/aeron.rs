@@ -76,6 +76,14 @@ impl MediaDriver {
         .arg(format!(
             "-Daeron.archive.replication.channel=aeron:udp?endpoint=127.0.0.1:{repl}"
         ))
+        // GC + safepoint log: the driver-stall flake family ("MediaDriver
+        // keepalive: age>10000ms" client aborts) needs to distinguish a JVM
+        // pause from host-level CPU/disk starvation — pair this with the
+        // stack's host-load.log timeline.
+        .arg(format!(
+            "-Xlog:gc*,safepoint=info:file={}/md-jvm.log:time,uptime,level,tags",
+            root.display()
+        ))
         .args([
             "-cp",
             &jar.display().to_string(),

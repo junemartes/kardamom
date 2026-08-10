@@ -119,6 +119,10 @@ pub struct LocalStack {
     sequencers: Vec<Spawned>,
     sealer: SealerCluster,
     driver: MediaDriver,
+    /// Samples `/proc/loadavg` into `<root>/host-load.log` while the stack is
+    /// up. The driver-stall flake family correlates with host load; a kept
+    /// failure root then carries the load timeline next to the service logs.
+    _load_sampler: LoadSampler,
     /// Anvil + the bridge contracts (`StackConfig::l1`). Dropped last among
     /// the services so a scenario's L1 queries stay live until teardown.
     l1: Option<l1::L1>,
@@ -269,6 +273,7 @@ impl LocalStack {
         };
         let ingress = services::spawn_ingress(&spec, &cfg.ingress)?;
 
+        let load_sampler = LoadSampler::start(root.path().join("host-load.log"));
         let stack = Self {
             ingress,
             da_watcher,
@@ -277,6 +282,7 @@ impl LocalStack {
             sequencers,
             sealer,
             driver,
+            _load_sampler: load_sampler,
             l1,
             genesis,
             log_config,
@@ -366,6 +372,15 @@ impl LocalStack {
 
     pub fn validator_state_dir(&self) -> Option<PathBuf> {
         self.validator.as_ref().and_then(|v| v.state_dir.clone())
+    }
+
+    /// Liveness probe for the validator process, for failure diagnostics:
+    /// the S2 mdbx-read-only failure family hinges on whether the validator
+    /// was already dead (Aeron driver-timeout abort leaves the env
+    /// unsteadily closed) at probe time. `None` when the stack runs no
+    /// validator.
+    pub fn validator_alive(&mut self) -> Option<bool> {
+        self.validator.as_mut().map(|v| v.proc.is_alive())
     }
 
     /// SIGSTOP the sealer so it stops stamping block boundaries: the chain
@@ -577,6 +592,48 @@ impl LocalStack {
             .collect();
         for p in procs {
             eprintln!("--- {} ---\n{}", p.name, p.log_tail(25));
+        }
+    }
+}
+
+/// Background `/proc/loadavg` sampler (500 ms cadence) writing epoch-stamped
+/// lines to a file in the stack root. One per stack; stops on drop.
+struct LoadSampler {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LoadSampler {
+    fn start(path: PathBuf) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let join = std::thread::Builder::new()
+            .name("load-sampler".into())
+            .spawn(move || {
+                use std::io::Write;
+                let Ok(mut f) = std::fs::File::create(&path) else {
+                    return;
+                };
+                while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+                    let epoch_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis())
+                        .unwrap_or(0);
+                    let _ = writeln!(f, "{epoch_ms} {}", load.trim());
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            })
+            .ok();
+        Self { stop, join }
+    }
+}
+
+impl Drop for LoadSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(j) = self.join.take() {
+            let _ = j.join();
         }
     }
 }
