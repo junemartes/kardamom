@@ -5,6 +5,8 @@
 //! report's row counts. `sweep` calls them in a fixed order; the iteration
 //! order within each check mirrors the table's key order.
 
+use std::ops::ControlFlow;
+
 use alloy_primitives::B256;
 use alloy_trie::KECCAK_EMPTY;
 use kardamom_types::BPosition;
@@ -21,7 +23,7 @@ use crate::meta::{
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_HEADERS, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
     decode_account_value, decode_header_value, decode_receipt_value, decode_storage_value,
-    decode_tx_hash_value, encode_code_key, encode_tx_hash_key,
+    decode_tx_hash_value, encode_code_key, encode_tx_hash_key, for_each_row,
 };
 use crate::trie::{TrieTables, rebuild_root};
 
@@ -92,15 +94,13 @@ pub(super) fn check_headers(
     r: &mut IntegrityReport,
 ) -> Result<(), StateError> {
     let headers_db = txn.open_db(Some(TABLE_HEADERS))?;
-    let mut cur = txn.cursor(headers_db)?;
     let mut prev_block: Option<u64> = None;
     let mut first_block: Option<u64> = None;
     let mut last_header_end_tx = None;
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-    while let Some((k, v)) = item {
+    for_each_row(txn, headers_db, |k, v| {
         if k.len() != 8 {
             problem(format!("headers key of length {} (expected 8)", k.len()), r);
-            break;
+            return Ok(ControlFlow::Break(()));
         }
         let block = u64::from_be_bytes(k[..8].try_into().expect("8 bytes"));
         match decode_header_value(&v) {
@@ -115,8 +115,8 @@ pub(super) fn check_headers(
         first_block.get_or_insert(block);
         prev_block = Some(block);
         r.headers += 1;
-        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     if let Some(first) = first_block
         && first > 1
     {
@@ -155,9 +155,7 @@ pub(super) fn check_receipts_index(
 ) -> Result<(), StateError> {
     let receipts_db = txn.open_db(Some(TABLE_RECEIPTS))?;
     let tx_hash_db = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
-    let mut cur = txn.cursor(receipts_db)?;
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-    while let Some((k, v)) = item {
+    for_each_row(txn, receipts_db, |k, v| {
         match (decode_b_position(&k), decode_receipt_value(&v)) {
             (Ok(pos), Ok(receipt)) => {
                 if receipt.tx_idx != pos {
@@ -194,14 +192,12 @@ pub(super) fn check_receipts_index(
             (_, Err(e)) => problem(format!("receipts value at {:02x?}: {e}", &k[..]), r),
         }
         r.receipts += 1;
-        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     // Reverse direction: every index entry points at an existing receipt
     // (counts alone would let dangling entries hide behind missing ones).
-    let mut cur = txn.cursor(tx_hash_db)?;
     let mut index_entries = 0u64;
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-    while let Some((k, v)) = item {
+    for_each_row(txn, tx_hash_db, |k, v| {
         index_entries += 1;
         match decode_tx_hash_value(&v) {
             Ok(pos) => {
@@ -220,8 +216,8 @@ pub(super) fn check_receipts_index(
             }
             Err(e) => problem(format!("tx_hash_index value: {e}"), r),
         }
-        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     if index_entries != r.receipts {
         problem(
             format!(
@@ -238,9 +234,7 @@ pub(super) fn check_receipts_index(
 pub(super) fn check_accounts(txn: &RwTxSync, r: &mut IntegrityReport) -> Result<(), StateError> {
     let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
     let code_db = txn.open_db(Some(TABLE_CODE))?;
-    let mut cur = txn.cursor(accounts_db)?;
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-    while let Some((k, v)) = item {
+    for_each_row(txn, accounts_db, |k, v| {
         match decode_account_value(&v) {
             Ok(a) => {
                 if a.code_hash != B256::ZERO
@@ -262,17 +256,15 @@ pub(super) fn check_accounts(txn: &RwTxSync, r: &mut IntegrityReport) -> Result<
             Err(e) => problem(format!("accounts value at {:02x?}: {e}", &k[..4]), r),
         }
         r.accounts += 1;
-        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 
 /// Storage: values decode.
 pub(super) fn check_storage(txn: &RwTxSync, r: &mut IntegrityReport) -> Result<(), StateError> {
     let storage_db = txn.open_db(Some(TABLE_STORAGE))?;
-    let mut cur = txn.cursor(storage_db)?;
-    let mut item = cur.first::<Vec<u8>, Vec<u8>>()?;
-    while let Some((k, v)) = item {
+    for_each_row(txn, storage_db, |k, v| {
         if k.len() != 52 {
             problem(
                 format!("storage key of length {} (expected 52)", k.len()),
@@ -282,8 +274,8 @@ pub(super) fn check_storage(txn: &RwTxSync, r: &mut IntegrityReport) -> Result<(
             problem(format!("storage value at {:02x?}: {e}", &k[..4]), r);
         }
         r.storage_slots += 1;
-        item = cur.next::<Vec<u8>, Vec<u8>>()?;
-    }
+        Ok(ControlFlow::Continue(()))
+    })?;
     Ok(())
 }
 

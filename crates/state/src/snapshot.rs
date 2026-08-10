@@ -19,7 +19,7 @@ use signet_libmdbx::{Database, Environment};
 use crate::env::StateEnv;
 use crate::error::StateError;
 use crate::meta::{
-    KEY_LAST_COMMITTED_BLOCK, KEY_STATE_ROOT, decode_b256, decode_u64, encode_b_position,
+    KEY_LAST_COMMITTED_BLOCK, KEY_STATE_ROOT, encode_b_position, read_meta_b256, read_meta_u64,
 };
 use crate::schema::{
     TABLE_ACCOUNTS, TABLE_CODE, TABLE_META, TABLE_RECEIPTS, TABLE_STORAGE, TABLE_TX_HASH_INDEX,
@@ -57,10 +57,7 @@ impl StateSnapshot {
     pub fn open(env: &StateEnv) -> Result<Self, StateError> {
         let txn = env.raw().begin_ro_sync()?;
         let meta = txn.open_db(Some(TABLE_META))?;
-        let block_number = match txn.get::<Vec<u8>>(meta.dbi(), KEY_LAST_COMMITTED_BLOCK)? {
-            Some(bytes) => decode_u64(&bytes)?,
-            None => 0,
-        };
+        let block_number = read_meta_u64(&txn, meta, KEY_LAST_COMMITTED_BLOCK)?.unwrap_or(0);
         let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
         let storage_db = txn.open_db(Some(TABLE_STORAGE))?;
         let code_db = txn.open_db(Some(TABLE_CODE))?;
@@ -91,10 +88,7 @@ impl StateSnapshot {
     /// writer (`StateWriter::spawn_with_trie`); see [`crate::trie`].
     pub fn state_root(&self) -> Result<Option<B256>, StateError> {
         let meta = self.inner.txn.open_db(Some(TABLE_META))?;
-        match self.inner.txn.get::<Vec<u8>>(meta.dbi(), KEY_STATE_ROOT)? {
-            None => Ok(None),
-            Some(bytes) => decode_b256(&bytes).map(Some),
-        }
+        read_meta_b256(&self.inner.txn, meta, KEY_STATE_ROOT)
     }
 }
 

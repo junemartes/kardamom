@@ -83,9 +83,8 @@ pub fn seed_genesis(
     {
         // Already seeded — verify the supplied alloc is the one this env was
         // seeded from, then report no-op.
-        match txn.get::<Vec<u8>>(meta.dbi(), KEY_GENESIS_DIGEST)? {
-            Some(stored_bytes) => {
-                let stored = crate::meta::decode_b256(&stored_bytes)?;
+        match crate::meta::read_meta_b256(&txn, meta, KEY_GENESIS_DIGEST)? {
+            Some(stored) => {
                 drop(txn);
                 if stored != digest {
                     return Err(StateError::GenesisMismatch {

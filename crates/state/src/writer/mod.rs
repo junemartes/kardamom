@@ -345,7 +345,7 @@ impl StateWriter {
 fn ensure_schema_version(env: &StateEnv) -> Result<(), StateError> {
     let txn = env.raw().begin_rw_sync()?;
     let meta = txn.open_db(Some(TABLE_META))?;
-    match txn.get::<Vec<u8>>(meta.dbi(), KEY_SCHEMA_VERSION)? {
+    match crate::meta::read_meta_u32(&txn, meta, KEY_SCHEMA_VERSION)? {
         None => {
             txn.put(
                 meta,
@@ -354,8 +354,7 @@ fn ensure_schema_version(env: &StateEnv) -> Result<(), StateError> {
                 WriteFlags::UPSERT,
             )?;
         }
-        Some(bytes) => {
-            let on_disk = crate::meta::decode_u32(&bytes)?;
+        Some(on_disk) => {
             if on_disk != SCHEMA_VERSION {
                 drop(txn);
                 return Err(StateError::Recovery(format!(

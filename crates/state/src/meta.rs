@@ -13,6 +13,9 @@
 
 use kardamom_types::BPosition;
 
+use signet_libmdbx::Database;
+use signet_libmdbx::tx::{TransactionKind, Tx};
+
 use crate::error::StateError;
 
 pub const KEY_LAST_COMMITTED_BLOCK: &[u8] = b"last_committed_block";
@@ -40,6 +43,58 @@ pub const KEY_STATE_ROOT: &[u8] = b"state_root";
 // hashed_accounts, hashed_storage). A v1 DB is refused (fresh-from-genesis
 // only; see docs/specs/2026-06-23-incremental-trie-design.md §8).
 pub const SCHEMA_VERSION: u32 = 2;
+
+// ---------- typed meta readers ----------
+//
+// One `get` + decode per well-known key, shared by every startup/verify path
+// that reads a cursor out of the `meta` table. `Ok(None)` means the key is
+// absent; a present-but-undecodable value surfaces the decoder's
+// `BadEncoding`. Generic over the txn kind so RO (snapshot, recovery) and RW
+// (writer, genesis) callers share one implementation.
+
+pub fn read_meta_u64<K: TransactionKind>(
+    txn: &Tx<K>,
+    meta: Database,
+    key: &[u8],
+) -> Result<Option<u64>, StateError> {
+    match txn.get::<Vec<u8>>(meta.dbi(), key)? {
+        Some(b) => Ok(Some(decode_u64(&b)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn read_meta_u32<K: TransactionKind>(
+    txn: &Tx<K>,
+    meta: Database,
+    key: &[u8],
+) -> Result<Option<u32>, StateError> {
+    match txn.get::<Vec<u8>>(meta.dbi(), key)? {
+        Some(b) => Ok(Some(decode_u32(&b)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn read_meta_b_position<K: TransactionKind>(
+    txn: &Tx<K>,
+    meta: Database,
+    key: &[u8],
+) -> Result<Option<BPosition>, StateError> {
+    match txn.get::<Vec<u8>>(meta.dbi(), key)? {
+        Some(b) => Ok(Some(decode_b_position(&b)?)),
+        None => Ok(None),
+    }
+}
+
+pub fn read_meta_b256<K: TransactionKind>(
+    txn: &Tx<K>,
+    meta: Database,
+    key: &[u8],
+) -> Result<Option<alloy_primitives::B256>, StateError> {
+    match txn.get::<Vec<u8>>(meta.dbi(), key)? {
+        Some(b) => Ok(Some(decode_b256(&b)?)),
+        None => Ok(None),
+    }
+}
 
 pub fn encode_u64(v: u64) -> [u8; 8] {
     v.to_be_bytes()

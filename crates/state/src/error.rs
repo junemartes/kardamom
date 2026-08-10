@@ -27,6 +27,27 @@ pub enum StateError {
     RkyvDecode { table: &'static str, detail: String },
     #[error("recovery failed: {0}")]
     Recovery(String),
+    /// A checkpoint image whose bytes do not hash to what its source (the
+    /// MANIFEST, or the serving peer's headers) claims. The Display string is
+    /// pinned: tests and operators grep for the CORRUPT marker.
+    #[error("checkpoint {image} is CORRUPT: image hashes to {got:#x}, {claimant} says {want:#x}")]
+    CorruptCheckpointImage {
+        image: String,
+        claimant: String,
+        got: alloy_primitives::B256,
+        want: alloy_primitives::B256,
+    },
+    /// A checkpoint image bound to a different chain's genesis than this
+    /// node's. The Display string is pinned: tests and operators grep for the
+    /// DIFFERENT CHAIN marker.
+    #[error(
+        "checkpoint {image} belongs to a DIFFERENT CHAIN: its genesis digest is {image_genesis:#x}, this node's is {expected:#x}"
+    )]
+    ForeignChainCheckpoint {
+        image: String,
+        image_genesis: alloy_primitives::B256,
+        expected: alloy_primitives::B256,
+    },
     #[error(
         "genesis mismatch: this env was seeded from a different genesis (stored digest {stored}, supplied {supplied}); refusing to run on divergent genesis state"
     )]
