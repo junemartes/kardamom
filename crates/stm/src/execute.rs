@@ -167,6 +167,14 @@ struct MvView<'a, S: StateDatabase> {
     /// SHARED across workers — see [`BaseCache`].
     base_cache: &'a BaseCache,
     metrics: &'a Metrics,
+    /// Read counters accumulated WITHOUT atomics and flushed once per
+    /// block. Incrementing shared atomics per read had every worker
+    /// hammering the same cache lines — instrumentation distorting the
+    /// very contention it was measuring.
+    n_reads: u64,
+    n_mv_hit: u64,
+    n_base_hit: u64,
+    n_backend: u64,
 }
 
 impl<'a, S: StateDatabase> MvView<'a, S> {
@@ -185,7 +193,32 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             sink_start,
             base_cache,
             metrics,
+            n_reads: 0,
+            n_mv_hit: 0,
+            n_base_hit: 0,
+            n_backend: 0,
         }
+    }
+
+    /// Fold this worker's counters into the shared metrics — once per
+    /// block, not once per read.
+    fn flush_counters(&mut self) {
+        self.metrics
+            .reads_total
+            .fetch_add(self.n_reads, Ordering::Relaxed);
+        self.metrics
+            .reads_mv_hit
+            .fetch_add(self.n_mv_hit, Ordering::Relaxed);
+        self.metrics
+            .reads_base_hit
+            .fetch_add(self.n_base_hit, Ordering::Relaxed);
+        self.metrics
+            .reads_backend
+            .fetch_add(self.n_backend, Ordering::Relaxed);
+        self.n_reads = 0;
+        self.n_mv_hit = 0;
+        self.n_base_hit = 0;
+        self.n_backend = 0;
     }
 }
 
@@ -199,9 +232,9 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
         if address == FEE_SINK {
             return Ok(self.sink_start.clone());
         }
-        self.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+        self.n_reads += 1;
         if let Some((ver, a)) = self.mv.read_account(self.idx, &address) {
-            self.metrics.reads_mv_hit.fetch_add(1, Ordering::Relaxed);
+            self.n_mv_hit += 1;
             self.reads.push(ReadRecord::Account(address, Some(ver)));
             return Ok(Some(AccountInfo {
                 nonce: a.nonce,
@@ -222,10 +255,10 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             .expect("base cache poisoned")
             .get(&address)
         {
-            self.metrics.reads_base_hit.fetch_add(1, Ordering::Relaxed);
+            self.n_base_hit += 1;
             return Ok(a.clone());
         }
-        self.metrics.reads_backend.fetch_add(1, Ordering::Relaxed);
+        self.n_backend += 1;
         let a = self.base.basic_ref(address)?;
         self.base_cache.accounts[sh]
             .write()
@@ -269,9 +302,9 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
         index: U256,
     ) -> Result<U256, Self::Error> {
         let key = B256::from(index.to_be_bytes::<32>());
-        self.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
+        self.n_reads += 1;
         if let Some((ver, v)) = self.mv.read_slot(self.idx, &address, &key) {
-            self.metrics.reads_mv_hit.fetch_add(1, Ordering::Relaxed);
+            self.n_mv_hit += 1;
             self.reads.push(ReadRecord::Slot(address, key, Some(ver)));
             return Ok(v);
         }
@@ -282,10 +315,10 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             .expect("base cache poisoned")
             .get(&(address, key))
         {
-            self.metrics.reads_base_hit.fetch_add(1, Ordering::Relaxed);
+            self.n_base_hit += 1;
             return Ok(*v);
         }
-        self.metrics.reads_backend.fetch_add(1, Ordering::Relaxed);
+        self.n_backend += 1;
         let v = self.base.storage_ref(address, index)?;
         self.base_cache.storage[sh]
             .write()
@@ -916,10 +949,6 @@ pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     /// later admission takes an edge from it while it is outstanding.
     last_barrier: Option<u32>,
     dispatch: Vec<u32>,
-    /// Cold (⊤) txs still need ORDER, and with no graph there is no
-    /// barrier to express it with — so a cold tx marks the wildcard: it
-    /// waits for every earlier tx and every later tx waits for it, via
-    /// the pending-mark machinery on one shared key.
     /// Kept for the sequential-fallback path (envelope payloads are
     /// refcounted; this is index metadata, not a byte copy).
     txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
@@ -1143,6 +1172,13 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             self.cold += 1;
         }
 
+        // Domain -> worker by HASH, deliberately. Round-robin on first
+        // sight was tried and REVERTED: it spread domains exactly (the
+        // busiest thread's share fell 1.96x -> 1.50x) yet cost 9% wall,
+        // because hashing is STABLE ACROSS BLOCKS — a pool returns to the
+        // same worker every block, keeping its state warm in that core's
+        // caches — while first-seen ordering reshuffles the assignment
+        // each block. Locality beat balance.
         let worker = match domain {
             Some(DomainKey::Account(a)) => domain_hash(a.as_slice(), self.workers),
             Some(DomainKey::Fixed(a, k)) => {
@@ -1619,12 +1655,26 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         .with_cfg(ctx.env.cfg_env())
         .build_mainnet();
     let qh = &ctx.queues[worker];
+    // Timing and read counts accumulate LOCALLY and flush once per block.
+    // Per-read (and even per-tx) `fetch_add` on shared metrics had every
+    // worker writing the same cache lines — instrumentation generating the
+    // very cross-core traffic it was measuring.
+    let mut local_busy_ns: u64 = 0;
+    macro_rules! leave {
+        ($evm:expr) => {{
+            revm::context_interface::ContextTr::db_mut(&mut *$evm).flush_counters();
+            ctx.metrics
+                .busy_ns
+                .fetch_add(local_busy_ns, Ordering::Relaxed);
+            return;
+        }};
+    }
     loop {
         let job = {
             let mut q = qh.q.lock().expect("queue poisoned");
             loop {
                 if ctx.aborted.load(Ordering::SeqCst) {
-                    return;
+                    leave!(evm);
                 }
                 if let Some(i) = q.pop_front() {
                     break i;
@@ -1641,7 +1691,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     continue;
                 }
                 if ctx.drained() {
-                    return;
+                    leave!(evm);
                 }
                 // Domain hashing collides when domains ~ workers (measured:
                 // the busiest thread took 1.7-2.3x its even share, and
@@ -1710,9 +1760,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             ctx.sink_start_balance,
         );
         let busy = t_busy.elapsed();
-        ctx.metrics
-            .busy_ns
-            .fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
+        local_busy_ns += busy.as_nanos() as u64;
         ctx.metrics.first_dispatch_ns.fetch_min(
             ctx.started.elapsed().as_nanos() as u64 - busy.as_nanos() as u64,
             Ordering::Relaxed,
