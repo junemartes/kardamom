@@ -451,6 +451,16 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
     }
 }
 
+/// Spins before a dry worker parks. Sized so the spin costs far less than
+/// the park/unpark syscall pair it avoids, while still yielding promptly
+/// when a block really is drained.
+const SPIN_BEFORE_PARK: u32 = 256;
+
+/// Longest a parked worker sleeps before re-checking its queue and the
+/// drain condition itself. Bounds the damage of a missed wake to one
+/// poll interval instead of a permanent hang.
+const PARK_POLL: std::time::Duration = std::time::Duration::from_micros(200);
+
 /// Gas-limit-derived hard cap on txs per block: `BLOCK_GAS_LIMIT` / 21k
 /// intrinsic gas = 1,428, with ~2.8x headroom. Slots are pre-allocated per
 /// block so workers address them lock-free while the feed is still
@@ -473,6 +483,11 @@ struct TxSlot {
 struct WorkerQueue {
     q: Mutex<std::collections::VecDeque<u32>>,
     cv: Condvar,
+    /// Whether this worker is PARKED on `cv`. Waking a thread that is
+    /// already running costs a futex syscall for nothing, and dispatch
+    /// happens once per transaction — on a 21k-gas transfer that is ~2.7us
+    /// of real work, so a wasted wake is a large fraction of the budget.
+    parked: AtomicBool,
 }
 
 /// Engine instrumentation — the numbers the prune-batch decision is made
@@ -703,7 +718,11 @@ impl<S: StateDatabase> BlockCtx<S> {
         let mut q = qh.q.lock().expect("queue poisoned");
         q.push_back(idx);
         drop(q);
-        qh.cv.notify_one();
+        // Only wake a worker that actually parked. Under load the queue is
+        // rarely empty, so this elides nearly every syscall.
+        if qh.parked.load(Ordering::Acquire) {
+            qh.cv.notify_one();
+        }
     }
 
     /// Apply parked completions to the live DAG: CLOSE each finished
@@ -951,6 +970,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 .map(|_| WorkerQueue {
                     q: Mutex::new(std::collections::VecDeque::new()),
                     cv: Condvar::new(),
+                    parked: AtomicBool::new(false),
                 })
                 .collect(),
             nodes: self.arena.clone(),
@@ -1548,8 +1568,39 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 if !q.is_empty() {
                     continue;
                 }
+                // SPIN before parking: at high throughput the next tx is
+                // usually microseconds away, and a park/unpark pair costs
+                // two syscalls — more than a small transfer's entire
+                // execution. Only a worker that stays dry through the spin
+                // advertises itself as parked and blocks.
                 let t_idle = std::time::Instant::now();
-                q = qh.cv.wait(q).expect("queue poisoned");
+                drop(q);
+                let mut spun = false;
+                for _ in 0..SPIN_BEFORE_PARK {
+                    std::hint::spin_loop();
+                    if !qh.q.lock().expect("queue poisoned").is_empty() {
+                        spun = true;
+                        break;
+                    }
+                }
+                q = qh.q.lock().expect("queue poisoned");
+                if !spun && q.is_empty() {
+                    // BOUNDED wait, deliberately. A notification can be
+                    // missed: `signal_done` wakes every queue WITHOUT
+                    // holding that queue's mutex, so a worker sitting
+                    // between "decided to park" and "actually waiting"
+                    // sleeps through it and never returns — the block
+                    // drains, `seal` finishes, and the pool then hangs
+                    // forever joining that thread. (Introducing the spin
+                    // above widened that window enough to hit it every
+                    // run; the race predates it.) A timeout makes any
+                    // missed wake self-healing, and costs nothing when
+                    // wakes arrive normally.
+                    qh.parked.store(true, Ordering::Release);
+                    let (nq, _) = qh.cv.wait_timeout(q, PARK_POLL).expect("queue poisoned");
+                    q = nq;
+                    qh.parked.store(false, Ordering::Release);
+                }
                 ctx.metrics
                     .idle_ns
                     .fetch_add(t_idle.elapsed().as_nanos() as u64, Ordering::Relaxed);
