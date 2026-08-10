@@ -60,6 +60,10 @@ struct Args {
     /// Print per-block lines.
     #[arg(long, default_value_t = false)]
     per_block: bool,
+    /// Write an on-CPU flamegraph here (pprof). Guessing which part of
+    /// the read path costs what has been wrong repeatedly — this settles it.
+    #[arg(long)]
+    pprof_out: Option<String>,
     /// State backend: `mock` (in-memory — the harshest baseline, where a
     /// read costs nothing) or `mdbx` (the real backend, where it does).
     #[arg(long, default_value = "mock")]
@@ -236,6 +240,8 @@ fn run_mdbx_ab(
             let (mut seq_ms, mut stm_ms, mut gas, mut wounds) = (0f64, 0f64, 0u64, 0usize);
             let (mut busy, mut span, mut commit, mut feed, mut snap_us) =
                 (0u64, 0u64, 0u64, 0u64, 0u64);
+            let (mut rt, mut rmv, mut rbase, mut rback) = (0u64, 0u64, 0u64, 0u64);
+            let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
             kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
                 for (bi, blk) in all_blocks.iter().enumerate() {
@@ -298,6 +304,12 @@ fn run_mdbx_ab(
                         commit += out.commit_us;
                         feed += out.feed_us;
                         snap_us += snap_open;
+                        rt += out.reads_total;
+                        rmv += out.reads_mv_hit;
+                        rbase += out.reads_base_hit;
+                        rback += out.reads_backend;
+                        evm_us += out.evm_us;
+                        pub_us += out.publish_us;
                         gas += seq_receipts
                             .last()
                             .map(|r| r.cumulative_gas_used)
@@ -349,6 +361,21 @@ fn run_mdbx_ab(
             );
             if wounds > 0 {
                 println!("   (wounds: {wounds})");
+            }
+            if rt > 0 {
+                println!(
+                    "     evm {:.1}ms | publish {:.1}ms | other {:.1}ms",
+                    evm_us as f64 / 1000.0,
+                    pub_us as f64 / 1000.0,
+                    (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
+                );
+                println!(
+                    "     reads {} = mv-version {:.1}% | base-cache {:.1}% | backend {:.1}%",
+                    rt,
+                    rmv as f64 / rt as f64 * 100.0,
+                    rbase as f64 / rt as f64 * 100.0,
+                    rback as f64 / rt as f64 * 100.0,
+                );
             }
         }
     }
@@ -489,7 +516,17 @@ fn main() -> anyhow::Result<()> {
         .map(|s| s.trim().parse().expect("prune-batch csv"))
         .collect();
     if a.state == "mdbx" {
-        return run_mdbx_ab(
+        let guard = match &a.pprof_out {
+            Some(_) => Some(
+                pprof::ProfilerGuardBuilder::default()
+                    .frequency(997)
+                    .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                    .build()
+                    .map_err(|e| anyhow::anyhow!("pprof guard: {e}"))?,
+            ),
+            None => None,
+        };
+        let r = run_mdbx_ab(
             &signers,
             &all_blocks,
             n_setup,
@@ -497,6 +534,16 @@ fn main() -> anyhow::Result<()> {
             &worker_counts,
             &batches,
         );
+        if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
+            && let Ok(report) = g.report().build()
+        {
+            let file = std::fs::File::create(path)?;
+            report
+                .flamegraph(file)
+                .map_err(|e| anyhow::anyhow!("flamegraph: {e}"))?;
+            eprintln!("==> wrote flamegraph to {path}");
+        }
+        return r;
     }
 
     eprintln!(

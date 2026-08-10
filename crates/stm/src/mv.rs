@@ -15,8 +15,9 @@
 //! worker reads its block-start value, and the commit pass materializes the
 //! exact prefix sums instead.
 
-use std::collections::HashMap;
 use std::sync::RwLock;
+
+use crate::FastMap;
 
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
@@ -60,7 +61,7 @@ fn shard_of(bytes: &[u8]) -> usize {
 
 /// A cell's version list: `(tx_index, value)`, sorted by index.
 type Versions<V> = Vec<(u32, V)>;
-type Shard<K, V> = RwLock<HashMap<K, Versions<V>>>;
+type Shard<K, V> = RwLock<FastMap<K, Versions<V>>>;
 
 /// Sharded multi-version store. Version lists are kept sorted by tx index
 /// via binary-search insert (append in the common pessimistic case).
@@ -69,7 +70,7 @@ pub struct MvCache {
     storage: Vec<Shard<(Address, B256), U256>>,
     /// Content-addressed CREATE bytecode — no versioning (a hash IS its
     /// content), append-only.
-    code: RwLock<HashMap<B256, Bytes>>,
+    code: RwLock<FastMap<B256, Bytes>>,
 }
 
 impl Default for MvCache {
@@ -81,9 +82,13 @@ impl Default for MvCache {
 impl MvCache {
     pub fn new() -> Self {
         Self {
-            accounts: (0..SHARDS).map(|_| RwLock::new(HashMap::new())).collect(),
-            storage: (0..SHARDS).map(|_| RwLock::new(HashMap::new())).collect(),
-            code: RwLock::new(HashMap::new()),
+            accounts: (0..SHARDS)
+                .map(|_| RwLock::new(FastMap::with_hasher(crate::FnvBuild)))
+                .collect(),
+            storage: (0..SHARDS)
+                .map(|_| RwLock::new(FastMap::with_hasher(crate::FnvBuild)))
+                .collect(),
+            code: RwLock::new(FastMap::with_hasher(crate::FnvBuild)),
         }
     }
 

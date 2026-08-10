@@ -29,6 +29,49 @@
 //!    P1 shadow already measures its trigger rate as ~zero, and the A/B
 //!    equivalence check catches any workload that violates the assumption.)
 
+/// FNV-1a `BuildHasher` for the engine's internal maps.
+///
+/// Their keys — addresses, slot hashes, domain tuples — are already
+/// high-entropy, so SipHash's collision resistance against adversarial
+/// input buys nothing here and costs real time: the state caches are
+/// probed ~7 times per transaction on the hottest path in the engine.
+/// A collision would cost lookup time, never correctness.
+#[derive(Default, Clone, Copy)]
+pub struct FnvBuild;
+
+pub struct Fnv(u64);
+
+impl std::hash::BuildHasher for FnvBuild {
+    type Hasher = Fnv;
+    fn build_hasher(&self) -> Fnv {
+        Fnv(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl std::hash::Hasher for Fnv {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 ^= *b as u64;
+            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        }
+    }
+    fn write_u64(&mut self, n: u64) {
+        self.write(&n.to_le_bytes());
+    }
+    fn write_u32(&mut self, n: u32) {
+        self.write(&n.to_le_bytes());
+    }
+    fn write_u8(&mut self, n: u8) {
+        self.write(&[n]);
+    }
+}
+
+/// Hash map using [`FnvBuild`].
+pub type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
+
 pub mod execute;
 pub mod mv;
 pub mod schedule;

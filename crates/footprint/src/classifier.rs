@@ -80,8 +80,26 @@ fn keccak_pair(key: U256, inner: B256) -> B256 {
     keccak256(buf)
 }
 
+/// Instantiate a KNOWN formula with this observation's words. One or two
+/// keccaks — the cheap test that must be tried before brute force.
+fn instantiate(f: &Formula, obs: &TxObs) -> Option<B256> {
+    let base = B256::from(U256::from(f.base).to_be_bytes::<32>());
+    let inner = match f.inner {
+        None => base,
+        Some(ic) => keccak_pair(cand_word(obs, ic)?, base),
+    };
+    Some(keccak_pair(cand_word(obs, f.outer)?, inner))
+}
+
 /// Try to solve `slot` as a mapping entry for this observation's
 /// candidates. Single level first, then one nesting level.
+///
+/// COST: this is a brute force — up to `CANDS x MAX_BASE` keccaks for the
+/// single level and `CANDS^2 x MAX_BASE` for the nested one, i.e. low
+/// thousands of hashes for a slot that does not solve. Profiling the live
+/// training loop showed it at 93% of all CPU, so callers MUST try the
+/// selector's already-solved formulas first (see `learn_obs`) and reach
+/// here only for genuinely novel slots.
 fn solve(obs: &TxObs, contract: Address, slot: B256) -> Option<Formula> {
     let bases: Vec<B256> = (0..MAX_BASE)
         .map(|p| B256::from(U256::from(p).to_be_bytes::<32>()))
@@ -192,10 +210,36 @@ impl Stats {
             match cell {
                 Cell::Slot(addr, slot) => {
                     e.slot_obs += 1;
-                    if let Some(f) = solve(o, *addr, *slot) {
-                        *e.formulas.entry(f).or_default() += 1;
-                    } else {
-                        *e.slot_seen.entry((*addr, *slot)).or_default() += 1;
+                    // A selector's footprint repeats: the SAME formulas,
+                    // instantiated with each tx's own words. Testing the
+                    // known ones costs one or two keccaks each, where the
+                    // brute force costs thousands — and after the first
+                    // few observations of a selector, essentially every
+                    // slot matches something already known.
+                    // NEGATIVE cache first. A slot address that recurs
+                    // across observations CANNOT be sender- or arg-derived
+                    // — those produce a different address per tx — so a
+                    // previous failure to solve it is final, and the brute
+                    // force must not be paid again. Fixed slots are ~40% of
+                    // observations (P0), so without this they re-brute-force
+                    // forever: profiling showed the inversion at 93% of all
+                    // CPU, and it is the SAME slots every block.
+                    if let Some(n) = e.slot_seen.get_mut(&(*addr, *slot)) {
+                        *n += 1;
+                        continue;
+                    }
+                    // POSITIVE cache: a selector's footprint repeats with
+                    // the same formulas, instantiated with each tx's own
+                    // words — one or two keccaks each, against thousands
+                    // for the brute force.
+                    let known = e
+                        .formulas
+                        .keys()
+                        .find(|f| f.contract == *addr && instantiate(f, o) == Some(*slot))
+                        .copied();
+                    match known.or_else(|| solve(o, *addr, *slot)) {
+                        Some(f) => *e.formulas.entry(f).or_default() += 1,
+                        None => *e.slot_seen.entry((*addr, *slot)).or_default() += 1,
                     }
                 }
                 Cell::Account(a) => {

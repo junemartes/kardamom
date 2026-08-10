@@ -12,7 +12,7 @@
 //! sequential fallback (invariant #3) carries correctness alone in P2a;
 //! the optimization lands with P2b once the A/B shows where it pays.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 
@@ -32,9 +32,9 @@ use revm::database::DatabaseRef;
 use revm::state::AccountInfo;
 use revm::{Context, ExecuteEvm, MainBuilder, MainContext};
 
-use crate::FEE_SINK;
 use crate::mv::{MvCache, ReadRecord};
 use crate::schedule;
+use crate::{FEE_SINK, FastMap};
 
 /// Layered block-input view: the pre-block delta over the snapshot — what
 /// sequential execution sees at the block's first tx. Read-only and shared
@@ -127,9 +127,9 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
 /// caches an immutable layer, so a stale entry is impossible.
 #[derive(Default)]
 struct BaseCache {
-    accounts: Vec<RwLock<HashMap<alloy_primitives::Address, Option<AccountInfo>>>>,
-    storage: Vec<RwLock<HashMap<(alloy_primitives::Address, B256), U256>>>,
-    code: RwLock<HashMap<B256, revm::state::Bytecode>>,
+    accounts: Vec<RwLock<FastMap<alloy_primitives::Address, Option<AccountInfo>>>>,
+    storage: Vec<RwLock<FastMap<(alloy_primitives::Address, B256), U256>>>,
+    code: RwLock<FastMap<B256, revm::state::Bytecode>>,
 }
 
 const BASE_SHARDS: usize = 64;
@@ -138,12 +138,12 @@ impl BaseCache {
     fn new() -> Self {
         Self {
             accounts: (0..BASE_SHARDS)
-                .map(|_| RwLock::new(HashMap::new()))
+                .map(|_| RwLock::new(FastMap::with_hasher(crate::FnvBuild)))
                 .collect(),
             storage: (0..BASE_SHARDS)
-                .map(|_| RwLock::new(HashMap::new()))
+                .map(|_| RwLock::new(FastMap::with_hasher(crate::FnvBuild)))
                 .collect(),
-            code: RwLock::new(HashMap::new()),
+            code: RwLock::new(FastMap::with_hasher(crate::FnvBuild)),
         }
     }
 
@@ -166,6 +166,7 @@ struct MvView<'a, S: StateDatabase> {
     sink_start: Option<AccountInfo>,
     /// SHARED across workers — see [`BaseCache`].
     base_cache: &'a BaseCache,
+    metrics: &'a Metrics,
 }
 
 impl<'a, S: StateDatabase> MvView<'a, S> {
@@ -174,6 +175,7 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
         base: &'a BlockInput<'a, S>,
         sink_start: Option<AccountInfo>,
         base_cache: &'a BaseCache,
+        metrics: &'a Metrics,
     ) -> Self {
         Self {
             mv,
@@ -182,6 +184,7 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             reads: Vec::new(),
             sink_start,
             base_cache,
+            metrics,
         }
     }
 }
@@ -196,7 +199,9 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
         if address == FEE_SINK {
             return Ok(self.sink_start.clone());
         }
+        self.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
         if let Some((ver, a)) = self.mv.read_account(self.idx, &address) {
+            self.metrics.reads_mv_hit.fetch_add(1, Ordering::Relaxed);
             self.reads.push(ReadRecord::Account(address, Some(ver)));
             return Ok(Some(AccountInfo {
                 nonce: a.nonce,
@@ -217,8 +222,10 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             .expect("base cache poisoned")
             .get(&address)
         {
+            self.metrics.reads_base_hit.fetch_add(1, Ordering::Relaxed);
             return Ok(a.clone());
         }
+        self.metrics.reads_backend.fetch_add(1, Ordering::Relaxed);
         let a = self.base.basic_ref(address)?;
         self.base_cache.accounts[sh]
             .write()
@@ -262,7 +269,9 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
         index: U256,
     ) -> Result<U256, Self::Error> {
         let key = B256::from(index.to_be_bytes::<32>());
+        self.metrics.reads_total.fetch_add(1, Ordering::Relaxed);
         if let Some((ver, v)) = self.mv.read_slot(self.idx, &address, &key) {
+            self.metrics.reads_mv_hit.fetch_add(1, Ordering::Relaxed);
             self.reads.push(ReadRecord::Slot(address, key, Some(ver)));
             return Ok(v);
         }
@@ -273,8 +282,10 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             .expect("base cache poisoned")
             .get(&(address, key))
         {
+            self.metrics.reads_base_hit.fetch_add(1, Ordering::Relaxed);
             return Ok(*v);
         }
+        self.metrics.reads_backend.fetch_add(1, Ordering::Relaxed);
         let v = self.base.storage_ref(address, index)?;
         self.base_cache.storage[sh]
             .write()
@@ -332,6 +343,12 @@ pub struct StmOutcome {
     pub feed_us: u64,
     pub redundant_edges: u64,
     pub steals: u64,
+    pub reads_total: u64,
+    pub reads_mv_hit: u64,
+    pub reads_base_hit: u64,
+    pub reads_backend: u64,
+    pub evm_us: u64,
+    pub publish_us: u64,
     /// Where the block's wall time went. `busy_us / (workers *
     /// parallel_span_us)` is the honest core utilization; `ramp_us` and
     /// `commit_us` are the serial head and tail no worker count reduces.
@@ -348,50 +365,6 @@ pub struct StmOutcome {
     pub avg_batch: f64,
     pub idle_us: u64,
 }
-
-/// FNV-1a `BuildHasher` for the scheduler's internal maps.
-///
-/// `DomainKey`s are already high-entropy (addresses, hashes, key words),
-/// so the standard library's SipHash — chosen to resist adversarial key
-/// collisions in maps whose keys come from untrusted input — buys nothing
-/// here and costs real time on a path measured in hundreds of nanoseconds
-/// per tx. A collision-heavy map would only cost scheduling throughput,
-/// never correctness: edges are still exact (the key COMPARISON is
-/// unchanged), and a mispredicted schedule is wound-repairable.
-#[derive(Default, Clone, Copy)]
-struct FnvBuild;
-
-struct Fnv(u64);
-
-impl std::hash::BuildHasher for FnvBuild {
-    type Hasher = Fnv;
-    fn build_hasher(&self) -> Fnv {
-        Fnv(0xcbf2_9ce4_8422_2325)
-    }
-}
-
-impl std::hash::Hasher for Fnv {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-    fn write(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.0 ^= *b as u64;
-            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
-        }
-    }
-    fn write_u64(&mut self, n: u64) {
-        self.write(&n.to_le_bytes());
-    }
-    fn write_u32(&mut self, n: u32) {
-        self.write(&n.to_le_bytes());
-    }
-    fn write_u8(&mut self, n: u8) {
-        self.write(&[n]);
-    }
-}
-
-type FastMap<K, V> = HashMap<K, V, FnvBuild>;
 
 /// Stable domain → worker mapping. Quality only affects BALANCE across
 /// threads, never correctness: ordering comes from the DAG's edges, and
@@ -520,6 +493,20 @@ pub struct Metrics {
     pub idle_ns: std::sync::atomic::AtomicU64,
     /// Ready txs taken from another thread's queue to fix imbalance.
     pub steals: std::sync::atomic::AtomicU64,
+    /// Read-path breakdown. The multi-version path costs 1.7x sequential
+    /// single-threaded, so which lookup dominates decides what to fix.
+    pub reads_total: std::sync::atomic::AtomicU64,
+    /// Reads served by a version written earlier in THIS block.
+    pub reads_mv_hit: std::sync::atomic::AtomicU64,
+    /// Reads that fell through to the shared base cache, and of those, the
+    /// ones that had to touch the backing store.
+    pub reads_base_hit: std::sync::atomic::AtomicU64,
+    pub reads_backend: std::sync::atomic::AtomicU64,
+    /// Split of a worker's per-tx time: inside revm (`transact`, which
+    /// includes the read path) vs publishing the write set into the
+    /// multi-version cache. Guessing which dominates has been wrong twice.
+    pub evm_ns: std::sync::atomic::AtomicU64,
+    pub publish_ns: std::sync::atomic::AtomicU64,
     /// Nanoseconds workers spent INSIDE revm (the only work that is
     /// actually the point). `busy / (workers x parallel_span)` is the true
     /// core utilization — idle time alone cannot distinguish "the DAG had
@@ -1450,6 +1437,12 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
             redundant_edges: m.redundant_edges.load(Ordering::Relaxed),
             steals: m.steals.load(Ordering::Relaxed),
+            reads_total: m.reads_total.load(Ordering::Relaxed),
+            reads_mv_hit: m.reads_mv_hit.load(Ordering::Relaxed),
+            reads_base_hit: m.reads_base_hit.load(Ordering::Relaxed),
+            reads_backend: m.reads_backend.load(Ordering::Relaxed),
+            evm_us: m.evm_ns.load(Ordering::Relaxed) / 1_000,
+            publish_us: m.publish_ns.load(Ordering::Relaxed) / 1_000,
             busy_us: m.busy_ns.load(Ordering::Relaxed) / 1_000,
             parallel_span_us: {
                 let f = m.first_dispatch_ns.load(Ordering::Relaxed);
@@ -1520,7 +1513,13 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         snapshot: &ctx.snapshots[worker % ctx.snapshots.len()],
         base: Some(&ctx.base),
     };
-    let view = MvView::new(&ctx.mv, &input, ctx.sink_start.clone(), &ctx.base_cache);
+    let view = MvView::new(
+        &ctx.mv,
+        &input,
+        ctx.sink_start.clone(),
+        &ctx.base_cache,
+        &ctx.metrics,
+    );
     let mut evm = Context::mainnet()
         .with_db(view)
         .with_block(ctx.env.block_env())
@@ -1577,6 +1576,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         let r = execute_one(
             &mut evm,
             &ctx.mv,
+            &ctx.metrics,
             ctx.env,
             job,
             slot.tx_idx,
@@ -1692,6 +1692,7 @@ type WorkerEvm<'a, S> = revm::handler::MainnetEvm<
 fn execute_one<S: StateDatabase>(
     evm: &mut WorkerEvm<'_, S>,
     mv: &MvCache,
+    metrics: &Metrics,
     env: ExecEnv,
     local_idx: u32,
     tx_idx: TxIndex,
@@ -1739,6 +1740,7 @@ fn execute_one<S: StateDatabase>(
         db.reads.clear();
     }
     let tx_env = tx_env_from_alloy(alloy_env, signer);
+    let t_evm = std::time::Instant::now();
     let outcome = match evm.transact(tx_env) {
         Ok(o) => o,
         Err(revm::context::result::EVMError::Transaction(reason)) => {
@@ -1755,6 +1757,9 @@ fn execute_one<S: StateDatabase>(
         }
     };
 
+    metrics
+        .evm_ns
+        .fetch_add(t_evm.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let gas_used = outcome.result.gas().tx_gas_used();
     let (status, logs) = match &outcome.result {
         ExecutionResult::Success { logs, .. } => (ReceiptStatus::Success, logs.clone()),
@@ -1767,7 +1772,11 @@ fn execute_one<S: StateDatabase>(
     // accounts — see `MvCache::publish_write_set`), skipping the fee sink
     // (Accumulator: all workers see block-start; the commit pass
     // materializes the prefixes).
+    let t_pub = std::time::Instant::now();
     mv.publish_write_set(local_idx, &ws, FEE_SINK);
+    metrics
+        .publish_ns
+        .fetch_add(t_pub.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let fee_delta = ws
         .accounts
         .iter()
