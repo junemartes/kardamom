@@ -107,8 +107,15 @@ case_cluster_member_rejoin() {
   # fresh start).
   f0="$(count_log_lines "${CLUSTER_TASK}" "sealer state FRESH at genesis memberId=${follower}" --stdout-only)"
   # Head at wipe time — the position the blank member must replay back to
-  # before this case may pass (see the catch-up proof below).
-  head_at_wipe="$(executor_progress || echo 0)"
+  # before this case may pass (see the catch-up proof below). A REAL reading is
+  # mandatory: executor_progress prints empty when every scrape fails (metric
+  # blackouts are routine right after the previous case's kill), and defaulting
+  # that to 0 would make the proof below vacuous all over again — "replayed to
+  # block >= 0" is satisfied by a member that has done nothing but log
+  # FRESH at genesis. Read it BEFORE any injection, so failing here is clean.
+  head_at_wipe="$(executor_progress || true)"
+  { [ -n "${head_at_wipe}" ] && [ "${head_at_wipe}" -gt 0 ]; } \
+    || fail "cluster-member-rejoin: could not read the executor head before the wipe (got '${head_at_wipe}') — refusing to run: the catch-up proof needs a real target position or it proves nothing"
 
   log "cluster-member-rejoin: leader=memberId=${leader}; killing FOLLOWER memberId=${follower} and WIPING its cluster + archive dirs"
   inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
