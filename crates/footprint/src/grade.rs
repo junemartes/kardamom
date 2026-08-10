@@ -233,8 +233,11 @@ mod tests {
 
     #[test]
     fn trained_stats_split_independent_senders_into_one_wave() {
-        // Train: each tx writes only its sender-derived slot => formula
-        // solves; distinct senders then predict disjoint cells.
+        // Each tx writes a slot unique to its sender. Those slots are NOT
+        // modelled since inversion was removed (they appear once each, far
+        // below the fixed threshold), so cell COVERAGE is partial — but
+        // the SCHEDULE is unaffected, which is the distinction that
+        // matters: unmodelled cells that never collide cost nothing.
         use alloy_primitives::keccak256;
         let slot_of = |a: Address| -> B256 {
             let mut buf = [0u8; 64];
@@ -264,7 +267,11 @@ mod tests {
         assert_eq!(g.false_pairs, 0);
         assert_eq!(g.predicted_waves, 1, "independent txs share one wave");
         assert_eq!(g.predicted_width, 3);
-        assert_eq!(g.hit_rate(), 1.0);
+        // Half the actual cells (the per-sender slots) are unmodelled...
+        assert_eq!(g.hit_rate(), 0.5);
+        // ...and it costs the schedule nothing, because they never
+        // collide: no true edge exists for the predictor to miss.
+        assert_eq!(g.missed_pairs, 0);
     }
 
     #[test]

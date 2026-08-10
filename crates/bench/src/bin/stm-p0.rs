@@ -50,11 +50,6 @@ struct Args {
     repo_root: String,
     #[arg(long, default_value_t = 412346)]
     chain_id: u64,
-    /// Predict from directly-observed hashes only (tier-1 accounts +
-    /// tier-3 fixed slots), with NO keccak inversion and no derived
-    /// mapping keys — the experiment that prices tier-2.
-    #[arg(long, default_value_t = false)]
-    no_derived: bool,
     /// Optional JSON report path.
     #[arg(long)]
     json: Option<String>,
@@ -285,7 +280,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let t1 = std::time::Instant::now();
-    let report = oracle::analyze_with(&obs, a.train_frac, &exclude, !a.no_derived);
+    let report = oracle::analyze(&obs, a.train_frac, &exclude);
     eprintln!("==> analysis {:.1}s", t1.elapsed().as_secs_f64());
 
     if a.shadow {
@@ -300,14 +295,13 @@ fn main() -> anyhow::Result<()> {
 
     // Classifier class shares (learned over ALL flow obs, reporting only).
     let stats = classifier::Stats::learn(&obs);
-    let (solved, fixed, total) = stats.class_shares();
+    let (fixed, total) = stats.class_shares();
     println!(
-        "CLASSIFIER: selectors={} slot-obs={} derived={:.1}% fixed={:.1}% unpredictable={:.1}%",
+        "CLASSIFIER: selectors={} slot-obs={} predicted-fixed={:.1}% unmodelled={:.1}%",
         stats.by_selector.len(),
         total,
-        solved as f64 / total.max(1) as f64 * 100.0,
         fixed as f64 / total.max(1) as f64 * 100.0,
-        (total - solved - fixed) as f64 / total.max(1) as f64 * 100.0,
+        (total - fixed) as f64 / total.max(1) as f64 * 100.0,
     );
 
     if let Some(path) = &a.json {

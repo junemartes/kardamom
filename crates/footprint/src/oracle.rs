@@ -147,18 +147,6 @@ pub fn universal_writes(obs: &[TxObs], threshold: f64) -> Vec<(Cell, f64)> {
 /// Full analysis: oracle per block over ALL blocks; classifier trained on
 /// the first `train_frac` of blocks and graded on the rest.
 pub fn analyze(obs: &[TxObs], train_frac: f64, exclude: &HashSet<Cell>) -> Report {
-    analyze_with(obs, train_frac, exclude, true)
-}
-
-/// [`analyze`] with the derived-key (keccak inversion) tier switchable —
-/// the experiment that asks what tier-2 is worth against using observed
-/// hashes directly.
-pub fn analyze_with(
-    obs: &[TxObs],
-    train_frac: f64,
-    exclude: &HashSet<Cell>,
-    derived_keys: bool,
-) -> Report {
     let mut report = Report {
         universal_write_cells: universal_writes(obs, 0.95),
         ..Default::default()
@@ -186,11 +174,7 @@ pub fn analyze_with(
     let train: Vec<TxObs> = obs.iter().filter(|o| o.block <= split).cloned().collect();
     let holdout: Vec<&TxObs> = obs.iter().filter(|o| o.block > split).collect();
     if !train.is_empty() && !holdout.is_empty() {
-        let mut stats = if derived_keys {
-            Stats::new()
-        } else {
-            Stats::without_derived()
-        };
+        let mut stats = Stats::default();
         for o in &train {
             stats.learn_obs(o);
         }

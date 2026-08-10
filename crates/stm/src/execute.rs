@@ -1108,20 +1108,6 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 b[4..].copy_from_slice(&k.as_slice()[28..32]);
                 domain_hash(&b, self.workers)
             }
-            Some(DomainKey::Derived {
-                contract,
-                base,
-                outer,
-                ..
-            }) => {
-                // The instance IS the domain: a pool pair, a CLOB market,
-                // a user's balance entry. Hash contract+base+key word.
-                let mut b = [0u8; 9];
-                b[..4].copy_from_slice(&contract.as_slice()[16..20]);
-                b[4] = base;
-                b[5..].copy_from_slice(&outer.to_be_bytes::<32>()[28..32]);
-                domain_hash(&b, self.workers)
-            }
             // ⊤ and empty predictions: canonical round-robin.
             None => i % self.workers,
         };
