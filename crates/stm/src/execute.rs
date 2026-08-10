@@ -623,9 +623,19 @@ struct Node {
 
 /// Per-block shared context; workers hold an `Arc` for the block's
 /// duration.
-struct BlockCtx<'env, S: StateDatabase> {
+struct BlockCtx<S: StateDatabase> {
     env: ExecEnv,
-    snapshot: &'env S,
+    /// One state view PER WORKER.
+    ///
+    /// This is not an optimization, it is a requirement of the backend:
+    /// mdbx's synchronized read transaction guards its pointer with a
+    /// mutex ("serialises access to the transaction pointer"), so workers
+    /// sharing ONE snapshot funnel every state read through one lock —
+    /// measured as parallel execution getting SLOWER with more workers
+    /// (0.86x at 4, 0.78x at 8) while the in-memory backend scaled. Each
+    /// worker therefore reads through its own transaction, all opened at
+    /// the same committed block, so the view is identical.
+    snapshots: Vec<S>,
     base: PendingDelta,
     sink_start: Option<AccountInfo>,
     sink_start_balance: U256,
@@ -669,7 +679,7 @@ struct BlockCtx<'env, S: StateDatabase> {
 /// HELD. Every dispatch therefore collects its ready set under the graph
 /// lock, releases it, and only then pushes. The idle path takes the graph
 /// lock only after dropping its queue lock.
-impl<S: StateDatabase> BlockCtx<'_, S> {
+impl<S: StateDatabase> BlockCtx<S> {
     /// Steal one ready tx from the longest other queue.
     ///
     /// SAFE BY CONSTRUCTION, and worth spelling out: a tx only ever
@@ -786,14 +796,14 @@ impl<S: StateDatabase> BlockCtx<'_, S> {
     }
 }
 
-struct PoolState<'env, S: StateDatabase> {
+struct PoolState<S: StateDatabase> {
     generation: u64,
-    ctx: Option<Arc<BlockCtx<'env, S>>>,
+    ctx: Option<Arc<BlockCtx<S>>>,
     shutdown: bool,
     cfg: PoolConfig,
 }
 
-type PoolShared<'env, S> = (Mutex<PoolState<'env, S>>, Condvar);
+type PoolShared<S> = (Mutex<PoolState<S>>, Condvar);
 
 /// A persistent worker pool bound to one snapshot view for its lifetime —
 /// the PIPELINE shape the live executor needs: workers are spawned ONCE
@@ -805,8 +815,7 @@ type PoolShared<'env, S> = (Mutex<PoolState<'env, S>>, Condvar);
 /// convenience; `begin_block`/`push_tx`/`seal` is the actor-shaped API
 /// (P3: the `ReaderToExec::Tx` arm pushes, the `Boundary` arm seals).
 pub struct PoolHandle<'a, S: StateDatabase + Sync> {
-    shared: &'a PoolShared<'a, S>,
-    snapshot: &'a S,
+    shared: &'a PoolShared<S>,
     /// THE ARENA. Allocated once for the pool's lifetime and reused by
     /// every block: a node is addressed by its index, so nothing here is
     /// ever allocated, freed, or reference-counted per transaction. This
@@ -825,8 +834,7 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
 }
 
 /// Spawn `workers` pool threads for the duration of `f`.
-pub fn with_pool<S: StateDatabase + Sync, R>(
-    snapshot: &S,
+pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     cfg: PoolConfig,
     f: impl FnOnce(&PoolHandle<'_, S>) -> R,
 ) -> R {
@@ -835,7 +843,7 @@ pub fn with_pool<S: StateDatabase + Sync, R>(
         workers,
         prune_batch: cfg.prune_batch.max(1),
     };
-    let shared: PoolShared<'_, S> = (
+    let shared: PoolShared<S> = (
         Mutex::new(PoolState {
             generation: 0,
             ctx: None,
@@ -851,7 +859,6 @@ pub fn with_pool<S: StateDatabase + Sync, R>(
         }
         let handle = PoolHandle {
             shared: shared_ref,
-            snapshot,
             arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
@@ -866,7 +873,7 @@ pub fn with_pool<S: StateDatabase + Sync, R>(
 /// One in-flight block being fed to the pool.
 pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     pool: &'p PoolHandle<'a, S>,
-    ctx: Arc<BlockCtx<'a, S>>,
+    ctx: Arc<BlockCtx<S>>,
     stats: &'p Stats,
     workers: usize,
     cold: usize,
@@ -896,6 +903,28 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// live delta at the block's first tx), owned by the session.
     pub fn begin_block<'p>(
         &'p self,
+        snapshot: S,
+        base: PendingDelta,
+        env: ExecEnv,
+        stats: &'p Stats,
+    ) -> Result<BlockSession<'p, 'a, S>, ExecutorError>
+    where
+        S: Clone,
+    {
+        let workers = {
+            let st = self.shared.0.lock().expect("pool poisoned");
+            st.cfg.workers.max(1)
+        };
+        // Cloning shares one transaction; backends that serialise reads
+        // need `begin_block_per_worker` with independent views.
+        self.begin_block_per_worker(vec![snapshot; workers], base, env, stats)
+    }
+
+    /// [`Self::begin_block`] with an INDEPENDENT state view per worker —
+    /// see [`BlockCtx::snapshots`] for why the backend can require it.
+    pub fn begin_block_per_worker<'p>(
+        &'p self,
+        snapshots: Vec<S>,
         base: PendingDelta,
         env: ExecEnv,
         stats: &'p Stats,
@@ -904,8 +933,13 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             let st = self.shared.0.lock().expect("pool poisoned");
             (st.cfg.workers, st.cfg.prune_batch)
         };
+        assert!(
+            snapshots.len() >= workers.max(1),
+            "one state view per worker: {} given, {workers} needed",
+            snapshots.len()
+        );
         let probe = BlockInput {
-            snapshot: self.snapshot,
+            snapshot: snapshots.first().expect("at least one snapshot"),
             base: Some(&base),
         };
         let sink_start = probe
@@ -914,7 +948,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         let sink_start_balance = sink_start.as_ref().map(|a| a.balance).unwrap_or(U256::ZERO);
         let ctx = Arc::new(BlockCtx {
             env,
-            snapshot: self.snapshot,
+            snapshots,
             base,
             sink_start,
             sink_start_balance,
@@ -980,6 +1014,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// readers will use.
     pub fn run_block_prepared(
         &self,
+        snapshots: Vec<S>,
         base: PendingDelta,
         env: ExecEnv,
         txs: &[(TxIndex, BPosition, TxEnvelope)],
@@ -987,7 +1022,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         stats: &Stats,
     ) -> Result<StmOutcome, ExecutorError> {
         debug_assert_eq!(txs.len(), prepared.len(), "one Prepared per tx");
-        let mut sess = self.begin_block(base, env, stats)?;
+        let mut sess = self.begin_block_per_worker(snapshots, base, env, stats)?;
         for ((t, p, e), prep) in txs.iter().zip(prepared) {
             sess.push_prepared(*t, *p, e.clone(), prep)?;
         }
@@ -997,12 +1032,13 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// Batch convenience: feed the whole block, seal, return the outcome.
     pub fn run_block(
         &self,
+        snapshots: Vec<S>,
         base: PendingDelta,
         env: ExecEnv,
         txs: &[(TxIndex, BPosition, TxEnvelope)],
         stats: &Stats,
     ) -> Result<StmOutcome, ExecutorError> {
-        let mut sess = self.begin_block(base, env, stats)?;
+        let mut sess = self.begin_block_per_worker(snapshots, base, env, stats)?;
         for (t, p, e) in txs {
             sess.push_tx(*t, *p, e.clone())?;
         }
@@ -1356,7 +1392,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         for (i, mut r) in tx_results.into_iter().enumerate() {
             if wounded_set.contains(&i) {
                 let (tx_idx, position, envelope) = &txs[i];
-                let mut scope = ExecScope::new(ctx.snapshot, Some(&layered), ctx.env)?;
+                let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
                 let (mut receipt, ws) = scope.execute_tx(
                     *tx_idx, *position, envelope, i as u64, cumulative, None, None,
                 )?;
@@ -1445,7 +1481,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     }
 }
 
-fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<'_, S>, worker: usize) {
+fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize) {
     let mut seen = 0u64;
     loop {
         let ctx = {
@@ -1479,9 +1515,9 @@ fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<'_, S>, worker: usiz
 /// published. Ordering is structural, so there is no wait-graph to
 /// deadlock — the canonical total order bounds every edge (low index →
 /// high), and completion only ever removes edges.
-fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
+fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
     let input = BlockInput {
-        snapshot: ctx.snapshot,
+        snapshot: &ctx.snapshots[worker % ctx.snapshots.len()],
         base: Some(&ctx.base),
     };
     let view = MvView::new(&ctx.mv, &input, ctx.sink_start.clone(), &ctx.base_cache);
@@ -1588,7 +1624,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
 /// Batch entry point over a transient pool — kept for tests and simple
 /// callers; long-lived callers (the A/B harness, the P3 actor) hold a
 /// [`with_pool`] scope and amortize the spawn away entirely.
-pub fn execute_block_stm<S: StateDatabase + Sync>(
+pub fn execute_block_stm<S: StateDatabase + Sync + Clone + 'static>(
     snapshot: &S,
     base: Option<&PendingDelta>,
     env: ExecEnv,
@@ -1597,12 +1633,19 @@ pub fn execute_block_stm<S: StateDatabase + Sync>(
     workers: usize,
 ) -> Result<StmOutcome, ExecutorError> {
     with_pool(
-        snapshot,
         PoolConfig {
             workers,
             ..Default::default()
         },
-        |pool| pool.run_block(base.cloned().unwrap_or_default(), env, txs, stats),
+        |pool: &PoolHandle<'_, S>| {
+            pool.run_block(
+                vec![snapshot.clone(); workers.max(1)],
+                base.cloned().unwrap_or_default(),
+                env,
+                txs,
+                stats,
+            )
+        },
     )
 }
 

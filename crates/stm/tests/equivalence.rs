@@ -357,14 +357,19 @@ fn each_tx_occupies_one_node_and_exits_once() {
     let n = envs.len();
     let recs = records(envs);
     let out = with_pool(
-        &database,
         PoolConfig {
             workers: 4,
             prune_batch: 8,
         },
         |pool| {
-            pool.run_block(PendingDelta::new(), env(), &recs, &Stats::default())
-                .expect("block must drain")
+            pool.run_block(
+                vec![database.clone(); 4],
+                PendingDelta::new(),
+                env(),
+                &recs,
+                &Stats::default(),
+            )
+            .expect("block must drain")
         },
     );
     assert_eq!(out.receipts.len(), n, "one receipt per admitted tx");
@@ -397,14 +402,19 @@ fn every_block_drains() {
     let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
     let started = std::time::Instant::now();
     let out = with_pool(
-        &database,
         PoolConfig {
             workers: 4,
             prune_batch: 8,
         },
         |pool| {
-            pool.run_block(PendingDelta::new(), env(), &recs, &Stats::default())
-                .expect("block must drain")
+            pool.run_block(
+                vec![database.clone(); 4],
+                PendingDelta::new(),
+                env(),
+                &recs,
+                &Stats::default(),
+            )
+            .expect("block must drain")
         },
     );
     assert!(

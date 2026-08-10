@@ -35,6 +35,9 @@ path = "src/bin/perf.rs"
 kardamom-types.workspace = true
 kardamom-footprint = { path = "../footprint" }
 kardamom-stm = { path = "../stm" }
+# mdbx-backed A/B: the honest baseline, where a state read costs real work.
+kardamom-state = { path = "../state" }
+tempfile.workspace = true
 kardamom-ingress = { path = "../ingress" }
 
 alloy-primitives.workspace = true

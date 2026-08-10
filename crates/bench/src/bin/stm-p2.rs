@@ -60,6 +60,10 @@ struct Args {
     /// Print per-block lines.
     #[arg(long, default_value_t = false)]
     per_block: bool,
+    /// State backend: `mock` (in-memory — the harshest baseline, where a
+    /// read costs nothing) or `mdbx` (the real backend, where it does).
+    #[arg(long, default_value = "mock")]
+    state: String,
     /// DAG prune batch sizes to sweep (completions applied per graph-lock
     /// acquisition; 1 = update on every completion).
     #[arg(long, default_value = "1")]
@@ -98,6 +102,258 @@ fn assert_identical(
             && seq_delta.code == stm_delta.code,
         "block {block} workers {w}: delta divergence"
     );
+}
+
+/// Fold a block's ACTUAL footprints into the stats — the capture pass the
+/// live shadow performs, shared by both backends so each block is scheduled
+/// with prior-blocks-only knowledge.
+fn train<S: kardamom_types::StateDatabase>(
+    snapshot: &S,
+    recs: &[(TxIndex, BPosition, TxEnvelope)],
+    e: ExecEnv,
+    base: Option<&PendingDelta>,
+    stats: &mut Stats,
+) -> anyhow::Result<()> {
+    let mut scope = ExecScope::new(snapshot, base, e)?;
+    let mut cumulative = 0u64;
+    for (i, (tx_idx, position, envelope)) in recs.iter().enumerate() {
+        let mut touches = TouchSet::default();
+        let (receipt, ws) = scope.execute_tx(
+            *tx_idx,
+            *position,
+            envelope,
+            i as u64,
+            cumulative,
+            None,
+            Some(&mut touches),
+        )?;
+        cumulative = receipt.cumulative_gas_used;
+        let (to, selector, args, has_value) = envelope_view(&envelope.raw_tx);
+        let mut reads: Vec<Cell> = touches
+            .slot_reads
+            .iter()
+            .map(|(ad, k)| Cell::Slot(*ad, *k))
+            .collect();
+        reads.sort_unstable();
+        reads.dedup();
+        let mut writes: Vec<Cell> = ws
+            .accounts
+            .iter()
+            .map(|(ad, _)| Cell::Account(*ad))
+            .chain(ws.storage.iter().map(|((ad, k), _)| Cell::Slot(*ad, *k)))
+            .collect();
+        writes.sort_unstable();
+        writes.dedup();
+        stats.learn_obs(&TxObs {
+            index: i as u64,
+            block: e.block_number,
+            sender: envelope.sender,
+            to,
+            selector,
+            args,
+            gas: receipt.gas_used,
+            has_value,
+            reads,
+            writes,
+        });
+    }
+    Ok(())
+}
+
+/// mdbx-backed A/B — THE honest baseline.
+///
+/// Every other number in this harness is measured against in-memory Mock
+/// state, where a read costs a hash lookup and sequential execution runs at
+/// ~3 Ggas/s. That is the most hostile possible comparison for a parallel
+/// engine: it maximizes the scheduler's share of the work. Here reads go to
+/// the real backend, so per-tx execution costs what it costs in production
+/// and the coordination overhead is measured against the right denominator.
+///
+/// State is MONOTONIC here (a committed block cannot be un-committed), so
+/// the sweep cannot replay a block per worker count against a rewound DB.
+/// Instead each configuration gets a FRESH database and replays the whole
+/// sequence, with both engines reading the SAME snapshot before it advances:
+/// snapshot -> sequential (timed, canonical outputs) -> STM (timed,
+/// byte-compared) -> commit the sequential delta -> next snapshot.
+#[allow(clippy::too_many_arguments)]
+fn run_mdbx_ab(
+    signers: &[kardamom_bench::signers::DerivedSigner],
+    all_blocks: &[Vec<TxEnvelope>],
+    n_setup: usize,
+    chain_id: u64,
+    worker_counts: &[usize],
+    batches: &[usize],
+) -> anyhow::Result<()> {
+    use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
+    use kardamom_types::{AccountChange, BlockBoundary};
+
+    let genesis: Vec<AccountChange> = signers
+        .iter()
+        .map(|s| AccountChange {
+            address: s.signer.address(),
+            nonce: 0,
+            balance: U256::from(10u128.pow(21)),
+            code_hash: alloy_primitives::KECCAK256_EMPTY,
+        })
+        .collect();
+
+    println!(
+        "\n===== STM-P2 A/B [mdbx-backed state] =====\n{:>3} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>7}",
+        "w",
+        "seq_ms",
+        "stm_ms",
+        "speedup",
+        "busy_ms",
+        "span_ms",
+        "commit_ms",
+        "feed_ms",
+        "snap_ms",
+        "util"
+    );
+
+    for &w in worker_counts {
+        for &batch in batches {
+            let dir = tempfile::tempdir()?;
+            let env = StateEnvBuilder::new(dir.path())
+                .durability(Durability::SafeNoSync)
+                .open()?;
+            kardamom_state::seed_genesis(&env, &genesis, &[])?;
+            // Keep an env handle: each worker needs its OWN read
+            // transaction (mdbx serialises reads through one txn's mutex).
+            let env_for_reads = env.clone();
+            let writer = StateWriter::spawn(env)?;
+            let mut snapshot = writer
+                .snapshot_rx
+                .current()
+                .expect("writer publishes an initial snapshot");
+
+            let cfg = kardamom_stm::execute::PoolConfig {
+                workers: w,
+                prune_batch: batch,
+            };
+            let mut stats = Stats::default();
+            let mut global_idx = 0u64;
+            let (mut seq_ms, mut stm_ms, mut gas, mut wounds) = (0f64, 0f64, 0u64, 0usize);
+            let (mut busy, mut span, mut commit, mut feed, mut snap_us) =
+                (0u64, 0u64, 0u64, 0u64, 0u64);
+
+            kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
+                for (bi, blk) in all_blocks.iter().enumerate() {
+                    let is_flow = bi >= n_setup;
+                    let e = ExecEnv {
+                        chain_id,
+                        block_number: bi as u64 + 1,
+                        l2_timestamp: 1_700_000_000 + bi as u64 * 2,
+                    };
+                    let recs = records(global_idx, blk);
+                    global_idx += blk.len() as u64;
+
+                    // Both engines read the SAME snapshot, before it moves.
+                    let t0 = Instant::now();
+                    let (seq_receipts, seq_delta) =
+                        execute_block_sequential(&snapshot, None, e, &recs)?;
+                    let s_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+                    let prepared: Vec<_> = recs
+                        .iter()
+                        .map(|(t, _, en)| kardamom_stm::execute::prepare(en, *t, &stats))
+                        .collect();
+                    let t1 = Instant::now();
+                    // One independent view per worker, all at the block
+                    // the writer just published.
+                    let t_snap = Instant::now();
+                    let views: Vec<kardamom_state::StateSnapshot> = (0..w)
+                        .map(|_| kardamom_state::StateSnapshot::open(&env_for_reads))
+                        .collect::<Result<_, _>>()?;
+                    let snap_open = t_snap.elapsed().as_micros() as u64;
+                    debug_assert!(
+                        views
+                            .iter()
+                            .all(|v| v.block_number() == snapshot.block_number()),
+                        "per-worker views must agree on the block"
+                    );
+                    let out = pool.run_block_prepared(
+                        views,
+                        PendingDelta::new(),
+                        e,
+                        &recs,
+                        prepared,
+                        &stats,
+                    )?;
+                    let p_ms = t1.elapsed().as_secs_f64() * 1e3;
+                    assert_identical(
+                        &seq_receipts,
+                        &seq_delta,
+                        &out.receipts,
+                        &out.delta,
+                        e.block_number,
+                        w,
+                    );
+                    if is_flow {
+                        seq_ms += s_ms;
+                        stm_ms += p_ms;
+                        wounds += out.wounds;
+                        busy += out.busy_us;
+                        span += out.parallel_span_us;
+                        commit += out.commit_us;
+                        feed += out.feed_us;
+                        snap_us += snap_open;
+                        gas += seq_receipts
+                            .last()
+                            .map(|r| r.cumulative_gas_used)
+                            .unwrap_or(0);
+                    }
+
+                    // Train on this block (prior-blocks-only stats), then
+                    // COMMIT it so the next block reads it from mdbx.
+                    train(&snapshot, &recs, e, None, &mut stats)?;
+                    let boundary = BlockBoundary {
+                        block_number: e.block_number,
+                        end_tx_idx: BPosition::from_index(global_idx),
+                        l2_timestamp: e.l2_timestamp,
+                        l1_origin: 0,
+                    };
+                    let bd = seq_delta.finalize(e.block_number, seq_receipts);
+                    writer.delta_tx.send(WriteBatch::new(boundary, bd))?;
+                    // Wait for the writer to publish the post-commit view.
+                    loop {
+                        let snap = writer.snapshot_rx.recv().expect("writer alive");
+                        let at = snap.block_number();
+                        snapshot = snap;
+                        if at >= e.block_number {
+                            break;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+
+            let util = if span > 0 {
+                busy as f64 / (w as f64 * span as f64) * 100.0
+            } else {
+                0.0
+            };
+            let _ = (gas, batch);
+            println!(
+                "{:>3} {:>8.0} {:>8.0} {:>7.2}x {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>6.0}%",
+                w,
+                seq_ms,
+                stm_ms,
+                seq_ms / stm_ms,
+                busy as f64 / 1000.0,
+                span as f64 / 1000.0,
+                commit as f64 / 1000.0,
+                feed as f64 / 1000.0,
+                snap_us as f64 / 1000.0,
+                util
+            );
+            if wounds > 0 {
+                println!("   (wounds: {wounds})");
+            }
+        }
+    }
+    println!("BYTE-IDENTICAL: every block, every worker count — verified");
+    Ok(())
 }
 
 fn main() -> anyhow::Result<()> {
@@ -227,6 +483,22 @@ fn main() -> anyhow::Result<()> {
     let mut all_blocks = setup_blocks;
     all_blocks.extend(flow_blocks);
 
+    let batches: Vec<usize> = a
+        .prune_batch
+        .split(',')
+        .map(|s| s.trim().parse().expect("prune-batch csv"))
+        .collect();
+    if a.state == "mdbx" {
+        return run_mdbx_ab(
+            &signers,
+            &all_blocks,
+            n_setup,
+            a.chain_id,
+            &worker_counts,
+            &batches,
+        );
+    }
+
     eprintln!(
         "==> A/B over {} blocks ({} setup) workers={:?}",
         all_blocks.len(),
@@ -285,51 +557,7 @@ fn main() -> anyhow::Result<()> {
 
         // Untimed capture pass: train the stats for the NEXT block
         // (prior-blocks-only, like the live shadow).
-        {
-            let mut scope = ExecScope::new(&snap, Some(&delta), env)?;
-            let mut cumulative = 0u64;
-            for (i, (tx_idx, position, envelope)) in recs.iter().enumerate() {
-                let mut touches = TouchSet::default();
-                let (receipt, ws) = scope.execute_tx(
-                    *tx_idx,
-                    *position,
-                    envelope,
-                    i as u64,
-                    cumulative,
-                    None,
-                    Some(&mut touches),
-                )?;
-                cumulative = receipt.cumulative_gas_used;
-                let (to, selector, args, has_value) = envelope_view(&envelope.raw_tx);
-                let mut reads: Vec<Cell> = touches
-                    .slot_reads
-                    .iter()
-                    .map(|(ad, k)| Cell::Slot(*ad, *k))
-                    .collect();
-                reads.sort_unstable();
-                reads.dedup();
-                let mut writes: Vec<Cell> = ws
-                    .accounts
-                    .iter()
-                    .map(|(ad, _)| Cell::Account(*ad))
-                    .chain(ws.storage.iter().map(|((ad, k), _)| Cell::Slot(*ad, *k)))
-                    .collect();
-                writes.sort_unstable();
-                writes.dedup();
-                stats.learn_obs(&TxObs {
-                    index: i as u64,
-                    block: env.block_number,
-                    sender: envelope.sender,
-                    to,
-                    selector,
-                    args,
-                    gas: receipt.gas_used,
-                    has_value,
-                    reads,
-                    writes,
-                });
-            }
-        }
+        train(&snap, &recs, env, Some(&delta), &mut stats)?;
 
         delta.merge_from(&seq_delta);
         // Cost of preparing this block upstream (measured once; the sweep
@@ -354,11 +582,6 @@ fn main() -> anyhow::Result<()> {
     // ---- Sweep: ONE persistent pool per worker count, blocks streamed
     // through it — no per-block thread cost, matching the executor
     // pipeline shape.
-    let batches: Vec<usize> = a
-        .prune_batch
-        .split(',')
-        .map(|s| s.trim().parse().expect("prune-batch csv"))
-        .collect();
     struct Row {
         workers: usize,
         batch: usize,
@@ -418,7 +641,7 @@ fn main() -> anyhow::Result<()> {
                 idle_us: 0,
             };
             let mut batch_weight = 0f64;
-            kardamom_stm::execute::with_pool(&snap, cfg, |pool| -> anyhow::Result<()> {
+            kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
                 for case in &cases {
                     let base = case.base.clone();
                     // Upstream stage — in production the tx_data readers,
@@ -430,8 +653,14 @@ fn main() -> anyhow::Result<()> {
                         .map(|(t, _, e)| kardamom_stm::execute::prepare(e, *t, &case.stats))
                         .collect();
                     let t = Instant::now();
-                    let out =
-                        pool.run_block_prepared(base, case.env, &case.recs, prepared, &case.stats)?;
+                    let out = pool.run_block_prepared(
+                        vec![snap.clone(); w],
+                        base,
+                        case.env,
+                        &case.recs,
+                        prepared,
+                        &case.stats,
+                    )?;
                     let ms = t.elapsed().as_secs_f64() * 1e3;
                     assert_identical(
                         &case.seq_receipts,
