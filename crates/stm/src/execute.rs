@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use alloy_primitives::{B256, U256};
 use kardamom_exec_core::block_env::ExecEnv;
@@ -113,6 +113,46 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
     }
 }
 
+/// SHARED read-through cache over the block-input layer.
+///
+/// The block input (pre-block delta ∘ snapshot) is immutable for the whole
+/// block, so every worker that misses the multi-version cache asks the
+/// same questions and gets the same answers. Per-worker memos made each
+/// thread re-answer them independently, which is why total CPU time GREW
+/// with worker count — 159ms at one worker, 325ms at eight, for the same
+/// 8000 transactions. Sharing the answers is what turns extra threads into
+/// extra throughput instead of extra work.
+///
+/// Sharded like [`MvCache`], read-mostly, and correctness-neutral: it
+/// caches an immutable layer, so a stale entry is impossible.
+#[derive(Default)]
+struct BaseCache {
+    accounts: Vec<RwLock<HashMap<alloy_primitives::Address, Option<AccountInfo>>>>,
+    storage: Vec<RwLock<HashMap<(alloy_primitives::Address, B256), U256>>>,
+    code: RwLock<HashMap<B256, revm::state::Bytecode>>,
+}
+
+const BASE_SHARDS: usize = 64;
+
+impl BaseCache {
+    fn new() -> Self {
+        Self {
+            accounts: (0..BASE_SHARDS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
+            storage: (0..BASE_SHARDS)
+                .map(|_| RwLock::new(HashMap::new()))
+                .collect(),
+            code: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn shard(addr: &alloy_primitives::Address) -> usize {
+        let b = addr.as_slice();
+        (b[19] as usize) % BASE_SHARDS
+    }
+}
+
 /// Per-tx database view: multi-version cache at index `idx` over the block
 /// input, recording every first read for validation. The fee sink is served
 /// from the cached block-start info and never recorded — the `Accumulator`
@@ -124,27 +164,24 @@ struct MvView<'a, S: StateDatabase> {
     idx: u32,
     reads: Vec<ReadRecord>,
     sink_start: Option<AccountInfo>,
-    // Worker-local memos over the IMMUTABLE-for-the-block layers (base
-    // input; content-addressed code). Without them every MvCache miss
-    // re-walks the delta BTreeMaps and the snapshot — and worse, re-copies
-    // full contract bytecode per call. The multi-version lists themselves
-    // are never memoized (their answers depend on the reader's index).
-    base_accounts: std::collections::HashMap<alloy_primitives::Address, Option<AccountInfo>>,
-    base_storage: std::collections::HashMap<(alloy_primitives::Address, B256), U256>,
-    code_cache: std::collections::HashMap<B256, revm::state::Bytecode>,
+    /// SHARED across workers — see [`BaseCache`].
+    base_cache: &'a BaseCache,
 }
 
 impl<'a, S: StateDatabase> MvView<'a, S> {
-    fn new(mv: &'a MvCache, base: &'a BlockInput<'a, S>, sink_start: Option<AccountInfo>) -> Self {
+    fn new(
+        mv: &'a MvCache,
+        base: &'a BlockInput<'a, S>,
+        sink_start: Option<AccountInfo>,
+        base_cache: &'a BaseCache,
+    ) -> Self {
         Self {
             mv,
             base,
             idx: 0,
             reads: Vec::new(),
             sink_start,
-            base_accounts: std::collections::HashMap::new(),
-            base_storage: std::collections::HashMap::new(),
-            code_cache: std::collections::HashMap::new(),
+            base_cache,
         }
     }
 }
@@ -174,18 +211,32 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             }));
         }
         self.reads.push(ReadRecord::Account(address, None));
-        if let Some(a) = self.base_accounts.get(&address) {
+        let sh = BaseCache::shard(&address);
+        if let Some(a) = self.base_cache.accounts[sh]
+            .read()
+            .expect("base cache poisoned")
+            .get(&address)
+        {
             return Ok(a.clone());
         }
         let a = self.base.basic_ref(address)?;
-        self.base_accounts.insert(address, a.clone());
+        self.base_cache.accounts[sh]
+            .write()
+            .expect("base cache poisoned")
+            .insert(address, a.clone());
         Ok(a)
     }
 
     fn code_by_hash(&mut self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
         // Content-addressed: no version, no record — memo both sources
         // (Bytecode clones are refcounted; the copy happens once).
-        if let Some(c) = self.code_cache.get(&code_hash) {
+        if let Some(c) = self
+            .base_cache
+            .code
+            .read()
+            .expect("base cache poisoned")
+            .get(&code_hash)
+        {
             return Ok(c.clone());
         }
         let c = if let Some(code) = self.mv.read_code(&code_hash) {
@@ -197,7 +248,11 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             self.reads.push(ReadRecord::Code(code_hash, false));
             self.base.code_by_hash_ref(code_hash)?
         };
-        self.code_cache.insert(code_hash, c.clone());
+        self.base_cache
+            .code
+            .write()
+            .expect("base cache poisoned")
+            .insert(code_hash, c.clone());
         Ok(c)
     }
 
@@ -212,11 +267,19 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             return Ok(v);
         }
         self.reads.push(ReadRecord::Slot(address, key, None));
-        if let Some(v) = self.base_storage.get(&(address, key)) {
+        let sh = BaseCache::shard(&address);
+        if let Some(v) = self.base_cache.storage[sh]
+            .read()
+            .expect("base cache poisoned")
+            .get(&(address, key))
+        {
             return Ok(*v);
         }
         let v = self.base.storage_ref(address, index)?;
-        self.base_storage.insert((address, key), v);
+        self.base_cache.storage[sh]
+            .write()
+            .expect("base cache poisoned")
+            .insert((address, key), v);
         Ok(v)
     }
 
@@ -233,6 +296,11 @@ struct TxResult {
     reads: Vec<ReadRecord>,
     /// This tx's exact credit to the fee sink (post − block-start seen).
     fee_delta: U256,
+    /// The write set contains the fee sink, so its hash is finalized at
+    /// COMMIT (after the prefix balance is materialized) and computing it
+    /// during execution would be thrown away. P0 measured this at 100% of
+    /// txs, so the saved keccak is not an edge case.
+    sink_touched: bool,
 }
 
 /// Outcome of one block through the STM engine.
@@ -264,6 +332,13 @@ pub struct StmOutcome {
     pub feed_us: u64,
     pub redundant_edges: u64,
     pub steals: u64,
+    /// Where the block's wall time went. `busy_us / (workers *
+    /// parallel_span_us)` is the honest core utilization; `ramp_us` and
+    /// `commit_us` are the serial head and tail no worker count reduces.
+    pub busy_us: u64,
+    pub parallel_span_us: u64,
+    pub ramp_us: u64,
+    pub commit_us: u64,
     pub decode_us: u64,
     pub predict_us: u64,
     pub admit_us: u64,
@@ -445,6 +520,23 @@ pub struct Metrics {
     pub idle_ns: std::sync::atomic::AtomicU64,
     /// Ready txs taken from another thread's queue to fix imbalance.
     pub steals: std::sync::atomic::AtomicU64,
+    /// Nanoseconds workers spent INSIDE revm (the only work that is
+    /// actually the point). `busy / (workers x parallel_span)` is the true
+    /// core utilization — idle time alone cannot distinguish "the DAG had
+    /// no work to give" from "work existed and nobody picked it up".
+    pub busy_ns: std::sync::atomic::AtomicU64,
+    /// Wall from the block's FIRST dispatch to its LAST completion — the
+    /// span during which parallelism was even possible.
+    pub parallel_span_ns: std::sync::atomic::AtomicU64,
+    /// Wall before the first dispatch (feed ramp) and after the last
+    /// completion (serial validate + commit tail). Both are per-block
+    /// costs that no worker count can reduce.
+    pub ramp_ns: std::sync::atomic::AtomicU64,
+    pub commit_ns: std::sync::atomic::AtomicU64,
+    /// Nanos of the first dispatch / last completion, as offsets from the
+    /// session start (interior mutability so workers can stamp them).
+    first_dispatch_ns: std::sync::atomic::AtomicU64,
+    last_done_ns: std::sync::atomic::AtomicU64,
     /// Envelope decode and footprint prediction, the two pure-computation
     /// parts of admission (the rest is the graph lock + dispatch).
     pub decode_ns: std::sync::atomic::AtomicU64,
@@ -538,6 +630,8 @@ struct BlockCtx<'env, S: StateDatabase> {
     sink_start: Option<AccountInfo>,
     sink_start_balance: U256,
     mv: MvCache,
+    /// Shared read-through cache over the immutable block-input layer.
+    base_cache: BaseCache,
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
@@ -557,6 +651,9 @@ struct BlockCtx<'env, S: StateDatabase> {
     /// Completions parked across all buffers, i.e. DAG updates owed.
     pending: std::sync::atomic::AtomicU64,
     prune_batch: usize,
+    /// Block start, so workers can stamp first-dispatch / last-completion
+    /// offsets without reaching into the session.
+    started: std::time::Instant,
     done_cv: Condvar,
     aborted: AtomicBool,
     /// Nodes observed leaving the graph more than once — always zero; a
@@ -822,6 +919,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             sink_start,
             sink_start_balance,
             mv: MvCache::new(),
+            base_cache: BaseCache::new(),
             slots: (0..MAX_BLOCK_TXS)
                 .map(|_| std::sync::OnceLock::new())
                 .collect(),
@@ -841,10 +939,15 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             completed: (0..workers).map(|_| Mutex::new(Vec::new())).collect(),
             pending: std::sync::atomic::AtomicU64::new(0),
             prune_batch: prune_batch.max(1),
+            started: std::time::Instant::now(),
             done_cv: Condvar::new(),
             aborted: AtomicBool::new(false),
             double_exit: AtomicU32::new(0),
-            metrics: Metrics::default(),
+            metrics: Metrics {
+                // fetch_min seeds from the top.
+                first_dispatch_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
+                ..Default::default()
+            },
         });
         {
             let mut st = self.shared.0.lock().expect("pool poisoned");
@@ -1222,6 +1325,10 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // block never re-runs. Everything after a wound sees the corrected
         // state through the same prefix, so a wound cascade re-executes
         // only the txs it actually reaches.
+        //
+        // SERIAL by definition: this is the block's tail, and no worker
+        // count shortens it.
+        let t_com = std::time::Instant::now();
         let mut receipts = Vec::with_capacity(n);
         let mut delta = PendingDelta::new();
         let mut cumulative = 0u64;
@@ -1236,7 +1343,16 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 wounded_set.insert(i);
             }
         }
-        let mut layered = ctx.base.clone();
+        // `layered` exists ONLY to re-execute a wounded tx against the
+        // exact prefix. Wounds are ~never, and maintaining it costs a full
+        // WriteSet clone plus a second delta insert per tx — 8000 of them
+        // on the block's serial tail. Build it only when it is needed.
+        let repairing = !wounded_set.is_empty();
+        let mut layered = if repairing {
+            ctx.base.clone()
+        } else {
+            PendingDelta::new()
+        };
         for (i, mut r) in tx_results.into_iter().enumerate() {
             if wounded_set.contains(&i) {
                 let (tx_idx, position, envelope) = &txs[i];
@@ -1254,15 +1370,21 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             cumulative += r.receipt.gas_used;
             r.receipt.cumulative_gas_used = cumulative;
             sink_running += r.fee_delta;
-            if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
-                entry.1.1 = sink_running;
+            if r.sink_touched {
+                if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
+                    entry.1.1 = sink_running;
+                }
+                // The ONLY hash of this write set (execution skipped it).
                 r.receipt.write_set_hash = r.ws.hash();
             }
-            layered.apply(r.ws.clone());
+            if repairing {
+                layered.apply(r.ws.clone());
+            }
             delta.apply(r.ws);
             receipts.push(r.receipt);
         }
 
+        let t_commit = t_com.elapsed();
         if wounds > 0 {
             tracing::warn!(
                 block = ctx.env.block_number,
@@ -1292,6 +1414,21 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
             redundant_edges: m.redundant_edges.load(Ordering::Relaxed),
             steals: m.steals.load(Ordering::Relaxed),
+            busy_us: m.busy_ns.load(Ordering::Relaxed) / 1_000,
+            parallel_span_us: {
+                let f = m.first_dispatch_ns.load(Ordering::Relaxed);
+                let l = m.last_done_ns.load(Ordering::Relaxed);
+                if f == u64::MAX || l < f {
+                    0
+                } else {
+                    (l - f) / 1_000
+                }
+            },
+            ramp_us: {
+                let f = m.first_dispatch_ns.load(Ordering::Relaxed);
+                if f == u64::MAX { 0 } else { f / 1_000 }
+            },
+            commit_us: t_commit.as_micros() as u64,
             decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
             predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
             admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
@@ -1347,7 +1484,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
         snapshot: ctx.snapshot,
         base: Some(&ctx.base),
     };
-    let view = MvView::new(&ctx.mv, &input, ctx.sink_start.clone());
+    let view = MvView::new(&ctx.mv, &input, ctx.sink_start.clone(), &ctx.base_cache);
     let mut evm = Context::mainnet()
         .with_db(view)
         .with_block(ctx.env.block_env())
@@ -1400,6 +1537,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
         let slot = ctx.slots[job as usize]
             .get()
             .expect("slot set before its index is dispatched");
+        let t_busy = std::time::Instant::now();
         let r = execute_one(
             &mut evm,
             &ctx.mv,
@@ -1411,6 +1549,17 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<'_, S>, worker: usize) {
             slot.decoded.as_ref(),
             ctx.sink_start_balance,
         );
+        let busy = t_busy.elapsed();
+        ctx.metrics
+            .busy_ns
+            .fetch_add(busy.as_nanos() as u64, Ordering::Relaxed);
+        ctx.metrics.first_dispatch_ns.fetch_min(
+            ctx.started.elapsed().as_nanos() as u64 - busy.as_nanos() as u64,
+            Ordering::Relaxed,
+        );
+        ctx.metrics
+            .last_done_ns
+            .fetch_max(ctx.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
         let errored = r.is_err();
         let _ = ctx.results[job as usize].set(r);
         if errored {
@@ -1524,6 +1673,7 @@ fn execute_one<S: StateDatabase>(
             ws,
             reads: Vec::new(),
             fee_delta: U256::ZERO,
+            sink_touched: false,
         }
     };
 
@@ -1588,7 +1738,10 @@ fn execute_one<S: StateDatabase>(
         std::mem::take(&mut db.reads)
     };
 
-    let write_set_hash = ws.hash();
+    let sink_touched = ws.accounts.iter().any(|(a, _)| *a == FEE_SINK);
+    // Hashing now is pure waste when the commit pass must re-hash after
+    // patching the accumulator's absolute balance.
+    let write_set_hash = if sink_touched { B256::ZERO } else { ws.hash() };
     let contract_address = if to.is_none() && status.is_success() {
         Some(signer.create(nonce))
     } else {
@@ -1617,5 +1770,6 @@ fn execute_one<S: StateDatabase>(
         ws,
         reads,
         fee_delta,
+        sink_touched,
     })
 }

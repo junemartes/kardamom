@@ -372,6 +372,10 @@ fn main() -> anyhow::Result<()> {
         imbalance: f64,
         imb_n: u64,
         idle_threads: usize,
+        busy_us: u64,
+        span_us: u64,
+        ramp_us: u64,
+        commit_us: u64,
         decode_us: u64,
         predict_us: u64,
         admit_us: u64,
@@ -400,6 +404,10 @@ fn main() -> anyhow::Result<()> {
                 imbalance: 0.0,
                 imb_n: 0,
                 idle_threads: 0,
+                busy_us: 0,
+                span_us: 0,
+                ramp_us: 0,
+                commit_us: 0,
                 decode_us: 0,
                 predict_us: 0,
                 admit_us: 0,
@@ -438,6 +446,10 @@ fn main() -> anyhow::Result<()> {
                         row.fallbacks += out.fallback as usize;
                         row.feed_us += out.feed_us;
                         row.prep_us += case.prep_us;
+                        row.busy_us += out.busy_us;
+                        row.span_us += out.parallel_span_us;
+                        row.ramp_us += out.ramp_us;
+                        row.commit_us += out.commit_us;
                         let total: u32 = out.dispatch.iter().sum();
                         let maxd = *out.dispatch.iter().max().unwrap_or(&0);
                         let used = out.dispatch.iter().filter(|c| **c > 0).count();
@@ -525,6 +537,26 @@ fn main() -> anyhow::Result<()> {
         "DISPATCH: empty-thread-slots {} over {} block-runs (domain-affinity collisions)",
         tot_idle_threads, tot_blocks
     );
+    println!(
+        "\n----- WHERE THE WALL TIME GOES (per worker count) -----\n{:>3} {:>10} {:>10} {:>10} {:>10} {:>12}",
+        "w", "ramp_ms", "span_ms", "commit_ms", "busy_ms", "utilization"
+    );
+    for r in &rows {
+        let util = if r.span_us > 0 {
+            r.busy_us as f64 / (r.workers as f64 * r.span_us as f64) * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "{:>3} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>11.1}%",
+            r.workers,
+            r.ramp_us as f64 / 1000.0,
+            r.span_us as f64 / 1000.0,
+            r.commit_us as f64 / 1000.0,
+            r.busy_us as f64 / 1000.0,
+            util
+        );
+    }
     println!("BYTE-IDENTICAL: every block, every worker count — verified");
     Ok(())
 }
