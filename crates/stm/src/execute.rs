@@ -495,6 +495,12 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 /// the feed thread; that is the real fix for oversubscription.
 const SPIN_BEFORE_PARK: u32 = 256;
 
+/// Mean per-tx execution time above which moving a ready tx to an idle
+/// core beats keeping its state warm on the owning one. Between a 21k-gas
+/// transfer (~2.75us, migration loses) and a uniswap swap (~15us,
+/// migration wins).
+const STEAL_WORTH_NS: u64 = 6_000;
+
 /// Longest a parked worker sleeps before re-checking its queue and the
 /// drain condition itself. Bounds the damage of a missed wake to one
 /// poll interval instead of a permanent hang.
@@ -716,6 +722,16 @@ struct BlockCtx<S: StateDatabase> {
     /// Block start, so workers can stamp first-dispatch / last-completion
     /// offsets without reaching into the session.
     started: std::time::Instant,
+    /// Whether an idle worker may take a ready tx from another thread.
+    ///
+    /// Stealing migrates a transaction to a core whose caches know nothing
+    /// about the accounts it touches. That pays handsomely when the tx is
+    /// expensive (uniswap swaps, ~15us: 1.55x -> 1.67x) and LOSES badly
+    /// when it is not (21k-gas transfers, ~2.75us: 0.93x -> 0.60x), where
+    /// the migration costs more than the work it moves. So the policy is
+    /// measured, not fixed: the pool tracks mean per-tx execution time and
+    /// enables stealing only above a threshold.
+    steal_enabled: bool,
     done_cv: Condvar,
     aborted: AtomicBool,
     /// Nodes observed leaving the graph more than once — always zero; a
@@ -752,7 +768,13 @@ impl<S: StateDatabase> BlockCtx<S> {
                 continue;
             }
             let len = qh.q.lock().expect("queue poisoned").len();
-            if len > 1 && best.is_none_or(|(_, b)| len > b) {
+            // ANY queued tx is stealable. The previous `len > 1` guard —
+            // "leave the owner its work" — silently disabled stealing
+            // altogether: under DAG chains a domain releases ONE ready tx
+            // at a time, so queues hold 0 or 1 items essentially always.
+            // That capped effective parallelism at roughly the number of
+            // domains that happened to hash to distinct workers.
+            if len >= 1 && best.is_none_or(|(_, b)| len > b) {
                 best = Some((w, len));
             }
         }
@@ -877,6 +899,9 @@ type PoolShared<S> = (Mutex<PoolState<S>>, Condvar);
 /// (P3: the `ReaderToExec::Tx` arm pushes, the `Boundary` arm seals).
 pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     shared: &'a PoolShared<S>,
+    /// Mean per-tx execution time of the last block, feeding the stealing
+    /// policy. Feed-thread-owned, so a `Cell` suffices.
+    avg_tx_ns: std::cell::Cell<u64>,
     /// THE ARENA. Allocated once for the pool's lifetime and reused by
     /// every block: a node is addressed by its index, so nothing here is
     /// ever allocated, freed, or reference-counted per transaction. This
@@ -920,6 +945,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         }
         let handle = PoolHandle {
             shared: shared_ref,
+            avg_tx_ns: std::cell::Cell::new(0),
             arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
@@ -1033,6 +1059,12 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             pending: std::sync::atomic::AtomicU64::new(0),
             prune_batch: prune_batch.max(1),
             started: std::time::Instant::now(),
+            steal_enabled: {
+                let avg = self.avg_tx_ns.get();
+                // Unknown (first block of a pool): allow it, and let the
+                // measurement correct course from the next block on.
+                avg == 0 || avg >= STEAL_WORTH_NS
+            },
             done_cv: Condvar::new(),
             aborted: AtomicBool::new(false),
             double_exit: AtomicU32::new(0),
@@ -1550,6 +1582,11 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             );
         }
         let m = &ctx.metrics;
+        // Feed the stealing policy: mean per-tx execution time this block.
+        if n > 0 {
+            pool.avg_tx_ns
+                .set(m.busy_ns.load(Ordering::Relaxed) / n as u64);
+        }
         let prune_calls = m.prune_calls.load(Ordering::Relaxed);
         let completions = m.completions.load(Ordering::Relaxed);
         Ok(StmOutcome {
@@ -1697,7 +1734,9 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 // the busiest thread took 1.7-2.3x its even share, and
                 // ~1.25 threads per block got nothing at all), so an idle
                 // worker helps the busiest one rather than parking.
-                if let Some(stolen) = ctx.steal(worker) {
+                if ctx.steal_enabled
+                    && let Some(stolen) = ctx.steal(worker)
+                {
                     ctx.metrics.steals.fetch_add(1, Ordering::Relaxed);
                     break stolen;
                 }

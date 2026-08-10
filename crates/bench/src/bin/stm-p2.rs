@@ -646,6 +646,7 @@ fn main() -> anyhow::Result<()> {
         feed_us: u64,
         prep_us: u64,
         redundant: u64,
+        steals: u64,
         /// Dispatch imbalance: busiest thread's share vs an even split.
         /// Domain-affinity assignment collides when domains ~ workers.
         imbalance: f64,
@@ -680,6 +681,7 @@ fn main() -> anyhow::Result<()> {
                 feed_us: 0,
                 prep_us: 0,
                 redundant: 0,
+                steals: 0,
                 imbalance: 0.0,
                 imb_n: 0,
                 idle_threads: 0,
@@ -744,6 +746,7 @@ fn main() -> anyhow::Result<()> {
                             row.imb_n += 1;
                         }
                         row.redundant += out.redundant_edges;
+                        row.steals += out.steals;
                         row.decode_us += out.decode_us;
                         row.predict_us += out.predict_us;
                         row.admit_us += out.admit_us;
@@ -816,6 +819,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
     let _ = |r: &Row| (r.avg_batch, r.redundant, r.idle_threads);
+    for r in &rows {
+        println!("  w={} steals={}", r.workers, r.steals);
+    }
     let tot_idle_threads: usize = rows.iter().map(|r| r.idle_threads).sum();
     let tot_blocks: u64 = rows.iter().map(|r| r.imb_n).sum();
     println!(
