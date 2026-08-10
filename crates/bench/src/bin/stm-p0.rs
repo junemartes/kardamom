@@ -50,6 +50,11 @@ struct Args {
     repo_root: String,
     #[arg(long, default_value_t = 412346)]
     chain_id: u64,
+    /// Predict from directly-observed hashes only (tier-1 accounts +
+    /// tier-3 fixed slots), with NO keccak inversion and no derived
+    /// mapping keys — the experiment that prices tier-2.
+    #[arg(long, default_value_t = false)]
+    no_derived: bool,
     /// Optional JSON report path.
     #[arg(long)]
     json: Option<String>,
@@ -280,7 +285,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let t1 = std::time::Instant::now();
-    let report = oracle::analyze(&obs, a.train_frac, &exclude);
+    let report = oracle::analyze_with(&obs, a.train_frac, &exclude, !a.no_derived);
     eprintln!("==> analysis {:.1}s", t1.elapsed().as_secs_f64());
 
     if a.shadow {

@@ -178,14 +178,49 @@ pub enum DomainKey {
 
 /// Aggregate stats over observations. Batch (`learn`) for the offline lab,
 /// incremental (`learn_obs`) for the live shadow — one code path.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub by_selector: HashMap<(Address, [u8; 4]), SelectorStats>,
+    /// When false, predictions use ONLY hashes observed directly in BALs
+    /// (tier-3 fixed slots) plus tier-1 account keys — no keccak inversion,
+    /// no derived mapping entries. An experiment knob: a fixed slot's
+    /// address is the same every call, so it needs no formula, and the
+    /// question is what the DERIVED keys are worth. See `--no-derived`.
+    pub derived_keys: bool,
+}
+
+impl Default for Stats {
+    /// Derived keys ON. Deriving `Default` would have silently defaulted
+    /// the flag to `false` and disabled tier-2 for every caller that
+    /// builds stats with `default()` — including the engine and the live
+    /// shadow.
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Stats {
+    /// Full predictor: tier-1 accounts, tier-3 fixed slots, and tier-2
+    /// derived mapping entries recovered by keccak inversion.
+    pub fn new() -> Self {
+        Self {
+            by_selector: HashMap::new(),
+            derived_keys: true,
+        }
+    }
+
+    /// Predictions from directly-observed hashes only.
+    pub fn without_derived() -> Self {
+        Self {
+            derived_keys: false,
+            ..Default::default()
+        }
+    }
 }
 
 impl Stats {
     pub fn learn(obs: &[TxObs]) -> Self {
-        let mut s = Self::default();
+        let mut s = Self::new();
         for o in obs {
             s.learn_obs(o);
         }
@@ -274,7 +309,7 @@ impl Stats {
             }
         }
         // Formulas: instantiate with THIS tx's words.
-        for (f, n) in &e.formulas {
+        for (f, n) in e.formulas.iter().filter(|_| self.derived_keys) {
             if *n == 0 {
                 continue;
             }
@@ -325,7 +360,7 @@ impl Stats {
                 keys.push(DomainKey::Fixed(*addr, *slot));
             }
         }
-        for (f, n) in &e.formulas {
+        for (f, n) in e.formulas.iter().filter(|_| self.derived_keys) {
             if *n == 0 {
                 continue;
             }
