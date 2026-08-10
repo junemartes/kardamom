@@ -70,7 +70,8 @@ mod thread;
 pub use handles::simple::{
     FsyncWatermarkPublisherHandle, FsyncWatermarkSubscriberHandle, QuorumPublisherHandle,
     QuorumSubscriberHandle, TxDepositsPublisherHandle, TxDepositsSubscriberHandle,
-    TxErrorsPublisherHandle, TxErrorsSubscriberHandle,
+    TxErrorsPublisherHandle, TxErrorsSubscriberHandle, TxRemoteEpochsPublisherHandle,
+    TxRemoteEpochsSubscriberHandle,
 };
 pub use handles::tx_data::{TxDataPublisherHandle, TxDataSubscriberHandle};
 pub use handles::tx_receipts::{

@@ -28,15 +28,16 @@
 pub mod cluster;
 
 use alloy_primitives::Address;
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{EpochRecord, TxError, TxRef};
 
 use crate::error::SequencerError;
 
 /// TxOrdering publisher contract — the canonical orderer. Publishes tiny
 /// [`TxRef`]s for L2 txs (~41 B) into Aeron's concurrent multi-publisher
-/// stream, plus whole [`EpochRecord`]s for L1 epochs. Both lanes share the
-/// tx_ordering channel so deposits and regular txs interleave in canonical
-/// order.
+/// stream, plus whole [`EpochRecord`]s for L1 epochs and
+/// [`RemoteEpochRecord`]s for peer chains. Every lane shares the tx_ordering
+/// channel so all three interleave in one canonical order.
 ///
 /// A blocked transport must surface as `Err(SequencerError::Backpressure)`
 /// so the state machine can rewind.
@@ -76,6 +77,15 @@ pub trait TxOrderingRefPublisher: Send {
     /// aren't nonce-gated and have no pending state to rewind, so on
     /// `Backpressure` the caller retries the same epoch next tick.
     fn try_publish_epoch(&mut self, e: &EpochRecord) -> Result<(), SequencerError>;
+
+    /// Publish a [`RemoteEpochRecord`] observed on `tx_remote_epochs` as a
+    /// REMOTE-ORIGIN-ADVANCING record: [`Self::try_publish_epoch`] for a peer
+    /// Kardamom chain rather than L1, so the sealer tracks the adopted
+    /// position per origin chain instead of stamping it into boundaries.
+    /// Same backpressure semantics — nothing is nonce-gated and there is no
+    /// pending state to rewind, so on `Backpressure` the caller retries the
+    /// same record next tick.
+    fn try_publish_remote_epoch(&mut self, r: &RemoteEpochRecord) -> Result<(), SequencerError>;
 }
 
 /// TxErrors channel publisher. Best-effort: errors are logged by the
@@ -94,17 +104,19 @@ pub trait TxErrorPublisher: Send {
 pub mod fakes {
     use std::sync::{Arc, Mutex};
 
+    use kardamom_types::xchain::RemoteEpochRecord;
     use kardamom_types::{EpochRecord, TxRef};
 
     use super::*;
 
-    /// In-memory tx_ordering publisher. Records every published `TxRef` and
-    /// `EpochRecord` in arrival order so tests can assert the canonical
-    /// sequence.
+    /// In-memory tx_ordering publisher. Records every published `TxRef`,
+    /// `EpochRecord` and `RemoteEpochRecord` in arrival order so tests can
+    /// assert the canonical sequence.
     #[derive(Default, Clone)]
     pub struct InMemoryTxOrderingRefPublisher {
         pub refs: Arc<Mutex<Vec<TxRef>>>,
         pub epochs: Arc<Mutex<Vec<EpochRecord>>>,
+        pub remote_epochs: Arc<Mutex<Vec<RemoteEpochRecord>>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
     }
 
@@ -127,6 +139,17 @@ pub mod fakes {
                 return Err(SequencerError::Backpressure);
             }
             self.epochs.lock().unwrap().push(e.clone());
+            Ok(())
+        }
+
+        fn try_publish_remote_epoch(
+            &mut self,
+            r: &RemoteEpochRecord,
+        ) -> Result<(), SequencerError> {
+            if *self.fail_with_backpressure.lock().unwrap() {
+                return Err(SequencerError::Backpressure);
+            }
+            self.remote_epochs.lock().unwrap().push(r.clone());
             Ok(())
         }
     }

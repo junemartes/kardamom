@@ -12,7 +12,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_log::aeron_live::{
     AeronRuntime, TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
-    TxReceiptsSubscriberHandle,
+    TxReceiptsSubscriberHandle, TxRemoteEpochsSubscriberHandle,
 };
 use kardamom_log::config::{ChannelsConfig, LogConfig};
 use kardamom_obs::bin::wait_for_shutdown;
@@ -21,7 +21,9 @@ use kardamom_sequencer::epoch::{EpochSubscriber, process_epoch};
 use kardamom_sequencer::error::SequencerError;
 use kardamom_sequencer::inbound::TxDataSubscriber;
 use kardamom_sequencer::outbound::{TxErrorPublisher, TxOrderingRefPublisher};
+use kardamom_sequencer::remote_epoch::{RemoteEpochSubscriber, process_remote_epoch};
 use kardamom_sequencer::sequencer::{Sequencer, Shutdown};
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord, TxDataLoc, TxEnvelope, TxError};
 
 #[derive(Debug, Parser)]
@@ -188,12 +190,15 @@ async fn main() -> anyhow::Result<()> {
         .context("open TxDataSubscriberHandle")?;
     let tx_deposits_sub = TxDepositsSubscriberHandle::open(&rt, &channels)
         .context("open TxDepositsSubscriberHandle")?;
+    let tx_remote_epochs_sub = TxRemoteEpochsSubscriberHandle::open(&rt, &channels)
+        .context("open TxRemoteEpochsSubscriberHandle")?;
     let tx_errors_pub =
         TxErrorsPublisherHandle::open(&rt, &channels).context("open TxErrorsPublisherHandle")?;
 
     let shutdown = Shutdown::new();
     let shutdown_for_main = shutdown.clone();
     let shutdown_for_deposits = shutdown.clone();
+    let shutdown_for_remote_epochs = shutdown.clone();
 
     tracing::info!(
         "nonce floors: sequencer holds no state-DB reader; cold senders seed at \
@@ -416,19 +421,22 @@ async fn main() -> anyhow::Result<()> {
         })
         .context("spawn receipts-floors thread")?;
 
-    // Clone shares the single session thread; offers serialise through it. Both
-    // loops use `cluster_pub` (impl `TxOrderingRefPublisher`) — the canonical
-    // `TxRef` loop and the `DepositRef` pump.
-    let (join_main, join_deposits) = spawn_publish_loops(
+    // Clone shares the single session thread; offers serialise through it. All
+    // three loops use `cluster_pub` (impl `TxOrderingRefPublisher`) — the
+    // canonical `TxRef` loop and the two origin pumps.
+    let (join_main, join_deposits, join_remote_epochs) = spawn_publish_loops(
         cfg_clone,
         LiveTxDataSub::new(tx_data_sub),
+        cluster_pub.clone(),
         cluster_pub.clone(),
         cluster_pub,
         LiveTxErrorPub::new(tx_errors_pub),
         LiveEpochSub::new(tx_deposits_sub),
+        LiveRemoteEpochSub::new(tx_remote_epochs_sub),
         Some(resync_controller),
         shutdown_for_main,
         shutdown_for_deposits,
+        shutdown_for_remote_epochs,
     );
 
     wait_for_shutdown().await;
@@ -444,7 +452,14 @@ async fn main() -> anyhow::Result<()> {
         Ok(Err(e)) => tracing::error!(error = %e, "sequencer epoch pump returned an error"),
         Err(e) => tracing::error!(error = %e, "sequencer epoch task panicked"),
     }
-    // Drop the cluster session only after both loops have stopped. This also
+    match join_remote_epochs.await {
+        Ok(Ok(())) => tracing::info!("sequencer remote-epoch pump returned cleanly"),
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "sequencer remote-epoch pump returned an error")
+        }
+        Err(e) => tracing::error!(error = %e, "sequencer remote-epoch task panicked"),
+    }
+    // Drop the cluster session only after every loop has stopped. This also
     // closes the egress channel, unblocking the watermark thread; the
     // receipts thread exits on the shutdown flag (or the closed floor
     // channel once the main loop is gone).
@@ -461,23 +476,31 @@ async fn main() -> anyhow::Result<()> {
 
 type LoopHandle = tokio::task::JoinHandle<Result<(), SequencerError>>;
 
-/// Spawn the main sequencer loop + the deposit pump over a pair of
+/// Spawn the main sequencer loop + the two origin pumps over three
 /// `TxOrderingRefPublisher`s (`main_pub` for the canonical `TxRef` loop,
-/// `deposit_pub` for the epoch pump). Generic over the publisher type so
-/// the Aeron and cluster branches share one implementation; both supply
-/// concrete publishers that impl the trait.
+/// `deposit_pub` for the L1 epoch pump, `remote_epoch_pub` for the interop
+/// one). Generic over the publisher type so the Aeron and cluster branches
+/// share one implementation; both supply concrete publishers that impl the
+/// trait.
+///
+/// The two origin pumps are separate loops, not one merged poll, because the
+/// origins are independent: a peer whose feed has stalled must not delay L1
+/// deposits, and an L1 RPC outage must not stall cross-chain delivery.
 #[allow(clippy::too_many_arguments)]
 fn spawn_publish_loops<P>(
     cfg: SequencerConfig,
     mut tx_data: LiveTxDataSub,
     main_pub: P,
     deposit_pub: P,
+    remote_epoch_pub: P,
     mut tx_errors: LiveTxErrorPub,
     mut epoch_sub: LiveEpochSub,
+    mut remote_epoch_sub: LiveRemoteEpochSub,
     resync: Option<kardamom_sequencer::resync::ResyncController>,
     shutdown_for_main: Shutdown,
     shutdown_for_deposits: Shutdown,
-) -> (LoopHandle, LoopHandle)
+    shutdown_for_remote_epochs: Shutdown,
+) -> (LoopHandle, LoopHandle, LoopHandle)
 where
     P: TxOrderingRefPublisher + Send + 'static,
 {
@@ -523,7 +546,31 @@ where
         }
     });
 
-    (join_main, join_deposits)
+    // Independent pump for tx_remote_epochs → remote-origin record on
+    // tx_ordering, on the same terms as the deposit pump above.
+    let mut remote_epoch_pub = remote_epoch_pub;
+    let join_remote_epochs = tokio::task::spawn_blocking(move || -> Result<(), SequencerError> {
+        let mut backoff_us = 1u64;
+        loop {
+            if shutdown_for_remote_epochs.is_signaled() {
+                return Ok(());
+            }
+            match process_remote_epoch(&mut remote_epoch_sub, &mut remote_epoch_pub) {
+                Ok(true) => backoff_us = 1,
+                Ok(false) => {
+                    std::thread::sleep(Duration::from_micros(backoff_us));
+                    backoff_us = backoff_us.saturating_mul(2).min(100);
+                }
+                Err(SequencerError::Backpressure) => {
+                    std::thread::sleep(Duration::from_micros(10));
+                }
+                Err(SequencerError::IngressDisconnected) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+        }
+    });
+
+    (join_main, join_deposits, join_remote_epochs)
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +607,22 @@ impl LiveEpochSub {
 
 impl EpochSubscriber for LiveEpochSub {
     fn poll(&mut self) -> Result<Option<(BPosition, EpochRecord)>, SequencerError> {
+        Ok(self.handle.try_recv())
+    }
+}
+
+struct LiveRemoteEpochSub {
+    handle: TxRemoteEpochsSubscriberHandle,
+}
+
+impl LiveRemoteEpochSub {
+    fn new(handle: TxRemoteEpochsSubscriberHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl RemoteEpochSubscriber for LiveRemoteEpochSub {
+    fn poll(&mut self) -> Result<Option<(BPosition, RemoteEpochRecord)>, SequencerError> {
         Ok(self.handle.try_recv())
     }
 }

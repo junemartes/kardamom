@@ -101,6 +101,111 @@ fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
     assert_eq!(&relayed[0..32], r.tx_hash.as_slice());
 }
 
+fn remote_epoch() -> kardamom_types::xchain::RemoteEpochRecord {
+    use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
+    RemoteEpochRecord {
+        origin_chain_id: 412_346,
+        anchor_number: 0x0011_2233_4455_6677,
+        anchor_hash: B256::repeat_byte(0x5A),
+        first_seq: 9,
+        messages: vec![
+            XChainMessage {
+                source_hash: B256::repeat_byte(0xE1),
+                seq: 9,
+                origin_sender: Address::repeat_byte(0xA1),
+                target: Address::repeat_byte(0xB2),
+                value: 0,
+                gas_limit: 200_000,
+                input: (&[0xCAu8, 0xFE][..]).into(),
+                callback: None,
+            },
+            XChainMessage {
+                source_hash: B256::repeat_byte(0xE2),
+                seq: 10,
+                origin_sender: Address::repeat_byte(0xA1),
+                target: Address::repeat_byte(0xB3),
+                value: 5,
+                gas_limit: 100_000,
+                input: Default::default(),
+                callback: None,
+            },
+        ],
+    }
+}
+
+/// The Java decoder reads this frame by fixed offsets and never parses the
+/// payload, so the offsets ARE the contract — a field that moves is a silent
+/// mis-parse on the other side of a language boundary no compiler checks.
+#[test]
+fn remote_origin_record_layout_is_pinned_byte_for_byte() {
+    let rec = remote_epoch();
+    let b = encode_ingress_remote_epoch(&rec).unwrap();
+
+    assert_eq!(b[0], KIND_REMOTE_ORIGIN_RECORD);
+    assert_eq!(b[0], 5, "kind 5 is the Java KIND_REMOTE_ORIGIN_RECORD");
+    assert_eq!(&b[1..33], rec.canonical_id().as_slice());
+    assert_eq!(
+        u64::from_le_bytes(b[33..41].try_into().unwrap()),
+        412_346,
+        "origin_chain_id is little-endian at offset 33"
+    );
+    assert_eq!(
+        u64::from_le_bytes(b[41..49].try_into().unwrap()),
+        0x0011_2233_4455_6677,
+        "anchor_number is little-endian at offset 41 — the pair's position, \
+         not a global one"
+    );
+    assert_eq!(
+        u32::from_le_bytes(b[49..53].try_into().unwrap()),
+        3,
+        "slot_count = marker + 2 messages"
+    );
+    assert_eq!(b[53], RT_REMOTE_EPOCH);
+    assert_eq!(b[53], 3);
+    // Everything from offset 54 on is the opaque rkyv payload.
+    assert!(b.len() > 54, "the record body must be present");
+
+    // The kind byte alone separates the two origin-advancing frames; the
+    // sealer branches on it without opening either payload.
+    let l1 = encode_ingress_epoch(&EpochRecord {
+        l1_number: 1,
+        l1_hash: B256::ZERO,
+        deposits: Vec::new(),
+    })
+    .unwrap();
+    assert_ne!(b[0], l1[0]);
+}
+
+/// Ingress → (service relays from the canonical id) → egress → decode
+/// reproduces the record. `slot_count` on the frame must equal what a
+/// consumer that DOES parse the payload re-derives.
+#[test]
+fn remote_epoch_ingress_relay_egress_roundtrip() {
+    let rec = remote_epoch();
+    let ingress = encode_ingress_remote_epoch(&rec).unwrap();
+
+    // Mirror the Java service: dedup on the canonical id, relay
+    // `[canonical_id][record_type][fields…]` — the kind, the origin pair and
+    // the slot count are consumed by the sealer, not forwarded.
+    let cid: [u8; 32] = ingress[1..33].try_into().unwrap();
+    assert_eq!(cid, rec.canonical_id().0);
+    let mut relayed = Vec::with_capacity(32 + ingress.len() - 53);
+    relayed.extend_from_slice(&cid);
+    relayed.extend_from_slice(&ingress[53..]);
+
+    match decode_egress(&encode_egress_record(11, &relayed)).unwrap() {
+        EgressItem::Record { index, msg } => {
+            assert_eq!(index, 11);
+            assert_eq!(msg, TxOrderingMessage::RemoteEpoch(rec.clone()));
+        }
+        other => panic!("expected Record, got {other:?}"),
+    }
+    assert_eq!(
+        u32::from_le_bytes(ingress[49..53].try_into().unwrap()) as u64,
+        remote_epoch_slots(&rec),
+    );
+}
+
 #[test]
 fn contiguity_reject_roundtrip() {
     let sender = Address::repeat_byte(0x99);

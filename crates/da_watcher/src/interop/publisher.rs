@@ -7,16 +7,20 @@
 //! no-skip rule is enforced on the dense per-pair `seq` instead of on origin
 //! blocks (`kardamom_types::xchain`, spec §6).
 //!
-//! ## No live implementation yet, on purpose
+//! ## A failed publish must never be reported as complete
 //!
-//! There is no `kardamom_log` handle to bind this to: `ChannelsConfig` has
-//! `tx_deposits` but no remote-epoch channel, so a live publisher would mean
-//! inventing a channel, a stream id, and a subscriber with nothing on the
-//! other end. That channel — and the sequencer relay that reads it onto
-//! `tx_ordering` as a remote-origin record — is the next slice's work. Until
-//! then the trait is the seam and [`fakes::InMemoryRemoteEpochPublisher`] is
-//! the only implementation, which is enough to close the loop end to end
-//! against a simulated origin.
+//! Production binds this to `kardamom_log`'s `tx_remote_epochs` publication
+//! (`LiveRemoteEpochsPublisher` in the `kardamom-da-watcher` binary); tests
+//! use [`fakes::InMemoryRemoteEpochPublisher`].
+//!
+//! [`PublishError::Backpressure`] and [`PublishError::Transport`] are both
+//! NON-FATAL: the watcher holds its cursor and re-derives the same batch. That
+//! is safe only because re-derivation is byte-identical, so cluster dedup on
+//! `canonical_id` collapses a record that did land. The asymmetry matters —
+//! reporting a landed record as failed costs one deduped duplicate, while
+//! reporting a FAILED publish as complete advances the cursor past a record
+//! that never existed and leaves a permanent hole in the pair's dense seq,
+//! which no retry can fill and which the destination halts on.
 
 use kardamom_types::BPosition;
 use kardamom_types::xchain::RemoteEpochRecord;

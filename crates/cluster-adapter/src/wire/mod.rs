@@ -47,8 +47,8 @@ pub use egress::{
 };
 pub use ingress::{
     decode_ingress_batch, decode_replay_request, encode_ingress_batch, encode_ingress_depositref,
-    encode_ingress_epoch, encode_ingress_txref, encode_replay_request, encode_subscribe,
-    ingress_sender_nonce, split_ingress,
+    encode_ingress_epoch, encode_ingress_remote_epoch, encode_ingress_txref, encode_replay_request,
+    encode_subscribe, ingress_sender_nonce, split_ingress,
 };
 
 /// Ingress app-message kind (the leading tag byte).
@@ -83,6 +83,29 @@ pub const KIND_BATCH: u8 = 3;
 /// [`KIND_BATCH`] holds 3. Matches Java `KIND_ORIGIN_RECORD`. See
 /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
 pub const KIND_ORIGIN_RECORD: u8 = 4;
+/// Ingress kind: a REMOTE-ORIGIN-ADVANCING record
+/// `[kind:u8 = 5][canonical_id:32][origin_chain_id:u64][anchor_number:u64][slot_count:u32][record_type:u8][fields…]`.
+///
+/// [`KIND_ORIGIN_RECORD`] for a peer Kardamom chain instead of L1. Same
+/// posture — deduped on `canonical_id`, block closed before the record is
+/// relayed, no guard header (cross-chain messages are not nonce-gated) — with
+/// two differences the sealer must see WITHOUT parsing the payload:
+///
+/// * the position is a PAIR of u64s, not one. A remote origin is only
+///   meaningful relative to the chain it came from, so the sealer tracks a
+///   marker per `origin_chain_id`; a single number would silently merge two
+///   peers' progress.
+/// * the adopted position is NOT stamped into block boundaries. `l1_origin` is
+///   part of the L2 block's identity; a peer chain's anchor is not, so a
+///   remote origin advances per-pair bookkeeping only.
+///
+/// A distinct KIND rather than a `record_type` under [`KIND_ORIGIN_RECORD`]
+/// for the same reason kind 4 exists at all: the sealer branches on the frame
+/// tag and never opens the payload, so it needs no notion of what a remote
+/// epoch is. Kind 5 because 0–4 are taken. Matches Java
+/// `KIND_REMOTE_ORIGIN_RECORD`. See
+/// `docs/specs/interop-outbox-messaging-spec.md` §7.
+pub const KIND_REMOTE_ORIGIN_RECORD: u8 = 5;
 /// Ingress kind: a replay request `[kind:u8 = 1][from_index:u64][from_block:u64]`.
 /// The service re-offers retained egress frames with `record.index >= from_index`
 /// or `boundary.block_number >= from_block` to the REQUESTING session only (not
@@ -177,6 +200,8 @@ pub enum WireError {
     BadPayloadLen { declared: usize, remaining: usize },
     #[error("bad epoch record: {0}")]
     BadEpoch(String),
+    #[error("bad remote epoch record: {0}")]
+    BadRemoteEpoch(String),
 }
 
 // ── shared helpers (both directions) ────────────────────────────────────────

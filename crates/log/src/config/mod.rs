@@ -200,6 +200,16 @@ pub struct ChannelsConfig {
     pub tx_deposits_channel: String,
     pub tx_deposits_stream_id: i32,
 
+    /// TxRemoteEpochs: the interop watcher publishes one `RemoteEpochRecord`
+    /// per peer-chain origin block that carried cross-chain messages; the M
+    /// sequencers subscribe and republish each verbatim onto `tx_ordering` as
+    /// a remote-origin-advancing record. `tx_deposits` for a peer Kardamom
+    /// chain instead of L1 — separate stream because the two origins advance
+    /// independently and a stalled peer must not hold up L1 deposits. RAM
+    /// only (`docs/specs/interop-outbox-messaging-spec.md`).
+    pub tx_remote_epochs_channel: String,
+    pub tx_remote_epochs_stream_id: i32,
+
     /// TxBal: the per-block BAL (Block Access List — the executor's
     /// `BlockDelta`: account/storage/code mutations + receipts for a sealed
     /// block). EVERY executor replica publishes one `BlockDelta` per block on
@@ -397,6 +407,11 @@ impl Default for ChannelsConfig {
             tx_errors_stream_id: 1015,
             tx_deposits_channel: "aeron:ipc?alias=tx-deposits".into(),
             tx_deposits_stream_id: 1016,
+            // 1017 adjoins tx_deposits (1016), the stream this mirrors, and is
+            // clear of every other block: receipts (1002,1003), BAL (1004),
+            // fsync (1010), tx_errors (1015), quorum (1020).
+            tx_remote_epochs_channel: "aeron:ipc?alias=tx-remote-epochs".into(),
+            tx_remote_epochs_stream_id: 1017,
             // 1004 sits in the free range between the receipt block (1002,1003)
             // and the fsync-watermark block (1010); BAL is another executor
             // output so it lives near receipts.

@@ -133,6 +133,13 @@ tx_errors_stream_id = 1015
 tx_deposits_channel = "aeron:udp?endpoint=239.192.56.19:40040|interface=192.168.56.0/24|ttl=1"
 tx_deposits_stream_id = 1016
 
+# --- TxRemoteEpochs: interop watcher publishes RemoteEpochRecords (one per
+# peer-chain origin block that carried cross-chain messages); sequencers
+# subscribe and relay them onto tx_ordering. Its own group so a stalled peer
+# pairing cannot delay L1 deposits.
+tx_remote_epochs_channel = "aeron:udp?endpoint=239.192.56.27:40080|interface=192.168.56.0/24|ttl=1"
+tx_remote_epochs_stream_id = 1017
+
 # --- TxBal: per-block BAL (the executor's BlockDelta). The executor publishes
 # one BlockDelta per sealed block; validators subscribe and cross-check their
 # independent re-execution against it. Multicast (many validator subscribers).

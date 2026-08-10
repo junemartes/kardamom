@@ -1,11 +1,20 @@
-//! kardamom-da-watcher: L1 deposit monitor CLI.
+//! kardamom-da-watcher: externally-sourced-transaction monitor CLI.
 //!
-//! Parses an `--l1-rpc <URL>` + `--lockbox <ADDRESS>` (plus an optional
-//! `--poll-interval <DURATION>`, default 12s), constructs an
-//! [`da_watcher::RpcL1Source`] over an alloy HTTP provider, spawns the
-//! watcher loop, and waits for ctrl-c. Each finalized L1 block is republished
-//! onto the `tx_deposits` Aeron channel via the live
-//! [`LiveTxDepositsPublisher`] adapter (wraps `kardamom_log::TxDepositsPublisherHandle`).
+//! Runs up to two independent origin watchers in one process:
+//!
+//! * **L1 deposits** (`--l1-rpc` + `--lockbox`, optional `--poll-interval`):
+//!   an [`da_watcher::RpcL1Source`] over an alloy HTTP provider; each
+//!   finalized L1 block becomes one `EpochRecord` on the `tx_deposits` Aeron
+//!   channel via [`LiveTxDepositsPublisher`].
+//! * **Interop** (`--interop-feed-url` + `--interop-peer-chain-id` +
+//!   `--self-chain-id`): a WebSocket outbox feed from ONE peer Kardamom
+//!   chain; each origin block that carried messages becomes one
+//!   `RemoteEpochRecord` on `tx_remote_epochs` via
+//!   [`LiveRemoteEpochsPublisher`].
+//!
+//! Either may run alone or both together — they share nothing but the Aeron
+//! runtime, because a stalled peer pairing must not hold up L1 deposits (and
+//! vice versa). At least one must be configured.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -17,31 +26,62 @@ use alloy_provider::ProviderBuilder;
 use anyhow::Context;
 use clap::Parser;
 
-use kardamom_da_watcher::{
-    DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, spawn as spawn_watcher,
+use kardamom_da_watcher::interop::{
+    InteropWatcherConfig, RemoteEpochPublisher, WsRemoteChainSource, spawn as spawn_interop_watcher,
 };
-use kardamom_log::aeron_live::{AeronRuntime, TxDepositsPublisherHandle};
+use kardamom_da_watcher::{
+    DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, WatcherHandle,
+    spawn as spawn_watcher,
+};
+use kardamom_log::aeron_live::{
+    AeronRuntime, TxDepositsPublisherHandle, TxRemoteEpochsPublisherHandle,
+};
 use kardamom_log::config::LogConfig;
 use kardamom_log::recorder::{Recorder, RecorderKind, connect_archive};
 use kardamom_obs::bin::wait_for_shutdown;
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{BPosition, EpochRecord};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "kardamom-da-watcher",
     version,
-    about = "L1 epoch monitor — tails finalized L1 blocks and publishes one EpochRecord each onto tx_deposits"
+    about = "origin monitor — tails finalized L1 blocks onto tx_deposits and/or a peer chain's outbox feed onto tx_remote_epochs"
 )]
 struct Args {
-    /// L1 JSON-RPC HTTP endpoint (e.g. `http://127.0.0.1:8545`).
+    /// L1 JSON-RPC HTTP endpoint (e.g. `http://127.0.0.1:8545`). Enables the
+    /// L1 deposit path; requires `--lockbox`.
     #[arg(long)]
-    l1_rpc: String,
+    l1_rpc: Option<String>,
     /// L1 address of the `ETHLockbox` proxy this L2 chain id maps to.
     #[arg(long)]
-    lockbox: String,
+    lockbox: Option<String>,
     /// Polling cadence in seconds (default 12).
     #[arg(long, default_value_t = 12)]
     poll_interval_secs: u64,
+    /// Peer Kardamom chain to source cross-chain messages FROM. Enables the
+    /// interop path; requires `--interop-feed-url` and `--self-chain-id`.
+    #[arg(long)]
+    interop_peer_chain_id: Option<u64>,
+    /// The peer validator's outbox-feed WebSocket endpoint
+    /// (e.g. `ws://127.0.0.1:9944`).
+    #[arg(long)]
+    interop_feed_url: Option<String>,
+    /// OUR chain id. The feed filters on it and `derive_remote_epoch` REJECTS
+    /// (never drops) a message addressed elsewhere, so a wrong value here
+    /// fail-stops the pair rather than executing another chain's traffic.
+    #[arg(long)]
+    self_chain_id: Option<u64>,
+    /// Cursor seed: the first per-pair seq not yet canonicalised. 0 is correct
+    /// only for a pair that has never run — a restart must be given the
+    /// destination chain's recorded position, or the first derivation fault
+    /// will be this flag.
+    #[arg(long, default_value_t = 0)]
+    interop_start_seq: u64,
+    /// Pause before retrying after a feed transport/decode failure. Not a poll
+    /// interval: the feed is stream-driven.
+    #[arg(long, default_value_t = 2)]
+    interop_retry_interval_secs: u64,
     /// Optional `LogConfig` TOML supplying the Aeron `[channels]` config.
     /// Unset ⇒ built-in single-host IPC defaults (preserves local/e2e
     /// behaviour); multi-host deployments point this at the rendered UDP
@@ -66,16 +106,87 @@ struct Args {
     host_id: String,
 }
 
+/// The L1 deposit path, resolved. Present only when both `--l1-rpc` and
+/// `--lockbox` were given.
+struct L1Path {
+    rpc: String,
+    cfg: DaWatcherConfig,
+}
+
+/// The interop path, resolved. Present only when the full peer triple
+/// (`--interop-peer-chain-id`, `--interop-feed-url`, `--self-chain-id`) was
+/// given.
+struct InteropPath {
+    peer_chain_id: u64,
+    feed_url: String,
+    cfg: InteropWatcherConfig,
+}
+
+/// Split the flags into the two independent origin paths.
+///
+/// A HALF-specified path is a hard error, not a silent skip: a process that
+/// quietly ran only the other origin would look healthy while one origin never
+/// advanced, and the resulting seq hole is exactly what a destination verifier
+/// halts on much later.
+fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropPath>)> {
+    let l1 = match (&args.l1_rpc, &args.lockbox) {
+        (Some(rpc), Some(lockbox)) => {
+            let lockbox = Address::from_str(lockbox)
+                .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
+            Some(L1Path {
+                rpc: rpc.clone(),
+                cfg: DaWatcherConfig {
+                    lockbox,
+                    poll_interval: Duration::from_secs(args.poll_interval_secs),
+                },
+            })
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("--l1-rpc and --lockbox must be given together"),
+    };
+
+    let interop = match (
+        args.interop_peer_chain_id,
+        &args.interop_feed_url,
+        args.self_chain_id,
+    ) {
+        (Some(peer_chain_id), Some(feed_url), Some(self_chain_id)) => {
+            if peer_chain_id == self_chain_id {
+                anyhow::bail!(
+                    "--interop-peer-chain-id equals --self-chain-id ({self_chain_id}): a chain \
+                     cannot be its own remote origin"
+                );
+            }
+            Some(InteropPath {
+                peer_chain_id,
+                feed_url: feed_url.clone(),
+                cfg: InteropWatcherConfig {
+                    self_chain_id,
+                    start_seq: args.interop_start_seq,
+                    retry_interval: Duration::from_secs(args.interop_retry_interval_secs),
+                },
+            })
+        }
+        (None, None, _) => None,
+        _ => anyhow::bail!(
+            "--interop-peer-chain-id, --interop-feed-url and --self-chain-id must be given together"
+        ),
+    };
+
+    if l1.is_none() && interop.is_none() {
+        anyhow::bail!(
+            "nothing to watch: give --l1-rpc + --lockbox, or the interop triple \
+             (--interop-peer-chain-id + --interop-feed-url + --self-chain-id), or both"
+        );
+    }
+    Ok((l1, interop))
+}
+
 fn main() -> anyhow::Result<()> {
     kardamom_obs::bin::init_tracing();
 
     let args = Args::parse();
-    let lockbox = Address::from_str(&args.lockbox)
-        .map_err(|e| anyhow::anyhow!("--lockbox is not a valid address: {e}"))?;
-    let cfg = DaWatcherConfig {
-        lockbox,
-        poll_interval: Duration::from_secs(args.poll_interval_secs),
-    };
+    let (l1, interop) = resolve_paths(&args)?;
 
     kardamom_obs::init(
         "da-watcher",
@@ -95,8 +206,23 @@ fn main() -> anyhow::Result<()> {
     let channels = resolved.channels;
     let aeron_cfg = resolved.aeron;
     let aeron_rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-    let tx_deposits_pub = TxDepositsPublisherHandle::open(&aeron_rt, &channels)
+    let tx_deposits_pub = l1
+        .is_some()
+        .then(|| TxDepositsPublisherHandle::open(&aeron_rt, &channels))
+        .transpose()
         .context("open TxDepositsPublisherHandle")?;
+    let tx_remote_epochs_pub = interop
+        .is_some()
+        .then(|| TxRemoteEpochsPublisherHandle::open(&aeron_rt, &channels))
+        .transpose()
+        .context("open TxRemoteEpochsPublisherHandle")?;
+
+    // --archive-durability records tx_deposits specifically; with no L1 path
+    // there is no such publication, and starting a recording on a stream this
+    // process never writes would report durability it is not providing.
+    if args.archive_durability && tx_deposits_pub.is_none() {
+        anyhow::bail!("--archive-durability records tx_deposits and requires the L1 path");
+    }
 
     // Archive recorder for tx_deposits, co-located with the publisher here, so
     // the executor can replay deposit envelopes on crash recovery.
@@ -149,31 +275,65 @@ fn main() -> anyhow::Result<()> {
     };
 
     rt.block_on(async move {
-        let provider = ProviderBuilder::new()
-            .connect(&args.l1_rpc)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", args.l1_rpc))?;
-        let source = RpcL1Source::new(provider);
-        let publisher = LiveTxDepositsPublisher::new(tx_deposits_pub);
+        let mut watchers: Vec<(&'static str, WatcherHandle)> = Vec::new();
 
-        tracing::info!(
-            l1_rpc = %args.l1_rpc,
-            ?lockbox,
-            poll_interval = ?cfg.poll_interval,
-            "kardamom-da-watcher starting; publishing epochs onto tx_deposits"
-        );
+        if let (Some(l1), Some(tx_deposits_pub)) = (l1, tx_deposits_pub) {
+            let provider = ProviderBuilder::new()
+                .connect(&l1.rpc)
+                .await
+                .map_err(|e| anyhow::anyhow!("failed to connect to L1 RPC {}: {e}", l1.rpc))?;
+            tracing::info!(
+                l1_rpc = %l1.rpc,
+                lockbox = ?l1.cfg.lockbox,
+                poll_interval = ?l1.cfg.poll_interval,
+                "kardamom-da-watcher: publishing L1 epochs onto tx_deposits"
+            );
+            watchers.push((
+                "l1",
+                spawn_watcher(
+                    LiveTxDepositsPublisher::new(tx_deposits_pub),
+                    RpcL1Source::new(provider),
+                    l1.cfg,
+                ),
+            ));
+        }
 
-        let handle = spawn_watcher(publisher, source, cfg);
-        // Wait for SIGTERM (orchestrator stop) or Ctrl-C, then ask the
+        if let (Some(interop), Some(tx_remote_epochs_pub)) = (interop, tx_remote_epochs_pub) {
+            tracing::info!(
+                feed_url = %interop.feed_url,
+                origin = interop.peer_chain_id,
+                self_chain_id = interop.cfg.self_chain_id,
+                start_seq = interop.cfg.start_seq,
+                "kardamom-da-watcher: publishing remote epochs onto tx_remote_epochs"
+            );
+            let source = WsRemoteChainSource::new(
+                interop.peer_chain_id,
+                interop.cfg.self_chain_id,
+                interop.feed_url,
+            );
+            watchers.push((
+                "interop",
+                spawn_interop_watcher(
+                    LiveRemoteEpochsPublisher::new(tx_remote_epochs_pub),
+                    source,
+                    interop.cfg,
+                ),
+            ));
+        }
+
+        // Wait for SIGTERM (orchestrator stop) or Ctrl-C, then ask each
         // watcher to exit at the next tick boundary. Drop on the shutdown
         // channel is also enough to signal, but explicit send() gives a
-        // clearer log line.
+        // clearer log line. A watcher that already fail-stopped on its own
+        // (an interop derivation fault) is simply already finished.
         wait_for_shutdown().await;
-        let _ = handle.shutdown.send(());
-        handle
-            .task
-            .await
-            .map_err(|e| anyhow::anyhow!("watcher task panicked: {e}"))?;
+        for (name, handle) in watchers {
+            let _ = handle.shutdown.send(());
+            handle
+                .task
+                .await
+                .map_err(|e| anyhow::anyhow!("{name} watcher task panicked: {e}"))?;
+        }
         Ok::<(), anyhow::Error>(())
     })?;
     recorder_stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -251,6 +411,44 @@ impl LiveTxDepositsPublisher {
 impl EpochPublisher for LiveTxDepositsPublisher {
     fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError> {
         match self.handle.publish(epoch) {
+            Ok(pos) => Ok(pos),
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("back-pressure") {
+                    Err(PublishError::Backpressure)
+                } else {
+                    Err(PublishError::Transport(msg))
+                }
+            }
+        }
+    }
+}
+
+/// Live [`RemoteEpochPublisher`] backed by an Aeron `tx_remote_epochs`
+/// publication — [`LiveTxDepositsPublisher`] for the interop path. One record
+/// per peer-origin block that carried messages; the sequencer relays each
+/// verbatim onto `tx_ordering` as a remote-origin-advancing record.
+struct LiveRemoteEpochsPublisher {
+    handle: TxRemoteEpochsPublisherHandle,
+}
+
+impl LiveRemoteEpochsPublisher {
+    fn new(handle: TxRemoteEpochsPublisherHandle) -> Self {
+        Self { handle }
+    }
+}
+
+impl RemoteEpochPublisher for LiveRemoteEpochsPublisher {
+    /// A failed offer MUST be reported as failed. Both non-`Closed` variants
+    /// are non-fatal — the watcher holds its cursor and re-derives the same
+    /// batch, which is safe only because re-derivation is byte-identical, so
+    /// cluster dedup on `canonical_id` absorbs a record that actually landed.
+    /// The reverse error is unrecoverable: a publisher that reported a failed
+    /// publish as complete would advance the cursor past a record that never
+    /// existed, leaving a permanent hole in the pair's dense seq that the
+    /// destination halts on and no retry can fill.
+    fn publish(&self, record: &RemoteEpochRecord) -> Result<BPosition, PublishError> {
+        match self.handle.publish(record) {
             Ok(pos) => Ok(pos),
             Err(e) => {
                 let msg = e.to_string();

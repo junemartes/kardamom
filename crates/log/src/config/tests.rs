@@ -111,6 +111,28 @@ fn tx_bal_defaults_present() {
 }
 
 #[test]
+fn tx_remote_epochs_defaults_present() {
+    let ch = ChannelsConfig::default();
+    assert_eq!(ch.tx_remote_epochs_stream_id, 1017);
+    assert!(ch.tx_remote_epochs_channel.contains("tx-remote-epochs"));
+    // Aeron IPC routes by stream id (the alias is a debug label only), so a
+    // collision silently delivers another stream's frames to be rkyv-decoded
+    // as a RemoteEpochRecord.
+    for other in [
+        ch.tx_ordering_stream_id,
+        ch.tx_receipts_stream_id,
+        ch.tx_receipts_stream_id + 1,
+        ch.tx_bal_stream_id,
+        ch.tx_errors_stream_id,
+        ch.tx_deposits_stream_id,
+        ch.fsync_watermark_stream_id,
+        ch.quorum_watermark_stream_id,
+    ] {
+        assert_ne!(ch.tx_remote_epochs_stream_id, other);
+    }
+}
+
+#[test]
 fn round_trips_through_toml() {
     // A fully-serialized config must parse back identically — guards the
     // serde attrs against a field that serializes but won't deserialize.

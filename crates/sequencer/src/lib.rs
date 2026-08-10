@@ -33,6 +33,7 @@ mod nonce_decode;
 pub mod outbound;
 pub mod partition;
 pub mod pending;
+pub mod remote_epoch;
 pub mod resync;
 pub mod sender;
 pub mod sequencer;
@@ -43,6 +44,7 @@ mod unconfirmed;
 pub use config::{BackpressurePolicy, SequencerConfig};
 pub use epoch::{EpochSubscriber, process_epoch};
 pub use error::SequencerError;
+pub use remote_epoch::{RemoteEpochSubscriber, process_remote_epoch};
 pub use sequencer::{Sequencer, Shutdown};
 
 // Re-export shared types so external callers can write

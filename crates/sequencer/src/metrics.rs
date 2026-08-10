@@ -33,6 +33,15 @@ pub const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
 pub const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
 pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 
+/// Remote epochs (and the messages inside them) relayed from
+/// `tx_remote_epochs` onto the canonical stream. Labelled by ORIGIN CHAIN
+/// rather than by partition: a peer pairing is its own fault domain, so a
+/// stalled pair has to be attributable to the peer, not to a shard. Racing
+/// sequencers each count their own offer, so these are relay attempts —
+/// cluster dedup collapses the M copies downstream.
+pub const REMOTE_EPOCHS_RELAYED: &str = "kardamom_sequencer_remote_epochs_relayed_total";
+pub const REMOTE_MESSAGES_RELAYED: &str = "kardamom_sequencer_remote_messages_relayed_total";
+
 /// Pre-registered per-partition metric HANDLES for the hot loop.
 ///
 /// Every `counter!(NAME, "partition" => p.to_string())` call boxes a fresh
@@ -144,6 +153,12 @@ pub fn record_unconfirmed_refs(partition: u32, n: usize) {
 
 pub fn record_ref_republished(partition: u32, n: usize) {
     counter!(REF_REPUBLISHED, "partition" => partition.to_string()).increment(n as u64);
+}
+
+pub fn record_remote_epoch_relayed(origin_chain_id: u64, messages: usize) {
+    let origin = origin_chain_id.to_string();
+    counter!(REMOTE_EPOCHS_RELAYED, "origin" => origin.clone()).increment(1);
+    counter!(REMOTE_MESSAGES_RELAYED, "origin" => origin).increment(messages as u64);
 }
 
 #[cfg(test)]
