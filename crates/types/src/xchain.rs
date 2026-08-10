@@ -290,6 +290,70 @@ pub fn msg_leaf(
     keccak256(buf)
 }
 
+/// Canonical signature of `Inbox.deliver` — the call every derived 0x7D tx
+/// makes. The callback parameter is the static tuple `(address,uint64,bytes32)`
+/// (`XChain.Callback`), which Solidity resolves into the signature exactly as
+/// written here.
+pub const INBOX_DELIVER_SIGNATURE: &str =
+    "deliver(uint64,uint64,address,address,uint256,uint64,bytes,(address,uint64,bytes32))";
+
+/// 4-byte function selector of [`INBOX_DELIVER_SIGNATURE`].
+pub fn inbox_deliver_selector() -> [u8; 4] {
+    let h = keccak256(INBOX_DELIVER_SIGNATURE.as_bytes());
+    [h[0], h[1], h[2], h[3]]
+}
+
+/// ABI-encode `Inbox.deliver(originChainId, seq, originSender, target, value,
+/// gasLimit, data, cb)` for one message — the calldata of the derived 0x7D tx.
+///
+/// Hand-rolled: the execution edge is `no_std` and must not grow an ABI
+/// codegen dependency for one fixed call; byte-parity with `alloy-sol-types`
+/// is pinned in tests. Layout: a 10-word head — the six static params, the
+/// offset word for `data` (0x140, the tail begins right after the head), and
+/// the static callback tuple inlined as three words — then `data`'s length
+/// word and its right-padded bytes. `callback: None` encodes as the zeroed
+/// tuple, which is exactly what `XChain.isNone` tests for.
+pub fn deliver_calldata(origin_chain_id: u64, msg: &XChainMessage) -> Vec<u8> {
+    const HEAD_WORDS: usize = 10;
+    let data = msg.input.as_ref();
+    let padded_len = data.len().div_ceil(32) * 32;
+    let mut out = Vec::with_capacity(4 + (HEAD_WORDS + 1) * 32 + padded_len);
+    out.extend_from_slice(&inbox_deliver_selector());
+    push_word_u64(&mut out, origin_chain_id);
+    push_word_u64(&mut out, msg.seq);
+    push_word_address(&mut out, msg.origin_sender);
+    push_word_address(&mut out, msg.target);
+    push_word_u128(&mut out, msg.value);
+    push_word_u64(&mut out, msg.gas_limit);
+    push_word_u64(&mut out, (HEAD_WORDS * 32) as u64);
+    let cb = msg.callback.unwrap_or_default();
+    push_word_address(&mut out, cb.target);
+    push_word_u64(&mut out, cb.gas_limit);
+    out.extend_from_slice(cb.context.as_slice());
+    push_word_u64(&mut out, data.len() as u64);
+    out.extend_from_slice(data);
+    out.resize(out.len() + (padded_len - data.len()), 0);
+    out
+}
+
+fn push_word_u64(out: &mut Vec<u8>, v: u64) {
+    let mut w = [0u8; 32];
+    w[24..].copy_from_slice(&v.to_be_bytes());
+    out.extend_from_slice(&w);
+}
+
+fn push_word_u128(out: &mut Vec<u8>, v: u128) {
+    let mut w = [0u8; 32];
+    w[16..].copy_from_slice(&v.to_be_bytes());
+    out.extend_from_slice(&w);
+}
+
+fn push_word_address(out: &mut Vec<u8>, a: Address) {
+    let mut w = [0u8; 32];
+    w[12..].copy_from_slice(a.as_slice());
+    out.extend_from_slice(&w);
+}
+
 /// One origin chain's contiguous batch of messages, as it travels on the
 /// canonical stream.
 ///
@@ -454,10 +518,7 @@ mod tests {
 
     #[test]
     fn source_hash_is_position_based_and_deterministic() {
-        assert_eq!(
-            remote_source_hash(ORIGIN, 7),
-            remote_source_hash(ORIGIN, 7)
-        );
+        assert_eq!(remote_source_hash(ORIGIN, 7), remote_source_hash(ORIGIN, 7));
         assert_ne!(remote_source_hash(ORIGIN, 7), remote_source_hash(ORIGIN, 8));
         assert_ne!(
             remote_source_hash(ORIGIN, 7),
@@ -511,18 +572,46 @@ mod tests {
     #[test]
     fn gap_and_regression_and_duplicate_are_faults() {
         let e = derive_remote_epoch(SELF, ORIGIN, 5, &[msg(6, SELF)]).unwrap_err();
-        assert!(matches!(e, XChainError::SeqSkipped { expected: 5, found: 6 }), "got {e:?}");
+        assert!(
+            matches!(
+                e,
+                XChainError::SeqSkipped {
+                    expected: 5,
+                    found: 6
+                }
+            ),
+            "got {e:?}"
+        );
 
         let e = derive_remote_epoch(SELF, ORIGIN, 5, &[msg(4, SELF)]).unwrap_err();
-        assert!(matches!(e, XChainError::SeqRegressed { expected: 5, found: 4 }), "got {e:?}");
+        assert!(
+            matches!(
+                e,
+                XChainError::SeqRegressed {
+                    expected: 5,
+                    found: 4
+                }
+            ),
+            "got {e:?}"
+        );
 
-        let e =
-            derive_remote_epoch(SELF, ORIGIN, 5, &[msg(5, SELF), msg(7, SELF)]).unwrap_err();
-        assert!(matches!(e, XChainError::SeqSkipped { expected: 6, found: 7 }), "got {e:?}");
+        let e = derive_remote_epoch(SELF, ORIGIN, 5, &[msg(5, SELF), msg(7, SELF)]).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                XChainError::SeqSkipped {
+                    expected: 6,
+                    found: 7
+                }
+            ),
+            "got {e:?}"
+        );
 
-        let e =
-            derive_remote_epoch(SELF, ORIGIN, 5, &[msg(5, SELF), msg(5, SELF)]).unwrap_err();
-        assert!(matches!(e, XChainError::DuplicateSeq { seq: 5 }), "got {e:?}");
+        let e = derive_remote_epoch(SELF, ORIGIN, 5, &[msg(5, SELF), msg(5, SELF)]).unwrap_err();
+        assert!(
+            matches!(e, XChainError::DuplicateSeq { seq: 5 }),
+            "got {e:?}"
+        );
     }
 
     #[test]
@@ -609,5 +698,108 @@ mod tests {
             leaf,
             b256!("0df14340efd8c8b32f4c333c3dca8470b0bae319a3dfe32adb213df2b8834d3c")
         );
+    }
+}
+
+#[cfg(test)]
+mod deliver_abi_tests {
+    use super::*;
+    use alloy_primitives::U256;
+    use alloy_sol_types::{SolCall, sol};
+
+    sol! {
+        struct SolCb {
+            address target;
+            uint64 gasLimit;
+            bytes32 context;
+        }
+
+        function deliver(
+            uint64 originChainId,
+            uint64 seq,
+            address originSender,
+            address target,
+            uint256 value,
+            uint64 gasLimit,
+            bytes data,
+            SolCb cb
+        );
+    }
+
+    const ORIGIN: u64 = 412_346;
+
+    fn wire_msg(data: &[u8], callback: Option<Callback>) -> XChainMessage {
+        XChainMessage {
+            source_hash: remote_source_hash(ORIGIN, 3),
+            seq: 3,
+            origin_sender: Address::repeat_byte(0xA7),
+            target: Address::repeat_byte(0xB9),
+            value: 0,
+            gas_limit: 250_000,
+            input: Bytes::copy_from_slice(data),
+            callback,
+        }
+    }
+
+    /// What `SolCall::abi_encode` produces for the same message — the
+    /// compiler-grade oracle the hand-encoding must match byte for byte.
+    fn reference(origin_chain_id: u64, m: &XChainMessage) -> alloc::vec::Vec<u8> {
+        let cb = m.callback.unwrap_or_default();
+        deliverCall {
+            originChainId: origin_chain_id,
+            seq: m.seq,
+            originSender: m.origin_sender,
+            target: m.target,
+            value: U256::from(m.value),
+            gasLimit: m.gas_limit,
+            data: AlloyBytes::copy_from_slice(m.input.as_ref()),
+            cb: SolCb {
+                target: cb.target,
+                gasLimit: cb.gas_limit,
+                context: cb.context,
+            },
+        }
+        .abi_encode()
+    }
+
+    #[test]
+    fn selector_matches_sol_resolution() {
+        // `sol!` resolves the user-defined struct to its tuple type when
+        // computing the selector — the same resolution Solidity applies to
+        // `XChain.Callback calldata cb` — so this pins the signature string
+        // against the actual Inbox dispatch.
+        assert_eq!(inbox_deliver_selector(), deliverCall::SELECTOR);
+    }
+
+    #[test]
+    fn hand_encoding_is_byte_identical_to_sol_types() {
+        let cb = Callback {
+            target: Address::repeat_byte(0x0C),
+            gas_limit: 90_000,
+            context: B256::repeat_byte(0x1D),
+        };
+        // Empty, sub-word, and word+1 payloads exercise the zero-length
+        // tail, right-padding, and a two-word tail respectively.
+        for data in [&b""[..], &[0x01][..], &[0xEE; 33][..]] {
+            for callback in [None, Some(cb)] {
+                let m = wire_msg(data, callback);
+                assert_eq!(
+                    deliver_calldata(ORIGIN, &m),
+                    reference(ORIGIN, &m),
+                    "data len {}, callback {}",
+                    data.len(),
+                    callback.is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn value_rides_the_uint256_word() {
+        // v1 execution rejects nonzero value, but the encoding must already
+        // carry it faithfully — the wire does not change when value ships.
+        let mut m = wire_msg(&[0x02], None);
+        m.value = u128::MAX;
+        assert_eq!(deliver_calldata(ORIGIN, &m), reference(ORIGIN, &m));
     }
 }

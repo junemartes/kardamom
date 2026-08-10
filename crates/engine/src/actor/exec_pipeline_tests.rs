@@ -89,6 +89,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
         None,
         None,
         None,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -164,6 +165,7 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
         None,
         None,
         None,
+        None,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -232,6 +234,7 @@ fn exec_settles_inflight_commits_while_idle() {
         },
         RecordingQueue(writer_log.clone()),
         0,
+        None,
         None,
         None,
         None,

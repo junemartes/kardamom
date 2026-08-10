@@ -17,6 +17,7 @@ use alloy_eips::eip2718::{Decodable2718, Typed2718};
 use alloy_primitives::Bytes as AlloyBytes;
 use alloy_primitives::{Address, B256, U256};
 use bytes::Bytes;
+use kardamom_types::xchain::{self, XChainMessage};
 use kardamom_types::{BPosition, Deposit, Receipt, StateDatabase, TxEnvelope, WireLog};
 use revm::context::TxEnv;
 use revm::context::result::ExecutionResult;
@@ -726,6 +727,139 @@ fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
     }
 }
 
+/// Tx-level gas headroom added on top of a cross-chain message's inner-call
+/// budget. `message.gas_limit` is the sender's paid-for budget for the inner
+/// `target` call alone — the Inbox forwards exactly that much — so intrinsic
+/// gas plus the Inbox's own work (delivery-status write, event, callback
+/// enqueue through the local Outbox) must ride on top, or bookkeeping would
+/// eat the app's budget.
+pub const XCHAIN_DELIVERY_OVERHEAD: u64 = 150_000;
+
+/// Execute one derived cross-chain message against a snapshot + the current
+/// `PendingDelta`. Returns the receipt plus a fresh per-tx `WriteSet`.
+///
+/// The deposit shape ([`execute_deposit_tx`]) minus the mint: fee-free
+/// (`gas_price = 0`), nonce check disabled, receipt `tx_hash` is the
+/// message's `remote_source_hash`. The EVM caller is the aliased origin
+/// Outbox ([`xchain::xchain_tx_sender`]) — the only address `Inbox.deliver`
+/// accepts — and the callee is always the Inbox predeploy; `target` is
+/// reached solely through the Inbox's inner call.
+///
+/// v1 carries no value: a nonzero `message.value` is a CHAIN FAULT, not a
+/// drop — the wire and leaf carry the field so the format is stable when
+/// value transfer ships, but minting before the anchored-tier value rules
+/// exist would be silent inflation, so the error fail-stops the engine.
+#[allow(clippy::too_many_arguments)] // matches execute_tx's shape; see the
+// equivalent allow on execute_tx for the rationale.
+pub fn execute_xchain_tx<S: StateDatabase>(
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    delta: &PendingDelta,
+    env: ExecEnv,
+    tx_idx: TxIndex,
+    tx_position: BPosition,
+    origin_chain_id: u64,
+    message: &XChainMessage,
+    tx_index_in_block: u64,
+    cumulative_gas_used_before: u64,
+    // See `execute_deposit_tx`: cross-chain claims are WRITES ONLY through
+    // the same constructed-account path, keeping executor and validator
+    // claims symmetric.
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
+) -> Result<(Receipt, WriteSet), ExecutorError> {
+    if message.value != 0 {
+        return Err(ExecutorError::Execution {
+            idx: tx_idx,
+            detail: format!(
+                "xchain message (origin {origin_chain_id}, seq {}) carries value {} but v1 \
+                 delivery is value-free — chain fault, not droppable",
+                message.seq, message.value
+            ),
+        });
+    }
+
+    // Layer the running delta on top of the snapshot via CacheDB so revm
+    // sees writes from earlier txs in the same block. Mirrors execute_tx.
+    let snap_ref = SnapshotRef { inner: snapshot };
+    let mut cache: CacheDB<SnapshotRef<'_, S>> = CacheDB::new(snap_ref);
+    for layer in parent.into_iter().chain(core::iter::once(delta)) {
+        seed_cache_layer(&mut cache, layer).map_err(|detail| ExecutorError::Execution {
+            idx: tx_idx,
+            detail,
+        })?;
+    }
+
+    // Like deposits, the derived tx carries no nonce.
+    let mut cfg = env.cfg_env();
+    cfg.disable_nonce_check = true;
+
+    let sender = xchain::xchain_tx_sender(origin_chain_id);
+    let tx_env = TxEnv {
+        caller: sender,
+        kind: TxKind::Call(xchain::INBOX),
+        value: U256::ZERO,
+        data: AlloyBytes::from(xchain::deliver_calldata(origin_chain_id, message)),
+        gas_limit: message.gas_limit.saturating_add(XCHAIN_DELIVERY_OVERHEAD),
+        gas_price: 0,
+        nonce: 0,
+        chain_id: None,
+        ..Default::default()
+    };
+    let mut evm = Context::mainnet()
+        .with_db(&mut cache)
+        .with_block(env.block_env())
+        .with_cfg(cfg)
+        .build_mainnet();
+    let result = evm
+        .transact_commit(tx_env)
+        .map_err(|e| ExecutorError::Execution {
+            idx: tx_idx,
+            detail: format!("{e:?}"),
+        })?;
+
+    let gas_used = result.gas().tx_gas_used();
+    // A revert inside deliver (or the inner call bubbling one up) marks the
+    // receipt failed but is NOT an engine error — the deposit posture.
+    let (status_success, logs) = match &result {
+        ExecutionResult::Success { logs, .. } => (true, logs.clone()),
+        ExecutionResult::Revert { .. } => (false, Vec::<Log>::new()),
+        ExecutionResult::Halt { .. } => (false, Vec::<Log>::new()),
+    };
+
+    let ws = write_set_from_cache(&cache.cache);
+    if let Some((bal, bal_index)) = bal {
+        record_writeset_into_bal(bal, bal_index, &ws);
+    }
+
+    let write_set_hash = ws.hash();
+    let wire_logs: Vec<WireLog> = logs.iter().map(wire_log).collect();
+    let cumulative_gas_used = cumulative_gas_used_before + gas_used;
+
+    let receipt = Receipt {
+        tx_idx: tx_position,
+        // The canonical id stamped at derivation (remote_source_hash), NOT a
+        // 2718 keccak — same posture as deposits.
+        tx_hash: message.source_hash,
+        tx_type: kardamom_types::TX_TYPE_XCHAIN,
+        status: status_success,
+        gas_used,
+        logs: wire_logs,
+        write_set_hash,
+        // Origin-derived: consumes no local nonce (`nonce: 0` is a filler,
+        // never a real nonce — consumers branch on tx_type, not on the 0).
+        nonce: 0,
+        from: sender,
+        to: Some(xchain::INBOX),
+        contract_address: None,
+        // Destination-side delivery pays no fee (quota-gated instead).
+        effective_gas_price: 0,
+        block_number: env.block_number,
+        transaction_index: tx_index_in_block,
+        cumulative_gas_used,
+    };
+    Ok((receipt, ws))
+}
+
 /// Build a `WriteSet` from CacheDB's accumulated cache. Unlike
 /// [`write_set_from_evm_state`] (which iterates revm's per-tx
 /// `EvmState`), this iterates `CacheDB::cache.accounts` after the deposit's
@@ -1273,6 +1407,147 @@ mod tests {
             "got {err:?}"
         );
     }
+    // -----------------------------------------------------------------
+    // Cross-chain (0x7D) execution tests — the delivery analogue of the
+    // deposit scenarios above.
+    // -----------------------------------------------------------------
+
+    const ORIGIN_CHAIN: u64 = 412_346;
+
+    fn xmsg(seq: u64, data: Bytes) -> xchain::XChainMessage {
+        xchain::XChainMessage {
+            source_hash: xchain::remote_source_hash(ORIGIN_CHAIN, seq),
+            seq,
+            origin_sender: Address::from([0x77u8; 20]),
+            target: Address::from([0x88u8; 20]),
+            value: 0,
+            gas_limit: 200_000,
+            input: data,
+            callback: None,
+        }
+    }
+
+    #[test]
+    fn xchain_delivery_produces_a_0x7d_receipt_keyed_by_source_hash() {
+        let snap = MockStateDatabase::builder().build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+        let m = xmsg(4, Bytes::from_static(&[0xCA, 0xFE]));
+
+        let mut bal = revm::state::bal::Bal::new();
+        let (receipt, ws) = execute_xchain_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            ORIGIN_CHAIN,
+            &m,
+            0,
+            33,
+            Some((&mut bal, 1)),
+        )
+        .expect("execute");
+
+        // Identity comes from the derivation, not from any local encoding.
+        assert_eq!(receipt.tx_hash, m.source_hash);
+        assert_eq!(receipt.tx_type, kardamom_types::TX_TYPE_XCHAIN);
+        assert!(receipt.status);
+        let sender = xchain::xchain_tx_sender(ORIGIN_CHAIN);
+        assert_eq!(
+            receipt.from, sender,
+            "EVM caller is the aliased origin Outbox"
+        );
+        assert_eq!(
+            receipt.to,
+            Some(xchain::INBOX),
+            "the derived tx only ever calls the Inbox"
+        );
+        assert_eq!(receipt.nonce, 0);
+        assert_eq!(receipt.effective_gas_price, 0);
+        assert_eq!(receipt.block_number, 1);
+        assert_eq!(receipt.cumulative_gas_used, 33 + receipt.gas_used);
+
+        // The caller's nonce bump is the delivery's minimal state effect —
+        // it must appear in the WriteSet and be claimed in the BAL, or the
+        // validator has nothing to cross-check.
+        assert_eq!(ws.account(&sender).expect("caller touched").0, 1);
+        let alloy = bal.into_alloy_bal();
+        assert!(
+            alloy
+                .iter()
+                .any(|a| a.address == sender && !a.nonce_changes.is_empty()),
+            "caller claim missing from BAL: {alloy:?}"
+        );
+    }
+
+    #[test]
+    fn xchain_nonzero_value_is_a_chain_fault_not_a_drop() {
+        let snap = MockStateDatabase::builder().build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+        let mut m = xmsg(0, Bytes::new());
+        m.value = 5;
+
+        let err = execute_xchain_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            ORIGIN_CHAIN,
+            &m,
+            0,
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ExecutorError::Execution { ref detail, .. } if detail.contains("value")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn xchain_inner_revert_yields_failed_receipt_not_error() {
+        // Revert bytecode at the INBOX stands in for a deliver() that
+        // reverts: the receipt records the failure, the engine continues —
+        // the deposit posture, minus the mint.
+        let revert_code = AlloyBytes::from(vec![0x60, 0x00, 0x60, 0x00, 0xfd]);
+        let bytecode = Bytecode::new_raw(revert_code);
+        let code_hash = bytecode.hash_slow();
+        let snap = MockStateDatabase::builder()
+            .account(xchain::INBOX, U256::ZERO, 1, code_hash)
+            .code(
+                code_hash,
+                Bytes::copy_from_slice(bytecode.original_bytes().as_ref()),
+            )
+            .build();
+        let delta = PendingDelta::new();
+        let env = ExecEnv::new(1, &boundary(1));
+
+        let m = xmsg(9, Bytes::new());
+        let (receipt, _ws) = execute_xchain_tx(
+            &snap,
+            None,
+            &delta,
+            env,
+            TxIndex(0),
+            pos(0),
+            ORIGIN_CHAIN,
+            &m,
+            0,
+            0,
+            None,
+        )
+        .expect("revert is OK at the executor layer");
+        assert!(!receipt.status, "inner revert yields status=false");
+        assert_eq!(receipt.tx_hash, m.source_hash);
+        assert_eq!(receipt.tx_type, kardamom_types::TX_TYPE_XCHAIN);
+    }
+
     /// Regression: EIP-7928 capture must actually populate the block Bal
     /// when a Bal handle is supplied to `execute_tx` (spec phase 1). An
     /// empty BAL means the validator has nothing to verify or seed from.

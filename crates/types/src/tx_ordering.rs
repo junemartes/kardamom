@@ -88,7 +88,9 @@ impl TxOrderingMessage {
     pub const fn as_tx_ref(&self) -> Option<&TxRef> {
         match self {
             Self::TxRef(r) => Some(r),
-            Self::DepositRef(_) | Self::BoundaryStart(_) | Self::Epoch(_)
+            Self::DepositRef(_)
+            | Self::BoundaryStart(_)
+            | Self::Epoch(_)
             | Self::RemoteEpoch(_) => None,
         }
     }
@@ -97,8 +99,7 @@ impl TxOrderingMessage {
     pub const fn as_deposit_ref(&self) -> Option<&DepositRef> {
         match self {
             Self::DepositRef(d) => Some(d),
-            Self::TxRef(_) | Self::BoundaryStart(_) | Self::Epoch(_)
-            | Self::RemoteEpoch(_) => None,
+            Self::TxRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) | Self::RemoteEpoch(_) => None,
         }
     }
 
@@ -106,7 +107,9 @@ impl TxOrderingMessage {
     pub const fn as_epoch(&self) -> Option<&EpochRecord> {
         match self {
             Self::Epoch(e) => Some(e),
-            Self::TxRef(_) | Self::DepositRef(_) | Self::BoundaryStart(_)
+            Self::TxRef(_)
+            | Self::DepositRef(_)
+            | Self::BoundaryStart(_)
             | Self::RemoteEpoch(_) => None,
         }
     }
@@ -115,9 +118,7 @@ impl TxOrderingMessage {
     pub const fn as_remote_epoch(&self) -> Option<&RemoteEpochRecord> {
         match self {
             Self::RemoteEpoch(r) => Some(r),
-            Self::TxRef(_) | Self::DepositRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => {
-                None
-            }
+            Self::TxRef(_) | Self::DepositRef(_) | Self::BoundaryStart(_) | Self::Epoch(_) => None,
         }
     }
 

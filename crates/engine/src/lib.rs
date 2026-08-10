@@ -39,7 +39,7 @@ pub use kardamom_exec_core::{
 };
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
-    EpochObserver, JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription,
+    EpochObserver, JoinBuffer, ReaderConfig, ReaderToExec, RemoteEpochObserver, TxDataSubscription,
     TxOrderingSubscription,
 };
 pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};

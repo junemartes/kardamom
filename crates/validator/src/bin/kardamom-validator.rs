@@ -679,6 +679,9 @@ async fn main() -> Result<()> {
             block_exec,
             join_recovery,
             epoch_observer,
+            // Remote-epoch check: wired by the destination validator only
+            // (interop P1); None until the RemoteEpochVerifier lands.
+            None,
         )
     });
 

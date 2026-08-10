@@ -195,6 +195,20 @@ impl Iterator for MultiArchiveReader {
                     // docs/agents/l1-origin-deposit-derivation-spec.md.
                     continue;
                 }
+                TxOrderingMessage::RemoteEpoch(rec) => {
+                    // Unlike epoch deposits, remote messages are NOT
+                    // re-derivable from this chain's L1 origin, so an
+                    // Epoch-style skip would build a batch a reconstructor
+                    // cannot replay into the same chain. Refuse loudly until
+                    // the interop DA format lands (mirrors `live.rs`).
+                    return Some(Err(BatcherError::Reconstruct(format!(
+                        "remote epoch (origin {}, seq {}..={}) has no DA representation; \
+                         refusing to build a non-reconstructible batch",
+                        rec.origin_chain_id,
+                        rec.first_seq,
+                        rec.last_seq()
+                    ))));
+                }
                 TxOrderingMessage::BoundaryStart(b) => {
                     return Some(Ok(ResolvedRecord::Boundary {
                         position,

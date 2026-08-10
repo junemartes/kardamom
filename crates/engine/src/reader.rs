@@ -52,6 +52,7 @@ use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use tracing::{debug, warn};
 
+use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
     BPosition, BlockBoundaryStart, Deposit, EpochRecord, TxDataLoc, TxEnvelope, TxOrderingMessage,
 };
@@ -286,6 +287,29 @@ pub enum ReaderToExec {
         epoch: EpochRecord,
         position: BPosition,
     },
+    /// A remote-epoch marker (interop): advances the pair's origin cursor
+    /// and consumes the first slot of the record's range. Applies NO
+    /// transaction — the record's messages follow as their own
+    /// [`ReaderToExec::XChain`] messages. Carries the full record (the
+    /// [`Epoch`](Self::Epoch) shape) so the [`RemoteEpochObserver`] seam
+    /// observes exactly what traveled the canonical stream; boxed (as is the
+    /// message below) so the rare interop arms don't grow the hot enum every
+    /// Tx dispatch moves.
+    RemoteEpoch {
+        tx_idx: TxIndex,
+        record: Box<RemoteEpochRecord>,
+        position: BPosition,
+    },
+    /// One derived cross-chain message — a 0x7D tx on this chain.
+    /// `origin_chain_id` rides alongside because execution aliases the
+    /// sender and authenticates the Inbox call per origin, and the message
+    /// itself deliberately does not repeat the pair identity on the wire.
+    XChain {
+        tx_idx: TxIndex,
+        origin_chain_id: u64,
+        message: Box<XChainMessage>,
+        position: BPosition,
+    },
     Boundary(BlockBoundaryStart),
 }
 
@@ -331,6 +355,24 @@ where
 /// background task with a deferred verdict, not inline here.
 pub trait EpochObserver: Send {
     fn observe(&mut self, epoch: &EpochRecord) -> Result<(), ExecutorError>;
+}
+
+/// Role-specific hook called for every [`RemoteEpochRecord`] on the canonical
+/// stream, in canonical order, before its messages execute — the interop
+/// mirror of [`EpochObserver`].
+///
+/// The executor wires nothing here. The destination VALIDATOR wires a
+/// verifier that re-checks the pair's sequence rules inline and the record's
+/// content/anchor against L1 in the background
+/// (`docs/specs/interop-outbox-messaging-spec.md` §10) — deriving remote
+/// epochs is only half the guarantee, exactly as for L1 epochs.
+///
+/// Same contract as [`EpochObserver`]: returning `Err` fail-stops the engine,
+/// and implementations must be CHEAP — this runs on the exec thread, so
+/// anything with network latency belongs on a background task with a
+/// deferred verdict.
+pub trait RemoteEpochObserver: Send {
+    fn observe(&mut self, rec: &RemoteEpochRecord) -> Result<(), ExecutorError>;
 }
 
 /// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
@@ -520,26 +562,52 @@ where
                         }
                     }
                     TxOrderingMessage::RemoteEpoch(rec) => {
-                        // Cross-chain execution lands with `execute_xchain_tx`
-                        // (interop P1, in progress). Until the exec side is
-                        // wired, a remote epoch on the stream MUST halt the
-                        // engine: skipping it would fork this replica from any
-                        // replica that does execute it — the same fail-stop
-                        // posture as the legacy DepositRef below.
-                        tracing::error!(
-                            target: "kardamom_executor::reader",
-                            origin_chain_id = rec.origin_chain_id,
-                            first_seq = rec.first_seq,
-                            "RemoteEpoch on the canonical stream but cross-chain \
-                             execution is not wired on this build; halting"
-                        );
-                        return Err(ExecutorError::State(format!(
-                            "RemoteEpoch from chain {} (seq {}..={}) but cross-chain \
-                             execution is not wired on this build",
-                            rec.origin_chain_id,
-                            rec.first_seq,
-                            rec.last_seq()
-                        )));
+                        // Same expansion contract as an L1 epoch: the record
+                        // claims a contiguous slot range — the marker, then
+                        // one slot per message (`wire::remote_epoch_slots`) —
+                        // and racing sequencers republish byte-identical
+                        // records, collapsed here on `canonical_id`.
+                        if !seen_canonical_ids.first_seen(rec.canonical_id()) {
+                            debug!(
+                                target: "kardamom_executor::reader",
+                                origin_chain_id = rec.origin_chain_id,
+                                first_seq = rec.first_seq,
+                                "skipping duplicate RemoteEpoch (MDS racing sequencers)"
+                            );
+                            continue;
+                        }
+                        let origin_chain_id = rec.origin_chain_id;
+                        let messages = rec.messages.clone();
+                        let marker_idx = next_tx_idx;
+                        next_tx_idx = next_tx_idx.next();
+                        if exec_out
+                            .send(ReaderToExec::RemoteEpoch {
+                                tx_idx: marker_idx,
+                                record: Box::new(rec),
+                                position,
+                            })
+                            .is_err()
+                        {
+                            return Ok(()); // exec thread shutting down
+                        }
+                        // Messages travel INSIDE the record, so as with epoch
+                        // deposits there is no side-stream join to wait on —
+                        // nothing here can time out or go missing.
+                        for message in messages {
+                            let tx_idx = next_tx_idx;
+                            next_tx_idx = next_tx_idx.next();
+                            if exec_out
+                                .send(ReaderToExec::XChain {
+                                    tx_idx,
+                                    origin_chain_id,
+                                    message: Box::new(message),
+                                    position,
+                                })
+                                .is_err()
+                            {
+                                return Ok(());
+                            }
+                        }
                     }
                     TxOrderingMessage::DepositRef(dep_ref) => {
                         // Retired by the epoch switch-over: deposits now
@@ -968,6 +1036,118 @@ mod tests {
             out.push(m);
         }
         assert_eq!(out.len(), 2, "one marker + one deposit, not two of each");
+    }
+
+    fn remote_record(origin: u64, first_seq: u64, n: u64) -> RemoteEpochRecord {
+        RemoteEpochRecord {
+            origin_chain_id: origin,
+            anchor_number: 40,
+            anchor_hash: alloy_primitives::B256::repeat_byte(0xAB),
+            first_seq,
+            messages: (first_seq..first_seq + n)
+                .map(|seq| XChainMessage {
+                    source_hash: kardamom_types::xchain::remote_source_hash(origin, seq),
+                    seq,
+                    gas_limit: 100_000,
+                    ..Default::default()
+                })
+                .collect(),
+        }
+    }
+
+    /// A remote epoch expands exactly like an L1 epoch: the marker plus one
+    /// dispatch per message, `tx_idx` contiguous across the whole range.
+    #[test]
+    fn channel_b_reader_expands_a_remote_epoch_into_marker_plus_messages() {
+        let origin = 412_346u64;
+        let rec = remote_record(origin, 5, 2);
+        let b = VecTxOrderingSub {
+            queue: VecDeque::from(vec![
+                Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),
+                Ok((
+                    pos(3),
+                    TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
+                        block_number: 1,
+                        // Marker + 2 messages = 3 slots consumed.
+                        end_tx_idx: pos(3),
+                        l2_timestamp: 1_700_000_000,
+                        l1_origin: 0,
+                    }),
+                )),
+            ]),
+        };
+        let (tx, rx) = bounded::<ReaderToExec>(8);
+        let h = spawn_tx_ordering_reader(
+            b,
+            JoinBuffer::new(),
+            ReaderConfig::default(),
+            tx,
+            TxIndex::ZERO,
+            None,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let mut out = Vec::new();
+        while let Ok(m) = rx.recv() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 4, "marker + 2 messages + boundary");
+        match &out[0] {
+            ReaderToExec::RemoteEpoch { tx_idx, record, .. } => {
+                assert_eq!(*tx_idx, TxIndex(0));
+                assert_eq!(record.origin_chain_id, origin);
+                assert_eq!(record.first_seq, 5);
+            }
+            other => panic!("expected RemoteEpoch marker, got {other:?}"),
+        }
+        for (i, expected) in rec.messages.iter().enumerate() {
+            match &out[1 + i] {
+                ReaderToExec::XChain {
+                    tx_idx,
+                    origin_chain_id,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(*tx_idx, TxIndex(1 + i as u64));
+                    assert_eq!(*origin_chain_id, origin);
+                    assert_eq!(message.source_hash, expected.source_hash);
+                }
+                other => panic!("expected XChain at {i}, got {other:?}"),
+            }
+        }
+        match &out[3] {
+            ReaderToExec::Boundary(b) => assert_eq!(b.end_tx_idx, pos(3)),
+            other => panic!("expected Boundary, got {other:?}"),
+        }
+    }
+
+    /// A duplicate remote epoch from a racing sequencer must dispatch
+    /// NOTHING — a second expansion would double-deliver every message.
+    #[test]
+    fn channel_b_reader_drops_a_duplicate_remote_epoch() {
+        let rec = remote_record(412_346, 0, 1);
+        let b = VecTxOrderingSub {
+            queue: VecDeque::from(vec![
+                Ok((pos(0), TxOrderingMessage::RemoteEpoch(rec.clone()))),
+                Ok((pos(2), TxOrderingMessage::RemoteEpoch(rec))),
+            ]),
+        };
+        let (tx, rx) = bounded::<ReaderToExec>(8);
+        let h = spawn_tx_ordering_reader(
+            b,
+            JoinBuffer::new(),
+            ReaderConfig::default(),
+            tx,
+            TxIndex::ZERO,
+            None,
+        );
+        h.join().expect("no panic").expect("ok");
+
+        let mut out = Vec::new();
+        while let Ok(m) = rx.recv() {
+            out.push(m);
+        }
+        assert_eq!(out.len(), 2, "one marker + one message, not two of each");
     }
 
     /// Race test: `TxRef` arrives BEFORE its envelope. The B reader spins

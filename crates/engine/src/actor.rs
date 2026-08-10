@@ -128,6 +128,10 @@ impl Executor {
         // ordered stream); the validator passes a verifier that re-derives
         // each epoch from L1.
         epoch_observer: Option<Box<dyn crate::reader::EpochObserver>>,
+        // The interop mirror of `epoch_observer`, invoked per RemoteEpoch
+        // marker. `None` everywhere until the destination-validator
+        // `RemoteEpochVerifier` lands.
+        remote_epoch_observer: Option<Box<dyn crate::reader::RemoteEpochObserver>>,
     ) -> Result<(), ExecutorError>
     where
         C: TxReceiptsPublication + 'static,
@@ -172,6 +176,7 @@ impl Executor {
             bal_tx,
             block_exec,
             epoch_observer,
+            remote_epoch_observer,
         );
         let commit = spawn_commit(c_pub, rx_e2c);
 

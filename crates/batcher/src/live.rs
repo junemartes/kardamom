@@ -361,6 +361,26 @@ pub fn run_feed<P: Provider>(
             // reconstructor reads the origin off the block boundary and
             // re-derives that L1 block's deposits itself.
             Ok(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. }) => {}
+            // Remote-epoch records have no DA representation yet: unlike
+            // deposits they are NOT re-derivable from this chain's L1 origin,
+            // so skipping them would post batches a reconstructor cannot
+            // replay into the same chain. Refuse loudly until the interop DA
+            // format lands (interop P1, reconstruction slice).
+            Ok(ReaderToExec::RemoteEpoch { record, .. }) => {
+                bail!(
+                    "remote epoch (origin {}, seq {}..={}) has no DA representation; \
+                     refusing to post a non-reconstructible batch",
+                    record.origin_chain_id,
+                    record.first_seq,
+                    record.last_seq()
+                )
+            }
+            Ok(ReaderToExec::XChain { .. }) => {
+                // Unreachable without a preceding RemoteEpoch marker (the
+                // reader always dispatches the marker first), which bails
+                // above.
+                bail!("cross-chain message outside a remote epoch on the batcher feed")
+            }
             Ok(ReaderToExec::Boundary(b)) => {
                 let closed = acc.observe_boundary(b);
                 counter!(metric_names::BLOCKS_OBSERVED).increment(1);

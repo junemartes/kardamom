@@ -35,3 +35,6 @@ thiserror = { version = "2", default-features = false }
 
 [dev-dependencies]
 # rkyv roundtrip tests only — nothing I/O
+# `sol!`-generated encoder: the compiler-grade oracle the hand-rolled
+# `xchain::deliver_calldata` is pinned byte-identical against.
+alloy-sol-types = { workspace = true }

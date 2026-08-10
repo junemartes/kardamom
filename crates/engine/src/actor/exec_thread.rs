@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 
+use kardamom_types::xchain::{RemoteEpochRecord, XChainMessage};
 use kardamom_types::{
     BPosition, BlockBoundary, BlockBoundaryStart, BlockDelta, Deposit, EpochRecord, SnapshotSource,
     TxEnvelope,
@@ -21,8 +22,8 @@ use crate::block_env::ExecEnv;
 use crate::delta::{PendingDelta, WriteSet};
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::executor::execute_deposit_tx;
-use crate::reader::{EpochObserver, ReaderToExec};
+use crate::executor::{execute_deposit_tx, execute_xchain_tx};
+use crate::reader::{EpochObserver, ReaderToExec, RemoteEpochObserver};
 
 use super::ports::{StateWriterQueue, StateWriterSignal};
 use super::types::{
@@ -70,6 +71,7 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P> {
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
     pub(super) block_exec: Option<BlockExec<S::Db>>,
     pub(super) epoch_observer: Option<Box<dyn EpochObserver>>,
+    pub(super) remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
     /// The snapshot source hands back owned snapshots keyed by block
     /// number: the block *just committed* — `initial_block` (== the
     /// persisted `resume.block` on a resume, 0 on a fresh start).
@@ -180,6 +182,7 @@ where
         bal_tx: Option<Sender<BalHandoff>>,
         block_exec: Option<BlockExec<S::Db>>,
         epoch_observer: Option<Box<dyn EpochObserver>>,
+        remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
     ) -> Self {
         let resume_count = resume.map(|r| r.record_count).unwrap_or(0);
         let snapshot = snapshots.snapshot_after(initial_block);
@@ -193,6 +196,7 @@ where
             bal_tx,
             block_exec,
             epoch_observer,
+            remote_epoch_observer,
             snapshot,
             delta: PendingDelta::new(),
             block_bal: revm::state::bal::Bal::new(),
@@ -241,6 +245,17 @@ where
                     deposit,
                     position,
                 } => self.on_deposit(tx_idx, deposit, position)?,
+                ReaderToExec::RemoteEpoch {
+                    tx_idx,
+                    record,
+                    position,
+                } => self.on_remote_epoch(tx_idx, record, position)?,
+                ReaderToExec::XChain {
+                    tx_idx,
+                    origin_chain_id,
+                    message,
+                    position,
+                } => self.on_xchain(tx_idx, origin_chain_id, message, position)?,
                 ReaderToExec::Boundary(start) => self.on_boundary(start)?,
             };
             if let Flow::Stop = flow {
@@ -461,6 +476,80 @@ where
         self.record_applied("execute_deposit_tx", position, result, apply_start)
     }
 
+    fn on_remote_epoch(
+        &mut self,
+        tx_idx: TxIndex,
+        record: Box<RemoteEpochRecord>,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
+        // Like the L1 epoch marker: consumes one slot, applies no tx — the
+        // pair's origin advances at a point every replica agrees on, and the
+        // messages that follow start at a slot the sealer also reserved.
+        self.check_in_order("RemoteEpoch", tx_idx, position)?;
+        // Checked BEFORE the record's messages execute, so a rejected
+        // record fail-stops instead of committing.
+        if let Some(obs) = self.remote_epoch_observer.as_mut() {
+            obs.observe(&record)?;
+        }
+        tracing::debug!(
+            target: "kardamom_executor::exec",
+            block = self.current_block,
+            origin_chain_id = record.origin_chain_id,
+            anchor_number = record.anchor_number,
+            messages = record.messages.len(),
+            "remote epoch marker: pair origin advances"
+        );
+        Ok(Flow::Continue)
+    }
+
+    fn on_xchain(
+        &mut self,
+        tx_idx: TxIndex,
+        origin_chain_id: u64,
+        message: Box<XChainMessage>,
+        position: BPosition,
+    ) -> Result<Flow, ExecutorError> {
+        self.check_in_order("XChain", tx_idx, position)?;
+        if self.block_exec.is_some() {
+            // Whole-block execution (the validator's parallel path) has no
+            // BufferedRecord arm for cross-chain messages yet. Executing the
+            // record inline here while the strategy replays the block without
+            // it would fork the two paths — fail stop until the destination
+            // validator wiring lands (interop P1, validator slice).
+            return Err(ExecutorError::State(format!(
+                "cross-chain message (origin {origin_chain_id}, seq {}) is not supported by \
+                 whole-block execution on this build",
+                message.seq
+            )));
+        }
+        let env = self.exec_env(self.current_block);
+        let apply_start = Instant::now();
+        let result = execute_xchain_tx(
+            &self.snapshot,
+            self.parent.as_ref(),
+            &self.delta,
+            env,
+            tx_idx,
+            position,
+            origin_chain_id,
+            &message,
+            self.tx_index_in_block,
+            self.cumulative_gas_used,
+            self.bal_tx
+                .as_ref()
+                .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
+        );
+        // Like deposits, the delivery runs outside the scope (own commit
+        // semantics) — fold its writes into the block cache so later txs
+        // in this block observe them.
+        if let (Some(sc), Ok((_, ws))) = (self.scope.as_mut(), &result) {
+            let mut layer = PendingDelta::new();
+            layer.apply(ws.clone());
+            sc.seed_layer(&layer)?;
+        }
+        self.record_applied("execute_xchain_tx", position, result, apply_start)
+    }
+
     fn on_boundary(&mut self, start: BlockBoundaryStart) -> Result<Flow, ExecutorError> {
         let BlockBoundaryStart {
             block_number,
@@ -641,6 +730,7 @@ pub(crate) fn spawn_exec<S, Q, P>(
     bal_tx: Option<Sender<BalHandoff>>,
     block_exec: Option<BlockExec<S::Db>>,
     epoch_observer: Option<Box<dyn EpochObserver>>,
+    remote_epoch_observer: Option<Box<dyn RemoteEpochObserver>>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     S: SnapshotSource + 'static,
@@ -662,6 +752,7 @@ where
                 bal_tx,
                 block_exec,
                 epoch_observer,
+                remote_epoch_observer,
             )
             .run()
         })

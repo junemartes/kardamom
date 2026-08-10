@@ -174,6 +174,9 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
             // The executor trusts the ordered stream (phase 2 would
             // give it its own L1 dependency); only the validator verifies.
             None,
+            // Remote-epoch check: wired by the destination validator only
+            // (interop P1); None until the RemoteEpochVerifier lands.
+            None,
         )
     });
 
