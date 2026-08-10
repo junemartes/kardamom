@@ -186,7 +186,11 @@ type (phase 2 left the anchor point ready, currently unpopulated);
 `kardamom-state::{state_root, storage_root}` is the pure full-trie oracle the
 tests cross-check against; `alloy-trie` provides `no_std`
 `proof::verify_proof` (inclusion AND exclusion) and is already a dependency
-of the EEST runner's oracle path.
+of the EEST runner's oracle path. Crucially — see "who computes
+`pre_state_root` live" below — the validator ALREADY maintains the canonical
+root node-incrementally per block (`kardamom-state::trie`, `TrieMode::
+Incremental`), so 3b anchors against a root the node already has rather than
+building root maintenance from scratch.
 
 ### What 3b must add
 
@@ -286,17 +290,70 @@ branch→leaf, root collapse, cascaded multi-delete under one branch)
 enumerated explicitly against the one sparse-recompute implementation —
 that's where sparse implementations rot.
 
-### Second open question: who computes `pre_state_root` live
+### Second question, largely ANSWERED: who computes `pre_state_root` live
 
-The validator must POPULATE `pre_state_root` at capture time to hand the
-prover an anchored witness. Computing the full root per block via the oracle
-is O(state) — fine for tests and the current cluster scale, wrong
-asymptotically. Options, to be decided at 3b implementation time against
-measured cluster state sizes: incremental trie maintenance in the state DB
-(the honest fix, real work), or full-oracle recompute behind a cadence knob
-(prove every Nth block first; the batcher's proof-per-batch cursor in PR 4
-already tolerates gaps). This decision gates NOTHING in the guest design —
-the guest only consumes the root.
+Superseded 2026-08-09 by reading what the state crate already does. The
+question was framed as a choice between "incremental trie maintenance in the
+state DB (the honest fix, real work)" and "full-oracle recompute behind a
+cadence knob". **The honest fix already exists and the validator already runs
+it**: `kardamom-state::trie` is a reth-model node-incremental root
+(`BranchNodeCompact` nodes in `account_trie`/`storage_trie` + a
+`hashed_accounts`/`hashed_storage` mirror, walked per block over a
+`PrefixSet` of changed key-prefixes via `alloy_trie::HashBuilder`), and
+`update_for_block` runs it INSIDE the writer's block-commit txn, so the
+canonical root advances atomically with state. The validator binary defaults
+to `TrieMode::Incremental` (`--trie-shadow-check N` selects
+`ShadowCheck{every_n}` against the `rebuild_root` oracle); the executor runs
+`TrieMode::Off`. No cadence knob is needed and no new subsystem is owed.
+
+What remains is small and precise: `pre_state_root` for block N is the
+COMMITTED root after block N-1, which the writer has already persisted and
+`snapshot.state_root()` already exposes (the validator's background poller
+reads exactly this today to feed the attester). The one wrinkle is the
+depth-K commit pipeline: at block N's capture time, N-1 may still be
+unsettled, so its root does not exist yet. Resolution — **stamp the anchor
+when the parent's commit settles**, not at capture: the witness is finalized
+(and only then handed to the prover) once its parent block is durable.
+Proving is asynchronous and batch-aligned (PR 4's proof-per-batch cursor),
+so a ≤K-block lag between execution and anchoring costs nothing. The
+alternative — blocking capture on the parent's fsync — would reintroduce
+exactly the stall the pipelined commit exists to remove.
+
+### Proof generation on the capture side: the walker gains a retainer
+
+The 3b notes above specify what the guest VERIFIES but not that the
+validator can PRODUCE it. It can, over the tables that already exist, with
+one bounded addition — and one trap worth recording:
+
+- **The stored node tables are NOT a proof set.** `account_trie` /
+  `storage_trie` hold only `BranchNodeCompact` intermediates; leaves and
+  extension nodes are never stored, and (per the trie module's own docs)
+  `HashBuilder` CLEARS the parent's hash bit for extension-shaped children,
+  so even branch coverage is deliberately partial. Reading proofs straight
+  out of the node tables would silently produce incomplete ones.
+- **The mechanism instead**: run the existing walk with a proof retainer.
+  `alloy-trie` 0.9.5 (already the pinned dependency behind
+  `StateRoot::*_incremental`) provides `HashBuilder::with_proof_retainer(
+  ProofRetainer)` + `take_proof_nodes()` — the same mechanism reth's proof
+  service uses — so proof generation reuses the walker, the cursors, and the
+  hashed-state mirror the incremental root already drives, rather than
+  standing up a second trie reader. `verify_proof` on the guest side is the
+  matching half, and alloy-trie's `std` is a default feature (so the guest
+  builds it `default-features = false`, consistent with the phase-1 no_std
+  gotchas).
+- **This is also how the fixed-point loop fetches.** The recompute-guided
+  capture above resolves each `MissingNode(path)` by re-running the walk
+  with that path added to the retainer's target set — one mechanism for
+  both the initial proof set and the deletion-collapse completion, and the
+  reason the loop terminates against a real oracle rather than a guess.
+
+Open sub-question deferred to implementation: whether proof retention rides
+the block-commit txn's existing walk (cheapest — the walk is already
+happening, but it widens the critical section under the writer lock) or runs
+as a separate read-txn walk against the committed snapshot (isolated, pays a
+second walk). Prefer the second until measured: witness capture is already
+off the commit path, and keeping it there preserves the property that
+proving cannot slow the chain.
 
 ### Deferred alongside (unchanged by 3b)
 
