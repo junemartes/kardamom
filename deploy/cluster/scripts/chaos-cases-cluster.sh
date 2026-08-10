@@ -99,7 +99,7 @@ case_cluster_member_rejoin() {
   # resumed serving replay sessions). NOTE the cost this documents: a
   # blank member's rejoin time grows with the lifetime log — bounding it
   # needs log purge after snapshot, tracked as audit follow-up.
-  local leader follower f0 f1 t head_at_wipe catchup_block
+  local leader follower f0 f1 t head_at_wipe catchup_block first_block=0 moved=0
   leader="$(cluster_leader)"
   for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
 
@@ -171,6 +171,13 @@ case_cluster_member_rejoin() {
         END { print last }' \
       | grep -oE 'block=[0-9]+' | cut -d= -f2 || true)"
     catchup_block="${catchup_block:-0}"
+    # Track the FIRST non-zero position and whether it ever moved: the two
+    # failure modes look identical in a single end-of-window number but need
+    # different responses, and measurement says they are cleanly separable
+    # (2026-08-10, 10 runs) — a converging member reaches the head in 10-40s,
+    # a wedged one parks on its first position and never moves again.
+    [ "${catchup_block}" -gt 0 ] && [ "${first_block:-0}" -eq 0 ] && first_block="${catchup_block}"
+    [ "${catchup_block}" -gt "${first_block:-0}" ] && moved=1
     # Converged when the replayed position reaches the head observed at
     # wipe time (the head keeps advancing under load; reaching the wipe-time
     # head proves the whole pre-existing log was replayed).
@@ -179,7 +186,10 @@ case_cluster_member_rejoin() {
     if [ "${t}" -ge "${CLUSTER_REJOIN_SLO_S}" ]; then
       [ "${f1}" -gt "${f0}" ] \
         || fail "cluster-member-rejoin: restarted member did not start blank (fresh-at-genesis count ${f0} -> ${f1}) — the wipe did not take, this run proved nothing about empty-state rejoin"
-      fail "cluster-member-rejoin: blank member did not replay to the head within ${t}s (post-wipe snapshot block ${catchup_block}, head at wipe ${head_at_wipe}) — join wedged (issue #195) or replay outran its budget; blank-member catch-up is O(lifetime log) and the log is never purged, see the log-purge follow-up in docs/reviews/2026-08-03-chaos-coverage-audit.md"
+      if [ "${moved:-0}" -eq 0 ]; then
+        fail "cluster-member-rejoin: blank member FROZE at block ${catchup_block} (head at wipe ${head_at_wipe}) — its replay position never advanced once in ${t}s, so this is the JOIN WEDGE of issue #195, not slow replay: the member fails to bind its catchup endpoint (Receiver.onAddDestination -> BindException), never receives the rest of the log, and parks in Election.init/awaitLocalSocketsClosed while reporting healthy to Nomad. Check the member's driver error log for 'Address already in use' on its 402x3 endpoint"
+      fi
+      fail "cluster-member-rejoin: blank member replayed to block ${catchup_block} of head-at-wipe ${head_at_wipe} in ${t}s — the position DID keep advancing, so this is genuinely slow catch-up rather than the #195 wedge: blank-member replay is O(lifetime log) and the log is never purged, see the log-purge follow-up in docs/reviews/2026-08-03-chaos-coverage-audit.md"
     fi
   done
   log "cluster-member-rejoin: memberId=${follower} rejoined blank via full log replay (fresh ${f0}->${f1}, replayed to block ${catchup_block} >= head-at-wipe ${head_at_wipe}, ${t}s); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
