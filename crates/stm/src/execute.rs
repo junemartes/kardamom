@@ -521,7 +521,7 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 /// against — the single-threaded feed and the serial delta fold — are
 /// implementation limits, and if they come down this constant should come
 /// down with them.
-const PARALLEL_WORTH_NS: u64 = 8_000;
+pub const PARALLEL_WORTH_NS: u64 = 8_000;
 
 const SPIN_BEFORE_PARK: u32 = 256;
 

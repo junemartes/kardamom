@@ -72,6 +72,13 @@ struct Args {
     /// acquisition; 1 = update on every completion).
     #[arg(long, default_value = "1")]
     prune_batch: String,
+    /// Mean per-tx nanoseconds below which the pool declines a block and
+    /// runs it sequentially. `0` forces parallel execution regardless —
+    /// which is what you want when MEASURING scaling, since the default
+    /// policy would route cheap workloads to the sequential path and hide
+    /// the very numbers under test.
+    #[arg(long)]
+    parallel_worth_ns: Option<u64>,
 }
 
 fn records(base_idx: u64, envs: &[TxEnvelope]) -> Vec<(TxIndex, BPosition, TxEnvelope)> {
@@ -187,6 +194,7 @@ fn run_mdbx_ab(
     chain_id: u64,
     worker_counts: &[usize],
     batches: &[usize],
+    parallel_worth_ns: u64,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -234,7 +242,7 @@ fn run_mdbx_ab(
             let cfg = kardamom_stm::execute::PoolConfig {
                 workers: w,
                 prune_batch: batch,
-                ..Default::default()
+                parallel_worth_ns,
             };
             let mut stats = Stats::default();
             let mut global_idx = 0u64;
@@ -395,6 +403,9 @@ fn run_mdbx_ab(
 
 fn main() -> anyhow::Result<()> {
     let a = Args::parse();
+    let parallel_worth_ns = a
+        .parallel_worth_ns
+        .unwrap_or(kardamom_stm::execute::PARALLEL_WORTH_NS);
     let worker_counts: Vec<usize> = a
         .workers
         .split(',')
@@ -543,6 +554,7 @@ fn main() -> anyhow::Result<()> {
             a.chain_id,
             &worker_counts,
             &batches,
+            parallel_worth_ns,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()
@@ -673,7 +685,7 @@ fn main() -> anyhow::Result<()> {
             let cfg = kardamom_stm::execute::PoolConfig {
                 workers: w,
                 prune_batch: batch,
-                ..Default::default()
+                parallel_worth_ns,
             };
             let mut row = Row {
                 workers: w,
