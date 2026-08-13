@@ -79,6 +79,9 @@ struct Args {
     /// the very numbers under test.
     #[arg(long)]
     parallel_worth_ns: Option<u64>,
+    /// Dispatch on the sender instead of the first non-sender cell.
+    #[arg(long, default_value_t = false)]
+    dispatch_by_sender: bool,
 }
 
 fn records(base_idx: u64, envs: &[TxEnvelope]) -> Vec<(TxIndex, BPosition, TxEnvelope)> {
@@ -195,6 +198,7 @@ fn run_mdbx_ab(
     worker_counts: &[usize],
     batches: &[usize],
     parallel_worth_ns: u64,
+    dispatch_by_sender: bool,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -243,6 +247,7 @@ fn run_mdbx_ab(
                 workers: w,
                 prune_batch: batch,
                 parallel_worth_ns,
+                dispatch_by_sender,
             };
             let mut stats = Stats::default();
             let mut global_idx = 0u64;
@@ -250,6 +255,7 @@ fn run_mdbx_ab(
             let (mut busy, mut span, mut commit, mut feed, mut snap_us) =
                 (0u64, 0u64, 0u64, 0u64, 0u64);
             let (mut rt, mut rmv, mut rbase, mut rback) = (0u64, 0u64, 0u64, 0u64);
+            let (mut w_own, mut w_foreign) = (0u64, 0u64);
             let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
@@ -316,6 +322,8 @@ fn run_mdbx_ab(
                         c_delta += out.commit_delta_us;
                         feed += out.feed_us;
                         snap_us += snap_open;
+                        w_own += out.writes_own;
+                        w_foreign += out.writes_foreign;
                         rt += out.reads_total;
                         rmv += out.reads_mv_hit;
                         rbase += out.reads_base_hit;
@@ -387,6 +395,13 @@ fn run_mdbx_ab(
                     pub_us as f64 / 1000.0,
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
+                let w_all = (w_own + w_foreign).max(1);
+                println!(
+                    "     account writes {} = own-domain {:.1}% | FOREIGN {:.1}%                      (foreign = written by >1 worker)",
+                    w_own + w_foreign,
+                    w_own as f64 / w_all as f64 * 100.0,
+                    w_foreign as f64 / w_all as f64 * 100.0,
+                );
                 println!(
                     "     reads {} = mv-version {:.1}% | base-cache {:.1}% | backend {:.1}%",
                     rt,
@@ -406,6 +421,7 @@ fn main() -> anyhow::Result<()> {
     let parallel_worth_ns = a
         .parallel_worth_ns
         .unwrap_or(kardamom_stm::execute::PARALLEL_WORTH_NS);
+    let dispatch_by_sender = a.dispatch_by_sender;
     let worker_counts: Vec<usize> = a
         .workers
         .split(',')
@@ -555,6 +571,7 @@ fn main() -> anyhow::Result<()> {
             &worker_counts,
             &batches,
             parallel_worth_ns,
+            dispatch_by_sender,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()
@@ -686,6 +703,7 @@ fn main() -> anyhow::Result<()> {
                 workers: w,
                 prune_batch: batch,
                 parallel_worth_ns,
+                dispatch_by_sender,
             };
             let mut row = Row {
                 workers: w,

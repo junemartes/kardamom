@@ -466,6 +466,7 @@ fn cheap_blocks_are_declined_and_still_match() {
             // block that runs in parallel is the one taken before any
             // measurement exists.
             parallel_worth_ns: u64::MAX,
+            dispatch_by_sender: false,
         },
         |pool| {
             let out1 = pool
@@ -523,6 +524,7 @@ fn an_open_gate_never_declines() {
             workers: 4,
             prune_batch: 8,
             parallel_worth_ns: 0,
+            dispatch_by_sender: false,
         },
         |pool| {
             let mut base = PendingDelta::new();
