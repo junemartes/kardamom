@@ -467,3 +467,19 @@ drafts (bot scope). Locally, toolchain installation is an OPERATOR step —
 sessions must not curl-install toolchains; the guest crate carries a
 `rust-toolchain.toml` + README pin so the build is reproducible wherever
 the toolchain exists.
+
+### 3c step 2 delivered (2026-08-15): the round-trip contract holds
+
+`witness_anchoring` doubles as the prover-fixture generator
+(`KARDAMOM_EMIT_PROVER_FIXTURE=dir`, deterministic signer): it emits the
+exact `ProverInput` it just validated plus the expected 104-byte
+`PublicOutputs`. `guest/kardamom-zk-host` (workspace-detached, sp1-sdk
+blocking API) executes the REAL guest ELF in SP1's executor against them.
+First run: **104 bytes identical, 7,893,786 cycles** for the 3-tx pipeline
+block (transfer + storage-zeroing call + storage-writing call, full
+anchoring) — UNPATCHED; the accelerator patches land with the prover
+harness and will cut the keccak/ecrecover share substantially. CI shape in
+`docs/ci/zk-guest.yml.draft` (operator applies): guest build → fixture →
+round trip on every exec-core/types/guest change. Remaining for 3c: the
+validator `--prove-batches` harness (live capture wiring + prover
+shell-out + PR-4 batch alignment).

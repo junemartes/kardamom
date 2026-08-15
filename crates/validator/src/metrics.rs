@@ -115,3 +115,15 @@ pub fn set_committed_block(block: u64) {
 pub fn set_state_root_block(block: u64) {
     metrics::gauge!(STATE_ROOT_BLOCK).set(block as f64);
 }
+
+/// Prover-spool outcomes (spec 3c): frames written, blocks dropped
+/// (pre-state window missed / records aged out), assembly failures.
+pub fn counter_prover_spooled() {
+    metrics::counter!("validator_prover_frames_spooled_total").increment(1);
+}
+pub fn counter_prover_skipped(n: u64) {
+    metrics::counter!("validator_prover_blocks_skipped_total").increment(n);
+}
+pub fn counter_prover_failed() {
+    metrics::counter!("validator_prover_blocks_failed_total").increment(1);
+}

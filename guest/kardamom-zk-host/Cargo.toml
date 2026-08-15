@@ -1,0 +1,13 @@
+# SP1 host runner for the guest round-trip contract (spec: phase 3c).
+# Workspace-detached like the guest (own lockfile): sp1-sdk is a heavy
+# host-side dependency that must not enter workspace feature unification.
+[package]
+name = "kardamom-zk-host"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+sp1-sdk = { version = "6.4", features = ["blocking"] }
+anyhow = "1"

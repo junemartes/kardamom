@@ -129,6 +129,14 @@ pub struct Args {
     /// contains deposits, so liveness never depends on the BAL.
     #[arg(long, env = "KARDAMOM_PARALLEL_VALIDATION", default_value_t = false)]
     pub parallel_validation: bool,
+    /// Spool anchored prover inputs (one frame per block: witness + MPT
+    /// proofs + records + BAL, plus the expected public outputs) to this
+    /// directory — the zkVM prover's queue (spec 3c). Entirely off the hot
+    /// path; blocks the spool cannot pin a pre-state snapshot for are
+    /// dropped with a counter, never awaited. Requires the trie-aware
+    /// writer (the default).
+    #[arg(long, env = "KARDAMOM_PROVE_BATCHES")]
+    pub prove_batches: Option<std::path::PathBuf>,
     /// Transactions per parallel batch (scheduling granularity — independent
     /// of the BAL's attribution granularity).
     #[arg(long, env = "KARDAMOM_VALIDATION_BATCH_SIZE", default_value_t = 8)]

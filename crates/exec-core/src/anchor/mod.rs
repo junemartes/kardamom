@@ -185,9 +185,19 @@ pub fn verify_witness_anchored(
                         what: format!("account {} witnessed absent but included", acct.address),
                     });
                 }
+                // #161's normalization rule, applied at the anchor too: the
+                // state table stores "no code" as ZERO, the trie leaf always
+                // uses KECCAK_EMPTY, and execution treats them identically —
+                // so the witness (a capture of table reads) compares under
+                // the same mapping the recompute already writes with.
+                let witness_code_hash = if acct.code_hash == B256::ZERO {
+                    KECCAK_EMPTY
+                } else {
+                    acct.code_hash
+                };
                 if ta.nonce != acct.nonce
                     || ta.balance != acct.balance
-                    || ta.code_hash != acct.code_hash
+                    || ta.code_hash != witness_code_hash
                 {
                     return Err(AnchorError::Refuted {
                         what: format!("account {} fields diverge from trie leaf", acct.address),
