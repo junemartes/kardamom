@@ -128,6 +128,9 @@ fn bucket_of(sz: usize) -> usize {
     }
 }
 
+static REALLOC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static REALLOC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         ALLOC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -139,6 +142,22 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+    // Explicit, so Vec growth is measured as GROWTH — the default impl
+    // routes through alloc()+dealloc() and makes a 4->8->16 growth series
+    // read as three fresh allocations.
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        REALLOC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        REALLOC_BYTES.fetch_add(new_size as u64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.realloc(ptr, layout, new_size) }
+    }
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        let b = bucket_of(layout.size());
+        ALLOC_BUCKETS[b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BUCKET_BYTES[b].fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc_zeroed(layout) }
     }
 }
 
@@ -154,10 +173,12 @@ fn bucket_snap() -> [(u64, u64); 6] {
 #[global_allocator]
 static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
 
-fn alloc_snap() -> (u64, u64) {
+fn alloc_snap() -> (u64, u64, u64, u64) {
     (
         ALLOC_CALLS.load(std::sync::atomic::Ordering::Relaxed),
         ALLOC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+        REALLOC_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        REALLOC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
     )
 }
 
@@ -344,6 +365,8 @@ fn run_mdbx_ab(
             let (mut stm_allocs, mut stm_abytes) = (0u64, 0u64);
             let mut seq_buckets = [(0u64, 0u64); 6];
             let mut stm_buckets = [(0u64, 0u64); 6];
+            let (mut seq_reallocs, mut seq_rebytes) = (0u64, 0u64);
+            let (mut stm_reallocs, mut stm_rebytes) = (0u64, 0u64);
             let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
@@ -365,8 +388,6 @@ fn run_mdbx_ab(
                     let (seq_receipts, seq_delta) =
                         execute_block_sequential(&snapshot, None, e, &recs)?;
                     let s_ms = t0.elapsed().as_secs_f64() * 1e3;
-                    let a1 = alloc_snap();
-                    let b1 = bucket_snap();
 
                     let prepared: Vec<_> = recs
                         .iter()
@@ -386,6 +407,8 @@ fn run_mdbx_ab(
                             .all(|v| v.block_number() == snapshot.block_number()),
                         "per-worker views must agree on the block"
                     );
+                    let a1 = alloc_snap();
+                    let b1 = bucket_snap();
                     let out = pool.run_block_prepared(
                         views,
                         PendingDelta::new(),
@@ -402,6 +425,10 @@ fn run_mdbx_ab(
                         seq_abytes += a1.1 - a0.1;
                         stm_allocs += a2.0 - a1.0;
                         stm_abytes += a2.1 - a1.1;
+                        seq_reallocs += a1.2 - a0.2;
+                        seq_rebytes += a1.3 - a0.3;
+                        stm_reallocs += a2.2 - a1.2;
+                        stm_rebytes += a2.3 - a1.3;
                         for i in 0..6 {
                             seq_buckets[i].0 += b1[i].0 - b0[i].0;
                             seq_buckets[i].1 += b1[i].1 - b0[i].1;
@@ -518,6 +545,13 @@ fn run_mdbx_ab(
                     seq_abytes as f64 / 8000.0,
                     stm_allocs as f64 / 8000.0,
                     stm_abytes as f64 / 8000.0,
+                );
+                println!(
+                    "     reallocs/tx: seq {:.1} ({:.0} B) | stm {:.1} ({:.0} B)",
+                    seq_reallocs as f64 / 8000.0,
+                    seq_rebytes as f64 / 8000.0,
+                    stm_reallocs as f64 / 8000.0,
+                    stm_rebytes as f64 / 8000.0,
                 );
                 const LBL: [&str; 6] = ["<64", "<512", "<4K", "<32K", "<256K", "big"];
                 for i in 0..6 {
