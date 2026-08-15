@@ -32,6 +32,7 @@ name = "kardamom-perf"
 path = "src/bin/perf.rs"
 
 [dependencies]
+core_affinity = "0.8"
 kardamom-types.workspace = true
 kardamom-footprint = { path = "../footprint" }
 kardamom-stm = { path = "../stm" }

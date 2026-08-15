@@ -99,6 +99,15 @@ struct Args {
     /// the honest substrate for scaling questions.
     #[arg(long, default_value_t = 1)]
     call_work: usize,
+    /// Flow blocks excluded from timing while the footprint stats warm
+    /// up. The FIRST flow block runs entirely COLD (nothing trained yet):
+    /// every tx is a barrier, the DAG degenerates to a serial chain with
+    /// O(n^2) edge fan-in (measured: 1000 colds, 375k edges, ~30ms serial
+    /// span), and the 8-block average mostly measures that one block.
+    /// Production stats are continuously warm; steady state is the honest
+    /// number.
+    #[arg(long, default_value_t = 1)]
+    warmup_blocks: usize,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -310,6 +319,7 @@ fn run_mdbx_ab(
     sticky_assign: bool,
     per_block: bool,
     pin_cores: Vec<usize>,
+    warmup_blocks: usize,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -375,6 +385,7 @@ fn run_mdbx_ab(
             let mut disp_hist = vec![0u64; w];
             let mut idle_us = 0u64;
             let mut bpw = vec![0u64; w];
+            let mut cold_sum = 0u64;
             let (mut prune_calls_s, mut prune_forced_s, mut prune_us_s, mut steals_s) =
                 (0u64, 0u64, 0u64, 0u64);
             let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
@@ -388,7 +399,7 @@ fn run_mdbx_ab(
 
             kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
                 for (bi, blk) in all_blocks.iter().enumerate() {
-                    let is_flow = bi >= n_setup;
+                    let is_flow = bi >= n_setup + warmup_blocks;
                     let e = ExecEnv {
                         chain_id,
                         block_number: bi as u64 + 1,
@@ -412,6 +423,28 @@ fn run_mdbx_ab(
                     let t0 = Instant::now();
                     let (seq_receipts, seq_delta) = if stm_only {
                         (Vec::new(), PendingDelta::new())
+                    } else if std::env::var_os("KARDAMOM_SEQ_ON_THREAD").is_some() {
+                        // Discriminator: the pool's per-tx cost exceeds
+                        // sequential's by ~1.8x for PURE-INTERPRETER work.
+                        // Run the same sequential engine on a spawned
+                        // thread pinned to a worker core: if it slows to
+                        // the pool's rate, the tax is THREAD CONTEXT
+                        // (stack, arena, placement); if it stays fast, the
+                        // tax is in the pool's own execution path.
+                        std::thread::scope(|sc| {
+                            sc.spawn(|| {
+                                let core: usize = std::env::var("KARDAMOM_SEQ_CORE")
+                                    .ok()
+                                    .and_then(|v| v.parse().ok())
+                                    .unwrap_or(3);
+                                let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                                    id: core,
+                                });
+                                execute_block_sequential(&snapshot, None, e, &recs)
+                            })
+                            .join()
+                            .expect("seq thread")
+                        })?
                     } else {
                         execute_block_sequential(&snapshot, None, e, &recs)?
                     };
@@ -534,6 +567,7 @@ fn run_mdbx_ab(
                         fifo_cov += out.fifo_covered;
                         fifo_st += out.fifo_stalls;
                         edges_sum += out.edges as u64;
+                        cold_sum += out.cold as u64;
                         for (wi, c) in out.dispatch.iter().enumerate() {
                             disp_hist[wi] += *c as u64;
                         }
@@ -620,6 +654,10 @@ fn run_mdbx_ab(
                 );
                 println!("     dispatch per worker: {disp_hist:?}");
                 println!("     busy per worker (ms): {bpw:?}");
+                println!(
+                    "     cold {cold_sum} of {} txs | edges {edges_sum} | fifo-covered {fifo_cov}",
+                    8 * 1000usize,
+                );
                 println!(
                     "     idle {:.1}ms across {w} workers (span cap {:.1}ms) | prunes {} (forced {}) {:.1}ms | steals {}",
                     idle_us as f64 / 1000.0,
@@ -968,6 +1006,7 @@ fn main() -> anyhow::Result<()> {
             sticky_assign,
             a.per_block,
             pin_cores,
+            a.warmup_blocks,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()

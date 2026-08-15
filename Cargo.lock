@@ -3723,6 +3723,7 @@ dependencies = [
  "alloy-signer-local",
  "anyhow",
  "clap",
+ "core_affinity",
  "dhat",
  "hdrhistogram",
  "humantime",
