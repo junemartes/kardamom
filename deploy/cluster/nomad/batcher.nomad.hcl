@@ -37,6 +37,17 @@ variable "batcher_key" {
   default = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a"
 }
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo@sha256:... reference captured at push time (deploy/cluster/
+# images.digests). The empty default falls back to the mutable :dev tag in
+# the task config — a dev affordance for manual `nomad job run` during
+# debugging, NOT a production path.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 job "batcher" {
   datacenters = ["dc1"]
   type        = "service"
@@ -84,10 +95,16 @@ job "batcher" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.10:5000/kardamom-batcher:dev"
-        # Always pull the freshly-built image (mutable :dev tag; see executor job).
-        force_pull   = true
-        network_mode = "host"
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-batcher:dev"
+        # force_pull kept for the mutable-:dev fallback path (see executor
+        # job); redundant-but-harmless for the digest-pinned path.
+        force_pull = true
+        # Read-only rootfs (attested-identity P0.3): the batcher's writable
+        # surfaces — cursor file + DA blob store + aeron dir — are all
+        # explicit bind mounts below, plus Nomad's alloc/local/secrets
+        # mounts. Validated by the cluster-e2e suite.
+        readonly_rootfs = true
+        network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           # Cursor file + DA blob store live under the persistent mount.

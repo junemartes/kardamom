@@ -63,6 +63,12 @@ NET=kardamom-net
 SUBNET=192.168.56.0/24
 REGISTRY=192.168.56.10:5000
 TAG=dev
+# Per-deploy image digest manifest (attested-identity P0.1): push_image
+# (ci-images.sh) records "<svc> <repo>@sha256:..." per pushed image, and
+# deploy.sh reads the SAME default path to pin every job's image_ref var.
+# Gitignored — it is an audit record of one deploy, not source.
+DIGEST_MANIFEST="${DIGEST_MANIFEST:-${CLUSTER_DIR}/images.digests}"
+export DIGEST_MANIFEST
 NODE_IMAGE=kardamom-node:ci
 # NOTE: kardamom-recorder was removed (durability is now archive-at-the-sealer);
 # the sealer image carries the durability sidecar.

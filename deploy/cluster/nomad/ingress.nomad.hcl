@@ -33,6 +33,19 @@ variable "ack_policy" {
   default     = "on-offer"
 }
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo@sha256:... reference captured at push time (deploy/cluster/
+# images.digests), so the task runs exactly the bytes that deploy pushed.
+# The empty default falls back to the mutable :dev tag in the task config —
+# a dev affordance for manual `nomad job run` during debugging, NOT a
+# production path (a mutable tag lets anyone with registry push access change
+# what the next restart runs).
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 job "ingress" {
   datacenters = ["dc1"]
   type        = "service"
@@ -97,12 +110,19 @@ job "ingress" {
         ulimit {
           nofile = "65536:65536"
         }
-        image        = "192.168.56.10:5000/kardamom-ingress:dev"
-        # Always pull the freshly-built image: the mutable :dev tag would otherwise
-        # let Nomad reuse a stale node-cached layer across rebuilds (caused a
-        # crash-retry storm that stalled the deploy).
-        force_pull    = true
-        network_mode = "host"
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-ingress:dev"
+        # force_pull is kept for the mutable-:dev FALLBACK path: without it
+        # Nomad can reuse a stale node-cached layer across rebuilds (caused a
+        # crash-retry storm that stalled the deploy). For the digest-pinned
+        # path it is redundant but harmless — a digest names immutable bytes,
+        # so a re-pull can only fetch identical content.
+        force_pull = true
+        # Read-only root filesystem (attested-identity P0.3): the ingress
+        # writes only to the bind-mounted aeron dir and Nomad's alloc/local/
+        # secrets mounts (which stay writable); integrity/fs-drift.sh expects
+        # an empty docker diff. Validated by the cluster-e2e suite.
+        readonly_rootfs = true
+        network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
         ]

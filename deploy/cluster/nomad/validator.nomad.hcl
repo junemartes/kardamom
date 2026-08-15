@@ -17,6 +17,17 @@
 # NOTE: this job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory (scripts/deploy.sh does this).
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo@sha256:... reference captured at push time (deploy/cluster/
+# images.digests). The empty default falls back to the mutable :dev tag in
+# the task config — a dev affordance for manual `nomad job run` during
+# debugging, NOT a production path.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 job "validator" {
   datacenters = ["dc1"]
   type        = "service"
@@ -74,10 +85,16 @@ job "validator" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.10:5000/kardamom-validator:dev"
-        # Always pull the freshly-built image (mutable :dev tag; see executor job).
-        force_pull   = true
-        network_mode = "host"
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-validator:dev"
+        # force_pull kept for the mutable-:dev fallback path (see executor
+        # job); redundant-but-harmless for the digest-pinned path.
+        force_pull = true
+        # Read-only rootfs (attested-identity P0.3): the validator's writable
+        # surfaces — its state dir under the shared mount, the checkpoint
+        # staging dir, the aeron dir — are all explicit bind mounts below,
+        # plus Nomad's alloc/local/secrets mounts. Validated by cluster-e2e.
+        readonly_rootfs = true
+        network_mode    = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",
           "/opt/kardamom/state:/opt/kardamom/state",

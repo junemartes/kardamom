@@ -49,6 +49,47 @@ if ! command -v nomad >/dev/null 2>&1; then
   exit 1
 fi
 
+# --- digest-pinned image refs (attested-identity P0.1) -----------------------
+# The image build/push step (ci-images.sh push_image, or `make images`) records
+# each pushed image's registry digest in the manifest below, one line per
+# image: "<svc> <repo>@sha256:...". Every kardamom job exposes an `image_ref`
+# HCL variable; passing the digest ref through it makes the task run the EXACT
+# bytes this deploy pushed (a digest is immutable — nobody who can push to the
+# registry can change what a restart runs). The manifest + this deploy log are
+# the audit record; `deploy/cluster/scripts/integrity/image-drift.sh` checks
+# the running fleet against the manifest later.
+#
+# Fallback: a missing manifest (or missing per-service line) leaves image_ref
+# empty and the job runs its mutable :dev tag default. That fallback exists so
+# a manual `nomad job run <job>.nomad.hcl` during debugging still works — it
+# is a DEV AFFORDANCE, not a production path, and it is loudly warned about.
+DIGEST_MANIFEST="${DIGEST_MANIFEST:-${CLUSTER_DIR}/images.digests}"
+if [[ -f "${DIGEST_MANIFEST}" ]]; then
+  echo "==> Image digests:  ${DIGEST_MANIFEST}"
+  sed 's/^/    /' "${DIGEST_MANIFEST}"
+else
+  echo "WARNING: digest manifest not found at ${DIGEST_MANIFEST}." >&2
+  echo "         Jobs will run mutable :dev tags (dev fallback, NOT a" >&2
+  echo "         production path). Run the image build/push step to pin." >&2
+fi
+
+# Populate IMAGE_REF_ARGS=(-var image_ref=<repo>@sha256:...) for a service, or
+# leave it empty (tag fallback) when the manifest has no line for it. The last
+# matching line wins, mirroring push order.
+IMAGE_REF_ARGS=()
+image_ref_args() {
+  local svc="$1" ref=""
+  IMAGE_REF_ARGS=()
+  if [[ -f "${DIGEST_MANIFEST}" ]]; then
+    ref="$(awk -v s="${svc}" '$1 == s { r = $2 } END { print r }' "${DIGEST_MANIFEST}")"
+  fi
+  if [[ -n "${ref}" ]]; then
+    IMAGE_REF_ARGS=(-var "image_ref=${ref}")
+  else
+    echo "WARNING: no pinned digest for '${svc}'; its job falls back to the mutable :dev tag." >&2
+  fi
+}
+
 # --- helpers ----------------------------------------------------------------
 
 run_job() {
@@ -103,7 +144,8 @@ wait_running() {
 # --- 1. Aeron substrate (system job on all nodes) ---------------------------
 echo
 echo "### Phase 1: Aeron substrate"
-run_job "aeron.system.nomad.hcl"
+image_ref_args aeron
+run_job "aeron.system.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # Generous timeout: every worker node force-pulls the aeron image from the single
 # in-cluster registry at once, slow under CI CPU contention (the dedicated cluster
 # nodes added more concurrent pullers). Comes up well under this cap on a healthy
@@ -190,24 +232,32 @@ if [[ -n "${KARDAMOM_CLUSTER_SNAPSHOT_S:-}" ]]; then
   echo "==> cluster: snapshot interval override: ${KARDAMOM_CLUSTER_SNAPSHOT_S}s"
   CLUSTER_ARGS+=(-var "cluster_snapshot_interval_s=${KARDAMOM_CLUSTER_SNAPSHOT_S}")
 fi
-run_job "cluster.nomad.hcl" "${CLUSTER_ARGS[@]}"
+image_ref_args cluster
+CLUSTER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
+run_job "cluster.nomad.hcl" ${CLUSTER_ARGS[@]+"${CLUSTER_ARGS[@]}"}
 wait_running "cluster" 300
-run_job "sequencer.nomad.hcl"
+image_ref_args sequencer
+run_job "sequencer.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # Bring the ingress up BEFORE the executor. The ingress is the tx_receipts
 # SUBSCRIBER and the executor is the must-deliver PUBLISHER; starting the
 # subscriber first means the executor's receipt publications connect immediately
 # instead of stalling against a not-yet-present subscriber during bring-up (which
 # would back-pressure the exec→commit channel and freeze state). The ingress also
 # subscribes the quorum watermark (from the already-running aggregator) here.
-run_job "ingress.nomad.hcl"
+image_ref_args ingress
+run_job "ingress.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 wait_running "ingress" 240
-run_job "executor.nomad.hcl"
+image_ref_args executor
+run_job "executor.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # The validator is a passive follower (subscribes to the same multicast
 # channels + its own cluster egress session); it can come up alongside the
 # executors — it re-executes from genesis regardless of join order.
-run_job "validator.nomad.hcl"
+image_ref_args validator
+run_job "validator.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
+image_ref_args da-watcher
+DA_WATCHER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
 run_job "da-watcher.nomad.hcl" ${DA_WATCHER_ARGS[@]+"${DA_WATCHER_ARGS[@]}"}
 
 # The cluster was already waited-on above (before the sequencer connected).
@@ -223,6 +273,8 @@ BATCHER_ARGS=()
 if [[ -n "${SETTLEMENT_ADDRESS}" ]]; then
   BATCHER_ARGS=(-var "settlement_address=${SETTLEMENT_ADDRESS}")
 fi
+image_ref_args batcher
+BATCHER_ARGS+=(${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"})
 run_job "batcher.nomad.hcl" ${BATCHER_ARGS[@]+"${BATCHER_ARGS[@]}"}
 if [[ -n "${SETTLEMENT_ADDRESS}" ]]; then
   wait_running "batcher" 240

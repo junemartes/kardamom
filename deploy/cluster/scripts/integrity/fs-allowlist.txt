@@ -1,0 +1,41 @@
+# =============================================================================
+# fs-allowlist.txt — expected-writable rootfs paths per kardamom service.
+# =============================================================================
+# Consumed by fs-drift.sh. Format, one entry per line:
+#
+#   <service-glob> <absolute-path-prefix>
+#
+# <service-glob> matches the short service key (image basename minus the
+# kardamom- prefix: aeron, cluster, ingress, sequencer, executor, validator,
+# da-watcher, batcher); '*' matches every service. A `docker diff` line is
+# allowed when its path equals the prefix or lives under it. Parent-directory
+# 'C' (change) entries produced by a write deeper down are handled by
+# fs-drift.sh itself (an ancestor of an allowed prefix is tolerated for C
+# lines only).
+#
+# IMPORTANT SCOPE NOTE: docker diff sees only the container's OWN rootfs
+# layers. The services' real data paths — /opt/kardamom/{aeron-mount,archive,
+# state,checkpoints,cluster,batcher} — are BIND MOUNTS declared in the job
+# specs and never appear in the diff, which is exactly why an empty (or
+# allowlisted-only) diff is the expected steady state. Entries below exist for
+# the writes that happen INSIDE the rootfs.
+#
+# Derived from the jobs' mount/volume stanzas + the images' runtime behavior:
+#   * the JVM images (aeron = ArchivingMediaDriver, cluster = Raft sealer)
+#     write /tmp (hsperfdata_<user>, JVM temp files) — the reason those two
+#     jobs do NOT set readonly_rootfs yet (see their .nomad.hcl comments);
+#   * the Rust service images are expected to write NOTHING in the rootfs
+#     (readonly_rootfs = true enforces it); /tmp is still allowlisted
+#     cluster-wide as the conventional scratch path so a future legitimate
+#     tmpfs mount does not read as drift.
+# Anything else is a finding. When rollout finds a noisy path: either mount it
+# writable explicitly in the job spec (and add it here with a comment), or fix
+# the service — do not blanket-widen this file.
+
+# conventional scratch space (JVM hsperfdata/tmp; tolerated everywhere)
+* /tmp
+
+# JVM ArchivingMediaDriver: driver heartbeat/loss reports under the image's
+# default aeron mount point if a stray default-path client starts before the
+# env overrides land (observed once during bring-up; harmless).
+aeron /aeron-mount
