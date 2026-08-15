@@ -58,9 +58,9 @@ fi
 # can push to the registry can change what a restart runs). The COMBINED
 # repo:tag@digest form matters: Nomad 1.9.5's docker driver mis-parses a bare
 # repo@digest on a port-carrying registry host ("invalid reference format" at
-# pull; see ci-images.sh push_image). The manifest + this deploy log are
-# the audit record; `deploy/cluster/scripts/integrity/image-drift.sh` checks
-# the running fleet against the manifest later.
+# pull; see ci-images.sh push_image). The manifest + this deploy log are the
+# audit record of what this deploy pinned; operational tooling can audit the
+# running fleet against them later.
 #
 # Fallback: a missing manifest (or missing per-service line) leaves image_ref
 # empty and the job runs its mutable :dev tag default. That fallback exists so

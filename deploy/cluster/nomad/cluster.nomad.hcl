@@ -117,8 +117,7 @@ job "cluster" {
         # outside the bind mounts — /tmp (hsperfdata, JVM temp files) at
         # minimum. Turning it on needs a tmpfs mount for /tmp validated by a
         # full cluster-e2e pass first; a wrong guess here wedges the Raft
-        # sealer, which is the whole pipeline. fs-drift.sh's allowlist
-        # documents the same expected-writable set.
+        # sealer, which is the whole pipeline.
         network_mode = "host"
         volumes = [
           "/opt/kardamom/aeron-mount:/opt/kardamom/aeron-mount",

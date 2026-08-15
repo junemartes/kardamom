@@ -81,8 +81,8 @@ validate:
 	@rc=0; \
 	yamllint ansible/ || rc=1; \
 	ansible-lint ansible/ || rc=1; \
-	for s in scripts/*.sh scripts/integrity/*.sh spire/*.sh; do bash -n "$$s" || rc=1; done; \
-	for j in nomad/*.hcl spire/*.nomad.hcl; do echo "== $$j =="; nomad job validate "$$j" || rc=1; done; \
+	for s in scripts/*.sh; do bash -n "$$s" || rc=1; done; \
+	for j in nomad/*.hcl; do echo "== $$j =="; nomad job validate "$$j" || rc=1; done; \
 	./scripts/check-contract.py || rc=1; \
 	exit $$rc
 

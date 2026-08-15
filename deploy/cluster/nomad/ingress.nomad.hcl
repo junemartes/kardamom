@@ -121,8 +121,8 @@ job "ingress" {
         force_pull = true
         # Read-only root filesystem (attested-identity P0.3): the ingress
         # writes only to the bind-mounted aeron dir and Nomad's alloc/local/
-        # secrets mounts (which stay writable); integrity/fs-drift.sh expects
-        # an empty docker diff. Validated by the cluster-e2e suite.
+        # secrets mounts (which stay writable), so its docker diff should be
+        # empty. Validated by the cluster-e2e suite.
         readonly_rootfs = true
         network_mode    = "host"
         volumes = [
