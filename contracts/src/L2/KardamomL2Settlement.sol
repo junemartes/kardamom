@@ -75,6 +75,8 @@ contract KardamomL2Settlement is KardamomUUPSBase {
         batches[newIndex] = BatchEntry({
             l2BlockStart: l2BlockStart, l2BlockEnd: l2BlockEnd, recordsCommitment: recordsCommitment
         });
-        emit BatchPosted(newIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd, recordsCommitment);
+        emit BatchPosted(
+            newIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd, recordsCommitment
+        );
     }
 }
