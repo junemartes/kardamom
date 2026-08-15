@@ -70,11 +70,11 @@ contract KardamomL2Settlement is KardamomUUPSBase {
         if (blobVersionedHashes.length == 0) revert EmptyBlobs();
         if (l2BlockEnd < l2BlockStart) revert BadBlockRange();
 
-        uint64 newIndex = prevBatchIndex + 1;
-        lastBatchIndex = newIndex;
-        batches[newIndex] = BatchEntry({
+        uint64 next = prevBatchIndex + 1;
+        lastBatchIndex = next;
+        batches[next] = BatchEntry({
             l2BlockStart: l2BlockStart, l2BlockEnd: l2BlockEnd, recordsCommitment: recordsCommitment
         });
-        emit BatchPosted(newIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd, recordsCommitment);
+        emit BatchPosted(next, blobVersionedHashes, l2BlockStart, l2BlockEnd, recordsCommitment);
     }
 }
