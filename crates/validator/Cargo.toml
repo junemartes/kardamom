@@ -49,6 +49,7 @@ path = "src/bin/kardamom-validator/main.rs"
 alloy-consensus.workspace = true
 alloy-eips.workspace = true
 crossbeam-channel = "0.5"
+tempfile.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true

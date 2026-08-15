@@ -23,7 +23,7 @@
 use alloy_primitives::{B256, U256};
 use alloy_trie::{BranchNodeCompact, HashBuilder, Nibbles};
 use signet_libmdbx::Database;
-use signet_libmdbx::tx::aliases::RwTxSync;
+use signet_libmdbx::TxSync;
 
 use super::cursor::{collect_hashed_accounts_under, collect_hashed_storage_under, get_branch_node};
 use super::prefix_set::PrefixSet;
@@ -53,8 +53,8 @@ struct WalkLog {
 /// Compute the account-trie root incrementally. `account_trie`/`hashed_accounts`
 /// are the table handles; `prefix_set` holds `keccak(addr)` of every changed
 /// account. Returns `(root, updates)`.
-pub(crate) fn account_root(
-    tx: &RwTxSync,
+pub(crate) fn account_root<K: crate::trie::cursor::ReadKind>(
+    tx: &TxSync<K>,
     account_trie: Database,
     hashed_accounts: Database,
     prefix_set: &PrefixSet,
@@ -78,8 +78,8 @@ pub(crate) fn account_root(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk_account(
-    tx: &RwTxSync,
+fn walk_account<K: crate::trie::cursor::ReadKind>(
+    tx: &TxSync<K>,
     account_trie: Database,
     hashed_accounts: Database,
     path: &Nibbles,
@@ -145,8 +145,8 @@ fn walk_account(
 }
 
 /// Compute one account's storage-trie root incrementally.
-pub(crate) fn storage_root(
-    tx: &RwTxSync,
+pub(crate) fn storage_root<K: crate::trie::cursor::ReadKind>(
+    tx: &TxSync<K>,
     storage_trie: Database,
     hashed_storage: Database,
     account_hash: &B256,
@@ -170,8 +170,8 @@ pub(crate) fn storage_root(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn walk_storage(
-    tx: &RwTxSync,
+fn walk_storage<K: crate::trie::cursor::ReadKind>(
+    tx: &TxSync<K>,
     storage_trie: Database,
     hashed_storage: Database,
     account_hash: &B256,
@@ -222,6 +222,53 @@ fn walk_storage(
         }
     }
     Ok(())
+}
+
+/// Proof-generation entry (`trie::proofs`): the account walk from the root
+/// with a caller-owned `HashBuilder` (proof retainer attached) and a
+/// discarded log — proof walks mutate nothing and apply nothing.
+pub(crate) fn walk_account_for_proofs<K: crate::trie::cursor::ReadKind>(
+    tx: &TxSync<K>,
+    account_trie: Database,
+    hashed_accounts: Database,
+    prefix_set: &PrefixSet,
+    hb: &mut HashBuilder,
+    account_leaf: &dyn Fn(&super::AccountTrieParts) -> Vec<u8>,
+) -> Result<(), StateError> {
+    let mut log = WalkLog::default();
+    walk_account(
+        tx,
+        account_trie,
+        hashed_accounts,
+        &Nibbles::new(),
+        prefix_set,
+        hb,
+        &mut log,
+        account_leaf,
+    )
+}
+
+/// Proof-generation entry: one storage trie's walk, same contract as
+/// [`walk_account_for_proofs`].
+pub(crate) fn walk_storage_for_proofs<K: crate::trie::cursor::ReadKind>(
+    tx: &TxSync<K>,
+    storage_trie: Database,
+    hashed_storage: Database,
+    account_hash: &B256,
+    prefix_set: &PrefixSet,
+    hb: &mut HashBuilder,
+) -> Result<(), StateError> {
+    let mut log = WalkLog::default();
+    walk_storage(
+        tx,
+        storage_trie,
+        hashed_storage,
+        account_hash,
+        &Nibbles::new(),
+        prefix_set,
+        hb,
+        &mut log,
+    )
 }
 
 /// Storage leaf value = RLP of the slot's U256 (matches `alloy_trie::root`).
