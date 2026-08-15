@@ -2304,10 +2304,9 @@ fn block_tail<S: StateDatabase + Sync>(
         };
         let hash_threads = ctx.queues.len().saturating_sub(1).max(1).min(n_res.max(1));
         let chunk = n_res.div_ceil(hash_threads);
-        type AccEntry = ((alloy_primitives::Address, u32), (u64, U256, B256));
-        type StoEntry = (((alloy_primitives::Address, B256), u32), U256);
-        type AccMap = std::collections::BTreeMap<alloy_primitives::Address, (u64, U256, B256)>;
-        type StoMap = std::collections::BTreeMap<(alloy_primitives::Address, B256), U256>;
+        type AccMap =
+            kardamom_exec_core::delta::DeltaMap<alloy_primitives::Address, (u64, U256, B256)>;
+        type StoMap = kardamom_exec_core::delta::DeltaMap<(alloy_primitives::Address, B256), U256>;
         let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
         let (acc_map, sto_map, sink_final, fold_ns): (
             AccMap,
@@ -2325,25 +2324,27 @@ fn block_tail<S: StateDatabase + Sync>(
                     });
                 }
                 let t0 = std::time::Instant::now();
+                // Plain upserts in canonical order — "later tx wins" is
+                // the map's own semantics; no sort, no index tags, no
+                // tree construction. This is the whole point of the
+                // DeltaMap representation change.
                 let mut sink_final: Option<(u64, U256, B256)> = None;
-                let mut acc_v: Vec<AccEntry> = Vec::with_capacity(results_ref.len() * 2);
-                let mut sto_v: Vec<StoEntry> = Vec::with_capacity(results_ref.len());
-                for (i, r) in results_ref.iter().enumerate() {
+                let mut acc =
+                    AccMap::with_capacity_and_hasher(results_ref.len() * 2, Default::default());
+                let mut sto =
+                    StoMap::with_capacity_and_hasher(results_ref.len(), Default::default());
+                for r in results_ref.iter() {
                     for (a, v) in r.ws.accounts.iter() {
                         if *a == FEE_SINK {
                             sink_final = Some(*v);
                         } else {
-                            acc_v.push(((*a, i as u32), *v));
+                            acc.insert(*a, *v);
                         }
                     }
                     for (k, v) in r.ws.storage.iter() {
-                        sto_v.push(((*k, i as u32), *v));
+                        sto.insert(*k, *v);
                     }
                 }
-                acc_v.sort_unstable_by_key(|e| e.0);
-                sto_v.sort_unstable_by_key(|e| e.0);
-                let acc: AccMap = acc_v.into_iter().map(|((a, _), v)| (a, v)).collect();
-                let sto: StoMap = sto_v.into_iter().map(|((k, _), v)| (k, v)).collect();
                 (acc, sto, sink_final, t0.elapsed().as_nanos() as u64)
             });
             // Hash lanes: read ws, write ONLY the side array.

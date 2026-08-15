@@ -14,7 +14,6 @@
 //! (EIP-6780 reduced its observable effect to balance transfer within the
 //! same tx). Add a `destroyed` flag when the runtime starts requiring it.
 
-use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use alloy_primitives::{Address, B256, U256};
@@ -166,10 +165,22 @@ impl WriteSet {
 /// BlockDelta` at block close.
 #[derive(Debug, Default, Clone)]
 pub struct PendingDelta {
-    pub accounts: BTreeMap<Address, (u64, U256, B256)>,
-    pub storage: BTreeMap<(Address, B256), U256>,
-    pub code: BTreeMap<B256, Bytes>,
+    // HASH maps, deliberately (were BTreeMaps): the accumulator's jobs
+    // are upserts, gets, and unordered iteration — nothing here needs
+    // order, and B-tree CONSTRUCTION was measured as the commit tail's
+    // single largest irreducible cost (~170ns/node; it survived input
+    // reduction, index-sort, and two chunk+merge parallelizations).
+    // The ONE ordered consumer — the state writer's cursor walk — gets
+    // its order from `finalize`, which sorts ONCE, deduped, off the
+    // execution-critical path. Iteration order here is nondeterministic;
+    // any serialization MUST go through `finalize` (it does).
+    pub accounts: DeltaMap<Address, (u64, U256, B256)>,
+    pub storage: DeltaMap<(Address, B256), U256>,
+    pub code: DeltaMap<B256, Bytes>,
 }
+
+/// The accumulator's map type — no_std-friendly hash map.
+pub type DeltaMap<K, V> = hashbrown::HashMap<K, V, hashbrown::DefaultHashBuilder>;
 
 impl PendingDelta {
     pub fn new() -> Self {
@@ -215,7 +226,12 @@ impl PendingDelta {
     /// `eth_getTransactionReceipt` answers from durable state after a restart
     /// (#109: this was hardcoded empty and the read path was dead).
     pub fn finalize(self, block_number: u64, receipts: Vec<kardamom_types::Receipt>) -> BlockDelta {
-        let accounts = self
+        // THE canonical ordering point: the accumulator maps are
+        // unordered; every serialized/persisted view of a block delta
+        // passes through here and leaves sorted. Cost: one sort of the
+        // DEDUPED entry set (~0.5ms for 8k entries) — paid once, off the
+        // execution-critical path, instead of B-tree construction on it.
+        let mut accounts: Vec<AccountChange> = self
             .accounts
             .into_iter()
             .map(|(address, (nonce, balance, code_hash))| AccountChange {
@@ -225,7 +241,8 @@ impl PendingDelta {
                 code_hash,
             })
             .collect();
-        let storage = self
+        accounts.sort_unstable_by_key(|a| a.address);
+        let mut storage: Vec<StorageChange> = self
             .storage
             .into_iter()
             .map(|((address, key), value)| StorageChange {
@@ -234,11 +251,13 @@ impl PendingDelta {
                 value,
             })
             .collect();
-        let code = self
+        storage.sort_unstable_by_key(|s| (s.address, s.key));
+        let mut code: Vec<CodeEntry> = self
             .code
             .into_iter()
             .map(|(code_hash, code)| CodeEntry { code_hash, code })
             .collect();
+        code.sort_unstable_by_key(|c| c.code_hash);
         BlockDelta {
             block_number,
             accounts,
