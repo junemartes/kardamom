@@ -466,7 +466,7 @@ fn cheap_blocks_are_declined_and_still_match() {
             // block that runs in parallel is the one taken before any
             // measurement exists.
             parallel_worth_ns: u64::MAX,
-            dispatch_by_sender: false,
+            ..Default::default()
         },
         |pool| {
             let out1 = pool
@@ -524,7 +524,7 @@ fn an_open_gate_never_declines() {
             workers: 4,
             prune_batch: 8,
             parallel_worth_ns: 0,
-            dispatch_by_sender: false,
+            ..Default::default()
         },
         |pool| {
             let mut base = PendingDelta::new();
@@ -546,4 +546,57 @@ fn an_open_gate_never_declines() {
             }
         },
     );
+}
+
+/// EAGER CHAIN MODE: a hot domain's chain must stream into its owner's
+/// FIFO at admission — ordered by queue position, not by edges — and
+/// still be byte-identical. The RMW counter makes any ordering mistake
+/// visible in state (the final count and every intermediate receipt
+/// depend on execution order), so this cannot pass by luck.
+#[test]
+fn hot_chain_streams_through_the_fifo() {
+    let sg = signers(3);
+    let database = db(&sg);
+    // 24 increments of one slot: a single 24-link chain interleaved with
+    // three 8-link sender chains, all hashing to the same worker.
+    let envs: Vec<TxEnvelope> = (0..8u64)
+        .flat_map(|n| sg.iter().map(move |s| (s, n)).collect::<Vec<_>>())
+        .map(|(s, n)| tx(s, n, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+        .collect();
+    let recs = records(envs);
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let stats = counter_stats();
+    for workers in [1, 4] {
+        let out = execute_block_stm(&database, None, env(), &recs, &stats, workers).unwrap();
+        assert_eq!(out.wounds, 0, "an ordered chain must never wound");
+        assert_eq!(
+            out.dispatch.iter().filter(|c| **c > 0).count(),
+            1,
+            "one hot domain must land on one worker: {:?}",
+            out.dispatch
+        );
+        // The point of eager mode: the chain is ordered by FIFO position.
+        // 23 counter links + sender links, minus whatever had already
+        // completed at admission — edges should be (near) zero and the
+        // covered count substantial.
+        assert!(
+            out.fifo_covered >= 20,
+            "chain links should be FIFO-covered, got {} (edges {})",
+            out.fifo_covered,
+            out.edges
+        );
+        assert!(
+            out.edges <= 4,
+            "eager mode should elide chain edges, got {}",
+            out.edges
+        );
+        assert_identical(
+            &seq,
+            &out.receipts,
+            &out.delta,
+            &format!("eager chain w={workers}"),
+        );
+    }
+    let key = (COUNTER, B256::ZERO);
+    assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
 }

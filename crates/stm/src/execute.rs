@@ -369,6 +369,10 @@ pub struct StmOutcome {
     /// Account writes whose domain belongs to another worker.
     pub writes_own: u64,
     pub writes_foreign: u64,
+    /// Chain links ordered by FIFO position instead of a DAG edge, and
+    /// how often a taken tx had to wait on a stolen FIFO predecessor.
+    pub fifo_covered: u64,
+    pub fifo_stalls: u64,
     /// ⊤ (cold, untrained-selector) txs — they wait out the prefix.
     pub cold: usize,
     /// Live-DAG edges created across the block (only against predecessors
@@ -651,6 +655,11 @@ pub struct Metrics {
     /// transfer is foreign has been wrong twice; this counts it.
     pub writes_own: std::sync::atomic::AtomicU64,
     pub writes_foreign: std::sync::atomic::AtomicU64,
+    /// Predecessors covered by FIFO order instead of an edge, and takes
+    /// of a queued tx that found a FIFO predecessor still running (a
+    /// steal moved it) and had to wait.
+    pub fifo_covered: std::sync::atomic::AtomicU64,
+    pub fifo_stalls: std::sync::atomic::AtomicU64,
 }
 
 /// Pool configuration.
@@ -677,6 +686,12 @@ pub struct PoolConfig {
     /// policy — the DAG still takes edges on every cell either way — so
     /// it cannot change results, only locality.
     pub dispatch_by_sender: bool,
+    /// Enqueue a tx at ADMISSION when every unfinished predecessor is
+    /// already released to the same worker's FIFO — queue order then
+    /// enforces the chain and the edge/prune hand-off is skipped
+    /// entirely. Per-link hand-off through batched pruning is the prime
+    /// suspect for the span floor (chains release one tx per prune).
+    pub eager_chain: bool,
 }
 
 /// MEASURED default (uniswap 8-pair, 16x500, 8 workers): batching 8
@@ -694,6 +709,7 @@ impl Default for PoolConfig {
             prune_batch: DEFAULT_PRUNE_BATCH,
             parallel_worth_ns: PARALLEL_WORTH_NS,
             dispatch_by_sender: false,
+            eager_chain: true,
         }
     }
 }
@@ -733,6 +749,16 @@ struct Node {
     /// The thread this tx was assigned. Written before any edge naming it
     /// exists, so whoever dispatches it reads a settled value.
     worker: std::sync::atomic::AtomicUsize,
+    /// Predecessors covered by FIFO ORDER instead of an edge (eager chain
+    /// mode): they were already released to THIS tx's own queue when this
+    /// tx was admitted, so queue position orders them — no edge, no prune
+    /// hand-off. Written only by the serial feed before the tx can be
+    /// released; read by whoever takes the tx from a queue, which must
+    /// verify each one has a result before executing (work stealing can
+    /// move a FIFO predecessor to another thread mid-flight, and the
+    /// verification is what makes that race benign rather than a data
+    /// race on state).
+    fifo_preds: Mutex<Vec<u32>>,
 }
 
 /// Per-block shared context; workers hold an `Arc` for the block's
@@ -815,17 +841,30 @@ struct BlockCtx<S: StateDatabase> {
 impl<S: StateDatabase> BlockCtx<S> {
     /// Steal one ready tx from the longest other queue.
     ///
-    /// SAFE BY CONSTRUCTION, and worth spelling out: a tx only ever
-    /// reaches a queue once its indegree hit zero, i.e. every predicted
-    /// predecessor has finished and published — including its
-    /// same-domain ones, which get real edges like any other. So queue
-    /// position carries NO ordering obligation; the domain-hashed
-    /// assignment is a locality hint, not a correctness mechanism, and
-    /// any thread may run any ready tx.
+    /// Safe by VERIFICATION: under eager chain mode queue position DOES
+    /// carry an ordering obligation (FIFO-covered predecessors have no
+    /// edge), so anything taken from a queue — here or by its owner — is
+    /// checked runnable first via `fifo_ready`. A mid-chain link fails
+    /// the check and stays put.
     ///
     /// Taken from the BACK, leaving the owner its front: the owner's
     /// front is the oldest (most likely to have warm state), and the two
     /// ends rarely contend.
+    /// May `idx` execute right now? True when every FIFO-covered
+    /// predecessor has a result. Ordinary FIFO drain makes this true by
+    /// construction (the predecessor sat AHEAD in the same queue); it is
+    /// false only when a steal moved a predecessor to another thread and
+    /// that thread is still running it.
+    fn fifo_ready(&self, idx: u32) -> bool {
+        let preds = self.nodes[idx as usize]
+            .fifo_preds
+            .lock()
+            .expect("fifo_preds poisoned");
+        preds
+            .iter()
+            .all(|p| self.results[*p as usize].get().is_some())
+    }
+
     fn steal(&self, thief: usize) -> Option<u32> {
         let mut best: Option<(usize, usize)> = None;
         for (w, qh) in self.queues.iter().enumerate() {
@@ -845,7 +884,20 @@ impl<S: StateDatabase> BlockCtx<S> {
         }
         let (victim, _) = best?;
         let mut q = self.queues[victim].q.lock().expect("queue poisoned");
-        q.pop_back()
+        let cand = q.pop_back()?;
+        // Eager chain mode voids the old "everything queued is ready"
+        // invariant: a queued tx may depend on FIFO order the thief does
+        // not preserve. Steal only what is verifiably runnable NOW; a
+        // mid-chain link goes back where it was. This also makes deep
+        // chains naturally steal-proof, which is the right policy anyway —
+        // a chained queue has a busy owner, and migrating one serial link
+        // destroys the locality that domain dispatch exists to build.
+        if self.fifo_ready(cand) {
+            Some(cand)
+        } else {
+            q.push_back(cand);
+            None
+        }
     }
 
     /// Hand a READY tx to its assigned thread. Called only with no node
@@ -971,6 +1023,7 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     avg_tx_ns: std::cell::Cell<u64>,
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
+    eager_chain: bool,
     /// THE ARENA. Allocated once for the pool's lifetime and reused by
     /// every block: a node is addressed by its index, so nothing here is
     /// ever allocated, freed, or reference-counted per transaction. This
@@ -1018,6 +1071,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             avg_tx_ns: std::cell::Cell::new(0),
             parallel_worth_ns: cfg.parallel_worth_ns,
             dispatch_by_sender: cfg.dispatch_by_sender,
+            eager_chain: cfg.eager_chain,
             arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
@@ -1236,6 +1290,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             learned_tx_ns: self.avg_tx_ns.get(),
             writes_own: 0,
             writes_foreign: 0,
+            fifo_covered: 0,
+            fifo_stalls: 0,
             ..Default::default()
         })
     }
@@ -1416,10 +1472,13 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 )));
             }
             c.clear();
+            node.fifo_preds.lock().expect("fifo_preds poisoned").clear();
             node.open.store(true, Ordering::Release);
         }
         self.ctx.admitted.fetch_add(1, Ordering::SeqCst);
         let mut deg = 0u32;
+        let mut covered = 0u64;
+        let eager = self.pool.eager_chain;
         for p in preds {
             if p == idx {
                 continue;
@@ -1427,24 +1486,51 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             let pn = &self.ctx.nodes[p as usize];
             let mut list = pn.children.lock().expect("children poisoned");
             if pn.open.load(Ordering::Acquire) {
-                // Increment BEFORE publishing the edge: the matching
-                // decrement can only happen once this child is visible in
-                // p's list, so the add always precedes its own subtract.
-                self.ctx.nodes[i].indegree.fetch_add(1, Ordering::AcqRel);
-                list.push(idx);
-                deg += 1;
-                if pn.worker.load(Ordering::Acquire) == worker
+                // p is unfinished. If it was already RELEASED to this
+                // tx's own queue (indegree 0 is definitive: admission is
+                // serial, so p's guard was dropped long ago and a
+                // released node is never re-blocked), FIFO position
+                // orders it — record for take-time verification instead
+                // of an edge, and the whole prune hand-off for this link
+                // disappears. A stale read of a nonzero indegree only
+                // costs an edge, never correctness.
+                if eager
+                    && pn.worker.load(Ordering::Acquire) == worker
                     && pn.indegree.load(Ordering::Acquire) == 0
                 {
-                    self.ctx
-                        .metrics
-                        .redundant_edges
-                        .fetch_add(1, Ordering::Relaxed);
+                    self.ctx.nodes[i]
+                        .fifo_preds
+                        .lock()
+                        .expect("fifo_preds poisoned")
+                        .push(p);
+                    covered += 1;
+                } else {
+                    // Increment BEFORE publishing the edge: the matching
+                    // decrement can only happen once this child is
+                    // visible in p's list, so the add always precedes
+                    // its own subtract.
+                    self.ctx.nodes[i].indegree.fetch_add(1, Ordering::AcqRel);
+                    list.push(idx);
+                    deg += 1;
+                    if pn.worker.load(Ordering::Acquire) == worker
+                        && pn.indegree.load(Ordering::Acquire) == 0
+                    {
+                        self.ctx
+                            .metrics
+                            .redundant_edges
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
             // else: p already finished and published — no edge needed.
         }
         self.edges += deg as usize;
+        if covered > 0 {
+            self.ctx
+                .metrics
+                .fifo_covered
+                .fetch_add(covered, Ordering::Relaxed);
+        }
         // Drop the admission guard; if every registered predecessor has
         // already retired, this tx is ours to dispatch.
         let dispatch_now = self.ctx.nodes[i].indegree.fetch_sub(1, Ordering::AcqRel) == 1;
@@ -1740,6 +1826,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             learned_tx_ns: pool.avg_tx_ns.get(),
             writes_own: m.writes_own.load(Ordering::Relaxed),
             writes_foreign: m.writes_foreign.load(Ordering::Relaxed),
+            fifo_covered: m.fifo_covered.load(Ordering::Relaxed),
+            fifo_stalls: m.fifo_stalls.load(Ordering::Relaxed),
             cold,
             edges,
             dispatch,
@@ -1815,11 +1903,13 @@ fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize) {
 /// here in canonical order, so a chain drains without any cross-thread
 /// handoff; the DAG carries only the cross-domain edges.
 ///
-/// A worker never blocks on a dependency: a tx reaches a queue only once
-/// its indegree is zero, i.e. every predicted predecessor has FINISHED and
-/// published. Ordering is structural, so there is no wait-graph to
-/// deadlock — the canonical total order bounds every edge (low index →
-/// high), and completion only ever removes edges.
+/// A worker (almost) never blocks on a dependency: a tx reaches a queue
+/// once its EDGE indegree is zero, and its FIFO-covered predecessors sit
+/// ahead of it in the same queue — verified at take time (`fifo_ready`),
+/// which is what keeps a stolen predecessor from breaking the order. No
+/// wait-graph deadlock is possible: the canonical total order bounds every
+/// edge and every FIFO obligation (low index → high), and completion only
+/// ever removes them.
 fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
     let input = BlockInput {
         snapshot: &ctx.snapshots[worker % ctx.snapshots.len()],
@@ -1878,7 +1968,19 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     leave!(evm);
                 }
                 if let Some(i) = q.pop_front() {
-                    break i;
+                    if ctx.fifo_ready(i) {
+                        break i;
+                    }
+                    // A FIFO predecessor was stolen and is still running
+                    // on another thread — rare, and bounded by that tx's
+                    // execution time. Put the head back and yield rather
+                    // than burn the lock.
+                    q.push_front(i);
+                    ctx.metrics.fifo_stalls.fetch_add(1, Ordering::Relaxed);
+                    drop(q);
+                    std::thread::yield_now();
+                    q = qh.q.lock().expect("queue poisoned");
+                    continue;
                 }
                 // Dry. Apply any parked completions MYSELF before parking:
                 // this is what makes batching safe — the pool can never sit

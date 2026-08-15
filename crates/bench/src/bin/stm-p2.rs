@@ -82,6 +82,11 @@ struct Args {
     /// Dispatch on the sender instead of the first non-sender cell.
     #[arg(long, default_value_t = false)]
     dispatch_by_sender: bool,
+    /// Eager chain FIFO: enqueue at admission when all unfinished preds
+    /// are already in the same worker's queue. Disable for the A/B
+    /// baseline.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    eager_chain: bool,
 }
 
 fn records(base_idx: u64, envs: &[TxEnvelope]) -> Vec<(TxIndex, BPosition, TxEnvelope)> {
@@ -199,6 +204,7 @@ fn run_mdbx_ab(
     batches: &[usize],
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
+    eager_chain: bool,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -248,6 +254,7 @@ fn run_mdbx_ab(
                 prune_batch: batch,
                 parallel_worth_ns,
                 dispatch_by_sender,
+                eager_chain,
             };
             let mut stats = Stats::default();
             let mut global_idx = 0u64;
@@ -256,6 +263,7 @@ fn run_mdbx_ab(
                 (0u64, 0u64, 0u64, 0u64, 0u64);
             let (mut rt, mut rmv, mut rbase, mut rback) = (0u64, 0u64, 0u64, 0u64);
             let (mut w_own, mut w_foreign) = (0u64, 0u64);
+            let (mut fifo_cov, mut fifo_st, mut edges_sum) = (0u64, 0u64, 0u64);
             let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
@@ -324,6 +332,9 @@ fn run_mdbx_ab(
                         snap_us += snap_open;
                         w_own += out.writes_own;
                         w_foreign += out.writes_foreign;
+                        fifo_cov += out.fifo_covered;
+                        fifo_st += out.fifo_stalls;
+                        edges_sum += out.edges as u64;
                         rt += out.reads_total;
                         rmv += out.reads_mv_hit;
                         rbase += out.reads_base_hit;
@@ -395,6 +406,10 @@ fn run_mdbx_ab(
                     pub_us as f64 / 1000.0,
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
+                println!(
+                    "     chain: edges {} | fifo-covered {} | fifo-stalls {}",
+                    edges_sum, fifo_cov, fifo_st,
+                );
                 let w_all = (w_own + w_foreign).max(1);
                 println!(
                     "     account writes {} = own-domain {:.1}% | FOREIGN {:.1}%                      (foreign = written by >1 worker)",
@@ -422,6 +437,7 @@ fn main() -> anyhow::Result<()> {
         .parallel_worth_ns
         .unwrap_or(kardamom_stm::execute::PARALLEL_WORTH_NS);
     let dispatch_by_sender = a.dispatch_by_sender;
+    let eager_chain = a.eager_chain;
     let worker_counts: Vec<usize> = a
         .workers
         .split(',')
@@ -572,6 +588,7 @@ fn main() -> anyhow::Result<()> {
             &batches,
             parallel_worth_ns,
             dispatch_by_sender,
+            eager_chain,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()
@@ -704,6 +721,7 @@ fn main() -> anyhow::Result<()> {
                 prune_batch: batch,
                 parallel_worth_ns,
                 dispatch_by_sender,
+                eager_chain,
             };
             let mut row = Row {
                 workers: w,
