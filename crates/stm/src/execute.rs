@@ -175,6 +175,10 @@ struct MvView<'a, S: StateDatabase> {
     n_mv_hit: u64,
     n_base_hit: u64,
     n_backend: u64,
+    /// Wall nanoseconds inside the read path (basic/storage/code), split
+    /// out of `evm_ns` — the flamegraph inlines these frames into the
+    /// interpreter, so timing is the only way to see them.
+    n_read_ns: u64,
 }
 
 impl<'a, S: StateDatabase> MvView<'a, S> {
@@ -197,6 +201,7 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             n_mv_hit: 0,
             n_base_hit: 0,
             n_backend: 0,
+            n_read_ns: 0,
         }
     }
 
@@ -219,16 +224,18 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
         self.n_mv_hit = 0;
         self.n_base_hit = 0;
         self.n_backend = 0;
+        self.metrics
+            .read_ns
+            .fetch_add(self.n_read_ns, Ordering::Relaxed);
+        self.n_read_ns = 0;
     }
 }
 
-impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
-    type Error = kardamom_exec_core::executor::StateRefError;
-
-    fn basic(
+impl<'a, S: StateDatabase> MvView<'a, S> {
+    fn basic_inner(
         &mut self,
         address: alloy_primitives::Address,
-    ) -> Result<Option<AccountInfo>, Self::Error> {
+    ) -> Result<Option<AccountInfo>, kardamom_exec_core::executor::StateRefError> {
         if address == FEE_SINK {
             return Ok(self.sink_start.clone());
         }
@@ -267,7 +274,10 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
         Ok(a)
     }
 
-    fn code_by_hash(&mut self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+    fn code_by_hash_inner(
+        &mut self,
+        code_hash: B256,
+    ) -> Result<revm::state::Bytecode, kardamom_exec_core::executor::StateRefError> {
         // Content-addressed: no version, no record — memo both sources
         // (Bytecode clones are refcounted; the copy happens once).
         if let Some(c) = self
@@ -296,11 +306,11 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
         Ok(c)
     }
 
-    fn storage(
+    fn storage_inner(
         &mut self,
         address: alloy_primitives::Address,
         index: U256,
-    ) -> Result<U256, Self::Error> {
+    ) -> Result<U256, kardamom_exec_core::executor::StateRefError> {
         let key = B256::from(index.to_be_bytes::<32>());
         self.n_reads += 1;
         if let Some((ver, v)) = self.mv.read_slot(self.idx, &address, &key) {
@@ -325,6 +335,42 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
             .expect("base cache poisoned")
             .insert((address, key), v);
         Ok(v)
+    }
+}
+
+impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
+    type Error = kardamom_exec_core::executor::StateRefError;
+
+    // Thin TIMED wrappers: the read path inlines into the interpreter and
+    // is invisible to a sampling profiler, so `n_read_ns` carves it out of
+    // `evm_ns` by measurement. Two clock reads per state access (~50ns)
+    // against multi-microsecond questions.
+    fn basic(
+        &mut self,
+        address: alloy_primitives::Address,
+    ) -> Result<Option<AccountInfo>, Self::Error> {
+        let t0 = std::time::Instant::now();
+        let r = self.basic_inner(address);
+        self.n_read_ns += t0.elapsed().as_nanos() as u64;
+        r
+    }
+
+    fn code_by_hash(&mut self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+        let t0 = std::time::Instant::now();
+        let r = self.code_by_hash_inner(code_hash);
+        self.n_read_ns += t0.elapsed().as_nanos() as u64;
+        r
+    }
+
+    fn storage(
+        &mut self,
+        address: alloy_primitives::Address,
+        index: U256,
+    ) -> Result<U256, Self::Error> {
+        let t0 = std::time::Instant::now();
+        let r = self.storage_inner(address, index);
+        self.n_read_ns += t0.elapsed().as_nanos() as u64;
+        r
     }
 
     fn block_hash(&mut self, number: u64) -> Result<B256, Self::Error> {
@@ -373,6 +419,7 @@ pub struct StmOutcome {
     /// how often a taken tx had to wait on a stolen FIFO predecessor.
     pub fifo_covered: u64,
     pub fifo_stalls: u64,
+    pub read_us: u64,
     /// ⊤ (cold, untrained-selector) txs — they wait out the prefix.
     pub cold: usize,
     /// Live-DAG edges created across the block (only against predecessors
@@ -660,6 +707,8 @@ pub struct Metrics {
     /// steal moved it) and had to wait.
     pub fifo_covered: std::sync::atomic::AtomicU64,
     pub fifo_stalls: std::sync::atomic::AtomicU64,
+    /// Nanoseconds inside MvView's read path — carved OUT of `evm_ns`.
+    pub read_ns: std::sync::atomic::AtomicU64,
 }
 
 /// Pool configuration.
@@ -1292,6 +1341,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             writes_foreign: 0,
             fifo_covered: 0,
             fifo_stalls: 0,
+            read_us: 0,
             ..Default::default()
         })
     }
@@ -1828,6 +1878,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             writes_foreign: m.writes_foreign.load(Ordering::Relaxed),
             fifo_covered: m.fifo_covered.load(Ordering::Relaxed),
             fifo_stalls: m.fifo_stalls.load(Ordering::Relaxed),
+            read_us: m.read_ns.load(Ordering::Relaxed) / 1_000,
             cold,
             edges,
             dispatch,
@@ -2153,13 +2204,30 @@ pub fn execute_block_sequential<S: StateDatabase + Sync>(
     let mut receipts = Vec::with_capacity(txs.len());
     let mut delta = PendingDelta::new();
     let mut cumulative = 0u64;
+    // Diagnostic split, env-gated: how much of the sequential wall is
+    // `execute_tx` itself vs the delta fold around it. Comparing engines
+    // by their outer walls alone has misattributed overhead twice.
+    let timing = std::env::var_os("KARDAMOM_SEQ_TIMING").is_some();
+    let mut exec_ns = 0u64;
     for (i, (tx_idx, position, envelope)) in txs.iter().enumerate() {
+        let t0 = timing.then(std::time::Instant::now);
         let (receipt, ws) = scope.execute_tx(
             *tx_idx, *position, envelope, i as u64, cumulative, None, None,
         )?;
+        if let Some(t0) = t0 {
+            exec_ns += t0.elapsed().as_nanos() as u64;
+        }
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
+    }
+    if timing && !txs.is_empty() {
+        eprintln!(
+            "seq block {}: execute_tx sum {:.1}ms ({} txs)",
+            env.block_number,
+            exec_ns as f64 / 1e6,
+            txs.len()
+        );
     }
     Ok((receipts, delta))
 }
@@ -2253,8 +2321,13 @@ fn execute_one<S: StateDatabase>(
         .evm_ns
         .fetch_add(t_evm.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let gas_used = outcome.result.gas().tx_gas_used();
-    let (status, logs) = match &outcome.result {
-        ExecutionResult::Success { logs, .. } => (ReceiptStatus::Success, logs.clone()),
+    // Wire logs straight from the borrowed result — the intermediate
+    // `logs.clone()` (topics Vecs + data Bytes per log, every success)
+    // was allocation for its own sake.
+    let (status, wire_logs) = match &outcome.result {
+        ExecutionResult::Success { logs, .. } => {
+            (ReceiptStatus::Success, logs.iter().map(wire_log).collect())
+        }
         ExecutionResult::Revert { .. } => (ReceiptStatus::Revert, Vec::new()),
         ExecutionResult::Halt { reason, .. } => (ReceiptStatus::Halt(reason.clone()), Vec::new()),
     };
@@ -2269,20 +2342,22 @@ fn execute_one<S: StateDatabase>(
     metrics
         .publish_ns
         .fetch_add(t_pub.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    let fee_delta = ws
-        .accounts
-        .iter()
-        .find(|(a, _)| *a == FEE_SINK)
+    // One scan answers both sink questions.
+    let sink_entry = ws.accounts.iter().find(|(a, _)| *a == FEE_SINK);
+    let sink_touched = sink_entry.is_some();
+    let fee_delta = sink_entry
         .map(|(_, (_, b, _))| *b - sink_start_balance)
         .unwrap_or(U256::ZERO);
 
     let reads = {
-        // Take this tx's read log back out of the worker's view.
+        // Take this tx's read log back out of the worker's view, leaving
+        // capacity behind: a bare `take` leaves an EMPTY Vec, so every tx
+        // re-grew it 4 -> 8 -> 16 — three reallocations per transaction
+        // for a log whose size is stable within a workload.
         let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
-        std::mem::take(&mut db.reads)
+        let cap = db.reads.len().next_power_of_two().clamp(8, 64);
+        std::mem::replace(&mut db.reads, Vec::with_capacity(cap))
     };
-
-    let sink_touched = ws.accounts.iter().any(|(a, _)| *a == FEE_SINK);
     // Hashing now is pure waste when the commit pass must re-hash after
     // patching the accumulator's absolute balance.
     let write_set_hash = if sink_touched { B256::ZERO } else { ws.hash() };
@@ -2297,7 +2372,7 @@ fn execute_one<S: StateDatabase>(
         tx_type: kardamom_types::tx_type_of(&envelope.raw_tx),
         status: status.is_success(),
         gas_used,
-        logs: logs.iter().map(wire_log).collect(),
+        logs: wire_logs,
         write_set_hash,
         nonce,
         from: signer,

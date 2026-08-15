@@ -264,6 +264,7 @@ fn run_mdbx_ab(
             let (mut rt, mut rmv, mut rbase, mut rback) = (0u64, 0u64, 0u64, 0u64);
             let (mut w_own, mut w_foreign) = (0u64, 0u64);
             let (mut fifo_cov, mut fifo_st, mut edges_sum) = (0u64, 0u64, 0u64);
+            let mut read_us = 0u64;
             let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
@@ -340,6 +341,7 @@ fn run_mdbx_ab(
                         rbase += out.reads_base_hit;
                         rback += out.reads_backend;
                         evm_us += out.evm_us;
+                        read_us += out.read_us;
                         pub_us += out.publish_us;
                         gas += seq_receipts
                             .last()
@@ -401,8 +403,9 @@ fn run_mdbx_ab(
                     (commit as f64 - c_hash as f64 - c_delta as f64) / 1000.0,
                 );
                 println!(
-                    "     evm {:.1}ms | publish {:.1}ms | other {:.1}ms",
+                    "     evm {:.1}ms (read-path {:.1}ms) | publish {:.1}ms | other {:.1}ms",
                     evm_us as f64 / 1000.0,
+                    read_us as f64 / 1000.0,
                     pub_us as f64 / 1000.0,
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
