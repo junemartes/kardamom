@@ -721,6 +721,10 @@ fn run_mdbx_ab(
                     };
                     let recs = records(global_idx, blk);
                     global_idx += blk.len() as u64;
+                    let prog = std::env::var_os("KARDAMOM_BENCH_PROGRESS").is_some();
+                    if prog {
+                        eprintln!("[prog] block {bi}: seq start");
+                    }
 
                     // Both engines read the SAME snapshot, before it moves.
                     // KARDAMOM_STM_ONLY: run pool blocks back-to-back with no
@@ -764,6 +768,9 @@ fn run_mdbx_ab(
                     };
                     let s_ms = t0.elapsed().as_secs_f64() * 1e3;
 
+                    if prog {
+                        eprintln!("[prog] block {bi}: seq done, preparing");
+                    }
                     let prepared: Vec<_> = recs
                         .iter()
                         .map(|(t, _, en)| kardamom_stm::execute::prepare(en, *t, &stats))
@@ -784,6 +791,9 @@ fn run_mdbx_ab(
                     );
                     let a1 = alloc_snap();
                     let b1 = bucket_snap();
+                    if prog {
+                        eprintln!("[prog] block {bi}: pool submit");
+                    }
                     let out = pool.run_block_prepared(
                         views,
                         PendingDelta::new(),
@@ -821,6 +831,9 @@ fn run_mdbx_ab(
                             e.block_number,
                             w,
                         );
+                    }
+                    if prog {
+                        eprintln!("[prog] block {bi}: pool done");
                     }
                     if per_block && is_flow {
                         let avg_gas = seq_receipts.iter().map(|r| r.gas_used).sum::<u64>()
@@ -1136,6 +1149,53 @@ fn main() -> anyhow::Result<()> {
                     flows.push(blk);
                 }
                 (vec![setup], flows)
+            }
+            "partransfer" => {
+                // FULLY INDEPENDENT plain transfers: sender i (one tx per
+                // block, senders >= block_size) pays 1 wei to a FRESH
+                // address derived from (sender, block) that nothing else
+                // ever touches. No sender chains, no recipient overlap,
+                // no code — the pure 21k-gas rung. The structural
+                // question it isolates: how much of a ~2.5us transaction
+                // do the engine's serial parts (feed ~0.5-0.7us, fold)
+                // consume — i.e. the Amdahl ceiling for micro-txs.
+                use alloy_consensus::{SignableTransaction, TxLegacy};
+                use alloy_eips::eip2718::Encodable2718;
+                use alloy_network::TxSignerSync;
+                use alloy_primitives::{TxKind, keccak256};
+                let mut nonces = vec![0u64; signers.len()];
+                let mut flows = Vec::with_capacity(a.blocks);
+                for bidx in 0..a.blocks {
+                    let mut blk = Vec::with_capacity(a.block_size);
+                    for i in 0..a.block_size {
+                        let si = i % signers.len();
+                        let mut fresh = [0u8; 20];
+                        fresh[..8].copy_from_slice(&(bidx as u64).to_be_bytes());
+                        fresh[8..16].copy_from_slice(&(i as u64).to_be_bytes());
+                        fresh[19] = 0xEE;
+                        let mut tx = TxLegacy {
+                            chain_id: Some(a.chain_id),
+                            nonce: nonces[si],
+                            gas_price: 1_000_000_000,
+                            gas_limit: 21_000,
+                            to: TxKind::Call(alloy_primitives::Address::from(fresh)),
+                            value: U256::from(1u64),
+                            input: Default::default(),
+                        };
+                        nonces[si] += 1;
+                        let sig = signers[si].signer.sign_transaction_sync(&mut tx).unwrap();
+                        let env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+                        let raw = env.encoded_2718();
+                        blk.push(TxEnvelope {
+                            correlation_id: 0,
+                            raw_tx: raw.clone().into(),
+                            sender: signers[si].signer.address(),
+                            tx_hash: keccak256(&raw),
+                        });
+                    }
+                    flows.push(blk);
+                }
+                (Vec::new(), flows)
             }
             "parcounter" => {
                 // FULLY INDEPENDENT contract calls — the bottom rung of

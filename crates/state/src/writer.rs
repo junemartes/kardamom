@@ -185,6 +185,12 @@ impl StateWriter {
             let size = batch.approx_size_bytes();
             debug!(block, size_bytes = size, "applying block delta");
             if let Err(e) = self.apply(&batch) {
+                // LOUD on both channels: tracing for production, stderr
+                // unconditionally — a halting state writer strands every
+                // consumer of the snapshot channel (they block, they do
+                // not error), and a silent version of this failure cost a
+                // debugging session to find.
+                eprintln!("kardamom-state-writer HALTING: block {block} apply failed: {e}");
                 error!(block, error = %e, "block apply failed; halting writer");
                 return Err(e);
             }
@@ -193,6 +199,9 @@ impl StateWriter {
             match StateSnapshot::open(&self.env) {
                 Ok(snap) => self.snapshot_handle.publish(snap),
                 Err(e) => {
+                    eprintln!(
+                        "kardamom-state-writer HALTING: snapshot open failed after block {block}: {e}"
+                    );
                     warn!(block, error = %e, "snapshot open failed after commit");
                     return Err(e);
                 }

@@ -618,17 +618,19 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 /// amount of work per transaction those fixed costs exceed anything more
 /// cores can return, and the honest thing is not to compete.
 ///
-/// MEASURED on the two ends of the workload range (mdbx-backed, 8000 txs):
-/// plain transfers cost ~2.5us/tx and lose (0.87x at 8 workers), while
-/// uniswap swaps cost ~18us/tx and win (1.81x). The threshold sits
-/// between them, nearer the losing end so that a workload only forfeits
-/// parallelism when it clearly cannot benefit.
+/// RECALIBRATED after the frequency root-cause fix: the original 8us
+/// threshold came from measurements where worker cores ran at half
+/// clock and transfers lost (0.87x). With cores held at frequency,
+/// fully-independent 21k transfers (~4.6us/tx on the mdbx stack)
+/// measure 1.54x at 4 workers — they belong on the parallel path. The
+/// threshold now sits below transfer cost; only degenerate sub-2.5us
+/// work declines.
 ///
 /// This is a FLOOR, not a verdict on transfers: the costs it defends
 /// against — the single-threaded feed and the serial delta fold — are
 /// implementation limits, and if they come down this constant should come
 /// down with them.
-pub const PARALLEL_WORTH_NS: u64 = 8_000;
+pub const PARALLEL_WORTH_NS: u64 = 2_500;
 
 /// Sticky-assignment map bound; beyond it new domains hash as before.
 const STICKY_CAP: usize = 65_536;
@@ -919,6 +921,16 @@ struct Node {
     /// The thread this tx was assigned. Written before any edge naming it
     /// exists, so whoever dispatches it reads a settled value.
     worker: std::sync::atomic::AtomicUsize,
+    /// TRUE once this node has been handed to a worker queue. The eager
+    /// coverage test reads THIS, not `indegree == 0`: prune decrements
+    /// indegrees first and pushes later, and in that window the feed
+    /// would otherwise enqueue a successor AHEAD of its predecessor —
+    /// the owner then spins forever on a head whose FIFO predecessor
+    /// sits behind it (measured: intermittent silent wedge on the
+    /// transfers shape, ~20% of runs). Set under the queue lock, so a
+    /// `true` read orders the predecessor's push before any subsequent
+    /// eager push to the same queue.
+    queued: AtomicBool,
     /// Predecessors covered by FIFO ORDER instead of an edge (eager chain
     /// mode): they were already released to THIS tx's own queue when this
     /// tx was admitted, so queue position orders them — no edge, no prune
@@ -1090,6 +1102,9 @@ impl<S: StateDatabase> BlockCtx<S> {
     fn push_ready(&self, worker: usize, idx: u32) {
         let qh = &self.queues[worker];
         let mut q = qh.q.lock().expect("queue poisoned");
+        self.nodes[idx as usize]
+            .queued
+            .store(true, Ordering::Release);
         q.push_back(idx);
         qh.len.fetch_add(1, Ordering::Release);
         drop(q);
@@ -1319,7 +1334,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             let tow = cfg_tail_on_workers;
             let avg = avg_tx_ns.clone();
             scope.spawn(move || {
-                while let Ok(job) = tail_rx.recv() {
+                'jobs: while let Ok(job) = tail_rx.recv() {
                     let TailJob {
                         ctx,
                         txs,
@@ -1335,10 +1350,6 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                     let deadline = std::time::Instant::now() + STALL_TIMEOUT;
                     let mut drain_err: Option<ExecutorError> = None;
                     while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
-                        if ctx.pending.load(Ordering::SeqCst) > 0 {
-                            ctx.prune(true);
-                            continue;
-                        }
                         if std::time::Instant::now() > deadline {
                             let admitted = ctx.admitted.load(Ordering::SeqCst);
                             let finished = ctx.finished.load(Ordering::SeqCst);
@@ -1363,6 +1374,10 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                             )));
                             break;
                         }
+                        if ctx.pending.load(Ordering::SeqCst) > 0 {
+                            ctx.prune(true);
+                            continue;
+                        }
                         std::thread::yield_now();
                     }
                     // Release the slot in ALL paths — and INSTALL the
@@ -1384,10 +1399,32 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                     let t_exec_wall = started.elapsed();
                     let mut ctx_arc = ctx;
                     let t_drain0 = std::time::Instant::now();
+                    let unwrap_deadline = std::time::Instant::now() + STALL_TIMEOUT;
                     let ctx = loop {
                         match Arc::try_unwrap(ctx_arc) {
                             Ok(c) => break c,
                             Err(back) => {
+                                // WATCHDOG: a worker that never drops its
+                                // Arc (wedged in a stall path) would spin
+                                // this loop forever and hang every later
+                                // ticket SILENTLY. Fail loudly instead.
+                                if std::time::Instant::now() > unwrap_deadline {
+                                    let holders = Arc::strong_count(&back);
+                                    eprintln!(
+                                        "stm WEDGE: ctx unwrap stalled {}s, {} Arc holders,                                          block {}, fifo_stalls {}",
+                                        STALL_TIMEOUT.as_secs(),
+                                        holders,
+                                        back.env.block_number,
+                                        back.metrics.fifo_stalls.load(Ordering::Relaxed),
+                                    );
+                                    let _ = out.send(Err(ExecutorError::State(format!(
+                                        "stm: ctx unwrap stalled, {holders} holders"
+                                    ))));
+                                    // Leak the ctx rather than spin: the
+                                    // wedged worker still references it.
+                                    std::mem::forget(back);
+                                    continue 'jobs;
+                                }
                                 ctx_arc = back;
                                 std::thread::yield_now();
                             }
@@ -1971,6 +2008,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 )));
             }
             c.clear();
+            node.queued.store(false, Ordering::Release);
             node.fifo_preds.lock().expect("fifo_preds poisoned").clear();
             node.open.store(true, Ordering::Release);
         }
@@ -1995,7 +2033,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 // costs an edge, never correctness.
                 if eager
                     && pn.worker.load(Ordering::Acquire) == worker
-                    && pn.indegree.load(Ordering::Acquire) == 0
+                    && pn.queued.load(Ordering::Acquire)
                 {
                     self.ctx.nodes[i]
                         .fifo_preds
@@ -2012,7 +2050,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                     list.push(idx);
                     deg += 1;
                     if pn.worker.load(Ordering::Acquire) == worker
-                        && pn.indegree.load(Ordering::Acquire) == 0
+                        && pn.queued.load(Ordering::Acquire)
                     {
                         self.ctx
                             .metrics
