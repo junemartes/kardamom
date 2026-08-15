@@ -1,0 +1,31 @@
+# The zkVM guest program (spec: no-std-exec-core, phase 3c).
+#
+# DELIBERATELY OUTSIDE the workspace (`[workspace]` below detaches it): the
+# guest builds under the vendor toolchain (`cargo prove build`, rustup
+# toolchain `succinct`) with its own lockfile, so zkVM patch pins can never
+# perturb the workspace's feature unification or Cargo.lock. The execution
+# crates are consumed by PATH, UNMODIFIED — the one-code-path invariant:
+# this program links the exact code the live validator runs.
+[package]
+name = "kardamom-zk-guest"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+kardamom-exec-core = { path = "../../crates/exec-core", default-features = false }
+kardamom-types = { path = "../../crates/types", default-features = false }
+sp1-zkvm = "6.4"
+rkyv = { version = "0.8", default-features = false, features = ["alloc", "bytecheck", "bytes-1"] }
+alloy-rlp = { version = "0.3", default-features = false }
+alloy-eip7928 = { version = "0.3", default-features = false, features = ["rlp"] }
+
+# NOTE: SP1's precompile accelerator patches (sha3/k256/bls12-381 forks)
+# are deliberately NOT pinned in the scaffold — they are a performance
+# optimization, correctness is identical unpatched, and their tags must be
+# chosen against the prover SDK version when the harness lands.
+
+[profile.release]
+opt-level = 3
+lto = true
