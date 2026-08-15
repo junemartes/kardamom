@@ -1917,6 +1917,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // Take sole ownership: each worker drops its Arc as it observes
         // the sealed-and-drained condition (microseconds of yield at most).
         let mut ctx_arc = ctx;
+        let t_drain0 = std::time::Instant::now();
         let ctx = loop {
             match Arc::try_unwrap(ctx_arc) {
                 Ok(c) => break c,
@@ -1926,6 +1927,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 }
             }
         };
+        let t_drain = t_drain0.elapsed();
+        let t_extract0 = std::time::Instant::now();
         let aborted = ctx.aborted.load(Ordering::SeqCst);
         let n = txs.len();
         let mut tx_results = Vec::with_capacity(n);
@@ -1943,6 +1946,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             }
         }
 
+        let t_extract = t_extract0.elapsed();
         // Validation: every recorded read must still be the highest
         // version below the reader. A conviction is a WOUND — the marks
         // missed a real conflict (the tx read a cell an earlier tx wrote
@@ -2192,8 +2196,15 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         }
         if std::env::var("KARDAMOM_STM_PHASE_TIMING").is_ok() {
             eprintln!(
-                "phase block={} n={} feed+exec={:?} validate={:?} wounds={}",
-                ctx.env.block_number, n, t_exec_wall, t_validate, wounds
+                "phase block={} n={} feed+exec={:?} drain={:?} extract={:?} validate={:?} commit={:?} wounds={}",
+                ctx.env.block_number,
+                n,
+                t_exec_wall,
+                t_drain,
+                t_extract,
+                t_validate,
+                t_commit,
+                wounds
             );
         }
         // Destructure: the HEAVY parts (multi-version cache with ~n
