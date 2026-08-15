@@ -87,6 +87,9 @@ struct Args {
     /// baseline.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     eager_chain: bool,
+    /// Sticky least-loaded domain assignment instead of pure hashing.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    sticky_assign: bool,
 }
 
 fn records(base_idx: u64, envs: &[TxEnvelope]) -> Vec<(TxIndex, BPosition, TxEnvelope)> {
@@ -205,6 +208,7 @@ fn run_mdbx_ab(
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
+    sticky_assign: bool,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -255,6 +259,7 @@ fn run_mdbx_ab(
                 parallel_worth_ns,
                 dispatch_by_sender,
                 eager_chain,
+                sticky_assign,
             };
             let mut stats = Stats::default();
             let mut global_idx = 0u64;
@@ -265,6 +270,7 @@ fn run_mdbx_ab(
             let (mut w_own, mut w_foreign) = (0u64, 0u64);
             let (mut fifo_cov, mut fifo_st, mut edges_sum) = (0u64, 0u64, 0u64);
             let mut read_us = 0u64;
+            let mut disp_hist = vec![0u64; w];
             let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
@@ -336,6 +342,9 @@ fn run_mdbx_ab(
                         fifo_cov += out.fifo_covered;
                         fifo_st += out.fifo_stalls;
                         edges_sum += out.edges as u64;
+                        for (wi, c) in out.dispatch.iter().enumerate() {
+                            disp_hist[wi] += *c as u64;
+                        }
                         rt += out.reads_total;
                         rmv += out.reads_mv_hit;
                         rbase += out.reads_base_hit;
@@ -409,6 +418,7 @@ fn run_mdbx_ab(
                     pub_us as f64 / 1000.0,
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
+                println!("     dispatch per worker: {disp_hist:?}");
                 println!(
                     "     chain: edges {} | fifo-covered {} | fifo-stalls {}",
                     edges_sum, fifo_cov, fifo_st,
@@ -441,6 +451,7 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(kardamom_stm::execute::PARALLEL_WORTH_NS);
     let dispatch_by_sender = a.dispatch_by_sender;
     let eager_chain = a.eager_chain;
+    let sticky_assign = a.sticky_assign;
     let worker_counts: Vec<usize> = a
         .workers
         .split(',')
@@ -592,6 +603,7 @@ fn main() -> anyhow::Result<()> {
             parallel_worth_ns,
             dispatch_by_sender,
             eager_chain,
+            sticky_assign,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()
@@ -725,6 +737,7 @@ fn main() -> anyhow::Result<()> {
                 parallel_worth_ns,
                 dispatch_by_sender,
                 eager_chain,
+                sticky_assign,
             };
             let mut row = Row {
                 workers: w,

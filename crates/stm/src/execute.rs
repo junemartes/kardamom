@@ -577,6 +577,9 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 /// down with them.
 pub const PARALLEL_WORTH_NS: u64 = 8_000;
 
+/// Sticky-assignment map bound; beyond it new domains hash as before.
+const STICKY_CAP: usize = 65_536;
+
 const SPIN_BEFORE_PARK: u32 = 256;
 
 /// Mean per-tx execution time above which moving a ready tx to an idle
@@ -741,6 +744,18 @@ pub struct PoolConfig {
     /// entirely. Per-link hand-off through batched pruning is the prime
     /// suspect for the span floor (chains release one tx per prune).
     pub eager_chain: bool,
+    /// Assign each NEW domain to the least-loaded worker and remember the
+    /// choice for the pool's lifetime, instead of hashing.
+    ///
+    /// Hashing is stable but collision-blind: 4 hot pairs over 4 workers
+    /// land on 4 distinct threads only ~28% of the time, and a collision
+    /// puts TWO serial chains on one core — measured as dispatch
+    /// [2591, 4017, 694, 698] on the 4-pair scenario, the busiest worker
+    /// carrying half the block. Round-robin-on-first-sight was tried and
+    /// REVERTED because its assignment reshuffled every block; this keeps
+    /// the cross-block stickiness that made hashing win, and fixes only
+    /// the collisions.
+    pub sticky_assign: bool,
 }
 
 /// MEASURED default (uniswap 8-pair, 16x500, 8 workers): batching 8
@@ -759,6 +774,7 @@ impl Default for PoolConfig {
             parallel_worth_ns: PARALLEL_WORTH_NS,
             dispatch_by_sender: false,
             eager_chain: true,
+            sticky_assign: false,
         }
     }
 }
@@ -1073,6 +1089,14 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
+    sticky_assign: bool,
+    /// Domain -> worker, pool-lifetime (feed-thread-owned). Capped: past
+    /// `STICKY_CAP` entries new domains fall back to hashing, so a
+    /// long-lived pool cannot grow this without bound.
+    assign: std::cell::RefCell<FastMap<DomainKey, usize>>,
+    /// Cumulative txs dispatched per worker — the load the least-loaded
+    /// choice reads.
+    assign_load: std::cell::RefCell<Vec<u64>>,
     /// THE ARENA. Allocated once for the pool's lifetime and reused by
     /// every block: a node is addressed by its index, so nothing here is
     /// ever allocated, freed, or reference-counted per transaction. This
@@ -1118,6 +1142,9 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         let handle = PoolHandle {
             shared: shared_ref,
             avg_tx_ns: std::cell::Cell::new(0),
+            sticky_assign: cfg.sticky_assign,
+            assign: std::cell::RefCell::new(FastMap::default()),
+            assign_load: std::cell::RefCell::new(vec![0; workers]),
             parallel_worth_ns: cfg.parallel_worth_ns,
             dispatch_by_sender: cfg.dispatch_by_sender,
             eager_chain: cfg.eager_chain,
@@ -1451,7 +1478,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         } else {
             domain
         };
-        let worker = match domain {
+        let hashed = match domain {
             Some(DomainKey::Account(a)) => domain_hash(a.as_slice(), self.workers),
             Some(DomainKey::Fixed(a, k)) => {
                 let mut b = [0u8; 8];
@@ -1462,6 +1489,26 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             // ⊤ and empty predictions: canonical round-robin.
             None => i % self.workers,
         };
+        let worker = match (self.pool.sticky_assign, domain) {
+            (true, Some(key)) => {
+                let mut map = self.pool.assign.borrow_mut();
+                if let Some(w) = map.get(&key) {
+                    *w
+                } else if map.len() >= STICKY_CAP {
+                    hashed
+                } else {
+                    let load = self.pool.assign_load.borrow();
+                    let w = (0..self.workers).min_by_key(|w| load[*w]).unwrap_or(hashed);
+                    drop(load);
+                    map.insert(key, w);
+                    w
+                }
+            }
+            _ => hashed,
+        };
+        if self.pool.sticky_assign {
+            self.pool.assign_load.borrow_mut()[worker] += 1;
+        }
 
         self.ctx.slots[i]
             .set(TxSlot {
