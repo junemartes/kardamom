@@ -342,7 +342,6 @@ fn run_pipelined(
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
-    use std::collections::VecDeque;
 
     let genesis: Vec<AccountChange> = signers
         .iter()
@@ -358,19 +357,20 @@ fn run_pipelined(
         let dir = tempfile::tempdir()?;
         let env = StateEnvBuilder::new(dir.path())
             .durability(Durability::SafeNoSync)
+            .write_map(true)
             .open()?;
         kardamom_state::seed_genesis(&env, &genesis, &[])?;
         let env_for_reads = env.clone();
         let writer = StateWriter::spawn(env)?;
         Ok((dir, env_for_reads, writer))
     };
-    let boundary = |bi: usize, end: u64| BlockBoundary {
+    let boundary = move |bi: usize, end: u64| BlockBoundary {
         block_number: bi as u64 + 1,
         end_tx_idx: BPosition::from_index(end),
         l2_timestamp: 1_700_000_000 + bi as u64 * 2,
         l1_origin: 0,
     };
-    let env_of = |bi: usize| ExecEnv {
+    let env_of = move |bi: usize| ExecEnv {
         chain_id,
         block_number: bi as u64 + 1,
         l2_timestamp: 1_700_000_000 + bi as u64 * 2,
@@ -484,19 +484,60 @@ fn run_pipelined(
         let mut outcomes: Vec<(usize, kardamom_stm::execute::StmOutcome)> = Vec::new();
         let t_pipe = Instant::now();
         kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
-            let mut tickets: VecDeque<(usize, kardamom_stm::execute::BlockTicket)> =
-                VecDeque::new();
             let timing = std::env::var_os("KARDAMOM_STM_PHASE_TIMING").is_some();
+            // SETTLER thread: resolves tickets in order — waits the tail,
+            // records the outcome, finalizes and hands the writer its
+            // batch, and advances the pool's base cache — all OFF the
+            // submission loop. The loop's only bookkeeping is layer
+            // assembly (Arc clones) and admission.
+            let (settle_tx, settle_rx) =
+                std::sync::mpsc::channel::<(usize, kardamom_stm::execute::BlockTicket)>();
+            let settled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let settled_c = settled.clone();
             // Writer settlement is ASYNC: deltas are sent and never
             // waited on inside the loop. `advanced_to` tracks which flow
             // deltas have been mirrored into the pool's base cache after
             // the writer confirmed them; everything after that is layered
             // as the pending base (depth grows only if the writer lags a
             // full execution span).
-            let mut advanced_to: usize = 0; // flow blocks [0, advanced_to) settled+advanced
+            let outcomes_arc = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
+                usize,
+                kardamom_stm::execute::StmOutcome,
+            )>::new()));
+            let outcomes_c = outcomes_arc.clone();
+            let settler = std::thread::spawn({
+                let delta_tx = writer_b.delta_tx.clone();
+                let ends: Vec<u64> = flow_recs
+                    .iter()
+                    .map(|r| r.last().map(|x| x.0.0 + 1).unwrap_or(0))
+                    .collect();
+                let env_of2 = env_of;
+                move || -> anyhow::Result<()> {
+                    while let Ok((pfi, t)) = settle_rx.recv() {
+                        let out = t.wait()?;
+                        let bi = warm + pfi;
+                        let e = env_of2(bi);
+                        let bd = out
+                            .delta
+                            .clone()
+                            .finalize(e.block_number, out.receipts.clone());
+                        delta_tx.send(WriteBatch::new(boundary(bi, ends[pfi]), bd))?;
+                        outcomes_c.lock().unwrap().push((pfi, out));
+                        settled_c.store(pfi + 1, std::sync::atomic::Ordering::Release);
+                    }
+                    Ok(())
+                }
+            });
+            // Arc layers per unsettled predecessor — zero clones, zero
+            // merges; the pool's base cache advances lazily as the writer
+            // confirms heights.
+            let deltas_arc: Vec<std::sync::Arc<PendingDelta>> = baseline
+                .iter()
+                .map(|(_, d)| std::sync::Arc::new(d.clone()))
+                .collect();
+            let mut advanced_to: usize = 0;
             for fi in 0..n_flow {
                 let t0 = Instant::now();
-                // Lazily advance for whatever the writer has confirmed.
                 let h = writer_b
                     .snapshot_rx
                     .current()
@@ -507,14 +548,14 @@ fn run_pipelined(
                     if bn > h {
                         break;
                     }
-                    pool.advance_base(&baseline[advanced_to].1);
+                    pool.advance_base(&deltas_arc[advanced_to]);
                     advanced_to += 1;
                 }
-                // Base = merge of unsettled predecessors' deltas.
-                let mut base = PendingDelta::new();
-                for k in advanced_to..fi {
-                    base.merge_from(&baseline[k].1);
-                }
+                // NEWEST FIRST.
+                let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
+                    .rev()
+                    .map(|k| deltas_arc[k].clone())
+                    .collect();
                 let t_base = t0.elapsed();
                 let t1 = Instant::now();
                 let views: Vec<kardamom_state::StateSnapshot> = (0..w)
@@ -522,54 +563,35 @@ fn run_pipelined(
                     .collect::<Result<_, _>>()?;
                 let t_views = t1.elapsed();
                 let t2 = Instant::now();
-                let mut sess =
-                    pool.begin_block_per_worker(views, base, env_of(warm + fi), &stats_b)?;
+                let mut sess = pool.begin_block_layered(
+                    views,
+                    PendingDelta::new(),
+                    layers,
+                    env_of(warm + fi),
+                    &stats_b,
+                )?;
                 for (t, p, en, prep) in std::mem::take(&mut feed_payloads[fi]) {
                     sess.push_prepared(t, p, en, prep)?;
                 }
                 let t_feed = t2.elapsed();
                 let t3 = Instant::now();
-                tickets.push_back((fi, sess.submit()?));
-                if tickets.len() == 2 {
-                    // Resolve the older block: keep the WRITER hand-off on
-                    // the loop (it is a production stage) but park the
-                    // byte-identical verification for AFTER the clock — it
-                    // is bench-only work.
-                    let (pfi, t) = tickets.pop_front().expect("len==2");
-                    let out = t.wait()?;
-                    let bi = warm + pfi;
-                    let e = env_of(bi);
-                    let end = flow_recs[pfi].last().map(|r| r.0.0 + 1).unwrap_or(0);
-                    let bd = out
-                        .delta
-                        .clone()
-                        .finalize(e.block_number, out.receipts.clone());
-                    writer_b
-                        .delta_tx
-                        .send(WriteBatch::new(boundary(bi, end), bd))?;
-                    outcomes.push((pfi, out));
-                }
+                settle_tx.send((fi, sess.submit()?)).expect("settler alive");
                 if timing {
                     eprintln!(
-                        "pipe block {fi}: base {t_base:?} views {t_views:?} feed {t_feed:?} resolve {:?}",
+                        "pipe block {fi}: base {t_base:?} views {t_views:?} feed {t_feed:?} hand {:?}",
                         t3.elapsed()
                     );
                 }
             }
-            while let Some((pfi, t)) = tickets.pop_front() {
-                let out = t.wait()?;
-                let bi = warm + pfi;
-                let e = env_of(bi);
-                let end = flow_recs[pfi].last().map(|r| r.0.0 + 1).unwrap_or(0);
-                let bd = out
-                    .delta
-                    .clone()
-                    .finalize(e.block_number, out.receipts.clone());
-                writer_b
-                    .delta_tx
-                    .send(WriteBatch::new(boundary(bi, end), bd))?;
-                outcomes.push((pfi, out));
-            }
+            drop(settle_tx);
+            settler.join().expect("settler join")?;
+            outcomes.extend(
+                std::sync::Arc::try_unwrap(outcomes_arc)
+                    .map_err(|_| ())
+                    .expect("settler done")
+                    .into_inner()
+                    .unwrap(),
+            );
             Ok(())
         })?;
         let stm_ms = t_pipe.elapsed().as_secs_f64() * 1e3;
@@ -642,6 +664,7 @@ fn run_mdbx_ab(
             let dir = tempfile::tempdir()?;
             let env = StateEnvBuilder::new(dir.path())
                 .durability(Durability::SafeNoSync)
+                .write_map(true)
                 .open()?;
             kardamom_state::seed_genesis(&env, &genesis, &[])?;
             // Keep an env handle: each worker needs its OWN read

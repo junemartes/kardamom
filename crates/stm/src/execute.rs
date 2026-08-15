@@ -42,6 +42,12 @@ use crate::{FEE_SINK, FastMap};
 pub struct BlockInput<'a, S: StateDatabase> {
     pub snapshot: &'a S,
     pub base: Option<&'a PendingDelta>,
+    /// Unsettled predecessor deltas, NEWEST FIRST, probed before `base`.
+    /// Arc-shared so pipelined submission builds a block's read layers
+    /// without cloning or merging a single entry (spec P3a: the merge
+    /// clone + advance were a measured, growing multi-ms drag on the
+    /// pipeline loop).
+    pub layers: &'a [std::sync::Arc<PendingDelta>],
 }
 
 impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
@@ -51,21 +57,21 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
         &self,
         address: alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
-        if let Some(base) = self.base
-            && let Some((nonce, balance, code_hash)) = base.accounts.get(&address)
-        {
-            let code_hash = if *code_hash == B256::ZERO {
-                revm::primitives::KECCAK_EMPTY
-            } else {
-                *code_hash
-            };
-            return Ok(Some(AccountInfo {
-                nonce: *nonce,
-                balance: *balance,
-                code_hash,
-                account_id: None,
-                code: None,
-            }));
+        for layer in self.layers.iter().map(|l| l.as_ref()).chain(self.base) {
+            if let Some((nonce, balance, code_hash)) = layer.accounts.get(&address) {
+                let code_hash = if *code_hash == B256::ZERO {
+                    revm::primitives::KECCAK_EMPTY
+                } else {
+                    *code_hash
+                };
+                return Ok(Some(AccountInfo {
+                    nonce: *nonce,
+                    balance: *balance,
+                    code_hash,
+                    account_id: None,
+                    code: None,
+                }));
+            }
         }
         SnapshotRef {
             inner: self.snapshot,
@@ -74,13 +80,14 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
-        if let Some(base) = self.base
-            && let Some(code) = base.code.get(&code_hash)
-            && !code.is_empty()
-        {
-            return Ok(revm::state::Bytecode::new_raw(
-                alloy_primitives::Bytes::copy_from_slice(code),
-            ));
+        for layer in self.layers.iter().map(|l| l.as_ref()).chain(self.base) {
+            if let Some(code) = layer.code.get(&code_hash)
+                && !code.is_empty()
+            {
+                return Ok(revm::state::Bytecode::new_raw(
+                    alloy_primitives::Bytes::copy_from_slice(code),
+                ));
+            }
         }
         SnapshotRef {
             inner: self.snapshot,
@@ -94,10 +101,10 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
         index: U256,
     ) -> Result<U256, Self::Error> {
         let key = B256::from(index.to_be_bytes::<32>());
-        if let Some(base) = self.base
-            && let Some(v) = base.storage.get(&(address, key))
-        {
-            return Ok(*v);
+        for layer in self.layers.iter().map(|l| l.as_ref()).chain(self.base) {
+            if let Some(v) = layer.storage.get(&(address, key)) {
+                return Ok(*v);
+            }
         }
         SnapshotRef {
             inner: self.snapshot,
@@ -256,23 +263,30 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             }));
         }
         self.reads.push(ReadRecord::Account(address, None));
-        // Pending-delta layer BEFORE the cache: the pool-lifetime cache
-        // mirrors the BACKEND only, and this layer changes per block.
-        if let Some(layer) = self.base.base
-            && let Some((nonce, balance, code_hash)) = layer.accounts.get(&address)
+        // Pending-delta LAYERS (newest first) then the base layer, all
+        // BEFORE the cache: the pool-lifetime cache mirrors the BACKEND
+        // only, and these layers change per block.
+        for layer in self
+            .base
+            .layers
+            .iter()
+            .map(|l| l.as_ref())
+            .chain(self.base.base)
         {
-            self.n_base_hit += 1;
-            return Ok(Some(AccountInfo {
-                nonce: *nonce,
-                balance: *balance,
-                code_hash: if *code_hash == B256::ZERO {
-                    revm::primitives::KECCAK_EMPTY
-                } else {
-                    *code_hash
-                },
-                account_id: None,
-                code: None,
-            }));
+            if let Some((nonce, balance, code_hash)) = layer.accounts.get(&address) {
+                self.n_base_hit += 1;
+                return Ok(Some(AccountInfo {
+                    nonce: *nonce,
+                    balance: *balance,
+                    code_hash: if *code_hash == B256::ZERO {
+                        revm::primitives::KECCAK_EMPTY
+                    } else {
+                        *code_hash
+                    },
+                    account_id: None,
+                    code: None,
+                }));
+            }
         }
         let sh = BaseCache::shard(&address);
         if let Some(a) = self.base_cache.accounts[sh]
@@ -340,11 +354,17 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             return Ok(v);
         }
         self.reads.push(ReadRecord::Slot(address, key, None));
-        if let Some(layer) = self.base.base
-            && let Some(v) = layer.storage.get(&(address, key))
+        for layer in self
+            .base
+            .layers
+            .iter()
+            .map(|l| l.as_ref())
+            .chain(self.base.base)
         {
-            self.n_base_hit += 1;
-            return Ok(*v);
+            if let Some(v) = layer.storage.get(&(address, key)) {
+                self.n_base_hit += 1;
+                return Ok(*v);
+            }
         }
         let sh = BaseCache::shard(&address);
         if let Some(v) = self.base_cache.storage[sh]
@@ -927,6 +947,8 @@ struct BlockCtx<S: StateDatabase> {
     /// the same committed block, so the view is identical.
     snapshots: Vec<S>,
     base: PendingDelta,
+    /// Unsettled predecessor deltas, newest first (see `BlockInput`).
+    layers: Vec<std::sync::Arc<PendingDelta>>,
     sink_start: Option<AccountInfo>,
     sink_start_balance: U256,
     mv: MvCache,
@@ -1473,6 +1495,20 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         env: ExecEnv,
         stats: &'p Stats,
     ) -> Result<BlockSession<'p, 'a, S>, ExecutorError> {
+        self.begin_block_layered(snapshots, base, Vec::new(), env, stats)
+    }
+
+    /// Like [`Self::begin_block_per_worker`], with unsettled predecessor
+    /// deltas layered (newest first) WITHOUT cloning or merging — the
+    /// pipelined caller's zero-copy read stack (spec P3a).
+    pub fn begin_block_layered<'p>(
+        &'p self,
+        snapshots: Vec<S>,
+        base: PendingDelta,
+        layers: Vec<std::sync::Arc<PendingDelta>>,
+        env: ExecEnv,
+        stats: &'p Stats,
+    ) -> Result<BlockSession<'p, 'a, S>, ExecutorError> {
         let (workers, prune_batch) = {
             let st = self.shared.0.lock().expect("pool poisoned");
             (st.cfg.workers, st.cfg.prune_batch)
@@ -1485,6 +1521,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         let probe = BlockInput {
             snapshot: snapshots.first().expect("at least one snapshot"),
             base: Some(&base),
+            layers: &layers,
         };
         let sink_start = probe
             .basic_ref(FEE_SINK)
@@ -1494,6 +1531,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             env,
             snapshots,
             base,
+            layers,
             sink_start,
             sink_start_balance,
             mv: MvCache::new(),
@@ -1624,32 +1662,55 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// call leaves stale entries and produces wrong reads — the harness's
     /// byte-identical assertion is the guard.
     pub fn advance_base(&self, delta: &PendingDelta) {
+        // ONE write-lock per touched shard, not one per entry: the
+        // per-entry version acquired ~12k write locks against executing
+        // workers' read locks and measured as a GROWING multi-ms drag on
+        // the pipeline loop (and stretched the executing block's span by
+        // slowing its reads). Group first, lock once.
+        let mut acc_by_shard: Vec<Vec<(alloy_primitives::Address, Option<AccountInfo>)>> =
+            (0..BASE_SHARDS).map(|_| Vec::new()).collect();
         for (addr, (nonce, balance, code_hash)) in delta.accounts.iter() {
-            let sh = BaseCache::shard(addr);
-            self.base_cache.accounts[sh]
-                .write()
-                .expect("base cache poisoned")
-                .insert(
-                    *addr,
-                    Some(AccountInfo {
-                        nonce: *nonce,
-                        balance: *balance,
-                        code_hash: if *code_hash == B256::ZERO {
-                            revm::primitives::KECCAK_EMPTY
-                        } else {
-                            *code_hash
-                        },
-                        account_id: None,
-                        code: None,
-                    }),
-                );
+            acc_by_shard[BaseCache::shard(addr)].push((
+                *addr,
+                Some(AccountInfo {
+                    nonce: *nonce,
+                    balance: *balance,
+                    code_hash: if *code_hash == B256::ZERO {
+                        revm::primitives::KECCAK_EMPTY
+                    } else {
+                        *code_hash
+                    },
+                    account_id: None,
+                    code: None,
+                }),
+            ));
         }
-        for ((addr, key), value) in delta.storage.iter() {
-            let sh = BaseCache::shard(addr);
-            self.base_cache.storage[sh]
+        for (sh, entries) in acc_by_shard.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let mut m = self.base_cache.accounts[sh]
                 .write()
-                .expect("base cache poisoned")
-                .insert((*addr, *key), *value);
+                .expect("base cache poisoned");
+            for (k, v) in entries {
+                m.insert(k, v);
+            }
+        }
+        let mut sto_by_shard: Vec<Vec<((alloy_primitives::Address, B256), U256)>> =
+            (0..BASE_SHARDS).map(|_| Vec::new()).collect();
+        for ((addr, key), value) in delta.storage.iter() {
+            sto_by_shard[BaseCache::shard(addr)].push(((*addr, *key), *value));
+        }
+        for (sh, entries) in sto_by_shard.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let mut m = self.base_cache.storage[sh]
+                .write()
+                .expect("base cache poisoned");
+            for (k, v) in entries {
+                m.insert(k, v);
+            }
         }
         for (hash, code) in delta.code.iter() {
             self.base_cache
@@ -2466,6 +2527,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
     let input = BlockInput {
         snapshot: &ctx.snapshots[worker % ctx.snapshots.len()],
         base: Some(&ctx.base),
+        layers: &ctx.layers,
     };
     let view = MvView::new(
         &ctx.mv,

@@ -201,6 +201,8 @@ impl StateWriter {
     }
 
     fn apply(&self, batch: &WriteBatch) -> Result<(), StateError> {
+        let timing = std::env::var_os("KARDAMOM_WRITER_TIMING").is_some();
+        let t0 = std::time::Instant::now();
         let txn = self.env.raw().begin_rw_sync()?;
 
         let accounts = txn.open_db(Some(TABLE_ACCOUNTS))?;
@@ -210,37 +212,52 @@ impl StateWriter {
         let receipts = txn.open_db(Some(TABLE_RECEIPTS))?;
         let tx_hash_index = txn.open_db(Some(TABLE_TX_HASH_INDEX))?;
         let meta = txn.open_db(Some(TABLE_META))?;
+        let t_open = t0.elapsed();
 
         // --- storage (written first so the trie-aware path can read an
         // account's current slots when recomputing its storage_root) ---
         // Upstream StorageChange.key is B256 (matches the StateDatabase trait
         // signature). The executor writes every slot as an absolute value;
         // there are no tombstones — writing U256::ZERO means "slot is now zero".
-        for change in &batch.delta.storage {
-            let key = encode_storage_key(change.address, change.key);
-            txn.put(
-                storage,
-                key,
-                encode_storage_value(change.value),
-                WriteFlags::UPSERT,
-            )?;
+        // CURSOR + SORTED INPUT: `BlockDelta` vectors come from BTreeMap
+        // iteration, so keys ascend, and a cursor upsert descends the
+        // tree from its previous position instead of from the root —
+        // measured as the difference between a writer that keeps pace
+        // with the execution pipeline and one 2x behind it.
+        let t1 = std::time::Instant::now();
+        {
+            let mut cur = txn.cursor(storage)?;
+            for change in &batch.delta.storage {
+                let key = encode_storage_key(change.address, change.key);
+                cur.put(
+                    &key,
+                    &encode_storage_value(change.value),
+                    WriteFlags::UPSERT,
+                )?;
+            }
         }
+        let t_storage = t1.elapsed();
 
         // --- accounts ---
         // The `accounts` table feeds revm reads (nonce/balance/code_hash) and
         // does not carry a meaningful storage_root — the state trie keeps the
         // canonical per-account storage_root in `hashed_accounts` (see
         // crate::trie). Persist storage_root = ZERO here regardless of trie mode.
-        for change in &batch.delta.accounts {
-            let key = encode_account_key(change.address);
-            let v = AccountValue {
-                nonce: change.nonce,
-                balance: change.balance,
-                code_hash: change.code_hash,
-                storage_root: B256::ZERO,
-            };
-            txn.put(accounts, key, encode_account_value(&v), WriteFlags::UPSERT)?;
+        let t2 = std::time::Instant::now();
+        {
+            let mut cur = txn.cursor(accounts)?;
+            for change in &batch.delta.accounts {
+                let key = encode_account_key(change.address);
+                let v = AccountValue {
+                    nonce: change.nonce,
+                    balance: change.balance,
+                    code_hash: change.code_hash,
+                    storage_root: B256::ZERO,
+                };
+                cur.put(&key, &encode_account_value(&v), WriteFlags::UPSERT)?;
+            }
         }
+        let t_accounts = t2.elapsed();
 
         // --- code ---
         for entry in &batch.delta.code {
@@ -271,21 +288,34 @@ impl StateWriter {
         // populate tx_hash_index[receipt.tx_hash] = receipt.tx_idx so the S1
         // proxy can serve eth_getTransactionReceipt(hash) via two reads:
         //   StateDatabase::get_tx_position(hash) → StateDatabase::get_receipt(pos)
-        for r in &batch.delta.receipts {
-            let pos_key = encode_b_position(r.tx_idx);
-            txn.put(
-                receipts,
-                pos_key,
-                encode_receipt_value(r),
-                WriteFlags::UPSERT,
-            )?;
-            txn.put(
-                tx_hash_index,
-                encode_tx_hash_key(r.tx_hash),
-                encode_tx_hash_value(r.tx_idx),
-                WriteFlags::UPSERT,
-            )?;
+        let t3 = std::time::Instant::now();
+        {
+            // Receipts arrive in ascending BPosition order — cursor.
+            let mut cur = txn.cursor(receipts)?;
+            for r in &batch.delta.receipts {
+                let pos_key = encode_b_position(r.tx_idx);
+                cur.put(&pos_key, &encode_receipt_value(r), WriteFlags::UPSERT)?;
+            }
+            // The hash index's keys are random; SORT them first so its
+            // cursor gets the same locality.
+            let mut hk: Vec<([u8; 32], [u8; 8])> = batch
+                .delta
+                .receipts
+                .iter()
+                .map(|r| {
+                    (
+                        encode_tx_hash_key(r.tx_hash),
+                        encode_tx_hash_value(r.tx_idx),
+                    )
+                })
+                .collect();
+            hk.sort_unstable_by_key(|e| e.0);
+            let mut cur = txn.cursor(tx_hash_index)?;
+            for (k, v) in &hk {
+                cur.put(k, v, WriteFlags::UPSERT)?;
+            }
         }
+        let t_receipts = t3.elapsed();
 
         // --- meta cursors (last) ---
         txn.put(
@@ -337,7 +367,22 @@ impl StateWriter {
             txn.put(meta, KEY_STATE_ROOT, encode_b256(root), WriteFlags::UPSERT)?;
         }
 
+        let t4 = std::time::Instant::now();
         txn.commit()?;
+        if timing {
+            eprintln!(
+                "writer apply block {}: open {:?} storage {:?} accounts {:?} receipts {:?} commit {:?} (n: sto {} acc {} rcpt {})",
+                batch.boundary.block_number,
+                t_open,
+                t_storage,
+                t_accounts,
+                t_receipts,
+                t4.elapsed(),
+                batch.delta.storage.len(),
+                batch.delta.accounts.len(),
+                batch.delta.receipts.len(),
+            );
+        }
         Ok(())
     }
 }

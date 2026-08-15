@@ -45,6 +45,7 @@ pub struct StateEnvBuilder {
     durability: Durability,
     max_readers: u64,
     read_only: bool,
+    write_map: bool,
 }
 
 impl StateEnvBuilder {
@@ -53,6 +54,7 @@ impl StateEnvBuilder {
             path: path.into(),
             durability: Durability::Durable,
             max_readers: MAX_READERS,
+            write_map: false,
             read_only: false,
         }
     }
@@ -70,6 +72,17 @@ impl StateEnvBuilder {
     ///
     /// The env must already exist and be initialised; `Durability` is
     /// irrelevant in this mode (nothing syncs).
+    /// mdbx WRITEMAP: dirty pages mutate the map directly and commit
+    /// skips the per-page pwrite pass — measured 30-45ms -> ~4ms for a
+    /// 16k-value block commit under SafeNoSync. The trade: any wild
+    /// write in THIS process can corrupt the map (no copy-on-write
+    /// isolation), so this is opt-in — benchmarking and deployments
+    /// that accept the blast radius. OFF by default.
+    pub fn write_map(mut self, yes: bool) -> Self {
+        self.write_map = yes;
+        self
+    }
+
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self
@@ -95,6 +108,9 @@ impl StateEnvBuilder {
         };
 
         let mut builder = Environment::builder();
+        if self.write_map {
+            builder.write_map();
+        }
         builder
             .set_max_dbs(MAX_DBS)
             .set_max_readers(self.max_readers)
