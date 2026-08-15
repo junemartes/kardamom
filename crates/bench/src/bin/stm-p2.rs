@@ -702,6 +702,7 @@ fn run_mdbx_ab(
             let mut cold_sum = 0u64;
             let (mut prune_calls_s, mut prune_forced_s, mut prune_us_s, mut steals_s) =
                 (0u64, 0u64, 0u64, 0u64);
+            let mut admit_us_s = 0u64;
             let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
             let (mut stm_allocs, mut stm_abytes) = (0u64, 0u64);
             let mut seq_buckets = [(0u64, 0u64); 6];
@@ -888,6 +889,7 @@ fn run_mdbx_ab(
                         prune_calls_s += out.prune_calls;
                         prune_forced_s += out.prune_forced;
                         prune_us_s += out.prune_us;
+                        admit_us_s += out.admit_us;
                         steals_s += out.steals;
                         w_own += out.writes_own;
                         w_foreign += out.writes_foreign;
@@ -991,6 +993,12 @@ fn run_mdbx_ab(
                 println!(
                     "     cold {cold_sum} of {} txs | edges {edges_sum} | fifo-covered {fifo_cov}",
                     8 * 1000usize,
+                );
+                println!(
+                    "     feed split: admit(graph) {:.1}ms | prune(graph) {:.1}ms | feed total {:.1}ms",
+                    admit_us_s as f64 / 1000.0,
+                    prune_us_s as f64 / 1000.0,
+                    feed as f64 / 1000.0,
                 );
                 println!(
                     "     idle {:.1}ms across {w} workers (span cap {:.1}ms) | prunes {} (forced {}) {:.1}ms | steals {}",
