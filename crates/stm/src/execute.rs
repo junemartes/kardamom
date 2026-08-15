@@ -1151,6 +1151,9 @@ struct PoolState<S: StateDatabase> {
 
 type PoolShared<S> = (Mutex<PoolState<S>>, Condvar);
 
+/// A spent block's droppables, shipped to the reaper thread.
+type Reap = Box<dyn Send>;
+
 /// A persistent worker pool bound to one snapshot view for its lifetime —
 /// the PIPELINE shape the live executor needs: workers are spawned ONCE
 /// (no per-block thread cost); each block is a session whose txs are
@@ -1176,6 +1179,12 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// Cumulative txs dispatched per worker — the load the least-loaded
     /// choice reads.
     assign_load: std::cell::RefCell<Vec<u64>>,
+    /// Teardown off the critical path: the seal thread ships each spent
+    /// block's carcass (the multi-version cache's ~30k entries, a
+    /// thousand tx slots, the spent read logs) here instead of dropping
+    /// it inline — measured as milliseconds of serial tail per block.
+    /// The reaper drops it while the next block already runs.
+    reaper: std::sync::mpsc::Sender<Reap>,
     /// POOL-LIFETIME cache of the BACKEND layer (below any pending-delta
     /// layer, which is probed before it — see `MvView`). parcounter
     /// measured 100% of reads reaching mdbx: hot cells change every
@@ -1230,7 +1239,11 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         Condvar::new(),
     );
     let shared_ref = &shared;
+    let (reap_tx, reap_rx) = std::sync::mpsc::channel::<Reap>();
     std::thread::scope(|scope| {
+        // Reaper: drops spent block state so seal() does not pay for it.
+        // Exits when the pool drops the last sender.
+        scope.spawn(move || while reap_rx.recv().is_ok() {});
         for w in 0..workers {
             let pin = pin_cores.clone();
             scope.spawn(move || {
@@ -1252,12 +1265,15 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             base_cache: std::sync::Arc::new(BaseCache::new()),
+            reaper: reap_tx.clone(),
             parallel_worth_ns,
             dispatch_by_sender,
             eager_chain,
             arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
+        drop(handle);
+        drop(reap_tx);
         let mut st = shared_ref.0.lock().expect("pool poisoned");
         st.shutdown = true;
         drop(st);
@@ -2055,10 +2071,15 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             // a few hundred distinct cells however many txs wrote them, so
             // there is less serial work here than the tx count suggests.
             let t_d = std::time::Instant::now();
-            for r in tx_results {
+            let mut spent_reads: Vec<Vec<ReadRecord>> = Vec::with_capacity(tx_results.len());
+            for mut r in tx_results {
+                // Freeing ~n read logs inline was serial-tail time; the
+                // reaper drops them while the next block runs.
+                spent_reads.push(std::mem::take(&mut r.reads));
                 delta.apply(r.ws);
                 receipts.push(r.receipt);
             }
+            pool.reaper.send(Box::new(spent_reads)).ok();
             delta_ns += t_d.elapsed().as_nanos() as u64;
         } else {
             // REPAIR PATH: a wound fired, so txs from the first wound on
@@ -2116,7 +2137,15 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 ctx.env.block_number, n, t_exec_wall, t_validate, wounds
             );
         }
-        let m = &ctx.metrics;
+        // Destructure: the HEAVY parts (multi-version cache with ~n
+        // versions, a thousand tx slots) go to the reaper; the light rest
+        // drops here. `S` (the snapshots) stays inline, so no 'static
+        // bound is needed on the payload.
+        let BlockCtx {
+            mv, slots, metrics, ..
+        } = ctx;
+        pool.reaper.send(Box::new((mv, slots))).ok();
+        let m = &metrics;
         // Feed the stealing policy: mean per-tx execution time this block.
         if n > 0 {
             pool.avg_tx_ns
