@@ -92,6 +92,75 @@ struct Args {
     sticky_assign: bool,
 }
 
+/// Counting allocator: every alloc through one pair of relaxed counters.
+/// The w=1 gap survived read-path timing (2.5us of 19.2), graph elision,
+/// and a sampling profiler — allocation pressure is the surviving
+/// hypothesis, and counting is the only offline way to test it.
+struct CountingAlloc;
+static ALLOC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static ALLOC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Size-class histogram: <64, <512, <4K, <32K, <256K, big.
+static ALLOC_BUCKETS: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+static BUCKET_BYTES: [std::sync::atomic::AtomicU64; 6] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+fn bucket_of(sz: usize) -> usize {
+    match sz {
+        0..=63 => 0,
+        64..=511 => 1,
+        512..=4095 => 2,
+        4096..=32767 => 3,
+        32768..=262143 => 4,
+        _ => 5,
+    }
+}
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        ALLOC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        ALLOC_BYTES.fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        let b = bucket_of(layout.size());
+        ALLOC_BUCKETS[b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        BUCKET_BYTES[b].fetch_add(layout.size() as u64, std::sync::atomic::Ordering::Relaxed);
+        unsafe { std::alloc::System.alloc(layout) }
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+}
+
+fn bucket_snap() -> [(u64, u64); 6] {
+    std::array::from_fn(|i| {
+        (
+            ALLOC_BUCKETS[i].load(std::sync::atomic::Ordering::Relaxed),
+            BUCKET_BYTES[i].load(std::sync::atomic::Ordering::Relaxed),
+        )
+    })
+}
+
+#[global_allocator]
+static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
+
+fn alloc_snap() -> (u64, u64) {
+    (
+        ALLOC_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        ALLOC_BYTES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 fn records(base_idx: u64, envs: &[TxEnvelope]) -> Vec<(TxIndex, BPosition, TxEnvelope)> {
     envs.iter()
         .enumerate()
@@ -271,6 +340,10 @@ fn run_mdbx_ab(
             let (mut fifo_cov, mut fifo_st, mut edges_sum) = (0u64, 0u64, 0u64);
             let mut read_us = 0u64;
             let mut disp_hist = vec![0u64; w];
+            let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
+            let (mut stm_allocs, mut stm_abytes) = (0u64, 0u64);
+            let mut seq_buckets = [(0u64, 0u64); 6];
+            let mut stm_buckets = [(0u64, 0u64); 6];
             let (mut c_hash, mut c_delta) = (0u64, 0u64);
             let (mut evm_us, mut pub_us) = (0u64, 0u64);
 
@@ -286,10 +359,14 @@ fn run_mdbx_ab(
                     global_idx += blk.len() as u64;
 
                     // Both engines read the SAME snapshot, before it moves.
+                    let a0 = alloc_snap();
+                    let b0 = bucket_snap();
                     let t0 = Instant::now();
                     let (seq_receipts, seq_delta) =
                         execute_block_sequential(&snapshot, None, e, &recs)?;
                     let s_ms = t0.elapsed().as_secs_f64() * 1e3;
+                    let a1 = alloc_snap();
+                    let b1 = bucket_snap();
 
                     let prepared: Vec<_> = recs
                         .iter()
@@ -318,6 +395,20 @@ fn run_mdbx_ab(
                         &stats,
                     )?;
                     let p_ms = t1.elapsed().as_secs_f64() * 1e3;
+                    let a2 = alloc_snap();
+                    let b2 = bucket_snap();
+                    if is_flow {
+                        seq_allocs += a1.0 - a0.0;
+                        seq_abytes += a1.1 - a0.1;
+                        stm_allocs += a2.0 - a1.0;
+                        stm_abytes += a2.1 - a1.1;
+                        for i in 0..6 {
+                            seq_buckets[i].0 += b1[i].0 - b0[i].0;
+                            seq_buckets[i].1 += b1[i].1 - b0[i].1;
+                            stm_buckets[i].0 += b2[i].0 - b1[i].0;
+                            stm_buckets[i].1 += b2[i].1 - b1[i].1;
+                        }
+                    }
                     assert_identical(
                         &seq_receipts,
                         &seq_delta,
@@ -419,6 +510,29 @@ fn run_mdbx_ab(
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
                 println!("     dispatch per worker: {disp_hist:?}");
+                let n_tx = (rt / rt.max(1)).max(1); // placeholder, replaced below
+                let _ = n_tx;
+                println!(
+                    "     allocs/tx: seq {:.1} ({:.0} B) | stm {:.1} ({:.0} B)",
+                    seq_allocs as f64 / 8000.0,
+                    seq_abytes as f64 / 8000.0,
+                    stm_allocs as f64 / 8000.0,
+                    stm_abytes as f64 / 8000.0,
+                );
+                const LBL: [&str; 6] = ["<64", "<512", "<4K", "<32K", "<256K", "big"];
+                for i in 0..6 {
+                    if seq_buckets[i].0 + stm_buckets[i].0 == 0 {
+                        continue;
+                    }
+                    println!(
+                        "       [{:>5}] seq {:>7.2}/tx {:>8.0}B | stm {:>7.2}/tx {:>8.0}B",
+                        LBL[i],
+                        seq_buckets[i].0 as f64 / 8000.0,
+                        seq_buckets[i].1 as f64 / 8000.0,
+                        stm_buckets[i].0 as f64 / 8000.0,
+                        stm_buckets[i].1 as f64 / 8000.0,
+                    );
+                }
                 println!(
                     "     chain: edges {} | fifo-covered {} | fifo-stalls {}",
                     edges_sum, fifo_cov, fifo_st,
