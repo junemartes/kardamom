@@ -367,6 +367,9 @@ fn run_mdbx_ab(
             let (mut fifo_cov, mut fifo_st, mut edges_sum) = (0u64, 0u64, 0u64);
             let mut read_us = 0u64;
             let mut disp_hist = vec![0u64; w];
+            let mut idle_us = 0u64;
+            let (mut prune_calls_s, mut prune_forced_s, mut prune_us_s, mut steals_s) =
+                (0u64, 0u64, 0u64, 0u64);
             let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
             let (mut stm_allocs, mut stm_abytes) = (0u64, 0u64);
             let mut seq_buckets = [(0u64, 0u64); 6];
@@ -501,6 +504,11 @@ fn run_mdbx_ab(
                         c_delta += out.commit_delta_us;
                         feed += out.feed_us;
                         snap_us += snap_open;
+                        idle_us += out.idle_us;
+                        prune_calls_s += out.prune_calls;
+                        prune_forced_s += out.prune_forced;
+                        prune_us_s += out.prune_us;
+                        steals_s += out.steals;
                         w_own += out.writes_own;
                         w_foreign += out.writes_foreign;
                         fifo_cov += out.fifo_covered;
@@ -591,6 +599,15 @@ fn run_mdbx_ab(
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
                 println!("     dispatch per worker: {disp_hist:?}");
+                println!(
+                    "     idle {:.1}ms across {w} workers (span cap {:.1}ms) | prunes {} (forced {}) {:.1}ms | steals {}",
+                    idle_us as f64 / 1000.0,
+                    (span * w as u64) as f64 / 1000.0,
+                    prune_calls_s,
+                    prune_forced_s,
+                    prune_us_s as f64 / 1000.0,
+                    steals_s,
+                );
                 let n_tx = (rt / rt.max(1)).max(1); // placeholder, replaced below
                 let _ = n_tx;
                 println!(
@@ -735,6 +752,93 @@ fn main() -> anyhow::Result<()> {
                         if si > a.block_size * queues.len() * 2 {
                             break;
                         }
+                    }
+                    flows.push(blk);
+                }
+                (vec![setup], flows)
+            }
+            "parcounter" => {
+                // FULLY INDEPENDENT contract calls — the bottom rung of
+                // the dependency ladder. Each sender deploys its OWN
+                // 10-byte counter (slot-0 increment) in setup, then calls
+                // it once per block. With senders >= block_size no two
+                // txs in a block share ANY state: distinct sender,
+                // distinct contract, distinct slot. Any idle time or
+                // sub-linear scaling here is an ENGINE defect by
+                // construction, not workload structure. Contract-call
+                // weight (~15us/tx) keeps the serial feed (<1us/tx) from
+                // masking the scaling, which plain transfers cannot do
+                // (2.5us/tx caps at ~2.2x by Amdahl regardless of the
+                // engine).
+                use alloy_consensus::{SignableTransaction, TxLegacy};
+                use alloy_eips::eip2718::Encodable2718;
+                use alloy_network::TxSignerSync;
+                use alloy_primitives::{TxKind, keccak256};
+                // init: PUSH1 len PUSH1 off PUSH1 0 CODECOPY PUSH1 len
+                // PUSH1 0 RETURN ++ runtime (slot0 += 1).
+                const RUNTIME: [u8; 10] =
+                    [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00];
+                let mut init = vec![
+                    0x60,
+                    RUNTIME.len() as u8,
+                    0x60,
+                    0x0c,
+                    0x60,
+                    0x00,
+                    0x39,
+                    0x60,
+                    RUNTIME.len() as u8,
+                    0x60,
+                    0x00,
+                    0xf3,
+                ];
+                init.extend_from_slice(&RUNTIME);
+                let sel = [0xAA, 0xBB, 0xCC, 0xDDu8];
+                let mut nonces = vec![0u64; signers.len()];
+                let counters: Vec<alloy_primitives::Address> = signers
+                    .iter()
+                    .map(|s| s.signer.address().create(0))
+                    .collect();
+                let mk =
+                    |si: usize, nonce: u64, kind: TxKind, input: Vec<u8>, gas: u64| -> TxEnvelope {
+                        let mut tx = TxLegacy {
+                            chain_id: Some(a.chain_id),
+                            nonce,
+                            gas_price: 1_000_000_000,
+                            gas_limit: gas,
+                            to: kind,
+                            value: U256::ZERO,
+                            input: input.into(),
+                        };
+                        let sig = signers[si].signer.sign_transaction_sync(&mut tx).unwrap();
+                        let env: alloy_consensus::TxEnvelope = tx.into_signed(sig).into();
+                        let raw = env.encoded_2718();
+                        TxEnvelope {
+                            correlation_id: 0,
+                            raw_tx: raw.clone().into(),
+                            sender: signers[si].signer.address(),
+                            tx_hash: keccak256(&raw),
+                        }
+                    };
+                let setup: Vec<TxEnvelope> = (0..signers.len())
+                    .map(|si| {
+                        nonces[si] += 1;
+                        mk(si, 0, TxKind::Create, init.clone(), 200_000)
+                    })
+                    .collect();
+                let mut flows = Vec::with_capacity(a.blocks);
+                for _ in 0..a.blocks {
+                    let mut blk = Vec::with_capacity(a.block_size);
+                    for i in 0..a.block_size {
+                        let si = i % signers.len();
+                        blk.push(mk(
+                            si,
+                            nonces[si],
+                            TxKind::Call(counters[si]),
+                            sel.to_vec(),
+                            80_000,
+                        ));
+                        nonces[si] += 1;
                     }
                     flows.push(blk);
                 }

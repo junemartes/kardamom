@@ -900,6 +900,15 @@ struct BlockCtx<S: StateDatabase> {
     /// measured, not fixed: the pool tracks mean per-tx execution time and
     /// enables stealing only above a threshold.
     steal_enabled: bool,
+    /// How long a dry worker spins before parking, in ns — sized from the
+    /// measured mean per-tx time. The old fixed 256 `spin_loop` hints
+    /// (<1us) were 25x SHORTER than the typical gap between chain-link
+    /// releases (~one tx execution), so workers parked into the exact
+    /// window their next transaction arrived in and paid up to the 200us
+    /// poll to notice it. MEASURED at w=4/4-pair: 25k dry cycles per 8k
+    /// txs, ~30% of worker capacity idle, while all prune work cost 8ms —
+    /// the idle was park latency, not scheduler cost.
+    spin_ns: u64,
     done_cv: Condvar,
     aborted: AtomicBool,
     /// Nodes observed leaving the graph more than once — always zero; a
@@ -1296,6 +1305,18 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 // Unknown (first block of a pool): allow it, and let the
                 // measurement correct course from the next block on.
                 avg == 0 || avg >= STEAL_WORTH_NS
+            },
+            spin_ns: {
+                // Bridge roughly one link-release gap (~one tx), bounded:
+                // spinning a full core for more than ~60us of silence is
+                // waste, and below ~5us the spin cannot outlast even a
+                // fast release.
+                let avg = self.avg_tx_ns.get();
+                if avg == 0 {
+                    20_000
+                } else {
+                    avg.clamp(5_000, 60_000)
+                }
             },
             done_cv: Condvar::new(),
             aborted: AtomicBool::new(false),
@@ -2146,10 +2167,26 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 let t_idle = std::time::Instant::now();
                 drop(q);
                 let mut spun = false;
-                for _ in 0..SPIN_BEFORE_PARK {
-                    std::hint::spin_loop();
+                let spin_start = std::time::Instant::now();
+                loop {
+                    for _ in 0..SPIN_BEFORE_PARK {
+                        std::hint::spin_loop();
+                    }
                     if !qh.q.lock().expect("queue poisoned").is_empty() {
                         spun = true;
+                        break;
+                    }
+                    // Completions may be parked while we spin — apply them
+                    // ourselves rather than spin past the work they would
+                    // release.
+                    if ctx.pending.load(Ordering::SeqCst) > 0 {
+                        ctx.prune(true);
+                        continue;
+                    }
+                    if ctx.drained() || ctx.aborted.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if spin_start.elapsed().as_nanos() as u64 >= ctx.spin_ns {
                         break;
                     }
                 }
