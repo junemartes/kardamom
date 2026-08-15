@@ -923,12 +923,6 @@ struct BlockCtx<S: StateDatabase> {
     /// measured, not fixed: the pool tracks mean per-tx execution time and
     /// enables stealing only above a threshold.
     steal_enabled: bool,
-    /// Worker pin list (empty = unpinned), also used by commit-phase
-    /// scoped threads: they are spawned from the CALLER's thread and
-    /// inherit ITS affinity mask — measured running the "parallel" hash
-    /// at serial speed because the caller was confined to two cores
-    /// while four workers' cores sat idle.
-    pin_cores: Vec<usize>,
     /// How long a dry worker spins before parking, in ns — sized from the
     /// measured mean per-tx time. The old fixed 256 `spin_loop` hints
     /// (<1us) were 25x SHORTER than the typical gap between chain-link
@@ -1145,8 +1139,6 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     dispatch_by_sender: bool,
     eager_chain: bool,
     sticky_assign: bool,
-    /// Worker/commit-thread pin list — see `PoolConfig::pin_cores`.
-    pin_cores: Vec<usize>,
     /// Domain -> worker, pool-lifetime (feed-thread-owned). Capped: past
     /// `STICKY_CAP` entries new domains fall back to hashing, so a
     /// long-lived pool cannot grow this without bound.
@@ -1218,7 +1210,6 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             shared: shared_ref,
             avg_tx_ns: std::cell::Cell::new(0),
             sticky_assign,
-            pin_cores: pin_cores.clone(),
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             parallel_worth_ns,
@@ -1344,7 +1335,6 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 // measurement correct course from the next block on.
                 avg == 0 || avg >= STEAL_WORTH_NS
             },
-            pin_cores: self.pin_cores.clone(),
             spin_ns: {
                 // Bridge roughly one link-release gap (~one tx), bounded:
                 // spinning a full core for more than ~60us of silence is
@@ -1839,12 +1829,48 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // missed a real conflict (the tx read a cell an earlier tx wrote
         // without a mark to park on).
         let t_val = std::time::Instant::now();
-        let wounded: Vec<usize> = tx_results
-            .iter()
-            .enumerate()
-            .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
-            .map(|(i, _)| i)
-            .collect();
+        // PARALLEL: replay is read-only against the multi-version cache
+        // and independent per tx — it was ~15ms of serial tail on a 9k-tx
+        // set, the single largest block in the commit path. Scoped
+        // threads, unpinned (the caller's cores are the hot ones — see
+        // the hash phase note).
+        let n_val = tx_results.len();
+        let val_threads = ctx.queues.len().min(n_val.max(1));
+        let wounded: Vec<usize> = if val_threads > 1 && n_val > 256 {
+            let chunk = n_val.div_ceil(val_threads);
+            let mut parts: Vec<Vec<usize>> = Vec::with_capacity(val_threads);
+            std::thread::scope(|sc| {
+                let handles: Vec<_> = tx_results
+                    .chunks(chunk)
+                    .enumerate()
+                    .map(|(ci, part)| {
+                        let base = ci * chunk;
+                        let mv = &ctx.mv;
+                        sc.spawn(move || {
+                            part.iter()
+                                .enumerate()
+                                .filter(|(j, r)| {
+                                    let i = base + j;
+                                    r.reads.iter().any(|rec| !mv.validate(i as u32, rec))
+                                })
+                                .map(|(j, _)| base + j)
+                                .collect::<Vec<usize>>()
+                        })
+                    })
+                    .collect();
+                for h in handles {
+                    parts.push(h.join().expect("validation thread"));
+                }
+            });
+            parts.concat()
+        } else {
+            tx_results
+                .iter()
+                .enumerate()
+                .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
+                .map(|(i, _)| i)
+                .collect()
+        };
         let t_validate = t_val.elapsed();
         let wounds = wounded.len();
 
@@ -1908,19 +1934,17 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             let threads = ctx.queues.len().min(n.max(1));
             if threads > 1 && n > 64 {
                 let chunk = n.div_ceil(threads);
-                let pins = &ctx.pin_cores;
                 std::thread::scope(|sc| {
-                    for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
+                    for part in tx_results.chunks_mut(chunk) {
                         sc.spawn(move || {
-                            // Escape the spawner's affinity mask: hash on
-                            // the (idle) worker cores, not wherever the
-                            // feed thread happens to be confined.
-                            if !pins.is_empty() {
-                                let id = core_affinity::CoreId {
-                                    id: pins[ti % pins.len()],
-                                };
-                                let _ = core_affinity::set_for_current(id);
-                            }
+                            // Deliberately UNPINNED (a pin to the worker
+                            // cores was tried and reverted): commit runs
+                            // while workers park, and the caller's cores
+                            // are the boosted ones — a hash thread pinned
+                            // to a worker core pays that core's frequency
+                            // ramp (or, under keep-hot spinners, SCHED_IDLE
+                            // preemption latency per spawn, measured 21ms
+                            // vs 5.6 for 9k hashes).
                             for r in part {
                                 if r.sink_touched {
                                     r.receipt.write_set_hash = r.ws.hash();
