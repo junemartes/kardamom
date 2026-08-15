@@ -219,7 +219,7 @@ fn anchored<T>(
         let proofs = proofs_from(have.clone());
         match op(&proofs) {
             Ok(v) => return (v, proofs),
-            Err(AnchorError::MissingNode { hash }) => {
+            Err(AnchorError::MissingNode { hash, .. }) => {
                 have.push(
                     all.get(&hash)
                         .unwrap_or_else(|| panic!("round {round}: unknown node {hash}"))
@@ -393,7 +393,7 @@ fn emptying_a_preexisting_account_fails_closed() {
         match verify_witness_anchored(&w, &proofs)
             .and_then(|pre| recompute_post_root(&w, &proofs, &pre, &delta))
         {
-            Err(AnchorError::MissingNode { hash }) => have.push(all[&hash].clone()),
+            Err(AnchorError::MissingNode { hash, .. }) => have.push(all[&hash].clone()),
             Err(e) => break e,
             Ok(_) => panic!("must fail closed"),
         }
@@ -440,7 +440,7 @@ fn slot_under_unwitnessed_account_is_rejected() {
     let err = loop {
         let proofs = proofs_from(have.clone());
         match verify_witness_anchored(&w, &proofs) {
-            Err(AnchorError::MissingNode { hash }) => have.push(all[&hash].clone()),
+            Err(AnchorError::MissingNode { hash, .. }) => have.push(all[&hash].clone()),
             Err(e) => break e,
             Ok(_) => panic!("must reject"),
         }

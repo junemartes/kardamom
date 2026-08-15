@@ -74,7 +74,7 @@ fn fixed_point<T>(
         let store = NodeStore::new(&proofs).expect("canonical set");
         match op(&store) {
             Ok(v) => return (v, rounds),
-            Err(AnchorError::MissingNode { hash }) => {
+            Err(AnchorError::MissingNode { hash, .. }) => {
                 let node = all_nodes
                     .get(&hash)
                     .unwrap_or_else(|| panic!("fixed point wants unknown node {hash}"));
@@ -148,7 +148,7 @@ fn lookup_without_proof_names_the_missing_node() {
     let store = NodeStore::new(&proofs).unwrap();
     let mut trie = SparseTrie::new(root, &store);
     match trie.lookup(key(7)) {
-        Err(AnchorError::MissingNode { hash }) => {
+        Err(AnchorError::MissingNode { hash, .. }) => {
             assert!(all.contains_key(&hash), "named node must be real");
             assert_eq!(hash, root, "first missing node is the root");
         }

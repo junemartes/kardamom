@@ -12,9 +12,11 @@
 //! `keccak256(node)`), so a malicious node set can only produce
 //! [`AnchorError::MissingNode`] or a root mismatch — never smuggle state.
 //!
-//! [`AnchorError::MissingNode`] is deliberately a NAMED hash: it is the
-//! signal the capture-side fixed point resolves (re-run the walk with that
-//! node added), so its precision is part of the design, not diagnostics.
+//! [`AnchorError::MissingNode`] deliberately names BOTH the hash and the
+//! nibble position: the capture-side fixed point resolves it by re-running
+//! the live-trie walk with that position as a retainer target (hashes are
+//! not addressable there), so its precision is part of the design, not
+//! diagnostics.
 //!
 //! [`NodeStore`]: super::NodeStore
 
@@ -40,8 +42,8 @@ impl Node {
     /// Expand an [`RlpNode`] reference into a structural node (children stay
     /// unresolved). Inline references (< 32 bytes) decode in place; hash
     /// references go through the store.
-    fn resolve(r: &RlpNode, store: &NodeStore<'_>) -> Result<Node, AnchorError> {
-        let trie_node = store.resolve(r)?;
+    fn resolve(r: &RlpNode, at: &Nibbles, store: &NodeStore<'_>) -> Result<Node, AnchorError> {
+        let trie_node = store.resolve(r, at)?;
         Ok(match trie_node {
             // A child reference never points at the empty root: MPT parents
             // omit empty children entirely (branch mask bit unset).
@@ -69,9 +71,9 @@ impl Node {
         })
     }
 
-    fn resolved(self, store: &NodeStore<'_>) -> Result<Node, AnchorError> {
+    fn resolved(self, at: &Nibbles, store: &NodeStore<'_>) -> Result<Node, AnchorError> {
         match self {
-            Node::Unresolved(ref r) => Node::resolve(r, store),
+            Node::Unresolved(ref r) => Node::resolve(r, at, store),
             n => Ok(n),
         }
     }
@@ -125,7 +127,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         store: &NodeStore<'_>,
     ) -> Result<Lookup, AnchorError> {
         if let Node::Unresolved(r) = node {
-            *node = Node::resolve(r, store)?;
+            *node = Node::resolve(r, &path.slice(..depth), store)?;
         }
         let rest = path.slice(depth..);
         match node {
@@ -174,7 +176,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         let rest = path.slice(depth..);
         let mut node = match node {
             None => return Ok(Node::Leaf { key: rest, value }),
-            Some(n) => n.resolved(store)?,
+            Some(n) => n.resolved(&path.slice(..depth), store)?,
         };
         match &mut node {
             Node::Unresolved(_) => unreachable!("resolved above"),
@@ -272,7 +274,7 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
         depth: usize,
         store: &NodeStore<'_>,
     ) -> Result<Option<Node>, AnchorError> {
-        let node = node.resolved(store)?;
+        let node = node.resolved(&path.slice(..depth), store)?;
         let rest = path.slice(depth..);
         match node {
             Node::Unresolved(_) => unreachable!("resolved above"),
@@ -329,9 +331,10 @@ impl<'s, 'p> SparseTrie<'s, 'p> {
                         // Resolving it is what can demand an off-path node —
                         // the MissingNode the fixed point exists to feed.
                         let survivor = children[i].take().expect("survivor indexed");
-                        let survivor = survivor.resolved(store)?;
                         let mut nib = Nibbles::new();
                         nib.push(i as u8);
+                        let survivor_at = path.slice(..depth).join(&nib);
+                        let survivor = survivor.resolved(&survivor_at, store)?;
                         Ok(Some(match survivor {
                             Node::Unresolved(_) => unreachable!("resolved above"),
                             Node::Leaf { key, value } => Node::Leaf {

@@ -53,8 +53,15 @@ pub enum AnchorError {
     /// The node set is not in canonical wire form (sorted by hash, unique).
     ProofSetNotCanonical,
     /// A walk needed a node the set does not carry. On the capture side
-    /// this is the fixed point's work item; in the guest it is fatal.
-    MissingNode { hash: B256 },
+    /// this is the fixed point's work item — `path` is the node's nibble
+    /// position (what a live-trie proof retainer targets; hashes are not
+    /// addressable there), and `account` names the storage trie it belongs
+    /// to (`None` = the account trie). In the guest it is fatal.
+    MissingNode {
+        hash: B256,
+        path: alloy_trie::Nibbles,
+        account: Option<Address>,
+    },
     /// A carried node failed to RLP-decode.
     NodeDecode { hash: B256 },
     /// The trie refutes a witness entry (wrong value, or present-vs-absent
@@ -103,19 +110,47 @@ impl<'p> NodeStore<'p> {
         Ok(Self { nodes })
     }
 
-    /// Expand a node reference: inline references decode in place; hash
-    /// references are fetched (verified by construction — the key IS the
-    /// hash) and decoded.
-    pub(crate) fn resolve(&self, r: &RlpNode) -> Result<TrieNode, AnchorError> {
+    /// Expand the node reference at nibble position `at`: inline references
+    /// decode in place; hash references are fetched (verified by
+    /// construction — the key IS the hash) and decoded. A miss names both
+    /// the hash and `at`, the retainer-addressable half.
+    pub(crate) fn resolve(
+        &self,
+        r: &RlpNode,
+        at: &alloy_trie::Nibbles,
+    ) -> Result<TrieNode, AnchorError> {
         let (bytes, hash) = match r.as_hash() {
             Some(h) => match self.nodes.get(&h) {
                 Some(b) => (*b, h),
-                None => return Err(AnchorError::MissingNode { hash: h }),
+                None => {
+                    return Err(AnchorError::MissingNode {
+                        hash: h,
+                        path: *at,
+                        account: None,
+                    });
+                }
             },
             None => (r.as_slice(), B256::ZERO),
         };
         let mut slice = bytes;
         TrieNode::decode(&mut slice).map_err(|_| AnchorError::NodeDecode { hash })
+    }
+}
+
+/// Stamp `account` onto a storage-trie walk's [`AnchorError::MissingNode`]
+/// so the capture side knows WHICH trie to target.
+fn in_storage_trie(account: Address, e: AnchorError) -> AnchorError {
+    match e {
+        AnchorError::MissingNode {
+            hash,
+            path,
+            account: None,
+        } => AnchorError::MissingNode {
+            hash,
+            path,
+            account: Some(account),
+        },
+        other => other,
     }
 }
 
@@ -184,7 +219,10 @@ pub fn verify_witness_anchored(
         let trie = storage_tries
             .entry(slot.address)
             .or_insert_with(|| SparseTrie::new(sroot, &store));
-        match trie.lookup(keccak256(slot.key))? {
+        match trie
+            .lookup(keccak256(slot.key))
+            .map_err(|e| in_storage_trie(slot.address, e))?
+        {
             Lookup::Found(value) => {
                 let mut slice = value.as_slice();
                 let got = U256::decode(&mut slice)
@@ -264,11 +302,13 @@ pub fn recompute_post_root(
         let mut trie = SparseTrie::new(sroot, &store);
         for (key, value) in writes {
             if value.is_zero() {
-                trie.remove(keccak256(key))?;
+                trie.remove(keccak256(key))
+                    .map_err(|e| in_storage_trie(*addr, e))?;
             } else {
                 let mut rlp = Vec::new();
                 alloy_rlp::Encodable::encode(value, &mut rlp);
-                trie.insert(keccak256(key), rlp)?;
+                trie.insert(keccak256(key), rlp)
+                    .map_err(|e| in_storage_trie(*addr, e))?;
             }
         }
         new_storage_root.insert(*addr, trie.root());
