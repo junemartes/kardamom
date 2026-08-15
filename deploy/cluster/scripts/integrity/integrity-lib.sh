@@ -16,14 +16,10 @@
 #   ../lib.sh           log/fail
 #   ../lib-topology.sh  topology_load -> NODES/NODE_IP/NODE_ROLE/NODE_TIER
 
-# Image namespace of the kardamom services in the in-cluster registry; inner
-# containers are recognised by it (mirrors group_vars image_prefix).
-INTEGRITY_IMAGE_PREFIX="${INTEGRITY_IMAGE_PREFIX:-192.168.56.10:5000/kardamom-}"
-
 # Nodes that can host kardamom task containers. The control node runs only
-# registry + anvil + the consul/nomad servers (no kardamom-* images), but it
-# is still enumerated — filtering happens by image, so a misplaced kardamom
-# container on the control node IS a finding, not a blind spot.
+# registry + anvil + the consul/nomad servers, but it is still enumerated —
+# classification happens per container, so a misplaced kardamom task on the
+# control node IS a finding, not a blind spot.
 integrity_nodes() {
   local n
   for n in "${NODES[@]}"; do
@@ -37,24 +33,55 @@ node_reachable() {
 }
 
 # Inner kardamom task containers on a node, one per line:
-#   <cid>|<name>|<image-ref-as-started>
-# The name is Nomad's <task>-<alloc-id>; the image ref is exactly what the
-# docker driver was asked to run (repo@sha256:... when the deploy pinned it,
-# repo:dev on the fallback path).
+#   <cid>|<name>|<svc>
+#
+# Enumerated by the Nomad docker driver's alloc_id LABEL, not by image ref:
+# Nomad 1.9.5 creates task containers with `Image: <imageID>` (the sha256
+# config id, drivers/docker/driver.go), so `docker ps` shows an ID — an
+# image-string filter would miss every task. The service key comes from the
+# container NAME, which Nomad forms as <task>-<alloc-uuid>.
 kardamom_containers() {
-  local node="$1"
-  docker exec "${node}" docker ps --no-trunc --format '{{.ID}}|{{.Names}}|{{.Image}}' 2>/dev/null \
-    | grep -F "${INTEGRITY_IMAGE_PREFIX}" || true
+  local node="$1" cid name svc
+  while IFS='|' read -r cid name; do
+    [[ -n "${cid}" ]] || continue
+    svc="$(svc_from_task_name "${name}")"
+    [[ -n "${svc}" ]] && echo "${cid}|${name}|${svc}"
+  done < <(docker exec "${node}" docker ps --no-trunc \
+      --filter label=com.hashicorp.nomad.alloc_id \
+      --format '{{.ID}}|{{.Names}}' 2>/dev/null || true)
 }
 
-# Short service key for a container's image ref (manifest key namespace):
-# 192.168.56.10:5000/kardamom-ingress@sha256:... -> ingress
-# (Basename FIRST, then strip the tag: the registry component carries a colon
-# of its own, so a naive %:* on the full ref would eat everything after the
-# registry host.)
-svc_from_image() {
-  local ref="${1%%@*}"
-  local name="${ref##*/}"
-  name="${name%%:*}"
-  echo "${name#kardamom-}"
+# Container name (<task>-<alloc-uuid>) -> digest-manifest service key. Empty
+# for Nomad tasks OUTSIDE the manifest's scope, which the sweeps skip:
+# anvil (digest-pinned directly in its job spec), haproxy/rpc-proxy (manual
+# push, operator-pinned), spire server/agent (pinned upstream digests).
+svc_from_task_name() {
+  case "$1" in
+    archiving-media-driver-*)    echo aeron ;;
+    cluster-*)                   echo cluster ;;
+    ingress-*)                   echo ingress ;;
+    sequencer-a-*|sequencer-b-*) echo sequencer ;;
+    executor-*)                  echo executor ;;
+    validator-*)                 echo validator ;;
+    da-watcher-*)                echo da-watcher ;;
+    batcher-*)                   echo batcher ;;
+    *)                           echo "" ;;
+  esac
+}
+
+# Strip the advisory :tag from a repo:tag@sha256:... reference, yielding the
+# bare repo@sha256:... form dockerd records in an image's RepoDigests. A ref
+# without a digest (the :dev fallback) or without a tag passes through
+# unchanged. Careful with the registry-port colon: only a colon in the
+# BASENAME is a tag separator.
+bare_digest_ref() {
+  local ref="$1"
+  if [[ "${ref}" != *@* ]]; then
+    echo "${ref}"
+    return
+  fi
+  local repo="${ref%%@*}" digest="${ref#*@}"
+  local base="${repo##*/}"
+  [[ "${base}" == *:* ]] && repo="${repo%:*}"
+  echo "${repo}@${digest}"
 }

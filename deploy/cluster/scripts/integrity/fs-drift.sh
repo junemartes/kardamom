@@ -82,10 +82,9 @@ for node in $(integrity_nodes); do
     log "${node}: unreachable (down or not a DinD node) — skipped"
     continue
   fi
-  while IFS='|' read -r cid name image; do
+  while IFS='|' read -r cid name svc; do
     [[ -n "${cid}" ]] || continue
     checked=$((checked + 1))
-    svc="$(svc_from_image "${image}")"
     diff_out="$(docker exec "${node}" docker diff "${cid}" 2>/dev/null || true)"
     [[ -z "${diff_out}" ]] && continue
     while read -r ctype path; do

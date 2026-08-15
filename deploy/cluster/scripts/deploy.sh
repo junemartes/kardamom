@@ -52,10 +52,13 @@ fi
 # --- digest-pinned image refs (attested-identity P0.1) -----------------------
 # The image build/push step (ci-images.sh push_image, or `make images`) records
 # each pushed image's registry digest in the manifest below, one line per
-# image: "<svc> <repo>@sha256:...". Every kardamom job exposes an `image_ref`
-# HCL variable; passing the digest ref through it makes the task run the EXACT
-# bytes this deploy pushed (a digest is immutable — nobody who can push to the
-# registry can change what a restart runs). The manifest + this deploy log are
+# image: "<svc> <repo>:<tag>@sha256:...". Every kardamom job exposes an
+# `image_ref` HCL variable; passing the digest ref through it makes the task
+# run the EXACT bytes this deploy pushed (a digest is immutable — nobody who
+# can push to the registry can change what a restart runs). The COMBINED
+# repo:tag@digest form matters: Nomad 1.9.5's docker driver mis-parses a bare
+# repo@digest on a port-carrying registry host ("invalid reference format" at
+# pull; see ci-images.sh push_image). The manifest + this deploy log are
 # the audit record; `deploy/cluster/scripts/integrity/image-drift.sh` checks
 # the running fleet against the manifest later.
 #
@@ -73,17 +76,25 @@ else
   echo "         production path). Run the image build/push step to pin." >&2
 fi
 
-# Populate IMAGE_REF_ARGS=(-var image_ref=<repo>@sha256:...) for a service, or
-# leave it empty (tag fallback) when the manifest has no line for it. The last
-# matching line wins, mirroring push order.
+# Populate IMAGE_REF_ARGS=(-var image_ref=<repo>:<tag>@sha256:...) for a
+# service, or leave it empty (tag fallback) when the manifest has no line for
+# it. The last matching line wins, mirroring push order. A PRESENT-but-
+# malformed ref is a hard error, not a fallback: it means the manifest is
+# corrupt (hand-edited, or a capture bug) and deploying unpinned while a
+# manifest exists would silently break the audit record.
 IMAGE_REF_ARGS=()
 image_ref_args() {
-  local svc="$1" ref=""
+  local svc="$1" ref="" ref_re='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
   IMAGE_REF_ARGS=()
   if [[ -f "${DIGEST_MANIFEST}" ]]; then
-    ref="$(awk -v s="${svc}" '$1 == s { r = $2 } END { print r }' "${DIGEST_MANIFEST}")"
+    ref="$(awk -v s="${svc}" '$1 == s { r = $2 } END { print r }' "${DIGEST_MANIFEST}" | tr -d '[:space:]\r')"
   fi
   if [[ -n "${ref}" ]]; then
+    if [[ ! "${ref}" =~ ${ref_re} ]]; then
+      echo "ERROR: malformed digest ref for '${svc}' in ${DIGEST_MANIFEST}: '${ref}'" >&2
+      echo "       expected <repo>:<tag>@sha256:<64 hex>; refusing to deploy from a corrupt manifest." >&2
+      exit 1
+    fi
     IMAGE_REF_ARGS=(-var "image_ref=${ref}")
   else
     echo "WARNING: no pinned digest for '${svc}'; its job falls back to the mutable :dev tag." >&2

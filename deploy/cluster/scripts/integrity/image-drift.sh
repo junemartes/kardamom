@@ -7,20 +7,27 @@
 # ACTUALLY running against what the last deploy PUSHED:
 #
 #   deployed  = deploy/cluster/images.digests, the per-deploy manifest the
-#               image push step writes ("<svc> <repo>@sha256:..." per image)
-#               and deploy.sh passes into every job's image_ref variable.
-#               The manifest is the source of truth here — not the Nomad job
-#               spec — because it is written at PUSH time by the pipeline
-#               that owns the bytes; a job spec re-registered by hand (the
-#               :dev fallback) is exactly the situation this sweep must flag.
-#   running   = (a) the image ref the container was STARTED from
-#               (.Config.Image), and (b) the RepoDigests of the image the
-#               container is USING (resolved from its image ID) — (b) catches
-#               a re-tagged/re-pushed image behind a stale ref, (a) catches a
-#               task that was never pinned at all.
+#               image push step writes ("<svc> <repo>:<tag>@sha256:..." per
+#               image) and deploy.sh passes into every job's image_ref
+#               variable. The manifest is the source of truth here — not the
+#               Nomad job spec — because it is written at PUSH time by the
+#               pipeline that owns the bytes; a job spec re-registered by
+#               hand (the :dev fallback) is exactly the situation this sweep
+#               must flag.
+#   running   = (b, authoritative) the RepoDigests of the image BACKING the
+#               container (resolved from its image ID) must contain the
+#               deployed digest — catches stale caches, re-pushed tags, and
+#               unpinned starts alike; PLUS (a, best-effort) when the
+#               container records a REF in .Config.Image, it must normalize
+#               to the deployed ref. Nomad 1.9.5 creates task containers by
+#               IMAGE ID (drivers/docker/driver.go: `Image: imageID`), so on
+#               this cluster .Config.Image is sha256:<id> and check (a) is
+#               skipped — (b) alone decides.
 #
 # Any container whose running digest differs from the manifest — or that
 # cannot be verified against it — is a finding: report + nonzero exit.
+# (Refs are normalized before comparison: the manifest's combined
+# repo:tag@digest form vs dockerd's bare repo@digest RepoDigests entries.)
 #
 # Usage:
 #   integrity/image-drift.sh [--manifest FILE]
@@ -69,25 +76,29 @@ for node in $(integrity_nodes); do
     log "${node}: unreachable (down or not a DinD node) — skipped"
     continue
   fi
-  while IFS='|' read -r cid name image; do
+  while IFS='|' read -r cid name svc; do
     [[ -n "${cid}" ]] || continue
     checked=$((checked + 1))
-    svc="$(svc_from_image "${image}")"
     expected="${EXPECTED[${svc}]:-}"
     if [[ -z "${expected}" ]]; then
-      finding "${node}/${name}: service '${svc}' has no line in ${MANIFEST} — running image cannot be verified (ref: ${image})"
+      finding "${node}/${name}: service '${svc}' has no line in ${MANIFEST} — running image cannot be verified"
       continue
     fi
-    # (a) the ref the task was started from should BE the pinned ref.
+    expected_bare="$(bare_digest_ref "${expected}")"
     started_ref="$(docker exec "${node}" docker inspect -f '{{.Config.Image}}' "${cid}" 2>/dev/null || true)"
-    # (b) the digests of the image actually backing the container.
     image_id="$(docker exec "${node}" docker inspect -f '{{.Image}}' "${cid}" 2>/dev/null || true)"
     repo_digests="$(docker exec "${node}" docker image inspect -f '{{join .RepoDigests "\n"}}' "${image_id}" 2>/dev/null || true)"
-    if [[ "${started_ref}" != "${expected}" ]]; then
-      finding "${node}/${name}: started from '${started_ref}', deploy pinned '${expected}' (tag-fallback or manual run?)"
+    # (a) best-effort: only when the container was created from a REF (Nomad
+    # 1.9.5 creates task containers by image ID — sha256:<id> — which proves
+    # nothing about pinning either way; (b) below decides).
+    if [[ -n "${started_ref}" && "${started_ref}" != sha256:* ]]; then
+      if [[ "$(bare_digest_ref "${started_ref}")" != "${expected_bare}" ]]; then
+        finding "${node}/${name}: started from '${started_ref}', deploy pinned '${expected}' (tag-fallback or manual run?)"
+      fi
     fi
-    if ! grep -qxF "${expected}" <<<"${repo_digests}"; then
-      finding "${node}/${name}: running image ${image_id} carries digests [$(tr '\n' ' ' <<<"${repo_digests}")], none is the deployed ${expected}"
+    # (b) authoritative: the backing image must carry the deployed digest.
+    if ! grep -qxF "${expected_bare}" <<<"${repo_digests}"; then
+      finding "${node}/${name}: running image ${image_id} carries digests [$(tr '\n' ' ' <<<"${repo_digests}")], none is the deployed ${expected_bare}"
     fi
   done < <(kardamom_containers "${node}")
 done

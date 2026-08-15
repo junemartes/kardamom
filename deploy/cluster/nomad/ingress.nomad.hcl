@@ -34,7 +34,7 @@ variable "ack_policy" {
 }
 
 # Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
-# repo@sha256:... reference captured at push time (deploy/cluster/
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
 # images.digests), so the task runs exactly the bytes that deploy pushed.
 # The empty default falls back to the mutable :dev tag in the task config —
 # a dev affordance for manual `nomad job run` during debugging, NOT a
@@ -42,7 +42,7 @@ variable "ack_policy" {
 # what the next restart runs).
 variable "image_ref" {
   type        = string
-  description = "Digest-pinned image reference (repo@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
   default     = ""
 }
 
@@ -111,11 +111,13 @@ job "ingress" {
           nofile = "65536:65536"
         }
         image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-ingress:dev"
-        # force_pull is kept for the mutable-:dev FALLBACK path: without it
-        # Nomad can reuse a stale node-cached layer across rebuilds (caused a
-        # crash-retry storm that stalled the deploy). For the digest-pinned
-        # path it is redundant but harmless — a digest names immutable bytes,
-        # so a re-pull can only fetch identical content.
+        # force_pull is kept for BOTH paths: the mutable-:dev fallback needs
+        # it (a stale node-cached layer once caused a crash-retry storm that
+        # stalled the deploy), and on the digest-pinned path Nomad 1.9.5
+        # pulls the ref's advisory TAG and then resolves the container image
+        # by the DIGEST — the pull refreshes the tag but the digest still
+        # pins what runs (a moved tag fails the task rather than ever
+        # running unpinned bytes).
         force_pull = true
         # Read-only root filesystem (attested-identity P0.3): the ingress
         # writes only to the bind-mounted aeron dir and Nomad's alloc/local/

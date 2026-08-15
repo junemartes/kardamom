@@ -35,8 +35,8 @@ push_image() {
     out="$(docker push "${img}" | tee /dev/stderr)"
   fi
   # Digest capture (attested-identity P0.1): record the digest of exactly this
-  # push so deploy.sh can pin the jobs to repo@sha256:... . The digest comes
-  # from the push output's final "digest: sha256:..." line, NOT from
+  # push so deploy.sh can pin the jobs. The digest comes from the push
+  # output's final "digest: sha256:..." line, NOT from
   # `docker inspect --format='{{index .RepoDigests 0}}'`, for two reasons:
   #   1. it works identically for both push paths above — in the
   #      REGISTRY_PUSH_NODE path the push happens inside the node's INNER
@@ -45,22 +45,41 @@ push_image() {
   #      repos/registries the same image ID is tagged under, so index 0 is not
   #      guaranteed to be this registry's digest — the push output line is by
   #      definition the digest of exactly this push to exactly this repo.
-  # Fail loudly rather than fall back: a deploy that silently lost its digest
+  # Defensive strip + shape validation: an invisible \r/space here would print
+  # clean in every log yet fail docker's reference parser at pull time. Fail
+  # loudly rather than fall back: a deploy that silently lost its digest
   # would run the mutable :dev tag while claiming an audit record.
   local digest
-  digest="$(awk '/digest: sha256:/ {d=$3} END {print d}' <<<"${out}")"
+  digest="$(awk '/digest: sha256:/ {d=$3} END {print d}' <<<"${out}" | tr -d '[:space:]\r')"
   if [[ -z "${digest}" ]]; then
     echo "ERROR: could not capture the pushed digest for ${img} from the push output" >&2
     exit 1
   fi
-  # Manifest line: "<svc> <repo>@sha256:..." where <svc> is the image basename
-  # minus the kardamom- prefix (aeron, cluster, ingress, ...). deploy.sh maps
-  # each job to its <svc> line and passes the ref via -var image_ref=... .
-  local repo name
-  repo="${img%:*}"
-  name="${repo##*/}"
-  echo "${name#kardamom-} ${repo}@${digest}" >>"${DIGEST_MANIFEST}"
-  log "pinned ${name#kardamom-} -> ${repo}@${digest}"
+  # Manifest line: "<svc> <repo>:<tag>@sha256:..." where <svc> is the image
+  # basename minus the kardamom- prefix (aeron, cluster, ingress, ...).
+  # deploy.sh maps each job to its <svc> line and passes the ref via
+  # -var image_ref=... .
+  #
+  # The COMBINED repo:tag@digest form (not bare repo@digest) is deliberate:
+  # Nomad 1.9.5's docker driver (drivers/docker/utils.go parseDockerImage)
+  # mis-parses a bare digest ref on a PORT-carrying registry host — the
+  # registry-port colon makes it take the "tag contains /" branch, append
+  # :latest, and the pull dies with "invalid reference format" (exactly what
+  # took down every aeron alloc on PR #212's first e2e run). With repo:tag@
+  # digest the driver pulls the advisory tag and then resolves the container
+  # image by the DIGEST ref (ImageInspectWithRaw on the full pinned string),
+  # so the digest still pins what runs: a moved tag fails the task instead
+  # of ever running unpinned bytes.
+  local ref name ref_re='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
+  ref="${img}@${digest}"
+  if [[ ! "${ref}" =~ ${ref_re} ]]; then
+    echo "ERROR: captured image ref fails shape validation: '${ref}'" >&2
+    exit 1
+  fi
+  name="${img##*/}"
+  name="${name%%:*}"
+  echo "${name#kardamom-} ${ref}" >>"${DIGEST_MANIFEST}"
+  log "pinned ${name#kardamom-} -> ${ref}"
 }
 
 # Thin service images from prebuilt binaries (§5): the workflow ran

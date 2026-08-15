@@ -18,13 +18,13 @@
 # deploy/cluster/ directory (scripts/deploy.sh does this).
 
 # Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
-# repo@sha256:... reference captured at push time (deploy/cluster/
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
 # images.digests). The empty default falls back to the mutable :dev tag in
 # the task config — a dev affordance for manual `nomad job run` during
 # debugging, NOT a production path.
 variable "image_ref" {
   type        = string
-  description = "Digest-pinned image reference (repo@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
   default     = ""
 }
 
@@ -86,8 +86,9 @@ job "validator" {
 
       config {
         image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-validator:dev"
-        # force_pull kept for the mutable-:dev fallback path (see executor
-        # job); redundant-but-harmless for the digest-pinned path.
+        # force_pull kept for both paths (see the ingress job's comment):
+        # the :dev fallback needs it; on the pinned path the 1.9.5 driver
+        # pulls the tag but resolves the image by digest, so the pin holds.
         force_pull = true
         # Read-only rootfs (attested-identity P0.3): the validator's writable
         # surfaces — its state dir under the shared mount, the checkpoint

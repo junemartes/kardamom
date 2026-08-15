@@ -11,11 +11,13 @@ take `--help`.
 ## What each script proves
 
 - **`image-drift.sh`** — for every kardamom task container on every node:
-  the image ref the task was started from AND the RepoDigests of the image
-  actually backing it both match the deploy's digest manifest
-  (`deploy/cluster/images.digests`, written at push time). Catches: a task
-  running the mutable-tag fallback, a node-cached stale image, a re-pushed
-  image behind a stale ref, a container started by hand.
+  the RepoDigests of the image actually backing the container must contain
+  the digest from the deploy's manifest (`deploy/cluster/images.digests`,
+  written at push time); when the container records a start REF (Nomad
+  1.9.5 creates task containers by image ID, so usually it does not), that
+  ref must normalize to the pinned one too. Catches: a task running the
+  mutable-tag fallback, a node-cached stale image, a re-pushed image behind
+  a stale ref, a container started by hand.
 - **`fs-drift.sh`** — `docker diff` per kardamom container is empty except
   for the per-service allowlist (`fs-allowlist.txt`; JVM `/tmp` etc.).
   Catches: anything written into the image filesystem the deploy did not

@@ -16,10 +16,13 @@
 #
 # Selector caveat (documented, deliberate): the docker attestor's image_id
 # selector value follows what the node's dockerd reports for the container's
-# image. With digest-pinned deploys that is the repo@sha256:... ref from the
-# manifest. If the deployed SPIRE version reports the local image CONFIG id
-# instead, pass --resolve-image-id <node> to translate each manifest ref into
-# that id via the node's docker before registering.
+# image. The default here is the manifest ref normalized to the bare
+# repo@sha256:... form (dockerd's RepoDigests convention; the manifest
+# carries repo:tag@sha256:...). NOTE: Nomad 1.9.5 creates task containers by
+# IMAGE ID (sha256 config id), so on this cluster the attestor most likely
+# reports that id — pass --resolve-image-id <node> to translate each
+# manifest ref into the local image id via the node's docker before
+# registering.
 #
 # The spire-server CLI is reached inside the server's task container on the
 # control node (docker exec, the chaos-suite access pattern). Override with
@@ -113,7 +116,13 @@ while read -r svc ref _; do
     echo "WARN: no job/task mapping for manifest service '${svc}' — skipped" >&2
     continue
   fi
-  image_sel="${ref}"
+  # Normalize the manifest's repo:tag@digest to bare repo@digest (RepoDigests
+  # convention); only a colon in the basename is a tag separator (the
+  # registry component carries its own port colon).
+  repo="${ref%%@*}"
+  base="${repo##*/}"
+  [[ "${base}" == *:* ]] && repo="${repo%:*}"
+  image_sel="${repo}@${ref#*@}"
   if [[ -n "${RESOLVE_NODE}" ]]; then
     image_sel="$(docker exec "kardamom-${RESOLVE_NODE}" docker image inspect -f '{{.Id}}' "${ref}")"
     [[ -n "${image_sel}" ]] || { echo "ERROR: could not resolve local image id for ${ref} on ${RESOLVE_NODE}" >&2; exit 1; }

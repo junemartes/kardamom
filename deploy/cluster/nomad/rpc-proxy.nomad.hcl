@@ -13,13 +13,15 @@
 # Digest-pinned image (attested-identity P0.1). This job is NOT in
 # deploy.sh's default path (the haproxy image is pushed manually — see the
 # header), so there is no automatic manifest line for it; an operator who
-# wants the pin passes the digest of their own push:
-#   nomad job run -var image_ref=192.168.56.10:5000/haproxy@sha256:... rpc-proxy.nomad.hcl
+# wants the pin passes the digest of their own push, in the COMBINED
+# repo:tag@digest form (Nomad 1.9.5's docker driver mis-parses bare
+# repo@digest on a port-carrying registry host — see ci-images.sh):
+#   nomad job run -var image_ref=192.168.56.10:5000/haproxy:2.9-alpine@sha256:... rpc-proxy.nomad.hcl
 # Empty default = the mutable :2.9-alpine tag fallback (dev affordance, NOT a
 # production path).
 variable "image_ref" {
   type        = string
-  description = "Digest-pinned image reference (repo@sha256:...) of the in-cluster haproxy push. Empty = mutable tag fallback (dev-only)."
+  description = "Digest-pinned image reference (repo:tag@sha256:...) of the in-cluster haproxy push. Empty = mutable tag fallback (dev-only)."
   default     = ""
 }
 

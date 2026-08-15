@@ -27,13 +27,13 @@
 # recording-events/replication UDP ports (8010/8011/8020/8021) directly.
 
 # Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
-# repo@sha256:... reference captured at push time (deploy/cluster/
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
 # images.digests). The empty default falls back to the mutable :dev tag in
 # the task config — a dev affordance for manual `nomad job run` during
 # debugging, NOT a production path.
 variable "image_ref" {
   type        = string
-  description = "Digest-pinned image reference (repo@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
   default     = ""
 }
 
