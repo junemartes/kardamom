@@ -29,12 +29,16 @@ use revm::primitives::hardfork::SpecId;
 /// `SpecId::default()`, which tracks whatever fork upstream considers current
 /// — semantics would shift under a routine `cargo update` with no diff here.
 ///
-/// Known spec-surface caveat (zk guest builds, phase 3): the 0x0A KZG
-/// point-evaluation precompile is active at OSAKA but revm only provides it
-/// via `c-kzg` (C, unavailable on no_std/zkVM targets) — the only precompile
-/// without a pure-Rust fallback. Resolving that (Rust kzg backend, or
-/// speccing 0x0A out) is a prerequisite for proving blocks that CALL 0x0A;
-/// blocks that don't are unaffected.
+/// Spec-surface note (zk guest builds — gap 1, CLOSED by revm 38): the
+/// 0x0A KZG point-evaluation precompile is registered UNCONDITIONALLY with
+/// a backend cascade — `c-kzg` (live builds, via feature unification) →
+/// `blst` → a pure-Rust arkworks fallback. The `no_std` guest build
+/// therefore carries 0x0A through arkworks (it has compiled through the
+/// riscv32 gate since the revm 38 upgrade); backend equivalence is revm's
+/// tested contract (shared c-kzg-4844 vectors), and the host side is
+/// EEST-attested. In-guest pairing cost is a 3c performance question, not
+/// a soundness one. (revm's own doc comment on `Precompiles::cancun` still
+/// claims c-kzg gating — stale; the registration code is unconditional.)
 pub const SPEC_ID: SpecId = SpecId::OSAKA;
 
 /// Fixed per-block gas limit (v0: no dynamic adjustment).

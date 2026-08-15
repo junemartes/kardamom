@@ -173,8 +173,8 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
 - **PR 3b (delivered 2026-08-15)** — witness MPT anchoring: account/storage proofs against
   `pre_state_root`, absence proofs, sparse post-state-root recompute over
   `alloy-trie` in the guest. Design notes below.
-- **PR 3c** — the zkVM guest program (SP1/RISC Zero) + async prover harness
-  behind a flag; guest-build kzg decision (gap 1).
+- **PR 3c** — the zkVM guest program + async prover harness behind a flag.
+  Design below (2026-08-15); gap 1 resolved without a decision — see it.
 - **PR 4** — batch-boundary wiring: one proof per posted batch aligned with
   the live batcher's L1-as-truth cursor; L1 submission/verification.
 
@@ -392,3 +392,78 @@ proving cannot slow the chain.
   in its own change, not in a rebase: publish the per-record step from
   exec-core and have `exec_record_in_scope` delegate to it, putting the
   parallel path under the same invariant.
+
+## Phase 3c design — the guest program and prover harness (2026-08-15)
+
+Design only. What 3a/3b left for 3c is deliberately thin: the guest BODY
+already exists (`stateless::execute_block_anchored` — riscv32-gated all
+series), the prover input is fully specified (witness + `WitnessProofs` +
+records + BAL frame + `ExecEnv`), and the public outputs are the anchored
+tuple `(pre_state_root, post_state_root, bal_commitment, block_number)`.
+3c is packaging: a zkVM entry point around that function, and a host-side
+harness that feeds it.
+
+### Gap 1 is closed, and not by us
+
+The phase-1 soundness list carried "0x0A has no pure-Rust fallback" from
+the revm-19 era. revm 38 registers the point-evaluation precompile
+UNCONDITIONALLY with a backend cascade — c-kzg → blst → pure-Rust
+arkworks — so the `no_std` guest build has carried 0x0A through arkworks
+since the upgrade (our riscv32 gate has been compiling it all along; revm's
+own doc comment claiming c-kzg gating is stale against its code). Backend
+equivalence is revm's tested contract over the shared c-kzg-4844 vectors;
+the live side is EEST-attested. What remains is PERFORMANCE (a BLS pairing
+in-guest is expensive) — addressed by zkVM precompile patches below, and
+irrelevant for blocks that never call 0x0A.
+
+### zkVM selection: SP1 first, RISC Zero as the check
+
+Criterion: our guest's hot operations are keccak (every trie node + every
+tx identity), secp256k1 recovery (every tx), and — rarely — bls12-381
+pairing (0x0A). SP1 ships audited precompile patches for exactly these
+(`sp1-patches` for keccak/k256/bls12-381) and has the closest architectural
+precedent: succinctlabs/rsp proves reth/revm block execution in-guest from
+a witness, which is structurally our `execute_block_anchored`. RISC Zero
+(zeth) proves the same shape and stays the fallback if SP1's toolchain or
+patch pins fight our revm 38 / alloy pins. The decision is made AT
+IMPLEMENTATION START by building the guest against both toolchains'
+current releases and keeping whichever compiles our unmodified exec-core
+first — the one-code-path invariant forbids maintaining a patched fork of
+our own execution crates.
+
+### Guest crate shape
+
+`guest/kardamom-zk-guest` OUTSIDE the workspace (its own lockfile,
+toolchain pin, and target — zkVM builds must not perturb workspace feature
+unification; precedent: rsp's layout):
+
+1. read the rkyv-serialized prover input (the wire types already exist);
+2. `execute_block_anchored(...)`;
+3. commit the public-output tuple; receipts/delta stay private (the BAL
+   commitment + roots are what L1 verifies — S0's slim-boundary decision
+   holds).
+
+Determinism guards ALREADY hold in exec-core (no clocks, no randomness, no
+HashMap iteration); the guest adds nothing but I/O.
+
+### Prover harness (validator-side, behind `--prove-batches`)
+
+The validator already produces every prover input: `capture_block_witness`
+at the snapshot seam, `anchor_block_witness` once the parent commit
+settles. The harness is an async task fed by a bounded channel from the
+commit path (drop-oldest under backpressure — proving lags, never stalls,
+matching the PR 4 cursor's gap tolerance); it shells out to the zkVM
+prover SDK and persists `(batch_id, proof, public_outputs)` for PR 4's L1
+submission. Proof cadence follows the batcher's L1-as-truth cursor — one
+proof per posted batch, the alignment PR 4 wires.
+
+### Toolchain and CI reality
+
+zkVM guest builds need vendor toolchains (`sp1up` / `rzup` — external
+installers). CI gets a dedicated `zk-guest` job that installs the pinned
+toolchain and builds (not proves) the guest ELF; proving in CI is a later,
+cost-gated decision. Workflow edits are operator-applied from `docs/ci/`
+drafts (bot scope). Locally, toolchain installation is an OPERATOR step —
+sessions must not curl-install toolchains; the guest crate carries a
+`rust-toolchain.toml` + README pin so the build is reproducible wherever
+the toolchain exists.
