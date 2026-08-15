@@ -88,7 +88,8 @@ fn exec_env() -> ExecEnv {
 
 #[test]
 fn capture_anchor_guest_and_live_trie_agree() {
-    let signer = PrivateKeySigner::random();
+    // Deterministic: this test doubles as the prover-fixture generator.
+    let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x5A)).unwrap();
     let sender = signer.address();
     let zeroer_hash = keccak256(ZEROER_CODE);
     let writer_hash = keccak256(WRITER_CODE);
@@ -216,6 +217,62 @@ fn capture_anchor_guest_and_live_trie_agree() {
     assert_eq!(anchored.post_state_root, post_root);
     assert_eq!(anchored.block_number, 1);
     assert_eq!(anchored.out.receipts, out.receipts, "receipts identical");
+
+    // --- Prover fixture export (3c): with KARDAMOM_EMIT_PROVER_FIXTURE=dir
+    // set, serialize the exact ProverInput this test just validated plus
+    // the expected 104-byte PublicOutputs. The SP1 host runner
+    // (guest/kardamom-zk-host) executes the real guest ELF against these
+    // and asserts byte equality — the guest/host round-trip contract.
+    if let Ok(dir) = std::env::var("KARDAMOM_EMIT_PROVER_FIXTURE") {
+        use kardamom_types::{ProverInput, ProverRecord, PublicOutputs};
+        let mut bal_rlp = Vec::new();
+        alloy_rlp::Encodable::encode(&bal, &mut bal_rlp);
+        let input = ProverInput {
+            chain_id: CHAIN_ID,
+            boundary: BlockBoundaryStart {
+                block_number: 1,
+                end_tx_idx: BPosition::from_index(0),
+                l2_timestamp: 1_700_000_000,
+                l1_origin: 0,
+            },
+            witness: witness.clone(),
+            proofs: proofs.clone(),
+            records: records
+                .iter()
+                .map(|r| match r {
+                    BufferedRecord::Tx {
+                        tx_idx,
+                        envelope,
+                        position,
+                    } => ProverRecord::Tx {
+                        tx_idx: tx_idx.0,
+                        envelope: envelope.clone(),
+                        position: *position,
+                    },
+                    BufferedRecord::Deposit {
+                        tx_idx,
+                        deposit,
+                        position,
+                    } => ProverRecord::Deposit {
+                        tx_idx: tx_idx.0,
+                        deposit: deposit.clone(),
+                        position: *position,
+                    },
+                })
+                .collect(),
+            bal_rlp: bal_rlp.into(),
+            granularity: 1,
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("serialize input");
+        let expected = PublicOutputs {
+            pre_state_root: anchored.pre_state_root,
+            post_state_root: anchored.post_state_root,
+            bal_commitment: anchored.bal_commitment,
+            block_number: anchored.block_number,
+        };
+        std::fs::write(format!("{dir}/prover-input.rkyv"), &bytes).unwrap();
+        std::fs::write(format!("{dir}/expected-outputs.bin"), expected.encode()).unwrap();
+    }
 
     // --- THE closing assertion: the live incremental writer lands on the
     // guest's recomputed root for the same block.
