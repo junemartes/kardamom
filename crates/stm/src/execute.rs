@@ -715,7 +715,7 @@ pub struct Metrics {
 }
 
 /// Pool configuration.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct PoolConfig {
     pub workers: usize,
     /// Apply completions to the DAG in batches of this many. `1` updates
@@ -756,6 +756,17 @@ pub struct PoolConfig {
     /// the cross-block stickiness that made hashing win, and fixes only
     /// the collisions.
     pub sticky_assign: bool,
+    /// Pin worker i to `pin_cores[i % len]`.
+    ///
+    /// MEASURED REASON (Ryzen 3600, two 3-core CCXes with SPLIT 16MB L3):
+    /// a worker sharing its CCX with the mdbx writer runs the SAME block
+    /// at 20.5us/tx that it runs at 10.6us/tx isolated — the writer's
+    /// page churn evicts the interpreter's working set from the shared
+    /// L3, a uniform memory-level tax no code-level timer can see (it
+    /// slowed evm and the read path by the same 28%). Empty = let the
+    /// scheduler place workers (it settles them ON the writer's CCX often
+    /// enough to produce a floating per-block performance step).
+    pub pin_cores: Vec<usize>,
 }
 
 /// MEASURED default (uniswap 8-pair, 16x500, 8 workers): batching 8
@@ -775,6 +786,7 @@ impl Default for PoolConfig {
             dispatch_by_sender: false,
             eager_chain: true,
             sticky_assign: false,
+            pin_cores: Vec::new(),
         }
     }
 }
@@ -1125,6 +1137,13 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         prune_batch: cfg.prune_batch.max(1),
         ..cfg
     };
+    let pin_cores = cfg.pin_cores.clone();
+    let (sticky_assign, parallel_worth_ns, dispatch_by_sender, eager_chain) = (
+        cfg.sticky_assign,
+        cfg.parallel_worth_ns,
+        cfg.dispatch_by_sender,
+        cfg.eager_chain,
+    );
     let shared: PoolShared<S> = (
         Mutex::new(PoolState {
             generation: 0,
@@ -1137,17 +1156,28 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let shared_ref = &shared;
     std::thread::scope(|scope| {
         for w in 0..workers {
-            scope.spawn(move || worker_loop(shared_ref, w));
+            let pin = pin_cores.clone();
+            scope.spawn(move || {
+                if !pin.is_empty() {
+                    let id = core_affinity::CoreId {
+                        id: pin[w % pin.len()],
+                    };
+                    if !core_affinity::set_for_current(id) {
+                        tracing::warn!(worker = w, core = id.id, "stm: worker pin failed");
+                    }
+                }
+                worker_loop(shared_ref, w)
+            });
         }
         let handle = PoolHandle {
             shared: shared_ref,
             avg_tx_ns: std::cell::Cell::new(0),
-            sticky_assign: cfg.sticky_assign,
+            sticky_assign,
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
-            parallel_worth_ns: cfg.parallel_worth_ns,
-            dispatch_by_sender: cfg.dispatch_by_sender,
-            eager_chain: cfg.eager_chain,
+            parallel_worth_ns,
+            dispatch_by_sender,
+            eager_chain,
             arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);

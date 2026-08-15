@@ -90,6 +90,9 @@ struct Args {
     /// Sticky least-loaded domain assignment instead of pure hashing.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     sticky_assign: bool,
+    /// Pin worker i to core list[i % len], e.g. "2,3,4,5". Empty = OS.
+    #[arg(long, default_value = "")]
+    pin_cores: String,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -299,6 +302,8 @@ fn run_mdbx_ab(
     dispatch_by_sender: bool,
     eager_chain: bool,
     sticky_assign: bool,
+    per_block: bool,
+    pin_cores: Vec<usize>,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -350,6 +355,7 @@ fn run_mdbx_ab(
                 dispatch_by_sender,
                 eager_chain,
                 sticky_assign,
+                pin_cores: pin_cores.clone(),
             };
             let mut stats = Stats::default();
             let mut global_idx = 0u64;
@@ -382,11 +388,23 @@ fn run_mdbx_ab(
                     global_idx += blk.len() as u64;
 
                     // Both engines read the SAME snapshot, before it moves.
+                    // KARDAMOM_STM_ONLY: run pool blocks back-to-back with no
+                    // sequential run between them. The per-block timeline
+                    // showed a uniform +30% step (evm AND reads equally) with
+                    // one block at 11.2ms — FASTER than sequential — which is
+                    // the signature of core-frequency ramping: the worker
+                    // parks during each interleaved sequential run and its
+                    // core downclocks. Skipping the interleave keeps the
+                    // worker hot; if the drag vanishes, it was frequency.
+                    let stm_only = std::env::var_os("KARDAMOM_STM_ONLY").is_some();
                     let a0 = alloc_snap();
                     let b0 = bucket_snap();
                     let t0 = Instant::now();
-                    let (seq_receipts, seq_delta) =
-                        execute_block_sequential(&snapshot, None, e, &recs)?;
+                    let (seq_receipts, seq_delta) = if stm_only {
+                        (Vec::new(), PendingDelta::new())
+                    } else {
+                        execute_block_sequential(&snapshot, None, e, &recs)?
+                    };
                     let s_ms = t0.elapsed().as_secs_f64() * 1e3;
 
                     let prepared: Vec<_> = recs
@@ -420,6 +438,7 @@ fn run_mdbx_ab(
                     let p_ms = t1.elapsed().as_secs_f64() * 1e3;
                     let a2 = alloc_snap();
                     let b2 = bucket_snap();
+                    let skip_assert = stm_only;
                     if is_flow {
                         seq_allocs += a1.0 - a0.0;
                         seq_abytes += a1.1 - a0.1;
@@ -436,14 +455,41 @@ fn run_mdbx_ab(
                             stm_buckets[i].1 += b2[i].1 - b1[i].1;
                         }
                     }
-                    assert_identical(
-                        &seq_receipts,
-                        &seq_delta,
-                        &out.receipts,
-                        &out.delta,
-                        e.block_number,
-                        w,
-                    );
+                    if !skip_assert {
+                        assert_identical(
+                            &seq_receipts,
+                            &seq_delta,
+                            &out.receipts,
+                            &out.delta,
+                            e.block_number,
+                            w,
+                        );
+                    }
+                    if per_block && is_flow {
+                        // Max core clock right now — the busy worker is the
+                        // boosted core, so max ~= the frequency the block
+                        // just ran at. Uniform per-block steps (evm AND
+                        // reads scaling together) are a frequency
+                        // signature, and this settles it.
+                        let mhz: u64 = (0..12)
+                            .filter_map(|c| {
+                                std::fs::read_to_string(format!(
+                                    "/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq"
+                                ))
+                                .ok()
+                                .and_then(|v| v.trim().parse::<u64>().ok())
+                            })
+                            .max()
+                            .unwrap_or(0)
+                            / 1000;
+                        eprintln!(
+                            "pool block {}: evm {:.1}ms (read {:.1}ms) busy {:.1}ms cpu {mhz}MHz",
+                            e.block_number,
+                            out.evm_us as f64 / 1000.0,
+                            out.read_us as f64 / 1000.0,
+                            out.busy_us as f64 / 1000.0,
+                        );
+                    }
                     if is_flow {
                         seq_ms += s_ms;
                         stm_ms += p_ms;
@@ -485,7 +531,15 @@ fn run_mdbx_ab(
                         l2_timestamp: e.l2_timestamp,
                         l1_origin: 0,
                     };
-                    let bd = seq_delta.finalize(e.block_number, seq_receipts);
+                    // In stm-only mode the pool's delta is the only one —
+                    // and when both run they are asserted byte-identical, so
+                    // this is the same state either way.
+                    let (fin_delta, fin_receipts) = if stm_only {
+                        (out.delta, out.receipts)
+                    } else {
+                        (seq_delta, seq_receipts)
+                    };
+                    let bd = fin_delta.finalize(e.block_number, fin_receipts);
                     writer.delta_tx.send(WriteBatch::new(boundary, bd))?;
                     // Wait for the writer to publish the post-commit view.
                     loop {
@@ -600,6 +654,12 @@ fn main() -> anyhow::Result<()> {
     let dispatch_by_sender = a.dispatch_by_sender;
     let eager_chain = a.eager_chain;
     let sticky_assign = a.sticky_assign;
+    let pin_cores: Vec<usize> = a
+        .pin_cores
+        .split(',')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().parse().expect("pin-cores csv"))
+        .collect();
     let worker_counts: Vec<usize> = a
         .workers
         .split(',')
@@ -752,6 +812,8 @@ fn main() -> anyhow::Result<()> {
             dispatch_by_sender,
             eager_chain,
             sticky_assign,
+            a.per_block,
+            pin_cores,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()
@@ -886,6 +948,7 @@ fn main() -> anyhow::Result<()> {
                 dispatch_by_sender,
                 eager_chain,
                 sticky_assign,
+                pin_cores: pin_cores.clone(),
             };
             let mut row = Row {
                 workers: w,

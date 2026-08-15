@@ -4090,6 +4090,7 @@ dependencies = [
  "alloy-primitives",
  "alloy-signer-local",
  "bytes",
+ "core_affinity",
  "kardamom-exec-core",
  "kardamom-footprint",
  "kardamom-types",

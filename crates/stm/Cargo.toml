@@ -8,6 +8,7 @@ name = "kardamom_stm"
 path = "src/lib.rs"
 
 [dependencies]
+core_affinity = "0.8"
 kardamom-exec-core = { workspace = true }
 kardamom-footprint = { path = "../footprint" }
 kardamom-types = { workspace = true }
