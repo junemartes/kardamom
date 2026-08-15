@@ -601,6 +601,13 @@ fn run_mdbx_ab(
                     } else {
                         (seq_delta, seq_receipts)
                     };
+                    // Mirror the committed delta into the pool's
+                    // pool-lifetime backend cache BEFORE the writer applies
+                    // it — next block's reads hit warm entries instead of
+                    // mdbx (parcounter measured 100% backend reads without
+                    // this: every hot cell changes every block, so a
+                    // per-block cache can never hit).
+                    pool.advance_base(&fin_delta);
                     let bd = fin_delta.finalize(e.block_number, fin_receipts);
                     writer.delta_tx.send(WriteBatch::new(boundary, bd))?;
                     // Wait for the writer to publish the post-commit view.

@@ -256,6 +256,24 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             }));
         }
         self.reads.push(ReadRecord::Account(address, None));
+        // Pending-delta layer BEFORE the cache: the pool-lifetime cache
+        // mirrors the BACKEND only, and this layer changes per block.
+        if let Some(layer) = self.base.base
+            && let Some((nonce, balance, code_hash)) = layer.accounts.get(&address)
+        {
+            self.n_base_hit += 1;
+            return Ok(Some(AccountInfo {
+                nonce: *nonce,
+                balance: *balance,
+                code_hash: if *code_hash == B256::ZERO {
+                    revm::primitives::KECCAK_EMPTY
+                } else {
+                    *code_hash
+                },
+                account_id: None,
+                code: None,
+            }));
+        }
         let sh = BaseCache::shard(&address);
         if let Some(a) = self.base_cache.accounts[sh]
             .read()
@@ -266,7 +284,10 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             return Ok(a.clone());
         }
         self.n_backend += 1;
-        let a = self.base.basic_ref(address)?;
+        let a = SnapshotRef {
+            inner: self.base.snapshot,
+        }
+        .basic_ref(address)?;
         self.base_cache.accounts[sh]
             .write()
             .expect("base cache poisoned")
@@ -319,6 +340,12 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             return Ok(v);
         }
         self.reads.push(ReadRecord::Slot(address, key, None));
+        if let Some(layer) = self.base.base
+            && let Some(v) = layer.storage.get(&(address, key))
+        {
+            self.n_base_hit += 1;
+            return Ok(*v);
+        }
         let sh = BaseCache::shard(&address);
         if let Some(v) = self.base_cache.storage[sh]
             .read()
@@ -329,7 +356,10 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             return Ok(*v);
         }
         self.n_backend += 1;
-        let v = self.base.storage_ref(address, index)?;
+        let v = SnapshotRef {
+            inner: self.base.snapshot,
+        }
+        .storage_ref(address, index)?;
         self.base_cache.storage[sh]
             .write()
             .expect("base cache poisoned")
@@ -881,7 +911,7 @@ struct BlockCtx<S: StateDatabase> {
     sink_start_balance: U256,
     mv: MvCache,
     /// Shared read-through cache over the immutable block-input layer.
-    base_cache: BaseCache,
+    base_cache: std::sync::Arc<BaseCache>,
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
@@ -1146,6 +1176,15 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// Cumulative txs dispatched per worker — the load the least-loaded
     /// choice reads.
     assign_load: std::cell::RefCell<Vec<u64>>,
+    /// POOL-LIFETIME cache of the BACKEND layer (below any pending-delta
+    /// layer, which is probed before it — see `MvView`). parcounter
+    /// measured 100% of reads reaching mdbx: hot cells change every
+    /// block, so a per-block cache can never hit. But the block's own
+    /// delta CARRIES every new value — `advance_base` upserts it, turning
+    /// next block's backend reads into warm map hits. Valid iff every
+    /// backend commit is mirrored here; the A/B harness asserts
+    /// byte-identical results per block, which checks exactly that.
+    base_cache: std::sync::Arc<BaseCache>,
     /// THE ARENA. Allocated once for the pool's lifetime and reused by
     /// every block: a node is addressed by its index, so nothing here is
     /// ever allocated, freed, or reference-counted per transaction. This
@@ -1212,6 +1251,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             sticky_assign,
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
+            base_cache: std::sync::Arc::new(BaseCache::new()),
             parallel_worth_ns,
             dispatch_by_sender,
             eager_chain,
@@ -1305,7 +1345,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             sink_start,
             sink_start_balance,
             mv: MvCache::new(),
-            base_cache: BaseCache::new(),
+            base_cache: self.base_cache.clone(),
             slots: (0..MAX_BLOCK_TXS)
                 .map(|_| std::sync::OnceLock::new())
                 .collect(),
@@ -1404,6 +1444,50 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             sess.push_prepared(*t, *p, e.clone(), prep)?;
         }
         sess.seal()
+    }
+
+    /// Mirror a committed delta into the pool-lifetime backend cache.
+    /// Call AFTER the state writer applies the same delta; skipping the
+    /// call leaves stale entries and produces wrong reads — the harness's
+    /// byte-identical assertion is the guard.
+    pub fn advance_base(&self, delta: &PendingDelta) {
+        for (addr, (nonce, balance, code_hash)) in delta.accounts.iter() {
+            let sh = BaseCache::shard(addr);
+            self.base_cache.accounts[sh]
+                .write()
+                .expect("base cache poisoned")
+                .insert(
+                    *addr,
+                    Some(AccountInfo {
+                        nonce: *nonce,
+                        balance: *balance,
+                        code_hash: if *code_hash == B256::ZERO {
+                            revm::primitives::KECCAK_EMPTY
+                        } else {
+                            *code_hash
+                        },
+                        account_id: None,
+                        code: None,
+                    }),
+                );
+        }
+        for ((addr, key), value) in delta.storage.iter() {
+            let sh = BaseCache::shard(addr);
+            self.base_cache.storage[sh]
+                .write()
+                .expect("base cache poisoned")
+                .insert((*addr, *key), *value);
+        }
+        for (hash, code) in delta.code.iter() {
+            self.base_cache
+                .code
+                .write()
+                .expect("base cache poisoned")
+                .insert(
+                    *hash,
+                    revm::state::Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(code)),
+                );
+        }
     }
 
     /// Would parallel execution pay for itself on this workload?
