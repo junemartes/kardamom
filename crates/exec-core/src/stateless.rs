@@ -105,49 +105,78 @@ fn execute_block_inner<S: StateDatabase>(
         // revm's Bal convention: index 0 = pre-execution, 1..=n = txs in
         // block order (same as the actor's `tx_index_in_block + 1`).
         let bal_arg = bal.as_deref_mut().map(|b| (b, idx_in_block + 1));
-        let (receipt, ws) = match rec {
-            BufferedRecord::Tx {
-                tx_idx,
-                envelope,
-                position,
-            } => scope.execute_tx(
-                *tx_idx,
-                *position,
-                envelope,
-                idx_in_block,
-                cumulative,
-                bal_arg,
-            )?,
-            BufferedRecord::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            } => {
-                let out = execute_deposit_tx(
-                    snapshot,
-                    parent,
-                    &delta,
-                    env,
-                    *tx_idx,
-                    *position,
-                    deposit,
-                    idx_in_block,
-                    cumulative,
-                    bal_arg,
-                )?;
-                // Fold deposit writes into the scope cache (mirrors the
-                // actor's streaming path) so later txs observe them.
-                let mut layer = PendingDelta::new();
-                layer.apply(out.1.clone());
-                scope.seed_layer(&layer)?;
-                out
-            }
-        };
+        let (receipt, ws) = execute_record_in_scope(
+            &mut scope,
+            snapshot,
+            parent,
+            &delta,
+            env,
+            rec,
+            idx_in_block,
+            cumulative,
+            bal_arg,
+        )?;
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
     }
     Ok((BlockExecOutput { receipts, delta }, ()))
+}
+
+/// Execute ONE canonical record inside an existing block scope — the
+/// Tx-vs-Deposit dispatch every whole-block strategy shares. A Tx runs in
+/// the scope; a Deposit runs outside it (rare, own commit semantics) against
+/// `snapshot ∘ parent ∘ delta`, and its writes are folded into the scope
+/// cache so later records observe them. `delta` is the caller's accumulated
+/// block/batch delta; `parent` its seed layer.
+///
+/// This is the single home of consensus-critical record dispatch: the
+/// sequential driver above, the validator's parallel batches, and (through
+/// the driver) the zk guest all execute records through here.
+#[allow(clippy::too_many_arguments)] // mirrors execute_tx/execute_deposit_tx;
+// a params struct would rename the same nine fields without removing any.
+pub fn execute_record_in_scope<'a, S: StateDatabase>(
+    scope: &mut ExecScope<&'a S>,
+    snapshot: &'a S,
+    parent: Option<&PendingDelta>,
+    delta: &PendingDelta,
+    env: ExecEnv,
+    rec: &BufferedRecord,
+    idx_in_block: u64,
+    cumulative: u64,
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
+) -> Result<(Receipt, crate::delta::WriteSet), ExecutorError> {
+    match rec {
+        BufferedRecord::Tx {
+            tx_idx,
+            envelope,
+            position,
+        } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, bal),
+        BufferedRecord::Deposit {
+            tx_idx,
+            deposit,
+            position,
+        } => {
+            let out = execute_deposit_tx(
+                snapshot,
+                parent,
+                delta,
+                env,
+                *tx_idx,
+                *position,
+                deposit,
+                idx_in_block,
+                cumulative,
+                bal,
+            )?;
+            // Fold deposit writes into the scope cache (mirrors the
+            // actor's streaming path) so later txs observe them.
+            let mut layer = PendingDelta::new();
+            layer.apply(out.1.clone());
+            scope.seed_layer(&layer)?;
+            Ok(out)
+        }
+    }
 }
 
 /// Re-derive a tx record's identity from its raw bytes — the in-guest

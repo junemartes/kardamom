@@ -86,9 +86,10 @@ fn env() -> ExecEnv {
 }
 
 /// One record through the FREE executor path (tx or deposit; a fresh
-/// scope per call) — deliberately NOT `exec_record_in_scope`, so the
-/// parity tests compare the shared production dispatch against an
-/// independently-constructed reference instead of against itself.
+/// scope per call) — deliberately NOT the exec core's
+/// `execute_record_in_scope`, so the parity tests compare the shared
+/// production dispatch against an independently-constructed reference
+/// instead of against itself.
 fn exec_record<S: StateDatabase>(
     snap: &S,
     parent: Option<&PendingDelta>,
