@@ -42,6 +42,7 @@ pub mod parallel;
 pub mod attester;
 pub mod epoch_verify;
 pub mod metrics;
+pub mod prover;
 pub mod witness;
 
 mod buffers;

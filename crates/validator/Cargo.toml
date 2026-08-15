@@ -17,6 +17,7 @@ async-trait = "0.1"
 bytes.workspace = true
 serde_json.workspace = true
 revm.workspace = true
+rkyv.workspace = true
 alloy-eip7928.workspace = true
 alloy-rlp.workspace = true
 kardamom-engine = { workspace = true }
@@ -50,7 +51,6 @@ alloy-consensus.workspace = true
 alloy-eips.workspace = true
 crossbeam-channel = "0.5"
 tempfile.workspace = true
-rkyv.workspace = true
 alloy-network.workspace = true
 alloy-primitives.workspace = true
 alloy-provider.workspace = true

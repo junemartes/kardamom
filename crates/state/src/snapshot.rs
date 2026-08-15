@@ -77,6 +77,12 @@ impl StateSnapshot {
         })
     }
 
+    /// The snapshot's pinned RO transaction — the read view for trie walks
+    /// (proof generation anchors against exactly this state; spec 3b/3c).
+    pub fn ro_txn(&self) -> &RoTxSync {
+        &self.inner.txn
+    }
+
     /// Returns the block number this snapshot is anchored at.
     pub fn block_number(&self) -> u64 {
         self.inner.block_number

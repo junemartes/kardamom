@@ -337,18 +337,23 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
               env: ExecEnv,
               block: u64| {
             if records.is_empty() {
+                // Empty blocks still enter the flight ring: the prover
+                // spool proves every block, and a gap here would stall it.
+                if let Some(f) = flight.as_ref() {
+                    f.push(block, 1, env, records, None);
+                }
                 return execute_block_sequential(snapshot, parent, records, env);
             }
             let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
                 crate::metrics::counter_parallel_fallback();
                 tracing::debug!(block, "no BAL claims in time; sequential re-execution");
                 if let Some(f) = flight.as_ref() {
-                    f.push(block, 1, records, None);
+                    f.push(block, 1, env, records, None);
                 }
                 return execute_block_sequential(snapshot, parent, records, env);
             };
             if let Some(f) = flight.as_ref() {
-                f.push(block, granularity, records, Some(Arc::clone(&idx)));
+                f.push(block, granularity, env, records, Some(Arc::clone(&idx)));
             }
             let out = match execute_block_parallel(
                 snapshot,

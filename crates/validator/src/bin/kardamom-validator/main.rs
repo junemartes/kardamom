@@ -288,9 +288,25 @@ async fn main() -> Result<()> {
             args.validation_batch_size,
             Some(flight.clone()),
         ))
+    } else if args.prove_batches.is_some() {
+        // The spool feeds from the flight ring, which only the whole-block
+        // path fills: run the SEQUENTIAL whole-block strategy (identical
+        // semantics to streaming — it delegates to the shared driver).
+        Some(kardamom_validator::prover::sequential_block_exec(
+            flight.clone(),
+        ))
     } else {
         None
     };
+    if let Some(dir) = args.prove_batches.clone() {
+        tracing::info!(spool = %dir.display(), "prover spool ENABLED (one frame per block)");
+        kardamom_validator::prover::spawn_prover_spool(
+            dir,
+            chain_id,
+            writer.snapshot_rx.clone(),
+            flight.clone(),
+        );
+    }
 
     // Epoch verification (phase 1). Sequence rules 1-2 are local and always
     // enforced once an epoch appears; the CONTENT check needs L1, so it is
