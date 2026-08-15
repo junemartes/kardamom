@@ -78,6 +78,9 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
     let sender = signer.address();
     let zeroer_hash = keccak256(ZEROER_CODE);
 
+    // With KARDAMOM_EMIT_BATCH_SPOOL=dir set, the spool lands there (blocks
+    // 2 and 3 — a REAL contiguous batch) for the zk-host batch round trip.
+    let export = std::env::var("KARDAMOM_EMIT_BATCH_SPOOL").ok();
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path().join("state"))
         .durability(Durability::SafeNoSync)
@@ -153,7 +156,9 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
             l1_origin: 0,
         },
     );
-    let spool = dir.path().join("spool");
+    let spool = export
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| dir.path().join("spool"));
     let outputs = spool_block(&spool, CHAIN_ID, &snap, 2, env2, &records).expect("spool block 2");
 
     // (a) The spooled frame re-verifies ONE-SHOT in the guest shape.
@@ -253,6 +258,38 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
     assert_eq!(
         live_root, outputs.post_state_root,
         "spooled post root must equal the live writer's root"
+    );
+
+    // --- Block 3: one more transfer, spooled against the pinned snapshot
+    // at block 2 — the second half of a REAL contiguous batch (the batch
+    // guest requires the root chain to link 2 → 3).
+    let snap2 = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(s) = writer.snapshot_rx.current()
+                && s.block_number() == 2
+            {
+                break s;
+            }
+            assert!(Instant::now() < deadline, "no snapshot at block 2");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let records3 = vec![tx(&signer, RECIPIENT, 2, 111, 0)];
+    let env3 = ExecEnv::new(
+        CHAIN_ID,
+        &BlockBoundaryStart {
+            block_number: 3,
+            end_tx_idx: BPosition::from_index(0),
+            l2_timestamp: 1_700_000_003,
+            l1_origin: 0,
+        },
+    );
+    let outputs3 =
+        spool_block(&spool, CHAIN_ID, &snap2, 3, env3, &records3).expect("spool block 3");
+    assert_eq!(
+        outputs3.pre_state_root, outputs.post_state_root,
+        "the spooled chain must link 2 -> 3"
     );
 
     // A spool against the WRONG pre-state snapshot fails closed.

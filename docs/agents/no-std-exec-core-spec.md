@@ -500,3 +500,82 @@ the cycle count), prover hardware (GPU: sp1 cuda mode), and PR 4's
 proof-per-batch cadence rather than proof-per-block. Verification cost
 (145ms core; the L1 path uses the groth16/plonk wrap, ~constant and
 cheap) is a non-issue.
+## PR 4 design — batch proofs on L1 (2026-08-16; DELIVERED same day)
+
+The last phase: one proof per POSTED batch, aligned with the batcher's
+L1-as-truth cursor, verified on L1 against a running root. Shipped as
+designed; the delivery evidence is the layered test stack — forge suite
+(oracle rejects every mismatch class + verifier consultation), the batch
+guest round trip over a REAL two-block spool (160 bytes, root chain
+internal), and `proof_submission_e2e` on anvil: a real accumulator batch
+posted with its records commitment, the submitter's three cursor-lag
+outcomes, and the oracle root advancing. One deviation: the deployer CLI
+defers `KardamomProofOracle` flags to prover-ops work (library-API deploys
+only, as the e2e does).
+
+### The DA binding, closed with a records commitment
+
+A proof of "blocks [a,b] transition pre→post" is only useful if it attests
+THE POSTED BATCH — otherwise a prover could prove different records than
+the DA carries. Re-deriving the blob encoding in-guest (KAR1 + zstd) is a
+non-starter; instead both sides compute a `records_commitment` over the
+CANONICAL RECORD IDENTITIES and L1 stores it at post time:
+
+```text
+block_digest  = keccak("KREC" || block_number(8 LE)
+                 || per record: 0x01 || len(4 LE) || raw_tx      (tx)
+                              | 0x02 || source_hash               (deposit))
+records_commitment = keccak("KBAT" || block_digest_a || .. || block_digest_b)
+```
+
+- The BATCHER computes it from its accumulator at batch close and passes
+  it to `postBatch`; the settlement contract now STORES
+  `batches[index] = (l2BlockStart, l2BlockEnd, recordsCommitment)`.
+- The GUEST computes the same over its input records (raw_tx bytes it
+  already identity-verifies; deposits by `source_hash`, their canonical
+  id — consistent with the S0 deposit-trust posture) and commits it.
+- The ORACLE requires equality. A prover that proves different records
+  than the batch posted cannot produce the stored commitment.
+
+### The batch guest
+
+`BatchProverInput { blocks: Vec<ProverInput> }` — the guest runs
+`execute_block_anchored` per block, requiring each block's
+`pre_state_root` to equal the previous block's recomputed post root (the
+root chain INTERNAL to the proof), folds block digests into the records
+commitment, and commits 160 bytes (5×32, abi-friendly):
+
+```text
+pre_state_root || post_state_root || first_block(u256) || last_block(u256)
+  || records_commitment
+```
+
+Single-block proving (the 104-byte layout) remains for dev/round-trip.
+
+### Contracts
+
+- `KardamomL2Settlement` v2: `postBatch(..., recordsCommitment)` + stored
+  `batches` mapping (2 slots/batch) + commitment in the event.
+- `KardamomProofOracle` (L1): holds the running `stateRoot` (genesis root
+  at init), `lastProvenBatch`, the settlement address, an `ISP1Verifier`
+  (Succinct's standard `verifyProof(bytes32 vkey, bytes publicValues,
+  bytes proof)` gateway interface) and the guest `programVKey`.
+  `submitBatchProof(batchIndex, publicValues, proof)`: strict batch-index
+  succession, public values must match the STORED batch entry and the
+  running root, then the verifier call, then advance. Permissionless
+  submission — the proof is the authorization.
+- Tests run against a mock verifier (accept/reject variants); the real
+  SP1 groth16 verifier address is a deploy parameter (the wrap step needs
+  prover-side circuit artifacts — an ops concern, not a contract one).
+
+### Roles
+
+- `kardamom-zk-host batch <spool> <first> <last>` assembles a
+  `BatchProverInput` from the spool's per-block frames, executes (or
+  `--prove`s) it, writes `(public-values.bin, proof.bin)`.
+- `kardamom-proof-submitter` (batcher crate, where the L1 plumbing
+  lives): reads the settlement's posted-batch cursor, submits available
+  proof files for the next unproven batch, permissionlessly.
+- Proving stays OFF every hot path: the spool queues, the prover drains,
+  the submitter posts — three decoupled cadences, gaps tolerated
+  end-to-end.

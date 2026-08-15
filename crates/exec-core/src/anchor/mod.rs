@@ -206,7 +206,16 @@ pub fn verify_witness_anchored(
                 proven.insert(acct.address, Some(ta));
             }
             Lookup::Absent => {
-                if acct.exists {
+                // The state TABLE may keep an EIP-161-EMPTY account as a row
+                // (a touched-with-zero-fee coinbase is the live shape) while
+                // the trie rightly excludes it. Execution semantics treat
+                // empty and absent identically, so the anchor does too: a
+                // witnessed-but-empty account is CONSISTENT with exclusion.
+                // Anything non-empty witnessed present stays refuted.
+                let empty = acct.nonce == 0
+                    && acct.balance.is_zero()
+                    && (acct.code_hash == B256::ZERO || acct.code_hash == KECCAK_EMPTY);
+                if acct.exists && !empty {
                     return Err(AnchorError::Refuted {
                         what: format!("account {} witnessed present but excluded", acct.address),
                     });

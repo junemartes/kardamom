@@ -11,3 +11,5 @@ edition = "2021"
 [dependencies]
 sp1-sdk = { version = "6.4", features = ["blocking"] }
 anyhow = "1"
+kardamom-types = { path = "../../crates/types" }
+rkyv = { version = "0.8", features = ["alloc", "bytecheck", "bytes-1"] }
