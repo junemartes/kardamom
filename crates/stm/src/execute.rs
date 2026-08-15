@@ -2110,14 +2110,34 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             // a few hundred distinct cells however many txs wrote them, so
             // there is less serial work here than the tx count suggests.
             let t_d = std::time::Instant::now();
+            // Fold via FastMap (~40ns upserts), then let BTreeMap's
+            // FromIterator BULK-BUILD the canonical maps once — the
+            // previous per-write-set `apply` paid a ~250ns B-tree insert
+            // per entry (15ms/block at 4k txs). Canonical iteration
+            // order makes "last write wins" hold in the FastMap exactly
+            // as it did in the tree.
             let mut spent_reads: Vec<Vec<ReadRecord>> = Vec::with_capacity(tx_results.len());
+            let mut acc_v: Vec<(alloy_primitives::Address, (u64, U256, B256))> =
+                Vec::with_capacity(tx_results.len() * 3);
+            let mut sto_v: Vec<((alloy_primitives::Address, B256), U256)> =
+                Vec::with_capacity(tx_results.len());
             for mut r in tx_results {
                 // Freeing ~n read logs inline was serial-tail time; the
                 // reaper drops them while the next block runs.
                 spent_reads.push(std::mem::take(&mut r.reads));
-                delta.apply(r.ws);
+                acc_v.extend(r.ws.accounts.drain(..));
+                sto_v.extend(r.ws.storage.drain(..));
+                for (h, b) in r.ws.code.drain(..) {
+                    delta.code.insert(h, b);
+                }
                 receipts.push(r.receipt);
             }
+            // BTreeMap::from_iter STABLE-sorts and keeps the LAST of equal
+            // keys, then bulk-builds — which on canonical-order input is
+            // exactly "later tx wins", at a fraction of per-entry insert
+            // cost.
+            delta.accounts = acc_v.into_iter().collect();
+            delta.storage = sto_v.into_iter().collect();
             pool.reaper.send(Box::new(spent_reads)).ok();
             delta_ns += t_d.elapsed().as_nanos() as u64;
         } else {
