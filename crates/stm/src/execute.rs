@@ -420,6 +420,8 @@ pub struct StmOutcome {
     pub fifo_covered: u64,
     pub fifo_stalls: u64,
     pub read_us: u64,
+    /// Per-worker busy microseconds — see `Metrics::busy_per_worker`.
+    pub busy_per_worker_us: Vec<u64>,
     /// ⊤ (cold, untrained-selector) txs — they wait out the prefix.
     pub cold: usize,
     /// Live-DAG edges created across the block (only against predecessors
@@ -641,6 +643,11 @@ struct WorkerQueue {
 #[repr(align(64))]
 pub(crate) struct PaddedLen(pub(crate) AtomicU32);
 
+/// One u64 counter per cache line (see [`PaddedLen`]).
+#[derive(Default)]
+#[repr(align(64))]
+pub struct PaddedLen64(pub std::sync::atomic::AtomicU64);
+
 #[derive(Default)]
 pub struct Metrics {
     /// Nanoseconds spent HOLDING the graph lock, split by cause.
@@ -723,6 +730,11 @@ pub struct Metrics {
     pub fifo_stalls: std::sync::atomic::AtomicU64,
     /// Nanoseconds inside MvView's read path — carved OUT of `evm_ns`.
     pub read_ns: std::sync::atomic::AtomicU64,
+    /// Per-worker busy nanoseconds — the straggler detector. Dispatch can
+    /// be perfectly balanced and idle still high if CORES run at
+    /// different speeds (this box's bimodal memory state is per-thread):
+    /// the histogram shows it directly.
+    pub busy_per_worker: Vec<PaddedLen64>,
 }
 
 /// Pool configuration.
@@ -911,6 +923,12 @@ struct BlockCtx<S: StateDatabase> {
     /// measured, not fixed: the pool tracks mean per-tx execution time and
     /// enables stealing only above a threshold.
     steal_enabled: bool,
+    /// Worker pin list (empty = unpinned), also used by commit-phase
+    /// scoped threads: they are spawned from the CALLER's thread and
+    /// inherit ITS affinity mask — measured running the "parallel" hash
+    /// at serial speed because the caller was confined to two cores
+    /// while four workers' cores sat idle.
+    pin_cores: Vec<usize>,
     /// How long a dry worker spins before parking, in ns — sized from the
     /// measured mean per-tx time. The old fixed 256 `spin_loop` hints
     /// (<1us) were 25x SHORTER than the typical gap between chain-link
@@ -1127,6 +1145,8 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     dispatch_by_sender: bool,
     eager_chain: bool,
     sticky_assign: bool,
+    /// Worker/commit-thread pin list — see `PoolConfig::pin_cores`.
+    pin_cores: Vec<usize>,
     /// Domain -> worker, pool-lifetime (feed-thread-owned). Capped: past
     /// `STICKY_CAP` entries new domains fall back to hashing, so a
     /// long-lived pool cannot grow this without bound.
@@ -1198,6 +1218,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             shared: shared_ref,
             avg_tx_ns: std::cell::Cell::new(0),
             sticky_assign,
+            pin_cores: pin_cores.clone(),
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             parallel_worth_ns,
@@ -1323,6 +1344,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 // measurement correct course from the next block on.
                 avg == 0 || avg >= STEAL_WORTH_NS
             },
+            pin_cores: self.pin_cores.clone(),
             spin_ns: {
                 // Bridge roughly one link-release gap (~one tx), bounded:
                 // spinning a full core for more than ~60us of silence is
@@ -1341,6 +1363,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             metrics: Metrics {
                 // fetch_min seeds from the top.
                 first_dispatch_ns: std::sync::atomic::AtomicU64::new(u64::MAX),
+                busy_per_worker: (0..workers).map(|_| PaddedLen64::default()).collect(),
                 ..Default::default()
             },
         });
@@ -1437,6 +1460,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             fifo_covered: 0,
             fifo_stalls: 0,
             read_us: 0,
+            busy_per_worker_us: Vec::new(),
             ..Default::default()
         })
     }
@@ -1884,9 +1908,19 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             let threads = ctx.queues.len().min(n.max(1));
             if threads > 1 && n > 64 {
                 let chunk = n.div_ceil(threads);
+                let pins = &ctx.pin_cores;
                 std::thread::scope(|sc| {
-                    for part in tx_results.chunks_mut(chunk) {
+                    for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
                         sc.spawn(move || {
+                            // Escape the spawner's affinity mask: hash on
+                            // the (idle) worker cores, not wherever the
+                            // feed thread happens to be confined.
+                            if !pins.is_empty() {
+                                let id = core_affinity::CoreId {
+                                    id: pins[ti % pins.len()],
+                                };
+                                let _ = core_affinity::set_for_current(id);
+                            }
                             for r in part {
                                 if r.sink_touched {
                                     r.receipt.write_set_hash = r.ws.hash();
@@ -1994,6 +2028,11 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             fifo_covered: m.fifo_covered.load(Ordering::Relaxed),
             fifo_stalls: m.fifo_stalls.load(Ordering::Relaxed),
             read_us: m.read_ns.load(Ordering::Relaxed) / 1_000,
+            busy_per_worker_us: m
+                .busy_per_worker
+                .iter()
+                .map(|c| c.0.load(Ordering::Relaxed) / 1_000)
+                .collect(),
             cold,
             edges,
             dispatch,
@@ -2108,6 +2147,9 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             revm::context_interface::ContextTr::db_mut(&mut *$evm).flush_counters();
             ctx.metrics
                 .busy_ns
+                .fetch_add(local_busy_ns, Ordering::Relaxed);
+            ctx.metrics.busy_per_worker[worker]
+                .0
                 .fetch_add(local_busy_ns, Ordering::Relaxed);
             ctx.metrics
                 .writes_own

@@ -93,6 +93,12 @@ struct Args {
     /// Pin worker i to core list[i % len], e.g. "2,3,4,5". Empty = OS.
     #[arg(long, default_value = "")]
     pin_cores: String,
+    /// parcounter: how many sload+add+sstore rounds each call performs.
+    /// 1 = the 10-byte micro counter (~4us/tx — a stress test of fixed
+    /// costs); ~25 approximates real contract weight (~10us/tx), which is
+    /// the honest substrate for scaling questions.
+    #[arg(long, default_value_t = 1)]
+    call_work: usize,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -368,6 +374,7 @@ fn run_mdbx_ab(
             let mut read_us = 0u64;
             let mut disp_hist = vec![0u64; w];
             let mut idle_us = 0u64;
+            let mut bpw = vec![0u64; w];
             let (mut prune_calls_s, mut prune_forced_s, mut prune_us_s, mut steals_s) =
                 (0u64, 0u64, 0u64, 0u64);
             let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
@@ -469,6 +476,16 @@ fn run_mdbx_ab(
                         );
                     }
                     if per_block && is_flow {
+                        let avg_gas = seq_receipts.iter().map(|r| r.gas_used).sum::<u64>()
+                            / seq_receipts.len().max(1) as u64;
+                        let ok = seq_receipts.iter().filter(|r| r.status).count();
+                        eprintln!(
+                            "  block {} receipts: avg gas {} ok {}/{}",
+                            e.block_number,
+                            avg_gas,
+                            ok,
+                            seq_receipts.len()
+                        );
                         // Max core clock right now — the busy worker is the
                         // boosted core, so max ~= the frequency the block
                         // just ran at. Uniform per-block steps (evm AND
@@ -505,6 +522,9 @@ fn run_mdbx_ab(
                         feed += out.feed_us;
                         snap_us += snap_open;
                         idle_us += out.idle_us;
+                        for (wi, b) in out.busy_per_worker_us.iter().enumerate() {
+                            bpw[wi] += *b / 1000;
+                        }
                         prune_calls_s += out.prune_calls;
                         prune_forced_s += out.prune_forced;
                         prune_us_s += out.prune_us;
@@ -599,6 +619,7 @@ fn run_mdbx_ab(
                     (busy as f64 - evm_us as f64 - pub_us as f64) / 1000.0,
                 );
                 println!("     dispatch per worker: {disp_hist:?}");
+                println!("     busy per worker (ms): {bpw:?}");
                 println!(
                     "     idle {:.1}ms across {w} workers (span cap {:.1}ms) | prunes {} (forced {}) {:.1}ms | steals {}",
                     idle_us as f64 / 1000.0,
@@ -774,25 +795,54 @@ fn main() -> anyhow::Result<()> {
                 use alloy_eips::eip2718::Encodable2718;
                 use alloy_network::TxSignerSync;
                 use alloy_primitives::{TxKind, keccak256};
+                // Runtime: `call_work` LOOP iterations of slot0 += 1.
+                // Warm sload/sstore are ~40ns in revm, so only a loop can
+                // reach contract-scale per-tx weight:
+                //   PUSH2 N; JUMPDEST@3; PUSH1 0 SLOAD; PUSH1 1 ADD;
+                //   PUSH1 0 SSTORE; PUSH1 1; SWAP1; SUB; DUP1; PUSH1 3;
+                //   JUMPI; STOP
+                let n = a.call_work.max(1) as u16;
+                let runtime: Vec<u8> = vec![
+                    0x61,
+                    (n >> 8) as u8,
+                    (n & 0xff) as u8,
+                    0x5b,
+                    0x60,
+                    0x00,
+                    0x54,
+                    0x60,
+                    0x01,
+                    0x01,
+                    0x60,
+                    0x00,
+                    0x55,
+                    0x60,
+                    0x01,
+                    0x90,
+                    0x03,
+                    0x80,
+                    0x60,
+                    0x03,
+                    0x57,
+                    0x00,
+                ];
                 // init: PUSH1 len PUSH1 off PUSH1 0 CODECOPY PUSH1 len
-                // PUSH1 0 RETURN ++ runtime (slot0 += 1).
-                const RUNTIME: [u8; 10] =
-                    [0x60, 0x00, 0x54, 0x60, 0x01, 0x01, 0x60, 0x00, 0x55, 0x00];
+                // PUSH1 0 RETURN ++ runtime.
                 let mut init = vec![
                     0x60,
-                    RUNTIME.len() as u8,
+                    runtime.len() as u8,
                     0x60,
                     0x0c,
                     0x60,
                     0x00,
                     0x39,
                     0x60,
-                    RUNTIME.len() as u8,
+                    runtime.len() as u8,
                     0x60,
                     0x00,
                     0xf3,
                 ];
-                init.extend_from_slice(&RUNTIME);
+                init.extend_from_slice(&runtime);
                 let sel = [0xAA, 0xBB, 0xCC, 0xDDu8];
                 let mut nonces = vec![0u64; signers.len()];
                 let counters: Vec<alloy_primitives::Address> = signers
@@ -836,7 +886,7 @@ fn main() -> anyhow::Result<()> {
                             nonces[si],
                             TxKind::Call(counters[si]),
                             sel.to_vec(),
-                            80_000,
+                            60_000 + a.call_work.max(1) as u64 * 400,
                         ));
                         nonces[si] += 1;
                     }
