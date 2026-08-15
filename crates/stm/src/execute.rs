@@ -614,6 +614,17 @@ struct TxSlot {
 /// order with no cross-thread coordination at all.
 struct WorkerQueue {
     q: Mutex<std::collections::VecDeque<u32>>,
+    /// Length HINT, maintained alongside every queue mutation. Spinning
+    /// workers and the steal scan read this instead of taking the mutex:
+    /// a dry worker probing its queue every ~half-microsecond for up to
+    /// 60us, and every steal attempt locking EVERY queue just to read a
+    /// length, were contending with the feed's submissions — the measured
+    /// reason admission cost GREW with worker count (1.3us/tx at w=1 to
+    /// 2.15us at w=4 on fully-independent work). A stale read costs one
+    /// wasted lock attempt or one missed-then-caught item; the
+    /// authoritative empty-check before parking still happens under the
+    /// mutex.
+    len: std::sync::atomic::AtomicUsize,
     cv: Condvar,
     /// Whether this worker is PARKED on `cv`. Waking a thread that is
     /// already running costs a futex syscall for nothing, and dispatch
@@ -957,7 +968,8 @@ impl<S: StateDatabase> BlockCtx<S> {
             if w == thief {
                 continue;
             }
-            let len = qh.q.lock().expect("queue poisoned").len();
+            // Hint only — the victim's own lock confirms below.
+            let len = qh.len.load(Ordering::Acquire);
             // ANY queued tx is stealable. The previous `len > 1` guard —
             // "leave the owner its work" — silently disabled stealing
             // altogether: under DAG chains a domain releases ONE ready tx
@@ -969,16 +981,19 @@ impl<S: StateDatabase> BlockCtx<S> {
             }
         }
         let (victim, _) = best?;
-        let mut q = self.queues[victim].q.lock().expect("queue poisoned");
+        let vq = &self.queues[victim];
+        // Verification stays UNDER the victim's lock, deliberately — this
+        // is the one place the pop/verify/putback triple must be atomic.
+        // A back-putback after an unlocked window reorders: the feed can
+        // eagerly enqueue the candidate's own FIFO-successor into the gap,
+        // the putback lands BEHIND it, and the owner livelocks on a head
+        // whose predecessor now sits behind it (measured: 3/6 test runs
+        // hung). The owner's pop-path verify can run unlocked because its
+        // FRONT-putback preserves relative order; back-putback cannot.
+        let mut q = vq.q.lock().expect("queue poisoned");
         let cand = q.pop_back()?;
-        // Eager chain mode voids the old "everything queued is ready"
-        // invariant: a queued tx may depend on FIFO order the thief does
-        // not preserve. Steal only what is verifiably runnable NOW; a
-        // mid-chain link goes back where it was. This also makes deep
-        // chains naturally steal-proof, which is the right policy anyway —
-        // a chained queue has a busy owner, and migrating one serial link
-        // destroys the locality that domain dispatch exists to build.
         if self.fifo_ready(cand) {
+            vq.len.fetch_sub(1, Ordering::Release);
             Some(cand)
         } else {
             q.push_back(cand);
@@ -992,6 +1007,7 @@ impl<S: StateDatabase> BlockCtx<S> {
         let qh = &self.queues[worker];
         let mut q = qh.q.lock().expect("queue poisoned");
         q.push_back(idx);
+        qh.len.fetch_add(1, Ordering::Release);
         drop(q);
         // Only wake a worker that actually parked. Under load the queue is
         // rarely empty, so this elides nearly every syscall.
@@ -1287,6 +1303,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             queues: (0..workers)
                 .map(|_| WorkerQueue {
                     q: Mutex::new(std::collections::VecDeque::new()),
+                    len: std::sync::atomic::AtomicUsize::new(0),
                     cv: Condvar::new(),
                     parked: AtomicBool::new(false),
                 })
@@ -2117,15 +2134,21 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     leave!(evm);
                 }
                 if let Some(i) = q.pop_front() {
+                    qh.len.fetch_sub(1, Ordering::Release);
+                    // Verify with NO lock held — the check takes a node
+                    // mutex and scans results, and holding the queue lock
+                    // across it would block the feed's submissions.
+                    drop(q);
                     if ctx.fifo_ready(i) {
                         break i;
                     }
                     // A FIFO predecessor was stolen and is still running
                     // on another thread — rare, and bounded by that tx's
-                    // execution time. Put the head back and yield rather
-                    // than burn the lock.
-                    q.push_front(i);
+                    // execution time. Put the head back and yield.
                     ctx.metrics.fifo_stalls.fetch_add(1, Ordering::Relaxed);
+                    q = qh.q.lock().expect("queue poisoned");
+                    q.push_front(i);
+                    qh.len.fetch_add(1, Ordering::Release);
                     drop(q);
                     std::thread::yield_now();
                     q = qh.q.lock().expect("queue poisoned");
@@ -2172,7 +2195,10 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     for _ in 0..SPIN_BEFORE_PARK {
                         std::hint::spin_loop();
                     }
-                    if !qh.q.lock().expect("queue poisoned").is_empty() {
+                    // Lock-free probe: a dry worker spinning here for tens
+                    // of microseconds must not contend with the feed's
+                    // push into this very queue.
+                    if qh.len.load(Ordering::Acquire) > 0 {
                         spun = true;
                         break;
                     }
