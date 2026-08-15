@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+pub mod anchor;
 pub mod bal_ladder;
 pub mod block_env;
 pub mod delta;
