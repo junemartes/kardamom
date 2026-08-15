@@ -524,6 +524,7 @@ const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// threads, which touch every envelope anyway and run BEFORE the canonical
 /// order arrives (the join buffer exists precisely because tx_data leads
 /// tx_ordering), so the work lands in slack that already exists.
+#[derive(Clone)]
 pub struct Prepared {
     /// `None` when the envelope does not decode — the #92 skip path.
     pub decoded: Option<alloy_consensus::TxEnvelope>,
@@ -820,6 +821,12 @@ pub struct PoolConfig {
     /// run continuously busy, so this mainly serves dedicated-core
     /// deployments and honest benchmarking.
     pub keep_hot: bool,
+    /// Run the commit tail's parallel phases ON the worker cores.
+    /// Right for block-at-a-time (workers park during the tail, their
+    /// cores are hot and instantly yielded); WRONG for the pipeline,
+    /// where the next block executes on those cores while this block's
+    /// tail runs — the phases then stay on the caller's mask.
+    pub tail_on_workers: bool,
     /// Pin worker i to `pin_cores[i % len]`.
     ///
     /// MEASURED REASON (Ryzen 3600, two 3-core CCXes with SPLIT 16MB L3):
@@ -851,6 +858,7 @@ impl Default for PoolConfig {
             eager_chain: true,
             sticky_assign: false,
             keep_hot: false,
+            tail_on_workers: true,
             pin_cores: Vec::new(),
         }
     }
@@ -1157,6 +1165,11 @@ impl<S: StateDatabase> BlockCtx<S> {
 struct PoolState<S: StateDatabase> {
     generation: u64,
     ctx: Option<Arc<BlockCtx<S>>>,
+    /// The NEXT block, fed while `ctx` still executes (pipeline depth 2).
+    /// The tail installs it the moment `ctx` drains; the generation bump
+    /// walks the workers over. Feeding needs no workers, so admission of
+    /// block N+1 overlaps execution of block N entirely.
+    next: Option<Arc<BlockCtx<S>>>,
     shutdown: bool,
     cfg: PoolConfig,
 }
@@ -1165,6 +1178,33 @@ type PoolShared<S> = (Mutex<PoolState<S>>, Condvar);
 
 /// A spent block's droppables, shipped to the reaper thread.
 type Reap = Box<dyn Send>;
+
+/// One sealed block handed to the persistent TAIL thread (spec P3a):
+/// drain, release the pool slot, then `block_tail`.
+struct TailJob<S: StateDatabase> {
+    ctx: Arc<BlockCtx<S>>,
+    txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
+    started: std::time::Instant,
+    cold: usize,
+    edges: usize,
+    dispatch: Vec<u32>,
+    out: std::sync::mpsc::Sender<Result<StmOutcome, ExecutorError>>,
+}
+
+/// A submitted block's pending outcome. Outcomes complete in submission
+/// order; `wait` blocks until this block is validated, repaired if
+/// wounded, and committed.
+pub struct BlockTicket {
+    rx: std::sync::mpsc::Receiver<Result<StmOutcome, ExecutorError>>,
+}
+
+impl BlockTicket {
+    pub fn wait(self) -> Result<StmOutcome, ExecutorError> {
+        self.rx
+            .recv()
+            .unwrap_or_else(|_| Err(ExecutorError::State("stm pool: tail thread gone".into())))
+    }
+}
 
 /// A persistent worker pool bound to one snapshot view for its lifetime —
 /// the PIPELINE shape the live executor needs: workers are spawned ONCE
@@ -1180,7 +1220,7 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// Mean per-tx execution time of the last block, feeding the stealing
     /// policy. Atomic (not `Cell`): P3's persistent tail thread updates
     /// it after each block's fold while the feed thread reads it.
-    avg_tx_ns: std::sync::atomic::AtomicU64,
+    avg_tx_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
@@ -1192,15 +1232,10 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// Cumulative txs dispatched per worker — the load the least-loaded
     /// choice reads.
     assign_load: std::cell::RefCell<Vec<u64>>,
-    /// Worker core pins, reused by the commit tail's scoped threads.
-    pin_cores: Vec<usize>,
-    keep_hot: bool,
-    /// Teardown off the critical path: the seal thread ships each spent
-    /// block's carcass (the multi-version cache's ~30k entries, a
-    /// thousand tx slots, the spent read logs) here instead of dropping
-    /// it inline — measured as milliseconds of serial tail per block.
-    /// The reaper drops it while the next block already runs.
-    reaper: std::sync::mpsc::Sender<Reap>,
+    /// The persistent TAIL thread's inbox (spec P3a): sealed blocks go
+    /// here; the thread drains, releases the pool slot, and runs
+    /// `block_tail` while the caller feeds the next block.
+    tail: std::sync::mpsc::Sender<TailJob<S>>,
     /// POOL-LIFETIME cache of the BACKEND layer (below any pending-delta
     /// layer, which is probed before it — see `MvView`). parcounter
     /// measured 100% of reads reaching mdbx: hot cells change every
@@ -1210,21 +1245,6 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// backend commit is mirrored here; the A/B harness asserts
     /// byte-identical results per block, which checks exactly that.
     base_cache: std::sync::Arc<BaseCache>,
-    /// THE ARENA. Allocated once for the pool's lifetime and reused by
-    /// every block: a node is addressed by its index, so nothing here is
-    /// ever allocated, freed, or reference-counted per transaction. This
-    /// is the whole reason the graph is not an `Arc` graph — `Arc` gives
-    /// the same semantics but demands one heap allocation per node plus
-    /// refcount traffic on every clone, which measured 4.3ms -> 38.9ms of
-    /// release cost per 8000 txs. Here a "weak reference" is the index,
-    /// and liveness is the node's own state (`children == None` means it
-    /// already left the graph).
-    ///
-    /// Sized by the gas limit (`MAX_BLOCK_TXS`), so it cannot overflow;
-    /// `reset` clears only the prefix a block actually used, and the
-    /// children vectors KEEP THEIR CAPACITY, so steady-state allocation
-    /// across blocks is zero.
-    arena: Arc<Vec<Node>>,
 }
 
 /// Spawn `workers` pool threads for the duration of `f`.
@@ -1240,6 +1260,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     };
     let pin_cores = cfg.pin_cores.clone();
     let cfg_keep_hot = cfg.keep_hot;
+    let cfg_tail_on_workers = cfg.tail_on_workers;
     let (sticky_assign, parallel_worth_ns, dispatch_by_sender, eager_chain) = (
         cfg.sticky_assign,
         cfg.parallel_worth_ns,
@@ -1250,17 +1271,114 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         Mutex::new(PoolState {
             generation: 0,
             ctx: None,
+            next: None,
             shutdown: false,
             cfg,
         }),
         Condvar::new(),
     );
     let shared_ref = &shared;
+    let avg_tx_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (reap_tx, reap_rx) = std::sync::mpsc::channel::<Reap>();
+    let (tail_tx, tail_rx) = std::sync::mpsc::channel::<TailJob<S>>();
     std::thread::scope(|scope| {
         // Reaper: drops spent block state so seal() does not pay for it.
         // Exits when the pool drops the last sender.
         scope.spawn(move || while reap_rx.recv().is_ok() {});
+        // The persistent TAIL thread (spec P3a). One thread owns every
+        // block's post-drain work in submission order; per-block scoped
+        // threads for sub-millisecond phases measured as a net loss, and
+        // this thread is also what lets the caller feed block N+1 while
+        // block N validates and commits.
+        {
+            let reaper = reap_tx.clone();
+            let pins = pin_cores.clone();
+            let hot = cfg_keep_hot;
+            let tow = cfg_tail_on_workers;
+            let avg = avg_tx_ns.clone();
+            scope.spawn(move || {
+                while let Ok(job) = tail_rx.recv() {
+                    let TailJob {
+                        ctx,
+                        txs,
+                        started,
+                        cold,
+                        edges,
+                        dispatch,
+                        out,
+                    } = job;
+                    // Drain: wait out the in-flight tail of execution.
+                    // WATCHDOG as in the inline path — a stranded edge
+                    // fail-stops with forensics instead of freezing.
+                    let deadline = std::time::Instant::now() + STALL_TIMEOUT;
+                    let mut drain_err: Option<ExecutorError> = None;
+                    while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
+                        if ctx.pending.load(Ordering::SeqCst) > 0 {
+                            ctx.prune(true);
+                            continue;
+                        }
+                        if std::time::Instant::now() > deadline {
+                            let admitted = ctx.admitted.load(Ordering::SeqCst);
+                            let finished = ctx.finished.load(Ordering::SeqCst);
+                            let stuck: Vec<(u32, u32)> = (0..admitted)
+                                .filter(|i| ctx.results[*i as usize].get().is_none())
+                                .map(|i| {
+                                    (i, ctx.nodes[i as usize].indegree.load(Ordering::SeqCst))
+                                })
+                                .take(16)
+                                .collect();
+                            tracing::error!(
+                                block = ctx.env.block_number,
+                                admitted,
+                                finished,
+                                double_exit = ctx.double_exit.load(Ordering::SeqCst),
+                                ?stuck,
+                                "stm: block failed to drain — scheduler invariant violated"
+                            );
+                            drain_err = Some(ExecutorError::State(format!(
+                                "stm: block {} failed to drain after {:?}: admitted={admitted}                                  finished={finished} stuck(idx,indegree)={stuck:?}",
+                                ctx.env.block_number, STALL_TIMEOUT
+                            )));
+                            break;
+                        }
+                        std::thread::yield_now();
+                    }
+                    // Release the slot in ALL paths — and INSTALL the
+                    // staged block, if any: its admission ran while this
+                    // block executed, so the workers walk straight onto
+                    // full queues.
+                    {
+                        let mut st = shared_ref.0.lock().expect("pool poisoned");
+                        st.ctx = st.next.take();
+                        if st.ctx.is_some() {
+                            st.generation += 1;
+                        }
+                    }
+                    shared_ref.1.notify_all();
+                    if let Some(e) = drain_err {
+                        let _ = out.send(Err(e));
+                        continue;
+                    }
+                    let t_exec_wall = started.elapsed();
+                    let mut ctx_arc = ctx;
+                    let t_drain0 = std::time::Instant::now();
+                    let ctx = loop {
+                        match Arc::try_unwrap(ctx_arc) {
+                            Ok(c) => break c,
+                            Err(back) => {
+                                ctx_arc = back;
+                                std::thread::yield_now();
+                            }
+                        }
+                    };
+                    let t_drain = t_drain0.elapsed();
+                    let _ = out.send(block_tail(
+                        ctx, txs, t_exec_wall, t_drain, cold, edges, dispatch, hot, tow,
+                        &pins, &reaper, &avg,
+                    ));
+                }
+            });
+        }
         for w in 0..workers {
             let pin = pin_cores.clone();
             let hot = cfg_keep_hot;
@@ -1278,22 +1396,20 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         }
         let handle = PoolHandle {
             shared: shared_ref,
-            avg_tx_ns: std::sync::atomic::AtomicU64::new(0),
+            avg_tx_ns: avg_tx_ns.clone(),
             sticky_assign,
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             base_cache: std::sync::Arc::new(BaseCache::new()),
-            pin_cores: pin_cores.clone(),
-            keep_hot: cfg_keep_hot,
-            reaper: reap_tx.clone(),
+            tail: tail_tx.clone(),
             parallel_worth_ns,
             dispatch_by_sender,
             eager_chain,
-            arena: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
         };
         let r = f(&handle);
         drop(handle);
         drop(reap_tx);
+        drop(tail_tx);
         let mut st = shared_ref.0.lock().expect("pool poisoned");
         st.shutdown = true;
         drop(st);
@@ -1396,7 +1512,12 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                     parked: AtomicBool::new(false),
                 })
                 .collect(),
-            nodes: self.arena.clone(),
+            // Per-BLOCK arena: with pipelined admission two blocks are
+            // alive at once, so the pool-shared arena would alias. The
+            // allocation (~4096 default nodes) is off the critical path
+            // (admission of a block that has not started executing) and
+            // the reaper eats the drop.
+            nodes: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
             admitted: AtomicU32::new(0),
             finished: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
@@ -1435,13 +1556,29 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         });
         {
             let mut st = self.shared.0.lock().expect("pool poisoned");
-            if st.ctx.is_some() {
-                return Err(ExecutorError::State(
-                    "stm pool: a block session is already active".into(),
-                ));
+            // Pipeline depth cap = 2: one block executing (`ctx`), one
+            // staged (`next`). Wait only when BOTH are occupied, bounded
+            // by the drain watchdog.
+            let deadline = std::time::Instant::now() + STALL_TIMEOUT;
+            while st.next.is_some() {
+                if std::time::Instant::now() > deadline {
+                    return Err(ExecutorError::State(
+                        "stm pool: previous blocks never released the slots".into(),
+                    ));
+                }
+                let (back, _) = self
+                    .shared
+                    .1
+                    .wait_timeout(st, PARK_POLL)
+                    .expect("pool poisoned");
+                st = back;
             }
-            st.ctx = Some(ctx.clone());
-            st.generation += 1;
+            if st.ctx.is_none() {
+                st.ctx = Some(ctx.clone());
+                st.generation += 1;
+            } else {
+                st.next = Some(ctx.clone());
+            }
         }
         self.shared.1.notify_all();
         Ok(BlockSession {
@@ -1855,6 +1992,14 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     /// missed conflict convicted — per-tx, not whole-block. Then commit in
     /// canonical order.
     pub fn seal(self) -> Result<StmOutcome, ExecutorError> {
+        self.submit()?.wait()
+    }
+
+    /// Hand this block to the persistent tail thread and return
+    /// immediately (spec P3a). The pool slot frees once execution
+    /// drains, so the caller may begin feeding the NEXT block while this
+    /// one validates and commits on the tail thread.
+    pub fn submit(self) -> Result<BlockTicket, ExecutorError> {
         let BlockSession {
             pool,
             ctx,
@@ -1869,81 +2014,19 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         for q in &ctx.queues {
             q.cv.notify_all();
         }
-        // Apply anything parked, then wait out the tail. Workers force a
-        // prune before they park, so this loop only ever waits on
-        // execution, never on unapplied updates.
-        // WATCHDOG. Every admitted tx must leave the graph exactly once,
-        // so this loop terminates — unless a scheduler bug strands an
-        // edge (a decrement that never arrives), in which case the naive
-        // version would spin forever and the executor would be frozen but
-        // alive: metrics up, chain stopped, no diagnosis. The engine
-        // instead fail-stops with the graph's state, which crash-recovery
-        // replays cleanly.
-        let deadline = std::time::Instant::now() + STALL_TIMEOUT;
-        while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
-            if ctx.pending.load(Ordering::SeqCst) > 0 {
-                ctx.prune(true);
-                continue;
-            }
-            if std::time::Instant::now() > deadline {
-                let admitted = ctx.admitted.load(Ordering::SeqCst);
-                let finished = ctx.finished.load(Ordering::SeqCst);
-                let stuck: Vec<(u32, u32)> = (0..admitted)
-                    .filter(|i| ctx.results[*i as usize].get().is_none())
-                    .map(|i| (i, ctx.nodes[i as usize].indegree.load(Ordering::SeqCst)))
-                    .take(16)
-                    .collect();
-                tracing::error!(
-                    block = ctx.env.block_number,
-                    admitted,
-                    finished,
-                    double_exit = ctx.double_exit.load(Ordering::SeqCst),
-                    ?stuck,
-                    "stm: block failed to drain — scheduler invariant violated"
-                );
-                return Err(ExecutorError::State(format!(
-                    "stm: block {} failed to drain after {:?}: admitted={admitted} \
-                     finished={finished} stuck(idx,indegree)={stuck:?}",
-                    ctx.env.block_number, STALL_TIMEOUT
-                )));
-            }
-            std::thread::yield_now();
-        }
-        // Release the pool for the next block before the (serial)
-        // validate+commit tail.
-        {
-            let mut st = pool.shared.0.lock().expect("pool poisoned");
-            st.ctx = None;
-        }
-        let t_exec_wall = started.elapsed();
-
-        // Take sole ownership: each worker drops its Arc as it observes
-        // the sealed-and-drained condition (microseconds of yield at most).
-        let mut ctx_arc = ctx;
-        let t_drain0 = std::time::Instant::now();
-        let ctx = loop {
-            match Arc::try_unwrap(ctx_arc) {
-                Ok(c) => break c,
-                Err(back) => {
-                    ctx_arc = back;
-                    std::thread::yield_now();
-                }
-            }
-        };
-        let t_drain = t_drain0.elapsed();
-        block_tail(
-            ctx,
-            txs,
-            t_exec_wall,
-            t_drain,
-            cold,
-            edges,
-            dispatch,
-            pool.keep_hot,
-            &pool.pin_cores,
-            &pool.reaper,
-            &pool.avg_tx_ns,
-        )
+        let (out, rx) = std::sync::mpsc::channel();
+        pool.tail
+            .send(TailJob {
+                ctx,
+                txs,
+                started,
+                cold,
+                edges,
+                dispatch,
+                out,
+            })
+            .map_err(|_| ExecutorError::State("stm pool: tail thread gone".into()))?;
+        Ok(BlockTicket { rx })
     }
 }
 
@@ -1961,6 +2044,7 @@ fn block_tail<S: StateDatabase + Sync>(
     edges: usize,
     dispatch: Vec<u32>,
     keep_hot: bool,
+    tail_on_workers: bool,
     pin_cores: &[usize],
     reaper: &std::sync::mpsc::Sender<Reap>,
     avg_tx_ns: &std::sync::atomic::AtomicU64,
@@ -2110,7 +2194,11 @@ fn block_tail<S: StateDatabase + Sync>(
         let threads = ctx.queues.len().min(n.max(1));
         if threads > 1 && n > 64 {
             let chunk = n.div_ceil(threads);
-            let tail_pins: &[usize] = if keep_hot { pin_cores } else { &[] };
+            let tail_pins: &[usize] = if keep_hot && tail_on_workers {
+                pin_cores
+            } else {
+                &[]
+            };
             std::thread::scope(|sc| {
                 for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
                     sc.spawn(move || {

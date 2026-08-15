@@ -112,6 +112,12 @@ struct Args {
     /// frequency; replaces external SCHED_IDLE spinners).
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     keep_hot: bool,
+    /// P3a pipelined measurement: two independent DBs; pass A runs
+    /// sequential per block (timed), pass B streams blocks through
+    /// submit-ahead (depth 2) with lag-1 byte-identical asserts and
+    /// production-shaped settlement. Reports aggregate throughput.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pipeline: bool,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -309,6 +315,284 @@ fn train<S: kardamom_types::StateDatabase>(
 /// sequence, with both engines reading the SAME snapshot before it advances:
 /// snapshot -> sequential (timed, canonical outputs) -> STM (timed,
 /// byte-compared) -> commit the sequential delta -> next snapshot.
+type FlowRecs = Vec<(TxIndex, BPosition, TxEnvelope)>;
+type FeedPayload = Vec<(
+    TxIndex,
+    BPosition,
+    TxEnvelope,
+    kardamom_stm::execute::Prepared,
+)>;
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+#[allow(clippy::needless_range_loop)]
+fn run_pipelined(
+    signers: &[kardamom_bench::signers::DerivedSigner],
+    all_blocks: &[Vec<TxEnvelope>],
+    n_setup: usize,
+    chain_id: u64,
+    worker_counts: &[usize],
+    parallel_worth_ns: u64,
+    dispatch_by_sender: bool,
+    eager_chain: bool,
+    sticky_assign: bool,
+    pin_cores: Vec<usize>,
+    warmup_blocks: usize,
+    keep_hot: bool,
+) -> anyhow::Result<()> {
+    use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
+    use kardamom_types::{AccountChange, BlockBoundary};
+    use std::collections::VecDeque;
+
+    let genesis: Vec<AccountChange> = signers
+        .iter()
+        .map(|s| AccountChange {
+            address: s.signer.address(),
+            nonce: 0,
+            balance: U256::from(10u128.pow(21)),
+            code_hash: alloy_primitives::KECCAK256_EMPTY,
+        })
+        .collect();
+
+    let mk_env = || -> anyhow::Result<_> {
+        let dir = tempfile::tempdir()?;
+        let env = StateEnvBuilder::new(dir.path())
+            .durability(Durability::SafeNoSync)
+            .open()?;
+        kardamom_state::seed_genesis(&env, &genesis, &[])?;
+        let env_for_reads = env.clone();
+        let writer = StateWriter::spawn(env)?;
+        Ok((dir, env_for_reads, writer))
+    };
+    let boundary = |bi: usize, end: u64| BlockBoundary {
+        block_number: bi as u64 + 1,
+        end_tx_idx: BPosition::from_index(end),
+        l2_timestamp: 1_700_000_000 + bi as u64 * 2,
+        l1_origin: 0,
+    };
+    let env_of = |bi: usize| ExecEnv {
+        chain_id,
+        block_number: bi as u64 + 1,
+        l2_timestamp: 1_700_000_000 + bi as u64 * 2,
+    };
+
+    println!("\n===== STM-P3a PIPELINED [two DBs, depth 2, lag-1 asserts] =====");
+    let warm = n_setup + warmup_blocks;
+
+    for &w in worker_counts {
+        // ---- PASS A: sequential, own DB, timed per flow block ----
+        let (_da, _ra, writer_a) = mk_env()?;
+        let mut snap_a = writer_a.snapshot_rx.current().expect("initial snapshot");
+        let mut stats = Stats::default();
+        let mut global_idx = 0u64;
+        let mut seq_ms = 0f64;
+        let mut baseline: Vec<(Vec<Receipt>, PendingDelta)> = Vec::new();
+        let mut flow_recs: Vec<Vec<(TxIndex, BPosition, TxEnvelope)>> = Vec::new();
+        for (bi, blk) in all_blocks.iter().enumerate() {
+            let e = env_of(bi);
+            let recs = records(global_idx, blk);
+            global_idx += blk.len() as u64;
+            let t0 = Instant::now();
+            let (receipts, delta) = execute_block_sequential(&snap_a, None, e, &recs)?;
+            let el = t0.elapsed().as_secs_f64() * 1e3;
+            if bi >= warm {
+                seq_ms += el;
+                baseline.push((receipts.clone(), delta.clone()));
+                flow_recs.push(recs.clone());
+            }
+            train(&snap_a, &recs, e, None, &mut stats)?;
+            let bd = delta.finalize(e.block_number, receipts);
+            let t_w = Instant::now();
+            writer_a
+                .delta_tx
+                .send(WriteBatch::new(boundary(bi, global_idx), bd))?;
+            loop {
+                let sn = writer_a.snapshot_rx.recv().expect("writer alive");
+                let at = sn.block_number();
+                snap_a = sn;
+                if at >= e.block_number {
+                    break;
+                }
+            }
+            if std::env::var_os("KARDAMOM_STM_PHASE_TIMING").is_some() && bi >= warm {
+                eprintln!("writer block {bi}: {:?}", t_w.elapsed());
+            }
+        }
+        drop(writer_a);
+
+        // ---- PASS B: pipelined pool, fresh DB, submit-ahead depth 2 ----
+        let (_db, env_b, writer_b) = mk_env()?;
+        let mut snap_b = writer_b.snapshot_rx.current().expect("initial snapshot");
+        let cfg = kardamom_stm::execute::PoolConfig {
+            workers: w,
+            prune_batch: 4,
+            parallel_worth_ns,
+            dispatch_by_sender,
+            eager_chain,
+            sticky_assign,
+            keep_hot,
+            tail_on_workers: false,
+            pin_cores: pin_cores.clone(),
+        };
+        // Prepare (decode+predict) upstream and untimed — P3 pays this on
+        // the tx_data readers.
+        let mut stats_b = Stats::default();
+        let mut gi = 0u64;
+        let mut warm_recs: Vec<(usize, FlowRecs)> = Vec::new();
+        for (bi, blk) in all_blocks.iter().enumerate() {
+            let recs = records(gi, blk);
+            gi += blk.len() as u64;
+            warm_recs.push((bi, recs));
+        }
+        // Settle setup+warmup on DB B (sequential, untimed), training as
+        // we go — the pipeline starts warm, as production does.
+        for (bi, recs) in warm_recs.iter().take(warm) {
+            let e = env_of(*bi);
+            let (receipts, delta) = execute_block_sequential(&snap_b, None, e, recs)?;
+            train(&snap_b, recs, e, None, &mut stats_b)?;
+            let end = recs.last().map(|r| r.0.0 + 1).unwrap_or(0);
+            let bd = delta.finalize(e.block_number, receipts);
+            writer_b
+                .delta_tx
+                .send(WriteBatch::new(boundary(*bi, end), bd))?;
+            loop {
+                let sn = writer_b.snapshot_rx.recv().expect("writer alive");
+                let at = sn.block_number();
+                snap_b = sn;
+                if at >= e.block_number {
+                    break;
+                }
+            }
+        }
+        // OWNED per-block feed payloads — the loop consumes them without
+        // clones, as production tx_data readers hand owned values.
+        let mut feed_payloads: Vec<FeedPayload> = warm_recs
+            .iter()
+            .skip(warm)
+            .map(|(_, recs)| {
+                recs.iter()
+                    .map(|(t, p, en)| {
+                        let prep = kardamom_stm::execute::prepare(en, *t, &stats_b);
+                        (*t, *p, en.clone(), prep)
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let n_flow = baseline.len();
+        let mut asserted = 0usize;
+        let mut outcomes: Vec<(usize, kardamom_stm::execute::StmOutcome)> = Vec::new();
+        let t_pipe = Instant::now();
+        kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
+            let mut tickets: VecDeque<(usize, kardamom_stm::execute::BlockTicket)> =
+                VecDeque::new();
+            let timing = std::env::var_os("KARDAMOM_STM_PHASE_TIMING").is_some();
+            // Writer settlement is ASYNC: deltas are sent and never
+            // waited on inside the loop. `advanced_to` tracks which flow
+            // deltas have been mirrored into the pool's base cache after
+            // the writer confirmed them; everything after that is layered
+            // as the pending base (depth grows only if the writer lags a
+            // full execution span).
+            let mut advanced_to: usize = 0; // flow blocks [0, advanced_to) settled+advanced
+            for fi in 0..n_flow {
+                let t0 = Instant::now();
+                // Lazily advance for whatever the writer has confirmed.
+                let h = writer_b
+                    .snapshot_rx
+                    .current()
+                    .map(|s| s.block_number())
+                    .unwrap_or(0);
+                while advanced_to < fi {
+                    let bn = (warm + advanced_to) as u64 + 1;
+                    if bn > h {
+                        break;
+                    }
+                    pool.advance_base(&baseline[advanced_to].1);
+                    advanced_to += 1;
+                }
+                // Base = merge of unsettled predecessors' deltas.
+                let mut base = PendingDelta::new();
+                for k in advanced_to..fi {
+                    base.merge_from(&baseline[k].1);
+                }
+                let t_base = t0.elapsed();
+                let t1 = Instant::now();
+                let views: Vec<kardamom_state::StateSnapshot> = (0..w)
+                    .map(|_| kardamom_state::StateSnapshot::open(&env_b))
+                    .collect::<Result<_, _>>()?;
+                let t_views = t1.elapsed();
+                let t2 = Instant::now();
+                let mut sess =
+                    pool.begin_block_per_worker(views, base, env_of(warm + fi), &stats_b)?;
+                for (t, p, en, prep) in std::mem::take(&mut feed_payloads[fi]) {
+                    sess.push_prepared(t, p, en, prep)?;
+                }
+                let t_feed = t2.elapsed();
+                let t3 = Instant::now();
+                tickets.push_back((fi, sess.submit()?));
+                if tickets.len() == 2 {
+                    // Resolve the older block: keep the WRITER hand-off on
+                    // the loop (it is a production stage) but park the
+                    // byte-identical verification for AFTER the clock — it
+                    // is bench-only work.
+                    let (pfi, t) = tickets.pop_front().expect("len==2");
+                    let out = t.wait()?;
+                    let bi = warm + pfi;
+                    let e = env_of(bi);
+                    let end = flow_recs[pfi].last().map(|r| r.0.0 + 1).unwrap_or(0);
+                    let bd = out
+                        .delta
+                        .clone()
+                        .finalize(e.block_number, out.receipts.clone());
+                    writer_b
+                        .delta_tx
+                        .send(WriteBatch::new(boundary(bi, end), bd))?;
+                    outcomes.push((pfi, out));
+                }
+                if timing {
+                    eprintln!(
+                        "pipe block {fi}: base {t_base:?} views {t_views:?} feed {t_feed:?} resolve {:?}",
+                        t3.elapsed()
+                    );
+                }
+            }
+            while let Some((pfi, t)) = tickets.pop_front() {
+                let out = t.wait()?;
+                let bi = warm + pfi;
+                let e = env_of(bi);
+                let end = flow_recs[pfi].last().map(|r| r.0.0 + 1).unwrap_or(0);
+                let bd = out
+                    .delta
+                    .clone()
+                    .finalize(e.block_number, out.receipts.clone());
+                writer_b
+                    .delta_tx
+                    .send(WriteBatch::new(boundary(bi, end), bd))?;
+                outcomes.push((pfi, out));
+            }
+            Ok(())
+        })?;
+        let stm_ms = t_pipe.elapsed().as_secs_f64() * 1e3;
+        // Verification AFTER the clock: every block, byte-identical.
+        for (pfi, out) in &outcomes {
+            assert_identical(
+                &baseline[*pfi].0,
+                &baseline[*pfi].1,
+                &out.receipts,
+                &out.delta,
+                (warm + *pfi) as u64 + 1,
+                4,
+            );
+            asserted += 1;
+        }
+        println!(
+            "  w={w} seq {seq_ms:.0}ms | pipelined {stm_ms:.0}ms | speedup {:.2}x | blocks {n_flow} asserted {asserted}",
+            seq_ms / stm_ms
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_mdbx_ab(
     signers: &[kardamom_bench::signers::DerivedSigner],
@@ -377,6 +661,7 @@ fn run_mdbx_ab(
                 eager_chain,
                 sticky_assign,
                 keep_hot,
+                tail_on_workers: true,
                 pin_cores: pin_cores.clone(),
             };
             let mut stats = Stats::default();
@@ -1006,6 +1291,30 @@ fn main() -> anyhow::Result<()> {
             ),
             None => None,
         };
+        if a.pipeline {
+            let r = run_pipelined(
+                &signers,
+                &all_blocks,
+                n_setup,
+                a.chain_id,
+                &worker_counts,
+                parallel_worth_ns,
+                dispatch_by_sender,
+                eager_chain,
+                sticky_assign,
+                pin_cores.clone(),
+                a.warmup_blocks,
+                a.keep_hot,
+            );
+            if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
+                && let Ok(report) = g.report().build()
+            {
+                let file = std::fs::File::create(path)?;
+                report.flamegraph(file)?;
+                eprintln!("==> wrote flamegraph to {path}");
+            }
+            return r;
+        }
         let r = run_mdbx_ab(
             &signers,
             &all_blocks,
@@ -1156,6 +1465,7 @@ fn main() -> anyhow::Result<()> {
                 eager_chain,
                 sticky_assign,
                 keep_hot: false,
+                tail_on_workers: true,
                 pin_cores: pin_cores.clone(),
             };
             let mut row = Row {
