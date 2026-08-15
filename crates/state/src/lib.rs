@@ -36,4 +36,8 @@ pub use recovery::{
 pub use snapshot::StateSnapshot;
 pub use swap::{SnapshotHandle, SnapshotReceiver, channel as snapshot_channel};
 pub use trie::{AccountTrieParts, empty_root, state_root, storage_root};
+// The 3b proof-generation API is generic over the libmdbx txn kind; callers
+// (the validator's witness anchoring) need to NAME those types without
+// growing their own libmdbx dependency line.
+pub use signet_libmdbx;
 pub use writer::{StateWriter, TrieMode, WriteBatch, WriterHandle};

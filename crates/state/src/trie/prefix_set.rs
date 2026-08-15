@@ -23,6 +23,16 @@ impl PrefixSet {
         Self { keys }
     }
 
+    /// Build from nibble paths directly — proof-generation targets may be
+    /// PARTIAL paths (a node position from the capture fixed point), which
+    /// force the walker to descend exactly that far.
+    pub fn from_nibbles(it: impl IntoIterator<Item = Nibbles>) -> Self {
+        let mut keys: Vec<Nibbles> = it.into_iter().collect();
+        keys.sort_unstable();
+        keys.dedup();
+        Self { keys }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }

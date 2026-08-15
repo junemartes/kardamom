@@ -36,6 +36,7 @@ std = [
     "alloy-eips/std",
     "alloy-eip7928/std",
     "alloy-rlp/std",
+    "alloy-trie/std",
     "bytes/std",
     "thiserror/std",
     "dep:tracing",
@@ -54,6 +55,11 @@ alloy-consensus = { version = "2.0", default-features = false, features = ["k256
 alloy-eips = { version = "2.0", default-features = false }
 alloy-eip7928 = { version = "0.3", default-features = false, features = ["rlp"] }
 alloy-rlp = { version = "0.3", default-features = false }
+# Phase 3b witness anchoring: `no_std` MPT node decode/encode + TrieAccount
+# (`ethereum` feature). The partial-trie walk and sparse recompute in
+# `anchor/` build on these primitives; version kept in sync with
+# kardamom-state's (workspace-root discipline, phase-1 gotcha).
+alloy-trie = { version = "0.9", default-features = false, features = ["ethereum"] }
 bytes = { version = "1", default-features = false }
 smallvec = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
@@ -64,9 +70,10 @@ metrics = { version = "0.24", optional = true }
 alloy-signer-local = { workspace = true }
 alloy-network = { workspace = true }
 # EEST conformance runner (`tests/eest_state.rs`): revm's statetest fixture
-# models, tree walking, and the pure state-root oracle.
+# models, tree walking, and the pure state-root oracle. (alloy-trie is a
+# real dependency since 3b; dev builds feature-unify std onto it.)
 revm = { version = "38", features = ["test-types", "serde"] }
-alloy-trie = { version = "0.9", features = ["ethereum"] }
+alloy-trie = { version = "0.9", features = ["ethereum", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"

@@ -170,7 +170,7 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
   shape: envelope.sender = victim, signature by attacker) and asserts halt +
   latch with the flag on, and — the documented blind spot — a committed
   theft with it off.
-- **PR 3b** — witness MPT anchoring: account/storage proofs against
+- **PR 3b (delivered 2026-08-15)** — witness MPT anchoring: account/storage proofs against
   `pre_state_root`, absence proofs, sparse post-state-root recompute over
   `alloy-trie` in the guest. Design notes below.
 - **PR 3c** — the zkVM guest program (SP1/RISC Zero) + async prover harness
@@ -180,7 +180,17 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
 
 ## Phase 3b design — MPT-anchoring the witness (design notes, 2026-08-08)
 
-Design only; no implementation yet. Status of the inputs it builds on:
+DELIVERED as designed (see the crate docs for the shipped shapes:
+`kardamom-types::WitnessProofs`, `exec-core::anchor`,
+`kardamom-state::trie::proofs`, `validator::witness::anchor_block_witness`,
+`stateless::execute_block_anchored`; acceptance gates in exec-core's
+`anchor_sparse`/`anchor_state` tests and the validator's
+`witness_anchoring` pipeline test, whose closing assertion is guest
+recompute == live `update_for_block` root). The one deviation from the
+notes below: `MissingNode` names (hash, path, account) rather than a hash
+alone — the live-trie retainer addresses paths, not hashes. Original
+design notes kept for the reasoning record. Status of the inputs it built
+on:
 `ExecutionWitness.pre_state_root: Option<B256>` already exists on the wire
 type (phase 2 left the anchor point ready, currently unpopulated);
 `kardamom-state::{state_root, storage_root}` is the pure full-trie oracle the

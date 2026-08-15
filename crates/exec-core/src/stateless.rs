@@ -249,6 +249,51 @@ pub fn execute_block_stateless(
     Ok(out)
 }
 
+/// The 3b proof shape: a stateless execution ANCHORED to the chain's root
+/// history. These are the proof's public outputs — an inductive chain from
+/// genesis: the L1 verifier holds the running root, checks
+/// `pre_state_root` continuity, `bal_commitment` against the posted frame,
+/// and advances to `post_state_root`.
+#[derive(Debug)]
+pub struct AnchoredBlockOutput {
+    pub out: BlockExecOutput,
+    pub pre_state_root: alloy_primitives::B256,
+    pub post_state_root: alloy_primitives::B256,
+    pub bal_commitment: alloy_primitives::B256,
+    pub block_number: u64,
+}
+
+/// The FULL guest entry (spec: no-std-exec-core, phase 3b):
+/// [`execute_block_stateless`]'s three fail-closed layers (identity,
+/// witness completeness, BAL equality) plus the MPT anchor on both ends —
+/// the witness is proven against `pre_state_root` BEFORE the first EVM
+/// step, and the post-state root is recomputed from the carried node set
+/// after the last. A prover that fabricates state now has nowhere left to
+/// stand: the witness must hash-link into a root the L1 already holds.
+pub fn execute_block_anchored(
+    witness: &ExecutionWitness,
+    proofs: &kardamom_types::WitnessProofs,
+    parent: Option<&PendingDelta>,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+    expected_bal: &alloy_eip7928::BlockAccessList,
+    granularity: u16,
+) -> Result<AnchoredBlockOutput, ExecutorError> {
+    let pre = crate::anchor::verify_witness_anchored(witness, proofs)?;
+    let pre_state_root = witness
+        .pre_state_root
+        .expect("verify_witness_anchored requires the root");
+    let out = execute_block_stateless(witness, parent, records, env, expected_bal, granularity)?;
+    let post_state_root = crate::anchor::recompute_post_root(witness, proofs, &pre, &out.delta)?;
+    Ok(AnchoredBlockOutput {
+        pre_state_root,
+        post_state_root,
+        bal_commitment: bal_commitment(expected_bal),
+        block_number: env.block_number,
+        out,
+    })
+}
+
 /// Canonical commitment to a (quantized) access list: keccak256 of its RLP
 /// encoding — the SAME bytes the executor publishes in `BalFrame.bal_rlp`,
 /// so an L1 verifier can check the proof's public output against the posted

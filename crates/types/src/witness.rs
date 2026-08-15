@@ -16,6 +16,7 @@
 use alloc::vec::Vec;
 
 use alloy_primitives::{Address, B256, U256};
+use bytes::Bytes;
 use rkyv::with::Map;
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -67,6 +68,36 @@ pub struct ExecutionWitness {
     /// witness only covers STATE.
     #[rkyv(with = Map<wire::B256Bytes>)]
     pub pre_state_root: Option<B256>,
+}
+
+/// MPT proof material anchoring an [`ExecutionWitness`] to its
+/// `pre_state_root` (spec: no-std-exec-core, phase 3b).
+///
+/// One flat, CONTENT-ADDRESSED node set rather than per-entry proof paths:
+/// every RLP-encoded trie node needed to (a) prove each witness
+/// account/slot present-or-absent under `pre_state_root` and (b) recompute
+/// the post-state root after the block's delta (including the
+/// deletion-collapse siblings the capture fixed point adds). MPT proof
+/// paths share prefixes heavily, so the set is far smaller than the sum of
+/// paths, and a consumer walks the trie from the root looking nodes up by
+/// `keccak256(node)` — reaching a leaf IS the inclusion proof; reaching a
+/// divergence is the exclusion proof.
+///
+/// Nodes whose RLP is shorter than 32 bytes never appear here: the MPT
+/// embeds them in their parent, so the walk finds them inline.
+///
+/// NOT part of [`ExecutionWitness::digest`]: proof nodes are recomputable
+/// commitments over state the digest already covers, and every node is
+/// verified by hash against `pre_state_root` on use — a tampered node set
+/// can only fail verification, never smuggle state.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Archive, Serialize, Deserialize)]
+pub struct WitnessProofs {
+    /// RLP-encoded MPT nodes (account trie and storage tries mixed —
+    /// content addressing needs no namespacing). Sorted by `keccak256(node)`
+    /// ascending; unique. Consumers MUST reject unsorted/duplicate sets
+    /// (canonical wire form, one valid encoding per set).
+    #[rkyv(with = Map<wire::BytesVec>)]
+    pub nodes: Vec<Bytes>,
 }
 
 impl ExecutionWitness {

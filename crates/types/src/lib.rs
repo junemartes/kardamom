@@ -53,4 +53,4 @@ pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;
 pub use txref::TxRef;
 pub use watermark::{FsyncWatermark, QuorumWatermark};
-pub use witness::{ExecutionWitness, WitnessAccount, WitnessSlot};
+pub use witness::{ExecutionWitness, WitnessAccount, WitnessProofs, WitnessSlot};
