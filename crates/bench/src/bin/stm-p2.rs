@@ -108,6 +108,10 @@ struct Args {
     /// number.
     #[arg(long, default_value_t = 1)]
     warmup_blocks: usize,
+    /// Engine keep-hot: workers spin-yield between blocks (holds core
+    /// frequency; replaces external SCHED_IDLE spinners).
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    keep_hot: bool,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -320,6 +324,7 @@ fn run_mdbx_ab(
     per_block: bool,
     pin_cores: Vec<usize>,
     warmup_blocks: usize,
+    keep_hot: bool,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -371,6 +376,7 @@ fn run_mdbx_ab(
                 dispatch_by_sender,
                 eager_chain,
                 sticky_assign,
+                keep_hot,
                 pin_cores: pin_cores.clone(),
             };
             let mut stats = Stats::default();
@@ -1014,6 +1020,7 @@ fn main() -> anyhow::Result<()> {
             a.per_block,
             pin_cores,
             a.warmup_blocks,
+            a.keep_hot,
         );
         if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
             && let Ok(report) = g.report().build()
@@ -1148,6 +1155,7 @@ fn main() -> anyhow::Result<()> {
                 dispatch_by_sender,
                 eager_chain,
                 sticky_assign,
+                keep_hot: false,
                 pin_cores: pin_cores.clone(),
             };
             let mut row = Row {

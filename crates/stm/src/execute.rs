@@ -809,6 +809,17 @@ pub struct PoolConfig {
     /// the cross-block stickiness that made hashing win, and fixes only
     /// the collisions.
     pub sticky_assign: bool,
+    /// Between blocks, workers SPIN-YIELD instead of sleeping on the
+    /// condvar. schedutil drops a core to base clock (2.1 vs 4.2GHz
+    /// measured) the moment it idles, and burst-park execution never
+    /// ramps it back — the root cause of the long "bimodal machine"
+    /// hunt. A yielding spinner holds the governor's utilization signal
+    /// up while surrendering the core within microseconds to any real
+    /// work — including the commit tail's scoped threads, which pin to
+    /// these same cores. Costs idle watts; production executor pools
+    /// run continuously busy, so this mainly serves dedicated-core
+    /// deployments and honest benchmarking.
+    pub keep_hot: bool,
     /// Pin worker i to `pin_cores[i % len]`.
     ///
     /// MEASURED REASON (Ryzen 3600, two 3-core CCXes with SPLIT 16MB L3):
@@ -839,6 +850,7 @@ impl Default for PoolConfig {
             dispatch_by_sender: false,
             eager_chain: true,
             sticky_assign: false,
+            keep_hot: false,
             pin_cores: Vec::new(),
         }
     }
@@ -1179,6 +1191,9 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// Cumulative txs dispatched per worker — the load the least-loaded
     /// choice reads.
     assign_load: std::cell::RefCell<Vec<u64>>,
+    /// Worker core pins, reused by the commit tail's scoped threads.
+    pin_cores: Vec<usize>,
+    keep_hot: bool,
     /// Teardown off the critical path: the seal thread ships each spent
     /// block's carcass (the multi-version cache's ~30k entries, a
     /// thousand tx slots, the spent read logs) here instead of dropping
@@ -1223,6 +1238,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         ..cfg
     };
     let pin_cores = cfg.pin_cores.clone();
+    let cfg_keep_hot = cfg.keep_hot;
     let (sticky_assign, parallel_worth_ns, dispatch_by_sender, eager_chain) = (
         cfg.sticky_assign,
         cfg.parallel_worth_ns,
@@ -1246,6 +1262,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         scope.spawn(move || while reap_rx.recv().is_ok() {});
         for w in 0..workers {
             let pin = pin_cores.clone();
+            let hot = cfg_keep_hot;
             scope.spawn(move || {
                 if !pin.is_empty() {
                     let id = core_affinity::CoreId {
@@ -1255,7 +1272,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         tracing::warn!(worker = w, core = id.id, "stm: worker pin failed");
                     }
                 }
-                worker_loop(shared_ref, w)
+                worker_loop(shared_ref, w, hot)
             });
         }
         let handle = PoolHandle {
@@ -1265,6 +1282,8 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             base_cache: std::sync::Arc::new(BaseCache::new()),
+            pin_cores: pin_cores.clone(),
+            keep_hot: cfg_keep_hot,
             reaper: reap_tx.clone(),
             parallel_worth_ns,
             dispatch_by_sender,
@@ -1939,6 +1958,17 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let wounded: Vec<usize> = if val_threads > 1 && n_val > 256 {
             let chunk = n_val.div_ceil(val_threads);
             let mut parts: Vec<Vec<usize>> = Vec::with_capacity(val_threads);
+            let tail_pins: &[usize] = if pool.keep_hot {
+                // Workers spin-YIELD on these cores between blocks, so a
+                // tail thread pinned there gets a hot, instantly-yielded
+                // core. Without keep_hot the cores are cold (or hold
+                // SCHED_IDLE squatters, whose preemption latency measured
+                // 21ms vs 10.6 on a 9k-hash phase) — stay on the caller's
+                // mask then.
+                &pool.pin_cores
+            } else {
+                &[]
+            };
             std::thread::scope(|sc| {
                 let handles: Vec<_> = tx_results
                     .chunks(chunk)
@@ -1947,6 +1977,11 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                         let base = ci * chunk;
                         let mv = &ctx.mv;
                         sc.spawn(move || {
+                            if !tail_pins.is_empty() {
+                                let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                                    id: tail_pins[ci % tail_pins.len()],
+                                });
+                            }
                             part.iter()
                                 .enumerate()
                                 .filter(|(j, r)| {
@@ -2034,17 +2069,21 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             let threads = ctx.queues.len().min(n.max(1));
             if threads > 1 && n > 64 {
                 let chunk = n.div_ceil(threads);
+                let tail_pins: &[usize] = if pool.keep_hot { &pool.pin_cores } else { &[] };
                 std::thread::scope(|sc| {
-                    for part in tx_results.chunks_mut(chunk) {
+                    for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
                         sc.spawn(move || {
-                            // Deliberately UNPINNED (a pin to the worker
-                            // cores was tried and reverted): commit runs
-                            // while workers park, and the caller's cores
-                            // are the boosted ones — a hash thread pinned
-                            // to a worker core pays that core's frequency
-                            // ramp (or, under keep-hot spinners, SCHED_IDLE
-                            // preemption latency per spawn, measured 21ms
-                            // vs 5.6 for 9k hashes).
+                            // Pinned to the keep-hot worker cores (which
+                            // yield within microseconds); with keep_hot
+                            // off, stay on the caller's mask — a pin to a
+                            // COLD worker core pays its frequency ramp,
+                            // and one to a SCHED_IDLE-squatted core pays
+                            // preemption latency (both measured).
+                            if !tail_pins.is_empty() {
+                                let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                                    id: tail_pins[ti % tail_pins.len()],
+                                });
+                            }
                             for r in part {
                                 if r.sink_touched {
                                     r.receipt.write_set_hash = r.ws.hash();
@@ -2216,22 +2255,43 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     }
 }
 
-fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize) {
+fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize, keep_hot: bool) {
     let mut seen = 0u64;
     loop {
-        let ctx = {
-            let mut st = shared.0.lock().expect("pool poisoned");
+        let ctx = 'next: {
             loop {
-                if st.shutdown {
-                    return;
-                }
-                if st.generation != seen
-                    && let Some(c) = &st.ctx
                 {
-                    seen = st.generation;
-                    break c.clone();
+                    let mut st = shared.0.lock().expect("pool poisoned");
+                    if !keep_hot {
+                        loop {
+                            if st.shutdown {
+                                return;
+                            }
+                            if st.generation != seen
+                                && let Some(c) = &st.ctx
+                            {
+                                seen = st.generation;
+                                break 'next c.clone();
+                            }
+                            st = shared.1.wait(st).expect("pool poisoned");
+                        }
+                    }
+                    if st.shutdown {
+                        return;
+                    }
+                    if st.generation != seen
+                        && let Some(c) = &st.ctx
+                    {
+                        seen = st.generation;
+                        break 'next c.clone();
+                    }
                 }
-                st = shared.1.wait(st).expect("pool poisoned");
+                // keep_hot: hold the core's frequency, hand it over
+                // instantly to whoever needs it (the commit tail pins
+                // its threads here).
+                for _ in 0..64 {
+                    std::thread::yield_now();
+                }
             }
         };
         run_worker_block(&ctx, worker);
