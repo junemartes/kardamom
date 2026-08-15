@@ -1178,8 +1178,9 @@ type Reap = Box<dyn Send>;
 pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     shared: &'a PoolShared<S>,
     /// Mean per-tx execution time of the last block, feeding the stealing
-    /// policy. Feed-thread-owned, so a `Cell` suffices.
-    avg_tx_ns: std::cell::Cell<u64>,
+    /// policy. Atomic (not `Cell`): P3's persistent tail thread updates
+    /// it after each block's fold while the feed thread reads it.
+    avg_tx_ns: std::sync::atomic::AtomicU64,
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
@@ -1277,7 +1278,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         }
         let handle = PoolHandle {
             shared: shared_ref,
-            avg_tx_ns: std::cell::Cell::new(0),
+            avg_tx_ns: std::sync::atomic::AtomicU64::new(0),
             sticky_assign,
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
@@ -1405,7 +1406,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             prune_batch: prune_batch.max(1),
             started: std::time::Instant::now(),
             steal_enabled: {
-                let avg = self.avg_tx_ns.get();
+                let avg = self.avg_tx_ns.load(Ordering::Relaxed);
                 // Unknown (first block of a pool): allow it, and let the
                 // measurement correct course from the next block on.
                 avg == 0 || avg >= STEAL_WORTH_NS
@@ -1415,7 +1416,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 // spinning a full core for more than ~60us of silence is
                 // waste, and below ~5us the spin cannot outlast even a
                 // fast release.
-                let avg = self.avg_tx_ns.get();
+                let avg = self.avg_tx_ns.load(Ordering::Relaxed);
                 if avg == 0 {
                     20_000
                 } else {
@@ -1532,7 +1533,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// measurement yet and is given the benefit of the doubt; one block is
     /// enough to correct course.
     fn parallel_worth_it(&self) -> bool {
-        let avg = self.avg_tx_ns.get();
+        let avg = self.avg_tx_ns.load(Ordering::Relaxed);
         avg == 0 || avg >= self.parallel_worth_ns
     }
 
@@ -1556,14 +1557,16 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         // parallel commit phase), so the bias is toward re-entering
         // parallel execution rather than staying out.
         if !txs.is_empty() {
-            self.avg_tx_ns
-                .set(started.elapsed().as_nanos() as u64 / txs.len() as u64);
+            self.avg_tx_ns.store(
+                started.elapsed().as_nanos() as u64 / txs.len() as u64,
+                Ordering::Relaxed,
+            );
         }
         Ok(StmOutcome {
             receipts,
             delta,
             declined: true,
-            learned_tx_ns: self.avg_tx_ns.get(),
+            learned_tx_ns: self.avg_tx_ns.load(Ordering::Relaxed),
             writes_own: 0,
             writes_foreign: 0,
             fifo_covered: 0,
@@ -1928,362 +1931,390 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             }
         };
         let t_drain = t_drain0.elapsed();
-        let t_extract0 = std::time::Instant::now();
-        let aborted = ctx.aborted.load(Ordering::SeqCst);
-        let n = txs.len();
-        let mut tx_results = Vec::with_capacity(n);
-        for cell in ctx.results.into_iter().take(n) {
-            match cell.into_inner() {
-                Some(Ok(r)) => tx_results.push(r),
-                Some(Err(e)) => return Err(e),
-                None => {
-                    return Err(ExecutorError::State(if aborted {
-                        "stm pool: block aborted".into()
-                    } else {
-                        "stm pool: sealed block has unexecuted txs (scheduler bug)".into()
-                    }));
-                }
-            }
-        }
-
-        let t_extract = t_extract0.elapsed();
-        // Validation: every recorded read must still be the highest
-        // version below the reader. A conviction is a WOUND — the marks
-        // missed a real conflict (the tx read a cell an earlier tx wrote
-        // without a mark to park on).
-        let t_val = std::time::Instant::now();
-        // PARALLEL: replay is read-only against the multi-version cache
-        // and independent per tx — it was ~15ms of serial tail on a 9k-tx
-        // set, the single largest block in the commit path. Scoped
-        // threads, unpinned (the caller's cores are the hot ones — see
-        // the hash phase note).
-        let n_val = tx_results.len();
-        let val_threads = ctx.queues.len().min(n_val.max(1));
-        let wounded: Vec<usize> = if val_threads > 1 && n_val > 256 {
-            let chunk = n_val.div_ceil(val_threads);
-            let mut parts: Vec<Vec<usize>> = Vec::with_capacity(val_threads);
-            let tail_pins: &[usize] = if pool.keep_hot {
-                // Workers spin-YIELD on these cores between blocks, so a
-                // tail thread pinned there gets a hot, instantly-yielded
-                // core. Without keep_hot the cores are cold (or hold
-                // SCHED_IDLE squatters, whose preemption latency measured
-                // 21ms vs 10.6 on a 9k-hash phase) — stay on the caller's
-                // mask then.
-                &pool.pin_cores
-            } else {
-                &[]
-            };
-            std::thread::scope(|sc| {
-                let handles: Vec<_> = tx_results
-                    .chunks(chunk)
-                    .enumerate()
-                    .map(|(ci, part)| {
-                        let base = ci * chunk;
-                        let mv = &ctx.mv;
-                        sc.spawn(move || {
-                            if !tail_pins.is_empty() {
-                                let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                                    id: tail_pins[ci % tail_pins.len()],
-                                });
-                            }
-                            part.iter()
-                                .enumerate()
-                                .filter(|(j, r)| {
-                                    let i = base + j;
-                                    r.reads.iter().any(|rec| !mv.validate(i as u32, rec))
-                                })
-                                .map(|(j, _)| base + j)
-                                .collect::<Vec<usize>>()
-                        })
-                    })
-                    .collect();
-                for h in handles {
-                    parts.push(h.join().expect("validation thread"));
-                }
-            });
-            parts.concat()
-        } else {
-            tx_results
-                .iter()
-                .enumerate()
-                .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
-                .map(|(i, _)| i)
-                .collect()
-        };
-        let t_validate = t_val.elapsed();
-        let wounds = wounded.len();
-
-        // Canonical-order commit. A wounded tx is RE-EXECUTED here against
-        // the exact materialized prefix (the delta as of its position), so
-        // its result is the sequential one by construction — the whole
-        // block never re-runs. Everything after a wound sees the corrected
-        // state through the same prefix, so a wound cascade re-executes
-        // only the txs it actually reaches.
-        //
-        // SERIAL by definition: this is the block's tail, and no worker
-        // count shortens it.
-        let t_com = std::time::Instant::now();
-        let (mut hash_ns, mut delta_ns) = (0u64, 0u64);
-        let mut receipts = Vec::with_capacity(n);
-        let mut delta = PendingDelta::new();
-        let mut cumulative = 0u64;
-        let mut sink_running = ctx.sink_start_balance;
-        let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
-        // A tx after a re-executed one may also be stale: once ANY wound
-        // fires, later txs are re-checked against the live prefix.
-        if let Some(first) = wounded_set.iter().copied().min() {
-            for i in first..n {
-                wounded_set.insert(i);
-            }
-        }
-        let repairing = !wounded_set.is_empty();
-
-        if !repairing {
-            // FAST PATH — the one that runs essentially always.
-            //
-            // The write-set hash is ~1.25us of keccak per tx and CANNOT be
-            // made cheaper (it is one permutation per 136 bytes of a
-            // contract the receipts depend on). On the serial commit tail
-            // it was 72% of that tail — the largest fixed parallelization
-            // tax in the engine, untouched by worker count.
-            //
-            // It does not have to be serial. The only thing forcing it
-            // there is the accumulator's absolute balance, and THAT is a
-            // prefix sum: computable in one cheap pass with no hashing, so
-            // afterwards every tx's hash is independent.
-            //
-            // Phase 1 (serial, ~ns/tx): cumulative gas + accumulator
-            // materialization.
-            for r in tx_results.iter_mut() {
-                cumulative += r.receipt.gas_used;
-                r.receipt.cumulative_gas_used = cumulative;
-                sink_running += r.fee_delta;
-                if r.sink_touched
-                    && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
-                {
-                    entry.1.1 = sink_running;
-                }
-            }
-            // Phase 2 (parallel): hash. Scoped threads rather than the
-            // worker pool — this is a self-contained parallel map over an
-            // owned slice, and keeping it out of the pool's state machine
-            // is worth one spawn (~tens of us) against the milliseconds it
-            // removes from the tail.
-            let t_h = std::time::Instant::now();
-            let threads = ctx.queues.len().min(n.max(1));
-            if threads > 1 && n > 64 {
-                let chunk = n.div_ceil(threads);
-                let tail_pins: &[usize] = if pool.keep_hot { &pool.pin_cores } else { &[] };
-                std::thread::scope(|sc| {
-                    for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
-                        sc.spawn(move || {
-                            // Pinned to the keep-hot worker cores (which
-                            // yield within microseconds); with keep_hot
-                            // off, stay on the caller's mask — a pin to a
-                            // COLD worker core pays its frequency ramp,
-                            // and one to a SCHED_IDLE-squatted core pays
-                            // preemption latency (both measured).
-                            if !tail_pins.is_empty() {
-                                let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                                    id: tail_pins[ti % tail_pins.len()],
-                                });
-                            }
-                            for r in part {
-                                if r.sink_touched {
-                                    r.receipt.write_set_hash = r.ws.hash();
-                                }
-                            }
-                        });
-                    }
-                });
-            } else {
-                for r in tx_results.iter_mut() {
-                    if r.sink_touched {
-                        r.receipt.write_set_hash = r.ws.hash();
-                    }
-                }
-            }
-            hash_ns += t_h.elapsed().as_nanos() as u64;
-            // Phase 3 (serial): fold the block delta in canonical order.
-            //
-            // Parallelising this was tried and REVERTED. The fold is
-            // associative ("later tx wins" per cell), so chunks can be
-            // folded independently and merged in order — but the merge
-            // costs back what the parallel build saves, and it measured
-            // neutral-to-worse (commit 14.7ms -> 16.3ms). The fold touches
-            // a few hundred distinct cells however many txs wrote them, so
-            // there is less serial work here than the tx count suggests.
-            let t_d = std::time::Instant::now();
-            // Fold via FastMap (~40ns upserts), then let BTreeMap's
-            // FromIterator BULK-BUILD the canonical maps once — the
-            // previous per-write-set `apply` paid a ~250ns B-tree insert
-            // per entry (15ms/block at 4k txs). Canonical iteration
-            // order makes "last write wins" hold in the FastMap exactly
-            // as it did in the tree.
-            let mut spent_reads: Vec<Vec<ReadRecord>> = Vec::with_capacity(tx_results.len());
-            let mut acc_v: Vec<(alloy_primitives::Address, (u64, U256, B256))> =
-                Vec::with_capacity(tx_results.len() * 3);
-            let mut sto_v: Vec<((alloy_primitives::Address, B256), U256)> =
-                Vec::with_capacity(tx_results.len());
-            for mut r in tx_results {
-                // Freeing ~n read logs inline was serial-tail time; the
-                // reaper drops them while the next block runs.
-                spent_reads.push(std::mem::take(&mut r.reads));
-                acc_v.extend(r.ws.accounts.drain(..));
-                sto_v.extend(r.ws.storage.drain(..));
-                for (h, b) in r.ws.code.drain(..) {
-                    delta.code.insert(h, b);
-                }
-                receipts.push(r.receipt);
-            }
-            // BTreeMap::from_iter STABLE-sorts and keeps the LAST of equal
-            // keys, then bulk-builds — which on canonical-order input is
-            // exactly "later tx wins", at a fraction of per-entry insert
-            // cost.
-            delta.accounts = acc_v.into_iter().collect();
-            delta.storage = sto_v.into_iter().collect();
-            pool.reaper.send(Box::new(spent_reads)).ok();
-            delta_ns += t_d.elapsed().as_nanos() as u64;
-        } else {
-            // REPAIR PATH: a wound fired, so txs from the first wound on
-            // re-execute against the exact materialized prefix. Strictly
-            // sequential by nature, and rare enough that its cost is not
-            // worth optimizing.
-            let mut layered = ctx.base.clone();
-            for (i, mut r) in tx_results.into_iter().enumerate() {
-                if wounded_set.contains(&i) {
-                    let (tx_idx, position, envelope) = &txs[i];
-                    let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
-                    let (mut receipt, ws) = scope.execute_tx(
-                        *tx_idx, *position, envelope, i as u64, cumulative, None, None,
-                    )?;
-                    cumulative = receipt.cumulative_gas_used;
-                    receipt.transaction_index = i as u64;
-                    layered.apply(ws.clone());
-                    delta.apply(ws);
-                    receipts.push(receipt);
-                    continue;
-                }
-                cumulative += r.receipt.gas_used;
-                r.receipt.cumulative_gas_used = cumulative;
-                sink_running += r.fee_delta;
-                if r.sink_touched {
-                    if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
-                        entry.1.1 = sink_running;
-                    }
-                    r.receipt.write_set_hash = r.ws.hash();
-                }
-                layered.apply(r.ws.clone());
-                delta.apply(r.ws);
-                receipts.push(r.receipt);
-            }
-        }
-
-        let t_commit = t_com.elapsed();
-        ctx.metrics
-            .commit_hash_ns
-            .fetch_add(hash_ns, Ordering::Relaxed);
-        ctx.metrics
-            .commit_delta_ns
-            .fetch_add(delta_ns, Ordering::Relaxed);
-        if wounds > 0 {
-            tracing::warn!(
-                block = ctx.env.block_number,
-                wounds,
-                rerun = wounded_set.len(),
-                "stm: wound — per-tx re-execution at canonical position"
-            );
-        }
-        if std::env::var("KARDAMOM_STM_PHASE_TIMING").is_ok() {
-            eprintln!(
-                "phase block={} n={} feed+exec={:?} drain={:?} extract={:?} validate={:?} commit={:?} wounds={}",
-                ctx.env.block_number,
-                n,
-                t_exec_wall,
-                t_drain,
-                t_extract,
-                t_validate,
-                t_commit,
-                wounds
-            );
-        }
-        // Destructure: the HEAVY parts (multi-version cache with ~n
-        // versions, a thousand tx slots) go to the reaper; the light rest
-        // drops here. `S` (the snapshots) stays inline, so no 'static
-        // bound is needed on the payload.
-        let BlockCtx {
-            mv, slots, metrics, ..
-        } = ctx;
-        pool.reaper.send(Box::new((mv, slots))).ok();
-        let m = &metrics;
-        // Feed the stealing policy: mean per-tx execution time this block.
-        if n > 0 {
-            pool.avg_tx_ns
-                .set(m.busy_ns.load(Ordering::Relaxed) / n as u64);
-        }
-        let prune_calls = m.prune_calls.load(Ordering::Relaxed);
-        let completions = m.completions.load(Ordering::Relaxed);
-        Ok(StmOutcome {
-            receipts,
-            delta,
-            wounds,
-            fallback: wounds > 0,
-            declined: false,
-            learned_tx_ns: pool.avg_tx_ns.get(),
-            writes_own: m.writes_own.load(Ordering::Relaxed),
-            writes_foreign: m.writes_foreign.load(Ordering::Relaxed),
-            fifo_covered: m.fifo_covered.load(Ordering::Relaxed),
-            fifo_stalls: m.fifo_stalls.load(Ordering::Relaxed),
-            read_us: m.read_ns.load(Ordering::Relaxed) / 1_000,
-            busy_per_worker_us: m
-                .busy_per_worker
-                .iter()
-                .map(|c| c.0.load(Ordering::Relaxed) / 1_000)
-                .collect(),
+        block_tail(
+            ctx,
+            txs,
+            t_exec_wall,
+            t_drain,
             cold,
             edges,
             dispatch,
-            double_exit: ctx.double_exit.load(Ordering::SeqCst),
-            feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
-            redundant_edges: m.redundant_edges.load(Ordering::Relaxed),
-            steals: m.steals.load(Ordering::Relaxed),
-            reads_total: m.reads_total.load(Ordering::Relaxed),
-            reads_mv_hit: m.reads_mv_hit.load(Ordering::Relaxed),
-            reads_base_hit: m.reads_base_hit.load(Ordering::Relaxed),
-            reads_backend: m.reads_backend.load(Ordering::Relaxed),
-            evm_us: m.evm_ns.load(Ordering::Relaxed) / 1_000,
-            publish_us: m.publish_ns.load(Ordering::Relaxed) / 1_000,
-            busy_us: m.busy_ns.load(Ordering::Relaxed) / 1_000,
-            parallel_span_us: {
-                let f = m.first_dispatch_ns.load(Ordering::Relaxed);
-                let l = m.last_done_ns.load(Ordering::Relaxed);
-                if f == u64::MAX || l < f {
-                    0
-                } else {
-                    (l - f) / 1_000
-                }
-            },
-            ramp_us: {
-                let f = m.first_dispatch_ns.load(Ordering::Relaxed);
-                if f == u64::MAX { 0 } else { f / 1_000 }
-            },
-            commit_us: t_commit.as_micros() as u64,
-            commit_hash_us: m.commit_hash_ns.load(Ordering::Relaxed) / 1_000,
-            commit_delta_us: m.commit_delta_ns.load(Ordering::Relaxed) / 1_000,
-            decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
-            predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
-            admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
-            prune_us: m.prune_ns.load(Ordering::Relaxed) / 1_000,
-            prune_calls,
-            prune_forced: m.prune_forced.load(Ordering::Relaxed),
-            avg_batch: if prune_calls == 0 {
-                0.0
-            } else {
-                completions as f64 / prune_calls as f64
-            },
-            idle_us: m.idle_ns.load(Ordering::Relaxed) / 1_000,
-        })
+            pool.keep_hot,
+            &pool.pin_cores,
+            &pool.reaper,
+            &pool.avg_tx_ns,
+        )
     }
+}
+
+/// The BLOCK TAIL: everything after the pool is released — extraction,
+/// validation, wound repair, the canonical commit, learning, teardown
+/// hand-off. Standalone so P3's persistent tail thread can own it; the
+/// block-at-a-time path calls it inline (seal = drain + tail).
+#[allow(clippy::too_many_arguments)]
+fn block_tail<S: StateDatabase + Sync>(
+    ctx: BlockCtx<S>,
+    txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
+    t_exec_wall: std::time::Duration,
+    t_drain: std::time::Duration,
+    cold: usize,
+    edges: usize,
+    dispatch: Vec<u32>,
+    keep_hot: bool,
+    pin_cores: &[usize],
+    reaper: &std::sync::mpsc::Sender<Reap>,
+    avg_tx_ns: &std::sync::atomic::AtomicU64,
+) -> Result<StmOutcome, ExecutorError> {
+    let t_extract0 = std::time::Instant::now();
+    let aborted = ctx.aborted.load(Ordering::SeqCst);
+    let n = txs.len();
+    let mut tx_results = Vec::with_capacity(n);
+    for cell in ctx.results.into_iter().take(n) {
+        match cell.into_inner() {
+            Some(Ok(r)) => tx_results.push(r),
+            Some(Err(e)) => return Err(e),
+            None => {
+                return Err(ExecutorError::State(if aborted {
+                    "stm pool: block aborted".into()
+                } else {
+                    "stm pool: sealed block has unexecuted txs (scheduler bug)".into()
+                }));
+            }
+        }
+    }
+
+    let t_extract = t_extract0.elapsed();
+    // Validation: every recorded read must still be the highest
+    // version below the reader. A conviction is a WOUND — the marks
+    // missed a real conflict (the tx read a cell an earlier tx wrote
+    // without a mark to park on).
+    let t_val = std::time::Instant::now();
+    // PARALLEL: replay is read-only against the multi-version cache
+    // and independent per tx — it was ~15ms of serial tail on a 9k-tx
+    // set, the single largest block in the commit path. Scoped
+    // threads, unpinned (the caller's cores are the hot ones — see
+    // the hash phase note).
+    let n_val = tx_results.len();
+    let val_threads = ctx.queues.len().min(n_val.max(1));
+    let wounded: Vec<usize> = if val_threads > 1 && n_val > 256 {
+        let chunk = n_val.div_ceil(val_threads);
+        let mut parts: Vec<Vec<usize>> = Vec::with_capacity(val_threads);
+        let tail_pins: &[usize] = if keep_hot {
+            // Workers spin-YIELD on these cores between blocks, so a
+            // tail thread pinned there gets a hot, instantly-yielded
+            // core. Without keep_hot the cores are cold (or hold
+            // SCHED_IDLE squatters, whose preemption latency measured
+            // 21ms vs 10.6 on a 9k-hash phase) — stay on the caller's
+            // mask then.
+            pin_cores
+        } else {
+            &[]
+        };
+        std::thread::scope(|sc| {
+            let handles: Vec<_> = tx_results
+                .chunks(chunk)
+                .enumerate()
+                .map(|(ci, part)| {
+                    let base = ci * chunk;
+                    let mv = &ctx.mv;
+                    sc.spawn(move || {
+                        if !tail_pins.is_empty() {
+                            let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                                id: tail_pins[ci % tail_pins.len()],
+                            });
+                        }
+                        part.iter()
+                            .enumerate()
+                            .filter(|(j, r)| {
+                                let i = base + j;
+                                r.reads.iter().any(|rec| !mv.validate(i as u32, rec))
+                            })
+                            .map(|(j, _)| base + j)
+                            .collect::<Vec<usize>>()
+                    })
+                })
+                .collect();
+            for h in handles {
+                parts.push(h.join().expect("validation thread"));
+            }
+        });
+        parts.concat()
+    } else {
+        tx_results
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let t_validate = t_val.elapsed();
+    let wounds = wounded.len();
+
+    // Canonical-order commit. A wounded tx is RE-EXECUTED here against
+    // the exact materialized prefix (the delta as of its position), so
+    // its result is the sequential one by construction — the whole
+    // block never re-runs. Everything after a wound sees the corrected
+    // state through the same prefix, so a wound cascade re-executes
+    // only the txs it actually reaches.
+    //
+    // SERIAL by definition: this is the block's tail, and no worker
+    // count shortens it.
+    let t_com = std::time::Instant::now();
+    let (mut hash_ns, mut delta_ns) = (0u64, 0u64);
+    let mut receipts = Vec::with_capacity(n);
+    let mut delta = PendingDelta::new();
+    let mut cumulative = 0u64;
+    let mut sink_running = ctx.sink_start_balance;
+    let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
+    // A tx after a re-executed one may also be stale: once ANY wound
+    // fires, later txs are re-checked against the live prefix.
+    if let Some(first) = wounded_set.iter().copied().min() {
+        for i in first..n {
+            wounded_set.insert(i);
+        }
+    }
+    let repairing = !wounded_set.is_empty();
+
+    if !repairing {
+        // FAST PATH — the one that runs essentially always.
+        //
+        // The write-set hash is ~1.25us of keccak per tx and CANNOT be
+        // made cheaper (it is one permutation per 136 bytes of a
+        // contract the receipts depend on). On the serial commit tail
+        // it was 72% of that tail — the largest fixed parallelization
+        // tax in the engine, untouched by worker count.
+        //
+        // It does not have to be serial. The only thing forcing it
+        // there is the accumulator's absolute balance, and THAT is a
+        // prefix sum: computable in one cheap pass with no hashing, so
+        // afterwards every tx's hash is independent.
+        //
+        // Phase 1 (serial, ~ns/tx): cumulative gas + accumulator
+        // materialization.
+        for r in tx_results.iter_mut() {
+            cumulative += r.receipt.gas_used;
+            r.receipt.cumulative_gas_used = cumulative;
+            sink_running += r.fee_delta;
+            if r.sink_touched
+                && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
+            {
+                entry.1.1 = sink_running;
+            }
+        }
+        // Phase 2 (parallel): hash. Scoped threads rather than the
+        // worker pool — this is a self-contained parallel map over an
+        // owned slice, and keeping it out of the pool's state machine
+        // is worth one spawn (~tens of us) against the milliseconds it
+        // removes from the tail.
+        let t_h = std::time::Instant::now();
+        let threads = ctx.queues.len().min(n.max(1));
+        if threads > 1 && n > 64 {
+            let chunk = n.div_ceil(threads);
+            let tail_pins: &[usize] = if keep_hot { pin_cores } else { &[] };
+            std::thread::scope(|sc| {
+                for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
+                    sc.spawn(move || {
+                        // Pinned to the keep-hot worker cores (which
+                        // yield within microseconds); with keep_hot
+                        // off, stay on the caller's mask — a pin to a
+                        // COLD worker core pays its frequency ramp,
+                        // and one to a SCHED_IDLE-squatted core pays
+                        // preemption latency (both measured).
+                        if !tail_pins.is_empty() {
+                            let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                                id: tail_pins[ti % tail_pins.len()],
+                            });
+                        }
+                        for r in part {
+                            if r.sink_touched {
+                                r.receipt.write_set_hash = r.ws.hash();
+                            }
+                        }
+                    });
+                }
+            });
+        } else {
+            for r in tx_results.iter_mut() {
+                if r.sink_touched {
+                    r.receipt.write_set_hash = r.ws.hash();
+                }
+            }
+        }
+        hash_ns += t_h.elapsed().as_nanos() as u64;
+        // Phase 3 (serial): fold the block delta in canonical order.
+        //
+        // Parallelising this was tried and REVERTED. The fold is
+        // associative ("later tx wins" per cell), so chunks can be
+        // folded independently and merged in order — but the merge
+        // costs back what the parallel build saves, and it measured
+        // neutral-to-worse (commit 14.7ms -> 16.3ms). The fold touches
+        // a few hundred distinct cells however many txs wrote them, so
+        // there is less serial work here than the tx count suggests.
+        let t_d = std::time::Instant::now();
+        // Fold via FastMap (~40ns upserts), then let BTreeMap's
+        // FromIterator BULK-BUILD the canonical maps once — the
+        // previous per-write-set `apply` paid a ~250ns B-tree insert
+        // per entry (15ms/block at 4k txs). Canonical iteration
+        // order makes "last write wins" hold in the FastMap exactly
+        // as it did in the tree.
+        let mut spent_reads: Vec<Vec<ReadRecord>> = Vec::with_capacity(tx_results.len());
+        let mut acc_v: Vec<(alloy_primitives::Address, (u64, U256, B256))> =
+            Vec::with_capacity(tx_results.len() * 3);
+        let mut sto_v: Vec<((alloy_primitives::Address, B256), U256)> =
+            Vec::with_capacity(tx_results.len());
+        for mut r in tx_results {
+            // Freeing ~n read logs inline was serial-tail time; the
+            // reaper drops them while the next block runs.
+            spent_reads.push(std::mem::take(&mut r.reads));
+            acc_v.extend(r.ws.accounts.drain(..));
+            sto_v.extend(r.ws.storage.drain(..));
+            for (h, b) in r.ws.code.drain(..) {
+                delta.code.insert(h, b);
+            }
+            receipts.push(r.receipt);
+        }
+        // BTreeMap::from_iter STABLE-sorts and keeps the LAST of equal
+        // keys, then bulk-builds — which on canonical-order input is
+        // exactly "later tx wins", at a fraction of per-entry insert
+        // cost.
+        delta.accounts = acc_v.into_iter().collect();
+        delta.storage = sto_v.into_iter().collect();
+        reaper.send(Box::new(spent_reads)).ok();
+        delta_ns += t_d.elapsed().as_nanos() as u64;
+    } else {
+        // REPAIR PATH: a wound fired, so txs from the first wound on
+        // re-execute against the exact materialized prefix. Strictly
+        // sequential by nature, and rare enough that its cost is not
+        // worth optimizing.
+        let mut layered = ctx.base.clone();
+        for (i, mut r) in tx_results.into_iter().enumerate() {
+            if wounded_set.contains(&i) {
+                let (tx_idx, position, envelope) = &txs[i];
+                let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
+                let (mut receipt, ws) = scope.execute_tx(
+                    *tx_idx, *position, envelope, i as u64, cumulative, None, None,
+                )?;
+                cumulative = receipt.cumulative_gas_used;
+                receipt.transaction_index = i as u64;
+                layered.apply(ws.clone());
+                delta.apply(ws);
+                receipts.push(receipt);
+                continue;
+            }
+            cumulative += r.receipt.gas_used;
+            r.receipt.cumulative_gas_used = cumulative;
+            sink_running += r.fee_delta;
+            if r.sink_touched {
+                if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
+                    entry.1.1 = sink_running;
+                }
+                r.receipt.write_set_hash = r.ws.hash();
+            }
+            layered.apply(r.ws.clone());
+            delta.apply(r.ws);
+            receipts.push(r.receipt);
+        }
+    }
+
+    let t_commit = t_com.elapsed();
+    ctx.metrics
+        .commit_hash_ns
+        .fetch_add(hash_ns, Ordering::Relaxed);
+    ctx.metrics
+        .commit_delta_ns
+        .fetch_add(delta_ns, Ordering::Relaxed);
+    if wounds > 0 {
+        tracing::warn!(
+            block = ctx.env.block_number,
+            wounds,
+            rerun = wounded_set.len(),
+            "stm: wound — per-tx re-execution at canonical position"
+        );
+    }
+    if std::env::var("KARDAMOM_STM_PHASE_TIMING").is_ok() {
+        eprintln!(
+            "phase block={} n={} feed+exec={:?} drain={:?} extract={:?} validate={:?} commit={:?} wounds={}",
+            ctx.env.block_number, n, t_exec_wall, t_drain, t_extract, t_validate, t_commit, wounds
+        );
+    }
+    // Destructure: the HEAVY parts (multi-version cache with ~n
+    // versions, a thousand tx slots) go to the reaper; the light rest
+    // drops here. `S` (the snapshots) stays inline, so no 'static
+    // bound is needed on the payload.
+    let BlockCtx {
+        mv, slots, metrics, ..
+    } = ctx;
+    reaper.send(Box::new((mv, slots))).ok();
+    let m = &metrics;
+    // Feed the stealing policy: mean per-tx execution time this block.
+    if n > 0 {
+        avg_tx_ns.store(
+            m.busy_ns.load(Ordering::Relaxed) / n as u64,
+            Ordering::Relaxed,
+        );
+    }
+    let prune_calls = m.prune_calls.load(Ordering::Relaxed);
+    let completions = m.completions.load(Ordering::Relaxed);
+    Ok(StmOutcome {
+        receipts,
+        delta,
+        wounds,
+        fallback: wounds > 0,
+        declined: false,
+        learned_tx_ns: avg_tx_ns.load(Ordering::Relaxed),
+        writes_own: m.writes_own.load(Ordering::Relaxed),
+        writes_foreign: m.writes_foreign.load(Ordering::Relaxed),
+        fifo_covered: m.fifo_covered.load(Ordering::Relaxed),
+        fifo_stalls: m.fifo_stalls.load(Ordering::Relaxed),
+        read_us: m.read_ns.load(Ordering::Relaxed) / 1_000,
+        busy_per_worker_us: m
+            .busy_per_worker
+            .iter()
+            .map(|c| c.0.load(Ordering::Relaxed) / 1_000)
+            .collect(),
+        cold,
+        edges,
+        dispatch,
+        double_exit: ctx.double_exit.load(Ordering::SeqCst),
+        feed_us: m.feed_ns.load(Ordering::Relaxed) / 1_000,
+        redundant_edges: m.redundant_edges.load(Ordering::Relaxed),
+        steals: m.steals.load(Ordering::Relaxed),
+        reads_total: m.reads_total.load(Ordering::Relaxed),
+        reads_mv_hit: m.reads_mv_hit.load(Ordering::Relaxed),
+        reads_base_hit: m.reads_base_hit.load(Ordering::Relaxed),
+        reads_backend: m.reads_backend.load(Ordering::Relaxed),
+        evm_us: m.evm_ns.load(Ordering::Relaxed) / 1_000,
+        publish_us: m.publish_ns.load(Ordering::Relaxed) / 1_000,
+        busy_us: m.busy_ns.load(Ordering::Relaxed) / 1_000,
+        parallel_span_us: {
+            let f = m.first_dispatch_ns.load(Ordering::Relaxed);
+            let l = m.last_done_ns.load(Ordering::Relaxed);
+            if f == u64::MAX || l < f {
+                0
+            } else {
+                (l - f) / 1_000
+            }
+        },
+        ramp_us: {
+            let f = m.first_dispatch_ns.load(Ordering::Relaxed);
+            if f == u64::MAX { 0 } else { f / 1_000 }
+        },
+        commit_us: t_commit.as_micros() as u64,
+        commit_hash_us: m.commit_hash_ns.load(Ordering::Relaxed) / 1_000,
+        commit_delta_us: m.commit_delta_ns.load(Ordering::Relaxed) / 1_000,
+        decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
+        predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
+        admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
+        prune_us: m.prune_ns.load(Ordering::Relaxed) / 1_000,
+        prune_calls,
+        prune_forced: m.prune_forced.load(Ordering::Relaxed),
+        avg_batch: if prune_calls == 0 {
+            0.0
+        } else {
+            completions as f64 / prune_calls as f64
+        },
+        idle_us: m.idle_ns.load(Ordering::Relaxed) / 1_000,
+    })
 }
 
 fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize, keep_hot: bool) {
