@@ -2284,110 +2284,122 @@ fn block_tail<S: StateDatabase + Sync>(
                 entry.1.1 = sink_running;
             }
         }
-        // Phase 2 (parallel): hash. Scoped threads rather than the
-        // worker pool — this is a self-contained parallel map over an
-        // owned slice, and keeping it out of the pool's state machine
-        // is worth one spawn (~tens of us) against the milliseconds it
-        // removes from the tail.
+        // Phases 2+3, OVERLAPPED (not fused — fusion measured worse
+        // twice): with the fee sink filtered from the fold, the hash
+        // lanes only READ write sets (their one mutation, the receipt
+        // wsh, goes to a side array), and the fold COPIES entries
+        // (all Copy types) instead of draining. The two phases then
+        // share `&tx_results` read-only and run CONCURRENTLY:
+        // wall = max(hash, fold) instead of hash + fold. The fold's
+        // residual cost is BTreeMap CONSTRUCTION itself (~170ns/node —
+        // it survived input reduction, index-sort, and two chunk+merge
+        // shapes), which is exactly why hiding it behind the hash is
+        // the winning shape.
         let t_h = std::time::Instant::now();
-        let threads = ctx.queues.len().min(n.max(1));
-        if threads > 1 && n > 64 {
-            let chunk = n.div_ceil(threads);
-            let tail_pins: &[usize] = if keep_hot && tail_on_workers {
-                pin_cores
-            } else {
-                &[]
-            };
-            std::thread::scope(|sc| {
-                for (ti, part) in tx_results.chunks_mut(chunk).enumerate() {
-                    sc.spawn(move || {
-                        // Pinned to the keep-hot worker cores (which
-                        // yield within microseconds); with keep_hot
-                        // off, stay on the caller's mask — a pin to a
-                        // COLD worker core pays its frequency ramp,
-                        // and one to a SCHED_IDLE-squatted core pays
-                        // preemption latency (both measured).
-                        if !tail_pins.is_empty() {
-                            let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                                id: tail_pins[ti % tail_pins.len()],
-                            });
-                        }
-                        for r in part {
-                            if r.sink_touched {
-                                r.receipt.write_set_hash = r.ws.hash();
-                            }
-                        }
+        let n_res = tx_results.len();
+        let tail_pins: &[usize] = if keep_hot && tail_on_workers {
+            pin_cores
+        } else {
+            &[]
+        };
+        let hash_threads = ctx.queues.len().saturating_sub(1).max(1).min(n_res.max(1));
+        let chunk = n_res.div_ceil(hash_threads);
+        type AccEntry = ((alloy_primitives::Address, u32), (u64, U256, B256));
+        type StoEntry = (((alloy_primitives::Address, B256), u32), U256);
+        type AccMap = std::collections::BTreeMap<alloy_primitives::Address, (u64, U256, B256)>;
+        type StoMap = std::collections::BTreeMap<(alloy_primitives::Address, B256), U256>;
+        let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
+        let (acc_map, sto_map, sink_final, fold_ns): (
+            AccMap,
+            StoMap,
+            Option<(u64, U256, B256)>,
+            u64,
+        ) = std::thread::scope(|sc| {
+            // Fold thread: read-only copy + index-sort + bulk build, on
+            // the last worker core (hot, parked, longest pole).
+            let results_ref: &[TxResult] = &tx_results;
+            let fold = sc.spawn(move || {
+                if !tail_pins.is_empty() {
+                    let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                        id: tail_pins[tail_pins.len() - 1],
                     });
                 }
+                let t0 = std::time::Instant::now();
+                let mut sink_final: Option<(u64, U256, B256)> = None;
+                let mut acc_v: Vec<AccEntry> = Vec::with_capacity(results_ref.len() * 2);
+                let mut sto_v: Vec<StoEntry> = Vec::with_capacity(results_ref.len());
+                for (i, r) in results_ref.iter().enumerate() {
+                    for (a, v) in r.ws.accounts.iter() {
+                        if *a == FEE_SINK {
+                            sink_final = Some(*v);
+                        } else {
+                            acc_v.push(((*a, i as u32), *v));
+                        }
+                    }
+                    for (k, v) in r.ws.storage.iter() {
+                        sto_v.push(((*k, i as u32), *v));
+                    }
+                }
+                acc_v.sort_unstable_by_key(|e| e.0);
+                sto_v.sort_unstable_by_key(|e| e.0);
+                let acc: AccMap = acc_v.into_iter().map(|((a, _), v)| (a, v)).collect();
+                let sto: StoMap = sto_v.into_iter().map(|((k, _), v)| (k, v)).collect();
+                (acc, sto, sink_final, t0.elapsed().as_nanos() as u64)
             });
-        } else {
-            for r in tx_results.iter_mut() {
-                if r.sink_touched {
-                    r.receipt.write_set_hash = r.ws.hash();
+            // Hash lanes: read ws, write ONLY the side array.
+            let hash_parts: Vec<(usize, &mut [B256])> = {
+                let mut out = Vec::new();
+                let mut rest: &mut [B256] = &mut hashes;
+                let mut base = 0usize;
+                while rest.len() > chunk {
+                    let (head, tail_s) = rest.split_at_mut(chunk);
+                    out.push((base, head));
+                    base += chunk;
+                    rest = tail_s;
                 }
+                out.push((base, rest));
+                out
+            };
+            for (ti, (base, out_slice)) in hash_parts.into_iter().enumerate() {
+                let results_ref: &[TxResult] = &tx_results;
+                sc.spawn(move || {
+                    if !tail_pins.is_empty() {
+                        let _ = core_affinity::set_for_current(core_affinity::CoreId {
+                            id: tail_pins[ti % tail_pins.len().max(1)],
+                        });
+                    }
+                    for (j, slot) in out_slice.iter_mut().enumerate() {
+                        let r = &results_ref[base + j];
+                        if r.sink_touched {
+                            *slot = r.ws.hash();
+                        }
+                    }
+                });
             }
-        }
+            fold.join().expect("fold thread")
+        });
         hash_ns += t_h.elapsed().as_nanos() as u64;
-        // Phase 3 (serial): fold the block delta in canonical order.
-        //
-        // Parallelising this was tried and REVERTED. The fold is
-        // associative ("later tx wins" per cell), so chunks can be
-        // folded independently and merged in order — but the merge
-        // costs back what the parallel build saves, and it measured
-        // neutral-to-worse (commit 14.7ms -> 16.3ms). The fold touches
-        // a few hundred distinct cells however many txs wrote them, so
-        // there is less serial work here than the tx count suggests.
         let t_d = std::time::Instant::now();
-        // Fold via FastMap (~40ns upserts), then let BTreeMap's
-        // FromIterator BULK-BUILD the canonical maps once — the
-        // previous per-write-set `apply` paid a ~250ns B-tree insert
-        // per entry (15ms/block at 4k txs). Canonical iteration
-        // order makes "last write wins" hold in the FastMap exactly
-        // as it did in the tree.
-        let mut spent_reads: Vec<Vec<ReadRecord>> = Vec::with_capacity(tx_results.len());
-        let mut acc_v: Vec<(alloy_primitives::Address, (u64, U256, B256))> =
-            Vec::with_capacity(tx_results.len() * 3);
-        let mut sto_v: Vec<((alloy_primitives::Address, B256), U256)> =
-            Vec::with_capacity(tx_results.len());
-        // The fee sink appears in EVERY fee-paying tx's write set — a
-        // third of the fold's input collapsing into ONE key. Filter it
-        // during the drain and insert the LAST (canonical-final, already
-        // patched by the phase-1 prefix pass) exactly once.
-        let mut sink_final: Option<(u64, U256, B256)> = None;
-        for mut r in tx_results {
-            // Freeing ~n read logs inline was serial-tail time; the
-            // reaper drops them while the next block runs.
-            spent_reads.push(std::mem::take(&mut r.reads));
-            for (a, v) in r.ws.accounts.drain(..) {
-                if a == FEE_SINK {
-                    sink_final = Some(v);
-                } else {
-                    acc_v.push((a, v));
-                }
-            }
-            sto_v.extend(r.ws.storage.drain(..));
-            for (h, b) in r.ws.code.drain(..) {
-                delta.code.insert(h, b);
-            }
-            receipts.push(r.receipt);
-        }
-        // INDEX-SORT + GATHER, then bulk build: sorting the entries
-        // directly moves ~92-byte payloads through every comparison
-        // swap; sorting u32 indices with a key lookup and gathering once
-        // (all Copy types) moves a quarter of the bytes. The gathered
-        // vec is fully sorted with equal keys in canonical order, so
-        // BTreeMap::from_iter's stable sort is a near-no-op and its
-        // dedup keeps the LAST — "later tx wins" exactly as before.
-        let mut acc_idx: Vec<u32> = (0..acc_v.len() as u32).collect();
-        acc_idx.sort_by_key(|&i| acc_v[i as usize].0);
-        delta.accounts = acc_idx.into_iter().map(|i| acc_v[i as usize]).collect();
-        let mut sto_idx: Vec<u32> = (0..sto_v.len() as u32).collect();
-        sto_idx.sort_by_key(|&i| sto_v[i as usize].0);
-        delta.storage = sto_idx.into_iter().map(|i| sto_v[i as usize]).collect();
+        delta.accounts = acc_map;
+        delta.storage = sto_map;
         if let Some(v) = sink_final {
             delta.accounts.insert(FEE_SINK, v);
         }
-        reaper.send(Box::new(spent_reads)).ok();
+        let _ = fold_ns;
+        // Serial epilogue: patch receipt hashes in place, move receipts
+        // out, then ship the WHOLE results vec (write sets + read logs)
+        // to the reaper as one move — a per-element carcass copy here
+        // measured 10-13ms of pure memmove and ate the overlap's win.
+        for (i, r) in tx_results.iter_mut().enumerate() {
+            if r.sink_touched {
+                r.receipt.write_set_hash = hashes[i];
+            }
+            for (h, b) in r.ws.code.drain(..) {
+                delta.code.insert(h, b);
+            }
+            receipts.push(std::mem::take(&mut r.receipt));
+        }
+        reaper.send(Box::new(tx_results)).ok();
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
         // REPAIR PATH: a wound fired, so txs from the first wound on
