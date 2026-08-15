@@ -2349,23 +2349,44 @@ fn block_tail<S: StateDatabase + Sync>(
             Vec::with_capacity(tx_results.len() * 3);
         let mut sto_v: Vec<((alloy_primitives::Address, B256), U256)> =
             Vec::with_capacity(tx_results.len());
+        // The fee sink appears in EVERY fee-paying tx's write set — a
+        // third of the fold's input collapsing into ONE key. Filter it
+        // during the drain and insert the LAST (canonical-final, already
+        // patched by the phase-1 prefix pass) exactly once.
+        let mut sink_final: Option<(u64, U256, B256)> = None;
         for mut r in tx_results {
             // Freeing ~n read logs inline was serial-tail time; the
             // reaper drops them while the next block runs.
             spent_reads.push(std::mem::take(&mut r.reads));
-            acc_v.extend(r.ws.accounts.drain(..));
+            for (a, v) in r.ws.accounts.drain(..) {
+                if a == FEE_SINK {
+                    sink_final = Some(v);
+                } else {
+                    acc_v.push((a, v));
+                }
+            }
             sto_v.extend(r.ws.storage.drain(..));
             for (h, b) in r.ws.code.drain(..) {
                 delta.code.insert(h, b);
             }
             receipts.push(r.receipt);
         }
-        // BTreeMap::from_iter STABLE-sorts and keeps the LAST of equal
-        // keys, then bulk-builds — which on canonical-order input is
-        // exactly "later tx wins", at a fraction of per-entry insert
-        // cost.
-        delta.accounts = acc_v.into_iter().collect();
-        delta.storage = sto_v.into_iter().collect();
+        // INDEX-SORT + GATHER, then bulk build: sorting the entries
+        // directly moves ~92-byte payloads through every comparison
+        // swap; sorting u32 indices with a key lookup and gathering once
+        // (all Copy types) moves a quarter of the bytes. The gathered
+        // vec is fully sorted with equal keys in canonical order, so
+        // BTreeMap::from_iter's stable sort is a near-no-op and its
+        // dedup keeps the LAST — "later tx wins" exactly as before.
+        let mut acc_idx: Vec<u32> = (0..acc_v.len() as u32).collect();
+        acc_idx.sort_by_key(|&i| acc_v[i as usize].0);
+        delta.accounts = acc_idx.into_iter().map(|i| acc_v[i as usize]).collect();
+        let mut sto_idx: Vec<u32> = (0..sto_v.len() as u32).collect();
+        sto_idx.sort_by_key(|&i| sto_v[i as usize].0);
+        delta.storage = sto_idx.into_iter().map(|i| sto_v[i as usize]).collect();
+        if let Some(v) = sink_final {
+            delta.accounts.insert(FEE_SINK, v);
+        }
         reaper.send(Box::new(spent_reads)).ok();
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
