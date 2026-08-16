@@ -32,6 +32,7 @@ const EMBEDDED_ARTIFACTS: &[(&str, &str)] = &[
     ("ERC1967_PROXY_CREATION", "ERC1967Proxy"),
     ("ETH_LOCKBOX_CREATION", "ETHLockbox"),
     ("KARDAMOM_L2_SETTLEMENT_CREATION", "KardamomL2Settlement"),
+    ("KARDAMOM_PROOF_ORACLE_CREATION", "KardamomProofOracle"),
     (
         "WITHDRAWAL_OUTPUT_ORACLE_CREATION",
         "WithdrawalOutputOracle",

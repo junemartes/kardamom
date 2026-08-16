@@ -331,12 +331,30 @@ fn every_witness_lie_is_refuted() {
     );
     assert!(
         refuted(&|w| {
-            // Claim the absent account exists.
+            // Claim the absent account exists WITH STATE. (Merely flipping
+            // `exists` on all-zero fields is EIP-161-empty — equivalent to
+            // absent by execution semantics, deliberately NOT a lie: the
+            // state table keeps touched-empty rows the trie excludes.)
             let i = w.accounts.iter().position(|a| a.address == ABSENT).unwrap();
             w.accounts[i].exists = true;
+            w.accounts[i].nonce = 1;
         }),
         "absence lie"
     );
+    {
+        // The EIP-161 equivalence, positively: witnessed-present-but-empty
+        // against a trie exclusion VERIFIES (the touched-zero-fee-coinbase
+        // shape the live pipeline produces).
+        let mut empty_present = w.clone();
+        let i = empty_present
+            .accounts
+            .iter()
+            .position(|a| a.address == ABSENT)
+            .unwrap();
+        empty_present.accounts[i].exists = true;
+        verify_witness_anchored(&empty_present, &proofs)
+            .expect("empty-but-present must verify as absent");
+    }
     assert!(
         refuted(&|w| {
             // Claim an existing account absent.

@@ -33,6 +33,11 @@ pub fn kardamom_l2_settlement_creation() -> Bytes {
     Bytes::from_static(KARDAMOM_L2_SETTLEMENT_CREATION)
 }
 
+/// Creation bytecode of `KardamomProofOracle` — the zk root chain (PR 4).
+pub fn kardamom_proof_oracle_creation() -> Bytes {
+    Bytes::from_static(KARDAMOM_PROOF_ORACLE_CREATION)
+}
+
 /// Creation bytecode of `WithdrawalOutputOracle` — the withdrawal output root
 /// registry. The factory CREATE2's this on demand.
 pub fn withdrawal_output_oracle_creation() -> Bytes {

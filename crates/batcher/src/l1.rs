@@ -90,6 +90,7 @@ pub async fn post_batch<P: Provider>(
         blobVersionedHashes: versioned_hashes.clone(),
         l2BlockStart: batch.l2_block_start,
         l2BlockEnd: batch.l2_block_end,
+        recordsCommitment: batch.records_commitment,
     }
     .abi_encode();
 

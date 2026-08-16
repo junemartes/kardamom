@@ -48,7 +48,10 @@ pub use envelope::TxEnvelope;
 pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::{BPosition, TxDataLoc};
-pub use prover::{ProverInput, ProverRecord, PublicOutputs};
+pub use prover::{
+    BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,
+    PublicOutputs, batch_records_commitment,
+};
 pub use receipt::{Receipt, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, WireLog, tx_type_of};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};

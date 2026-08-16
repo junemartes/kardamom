@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
                     ContractId::EthLockbox => Some("ETHLockbox"),
                     ContractId::KardamomL2Settlement => Some("KardamomL2Settlement"),
                     ContractId::WithdrawalOutputOracle => None,
+                    ContractId::KardamomProofOracle => None,
                 })
                 .collect();
             if !minter_consumers.is_empty() && l2_chain_ids.len() != l2_minters.len() {
@@ -292,6 +293,15 @@ async fn run_deploy(
                 // contract's `_l1Batcher` (documented on the flag). A dedicated
                 // --l1-batcher flag is a follow-up if the roles ever diverge.
                 ContractId::KardamomL2Settlement => encode_address_arg(l2_minters[i]),
+                // The proof oracle's init wires the SP1 verifier gateway,
+                // program vkey, and genesis root — deployment parameters the
+                // CLI does not model yet. Deploy it via the library API
+                // (`encode_proof_oracle_init_args`, as the e2e does) until a
+                // dedicated flag set lands with the prover ops work.
+                ContractId::KardamomProofOracle => bail!(
+                    "KardamomProofOracle CLI deployment needs --sp1-verifier/--program-vkey/\
+                     --genesis-root flags (not yet modeled); use the library API"
+                ),
             };
             ops.push(Op::Deploy {
                 l2_chain_id: *chain_id,
