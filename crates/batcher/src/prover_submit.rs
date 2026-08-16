@@ -8,6 +8,9 @@
 //! reports "not yet" and the caller retries later. Submission is
 //! PERMISSIONLESS on the contract; the proof is the authorization.
 
+// The sol! macro generates initialize(7 args) for oracle v2.
+#![allow(clippy::too_many_arguments)]
+
 use std::path::Path;
 
 use alloy_primitives::Address;
