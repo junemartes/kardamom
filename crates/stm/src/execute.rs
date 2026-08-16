@@ -3674,7 +3674,7 @@ fn execute_one<S: StateDatabase>(
     }
     let tx_env = tx_env_from_alloy(alloy_env, signer);
     let t_evm = std::time::Instant::now();
-    let outcome = match evm.transact(tx_env) {
+    let mut outcome = match evm.transact(tx_env) {
         Ok(o) => o,
         Err(revm::context::result::EVMError::Transaction(reason)) => {
             return Ok(skip(&format!("{reason:?}"), nonce, to));
@@ -3706,6 +3706,21 @@ fn execute_one<S: StateDatabase>(
     };
 
     let ws = write_set_from_evm_state(&outcome.state);
+    // POOLED JOURNAL: revm's finalize mem::takes the state map out of
+    // the journal into `outcome.state`, leaving a capacity-0 map behind
+    // — every tx then regrew a fresh table (measured as the shared
+    // per-tx allocation floor, ~2.5 allocs/tx in the <4K bucket). Hand
+    // the SPENT table back: its entries drop here (they are tx-local by
+    // contract — a stale entry would be read as a cached truth by the
+    // next tx's load_account), its capacity survives, and the journal's
+    // own entry vec / transient storage already clear in place.
+    {
+        let mut spent = std::mem::take(&mut outcome.state);
+        spent.clear();
+        revm::context_interface::ContextTr::journal_mut(&mut **evm)
+            .inner
+            .state = spent;
+    }
     // Publish in the ordered helper's sequence (code+storage, THEN
     // accounts — see `MvCache::publish_write_set`), skipping the fee sink
     // (Accumulator: all workers see block-start; the commit pass
