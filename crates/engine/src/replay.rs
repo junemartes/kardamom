@@ -11,16 +11,23 @@
 //!
 //! ## Scope
 //!
-//! L2 transactions only. Deposits (L1-originated) are not carried in the DA
-//! payload — the batcher's `MultiArchiveReader` skips `DepositRef`s — so a
-//! block range that contains deposits cannot be reconstructed to a
-//! byte-identical root from blobs alone; that requires re-deriving deposits
-//! from L1 events (the `da_watcher` path) and interleaving them in canonical
-//! order, a documented follow-up. For deposit-free ranges (the common case,
-//! and everything the load harness produces) the reconstructed root is exact.
+//! L2 transactions plus cross-chain (interop) deliveries. Remote-epoch
+//! records travel in the DA payload by value (KAR1 v2, spec §16 Q8) — they
+//! are NOT re-derivable from this chain's L1 — so replay re-executes their
+//! messages as 0x7D txs at the head of the block each record leads, exactly
+//! where the live exec thread applied them.
+//!
+//! Deposits (L1-originated) are not carried in the DA payload — the batcher's
+//! `MultiArchiveReader` skips `DepositRef`s — so a block range that contains
+//! deposits cannot be reconstructed to a byte-identical root from blobs
+//! alone; that requires re-deriving deposits from L1 events (the `da_watcher`
+//! path) and interleaving them in canonical order, a documented follow-up.
+//! For deposit-free ranges (the common case, and everything the load harness
+//! produces) the reconstructed root is exact.
 
 use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateWriter, TrieMode, seed_genesis};
+use kardamom_types::xchain::RemoteEpochRecord;
 use kardamom_types::{
     AccountChange, BPosition, BlockBoundary, CodeEntry, SnapshotSource, TxEnvelope,
 };
@@ -29,7 +36,7 @@ use crate::actor::{StateWriterQueue, StateWriterSignal};
 use crate::block_env::ExecEnv;
 use crate::delta::PendingDelta;
 use crate::exec_types::TxIndex;
-use crate::executor::execute_tx;
+use crate::executor::{execute_tx, execute_xchain_tx};
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 
 /// One block to re-execute: boundary metadata + its ordered transactions.
@@ -37,11 +44,18 @@ use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 /// The transaction list is the block's canonical order (as recovered from the
 /// DA payload). `sender`/`tx_hash` on each [`TxEnvelope`] are trusted exactly
 /// as they are on the hot path — the proxy stamped them at the system boundary
-/// and they were preserved through the DA round-trip.
+/// and they were preserved through the DA round-trip. The same trust applies
+/// to `remote_epochs` (per-message `source_hash`/`seq` carried verbatim):
+/// replay reproduces bytes; verification is the validator's job.
 #[derive(Clone, Debug)]
 pub struct ReplayBlock {
     pub block_number: u64,
     pub l2_timestamp: u64,
+    /// Remote-epoch records leading this block. Their messages execute (as
+    /// 0x7D txs, in record order then seq order) BEFORE `txs` — mirroring the
+    /// live pipeline, where the sealer closes the open block on a remote
+    /// origin advance so a record's messages open the next one.
+    pub remote_epochs: Vec<RemoteEpochRecord>,
     pub txs: Vec<TxEnvelope>,
 }
 
@@ -184,7 +198,44 @@ where
         let mut delta = PendingDelta::new();
         let mut block_receipts = Vec::with_capacity(block.txs.len());
         let mut cumulative_gas = 0u64;
-        for (i, tx) in block.txs.iter().enumerate() {
+        let mut tx_index_in_block = 0u64;
+
+        // Remote-epoch messages lead the block (the sealer closed the previous
+        // block on the origin advance), so they execute FIRST — 0x7D txs in
+        // record order then seq order, exactly the live exec thread's order.
+        for record in &block.remote_epochs {
+            // The record's marker consumed one canonical slot on the live
+            // stream without applying a tx; mirror that so the synthetic
+            // counters stay shaped like the live ones (neither feeds the
+            // state trie — see `Counters`).
+            counters.tx_idx += 1;
+            counters.global_pos += 1;
+            for message in &record.messages {
+                let tx_position = BPosition::from_index(counters.global_pos);
+                let (receipt, ws) = execute_xchain_tx(
+                    &snapshot,
+                    None,
+                    &delta,
+                    exec_env,
+                    TxIndex(counters.tx_idx),
+                    tx_position,
+                    record.origin_chain_id,
+                    message,
+                    tx_index_in_block,
+                    cumulative_gas,
+                    None,
+                )?;
+                delta.apply(ws);
+                cumulative_gas += receipt.gas_used;
+                block_receipts.push(receipt);
+                tx_index_in_block += 1;
+                counters.tx_idx += 1;
+                counters.global_pos += 1;
+                counters.txs_applied += 1;
+            }
+        }
+
+        for tx in block.txs.iter() {
             let tx_position = BPosition::from_index(counters.global_pos);
             // Replay executes one durably-committed block at a time against
             // its own committed snapshot — no pipelined parent layer.
@@ -196,13 +247,14 @@ where
                 TxIndex(counters.tx_idx),
                 tx_position,
                 tx,
-                i as u64,
+                tx_index_in_block,
                 cumulative_gas,
                 None,
             )?;
             delta.apply(ws);
             cumulative_gas += receipt.gas_used;
             block_receipts.push(receipt);
+            tx_index_in_block += 1;
             counters.tx_idx += 1;
             counters.global_pos += 1;
             counters.txs_applied += 1;
@@ -293,11 +345,13 @@ mod tests {
             ReplayBlock {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
+                remote_epochs: Vec::new(),
                 txs: vec![transfer(signer, to1, 0, 100), transfer(signer, to2, 1, 50)],
             },
             ReplayBlock {
                 block_number: 2,
                 l2_timestamp: 1_700_000_001,
+                remote_epochs: Vec::new(),
                 txs: vec![transfer(signer, to1, 2, 25)],
             },
         ]

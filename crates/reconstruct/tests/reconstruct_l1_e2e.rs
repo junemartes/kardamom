@@ -136,6 +136,7 @@ async fn rebuild_from_l1_reconstructs_canonical_state_root() {
         block_number: 1,
         l2_timestamp: 1_700_000_000,
         end_tx_idx: BPosition::from_index(2),
+        remote_epochs: vec![],
         txs: vec![
             RecordedTx {
                 position: BPosition::from_index(0),
@@ -151,6 +152,7 @@ async fn rebuild_from_l1_reconstructs_canonical_state_root() {
         block_number: 2,
         l2_timestamp: 1_700_000_001,
         end_tx_idx: BPosition::from_index(3),
+        remote_epochs: vec![],
         txs: vec![RecordedTx {
             position: BPosition::from_index(2),
             envelope: transfer(&user, to1, 2, 25),
@@ -196,11 +198,13 @@ async fn rebuild_from_l1_reconstructs_canonical_state_root() {
         ReplayBlock {
             block_number: 1,
             l2_timestamp: 1_700_000_000,
+            remote_epochs: vec![],
             txs: block1.txs.iter().map(|t| t.envelope.clone()).collect(),
         },
         ReplayBlock {
             block_number: 2,
             l2_timestamp: 1_700_000_001,
+            remote_epochs: vec![],
             txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
         },
     ];

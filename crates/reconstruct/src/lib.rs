@@ -14,7 +14,11 @@
 //!
 //! Deposits are out of scope here for the same reason they are absent from the
 //! DA payload (the batcher's `MultiArchiveReader` skips `DepositRef`s); see
-//! [`kardamom_engine::replay`].
+//! [`kardamom_engine::replay`]. Cross-chain (interop) deliveries are IN scope:
+//! remote-epoch records travel in the DA payload by value (KAR1 v2, spec
+//! §16 Q8 — they are not re-derivable from this chain's L1), and the replay
+//! re-executes their messages as 0x7D txs at the head of the block each
+//! record leads.
 
 use std::path::Path;
 
@@ -38,6 +42,7 @@ pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
     ReplayBlock {
         block_number: frame.block_number,
         l2_timestamp: frame.l2_timestamp,
+        remote_epochs: frame.remote_epochs.clone(),
         txs: frame
             .txs
             .iter()
@@ -137,6 +142,7 @@ mod tests {
             block_number: 1,
             l2_timestamp: 1_700_000_000,
             end_tx_idx: BPosition::from_index(2),
+            remote_epochs: vec![],
             txs: vec![
                 RecordedTx {
                     position: BPosition::from_index(0),
@@ -152,6 +158,7 @@ mod tests {
             block_number: 2,
             l2_timestamp: 1_700_000_001,
             end_tx_idx: BPosition::from_index(3),
+            remote_epochs: vec![],
             txs: vec![RecordedTx {
                 position: BPosition::from_index(2),
                 envelope: transfer(&signer, to1, 2, 25),
@@ -179,11 +186,13 @@ mod tests {
             ReplayBlock {
                 block_number: 1,
                 l2_timestamp: 1_700_000_000,
+                remote_epochs: vec![],
                 txs: block1.txs.iter().map(|t| t.envelope.clone()).collect(),
             },
             ReplayBlock {
                 block_number: 2,
                 l2_timestamp: 1_700_000_001,
+                remote_epochs: vec![],
                 txs: block2.txs.iter().map(|t| t.envelope.clone()).collect(),
             },
         ];
@@ -196,5 +205,170 @@ mod tests {
             recovered.state_root, oracle.state_root,
             "DA-reconstructed root must equal the directly-executed root"
         );
+    }
+
+    /// The interop DA guarantee (spec §16 Q8), at the reexec level. No
+    /// deposits-in-DA analogue exists (deposits are absent from DA by
+    /// design), so this is the first record-in-DA replay test: a block led
+    /// by a remote-epoch record — carried in the blob by VALUE — must
+    /// reconstruct to the same root as direct execution, with the 0x7D
+    /// deliveries executed against the REAL Inbox predeploy (the
+    /// `chains/dev-interop.toml` genesis), the Inbox/Outbox lane state
+    /// present in the rebuilt DB, and the 0x7D receipts reproduced.
+    #[test]
+    fn blob_roundtrip_executes_remote_epochs() {
+        use alloy_primitives::{B256, U256 as APU256};
+        use kardamom_types::xchain::{
+            Callback, INBOX, OUTBOX, OutboxMessage, derive_remote_epoch, remote_source_hash,
+            xchain_tx_sender,
+        };
+        use kardamom_types::{StateDatabase, TX_TYPE_XCHAIN};
+
+        const ORIGIN: u64 = 412_399;
+
+        // The real interop genesis: Outbox/Inbox runtime bytecode at their
+        // canonical predeploys — the same file `kardamom-reconstruct --chain`
+        // seeds from.
+        let genesis_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../chains/dev-interop.toml");
+        let raw = std::fs::read_to_string(&genesis_path).expect("read dev-interop genesis");
+        let chain: kardamom_types::Genesis = toml::from_str(&raw).expect("parse genesis");
+        chain.validate().expect("valid genesis");
+        assert_eq!(chain.chain_id, CHAIN_ID, "test pins the dev chain id");
+        let (mut accounts, code) = chain.to_alloc();
+
+        // Fund a random user so the block also carries an ordinary tx.
+        let signer = PrivateKeySigner::random();
+        let from = signer.address();
+        accounts.extend(genesis(from));
+
+        // One record, two messages (block-100 batch): an EOA call, and one
+        // with a callback so the response is enqueued through the
+        // destination's OWN Outbox — real predeploy writes on both sides.
+        let payee = address!("00000000000000000000000000000000000E0001");
+        let cb = Callback {
+            target: Address::repeat_byte(0xCB),
+            gas_limit: 90_000,
+            context: B256::repeat_byte(0x42),
+        };
+        let msg = |seq: u64, callback: Option<Callback>| OutboxMessage {
+            origin_block_number: 100,
+            origin_block_hash: B256::repeat_byte(0x64),
+            dest_chain_id: CHAIN_ID,
+            seq,
+            sender: Address::repeat_byte(0xA1),
+            target: payee,
+            value: 0,
+            gas_limit: 150_000,
+            data: alloy_primitives::Bytes::copy_from_slice(&[0xDE, 0xAD]),
+            callback,
+        };
+        let record = derive_remote_epoch(CHAIN_ID, ORIGIN, 0, &[msg(0, None), msg(1, Some(cb))])
+            .expect("derive record");
+
+        let block = ClosedBlock {
+            block_number: 1,
+            l2_timestamp: 1_700_000_000,
+            end_tx_idx: BPosition::from_index(4),
+            remote_epochs: vec![record.clone()],
+            txs: vec![RecordedTx {
+                position: BPosition::from_index(3),
+                envelope: transfer(&signer, payee, 0, 100),
+            }],
+        };
+
+        // Pack → blobs → reconstruct → re-execute.
+        let batch = pack_blocks(&BatcherConfig::default(), std::slice::from_ref(&block)).unwrap();
+        let frames = reconstruct(&batch.blobs).unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].remote_epochs, vec![record.clone()]);
+
+        let recon_dir = tempfile::tempdir().unwrap();
+        let recovered =
+            reconstruct_state(recon_dir.path(), CHAIN_ID, &accounts, &code, &frames).unwrap();
+        assert_eq!(recovered.head_block, 1);
+        assert_eq!(
+            recovered.txs_applied, 3,
+            "two 0x7D deliveries + one user tx"
+        );
+
+        // Oracle: direct replay of the same block, no DA round-trip.
+        let oracle_dir = tempfile::tempdir().unwrap();
+        let oracle_env = StateEnvBuilder::new(oracle_dir.path())
+            .durability(Durability::SafeNoSync)
+            .open()
+            .unwrap();
+        let oracle = engine_replay(
+            oracle_env,
+            CHAIN_ID,
+            &accounts,
+            &code,
+            vec![ReplayBlock {
+                block_number: 1,
+                l2_timestamp: 1_700_000_000,
+                remote_epochs: vec![record],
+                txs: block.txs.iter().map(|t| t.envelope.clone()).collect(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            recovered.state_root, oracle.state_root,
+            "DA-reconstructed root must equal the directly-executed root — \
+             including the 0x7D deliveries"
+        );
+
+        // The rebuilt DB holds the Inbox/Outbox lane state the deliveries
+        // wrote (Inbox.delivered = 1 success; nextSeq advanced past the
+        // batch; the callback response committed through the local Outbox).
+        let pad = |v: u64| {
+            let mut w = [0u8; 32];
+            w[24..].copy_from_slice(&v.to_be_bytes());
+            B256::from(w)
+        };
+        let map_slot = |key: B256, base: u64| {
+            alloy_primitives::keccak256([key.as_slice(), pad(base).as_slice()].concat())
+        };
+        let delivered_slot = |seq: u64| {
+            let inner = map_slot(pad(ORIGIN), 0);
+            alloy_primitives::keccak256([pad(seq).as_slice(), inner.as_slice()].concat())
+        };
+        let env = StateEnvBuilder::new(recon_dir.path())
+            .read_only(true)
+            .open()
+            .unwrap();
+        let snap = kardamom_state::StateSnapshot::open(&env).unwrap();
+        for seq in 0..2u64 {
+            assert_eq!(
+                snap.storage(INBOX, delivered_slot(seq)).unwrap(),
+                APU256::from(1),
+                "Inbox.delivered[{ORIGIN}][{seq}] must be success in the rebuilt DB"
+            );
+        }
+        assert_eq!(
+            snap.storage(INBOX, map_slot(pad(ORIGIN), 1)).unwrap(),
+            APU256::from(2),
+            "Inbox.nextSeq[{ORIGIN}] must cover the batch"
+        );
+        assert_eq!(
+            snap.storage(OUTBOX, map_slot(pad(ORIGIN), 0)).unwrap(),
+            APU256::from(1),
+            "the callback response must be enqueued through the local Outbox"
+        );
+
+        // And the 0x7D receipts are reproduced, keyed by remote_source_hash.
+        for seq in 0..2u64 {
+            let source_hash = remote_source_hash(ORIGIN, seq);
+            let pos = snap
+                .get_tx_position(source_hash)
+                .unwrap()
+                .unwrap_or_else(|| panic!("rebuilt DB must index the seq-{seq} 0x7D receipt"));
+            let receipt = snap.get_receipt(pos).unwrap().expect("receipt at position");
+            assert_eq!(receipt.tx_hash, source_hash);
+            assert_eq!(receipt.tx_type, TX_TYPE_XCHAIN);
+            assert!(receipt.status, "delivery seq {seq} must succeed");
+            assert_eq!(receipt.to, Some(INBOX));
+            assert_eq!(receipt.from, xchain_tx_sender(ORIGIN));
+            assert_eq!(receipt.effective_gas_price, 0, "delivery is fee-free");
+        }
     }
 }
