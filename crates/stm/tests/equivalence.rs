@@ -1053,3 +1053,109 @@ fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
     }
     eprintln!("mv-layer: {wound_reps}/{reps} reps wounded");
 }
+
+/// BAG SCHEDULER (flag-gated v1): one shared runnable set, no
+/// per-worker queues, no stealing, no eager coverage — every shape that
+/// pins the FIFO scheduler must stay byte-identical under the bag too:
+/// chains (every dependency an edge), racing lying-stats reps, and
+/// plain transfers, across worker counts.
+#[test]
+fn bag_scheduler_byte_identical() {
+    let sg = signers(4);
+    let database = db(&sg);
+    let run_bag = |recs: &[(TxIndex, BPosition, TxEnvelope)], stats: &Stats, workers: usize| {
+        kardamom_stm::execute::with_pool(
+            kardamom_stm::execute::PoolConfig {
+                workers,
+                bag_scheduler: true,
+                ..Default::default()
+            },
+            |pool| {
+                pool.run_block(
+                    vec![database.clone(); workers.max(1)],
+                    PendingDelta::new(),
+                    env(),
+                    recs,
+                    stats,
+                )
+                .unwrap()
+            },
+        )
+    };
+    // Chained counter (canonical order is the only right answer).
+    let recs = records(
+        (0..8u64)
+            .flat_map(|n| sg.iter().map(move |s| (s, n)).collect::<Vec<_>>())
+            .map(|(s, n)| tx(s, n, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let stats = counter_stats();
+    for workers in [1, 2, 4] {
+        let out = run_bag(&recs, &stats, workers);
+        assert_eq!(out.wounds, 0, "ordered chain must never wound (bag)");
+        assert_identical(
+            &seq,
+            &out.receipts,
+            &out.delta,
+            &format!("bag chain w={workers}"),
+        );
+    }
+    // Lying stats: racing increments, wound/repair must stay identical.
+    let lying = {
+        let obs: Vec<TxObs> = (0..4)
+            .map(|i| {
+                let sender = Address::with_last_byte(i as u8 + 0x10);
+                let mut buf = [0u8; 64];
+                buf[..32]
+                    .copy_from_slice(&U256::from_be_slice(sender.as_slice()).to_be_bytes::<32>());
+                buf[32..].copy_from_slice(&U256::from(3u8).to_be_bytes::<32>());
+                TxObs {
+                    index: i,
+                    block: 1,
+                    sender,
+                    to: Some(COUNTER),
+                    selector: Some(COUNTER_SEL),
+                    args: Vec::new(),
+                    gas: 30_000,
+                    has_value: false,
+                    reads: Vec::new(),
+                    writes: vec![Cell::Slot(COUNTER, keccak256(buf))],
+                }
+            })
+            .collect();
+        Stats::learn(&obs)
+    };
+    let recs2 = records(
+        (0..4)
+            .map(|i| tx(&sg[i], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let seq2 = execute_block_sequential(&database, None, env(), &recs2).unwrap();
+    for rep in 0..25 {
+        let out = run_bag(&recs2, &lying, 4);
+        assert_identical(
+            &seq2,
+            &out.receipts,
+            &out.delta,
+            &format!("bag lying rep={rep}"),
+        );
+    }
+    // Transfers with value flows.
+    let recs3 = records(vec![
+        tx(&sg[0], 0, TxKind::Call(sg[1].address()), 500, &[]),
+        tx(&sg[1], 0, TxKind::Call(sg[2].address()), 300, &[]),
+        tx(&sg[0], 1, TxKind::Call(sg[2].address()), 100, &[]),
+        tx(&sg[2], 0, TxKind::Call(sg[3].address()), 200, &[]),
+    ]);
+    let seq3 = execute_block_sequential(&database, None, env(), &recs3).unwrap();
+    for workers in [1, 4] {
+        let out = run_bag(&recs3, &Stats::default(), workers);
+        assert_identical(
+            &seq3,
+            &out.receipts,
+            &out.delta,
+            &format!("bag transfers w={workers}"),
+        );
+    }
+}

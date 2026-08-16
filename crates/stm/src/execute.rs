@@ -890,6 +890,14 @@ pub struct PoolConfig {
     /// the cross-block stickiness that made hashing win, and fixes only
     /// the collisions.
     pub sticky_assign: bool,
+    /// BAG SCHEDULER (spec: "admission-queue redesign"): dispatch every
+    /// runnable tx into ONE shared lock-free bag popped by whichever
+    /// worker is free — no per-worker queues, no stealing, no eager
+    /// coverage (every dependency takes an edge; chains advance through
+    /// prune). Balanced by construction; admission's queue op becomes a
+    /// single lock-free push. v1 is flag-gated so the equivalence
+    /// harness runs both schedulers.
+    pub bag_scheduler: bool,
     /// Between blocks, workers SPIN-YIELD instead of sleeping on the
     /// condvar. schedutil drops a core to base clock (2.1 vs 4.2GHz
     /// measured) the moment it idles, and burst-park execution never
@@ -937,6 +945,7 @@ impl Default for PoolConfig {
             dispatch_by_sender: false,
             eager_chain: true,
             sticky_assign: false,
+            bag_scheduler: false,
             keep_hot: false,
             tail_on_workers: true,
             pin_cores: Vec::new(),
@@ -1039,6 +1048,10 @@ struct BlockCtx<S: StateDatabase> {
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
+    /// Bag-scheduler mode (see PoolConfig::bag_scheduler): the shared
+    /// runnable set. Allocated always (16KB), used when `bag_mode`.
+    bag: crossbeam_queue::ArrayQueue<u32>,
+    bag_mode: bool,
     /// The pool's arena (see [`PoolHandle::arena`]) — shared, never
     /// reallocated, indexed concurrently while the feed is still
     /// admitting.
@@ -1170,6 +1183,21 @@ impl<S: StateDatabase> BlockCtx<S> {
     /// Hand a READY tx to its assigned thread. Called only with no node
     /// mutex held (lock order: node registration points are leaves).
     fn push_ready(&self, worker: usize, idx: u32) {
+        if self.bag_mode {
+            // ONE shared lock-free runnable set: no assignment, no
+            // per-worker locks, balanced by whoever pops first. `queued`
+            // is irrelevant (coverage is off in bag mode — every
+            // dependency is an edge).
+            let pushed = self.bag.push(idx).is_ok();
+            debug_assert!(pushed, "bag sized at MAX_BLOCK_TXS");
+            for qh in &self.queues {
+                if qh.parked.load(Ordering::Acquire) {
+                    qh.cv.notify_one();
+                    break;
+                }
+            }
+            return;
+        }
         let qh = &self.queues[worker];
         let mut q = qh.q.lock().expect("queue poisoned");
         self.nodes[idx as usize]
@@ -1881,9 +1909,9 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         env: ExecEnv,
         stats: &'p Stats,
     ) -> Result<(BlockSession<'p, 'a, S>, LayerBinder<S>), ExecutorError> {
-        let (workers, prune_batch) = {
+        let (workers, prune_batch, bag_mode) = {
             let st = self.shared.0.lock().expect("pool poisoned");
-            (st.cfg.workers, st.cfg.prune_batch)
+            (st.cfg.workers, st.cfg.prune_batch, st.cfg.bag_scheduler)
         };
         assert!(
             snapshots.len() >= workers.max(1),
@@ -1935,6 +1963,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                     .map(|_| std::sync::OnceLock::new())
                     .collect()
             }),
+            bag: crossbeam_queue::ArrayQueue::new(MAX_BLOCK_TXS),
+            bag_mode,
             queues: (0..workers)
                 .map(|_| WorkerQueue {
                     q: Mutex::new(std::collections::VecDeque::new()),
@@ -2430,6 +2460,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 // disappears. A stale read of a nonzero indegree only
                 // costs an edge, never correctness.
                 if eager
+                    && !self.ctx.bag_mode
                     && pn.worker.load(Ordering::Acquire) == worker
                     && pn.queued.load(Ordering::Acquire)
                 {
@@ -3339,7 +3370,14 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 if ctx.aborted.load(Ordering::SeqCst) {
                     leave!(evm);
                 }
-                if let Some(i) = q.pop_front() {
+                if ctx.bag_mode {
+                    // Bag entries are indegree-0-dispatched with coverage
+                    // off ⇒ no fifo_preds ⇒ nothing to verify.
+                    if let Some(i) = ctx.bag.pop() {
+                        drop(q);
+                        break i;
+                    }
+                } else if let Some(i) = q.pop_front() {
                     qh.len.fetch_sub(1, Ordering::Release);
                     // Verify with NO lock held — the check takes a node
                     // mutex and scans results, and holding the queue lock
@@ -3362,9 +3400,11 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 }
                 // Dry. Apply any parked completions MYSELF before parking:
                 // this is what makes batching safe — the pool can never sit
-                // idle on DAG updates nobody applied. (Queue lock already
-                // dropped: never hold a queue lock while taking the graph
-                // lock.)
+                // idle on DAG updates nobody applied. The queue lock is
+                // dropped first (lock order: never hold a queue lock while
+                // taking the graph lock — and prune's push_ready re-locks
+                // queues, so holding one here self-deadlocks).
+                drop(q);
                 if ctx.pending.load(Ordering::SeqCst) > 0 {
                     ctx.prune(true);
                     q = qh.q.lock().expect("queue poisoned");
@@ -3384,7 +3424,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     break stolen;
                 }
                 q = qh.q.lock().expect("queue poisoned");
-                if !q.is_empty() {
+                if !q.is_empty() || (ctx.bag_mode && !ctx.bag.is_empty()) {
                     continue;
                 }
                 // SPIN before parking: at high throughput the next tx is
@@ -3403,7 +3443,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     // Lock-free probe: a dry worker spinning here for tens
                     // of microseconds must not contend with the feed's
                     // push into this very queue.
-                    if qh.len.load(Ordering::Acquire) > 0 {
+                    if qh.len.load(Ordering::Acquire) > 0 || (ctx.bag_mode && !ctx.bag.is_empty()) {
                         spun = true;
                         break;
                     }
@@ -3422,7 +3462,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     }
                 }
                 q = qh.q.lock().expect("queue poisoned");
-                if !spun && q.is_empty() {
+                if !spun && q.is_empty() && (!ctx.bag_mode || ctx.bag.is_empty()) {
                     // BOUNDED wait, deliberately. A notification can be
                     // missed: `signal_done` wakes every queue WITHOUT
                     // holding that queue's mutex, so a worker sitting

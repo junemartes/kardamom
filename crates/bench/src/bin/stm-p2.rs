@@ -125,6 +125,10 @@ struct Args {
     /// wound-free: a corrected release fails the run loudly.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pipeline_speculative: bool,
+    /// Bag scheduler (one shared lock-free runnable set, no per-worker
+    /// queues/stealing/eager-coverage). Flag-gated v1 for A/B.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    bag_scheduler: bool,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -347,6 +351,7 @@ fn run_pipelined(
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
+    bag_scheduler: bool,
     sticky_assign: bool,
     pin_cores: Vec<usize>,
     warmup_blocks: usize,
@@ -442,6 +447,7 @@ fn run_pipelined(
             parallel_worth_ns,
             dispatch_by_sender,
             eager_chain,
+            bag_scheduler,
             sticky_assign,
             keep_hot,
             tail_on_workers: false,
@@ -805,6 +811,7 @@ fn run_mdbx_ab(
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
+    bag_scheduler: bool,
     sticky_assign: bool,
     per_block: bool,
     pin_cores: Vec<usize>,
@@ -861,6 +868,7 @@ fn run_mdbx_ab(
                 parallel_worth_ns,
                 dispatch_by_sender,
                 eager_chain,
+                bag_scheduler,
                 sticky_assign,
                 keep_hot,
                 tail_on_workers: true,
@@ -1574,6 +1582,7 @@ fn main() -> anyhow::Result<()> {
                 parallel_worth_ns,
                 dispatch_by_sender,
                 eager_chain,
+                a.bag_scheduler,
                 sticky_assign,
                 pin_cores.clone(),
                 a.warmup_blocks,
@@ -1599,6 +1608,7 @@ fn main() -> anyhow::Result<()> {
             parallel_worth_ns,
             dispatch_by_sender,
             eager_chain,
+            a.bag_scheduler,
             sticky_assign,
             a.per_block,
             pin_cores,
@@ -1737,6 +1747,7 @@ fn main() -> anyhow::Result<()> {
                 parallel_worth_ns,
                 dispatch_by_sender,
                 eager_chain,
+                bag_scheduler: false,
                 sticky_assign,
                 keep_hot: false,
                 tail_on_workers: true,
