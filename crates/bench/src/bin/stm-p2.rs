@@ -13,7 +13,6 @@
 //! Wall-clock numbers are indicative (shared dev host); the assertion is
 //! the point — the speedup column is the shape, not a benchmark citation.
 
-
 use std::time::Instant;
 
 use alloy_primitives::U256;
