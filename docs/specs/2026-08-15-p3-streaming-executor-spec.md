@@ -499,3 +499,32 @@ chains, plus the standing equivalence + lying-stats gauntlets.
 Follow-up (needed for 4x on independents): slim the remaining ~1µs of
 admission — batch node init, cheaper last-toucher upserts, and (the
 lock now being gone) shard admission for predicted-independent txs.
+
+### SUPERSEDED by the bag scheduler (same session, user question: "why
+### contiguous at all?")
+
+The ring encoded order positionally; the order already lives in the
+DAG. Dispatch-only-when-runnable makes the ready-set UNORDERED, and
+the whole positional machinery deletes:
+
+- ONE shared lock-free bag (ArrayQueue, preallocated, O(1)) for every
+  runnable tx — no assignment, no stealing, balanced by construction.
+- CHAIN-LOCAL HAND-OFF: completing link n processes its children
+  INLINE (uncontended per-node child lock + indegree fetch_sub); the
+  first zero-indegree child becomes the worker's OWN next job (a local
+  slot, zero queue ops — chain affinity and streaming for free); the
+  rest go to the bag.
+- DELETED: per-worker queues + locks, queued flag, fifo_preds,
+  take-time verification, stall/putback, steal, prune batching +
+  completed buffers (inline completion), sticky queue assignment.
+- The earlier shared-lane failure does NOT recur: coverage no longer
+  exists, so chain heads need no FIFO anchor — chains anchor on DAG
+  successor pointers.
+- Rollout FLAG-GATED (scheduler = eager-fifo | bag): equivalence
+  harness runs both; flip on measurement; delete the old machinery in
+  a follow-up once the ladder confirms.
+
+Risks: single bag CAS traffic (fine at ~200k dispatches/s vs multi-M
+capability; shard the bag if ever hot), chain affinity via local-next
+instead of sticky domains, fifo_covered/steal metrics + tests retire
+with the machinery.
