@@ -13,7 +13,45 @@
 #   deploy/cluster/scripts/deploy.sh
 #   NOMAD_ADDR=http://192.168.56.10:4646 deploy/cluster/scripts/deploy.sh
 #   LOCKBOX_ADDRESS=0x... deploy/cluster/scripts/deploy.sh   # for da-watcher
+#   KARDAMOM_REQUIRE_SIGNED=1 deploy/cluster/scripts/deploy.sh   # prod posture
 set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: deploy.sh [-h|--help]
+
+Deploys the kardamom Nomad job pipeline (Aeron substrate -> anvil L1 ->
+cluster/sequencer/ingress/executor/validator/da-watcher -> batcher). All
+configuration is via environment variables; see the header comment for
+NOMAD_ADDR / LOCKBOX_ADDRESS / SETTLEMENT_ADDRESS / DIGEST_MANIFEST.
+
+Signature verification (attested-identity P0.5, cosign keyless + public
+Rekor):
+
+  KARDAMOM_REQUIRE_SIGNED=1
+      Before ANY job run: verify the digest manifest's signature bundle
+      (<manifest>.sigbundle, written by the CI push path) and every pinned
+      image's keyless signature, both against the pinned CI identity. Any
+      failure — missing manifest, missing bundle, bad signature, unverifiable
+      image — REFUSES the deploy (fail closed). This is the PRODUCTION
+      posture.
+
+  DEFAULT: OFF. Unsigned local deploys are a dev affordance for the local
+  cluster, loudly warned about at run time — a production deploy without
+  KARDAMOM_REQUIRE_SIGNED=1 has no supply-chain integrity gate.
+
+  Identity pinning (defaults for junemartes/kardamom's CI live in ONE place,
+  scripts/lib-signing.sh signing_defaults; override to re-pin):
+      KARDAMOM_CERT_IDENTITY_RE    certificate identity regexp
+                                   (org/repo/workflow ref of the signing run)
+      KARDAMOM_CERT_OIDC_ISSUER    OIDC issuer (GitHub Actions)
+EOF
+}
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  "") ;;
+  *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+esac
 
 # --- locate the nomad/ job dir relative to this script ----------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +112,52 @@ else
   echo "WARNING: digest manifest not found at ${DIGEST_MANIFEST}." >&2
   echo "         Jobs will run mutable :dev tags (dev fallback, NOT a" >&2
   echo "         production path). Run the image build/push step to pin." >&2
+fi
+
+# --- signed-manifest verification (attested-identity P0.5) -------------------
+# A deploy-time signature is a birth certificate, not a pulse: this gate
+# proves the manifest (and every image it pins) was produced by the pinned CI
+# identity BEFORE any job run; the continuous half lives in the private
+# repo's image-drift sweep, which verifies the same bundle before trusting
+# the manifest as its expected-state anchor. Fail closed on ANY failure —
+# missing manifest, missing bundle, bad signature — matching the
+# corrupt-manifest posture in image_ref_args below.
+if [[ "${KARDAMOM_REQUIRE_SIGNED:-0}" == "1" ]]; then
+  # shellcheck source=deploy/cluster/scripts/lib-signing.sh
+  source "${SCRIPT_DIR}/lib-signing.sh"
+  echo "==> KARDAMOM_REQUIRE_SIGNED=1: verifying manifest + image signatures (cosign, public Rekor)"
+  if [[ ! -f "${DIGEST_MANIFEST}" ]]; then
+    echo "ERROR: KARDAMOM_REQUIRE_SIGNED=1 but there is no digest manifest at" >&2
+    echo "       ${DIGEST_MANIFEST}. A signed deploy cannot fall back to mutable" >&2
+    echo "       tags; refusing to deploy." >&2
+    exit 1
+  fi
+  if ! verify_manifest_signature "${DIGEST_MANIFEST}"; then
+    echo "ERROR: digest manifest signature verification FAILED — refusing to deploy." >&2
+    exit 1
+  fi
+  SIGNED_REF_RE='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
+  VERIFIED_IMAGES=0
+  # fd 3, not stdin: cosign must not be able to swallow manifest lines.
+  while read -r -u 3 svc ref _; do
+    [[ -z "${svc}" || "${svc}" == \#* ]] && continue
+    if [[ ! "${ref}" =~ ${SIGNED_REF_RE} ]]; then
+      echo "ERROR: malformed digest ref for '${svc}' in the SIGNED manifest: '${ref}'" >&2
+      echo "       (signature verified but the content is not a pinned ref) — refusing to deploy." >&2
+      exit 1
+    fi
+    if ! verify_image_signature "${ref}"; then
+      echo "ERROR: image signature verification FAILED for '${svc}' (${ref}) — refusing to deploy." >&2
+      exit 1
+    fi
+    VERIFIED_IMAGES=$((VERIFIED_IMAGES + 1))
+  done 3<"${DIGEST_MANIFEST}"
+  echo "==> signatures OK: manifest bundle + ${VERIFIED_IMAGES} image ref(s) verified"
+else
+  echo "WARNING: KARDAMOM_REQUIRE_SIGNED is not set — deploying WITHOUT" >&2
+  echo "         signature verification. This is the local-dev posture only;" >&2
+  echo "         production deploys must set KARDAMOM_REQUIRE_SIGNED=1" >&2
+  echo "         (see --help)." >&2
 fi
 
 # Populate IMAGE_REF_ARGS=(-var image_ref=<repo>:<tag>@sha256:...) for a

@@ -33,6 +33,14 @@ if [[ $# -ne 3 || "$1" == "-h" || "$1" == "--help" ]]; then
   exit 2
 fi
 
+# Signing (attested-identity P0.5): keyless cosign of the pushed digest when
+# running in CI with OIDC; a clear skip line otherwise (this Makefile/VM path
+# is normally local dev). The Makefile signs the completed manifest after the
+# LAST image via scripts/sign-manifest.sh.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=deploy/cluster/scripts/lib-signing.sh
+source "${SCRIPT_DIR}/lib-signing.sh"
+
 svc="$1"
 img="$2"
 manifest="$3"
@@ -55,3 +63,4 @@ fi
 
 echo "${svc} ${ref}" >>"${manifest}"
 echo "==> pinned ${svc} -> ${ref}"
+sign_pushed_image "${ref}"

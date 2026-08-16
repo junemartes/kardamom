@@ -7,7 +7,10 @@
 # Reads the entry script's ROOT/REGISTRY/TAG/SERVICES/DIGEST_MANIFEST
 # constants at call time.
 # This file must NOT install traps (ci-cluster.sh owns the single EXIT trap).
-# Requires lib.sh (log).
+# Requires lib.sh (log) and lib-signing.sh (sign_pushed_image; ci-cluster.sh
+# signs the completed manifest itself via sign_digest_manifest — after the
+# LAST push, because a bundle over a half-written manifest would verify and
+# still lie).
 
 # Push a locally-built image to the in-cluster registry.
 #
@@ -80,6 +83,11 @@ push_image() {
   name="${name%%:*}"
   echo "${name#kardamom-} ${ref}" >>"${DIGEST_MANIFEST}"
   log "pinned ${name#kardamom-} -> ${ref}"
+  # Attested-identity P0.5: keyless-sign the digest we just pinned (public
+  # Rekor). No-op with a log line outside CI-with-OIDC — the local harness
+  # (and the REGISTRY_PUSH_NODE proxy-safe path, which is local-dev by
+  # definition) deploys unsigned, exactly like deploy.sh's :dev-tag fallback.
+  sign_pushed_image "${ref}"
 }
 
 # Thin service images from prebuilt binaries (§5): the workflow ran

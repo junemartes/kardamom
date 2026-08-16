@@ -21,6 +21,8 @@ __pycache__/
 *.pyc
 
 # per-deploy image digest manifest (written by the image push step, read by
-# deploy.sh; an audit record of one deploy, not source)
+# deploy.sh; an audit record of one deploy, not source) + its cosign
+# signature bundle (written by the CI signing step, P0.5)
 deploy/cluster/images.digests
+deploy/cluster/images.digests.sigbundle
 

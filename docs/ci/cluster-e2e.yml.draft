@@ -1,0 +1,259 @@
+# =============================================================================
+# DRAFT — OPERATOR ACTION REQUIRED (this bot cannot push workflow files).
+# Replace .github/workflows/cluster-e2e.yml with this file. Sole delta vs the
+# committed workflow: the job-level `permissions` block below, which grants
+# `id-token: write` so the image push path (ci-images.sh / lib-signing.sh,
+# attested-identity P0.5) can mint the GitHub OIDC token cosign keyless
+# signing needs. Until this lands, ACTIONS_ID_TOKEN_REQUEST_URL stays unset
+# in CI and the signing layer no-ops there by design (a skip line per image
+# + manifest) — nothing breaks, nothing is signed.
+# NOTE: specifying `permissions` resets every unlisted scope to `none`, hence
+# the explicit `contents: read` for actions/checkout.
+# Optional follow-up (operator call, not part of this draft's delta): once
+# signed runs exist, exporting KARDAMOM_REQUIRE_SIGNED=1 into the "Bring up
+# cluster + run shard" step makes each shard's deploy.sh verify what its own
+# build just signed — full sign->verify closure per run, at the cost of
+# coupling CI green to Fulcio/Rekor availability.
+# =============================================================================
+name: cluster-e2e
+
+# Container-based cluster end-to-end (Ansible → Nomad → Consul). Brings up the
+# multi-node cluster as privileged systemd+DinD containers on a 192.168.56.0/24
+# bridge (the VM-less analogue of `make up`), provisions it with the UNMODIFIED
+# site.yml, deploys the Nomad jobs, and runs the pipeline smoke + sustained-load
+# + chaos suite. See deploy/cluster/scripts/{ci-cluster,chaos}.sh.
+#
+# The deploy uses the CLUSTERED sealer (Phase 3): a 3-member Aeron Cluster (Raft)
+# replaces the single sealer. The cluster transport is unconditional in the Rust
+# binaries (no cargo feature to toggle); the Java cluster image is built from the
+# gradle shadowJar.
+#
+# The FULL suite runs on every trigger, SHARDED across runners (each shard brings
+# up its own cluster and runs one slice): one `load` shard (5-min soak), three
+# `chaos-*` component shards (executor/ingress/sequencer), and one `chaos-cluster`
+# shard for the Raft resilience cases. Splitting across runners keeps wall-clock
+# to ~one shard instead of running everything serially. Opt out with the
+# `skip-cluster-e2e` label for changes that can't affect the cluster.
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Harden the heavy cargo build against transient crates.io download drops
+  # ("curl failed [56] ... unexpected eof while reading"): retry more, and
+  # disable HTTP/2 multiplexing (the known trigger for those mid-stream EOFs
+  # against the crates.io CDN in CI).
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
+jobs:
+  cluster-e2e:
+    if: >-
+      !contains(github.event.pull_request.labels.*.name, 'skip-cluster-e2e')
+    name: container cluster e2e (${{ matrix.shard }})
+    # cosign keyless signing (attested-identity P0.5): id-token lets the push
+    # path mint the OIDC token Fulcio exchanges for the signing certificate;
+    # listing permissions resets the rest, so contents: read is explicit.
+    permissions:
+      contents: read
+      id-token: write
+    # Pinned (not ubuntu-latest): the binaries + libaeron.so built here run in
+    # the ubuntu:24.04 ci-service image, so the runner glibc must match that
+    # base (see deploy/cluster/docker/ci-service.Dockerfile).
+    runs-on: ubuntu-24.04
+    # Each shard brings up its own cluster (~30 min) + runs its slice.
+    timeout-minutes: 75
+    strategy:
+      # Don't cancel the other shards if one fails — we want every shard's
+      # result on a single run.
+      fail-fast: false
+      matrix:
+        # `load` = the 5-min sustained-load soak. The `chaos-*` shards split the
+        # chaos cases (each brings up its own cluster). chaos-cluster covers the
+        # 3-member Raft sealer (leader-kill / follower-kill / quorum-loss-recover);
+        # it SUPERSEDES the old chaos-sealer shard (the single-sealer SPOF is gone
+        # now the deploy uses the clustered sealer — see "Configure shard").
+        shard:
+          [load, chaos-executor, chaos-ingress, chaos-sequencer, chaos-cluster, chaos-retention, semantics]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build deps (Aeron C client)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake uuid-dev libbsd-dev libssl-dev pkg-config build-essential \
+            ansible
+
+      - name: Ansible docker connection plugin
+        run: ansible-galaxy collection install community.docker
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          # Pin a concrete version: `stable`/`latest` make foundryup hit the
+          # GitHub releases API, which 403s under the unauthenticated per-IP
+          # rate limit on Actions runners. A concrete tag downloads directly.
+          version: v1.7.1
+      # rusteron's build.rs compiles the Aeron C library with -march=native
+      # (hardcoded, no opt-out); those objects land in target/ and travel in
+      # the rust cache. GitHub's runner fleet is CPU-heterogeneous, so a cache
+      # populated on a wider-ISA VM SIGILLs (exit 132, empty stderr) when
+      # restored on a narrower one — observed as multi-shard waves of
+      # sequencers crash-looping the moment they touched Aeron. Key the cache
+      # by the CPU's feature-flag set so native objects never cross ISAs.
+      - name: CPU microarch cache key
+        id: cpukey
+        # Key by the CPUID FEATURE FLAGS, not the model name: hypervisors mask
+        # feature bits per VM independently of the brand string, and the reroll
+        # SIGILL'd again on a full-match model-name cache (host runnervmvrwv9
+        # reports the same model as the fleet but a narrower ISA). The flags
+        # line is exactly the surface -march=native compiles against.
+        run: echo "cpu=$(grep -m1 '^flags' /proc/cpuinfo | md5sum | cut -c1-8)" >> "$GITHUB_OUTPUT"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: cluster-e2e
+          prefix-key: v0-rust-${{ steps.cpukey.outputs.cpu }}
+
+      # JDK for the Java Aeron-Cluster sealer node. The clustered sealer image is
+      # a pure-JVM shadowJar (no native libs); temurin 17 matches cluster.Dockerfile
+      # (eclipse-temurin:17-jre).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Trust the in-cluster registry (plain HTTP on the bridge IP).
+      - name: Configure host docker for the insecure registry
+        run: |
+          echo '{ "insecure-registries": ["192.168.56.10:5000"] }' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+          # cgroup v2 + systemd-in-container needs this on some runners.
+          sudo modprobe ip_tables || true
+
+      # Build the Java cluster node jar BEFORE the image build: ci-cluster.sh
+      # stages cluster/sealer-service/service/build/libs/kardamom-cluster-node.jar
+      # into cluster.Dockerfile's context and builds/pushes kardamom-cluster:dev.
+      - name: Build cluster sealer jar (gradle shadowJar)
+        working-directory: cluster/sealer-service
+        run: ./gradlew :service:shadowJar --no-daemon
+
+      # Build the service binaries once on the host; ci-service.Dockerfile then
+      # wraps each into a thin image (the in-image workspace build is too slow).
+      # kardamom-load is the sustained-load + chaos harness ci-cluster.sh runs from
+      # target/release (it stays on the runner, not in a service image).
+      - name: cargo build --release (service binaries + load harness)
+        run: |
+          # Cluster-only: the Aeron Cluster (Raft) transport is unconditional now
+          # (no `cluster` cargo feature), so every service bin builds in one pass —
+          # sequencer/executor talk to the cluster by default.
+          cargo build --release \
+            -p kardamom-ingress -p kardamom-sequencer -p kardamom-executor \
+            -p kardamom-validator -p kardamom-da-watcher -p kardamom-batcher \
+            -p kardamom-reconstruct \
+            --bins
+          # Settlement-contract deploy for the live batcher (deploy.sh Phase 2b).
+          cargo build --release -p kardamom-deployer --bin kardamom-deploy
+          cargo build --release -p kardamom-bench --bin kardamom-load
+          # Target-C runner for the chain-semantics shard. Feature-gated
+          # because it links the scenario drivers.
+          cargo build --release -p e2e --features full-pipeline-e2e \
+            --bin kardamom-semantics
+
+      - name: Install Nomad CLI
+        run: |
+          ver="$(sed -n 's/^nomad_version: "\([^"]*\)".*/\1/p' deploy/cluster/ansible/group_vars/all.yml)"
+          curl -fsSL "https://releases.hashicorp.com/nomad/${ver}/nomad_${ver}_linux_amd64.zip" -o /tmp/nomad.zip
+          sudo unzip -o /tmp/nomad.zip -d /usr/local/bin
+
+      # Select this shard's stage(s). ci-cluster.sh reads RUN_LOAD / RUN_CHAOS /
+      # CHAOS_CASES from the env. Every shard runs the full (not PR-short)
+      # durations.
+      - name: Configure shard (${{ matrix.shard }})
+        run: |
+          # Runner identity for the #124 correlation stamps in ci-cluster.sh.
+          echo "RUNNER_NAME=${{ runner.name }}" >> "$GITHUB_ENV"
+          case "${{ matrix.shard }}" in
+            # 300 tps is an INVARIANT-gate rate, not a perf target: every
+            # 4-core runner sustains it (accept 0.995+ across all recorded
+            # runs) while still exercising real backpressure. Edge discovery
+            # on these VMs measured the hypervisor, not the stack (see the
+            # fixed-rate rationale in ci-cluster.sh).
+            load)            { echo "RUN_LOAD=1"; echo "RUN_CHAOS=0"; echo "LOAD_DURATION_S=300"; echo "LOAD_TARGET_TPS=300"; echo "LOAD_SENDERS=6"; } ;;
+            chaos-executor)  { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-executor hard-executor node-failure-executor state-checkpoint-restore replay-window-resync"; } ;;
+            # archive-driver-loss kills the Aeron SUBSTRATE (ArchivingMediaDriver
+            # system task) under ingress-0 — active/active must ride through a
+            # node losing its driver + durability recorder, not just its task.
+            chaos-ingress)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-ingress hard-ingress archive-driver-loss archive-tx-data-wipe archive-corruption"; } ;;
+            # sequencer-replica-kill targets one racing replica of a shard
+            # (seq-a on node-0) and asserts the twin keeps the shard live
+            # with NO stall (P=2 replicas per shard as of the replicated-
+            # sequencer-shards change). validator-lapse pauses the validator
+            # under load and asserts it resumes verifying with coverage held.
+            chaos-sequencer) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=graceful-sequencer hard-sequencer sequencer-replica-kill sequencer-lapse validator-lapse validator-join"; } ;;
+            # The clustered sealer (Phase 3) is a 3-member Aeron Cluster (Raft).
+            # These cases hard-kill the LEADER (must re-elect within the SLO), a
+            # FOLLOWER (quorum 2/3 holds, no stall), and TWO whole nodes (quorum
+            # lost → pipeline correctly stalls → one node returns → resumes).
+            # This SUPERSEDES the old chaos-sealer shard: the single-sealer hard-
+            # kill SPOF (issue #58, sealer-hard) no longer exists — the Raft quorum
+            # survives the loss of any one member, so chaos-sealer is DROPPED.
+            # cluster-member-rejoin needs snapshots to exist inside one case
+            # window, so this shard deploys the sealer with a 60s snapshot
+            # interval (KARDAMOM_CLUSTER_SNAPSHOT_S -> deploy.sh -var ->
+            # -Dkardamom.cluster.snapshotIntervalS; other shards keep the
+            # jobspec default).
+            # cpu-squeeze rides this shard: 3 oscillating whole-stack
+            # starvation cycles (the lapse->reconnect->replay transition the
+            # 2026-08-03 divergence needed). On the 4-core runners the
+            # throttle stacks onto ambient oversubscription — exactly the
+            # storm that produced the incident; with the flight ring +
+            # reason-printing a recurrence now self-documents.
+            chaos-cluster)   { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=cluster-leader-kill cluster-follower-kill cluster-member-rejoin cluster-quorum-loss-recover cpu-squeeze"; echo "KARDAMOM_CLUSTER_SNAPSHOT_S=60"; echo "SQUEEZE_CYCLES=3"; echo "SQUEEZE_S=60"; echo "SQUEEZE_CPUS_PER_NODE=0.4"; } ;;
+            # The LIVE replay-window overrun tier (recovery-D), on its own
+            # shard because the sealer is deployed with a deliberately SMALL
+            # egress retention (KARDAMOM_CLUSTER_RETENTION -> deploy.sh -var ->
+            # -Dkardamom.cluster.retention), which would tighten every other
+            # case's replay margins. A frozen consumer's cursor ages out of the
+            # window mid-flight; the case asserts the full self-repair:
+            # REPLAY_UNAVAILABLE -> peer-checkpoint fetch -> park -> restart ->
+            # restore (executor) / adopt (validator, #143) -> rejoin. The
+            # freeze is ADAPTIVE — held until the OBSERVED ingress delta
+            # exceeds 2x retention (first run: the runner delivered ~36tps of
+            # the 200tps target, so a fixed-duration freeze never overran the
+            # window). 6144 frames keeps the donors' 20s checkpoint interval
+            # inside the window even at a full 200tps (~4000 frames of lag),
+            # while a ~36tps runner overruns it in ~6min, inside the cap.
+            chaos-retention) { echo "RUN_LOAD=0"; echo "RUN_CHAOS=1"; echo "CHAOS_CASES=retention-overrun retention-overrun-validator"; echo "KARDAMOM_CLUSTER_RETENTION=6144"; } ;;
+            # The chain-semantics suite (Target C): the SAME scenario drivers
+            # the per-PR Target-L job runs, against the real cluster — nonce
+            # ordering, gap non-processing, RPC liveness and validator/executor
+            # consistency. Runs NO load and NO chaos, so the funded-account
+            # ledger leaves #1..#15 free for it, and a failure here cannot be
+            # confused with a resilience regression. See
+            # docs/agents/chain-semantics-e2e-suite-spec.md.
+            semantics)       { echo "RUN_LOAD=0"; echo "RUN_CHAOS=0"; echo "RUN_SEMANTICS=1"; } ;;
+            *) echo "unknown shard ${{ matrix.shard }}" >&2; exit 1 ;;
+          esac >> "$GITHUB_ENV"
+          # Chaos knobs shared by all chaos shards (no-op on the load shard).
+          { echo "CHAOS_TPS=200"; echo "CHAOS_CASE_S=120"; echo "CHAOS_RESCHEDULE_SLO_S=200"; echo "CHAOS_LEADER_SLO_S=45"; } >> "$GITHUB_ENV"
+
+      - name: Bring up cluster + run shard (${{ matrix.shard }})
+        run: deploy/cluster/scripts/ci-cluster.sh
+
+      - name: Dump cluster diagnostics on failure
+        if: failure()
+        run: |
+          export NOMAD_ADDR=http://192.168.56.10:4646
+          nomad job status 2>/dev/null || true
+          for c in $(docker ps --format '{{.Names}}' | grep '^kardamom-' || true); do
+            echo "===== $c journal ====="
+            docker exec "$c" journalctl -u nomad -u consul --no-pager -n 80 2>/dev/null || true
+          done

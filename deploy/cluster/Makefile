@@ -62,6 +62,9 @@ images:
 	docker build -f docker/cluster.Dockerfile \
 		-t $(REGISTRY)/kardamom-cluster:$(TAG) docker
 	./scripts/push-image.sh cluster $(REGISTRY)/kardamom-cluster:$(TAG) $(DIGEST_MANIFEST)
+	@# P0.5: sign the COMPLETED manifest (keyless, CI-with-OIDC only; a clear
+	@# skip line locally). Must stay the LAST step of this target.
+	./scripts/sign-manifest.sh $(DIGEST_MANIFEST)
 
 ## deploy: run the Aeron system job, then the service jobs (sealer first — it
 deploy:
