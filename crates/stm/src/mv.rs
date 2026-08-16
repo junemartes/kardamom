@@ -196,11 +196,32 @@ impl MvCache {
     /// ones. Caller guarantees quiescence (the reaper scrubs only
     /// unwrapped caches).
     pub fn scrub(&self) {
+        // Keep KEYS and their version-vec buffers: hot cells recur
+        // block after block, so an entry with a cleared vec means the
+        // next block's publish PUSHES into a warm buffer instead of
+        // allocating (a cell with no versions reads/validates exactly
+        // like an absent cell). A drifting keyset would grow the maps
+        // unboundedly — the size cap falls back to a full clear.
+        const KEEP_KEYS_CAP: usize = 1024; // per shard; ~64 shards
         for sh in &self.accounts {
-            sh.write().expect("mv poisoned").clear();
+            let mut g = sh.write().expect("mv poisoned");
+            if g.len() > KEEP_KEYS_CAP {
+                g.clear();
+            } else {
+                for v in g.values_mut() {
+                    v.clear();
+                }
+            }
         }
         for sh in &self.storage {
-            sh.write().expect("mv poisoned").clear();
+            let mut g = sh.write().expect("mv poisoned");
+            if g.len() > KEEP_KEYS_CAP {
+                g.clear();
+            } else {
+                for v in g.values_mut() {
+                    v.clear();
+                }
+            }
         }
         self.code.write().expect("mv poisoned").clear();
     }
