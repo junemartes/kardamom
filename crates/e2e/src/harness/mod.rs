@@ -391,6 +391,25 @@ impl LocalStack {
         self.executor.proc.kill();
     }
 
+    /// Spawn the interop watcher (`kardamom-da-watcher` in interop mode)
+    /// against `feed_url`, publishing remote epochs into this stack's Aeron
+    /// dir. The caller owns the returned process — the xchain scenario
+    /// observes its exit (the pair-scoped fail-stop) directly — and it still
+    /// dies with the test via `PR_SET_PDEATHSIG`, so nothing leaks.
+    pub fn spawn_interop_watcher(
+        &self,
+        origin_chain_id: u64,
+        feed_url: &str,
+        cursor_file: &Path,
+    ) -> Result<services::Spawned> {
+        services::spawn_interop_watcher(
+            &self.service_spec(),
+            origin_chain_id,
+            feed_url,
+            cursor_file,
+        )
+    }
+
     /// The [`ServiceSpec`] this stack launched its services from, rebuilt
     /// from the launch-time state (same genesis, same `--log-config`).
     fn service_spec(&self) -> ServiceSpec<'_> {

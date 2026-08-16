@@ -74,3 +74,4 @@ include!("pipeline.rs");
 include!("consistency.rs");
 include!("bridge_da.rs");
 include!("derivation.rs");
+include!("xchain.rs");

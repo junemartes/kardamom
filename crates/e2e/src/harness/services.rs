@@ -118,6 +118,49 @@ pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned
     })
 }
 
+/// Spawn `kardamom-da-watcher` in INTEROP mode: no L1 flags, one peer pair
+/// sourced from `feed_url` (the scenario's `MockInteropFeed`), remote epochs
+/// published into the stack's Aeron dir for the sequencers to relay.
+///
+/// Spawning the real binary rather than driving the watcher in-process is
+/// deliberate: it exercises the CLI's cursor-file bootstrap, the Aeron
+/// `tx_remote_epochs` publication, and the process-level fail-stop contract
+/// (the interop path running ALONE means a pair fault ends the process
+/// nonzero — the exact seam the gap scenario asserts on).
+pub fn spawn_interop_watcher(
+    spec: &ServiceSpec<'_>,
+    origin_chain_id: u64,
+    feed_url: &str,
+    cursor_file: &Path,
+) -> Result<Spawned> {
+    let metrics_port = free_tcp_port()?;
+    let mut cmd = Command::new(bin("kardamom-da-watcher")?);
+    cmd.args(["--interop-peer-chain-id", &origin_chain_id.to_string()])
+        .args(["--interop-feed-url", feed_url])
+        .args(["--self-chain-id", &spec.chain_id.to_string()])
+        .arg("--interop-cursor-file")
+        .arg(cursor_file)
+        // 1 s (vs the 2 s default) keeps feed-retry latency inside a test's
+        // patience, mirroring the L1 watcher's tightened poll interval.
+        .args(["--interop-retry-interval-secs", "1"])
+        .arg("--aeron-dir")
+        .arg(spec.aeron_dir);
+    with_log_config(&mut cmd, spec);
+    cmd.args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
+        .args(["--host-id", "e2e-interop-watcher"]);
+    cmd.env("RUST_LOG", "info");
+    let proc = Proc::spawn(
+        "interop-watcher",
+        cmd,
+        spec.root.join("interop-watcher.log"),
+    )?;
+    Ok(Spawned {
+        proc,
+        metrics_addr: format!("127.0.0.1:{metrics_port}").parse()?,
+        state_dir: None,
+    })
+}
+
 pub struct Spawned {
     pub proc: Proc,
     pub metrics_addr: SocketAddr,
