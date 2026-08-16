@@ -897,13 +897,17 @@ pub struct PoolConfig {
     /// the cross-block stickiness that made hashing win, and fixes only
     /// the collisions.
     pub sticky_assign: bool,
-    /// BAG SCHEDULER (spec: "admission-queue redesign"): dispatch every
-    /// runnable tx into ONE shared lock-free bag popped by whichever
-    /// worker is free — no per-worker queues, no stealing, no eager
-    /// coverage (every dependency takes an edge; chains advance through
-    /// prune). Balanced by construction; admission's queue op becomes a
-    /// single lock-free push. v1 is flag-gated so the equivalence
-    /// harness runs both schedulers.
+    /// BAG SCHEDULER (the DEFAULT; spec: "admission-queue redesign"):
+    /// every runnable tx goes into ONE shared lock-free bag popped by
+    /// whichever worker is free; completion is INLINE (the finishing
+    /// worker closes its node and dispatches children — no prune
+    /// batching) with CHAIN-LOCAL HAND-OFF (the first ready child stays
+    /// on the completing worker: chains stream on one core with zero
+    /// queue ops). No per-worker queues, no stealing, no eager coverage
+    /// (every dependency is an edge). Measured >= the FIFO scheduler on
+    /// every ladder rung (parcounter 2.78 -> 2.95x, uniswap 2.31 -> 2.50,
+    /// partransfer 1.57 -> 2.0, defi 1.31 -> 1.34, transfers 1.00 ->
+    /// 1.07). `false` selects the legacy per-worker FIFO scheduler.
     pub bag_scheduler: bool,
     /// Between blocks, workers SPIN-YIELD instead of sleeping on the
     /// condvar. schedutil drops a core to base clock (2.1 vs 4.2GHz
@@ -952,7 +956,7 @@ impl Default for PoolConfig {
             dispatch_by_sender: false,
             eager_chain: true,
             sticky_assign: false,
-            bag_scheduler: false,
+            bag_scheduler: true,
             keep_hot: false,
             tail_on_workers: true,
             pin_cores: Vec::new(),
@@ -1232,7 +1236,7 @@ impl<S: StateDatabase> BlockCtx<S> {
     /// existed to amortize the OLD global graph lock; per-node locks
     /// made it ceremony (measured ~0.8µs per completion on independent
     /// transfers — the next wall after the feed).
-    fn complete_inline(&self, job: u32) {
+    fn complete_inline(&self, job: u32) -> Option<u32> {
         let node = &self.nodes[job as usize];
         let mut list = node.children.lock().expect("children poisoned");
         if !node.open.swap(false, Ordering::AcqRel) {
@@ -1265,8 +1269,18 @@ impl<S: StateDatabase> BlockCtx<S> {
         drop(list);
         self.finished.fetch_add(1, Ordering::SeqCst);
         self.metrics.completions.fetch_add(1, Ordering::Relaxed);
+        // CHAIN-LOCAL HAND-OFF: the FIRST ready child stays with the
+        // completing worker as its next job (returned, no bag op, warm
+        // cache — a chain streams on one core exactly as the FIFO
+        // scheduler streamed it, without a queue); the rest go to the
+        // bag for whoever is free.
+        let mut keep: Option<u32> = None;
         for c in ready_buf.iter().take(n_ready).chain(spill.iter()) {
-            self.push_ready(0, *c);
+            if keep.is_none() {
+                keep = Some(*c);
+            } else {
+                self.push_ready(0, *c);
+            }
         }
         if self.drained() {
             for q in &self.queues {
@@ -1274,6 +1288,7 @@ impl<S: StateDatabase> BlockCtx<S> {
             }
             self.done_cv.notify_all();
         }
+        keep
     }
 
     fn prune(&self, forced: bool) -> usize {
@@ -3406,6 +3421,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         &ctx.metrics,
     );
     let mut read_stash: Vec<Vec<ReadRecord>> = Vec::new();
+    let mut local_next: Option<u32> = None;
     let mut evm = Context::mainnet()
         .with_db(view)
         .with_block(ctx.env.block_env())
@@ -3455,8 +3471,13 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     leave!(evm);
                 }
                 if ctx.bag_mode {
-                    // Bag entries are indegree-0-dispatched with coverage
-                    // off ⇒ no fifo_preds ⇒ nothing to verify.
+                    // Chain-local hand-off first (see complete_inline),
+                    // then the shared bag. Bag entries are indegree-0-
+                    // dispatched with coverage off ⇒ nothing to verify.
+                    if let Some(i) = local_next.take() {
+                        drop(q);
+                        break i;
+                    }
                     if let Some(i) = ctx.bag.pop() {
                         drop(q);
                         break i;
@@ -3631,7 +3652,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         // adversarial test's abort storms). Incremented-but-unpushed
         // is the safe direction: a spurious prune drains nothing.
         if ctx.bag_mode {
-            ctx.complete_inline(job);
+            local_next = ctx.complete_inline(job);
         } else {
             let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
             {

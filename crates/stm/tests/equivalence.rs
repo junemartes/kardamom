@@ -577,7 +577,26 @@ fn hot_chain_streams_through_the_fifo() {
         // on at least one.
         let mut shaped = false;
         for _attempt in 0..20 {
-            let out = execute_block_stm(&database, None, env(), &recs, &stats, workers).unwrap();
+            // This test pins the LEGACY FIFO scheduler's mechanics
+            // (eager coverage, single-worker domains); the bag scheduler
+            // has neither and is pinned by `bag_hot_chain_byte_identical`.
+            let out = kardamom_stm::execute::with_pool(
+                kardamom_stm::execute::PoolConfig {
+                    workers,
+                    bag_scheduler: false,
+                    ..Default::default()
+                },
+                |pool| {
+                    pool.run_block(
+                        vec![database.clone(); workers.max(1)],
+                        PendingDelta::new(),
+                        env(),
+                        &recs,
+                        &stats,
+                    )
+                    .unwrap()
+                },
+            );
             assert_eq!(out.wounds, 0, "an ordered chain must never wound");
             assert_eq!(
                 out.dispatch.iter().filter(|c| **c > 0).count(),
@@ -1158,4 +1177,34 @@ fn bag_scheduler_byte_identical() {
             &format!("bag transfers w={workers}"),
         );
     }
+}
+
+/// The bag scheduler on the SAME hot chain: no coverage, no single-
+/// worker domain — just edges + chain-local hand-off. Must stay
+/// byte-identical with zero wounds at every worker count.
+#[test]
+fn bag_hot_chain_byte_identical() {
+    let sg = signers(3);
+    let database = db(&sg);
+    let envs: Vec<TxEnvelope> = (0..8u64)
+        .flat_map(|n| sg.iter().map(move |s| (s, n)).collect::<Vec<_>>())
+        .map(|(s, n)| tx(s, n, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+        .collect();
+    let recs = records(envs);
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let stats = counter_stats();
+    for workers in [1, 2, 4] {
+        for rep in 0..5 {
+            let out = execute_block_stm(&database, None, env(), &recs, &stats, workers).unwrap();
+            assert_eq!(out.wounds, 0, "an ordered chain must never wound (bag)");
+            assert_identical(
+                &seq,
+                &out.receipts,
+                &out.delta,
+                &format!("bag hot chain w={workers} rep={rep}"),
+            );
+        }
+    }
+    let key = (COUNTER, B256::ZERO);
+    assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
 }

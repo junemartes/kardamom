@@ -125,9 +125,10 @@ struct Args {
     /// wound-free: a corrected release fails the run loudly.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pipeline_speculative: bool,
-    /// Bag scheduler (one shared lock-free runnable set, no per-worker
-    /// queues/stealing/eager-coverage). Flag-gated v1 for A/B.
-    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    /// Bag scheduler (default): one shared lock-free runnable set,
+    /// inline completion, chain-local hand-off. `false` = legacy
+    /// per-worker FIFO scheduler (stealing + eager coverage) for A/B.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     bag_scheduler: bool,
 }
 
@@ -1752,7 +1753,7 @@ fn main() -> anyhow::Result<()> {
                 parallel_worth_ns,
                 dispatch_by_sender,
                 eager_chain,
-                bag_scheduler: false,
+                bag_scheduler: true,
                 sticky_assign,
                 keep_hot: false,
                 tail_on_workers: true,
