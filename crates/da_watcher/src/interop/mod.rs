@@ -25,6 +25,7 @@
 //! §10 makes mandatory before value moves are a later slice; they ADD to the
 //! wire contract in [`feed`] rather than reshaping it.
 
+pub mod cursor;
 pub mod feed;
 pub mod publisher;
 pub mod source;
@@ -37,6 +38,7 @@ pub mod watcher;
 #[cfg(any(test, feature = "test-support"))]
 pub mod mock;
 
+pub use cursor::{CursorError, CursorFile};
 pub use feed::{
     OutboxCursor, OutboxEventDto, OutboxFeedApiServer, OutboxMessageDto, SUBSCRIBE_OUTBOX_METHOD,
     UNSUBSCRIBE_OUTBOX_METHOD,

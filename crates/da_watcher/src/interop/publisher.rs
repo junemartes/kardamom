@@ -37,22 +37,39 @@ pub trait RemoteEpochPublisher: Send + Sync + 'static {
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod fakes {
+    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
+
+    use alloy_primitives::B256;
 
     use super::*;
 
     /// In-memory [`RemoteEpochPublisher`] recording every published record in
-    /// order, mirroring [`crate::publisher::fakes::InMemoryEpochPublisher`].
+    /// order, mirroring [`crate::publisher::fakes::InMemoryEpochPublisher`] —
+    /// plus the CLUSTER'S first-seen dedup on `canonical_id`, modelled here
+    /// because it is half of the safety argument: a stale-cursor restart
+    /// re-publishes a record that already landed, and the claim "that is
+    /// harmless" is only true because this dedup absorbs it. A fake without
+    /// it could not test the property end to end.
     #[derive(Default, Clone)]
     pub struct InMemoryRemoteEpochPublisher {
         pub published: Arc<Mutex<Vec<RemoteEpochRecord>>>,
+        seen: Arc<Mutex<BTreeSet<B256>>>,
+        /// Publishes absorbed as duplicates (offer succeeded, record already
+        /// present — the cluster's first-seen outcome).
+        pub deduped: Arc<Mutex<u64>>,
         pub fail_with_backpressure: Arc<Mutex<bool>>,
     }
 
     impl InMemoryRemoteEpochPublisher {
-        /// Records published so far, cloned.
+        /// Records ACCEPTED so far (first-seen, in order), cloned.
         pub fn records(&self) -> Vec<RemoteEpochRecord> {
             self.published.lock().unwrap().clone()
+        }
+
+        /// How many publishes were absorbed as `canonical_id` duplicates.
+        pub fn deduped_count(&self) -> u64 {
+            *self.deduped.lock().unwrap()
         }
     }
 
@@ -60,6 +77,18 @@ pub mod fakes {
         fn publish(&self, record: &RemoteEpochRecord) -> Result<BPosition, PublishError> {
             if *self.fail_with_backpressure.lock().unwrap() {
                 return Err(PublishError::Backpressure);
+            }
+            // A duplicate is a SUCCESSFUL publish whose record the cluster
+            // already holds — the transport accepted the offer either way,
+            // which is exactly why the producer cannot tell (and must not
+            // need to tell) whether its retry was the first copy.
+            if !self.seen.lock().unwrap().insert(record.canonical_id()) {
+                *self.deduped.lock().unwrap() += 1;
+                let len = self.published.lock().unwrap().len();
+                return Ok(BPosition {
+                    term_id: 0,
+                    term_offset: (len as i32) * 64,
+                });
             }
             let mut v = self.published.lock().unwrap();
             v.push(record.clone());

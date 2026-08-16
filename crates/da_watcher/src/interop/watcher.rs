@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 
 use kardamom_types::xchain::{XChainError, derive_remote_epoch};
 
+use crate::interop::cursor::CursorFile;
 use crate::interop::publisher::{PublishError, RemoteEpochPublisher};
 use crate::interop::source::{RemoteChainSource, RemoteSourceError};
 use crate::metrics;
@@ -164,10 +165,22 @@ where
 /// until an origin block closes — so there is no tick interval, only the
 /// failure-path pace in [`InteropWatcherConfig::retry_interval`].
 ///
+/// `cursor_file`, when given, is persisted after every pass that advanced the
+/// cursor — that is, strictly AFTER the publish it describes (see the write
+/// site below for why that ordering is load-bearing). `config.start_seq` is
+/// the caller's resume position either way; loading the file (and preferring
+/// it over the CLI seed) is the binary's job, so the loop has exactly one
+/// notion of "where am I".
+///
 /// The task ends on shutdown, on a closed publisher, or on a derivation fault.
 /// The last of those is the fail-stop: the handle's `task` completing without
 /// a shutdown signal is the pair's halt signal.
-pub fn spawn<S, P>(publisher: P, mut source: S, config: InteropWatcherConfig) -> WatcherHandle
+pub fn spawn<S, P>(
+    publisher: P,
+    mut source: S,
+    config: InteropWatcherConfig,
+    cursor_file: Option<CursorFile>,
+) -> WatcherHandle
 where
     S: RemoteChainSource,
     P: RemoteEpochPublisher,
@@ -178,6 +191,7 @@ where
     let task = tokio::spawn(async move {
         let mut cursor = config.start_seq;
         loop {
+            let cursor_before = cursor;
             let outcome = tokio::select! {
                 biased;
                 _ = &mut shutdown_rx => {
@@ -189,6 +203,34 @@ where
                 // which the cursor-authoritative resume replays.
                 r = process_once(&publisher, &mut source, config.self_chain_id, &mut cursor) => r,
             };
+            // THE WRITE SITE. Persist strictly AFTER a successful publish
+            // (the only thing that advances `cursor`), never before. The two
+            // failure directions are not symmetric: a cursor that dies STALE
+            // here is harmless — the restart re-derives byte-identical
+            // records and cluster dedup on `canonical_id` absorbs the
+            // re-publish — while a cursor persisted AHEAD of a publish would
+            // be a permanent lane hole no retry can fill (the record between
+            // the two positions was never published and never will be). A
+            // FAILED persist therefore only degrades restart to the stale
+            // case, so it is logged loudly and the pair keeps flowing.
+            if cursor != cursor_before
+                && let Some(cf) = &cursor_file
+                && let Err(e) = cf.persist(cursor)
+            {
+                ::metrics::counter!(
+                    metrics::REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
+                    "origin" => origin_label.clone()
+                )
+                .increment(1);
+                warn!(
+                    target: "da_watcher::interop",
+                    origin,
+                    cursor,
+                    error = %e,
+                    "cursor persist failed; a restart before the next successful persist \
+                     resumes STALE (harmless: dedup absorbs the re-publish)"
+                );
+            }
             match outcome {
                 Ok(_) => {
                     ::metrics::counter!(
@@ -286,18 +328,30 @@ mod tests {
         feed: &MockInteropFeed,
     ) -> (InMemoryRemoteEpochPublisher, WatcherHandle) {
         let publisher = InMemoryRemoteEpochPublisher::default();
+        let handle = spawn_resuming(feed, publisher.clone(), 0, None).await;
+        (publisher, handle)
+    }
+
+    /// [`spawn_against`] with an explicit resume position and (optionally) a
+    /// durable cursor — the restart-shaped variant.
+    async fn spawn_resuming(
+        feed: &MockInteropFeed,
+        publisher: InMemoryRemoteEpochPublisher,
+        start_seq: u64,
+        cursor_file: Option<CursorFile>,
+    ) -> WatcherHandle {
         let source = WsRemoteChainSource::new(ORIGIN, SELF, feed.url())
             .with_reconnect(Duration::from_millis(20), 50);
-        let handle = spawn(
-            publisher.clone(),
+        spawn(
+            publisher,
             source,
             InteropWatcherConfig {
                 self_chain_id: SELF,
-                start_seq: 0,
+                start_seq,
                 retry_interval: Duration::from_millis(20),
             },
-        );
-        (publisher, handle)
+            cursor_file,
+        )
     }
 
     async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
@@ -511,6 +565,128 @@ mod tests {
                 .map(|r| r.canonical_id())
                 .collect::<Vec<_>>(),
         );
+    }
+
+    /// Restart continuity, through the DURABLE cursor: a watcher that
+    /// persisted its position and died resumes exactly where it stopped —
+    /// same records, no repeat, no hole — with the resume seq coming from
+    /// the file, not from the CLI seed (which deliberately lies here).
+    #[tokio::test]
+    async fn a_restart_resumes_exactly_from_the_persisted_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_file = CursorFile::new(dir.path().join("pair.cursor"));
+
+        let feed = MockInteropFeed::new(ORIGIN).await;
+        let publisher = InMemoryRemoteEpochPublisher::default();
+        let handle = spawn_resuming(&feed, publisher.clone(), 0, Some(cursor_file.clone())).await;
+
+        feed.push_message(msg(0, 100));
+        feed.push_message(msg(1, 100));
+        feed.push_message(msg(2, 101));
+        feed.push_message(msg(3, 102)); // sentinel: closes 101
+        wait_until(|| publisher.records().len() >= 2, "two records").await;
+        let _ = handle.shutdown.send(());
+        handle.task.await.unwrap();
+        assert_eq!(
+            cursor_file.load().unwrap(),
+            Some(3),
+            "the persisted cursor must be one past the last PUBLISHED seq \
+             (seq 3's block is still open, so it is not published yet)"
+        );
+
+        // "Restart": a fresh watcher over the same publisher, seeded with a
+        // deliberately wrong CLI value — the file must win.
+        let resumed = cursor_file.load().unwrap().expect("cursor persisted");
+        let handle =
+            spawn_resuming(&feed, publisher.clone(), resumed, Some(cursor_file.clone())).await;
+        feed.push_message(msg(4, 103)); // closes 102
+        feed.push_message(msg(5, 104)); // closes 103
+        wait_until(|| publisher.records().len() >= 4, "four records").await;
+        let _ = handle.shutdown.send(());
+        handle.task.await.unwrap();
+
+        let seqs: Vec<u64> = publisher
+            .records()
+            .iter()
+            .flat_map(|r| r.messages.iter().map(|m| m.seq))
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![0, 1, 2, 3, 4],
+            "no loss, no repeat across the restart"
+        );
+        assert_eq!(
+            publisher.deduped_count(),
+            0,
+            "a clean restart re-publishes nothing"
+        );
+        assert_eq!(cursor_file.load().unwrap(), Some(5));
+    }
+
+    /// The crash window the write ordering exists for: die AFTER the publish,
+    /// BEFORE the persist. The restart resumes STALE, re-derives the same
+    /// batch, re-publishes it — and the duplicate is absorbed by dedup on
+    /// `canonical_id`, proving end to end that the stale side of the
+    /// asymmetry really is harmless.
+    #[tokio::test]
+    async fn a_crash_between_publish_and_persist_resumes_stale_and_dedup_absorbs() {
+        use crate::interop::source::fakes::ScriptedRemoteSource;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cursor_file = CursorFile::new(dir.path().join("pair.cursor"));
+        let publisher = InMemoryRemoteEpochPublisher::default();
+
+        // First life: publish succeeds, then the process dies before the
+        // persist (simulated by simply never calling it).
+        let mut source = ScriptedRemoteSource::new(ORIGIN);
+        source.push_batch(Ok(vec![msg(0, 100), msg(1, 100)]));
+        let mut cursor = cursor_file.load().unwrap().unwrap_or(0);
+        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(cursor, 2, "in-memory cursor advanced past the publish");
+        drop(source); // the crash: no persist happened
+        assert_eq!(cursor_file.load().unwrap(), None, "nothing durable yet");
+
+        // Second life: resume from the (stale) durable state, which replays
+        // the SAME feed prefix — byte-identical derivation by construction.
+        let mut source = ScriptedRemoteSource::new(ORIGIN);
+        source.push_batch(Ok(vec![msg(0, 100), msg(1, 100)]));
+        source.push_batch(Ok(vec![msg(2, 101)]));
+        let mut cursor = cursor_file.load().unwrap().unwrap_or(0);
+        assert_eq!(cursor, 0, "resumed stale — the harmless side");
+        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "the re-publish is reported successful to the producer"
+        );
+        cursor_file.persist(cursor).unwrap();
+        let n = process_once(&publisher, &mut source, SELF, &mut cursor)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        cursor_file.persist(cursor).unwrap();
+
+        // The duplicate was absorbed, not executed twice: one copy of each
+        // record, one dedup hit, and the lane is dense.
+        let records = publisher.records();
+        assert_eq!(
+            records.len(),
+            2,
+            "the replayed record must not appear twice"
+        );
+        assert_eq!(
+            publisher.deduped_count(),
+            1,
+            "the replay was absorbed by canonical_id dedup"
+        );
+        assert_eq!(records[0].first_seq, 0);
+        assert_eq!(records[0].last_seq(), 1);
+        assert_eq!(records[1].first_seq, 2);
+        assert_eq!(cursor_file.load().unwrap(), Some(3));
     }
 
     /// `Lagged` says the feed's retention overtook us; reading on would skip.

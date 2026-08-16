@@ -25,6 +25,11 @@ pub const REMOTE_WATCHER_TICK_TOTAL: &str = "kardamom_da_watcher_remote_tick_tot
 /// exactly the one whose gauge is flat while the peer keeps sending — the
 /// interop analogue of the L1 origin lag.
 pub const REMOTE_CURSOR_SEQ: &str = "kardamom_da_watcher_remote_cursor_seq";
+/// Failed durable-cursor writes. Non-fatal by design (a stale cursor resumes
+/// harmlessly through dedup), but a GROWING count means the next restart
+/// replays further and further back — an operator alarm, not an error path.
+pub const REMOTE_CURSOR_PERSIST_FAILURES_TOTAL: &str =
+    "kardamom_da_watcher_remote_cursor_persist_failures_total";
 
 pub fn describe() {
     metrics::describe_gauge!(L1_FINALIZED, "latest finalised L1 block number observed");
@@ -64,5 +69,9 @@ pub fn describe() {
     metrics::describe_gauge!(
         REMOTE_CURSOR_SEQ,
         "first per-pair outbox seq not yet canonicalised, labelled by origin chain id"
+    );
+    metrics::describe_counter!(
+        REMOTE_CURSOR_PERSIST_FAILURES_TOTAL,
+        "failed durable-cursor writes, labelled by origin chain id; non-fatal (stale resume is absorbed by dedup) but growth widens the restart replay window"
     );
 }

@@ -27,7 +27,8 @@ use anyhow::Context;
 use clap::Parser;
 
 use kardamom_da_watcher::interop::{
-    InteropWatcherConfig, RemoteEpochPublisher, WsRemoteChainSource, spawn as spawn_interop_watcher,
+    CursorFile, InteropWatcherConfig, RemoteEpochPublisher, WsRemoteChainSource,
+    spawn as spawn_interop_watcher,
 };
 use kardamom_da_watcher::{
     DaWatcherConfig, EpochPublisher, PublishError, RpcL1Source, WatcherHandle,
@@ -72,10 +73,17 @@ struct Args {
     /// fail-stops the pair rather than executing another chain's traffic.
     #[arg(long)]
     self_chain_id: Option<u64>,
-    /// Cursor seed: the first per-pair seq not yet canonicalised. 0 is correct
-    /// only for a pair that has never run — a restart must be given the
-    /// destination chain's recorded position, or the first derivation fault
-    /// will be this flag.
+    /// Durable per-pair cursor file (required with the interop triple). The
+    /// watcher persists its resume position here (atomically, AFTER each
+    /// successful publish); on restart the file overrides
+    /// `--interop-start-seq`. A file that exists but does not parse is a hard
+    /// error, never a silent seq 0.
+    #[arg(long)]
+    interop_cursor_file: Option<PathBuf>,
+    /// Cursor seed used ONLY when `--interop-cursor-file` does not exist yet
+    /// (first boot of the pair). 0 is correct only for a pair that has never
+    /// run; once the file exists it is authoritative and this flag is
+    /// ignored.
     #[arg(long, default_value_t = 0)]
     interop_start_seq: u64,
     /// Pause before retrying after a feed transport/decode failure. Not a poll
@@ -114,11 +122,12 @@ struct L1Path {
 }
 
 /// The interop path, resolved. Present only when the full peer triple
-/// (`--interop-peer-chain-id`, `--interop-feed-url`, `--self-chain-id`) was
-/// given.
+/// (`--interop-peer-chain-id`, `--interop-feed-url`, `--self-chain-id`) plus
+/// `--interop-cursor-file` were given.
 struct InteropPath {
     peer_chain_id: u64,
     feed_url: String,
+    cursor_file: CursorFile,
     cfg: InteropWatcherConfig,
 }
 
@@ -157,12 +166,40 @@ fn resolve_paths(args: &Args) -> anyhow::Result<(Option<L1Path>, Option<InteropP
                      cannot be its own remote origin"
                 );
             }
+            // The cursor file is REQUIRED, not optional-with-a-default: a
+            // watcher whose resume position lives only in a CLI flag replays
+            // (or worse, skips) on every restart, and the skip direction is a
+            // permanent lane hole.
+            let Some(path) = &args.interop_cursor_file else {
+                anyhow::bail!(
+                    "the interop path requires --interop-cursor-file (the durable resume \
+                     position; --interop-start-seq only seeds the very first boot)"
+                );
+            };
+            let cursor_file = CursorFile::new(path.clone());
+            // A corrupt file must stop the process HERE, before anything is
+            // derived — see `CursorFile::load` for why it is never treated
+            // as 0.
+            let start_seq = match cursor_file.load().context("load --interop-cursor-file")? {
+                Some(persisted) => {
+                    if args.interop_start_seq != 0 && args.interop_start_seq != persisted {
+                        tracing::info!(
+                            persisted,
+                            flag = args.interop_start_seq,
+                            "cursor file exists; ignoring --interop-start-seq"
+                        );
+                    }
+                    persisted
+                }
+                None => args.interop_start_seq,
+            };
             Some(InteropPath {
                 peer_chain_id,
                 feed_url: feed_url.clone(),
+                cursor_file,
                 cfg: InteropWatcherConfig {
                     self_chain_id,
-                    start_seq: args.interop_start_seq,
+                    start_seq,
                     retry_interval: Duration::from_secs(args.interop_retry_interval_secs),
                 },
             })
@@ -304,6 +341,7 @@ fn main() -> anyhow::Result<()> {
                 origin = interop.peer_chain_id,
                 self_chain_id = interop.cfg.self_chain_id,
                 start_seq = interop.cfg.start_seq,
+                cursor_file = %interop.cursor_file.path().display(),
                 "kardamom-da-watcher: publishing remote epochs onto tx_remote_epochs"
             );
             let source = WsRemoteChainSource::new(
@@ -317,6 +355,7 @@ fn main() -> anyhow::Result<()> {
                     LiveRemoteEpochsPublisher::new(tx_remote_epochs_pub),
                     source,
                     interop.cfg,
+                    Some(interop.cursor_file),
                 ),
             ));
         }
@@ -324,15 +363,44 @@ fn main() -> anyhow::Result<()> {
         // Wait for SIGTERM (orchestrator stop) or Ctrl-C, then ask each
         // watcher to exit at the next tick boundary. Drop on the shutdown
         // channel is also enough to signal, but explicit send() gives a
-        // clearer log line. A watcher that already fail-stopped on its own
-        // (an interop derivation fault) is simply already finished.
-        wait_for_shutdown().await;
+        // clearer log line.
+        //
+        // ALSO wait on the watcher tasks themselves: a watcher that finishes
+        // WITHOUT being asked to has fail-stopped (an interop derivation
+        // fault, or a closed publisher). While at least one other watcher is
+        // still running, the process stays up — the fault domain is the PAIR,
+        // and killing the L1 deposit path because a peer feed served a gap
+        // would widen it. But when the LAST watcher has fail-stopped there is
+        // nothing left to watch, and lingering as a healthy-looking husk
+        // would hide the halt from the orchestrator: exit nonzero so the
+        // supervisor (or an e2e harness) sees the fail-stop as a process
+        // outcome, not just a log line.
+        let all_fail_stopped = tokio::select! {
+            _ = wait_for_shutdown() => false,
+            () = async {
+                loop {
+                    if watchers.iter().all(|(_, h)| h.task.is_finished()) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            } => true,
+        };
         for (name, handle) in watchers {
+            if handle.task.is_finished() {
+                tracing::error!(watcher = name, "watcher exited without a shutdown request");
+            }
             let _ = handle.shutdown.send(());
             handle
                 .task
                 .await
                 .map_err(|e| anyhow::anyhow!("{name} watcher task panicked: {e}"))?;
+        }
+        if all_fail_stopped {
+            anyhow::bail!(
+                "every configured watcher fail-stopped (no shutdown was requested); \
+                 exiting nonzero so the halt is a process outcome"
+            );
         }
         Ok::<(), anyhow::Error>(())
     })?;

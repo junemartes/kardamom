@@ -40,6 +40,7 @@ clap.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true }
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [[bin]]
