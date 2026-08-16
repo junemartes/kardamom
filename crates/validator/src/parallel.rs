@@ -494,7 +494,77 @@ fn exec_record_in_scope<'a, S: StateDatabase>(
             scope.seed_layer(&layer)?;
             Ok(out)
         }
+        // Cross-chain deliveries mirror deposits: own commit semantics
+        // outside the scope, writes folded back so later records in this
+        // block/batch observe them.
+        BufferedRecord::XChain {
+            tx_idx,
+            origin_chain_id,
+            message,
+            position,
+        } => {
+            let out = kardamom_engine::executor::execute_xchain_tx(
+                snapshot,
+                parent,
+                delta,
+                env,
+                *tx_idx,
+                *position,
+                *origin_chain_id,
+                message,
+                idx_in_block,
+                cumulative,
+                bal,
+            )?;
+            let mut layer = PendingDelta::new();
+            layer.apply(out.1.clone());
+            scope.seed_layer(&layer)?;
+            Ok(out)
+        }
     }
+}
+
+/// Remove from `computed` the entries `claimed` lacks whose value equals the
+/// latest claimed value strictly before `unit` — i.e. re-statements of the
+/// already-established value.
+///
+/// WHY: the executor's wire claims come from ONE whole-block revm `Bal`,
+/// whose `BalWrites::update` records a write at a new index only when the
+/// value CHANGED vs the last recorded write. A batch-local capture starts
+/// empty, so the forced WriteSet-projection writes of deposits and 0x7D
+/// deliveries (`record_writeset_into_bal` fabricates originals to force
+/// write classification) record unconditionally — a delivery that merely
+/// touches the fee recipient at its unchanged balance is claimed by the
+/// block capture ONLY at the first occurrence and deduped afterwards, while
+/// every batch re-records it. Equality with the prior claim is exactly the
+/// dedup condition the block capture applied, so dropping these entries is
+/// lossless: a genuinely different value still diverges, and the reverse
+/// direction (claimed but not recomputed) stays strict — the block capture
+/// can never keep a write the batch capture dropped, because both dedup
+/// against the same last-recorded value.
+fn drop_wire_deduped(
+    computed: &mut ClaimSlice,
+    claimed: &ClaimSlice,
+    claims: &ClaimIndex,
+    unit: u64,
+) {
+    computed.storage.retain(|(addr, slot), v| {
+        claimed.storage.contains_key(&(*addr, *slot))
+            || claims.storage_seed(*addr, *slot, unit) != Some(*v)
+    });
+    computed.balance.retain(|addr, v| {
+        claimed.balance.contains_key(addr) || claims.balance_seed(*addr, unit) != Some(*v)
+    });
+    computed.nonce.retain(|addr, v| {
+        claimed.nonce.contains_key(addr) || claims.nonce_seed(*addr, unit) != Some(*v)
+    });
+    computed.code.retain(|addr, h| {
+        claimed.code.contains_key(addr)
+            || claims
+                .code_seed(*addr, unit)
+                .map(alloy_primitives::keccak256)
+                != Some(*h)
+    });
 }
 
 pub fn execute_batch<S: StateDatabase>(
@@ -557,7 +627,8 @@ pub fn execute_batch<S: StateDatabase>(
     if granularity <= 1 {
         for unit in first_index..=last_index {
             let claimed = claims.claims_in_range(unit, unit);
-            let computed = computed_idx.claims_in_range(unit, unit);
+            let mut computed = computed_idx.claims_in_range(unit, unit);
+            drop_wire_deduped(&mut computed, &claimed, claims, unit);
             if claimed != computed {
                 return Err(ExecutorError::Divergence(format!(
                     "tx {unit}: {}",
@@ -568,7 +639,8 @@ pub fn execute_batch<S: StateDatabase>(
     } else {
         let chunk = kardamom_engine::bal_ladder::chunk_of(first_index, k);
         let claimed = claims.claims_in_range(chunk, chunk);
-        let computed = computed_idx.claims_in_range(chunk, chunk);
+        let mut computed = computed_idx.claims_in_range(chunk, chunk);
+        drop_wire_deduped(&mut computed, &claimed, claims, chunk);
         if claimed != computed {
             return Err(ExecutorError::Divergence(format!(
                 "chunk {chunk} (txs {first_index}..={last_index}): {}",
@@ -902,6 +974,25 @@ mod engine_tests {
                 bal,
             )
             .expect("seq deposit"),
+            BufferedRecord::XChain {
+                tx_idx,
+                origin_chain_id,
+                message,
+                position,
+            } => kardamom_engine::executor::execute_xchain_tx(
+                snap,
+                parent,
+                delta,
+                env(),
+                *tx_idx,
+                *position,
+                *origin_chain_id,
+                message,
+                i,
+                cumulative,
+                bal,
+            )
+            .expect("seq xchain"),
         }
     }
 
@@ -1197,6 +1288,117 @@ mod engine_tests {
         assert_eq!(out.batches, 2);
     }
 
+    fn xchain(origin: u64, seq: u64, target: Address, i: u64) -> BufferedRecord {
+        use kardamom_types::xchain;
+        BufferedRecord::XChain {
+            tx_idx: TxIndex(i),
+            origin_chain_id: origin,
+            position: BPosition {
+                term_id: 0,
+                term_offset: (i * 64) as i32,
+            },
+            message: Box::new(xchain::XChainMessage {
+                source_hash: xchain::remote_source_hash(origin, seq),
+                seq,
+                origin_sender: Address::repeat_byte(0xA5),
+                target,
+                value: 0,
+                gas_limit: 100_000,
+                input: Default::default(),
+                callback: None,
+            }),
+        }
+    }
+
+    /// Cross-chain deliveries participate in the whole-block path like
+    /// deposits: buffered, dispatched through the SAME `execute_xchain_tx`
+    /// the streaming path uses, claims verified where produced, writes
+    /// seeding later batches. Parallel must equal sequential with a 0x7D
+    /// record mid-block (the slice-2 gap: this used to fail-stop in the
+    /// engine before the `BufferedRecord::XChain` arm existed).
+    #[test]
+    fn xchain_records_execute_in_parallel_blocks() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000F4");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        let origin = 424_242u64;
+        // tx, xchain delivery, tx, xchain delivery, tx — deliveries at
+        // bal indices 2 and 4, so with batch_size 1 their claims must seed
+        // the following batches.
+        let records: Vec<BufferedRecord> = vec![
+            tx(&signer, to, 0, 100, 0),
+            xchain(origin, 0, to, 1),
+            tx(&signer, to, 1, 100, 2),
+            xchain(origin, 1, to, 3),
+            tx(&signer, to, 2, 100, 4),
+        ];
+
+        let claims = honest_claims(&snap, &records);
+        let expected = seq_delta(&snap, &records);
+
+        for batch_size in [1usize, 2, 5] {
+            let out = execute_block_parallel(&snap, None, &records, &claims, env(), batch_size, 1)
+                .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
+            assert_eq!(out.delta.accounts, expected.accounts);
+            assert_eq!(out.delta.storage, expected.storage);
+            assert_eq!(out.receipts.len(), records.len());
+            // The deliveries surface as 0x7D receipts keyed by their
+            // remote source hash, exactly as on the streaming path.
+            for (seq, idx) in [(0u64, 1usize), (1, 3)] {
+                let r = &out.receipts[idx];
+                assert_eq!(r.tx_type, kardamom_types::TX_TYPE_XCHAIN);
+                assert_eq!(
+                    r.tx_hash,
+                    kardamom_types::xchain::remote_source_hash(origin, seq)
+                );
+                assert_eq!(r.from, kardamom_types::xchain::xchain_tx_sender(origin));
+                assert_eq!(r.to, Some(kardamom_types::xchain::INBOX));
+            }
+        }
+    }
+
+    /// A forged claim about a cross-chain delivery fails-stop like any
+    /// other — 0x7D records get no special trust in the induction.
+    #[test]
+    fn a_forged_xchain_claim_fails_stop() {
+        let signer = PrivateKeySigner::random();
+        let to = address!("00000000000000000000000000000000000000F5");
+        let snap = MockStateDatabase::builder()
+            .account(
+                signer.address(),
+                U256::from(10u128.pow(18)),
+                0,
+                alloy_primitives::KECCAK256_EMPTY,
+            )
+            .build();
+        let origin = 424_242u64;
+        let records: Vec<BufferedRecord> =
+            vec![xchain(origin, 0, to, 0), tx(&signer, to, 0, 1_000, 1)];
+        let mut claims = honest_claims(&snap, &records);
+        // Tamper the delivery's claimed nonce write (the aliased sender's
+        // nonce bump at bal index 1).
+        let aliased = kardamom_types::xchain::xchain_tx_sender(origin);
+        let w = claims.nonce.get_mut(&aliased).expect("delivery nonce claim");
+        let entry = w.iter_mut().find(|(i, _)| *i == 1).expect("index 1");
+        entry.1 += 7;
+
+        let err = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+            .expect_err("forged xchain claim must be caught");
+        match err {
+            ExecutorError::Divergence(msg) => {
+                assert!(msg.contains("tx 1"), "must name the producing unit: {msg}");
+            }
+            other => panic!("expected Divergence, got {other:?}"),
+        }
+    }
+
     /// Deposits inside a K > 1 chunk: chunk-aligned batches with a deposit
     /// mid-chunk verify and match sequential (the deposit's claims are
     /// quantized through the same shared ladder as tx claims).
@@ -1363,6 +1565,24 @@ pub(crate) fn records_json(records: &[BufferedRecord]) -> Vec<serde_json::Value>
                 "value": deposit.value.to_string(),
                 "gas_limit": deposit.gas_limit,
                 "input": alloy_primitives::hex::encode(&deposit.input),
+                "idx": tx_idx.0,
+                "pos": position.as_index(),
+            }),
+            BufferedRecord::XChain {
+                tx_idx,
+                origin_chain_id,
+                message,
+                position,
+            } => serde_json::json!({
+                "kind": "xchain",
+                "origin_chain_id": origin_chain_id,
+                "source_hash": format!("{:?}", message.source_hash),
+                "seq": message.seq,
+                "origin_sender": format!("{:?}", message.origin_sender),
+                "target": format!("{:?}", message.target),
+                "value": message.value.to_string(),
+                "gas_limit": message.gas_limit,
+                "input": alloy_primitives::hex::encode(&message.input),
                 "idx": tx_idx.0,
                 "pos": position.as_index(),
             }),

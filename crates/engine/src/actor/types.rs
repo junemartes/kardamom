@@ -85,6 +85,19 @@ pub enum BufferedRecord {
         deposit: kardamom_types::Deposit,
         position: BPosition,
     },
+    /// One derived cross-chain message (a 0x7D delivery). `origin_chain_id`
+    /// rides alongside for the same reason it does on
+    /// [`crate::reader::ReaderToExec::XChain`]: execution aliases the sender
+    /// and authenticates the Inbox call per origin, and the message itself
+    /// deliberately does not repeat the pair identity. Boxed like the reader
+    /// arm so the rare interop variant doesn't grow the enum every Tx clone
+    /// moves.
+    XChain {
+        tx_idx: TxIndex,
+        origin_chain_id: u64,
+        message: Box<kardamom_types::xchain::XChainMessage>,
+        position: BPosition,
+    },
 }
 
 /// What a block-execution strategy returns: the block's receipts in block

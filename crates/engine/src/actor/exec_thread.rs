@@ -511,16 +511,17 @@ where
     ) -> Result<Flow, ExecutorError> {
         self.check_in_order("XChain", tx_idx, position)?;
         if self.block_exec.is_some() {
-            // Whole-block execution (the validator's parallel path) has no
-            // BufferedRecord arm for cross-chain messages yet. Executing the
-            // record inline here while the strategy replays the block without
-            // it would fork the two paths — fail stop until the destination
-            // validator wiring lands (interop P1, validator slice).
-            return Err(ExecutorError::State(format!(
-                "cross-chain message (origin {origin_chain_id}, seq {}) is not supported by \
-                 whole-block execution on this build",
-                message.seq
-            )));
+            // Whole-block execution (the validator's parallel path): buffer
+            // like a deposit — the strategy replays the block's records in
+            // canonical order at the boundary, dispatching this arm through
+            // the SAME `execute_xchain_tx` the streaming path uses.
+            self.buffered.push(BufferedRecord::XChain {
+                tx_idx,
+                origin_chain_id,
+                message,
+                position,
+            });
+            return Ok(Flow::Continue);
         }
         let env = self.exec_env(self.current_block);
         let apply_start = Instant::now();
