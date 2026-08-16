@@ -483,3 +483,20 @@ harness and will cut the keccak/ecrecover share substantially. CI shape in
 round trip on every exec-core/types/guest change. Remaining for 3c: the
 validator `--prove-batches` harness (live capture wiring + prover
 shell-out + PR-4 batch alignment).
+
+### The first proof (2026-08-16)
+
+`kardamom-zk-host --prove` generated, verified, and persisted a REAL SP1
+core proof of the pipeline fixture block — the series' destination:
+
+- **setup 8.9s, prove 401s, verify 145ms**; 4.2M proof artifact
+- public values byte-identical to the host expectation
+- CPU-only, UNPATCHED guest (~7.9M cycles → ~20k cycles/s core proving)
+
+Numbers to design PR 4's cadence against: unpatched CPU proving runs
+~200x slower than the chain (401s for a block that executes in ms), so
+production proving needs the accelerator patches (keccak/k256 dominate
+the cycle count), prover hardware (GPU: sp1 cuda mode), and PR 4's
+proof-per-batch cadence rather than proof-per-block. Verification cost
+(145ms core; the L1 path uses the groth16/plonk wrap, ~constant and
+cheap) is a non-issue.
