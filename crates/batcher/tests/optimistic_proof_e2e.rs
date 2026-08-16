@@ -260,7 +260,9 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
     // A griefer submits the SAME real proof. Its proven post == the claimed
     // root, so the contract rejects on `ProofAgreesWithClaim` BEFORE the
     // verifier — an honest proposer cannot be challenged even with a valid
-    // proof.
+    // proof. `.send()` returns Ok for a tx that reverts on chain (the revert
+    // surfaces in the receipt), so assert the receipt reverted — OR, if the
+    // node simulated and rejected at submit, an Err is equally acceptable.
     let grief = oracle
         .challengeBlock(
             1,
@@ -272,8 +274,15 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
         )
         .send()
         .await;
+    let grief_reverted = match grief {
+        Err(_) => true,
+        Ok(pending) => match pending.get_receipt().await {
+            Ok(receipt) => !receipt.status(),
+            Err(_) => true,
+        },
+    };
     assert!(
-        grief.is_err(),
+        grief_reverted,
         "challenging an honest claim must revert (ProofAgreesWithClaim)"
     );
     // The honest claim survives untouched.
