@@ -122,6 +122,7 @@ fn with_log_config(cmd: &mut Command, spec: &ServiceSpec<'_>) {
 
 /// L1 wiring for the bridge scenarios: the da-watcher needs the lockbox to
 /// watch, and the validator's attester needs the oracle + a key.
+#[derive(Clone)]
 pub struct L1Wiring {
     pub rpc_url: String,
     pub lockbox: String,

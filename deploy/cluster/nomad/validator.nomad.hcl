@@ -17,6 +17,27 @@
 # NOTE: this job uses file() for its templates, so submit it from the
 # deploy/cluster/ directory (scripts/deploy.sh does this).
 
+# Epoch verification (phase D). BOTH must be set to enable it: the validator
+# then re-derives every epoch from L1 and fail-stops on disagreement. Left
+# empty, it still enforces the origin SEQUENCE (rules 1-2, which need no L1)
+# but cannot check an epoch's contents.
+#
+# Point l1_rpc_url at the LIGHT CLIENT (l1-light-client.nomad.hcl), not at an
+# upstream RPC: a plain endpoint is blindly trusted, and the whole value of
+# deriving from L1 is that it is a source the sequencer cannot influence
+# (issue #163).
+variable "l1_rpc_url" {
+  type        = string
+  description = "Verified L1 JSON-RPC — the light client's endpoint. Empty disables epoch CONTENT verification."
+  default     = ""
+}
+
+variable "lockbox_address" {
+  type        = string
+  description = "L1 ETHLockbox proxy, used to select DepositInitiated logs when re-deriving epochs. Empty disables epoch CONTENT verification."
+  default     = ""
+}
+
 job "validator" {
   datacenters = ["dc1"]
   type        = "service"
@@ -88,7 +109,7 @@ job "validator" {
           # by this validator (trust class of the #78 catch-up).
           "/opt/kardamom/checkpoints:/opt/kardamom/checkpoints",
         ]
-        args = [
+        args = concat([
           # Seeded parallel batch re-execution from the EIP-7928 BAL
           # (falls back to sequential per block when claims are absent).
           "--parallel-validation",
@@ -130,7 +151,16 @@ job "validator" {
           # randomized blocks; cadence 8 still shadow-checks hundreds of blocks
           # per e2e run under real load).
           "--trie-shadow-check", "8",
-        ]
+        ],
+        # Epoch verification against L1 (phase D). Appended ONLY when both
+        # are configured — the validator requires --lockbox to parse as an
+        # address, so passing it empty would break every deploy that has not
+        # opted in. Unset, the validator still enforces the origin SEQUENCE;
+        # only the content check is off.
+        var.l1_rpc_url == "" || var.lockbox_address == "" ? [] : [
+          "--l1-rpc-url", var.l1_rpc_url,
+          "--lockbox", var.lockbox_address,
+        ])
       }
 
       env {

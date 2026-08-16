@@ -42,13 +42,24 @@ pub trait L1Source: Send + Sync + 'static {
     /// Latest finalized L1 block number.
     async fn finalized_block_number(&self) -> Result<u64, L1SourceError>;
 
-    /// Hash of L1 block `number`.
+    /// `(hash, parent_hash)` of L1 block `number`, from ONE round trip.
     ///
-    /// Needed because an epoch must be emitted for EVERY finalized L1 block,
-    /// including ones with no deposits — and a block with no logs has no log
-    /// to carry its hash. The hash is what the epoch's canonical id is derived
-    /// from, so it cannot be skipped or synthesised.
-    async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError>;
+    /// The hash is needed because an epoch must be emitted for EVERY finalized
+    /// L1 block, including ones with no deposits — and a block with no logs has
+    /// no log to carry its hash. The hash is what the epoch's canonical id
+    /// derives from, so it cannot be skipped or synthesised.
+    ///
+    /// The parent hash rides along because the verifier CHAINS consecutive
+    /// origins: block N's parent must be block N-1's hash. Both live in the
+    /// same header, so chaining costs no extra request — and it forces a lying
+    /// L1 endpoint to fabricate a consistent chain rather than isolated
+    /// blocks. See issue #163.
+    async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError>;
+
+    /// Hash of L1 block `number`. Convenience over [`Self::block_ids`].
+    async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError> {
+        Ok(self.block_ids(number).await?.0)
+    }
 
     /// `DepositInitiated` logs emitted by `lockbox` in the inclusive block
     /// range `[from_block, to_block]`. Order within the response is the
@@ -127,19 +138,23 @@ pub mod fakes {
                 .unwrap_or(Err(L1SourceError::NotFinalized))
         }
 
-        async fn block_hash(&self, number: u64) -> Result<B256, L1SourceError> {
+        async fn block_ids(&self, number: u64) -> Result<(B256, B256), L1SourceError> {
             if *self.block_hash_fails.lock().unwrap() {
                 return Err(L1SourceError::Provider(
                     "scripted block_hash failure".into(),
                 ));
             }
-            Ok(self
-                .hashes
-                .lock()
-                .unwrap()
-                .get(&number)
-                .copied()
-                .unwrap_or_else(|| Self::filler_hash(number)))
+            let hashes = self.hashes.lock().unwrap();
+            let at = |n: u64| {
+                hashes
+                    .get(&n)
+                    .copied()
+                    .unwrap_or_else(|| Self::filler_hash(n))
+            };
+            // Filler hashes chain by construction — block N's parent is the
+            // filler for N-1 — so a mock chain is self-consistent unless a
+            // test deliberately breaks it.
+            Ok((at(number), at(number.saturating_sub(1))))
         }
 
         async fn deposit_logs(
