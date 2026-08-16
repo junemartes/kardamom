@@ -667,6 +667,12 @@ fn run_pipelined(
                             break;
                         }
                         pool.advance_base(&layer_of(&engine_deltas, advanced_to));
+                        // Settled: hand the shell back to the fold pool.
+                        if let Some(arc) = engine_deltas[advanced_to].take()
+                            && let Ok(d) = std::sync::Arc::try_unwrap(arc)
+                        {
+                            pool.recycle_delta(d);
+                        }
                         advanced_to += 1;
                     }
                     let t_adv = t_a.elapsed();
@@ -968,7 +974,7 @@ fn run_mdbx_ab(
                     if prog {
                         eprintln!("[prog] block {bi}: pool submit");
                     }
-                    let out = pool.run_block_prepared(
+                    let mut out = pool.run_block_prepared(
                         views,
                         PendingDelta::new(),
                         e,
@@ -1006,6 +1012,9 @@ fn run_mdbx_ab(
                             w,
                         );
                     }
+                    // Off the measured window (a2 snapped above): the
+                    // delta shell goes back to the fold pool.
+                    pool.recycle_delta(std::mem::take(&mut out.delta));
                     if prog {
                         eprintln!("[prog] block {bi}: pool done");
                     }

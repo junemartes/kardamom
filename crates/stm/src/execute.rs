@@ -1299,6 +1299,13 @@ struct RecyclePools {
     /// per-tx `Vec::with_capacity` + growth reallocs were the largest
     /// STM-specific allocation (~4KB/tx at contract weight).
     read_bufs: Mutex<Vec<Vec<ReadRecord>>>,
+    /// Cleared result-carcass vecs (4096 x ~450B TxResult — one of the
+    /// ~16 huge per-block allocations the size histogram exposed).
+    carcasses: Mutex<Vec<Vec<TxResult>>>,
+    /// Cleared PendingDelta shells for the fold (the maps' tables are
+    /// the other huge per-block allocation); returned by the consumer
+    /// via [`PoolHandle::recycle_delta`] once a release settles.
+    deltas: Mutex<Vec<PendingDelta>>,
 }
 
 struct SpentArena {
@@ -1552,6 +1559,8 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         mv_clean: Mutex::new(Vec::new()),
         mv_parked: Mutex::new(Vec::new()),
         read_bufs: Mutex::new(Vec::new()),
+        carcasses: Mutex::new(Vec::new()),
+        deltas: Mutex::new(Vec::new()),
     });
     std::thread::scope(|scope| {
         // Reaper: drops junk freight and SCRUBS recyclable arenas (in
@@ -1561,16 +1570,25 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         scope.spawn(move || {
             while let Ok(r) = reap_rx.recv() {
                 match r {
-                    Reap::Results { results, pools } => {
+                    Reap::Results { mut results, pools } => {
                         let mut bufs: Vec<Vec<ReadRecord>> = Vec::with_capacity(results.len());
-                        for mut r in results {
+                        for r in results.iter_mut() {
                             let mut b = std::mem::take(&mut r.reads);
                             b.clear();
                             bufs.push(b);
                         }
-                        let mut g = pools.read_bufs.lock().expect("pools poisoned");
-                        let room = MAX_BLOCK_TXS.saturating_sub(g.len());
-                        g.extend(bufs.into_iter().take(room));
+                        {
+                            let mut g = pools.read_bufs.lock().expect("pools poisoned");
+                            let room = MAX_BLOCK_TXS.saturating_sub(g.len());
+                            g.extend(bufs.into_iter().take(room));
+                        }
+                        // The carcass vec itself recycles: drop the spent
+                        // TxResults in place, keep the 4096-slot buffer.
+                        results.clear();
+                        let mut g = pools.carcasses.lock().expect("pools poisoned");
+                        if g.len() < 4 {
+                            g.push(results);
+                        }
                     }
                     Reap::Arena {
                         mut slots,
@@ -2035,6 +2053,21 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             sess.push_prepared(*t, *p, e.clone(), prep)?;
         }
         sess.seal()
+    }
+
+    /// Return a settled release's delta shell for reuse: the fold's
+    /// PendingDelta hashmap tables are ~1MB per block, one of the huge
+    /// per-block allocations the size histogram exposed. The consumer
+    /// calls this once a release's Arc unwraps (after advance_base);
+    /// entries drop here, tables keep their capacity.
+    pub fn recycle_delta(&self, mut d: PendingDelta) {
+        d.accounts.clear();
+        d.storage.clear();
+        d.code.clear();
+        let mut g = self.recycle.deltas.lock().expect("pools poisoned");
+        if g.len() < 4 {
+            g.push(d);
+        }
     }
 
     /// Abort the executing block and any staged successor: workers
@@ -2609,7 +2642,12 @@ fn block_tail<S: StateDatabase + Sync>(
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
     let n = txs.len();
-    let mut tx_results = Vec::with_capacity(n);
+    let mut tx_results = recycle
+        .carcasses
+        .lock()
+        .expect("pools poisoned")
+        .pop()
+        .unwrap_or_else(|| Vec::with_capacity(n));
     // take() IN PLACE: the spent OnceLock array keeps its buffer and
     // recycles through the reaper (steady-state zero-allocation blocks).
     for cell in ctx.results.iter_mut().take(n) {
@@ -2735,7 +2773,12 @@ fn block_tail<S: StateDatabase + Sync>(
     let val_ns = std::sync::atomic::AtomicU64::new(0);
     let fold_inline = |results: &[TxResult]| -> PendingDelta {
         let mut sink_final: Option<(u64, U256, B256)> = None;
-        let mut d = PendingDelta::new();
+        let mut d = recycle
+            .deltas
+            .lock()
+            .expect("pools poisoned")
+            .pop()
+            .unwrap_or_default();
         d.accounts.reserve(results.len() * 2);
         d.storage.reserve(results.len());
         for r in results.iter() {
@@ -2810,6 +2853,12 @@ fn block_tail<S: StateDatabase + Sync>(
             // the released delta must carry CREATEd code for the next
             // block's readers.
             let results_ref: &[TxResult] = &tx_results;
+            let warm_delta = recycle
+                .deltas
+                .lock()
+                .expect("pools poisoned")
+                .pop()
+                .unwrap_or_default();
             let fold = sc.spawn(move || {
                 if !tail_pins.is_empty() {
                     let _ = core_affinity::set_for_current(core_affinity::CoreId {
@@ -2817,7 +2866,7 @@ fn block_tail<S: StateDatabase + Sync>(
                     });
                 }
                 let mut sink_final: Option<(u64, U256, B256)> = None;
-                let mut d = PendingDelta::new();
+                let mut d = warm_delta;
                 d.accounts.reserve(results_ref.len() * 2);
                 d.storage.reserve(results_ref.len());
                 for r in results_ref.iter() {
