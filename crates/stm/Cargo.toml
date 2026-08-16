@@ -17,6 +17,7 @@ alloy-consensus.workspace = true
 bytes = "1"
 revm.workspace = true
 tracing.workspace = true
+crossbeam-queue = "0.3.13"
 
 [dev-dependencies]
 alloy-eips.workspace = true

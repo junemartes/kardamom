@@ -3362,10 +3362,9 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 }
                 // Dry. Apply any parked completions MYSELF before parking:
                 // this is what makes batching safe — the pool can never sit
-                // idle on DAG updates nobody applied. The queue lock is
-                // dropped first (lock order: never hold a queue lock while
-                // taking the graph lock).
-                drop(q);
+                // idle on DAG updates nobody applied. (Queue lock already
+                // dropped: never hold a queue lock while taking the graph
+                // lock.)
                 if ctx.pending.load(Ordering::SeqCst) > 0 {
                     ctx.prune(true);
                     q = qh.q.lock().expect("queue poisoned");

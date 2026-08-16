@@ -452,3 +452,50 @@ Shared-box note: perf -C windows caught ANOTHER Claude session's V8
 "HeapHelper" threads at 50% on the worker cores (affinity 0-11).
 Process-scoped `perf record -p/-- cmd` is immune; timing comparisons
 on this box must check `pgrep claude` first.
+
+## Admission-queue redesign (2026-08-16, co-designed) — claim-CAS ring, tombstone skips
+
+Motivation (measured): for independent micro-txs the serial feed IS the
+span (workers consume one 2.5µs tx per 0.6µs; admission delivers one
+per ~1.0-1.5µs; utilization 58%). The queue op is only ~0.2µs of that,
+but its LOCK is what prevents sharding the rest of admission later —
+and the pop lock is what the stall/steal paths serialize on.
+
+Structure (per worker, pre-allocated, O(n) memory, O(1) amortized ops,
+lock-free, NO unsafe — packed AtomicU64 slots):
+
+    slot: EMPTY(0) | VALUE(tag|tx) | TOMBSTONE(tag|skip)
+    append:  tail.fetch_add + slot.store(VALUE, Release)   [feed/prune]
+    claim:   verify fifo_ready(tx) THEN CAS VALUE->TOMBSTONE
+             — sound WITHOUT a lock because readiness is MONOTONE
+             (a completed predecessor stays completed); the CAS is the
+             single consumption point, so putback ceases to exist.
+    head:    owner-only (thieves claim mid-queue, never touch head);
+             advance follows tombstone skip pointers with lazy
+             union-find-style compression (stale skips only undershoot
+             — safe, amortized O(1)).
+    queued flag: stored AFTER the publish; a racing coverage check
+             reads false and takes an edge (the always-correct path).
+    wrap:    cap = MAX_BLOCK_TXS and <=1 push per tx per block — the
+             ring never wraps mid-block; reset via the arena scrub.
+    parking: tiny per-worker mutex+cv, COLD path only.
+
+Wins: feed append ~10ns uncontended and shardable later; owner pop = 1
+CAS; the stalled-head case IMPROVES (owner claims a later ready item
+instead of yield-spinning); the pop/verify/putback race class (two
+measured wedges in the campaign) is structurally gone.
+
+Rejected on the way: a SHARED independent lane (no assignment at all)
+— perfect balance for independents, but chain HEADS are
+indistinguishable from independents at admission, so chains lost their
+FIFO anchors and eager coverage collapsed to edges (hot_chain test
+failed 8/8, deterministically). The ring keeps every chain semantic in
+place.
+
+Test plan: the flat-table torture methodology — packed-word oracle
+tests, claim-storm races (owner vs thieves vs producers), stalled-head
+chains, plus the standing equivalence + lying-stats gauntlets.
+
+Follow-up (needed for 4x on independents): slim the remaining ~1µs of
+admission — batch node init, cheaper last-toucher upserts, and (the
+lock now being gone) shard admission for predicted-independent txs.
