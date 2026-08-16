@@ -118,6 +118,13 @@ struct Args {
     /// production-shaped settlement. Reports aggregate throughput.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pipeline: bool,
+    /// With --pipeline: layer block N+1 on the ENGINE's own deltas,
+    /// released speculatively at block N's fold (spec P3b) — the
+    /// production shape. Default keeps the baseline-delta layering
+    /// (measures pipeline mechanics only). Scenarios must be
+    /// wound-free: a corrected release fails the run loudly.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
+    pipeline_speculative: bool,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -339,6 +346,7 @@ fn run_pipelined(
     pin_cores: Vec<usize>,
     warmup_blocks: usize,
     keep_hot: bool,
+    speculative: bool,
 ) -> anyhow::Result<()> {
     use kardamom_state::{Durability, StateEnvBuilder, StateWriter, WriteBatch};
     use kardamom_types::{AccountChange, BlockBoundary};
@@ -528,16 +536,54 @@ fn run_pipelined(
                     Ok(())
                 }
             });
-            // Arc layers per unsettled predecessor — zero clones, zero
-            // merges; the pool's base cache advances lazily as the writer
-            // confirms heights.
-            let deltas_arc: Vec<std::sync::Arc<PendingDelta>> = baseline
-                .iter()
-                .map(|(_, d)| std::sync::Arc::new(d.clone()))
-                .collect();
+            // Layer source. BASELINE mode: pass A's deltas, Arc'd up
+            // front — measures pipeline mechanics with the answer known.
+            // SPECULATIVE mode (P3b, the production shape): the engine's
+            // own deltas, received from the tail's streaming release at
+            // each block's FOLD — block fi cannot be layered before
+            // fi-1's release arrives, which is exactly the pipeline's
+            // sync point (execution of fi overlaps only fi-1's
+            // validate/hash/receipts/settle tail).
+            let deltas_arc: Vec<std::sync::Arc<PendingDelta>> = if speculative {
+                Vec::new()
+            } else {
+                baseline
+                    .iter()
+                    .map(|(_, d)| std::sync::Arc::new(d.clone()))
+                    .collect()
+            };
+            let mut engine_deltas: Vec<Option<std::sync::Arc<PendingDelta>>> =
+                vec![None; n_flow];
+            let (rel_tx, rel_rx) =
+                std::sync::mpsc::channel::<kardamom_stm::execute::DeltaRelease>();
+            let layer_of = |engine_deltas: &[Option<std::sync::Arc<PendingDelta>>],
+                            k: usize|
+             -> std::sync::Arc<PendingDelta> {
+                if speculative {
+                    engine_deltas[k].clone().expect("release drained in order")
+                } else {
+                    deltas_arc[k].clone()
+                }
+            };
             let mut advanced_to: usize = 0;
             for fi in 0..n_flow {
                 let t0 = Instant::now();
+                if speculative && fi > 0 {
+                    // Releases arrive in submission order (one tail
+                    // thread): drain until fi-1's is in hand.
+                    while engine_deltas[fi - 1].is_none() {
+                        let rel = rel_rx.recv().expect("tail release channel");
+                        assert!(
+                            !rel.corrected,
+                            "wound in pipeline bench (block {}) — scenario must be wound-free",
+                            rel.block
+                        );
+                        let k = (rel.block as usize)
+                            .checked_sub(warm + 1)
+                            .expect("flow-range release");
+                        engine_deltas[k] = Some(rel.delta);
+                    }
+                }
                 let h = writer_b
                     .snapshot_rx
                     .current()
@@ -548,13 +594,13 @@ fn run_pipelined(
                     if bn > h {
                         break;
                     }
-                    pool.advance_base(&deltas_arc[advanced_to]);
+                    pool.advance_base(&layer_of(&engine_deltas, advanced_to));
                     advanced_to += 1;
                 }
                 // NEWEST FIRST.
                 let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
                     .rev()
-                    .map(|k| deltas_arc[k].clone())
+                    .map(|k| layer_of(&engine_deltas, k))
                     .collect();
                 let t_base = t0.elapsed();
                 let t1 = Instant::now();
@@ -575,7 +621,12 @@ fn run_pipelined(
                 }
                 let t_feed = t2.elapsed();
                 let t3 = Instant::now();
-                settle_tx.send((fi, sess.submit()?)).expect("settler alive");
+                let ticket = if speculative {
+                    sess.submit_streaming(rel_tx.clone(), true)?
+                } else {
+                    sess.submit()?
+                };
+                settle_tx.send((fi, ticket)).expect("settler alive");
                 if timing {
                     eprintln!(
                         "pipe block {fi}: base {t_base:?} views {t_views:?} feed {t_feed:?} hand {:?}",
@@ -1396,6 +1447,7 @@ fn main() -> anyhow::Result<()> {
                 pin_cores.clone(),
                 a.warmup_blocks,
                 a.keep_hot,
+                a.pipeline_speculative,
             );
             if let (Some(g), Some(path)) = (guard, a.pprof_out.as_ref())
                 && let Ok(report) = g.report().build()

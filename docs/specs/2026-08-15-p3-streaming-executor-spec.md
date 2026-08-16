@@ -207,3 +207,44 @@ Credit-deferral / `pending_credits` observation edges (designed earlier
 in this campaign — composes with, but is not required by, this spec);
 cold-barrier watermark (O(1) barriers — filed, independent); multi-node
 concerns (the pipeline is within one executor).
+
+## P3b первое измерение (2026-08-16) — the sync point is in the wrong place
+
+Engine protocol landed and adversarially tested (streaming release at
+fold, wound → corrected re-issue → consumer `abort_active` → rebuild;
+the test also exposed and fixed a latent repair-path bug: layers were
+dropped from the materialized prefix). Bench grew
+`--pipeline-speculative`: block N+1 layered on the ENGINE's released
+delta, production-shaped.
+
+Measured (parcounter cw100, 4k-tx blocks, w=4, clean-box protocol):
+
+    block-at-a-time      2.68x   (21.4 ms/block)
+    pipeline, baseline   2.66x   (layers known in advance — mechanics only)
+    pipeline, SPECULATIVE 2.08x  (26.1 ms/block)
+
+The naive sequencing LOSES: waiting for N's fold-release before
+BUILDING N+1's session puts the feed (~3 ms) and the fold (~2.5 ms)
+back on the critical path — the exact milliseconds the pipeline exists
+to hide. The release point is as early as it can be; the consumer's
+wait is what must move.
+
+Next unit, in order of leverage:
+
+1. **Late-bound layers**: admission (predict + DAG + queues) is
+   layer-independent — only `sink_start` and worker reads need them.
+   Build and FEED N+1's session during N's execution; bind the layer
+   vec when the release arrives; gate worker start on bind (the
+   install/generation gate already exists). Recovers the feed (~3 ms).
+2. **The mv cache IS the layer**: N's MvCache already holds every
+   final value (highest version = final; read at idx MAX) the moment
+   execution drains — BEFORE any fold. Let N+1's MvView probe
+   predecessor caches directly; the fold then runs entirely off the
+   critical path (needed only for writer settlement and
+   advance_base). Removes the fold (~2.5 ms). Deeper speculation
+   (pre-verdict values), same wound-abort unwind — machinery already
+   tested. Requires MvCache to outlive its block (MvPool exists on
+   `stash/flat-seqlock-tables`; the RwLock cache pools the same way).
+3. Ceiling then ≈ span + install ≈ 15.4 ms → ~3.5x at cw100 — the
+   goal number, with span-slack packing (~2.6 ms of imperfect
+   dispatch) as the remaining margin.
