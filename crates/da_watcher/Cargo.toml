@@ -14,6 +14,7 @@ test-support = []
 
 [dependencies]
 kardamom-types = { workspace = true }
+kardamom-interop-feed = { workspace = true }
 kardamom-obs = { path = "../obs" }
 
 alloy-primitives = { workspace = true, features = ["serde"] }

@@ -42,6 +42,7 @@ alloy-sol-types = { version = "1.6", features = ["json"] }
 alloy-node-bindings = "2.0"
 
 kardamom-types = { path = "crates/types" }
+kardamom-interop-feed = { path = "crates/interop-feed" }
 kardamom-exec-core = { path = "crates/exec-core" }
 kardamom-log = { path = "crates/log" }
 kardamom-engine = { path = "crates/engine" }
