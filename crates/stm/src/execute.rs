@@ -1226,6 +1226,28 @@ struct TailJob<S: StateDatabase> {
     edges: usize,
     dispatch: Vec<u32>,
     out: std::sync::mpsc::Sender<Result<StmOutcome, ExecutorError>>,
+    delta_out: Option<DeltaOut>,
+}
+
+/// Streaming delta hand-off (spec P3): block N's folded delta, released
+/// to whoever layers block N+1 — before N's receipts, and (in
+/// speculative mode) before N's validation verdict.
+pub struct DeltaRelease {
+    pub block: u64,
+    pub delta: std::sync::Arc<PendingDelta>,
+    /// True when this re-issues a block whose earlier speculative
+    /// release was invalidated by a wound: everything layered on the
+    /// stale release must be aborted and rebuilt on THIS delta.
+    pub corrected: bool,
+}
+
+struct DeltaOut {
+    tx: std::sync::mpsc::Sender<DeltaRelease>,
+    /// Speculative (spec P3b): release at fold, CONCURRENT with
+    /// validation — a wound invalidates the release (a `corrected`
+    /// re-issue follows). Conservative (P3a): release only after the
+    /// verdict, when the delta can no longer change.
+    speculative: bool,
 }
 
 /// A submitted block's pending outcome. Outcomes complete in submission
@@ -1343,6 +1365,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         edges,
                         dispatch,
                         out,
+                        delta_out,
                     } = job;
                     // Drain: wait out the in-flight tail of execution.
                     // WATCHDOG as in the inline path — a stranded edge
@@ -1433,7 +1456,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                     let t_drain = t_drain0.elapsed();
                     let _ = out.send(block_tail(
                         ctx, txs, t_exec_wall, t_drain, cold, edges, dispatch, hot, tow,
-                        &pins, &reaper, &avg,
+                        &pins, &reaper, &avg, delta_out,
                     ));
                 }
             });
@@ -2123,6 +2146,51 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 edges,
                 dispatch,
                 out,
+                delta_out: None,
+            })
+            .map_err(|_| ExecutorError::State("stm pool: tail thread gone".into()))?;
+        Ok(BlockTicket { rx })
+    }
+
+    /// `submit`, plus a streaming delta release (spec P3): the tail
+    /// sends this block's folded delta on `delta_tx` as soon as it
+    /// exists — at the fold, before validation, when `speculative`
+    /// (P3b); after the verdict when not (P3a). On a wound the tail
+    /// sends a second, `corrected` release; the consumer must abort
+    /// anything layered on the first.
+    pub fn submit_streaming(
+        self,
+        delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
+        speculative: bool,
+    ) -> Result<BlockTicket, ExecutorError> {
+        let BlockSession {
+            pool,
+            ctx,
+            txs,
+            started,
+            cold,
+            edges,
+            dispatch,
+            ..
+        } = self;
+        ctx.sealed.store(true, Ordering::SeqCst);
+        for q in &ctx.queues {
+            q.cv.notify_all();
+        }
+        let (out, rx) = std::sync::mpsc::channel();
+        pool.tail
+            .send(TailJob {
+                ctx,
+                txs,
+                started,
+                cold,
+                edges,
+                dispatch,
+                out,
+                delta_out: Some(DeltaOut {
+                    tx: delta_tx,
+                    speculative,
+                }),
             })
             .map_err(|_| ExecutorError::State("stm pool: tail thread gone".into()))?;
         Ok(BlockTicket { rx })
@@ -2147,6 +2215,7 @@ fn block_tail<S: StateDatabase + Sync>(
     pin_cores: &[usize],
     reaper: &std::sync::mpsc::Sender<Reap>,
     avg_tx_ns: &std::sync::atomic::AtomicU64,
+    delta_out: Option<DeltaOut>,
 ) -> Result<StmOutcome, ExecutorError> {
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
@@ -2167,71 +2236,6 @@ fn block_tail<S: StateDatabase + Sync>(
     }
 
     let t_extract = t_extract0.elapsed();
-    // Validation: every recorded read must still be the highest
-    // version below the reader. A conviction is a WOUND — the marks
-    // missed a real conflict (the tx read a cell an earlier tx wrote
-    // without a mark to park on).
-    let t_val = std::time::Instant::now();
-    // PARALLEL: replay is read-only against the multi-version cache
-    // and independent per tx — it was ~15ms of serial tail on a 9k-tx
-    // set, the single largest block in the commit path. Scoped
-    // threads, unpinned (the caller's cores are the hot ones — see
-    // the hash phase note).
-    let n_val = tx_results.len();
-    let val_threads = ctx.queues.len().min(n_val.max(1));
-    let wounded: Vec<usize> = if val_threads > 1 && n_val > 256 {
-        let chunk = n_val.div_ceil(val_threads);
-        let mut parts: Vec<Vec<usize>> = Vec::with_capacity(val_threads);
-        let tail_pins: &[usize] = if keep_hot {
-            // Workers spin-YIELD on these cores between blocks, so a
-            // tail thread pinned there gets a hot, instantly-yielded
-            // core. Without keep_hot the cores are cold (or hold
-            // SCHED_IDLE squatters, whose preemption latency measured
-            // 21ms vs 10.6 on a 9k-hash phase) — stay on the caller's
-            // mask then.
-            pin_cores
-        } else {
-            &[]
-        };
-        std::thread::scope(|sc| {
-            let handles: Vec<_> = tx_results
-                .chunks(chunk)
-                .enumerate()
-                .map(|(ci, part)| {
-                    let base = ci * chunk;
-                    let mv = &ctx.mv;
-                    sc.spawn(move || {
-                        if !tail_pins.is_empty() {
-                            let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                                id: tail_pins[ci % tail_pins.len()],
-                            });
-                        }
-                        part.iter()
-                            .enumerate()
-                            .filter(|(j, r)| {
-                                let i = base + j;
-                                r.reads.iter().any(|rec| !mv.validate(i as u32, rec))
-                            })
-                            .map(|(j, _)| base + j)
-                            .collect::<Vec<usize>>()
-                    })
-                })
-                .collect();
-            for h in handles {
-                parts.push(h.join().expect("validation thread"));
-            }
-        });
-        parts.concat()
-    } else {
-        tx_results
-            .iter()
-            .enumerate()
-            .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let t_validate = t_val.elapsed();
-    let wounds = wounded.len();
 
     // Canonical-order commit. A wounded tx is RE-EXECUTED here against
     // the exact materialized prefix (the delta as of its position), so
@@ -2248,74 +2252,65 @@ fn block_tail<S: StateDatabase + Sync>(
     let mut delta = PendingDelta::new();
     let mut cumulative = 0u64;
     let mut sink_running = ctx.sink_start_balance;
-    let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
-    // A tx after a re-executed one may also be stale: once ANY wound
-    // fires, later txs are re-checked against the live prefix.
-    if let Some(first) = wounded_set.iter().copied().min() {
-        for i in first..n {
-            wounded_set.insert(i);
+    // FAST-PATH PREFIX — runs before the validation verdict exists.
+    //
+    // The write-set hash is ~1.25us of keccak per tx and CANNOT be
+    // made cheaper (it is one permutation per 136 bytes of a
+    // contract the receipts depend on). On the serial commit tail
+    // it was 72% of that tail — the largest fixed parallelization
+    // tax in the engine, untouched by worker count.
+    //
+    // It does not have to be serial. The only thing forcing it
+    // there is the accumulator's absolute balance, and THAT is a
+    // prefix sum: computable in one cheap pass with no hashing, so
+    // afterwards every tx's hash is independent.
+    //
+    // Phase 1 (serial, ~ns/tx): cumulative gas + accumulator
+    // materialization. Safe before the verdict: the repair path's
+    // kept-prefix arm performs these exact mutations itself
+    // (idempotent), and re-executed txs are rebuilt from scratch.
+    for r in tx_results.iter_mut() {
+        cumulative += r.receipt.gas_used;
+        r.receipt.cumulative_gas_used = cumulative;
+        sink_running += r.fee_delta;
+        if r.sink_touched
+            && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
+        {
+            entry.1.1 = sink_running;
         }
     }
-    let repairing = !wounded_set.is_empty();
-
-    if !repairing {
-        // FAST PATH — the one that runs essentially always.
-        //
-        // The write-set hash is ~1.25us of keccak per tx and CANNOT be
-        // made cheaper (it is one permutation per 136 bytes of a
-        // contract the receipts depend on). On the serial commit tail
-        // it was 72% of that tail — the largest fixed parallelization
-        // tax in the engine, untouched by worker count.
-        //
-        // It does not have to be serial. The only thing forcing it
-        // there is the accumulator's absolute balance, and THAT is a
-        // prefix sum: computable in one cheap pass with no hashing, so
-        // afterwards every tx's hash is independent.
-        //
-        // Phase 1 (serial, ~ns/tx): cumulative gas + accumulator
-        // materialization.
-        for r in tx_results.iter_mut() {
-            cumulative += r.receipt.gas_used;
-            r.receipt.cumulative_gas_used = cumulative;
-            sink_running += r.fee_delta;
-            if r.sink_touched
-                && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
-            {
-                entry.1.1 = sink_running;
-            }
-        }
-        // Phases 2+3, OVERLAPPED (not fused — fusion measured worse
-        // twice): with the fee sink filtered from the fold, the hash
-        // lanes only READ write sets (their one mutation, the receipt
-        // wsh, goes to a side array), and the fold COPIES entries
-        // (all Copy types) instead of draining. The two phases then
-        // share `&tx_results` read-only and run CONCURRENTLY:
-        // wall = max(hash, fold) instead of hash + fold. The fold's
-        // residual cost is BTreeMap CONSTRUCTION itself (~170ns/node —
-        // it survived input reduction, index-sort, and two chunk+merge
-        // shapes), which is exactly why hiding it behind the hash is
-        // the winning shape.
-        let t_h = std::time::Instant::now();
-        let n_res = tx_results.len();
-        let tail_pins: &[usize] = if keep_hot && tail_on_workers {
-            pin_cores
-        } else {
-            &[]
-        };
-        let hash_threads = ctx.queues.len().saturating_sub(1).max(1).min(n_res.max(1));
-        let chunk = n_res.div_ceil(hash_threads);
-        type AccMap =
-            kardamom_exec_core::delta::DeltaMap<alloy_primitives::Address, (u64, U256, B256)>;
-        type StoMap = kardamom_exec_core::delta::DeltaMap<(alloy_primitives::Address, B256), U256>;
-        let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
-        let (acc_map, sto_map, sink_final, fold_ns): (
-            AccMap,
-            StoMap,
-            Option<(u64, U256, B256)>,
-            u64,
-        ) = std::thread::scope(|sc| {
-            // Fold thread: read-only copy + index-sort + bulk build, on
-            // the last worker core (hot, parked, longest pole).
+    // Fold + hash + VALIDATION, one overlap scope (fusing hash and
+    // fold measured worse twice; OVERLAP won — validation now joins
+    // the same scope): the fold builds the delta; each hash lane
+    // hashes its chunk into the side array, then VALIDATES the same
+    // chunk (read-only replay against the multi-version cache — every
+    // recorded read must still be the highest version below the
+    // reader; a conviction is a WOUND). Validation was its own phase
+    // before the commit; hiding it under the fold, the longest pole,
+    // removes it from the wall.
+    //
+    // The fold joins FIRST: the delta exists at that point — the
+    // streaming release point (spec P3) — while hash+validate lanes
+    // are still running.
+    let t_h = std::time::Instant::now();
+    let n_res = tx_results.len();
+    let tail_pins: &[usize] = if keep_hot && tail_on_workers {
+        pin_cores
+    } else {
+        &[]
+    };
+    let hash_threads = ctx.queues.len().saturating_sub(1).max(1).min(n_res.max(1));
+    let chunk = n_res.div_ceil(hash_threads);
+    let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
+    let val_ns = std::sync::atomic::AtomicU64::new(0);
+    let (delta_arc, wounded): (std::sync::Arc<PendingDelta>, Vec<usize>) =
+        std::thread::scope(|sc| {
+            // Fold thread: read-only copy, plain upserts in canonical
+            // order ("later tx wins" is the map's own semantics), on
+            // the last worker core (hot, parked, longest pole). Code
+            // entries are COPIED (Bytes is refcounted), not drained:
+            // the released delta must carry CREATEd code for the next
+            // block's readers.
             let results_ref: &[TxResult] = &tx_results;
             let fold = sc.spawn(move || {
                 if !tail_pins.is_empty() {
@@ -2323,31 +2318,32 @@ fn block_tail<S: StateDatabase + Sync>(
                         id: tail_pins[tail_pins.len() - 1],
                     });
                 }
-                let t0 = std::time::Instant::now();
-                // Plain upserts in canonical order — "later tx wins" is
-                // the map's own semantics; no sort, no index tags, no
-                // tree construction. This is the whole point of the
-                // DeltaMap representation change.
                 let mut sink_final: Option<(u64, U256, B256)> = None;
-                let mut acc =
-                    AccMap::with_capacity_and_hasher(results_ref.len() * 2, Default::default());
-                let mut sto =
-                    StoMap::with_capacity_and_hasher(results_ref.len(), Default::default());
+                let mut d = PendingDelta::new();
+                d.accounts.reserve(results_ref.len() * 2);
+                d.storage.reserve(results_ref.len());
                 for r in results_ref.iter() {
                     for (a, v) in r.ws.accounts.iter() {
                         if *a == FEE_SINK {
                             sink_final = Some(*v);
                         } else {
-                            acc.insert(*a, *v);
+                            d.accounts.insert(*a, *v);
                         }
                     }
                     for (k, v) in r.ws.storage.iter() {
-                        sto.insert(*k, *v);
+                        d.storage.insert(*k, *v);
+                    }
+                    for (h, b) in r.ws.code.iter() {
+                        d.code.insert(*h, b.clone());
                     }
                 }
-                (acc, sto, sink_final, t0.elapsed().as_nanos() as u64)
+                if let Some(v) = sink_final {
+                    d.accounts.insert(FEE_SINK, v);
+                }
+                d
             });
-            // Hash lanes: read ws, write ONLY the side array.
+            // Hash+validate lanes: read ws, write ONLY the side array
+            // and a local wounded list.
             let hash_parts: Vec<(usize, &mut [B256])> = {
                 let mut out = Vec::new();
                 let mut rest: &mut [B256] = &mut hashes;
@@ -2361,32 +2357,92 @@ fn block_tail<S: StateDatabase + Sync>(
                 out.push((base, rest));
                 out
             };
+            let mut lanes = Vec::with_capacity(hash_parts.len());
             for (ti, (base, out_slice)) in hash_parts.into_iter().enumerate() {
                 let results_ref: &[TxResult] = &tx_results;
-                sc.spawn(move || {
+                let mv = &ctx.mv;
+                let val_ns = &val_ns;
+                lanes.push(sc.spawn(move || {
                     if !tail_pins.is_empty() {
                         let _ = core_affinity::set_for_current(core_affinity::CoreId {
                             id: tail_pins[ti % tail_pins.len().max(1)],
                         });
                     }
+                    let len = out_slice.len();
                     for (j, slot) in out_slice.iter_mut().enumerate() {
                         let r = &results_ref[base + j];
                         if r.sink_touched {
                             *slot = r.ws.hash();
                         }
                     }
+                    let t0 = std::time::Instant::now();
+                    let mut wounded_local = Vec::new();
+                    for j in 0..len {
+                        let i = base + j;
+                        if results_ref[i]
+                            .reads
+                            .iter()
+                            .any(|rec| !mv.validate(i as u32, rec))
+                        {
+                            wounded_local.push(i);
+                        }
+                    }
+                    val_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    wounded_local
+                }));
+            }
+            let delta_arc = std::sync::Arc::new(fold.join().expect("fold thread"));
+            // SPECULATIVE RELEASE (spec P3b): the delta ships here,
+            // while validation is still running. Measured wound rate
+            // across the campaign: zero — the gamble prices only when
+            // it fires, and a `corrected` re-issue follows if it does.
+            if let Some(DeltaOut {
+                tx,
+                speculative: true,
+            }) = &delta_out
+            {
+                let _ = tx.send(DeltaRelease {
+                    block: ctx.env.block_number,
+                    delta: delta_arc.clone(),
+                    corrected: false,
                 });
             }
-            fold.join().expect("fold thread")
+            let wounded: Vec<usize> = lanes
+                .into_iter()
+                .flat_map(|h| h.join().expect("hash+validate lane"))
+                .collect();
+            (delta_arc, wounded)
         });
-        hash_ns += t_h.elapsed().as_nanos() as u64;
-        let t_d = std::time::Instant::now();
-        delta.accounts = acc_map;
-        delta.storage = sto_map;
-        if let Some(v) = sink_final {
-            delta.accounts.insert(FEE_SINK, v);
+    hash_ns += t_h.elapsed().as_nanos() as u64;
+    let t_validate = std::time::Duration::from_nanos(val_ns.load(Ordering::Relaxed));
+    let wounds = wounded.len();
+    let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
+    // A tx after a re-executed one may also be stale: once ANY wound
+    // fires, later txs are re-checked against the live prefix.
+    if let Some(first) = wounded_set.iter().copied().min() {
+        for i in first..n {
+            wounded_set.insert(i);
         }
-        let _ = fold_ns;
+    }
+    if wounds == 0 {
+        let t_d = std::time::Instant::now();
+        // The consumer may still hold the released Arc — clone then
+        // (pipeline mode); a sole owner unwraps for free
+        // (block-at-a-time, no release).
+        delta = std::sync::Arc::try_unwrap(delta_arc).unwrap_or_else(|a| (*a).clone());
+        // Conservative release (spec P3a): only now, when the delta
+        // can no longer change.
+        if let Some(DeltaOut {
+            tx,
+            speculative: false,
+        }) = &delta_out
+        {
+            let _ = tx.send(DeltaRelease {
+                block: ctx.env.block_number,
+                delta: std::sync::Arc::new(delta.clone()),
+                corrected: false,
+            });
+        }
         // Serial epilogue: patch receipt hashes in place, move receipts
         // out, then ship the WHOLE results vec (write sets + read logs)
         // to the reaper as one move — a per-element carcass copy here
@@ -2395,14 +2451,20 @@ fn block_tail<S: StateDatabase + Sync>(
             if r.sink_touched {
                 r.receipt.write_set_hash = hashes[i];
             }
-            for (h, b) in r.ws.code.drain(..) {
-                delta.code.insert(h, b);
-            }
             receipts.push(std::mem::take(&mut r.receipt));
         }
         reaper.send(Box::new(tx_results)).ok();
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
+        // A speculative release (if any) was WRONG: drop our Arc and
+        // rebuild the delta on the repair path; a `corrected` release
+        // follows the repair.
+        drop(delta_arc);
+        // Phase 1 already ran over these results; the kept-prefix arm
+        // below recomputes the same values, so restart the running
+        // sums from zero.
+        cumulative = 0;
+        sink_running = ctx.sink_start_balance;
         // REPAIR PATH: a wound fired, so txs from the first wound on
         // re-execute against the exact materialized prefix. Strictly
         // sequential by nature, and rare enough that its cost is not
@@ -2434,6 +2496,16 @@ fn block_tail<S: StateDatabase + Sync>(
             layered.apply(r.ws.clone());
             delta.apply(r.ws);
             receipts.push(r.receipt);
+        }
+        // CORRECTED release: whoever consumed the speculative delta
+        // must unwind onto this one (spec P3b wound-abort). Sent in
+        // conservative mode too — it is simply the first release then.
+        if let Some(d) = &delta_out {
+            let _ = d.tx.send(DeltaRelease {
+                block: ctx.env.block_number,
+                delta: std::sync::Arc::new(delta.clone()),
+                corrected: d.speculative,
+            });
         }
     }
 

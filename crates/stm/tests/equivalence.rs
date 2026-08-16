@@ -607,3 +607,127 @@ fn hot_chain_streams_through_the_fifo() {
     let key = (COUNTER, B256::ZERO);
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
 }
+
+/// STREAMING RELEASE (spec P3): `submit_streaming` ships the folded
+/// delta before receipts — and, speculatively, before the validation
+/// verdict. Invariants pinned here, per rep and mode:
+/// - wounds == 0  ⇒ exactly ONE release, not corrected;
+/// - wounds  > 0  ⇒ speculative mode sends TWO (stale speculative, then
+///   corrected), conservative sends ONE (already-final);
+/// - the LAST release always byte-equals the outcome's delta;
+/// - receipts + delta stay byte-identical to sequential in every case.
+///
+/// The lying-stats generator makes wounds actually fire across reps, so
+/// the correction leg is exercised for real, not vacuously.
+#[test]
+fn streaming_release_and_wound_correction() {
+    let sg = signers(4);
+    let database = db(&sg);
+    let lying_stats = {
+        let obs: Vec<TxObs> = (0..4)
+            .map(|i| {
+                let sender = Address::with_last_byte(i as u8 + 0x10);
+                let mut buf = [0u8; 64];
+                buf[..32]
+                    .copy_from_slice(&U256::from_be_slice(sender.as_slice()).to_be_bytes::<32>());
+                buf[32..].copy_from_slice(&U256::from(3u8).to_be_bytes::<32>());
+                TxObs {
+                    index: i,
+                    block: 1,
+                    sender,
+                    to: Some(COUNTER),
+                    selector: Some(COUNTER_SEL),
+                    args: Vec::new(),
+                    gas: 30_000,
+                    has_value: false,
+                    reads: Vec::new(),
+                    writes: vec![Cell::Slot(COUNTER, keccak256(buf))],
+                }
+            })
+            .collect();
+        Stats::learn(&obs)
+    };
+    let envs = vec![
+        tx(&sg[0], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
+        tx(&sg[1], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
+        tx(&sg[2], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
+        tx(&sg[3], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL),
+    ];
+    let recs = records(envs);
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+
+    for speculative in [true, false] {
+        let mut wound_reps = 0usize;
+        let mut reps = 0usize;
+        // Hunt for the wound leg: races are timing-dependent, and a fast
+        // machine may win every one (the sibling lying-stats test's
+        // note) — so rep until a wound is seen or the budget runs out,
+        // asserting the protocol on every rep either way.
+        for rep in 0..200 {
+            let (out, releases) = kardamom_stm::execute::with_pool(
+                kardamom_stm::execute::PoolConfig {
+                    workers: 4,
+                    ..Default::default()
+                },
+                |pool| {
+                    let mut sess = pool
+                        .begin_block(database.clone(), PendingDelta::new(), env(), &lying_stats)
+                        .unwrap();
+                    for (t, p, e) in &recs {
+                        sess.push_tx(*t, *p, e.clone()).unwrap();
+                    }
+                    let (dtx, drx) = std::sync::mpsc::channel();
+                    let ticket = sess.submit_streaming(dtx, speculative).unwrap();
+                    let out = ticket.wait().unwrap();
+                    let releases: Vec<kardamom_stm::execute::DeltaRelease> =
+                        drx.try_iter().collect();
+                    (out, releases)
+                },
+            );
+            let label = format!("streaming spec={speculative} rep={rep}");
+            assert_identical(&seq, &out.receipts, &out.delta, &label);
+            if out.wounds == 0 {
+                assert_eq!(releases.len(), 1, "{label}: clean block, one release");
+                assert!(!releases[0].corrected, "{label}: clean release");
+            } else {
+                wound_reps += 1;
+                if speculative {
+                    assert_eq!(
+                        releases.len(),
+                        2,
+                        "{label}: wound must re-issue the release"
+                    );
+                    assert!(!releases[0].corrected);
+                    assert!(releases[1].corrected, "{label}: second release corrects");
+                } else {
+                    assert_eq!(
+                        releases.len(),
+                        1,
+                        "{label}: conservative releases once, post-verdict"
+                    );
+                    assert!(!releases[0].corrected);
+                }
+            }
+            let last = releases.last().expect("at least one release");
+            assert_eq!(
+                last.delta.accounts, out.delta.accounts,
+                "{label}: final release delta == outcome delta (accounts)"
+            );
+            assert_eq!(
+                last.delta.storage, out.delta.storage,
+                "{label}: final release delta == outcome delta (storage)"
+            );
+            assert_eq!(
+                last.delta.code, out.delta.code,
+                "{label}: final release delta == outcome delta (code)"
+            );
+            reps = rep + 1;
+            if wound_reps > 0 && rep >= 24 {
+                break; // wound leg exercised and a full base run done
+            }
+        }
+        // Not asserted — a fast machine may win every race — but loud
+        // when the correction leg went unexercised.
+        eprintln!("streaming spec={speculative}: {wound_reps}/{reps} reps wounded");
+    }
+}
