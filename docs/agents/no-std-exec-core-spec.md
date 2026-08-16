@@ -579,3 +579,179 @@ Single-block proving (the 104-byte layout) remains for dev/round-trip.
 - Proving stays OFF every hot path: the spool queues, the prover drains,
   the submitter posts — three decoupled cadences, gaps tolerated
   end-to-end.
+
+## PR 5 design — optimistic validation, proofs on dispute (2026-08-16)
+
+Validity mode (PR 4) proves every batch: ~8M cycles/block spent proving
+things nobody disputes. This phase inverts the default: batches advance the
+root chain OPTIMISTICALLY under a bonded claim and a challenge window;
+proving happens only on dispute. In equilibrium (rational actors, slashed
+bonds) the proving cost of the happy path is ZERO. The pattern is known in
+the wild as "zk fault proofs" (RISC Zero Kailua, op-succinct-lite): no
+interactive bisection — the dispute is settled by ONE validity proof.
+
+### Division of labor (all three detection layers already exist)
+
+- **Detection is NATIVE, live, and already running.** The validator
+  re-executes every block at chain speed and fail-stops on proven
+  divergence (receipts, BAL write-sets, anchored roots). Detection never
+  touches the zkVM — native re-execution is strictly faster than
+  zkVM-executor re-execution and it is the validator's existing duty.
+  A new, thin L1-CLAIM WATCHER compares each posted claim's root against
+  the local committed root (`snapshot.state_root()` — the attester poller's
+  shape) and triggers a challenge on disagreement.
+- **The dispute unit is the BATCH; the tx is diagnostics.** Detection
+  names the diverging tx (receipt mismatch is per-tx), but refutation
+  needs only the existing batch proof: it establishes the true post-root
+  for the claimed range, and a claim that disagrees is dead regardless of
+  which tx diverged. The spool already queues the anchored per-block
+  frames; `zk-host batch --prove` already produces the proof. The
+  challenge event carries the tx index as evidence for humans.
+- **Both lie classes are covered by one mechanism.** (a) A proposer lies
+  on L1 about honest L2 execution: the local root disagrees → challenge
+  with the proof of the honest batch. (b) The L2 stream itself is forged:
+  3a.1 identity checks + 3b anchoring make honest validators halt, and
+  because a proof must reproduce the settlement's stored records
+  commitment, no honest proof of the forged claim can exist — the
+  unanswerable challenge exposes it.
+
+### Per-block granularity inside the batch claim (2026-08-16 refinement)
+
+A batch may be arbitrarily heavy; a dispute must never require proving one.
+The claim therefore carries PER-BLOCK attestations, and the dispute unit is
+ONE BLOCK — the challenge window becomes independent of batch size, and the
+dispute proof is the SINGLE-BLOCK guest (~8M cycles, bounded by the block
+gas limit), not the batch guest.
+
+Kardamom has no block-header hash (S0's slim boundary carries no
+commitment), so the per-block attestation is the pair
+`(post_root_i, records_digest_i)` — exactly what the system natively
+commits to. And per-block attestation TRANSACTIONS would scale L1 gas with
+block count, so the sequence rides inside the ONE batch claim (32 bytes ×
+2 per block of calldata): per-block granularity at batch cadence.
+
+### Contract: KardamomProofOracle v2 — three new verbs, one root chain
+
+- `claimBatch(batchIndex, blockRoots[], blockDigests[])` payable (bond):
+  strict succession; the batch must exist in the settlement; array lengths
+  must equal the posted range; and — the anti-smuggling check —
+  `fold(blockDigests) == settlement.batches[batchIndex].recordsCommitment`
+  (one keccak pass at claim time; a claimer cannot partition the records
+  differently than the batcher posted). The contract stores
+  `keccak(blockRoots ‖ blockDigests)` and the claimed final root
+  (`blockRoots[last]`); the full sequences live in calldata + the event,
+  which is what challengers replay. Claims CHAIN optimistically: claim
+  N+1's implicit pre-root is claim N's pending final root.
+- `finalizeBatch(batchIndex)`: window elapsed, unchallenged → `stateRoot`
+  advances to the claimed final root, bond refunds. Strictly sequential.
+- `challengeBlock(batchIndex, blockOffset, blockRoots[], blockDigests[],
+  publicValues, proof)`: the challenger targets the FIRST divergent block —
+  at the first divergence the claimed `root[i-1]` is still honest, so an
+  honest single-block proof anchored at it EXISTS and refutes `root[i]`
+  (no bisection, ever). The contract re-derives the stored sequence hash
+  from the provided arrays, then requires of the proof's public values:
+  `pre_state_root == blockRoots[i-1]` (or the previous batch's finalized/
+  claimed root for i = 0), `block_number == range.start + i`,
+  `records_digest == blockDigests[i]`, verifier accepts, and
+  `post_state_root != blockRoots[i]`. Then: claim cancelled, bond slashed
+  to the challenger, dependent pending claims cascade-cancelled with
+  refunds. The root chain REWINDS to the last finalized root — the proven
+  single block does not advance it (later blocks of the batch are now
+  unattested); an honest re-claim follows.
+  A proof that AGREES with `blockRoots[i]` refutes nothing and reverts
+  (challenges are targeted, not exploratory; gas discourages noise).
+- `submitBatchProof` (validity mode) REMAINS: proof-first advancement for
+  operators that want instant finality. Both modes share one root chain
+  and one verifier — with DISTINCT program vkeys (batch guest for validity
+  mode, single-block guest for disputes), both held by the oracle.
+
+### Why the three sharp edges cut the way they do (decision record)
+
+Running example: batch 5 covers blocks 100–199; honest roots `h_100..h_199`;
+a malicious claim `r_i = h_i` for i < 150, lie starts at `r_150 != h_150`.
+
+**The digest-fold check exists to keep claims challengeable.** The dispute
+compares the challenger's proven `records_digest` against the CLAIM's
+`blockDigests[i]` — L1 stores only the fold, so the claim's array is the
+per-block reference. Unchecked, a claimer rigs the reference instead of
+winning the dispute: describe a partition that moves a real tx from block
+150 to 151, and the honest challenger's proof (executing the POSTED block
+150) mismatches `blockDigests[150]` — the honest challenge bounces off the
+contract's own rule. The claim-time fold check makes such a claim
+UNCREATABLE: fixed 32-byte segments in fixed order mean exactly one
+sequence folds to the stored commitment — the posted one.
+
+**Rewind, because attestations are free and partial batches are not.**
+After the block-150 challenge wins, `r_151..r_199` are chained off a lie —
+worthless. Advancing to `h_150` would strand blocks 151–199 with no claim
+over them, forcing partial-batch re-claims keyed on (batch, offset), prefix
+window rules, and new interactions with pending claims above — real state-
+machine surface bought to preserve work that cost nothing to redo (the one
+expensive artifact, the proof, already did its whole job: killing the
+lie). Rewind restores the exact pre-claim state; the honest re-claim lists
+`h_100..h_199` through the normal window. Cascade-cancelled claims above
+get REFUNDS, not slashes: honest claimers could never have built on
+`r_199` (honest roots chain off `h_199`), so cascade victims are the liar
+or its copyists — but punishing without proof is what this design exists
+to avoid, and the block-150 bond already paid the challenger. Griefing
+math: one bond buys at most one forced single-block proof, so with
+`bond > proving cost + challenge gas`, the attack funds the defense.
+
+**An agreeing proof reverts because it has no sound transition.** At batch
+granularity an agreeing proof was a full validity proof (finalize early —
+sound). At block granularity it attests one block of a hundred: finalizing
+the claim on it is unsound; finalizing just that block reintroduces the
+partial-batch machinery rejected above. So `challengeBlock`'s precondition
+is "the claim is wrong here", an agreeing proof fails it, and the failed
+challenge is a STRICT no-op — the window must not move. No challenger bond
+is needed: a failed challenge imposes zero cost on the claimer, so its
+whole cost (proving + gas) self-prices the spam. Underneath sits the
+property that makes the verb clean: one honest post-root exists per
+`(pre_root, records)` and the verifier accepts only honest executions —
+so false challenges CANNOT succeed and true challenges CANNOT fail
+(modulo prover liveness inside the window).
+
+### Single-block public outputs v2 (guest change, slice 0)
+
+The dispute check needs the block's records digest in the PROOF, so the
+single-block guest's outputs move from the 104-byte layout to the batch
+guest's 160-byte abi shape: `pre_state_root ‖ post_state_root ‖
+block_number(u256) ‖ records_digest ‖ bal_commitment`. The guest already
+iterates its records to identity-check them; folding the digest is one
+hasher alongside. (bal_commitment stays: it binds the L2-published BAL
+artifact for off-chain accountability even though L1 does not store it.)
+
+### Window and bond
+
+The window must cover detection (instant, live) + proving (minutes with
+patches/GPU; ~40min/6-block batch unpatched CPU) + L1 INCLUSION under
+censorship — the last term dominates, as on every optimistic rollup.
+Default window: 24h, configurable at init. Bond: ≥ challenge gas + margin;
+slashing pays the challenger, making the honest-challenger liveness
+assumption also an incentive.
+
+### The endgame this unlocks
+
+`WithdrawalOutputOracle`'s doc comment has always said its permissioned
+challenger is "the stand-in for a trustless ZK fault proof" — this is that
+replacement arriving. Follow-up (deferred): point withdrawal finalization
+at the proof oracle's FINALIZED roots and retire the permissioned
+attester/challenger pair; one root chain serves batches and withdrawals.
+
+### Delivery slices
+
+0. Single-block guest outputs v2 (160-byte layout + records digest) +
+   zk-host + spool expected-outputs updated in lockstep; round trip green.
+1. Oracle v2 (claim/finalize/challengeBlock + bonds + cascade + sequence
+   commitments) + forge suite incl. the first-divergence rule and the
+   digest-fold anti-smuggling check.
+2. Validator claim watcher (per-block root comparison against the claim
+   event's sequence — names the exact divergent offset) + challenge
+   trigger wired into the divergence path (a halting validator fires its
+   challenge BEFORE it halts — the halt protects the node, the challenge
+   protects L1).
+3. Claim poster (batcher-side: roots from the validator's committed chain,
+   digests from pack_blocks — both already computed).
+4. Anvil e2e: honest claim finalizes unproven; a claim lying at block k
+   challenged at offset k with a REAL spool-derived single-block proof
+   shape; cascade cancellation; rewind-and-reclaim.
