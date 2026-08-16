@@ -610,10 +610,35 @@ pub struct Prepared {
     pub decoded: Option<alloy_consensus::TxEnvelope>,
     /// Predicted contention domains, fee sink already excluded.
     pub domains: Vec<DomainKey>,
+    /// 64-bit hash per domain, computed HERE (off the feed thread, in
+    /// parallel with every other tx's preparation) so the serial feed
+    /// only probes. See [`TouchTable`] for why hashing by value is
+    /// sound.
+    pub domain_hashes: Vec<u64>,
     /// The domain that decides which thread runs this tx.
     pub primary: Option<DomainKey>,
     /// ⊤: untrained selector — orders behind everything outstanding.
     pub cold: bool,
+}
+
+/// Hash a contention cell to 64 bits (see [`TouchTable`]: equal cells
+/// hash equal, and a collision can only fabricate a conservative edge).
+#[inline]
+pub fn domain_hash64(d: &DomainKey) -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = crate::FnvBuild.build_hasher();
+    match d {
+        DomainKey::Account(a) => {
+            h.write_u8(1);
+            h.write(a.as_slice());
+        }
+        DomainKey::Fixed(a, k) => {
+            h.write_u8(2);
+            h.write(a.as_slice());
+            h.write(k.as_slice());
+        }
+    }
+    h.finish()
 }
 
 /// Decode + predict, off the feed thread. `stats` must be a snapshot
@@ -630,6 +655,7 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
     // observation), so preparation needs no position in the block.
     let view = schedule::scheduling_view_decoded(0, envelope, decoded.as_ref());
     let mut domains: Vec<DomainKey> = Vec::new();
+    let mut domain_hashes: Vec<u64> = Vec::new();
     let mut primary: Option<DomainKey> = None;
     let cold = match stats.predict_domains(&view) {
         Some(predicted) => {
@@ -648,6 +674,7 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
                 if primary.is_none() || (!is_sender && primary_is_sender) {
                     primary = Some(c);
                 }
+                domain_hashes.push(domain_hash64(&c));
                 domains.push(c);
             }
             false
@@ -657,6 +684,7 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
     Prepared {
         decoded,
         domains,
+        domain_hashes,
         primary,
         cold,
     }
@@ -960,6 +988,87 @@ impl Default for PoolConfig {
             keep_hot: false,
             tail_on_workers: true,
             pin_cores: Vec::new(),
+        }
+    }
+}
+
+/// The feed's LAST-TOUCHER index: cell-hash -> most recent toucher.
+///
+/// Flat and hash-keyed, not a `HashMap<DomainKey, u32>`: the map held
+/// ~8k live entries of 53-byte keys (~512KB, L2-busting) and compared
+/// those keys on every probe, and the upsert pair was the serial feed's
+/// largest stage (0.29µs/tx measured). Here a slot is 16 bytes, the
+/// whole table is 256KB, a probe is ONE cache line, and the key
+/// comparison is a u64.
+///
+/// COLLISIONS ARE SAFE BY CONSTRUCTION: a 64-bit collision fabricates a
+/// dependency EDGE between two txs that do not actually share a cell.
+/// The DAG is conservative — a false edge costs a sliver of parallelism
+/// and nothing else, while a MISSED edge (impossible here: equal cells
+/// hash equal) is what validation exists to catch.
+///
+/// Reset is O(1): a slot belongs to the current block only if its
+/// `stamp` matches, so a new block bumps the stamp instead of clearing
+/// 256KB.
+struct TouchSlot {
+    hash: u64,
+    idx: u32,
+    stamp: u32,
+}
+
+pub(crate) struct TouchTable {
+    slots: Vec<TouchSlot>,
+    mask: usize,
+    stamp: u32,
+}
+
+impl TouchTable {
+    fn new(capacity_pow2: usize) -> Self {
+        Self {
+            slots: (0..capacity_pow2)
+                .map(|_| TouchSlot {
+                    hash: 0,
+                    idx: 0,
+                    stamp: 0,
+                })
+                .collect(),
+            mask: capacity_pow2 - 1,
+            stamp: 0,
+        }
+    }
+
+    /// O(1) between-block reset (and the ⊤-barrier clear).
+    fn clear(&mut self) {
+        self.stamp = self.stamp.wrapping_add(1);
+        if self.stamp == 0 {
+            // Wrapped after 4.3B blocks: hard-clear so no stale slot can
+            // resurrect, then restart at 1.
+            for s in self.slots.iter_mut() {
+                s.stamp = 0;
+            }
+            self.stamp = 1;
+        }
+    }
+
+    /// Record `idx` as the latest toucher of `hash`; return the previous
+    /// one, if this block has seen the cell.
+    #[inline]
+    fn upsert(&mut self, hash: u64, idx: u32) -> Option<u32> {
+        let mut i = hash as usize & self.mask;
+        loop {
+            let slot = &mut self.slots[i];
+            if slot.stamp != self.stamp {
+                slot.hash = hash;
+                slot.idx = idx;
+                slot.stamp = self.stamp;
+                return None;
+            }
+            if slot.hash == hash {
+                let prev = slot.idx;
+                slot.idx = idx;
+                return Some(prev);
+            }
+            i = (i + 1) & self.mask;
         }
     }
 }
@@ -1620,6 +1729,10 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     base_cache: std::sync::Arc<BaseCache>,
     /// Recycled block structures (see [`RecyclePools`]).
     recycle: std::sync::Arc<RecyclePools>,
+    /// The feed's last-toucher index — POOL-LIFETIME (allocated once,
+    /// O(1) stamp reset per block) and feed-owned, exactly like
+    /// `assign`: only the single admission thread ever touches it.
+    touch: std::cell::RefCell<TouchTable>,
 }
 
 /// Spawn `workers` pool threads for the duration of `f`.
@@ -1878,6 +1991,10 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             base_cache: std::sync::Arc::new(BaseCache::new()),
             recycle: recycle_pools.clone(),
+            // 4x MAX_BLOCK_TXS slots: a block's live cell count is at
+            // most ~2 per tx, so load factor stays <= 0.5 (about 1.5
+            // probes) at 256KB total.
+            touch: std::cell::RefCell::new(TouchTable::new(MAX_BLOCK_TXS * 4)),
             tail: tail_tx.clone(),
             parallel_worth_ns,
             dispatch_by_sender,
@@ -1908,7 +2025,12 @@ pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     /// lives here rather than in the shared graph: keeping it out of the
     /// critical section removes ~8 hashmap operations per tx from the
     /// lock. Keyed symbolically — no keccak on the hot path.
-    last_toucher: FastMap<DomainKey, u32>,
+    /// Reusable predecessor scratch — a fresh `Vec` per tx was a heap
+    /// allocation on the serial feed (~50ns/tx).
+    preds_buf: Vec<u32>,
+    /// `KARDAMOM_STM_FEED_STAGES`: per-stage feed timers (off by default
+    /// — they cost what they measure).
+    stage_timing: bool,
     /// The most recent ⊤ (cold) tx: conflicts with everything, so every
     /// later admission takes an edge from it while it is outstanding.
     last_barrier: Option<u32>,
@@ -2011,6 +2133,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 }
             }
         }
+        // O(1) reset of the feed's last-toucher index for this block.
+        self.touch.borrow_mut().clear();
         let recycled = self.recycle.arenas.lock().expect("pools poisoned").pop();
         let recycled_mv = self.recycle.mv_clean.lock().expect("pools poisoned").pop();
         let (r_slots, r_results, r_nodes) = match recycled {
@@ -2124,7 +2248,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             workers,
             cold: 0,
             edges: 0,
-            last_toucher: FastMap::default(),
+            preds_buf: Vec::with_capacity(8),
+            stage_timing: std::env::var_os("KARDAMOM_STM_FEED_STAGES").is_some(),
             last_barrier: None,
             dispatch: vec![0; workers],
             n_txs: 0,
@@ -2394,6 +2519,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let Prepared {
             decoded,
             domains: cells,
+            domain_hashes: hashes,
             primary: domain,
             cold: is_cold,
         } = prep;
@@ -2472,42 +2598,57 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             .unwrap_or_else(|_| unreachable!("slot set once per index"));
         self.n_txs += 1;
         self.dispatch[worker] += 1;
-        let t_pre_end = std::time::Instant::now();
-        self.ctx
-            .metrics
-            .feed_pre_ns
-            .fetch_add((t_pre_end - t_feed).as_nanos() as u64, Ordering::Relaxed);
+        // Stage timers are OPT-IN: two extra clock reads per tx measured
+        // ~5% of the serial feed, and the feed is the thing they measure.
+        let t_pre_end = if self.stage_timing {
+            let t = std::time::Instant::now();
+            self.ctx
+                .metrics
+                .feed_pre_ns
+                .fetch_add((t - t_feed).as_nanos() as u64, Ordering::Relaxed);
+            Some(t)
+        } else {
+            None
+        };
 
         // (2) Update the live DAG + (3) dispatch if ready.
         // Candidate predecessors come from the FEED-OWNED last-toucher
         // index — no lock needed, because admission is single-threaded and
         // prune never reads it.
-        let mut preds: Vec<u32> = Vec::with_capacity(cells.len() + 1);
+        let mut preds = std::mem::take(&mut self.preds_buf);
+        preds.clear();
         if let Some(b) = self.last_barrier {
             preds.push(b);
         }
-        if is_cold {
-            // ⊤: conflicts with everything — every outstanding tx is a
-            // candidate predecessor, and this tx becomes the barrier.
-            preds.clear();
-            preds.extend(0..idx);
-            self.last_barrier = Some(idx);
-            self.last_toucher.clear();
-        } else {
-            for c in &cells {
-                if let Some(p) = self.last_toucher.insert(*c, idx) {
-                    preds.push(p);
+        {
+            let mut touch = self.pool.touch.borrow_mut();
+            if is_cold {
+                // ⊤: conflicts with everything — every outstanding tx is
+                // a candidate predecessor, and this tx becomes the
+                // barrier.
+                preds.clear();
+                preds.extend(0..idx);
+                self.last_barrier = Some(idx);
+                touch.clear();
+            } else {
+                // Hashes came from `prepare`, off this thread.
+                for h in &hashes {
+                    if let Some(p) = touch.upsert(*h, idx) {
+                        preds.push(p);
+                    }
                 }
+                preds.sort_unstable();
+                preds.dedup();
             }
-            preds.sort_unstable();
-            preds.dedup();
         }
 
         let t_admit = std::time::Instant::now();
-        self.ctx
-            .metrics
-            .feed_dag_ns
-            .fetch_add((t_admit - t_pre_end).as_nanos() as u64, Ordering::Relaxed);
+        if let Some(t_pre_end) = t_pre_end {
+            self.ctx
+                .metrics
+                .feed_dag_ns
+                .fetch_add((t_admit - t_pre_end).as_nanos() as u64, Ordering::Relaxed);
+        }
         // NO GLOBAL LOCK. Open this node's registration point, seed the
         // admission guard, then register on each predecessor that is still
         // open. The guard (+1) means a predecessor finishing mid-admission
@@ -2538,7 +2679,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let mut deg = 0u32;
         let mut covered = 0u64;
         let eager = self.pool.eager_chain;
-        for p in preds {
+        for &p in preds.iter() {
             if p == idx {
                 continue;
             }
@@ -2591,6 +2732,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 .fifo_covered
                 .fetch_add(covered, Ordering::Relaxed);
         }
+        self.preds_buf = preds; // scratch back for the next tx
+
         // Drop the admission guard; if every registered predecessor has
         // already retired, this tx is ours to dispatch.
         let dispatch_now = self.ctx.nodes[i].indegree.fetch_sub(1, Ordering::AcqRel) == 1;
