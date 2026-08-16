@@ -579,3 +579,85 @@ Single-block proving (the 104-byte layout) remains for dev/round-trip.
 - Proving stays OFF every hot path: the spool queues, the prover drains,
   the submitter posts — three decoupled cadences, gaps tolerated
   end-to-end.
+
+## PR 5 design — optimistic validation, proofs on dispute (2026-08-16)
+
+Validity mode (PR 4) proves every batch: ~8M cycles/block spent proving
+things nobody disputes. This phase inverts the default: batches advance the
+root chain OPTIMISTICALLY under a bonded claim and a challenge window;
+proving happens only on dispute. In equilibrium (rational actors, slashed
+bonds) the proving cost of the happy path is ZERO. The pattern is known in
+the wild as "zk fault proofs" (RISC Zero Kailua, op-succinct-lite): no
+interactive bisection — the dispute is settled by ONE validity proof.
+
+### Division of labor (all three detection layers already exist)
+
+- **Detection is NATIVE, live, and already running.** The validator
+  re-executes every block at chain speed and fail-stops on proven
+  divergence (receipts, BAL write-sets, anchored roots). Detection never
+  touches the zkVM — native re-execution is strictly faster than
+  zkVM-executor re-execution and it is the validator's existing duty.
+  A new, thin L1-CLAIM WATCHER compares each posted claim's root against
+  the local committed root (`snapshot.state_root()` — the attester poller's
+  shape) and triggers a challenge on disagreement.
+- **The dispute unit is the BATCH; the tx is diagnostics.** Detection
+  names the diverging tx (receipt mismatch is per-tx), but refutation
+  needs only the existing batch proof: it establishes the true post-root
+  for the claimed range, and a claim that disagrees is dead regardless of
+  which tx diverged. The spool already queues the anchored per-block
+  frames; `zk-host batch --prove` already produces the proof. The
+  challenge event carries the tx index as evidence for humans.
+- **Both lie classes are covered by one mechanism.** (a) A proposer lies
+  on L1 about honest L2 execution: the local root disagrees → challenge
+  with the proof of the honest batch. (b) The L2 stream itself is forged:
+  3a.1 identity checks + 3b anchoring make honest validators halt, and
+  because a proof must reproduce the settlement's stored records
+  commitment, no honest proof of the forged claim can exist — the
+  unanswerable challenge exposes it.
+
+### Contract: KardamomProofOracle v2 — three new verbs, one root chain
+
+- `claimBatch(batchIndex, postRoot)` payable (bond): strict succession,
+  batch must exist in the settlement, opens the window. Claims CHAIN
+  optimistically: claim N+1's implicit pre-root is claim N's (pending)
+  post-root, so the pending chain can run ahead of finalization.
+- `finalizeBatch(batchIndex)`: window elapsed, unchallenged → `stateRoot`
+  advances, bond refunds. Finalization is strictly sequential.
+- `challengeBatch(batchIndex, publicValues, proof)`: the EXISTING
+  verification path (settlement cross-check + ISP1Verifier). If the proven
+  post-root differs from the claim: claim cancelled, bond slashed to the
+  challenger, the PROVEN root finalizes immediately (a valid proof needs
+  no window), and every dependent pending claim (N+1..) is cascade-
+  cancelled with bonds refunded (their fault was a wrong base, not a lie).
+  If the proven root EQUALS the claim, the claim simply finalizes early —
+  a harmless (gas-only) challenge.
+- `submitBatchProof` (validity mode) REMAINS: proof-first advancement for
+  operators that want instant finality on specific batches. Both modes
+  share one root chain and one verifier.
+
+### Window and bond
+
+The window must cover detection (instant, live) + proving (minutes with
+patches/GPU; ~40min/6-block batch unpatched CPU) + L1 INCLUSION under
+censorship — the last term dominates, as on every optimistic rollup.
+Default window: 24h, configurable at init. Bond: ≥ challenge gas + margin;
+slashing pays the challenger, making the honest-challenger liveness
+assumption also an incentive.
+
+### The endgame this unlocks
+
+`WithdrawalOutputOracle`'s doc comment has always said its permissioned
+challenger is "the stand-in for a trustless ZK fault proof" — this is that
+replacement arriving. Follow-up (deferred): point withdrawal finalization
+at the proof oracle's FINALIZED roots and retire the permissioned
+attester/challenger pair; one root chain serves batches and withdrawals.
+
+### Delivery slices
+
+1. Oracle v2 (claim/finalize/challenge + bonds + cascade) + forge suite.
+2. Validator claim watcher + challenge trigger (wired into the divergence
+   path: a halting validator fires its challenge BEFORE it halts — the
+   halt protects the node, the challenge protects L1).
+3. Claim poster (batcher-side, same EOA cadence as postBatch).
+4. Anvil e2e: honest claim finalizes unproven; lying claim challenged
+   with a REAL spool-derived proof shape; cascade cancellation.
