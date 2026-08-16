@@ -22,6 +22,7 @@ use sp1_sdk::blocking::{Elf, ProveRequest, Prover, ProverClient};
 use sp1_sdk::SP1Stdin;
 
 fn main() -> anyhow::Result<()> {
+    sp1_sdk::utils::setup_logger();
     let mut args = std::env::args().skip(1).peekable();
     if args.peek().is_some_and(|a| a == "batch") {
         args.next();

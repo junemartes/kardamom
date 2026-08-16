@@ -11,8 +11,9 @@ does NOT prove at test time. Regenerate them after a guest or SP1 change:
     # Single-block frame (block 1) from the anchoring pipeline test:
     KARDAMOM_EMIT_PROVER_FIXTURE=/tmp/fx cargo test -p kardamom-validator \
         --test witness_anchoring
-    # Real groth16 proof + on-chain bytes + vkey (needs the SP1 toolchain
-    # + circuit artifacts; ~minutes on CPU):
+    # Real groth16 proof + on-chain bytes + vkey. HEAVY: the gnark wrap is a
+    # ~1-hour CPU job (needs a GPU or a machine without a long-job runtime
+    # cap; RAM peak ~38G). Downloads the v6.1.0 circuit artifacts on first run.
     cd guest/kardamom-zk-guest && cargo prove build && cd ../kardamom-zk-host
     KARDAMOM_GROTH16=1 cargo run --release -- --prove /tmp/fx
     # Copy into place:

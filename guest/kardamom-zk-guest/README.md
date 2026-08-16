@@ -21,6 +21,9 @@ to the workspace's proven versions; the succinct rustc trails stable, so
 target. The execution crates are path dependencies, UNMODIFIED — the
 one-code-path invariant.
 
-SP1's precompile accelerator patches (sha3/k256/bls12-381) are not yet
-pinned — perf optimization, chosen against the prover SDK version when the
-harness lands (3c step 2).
+SP1 precompile accelerator patches (sha3/sha2/k256, the rsp reth-block set,
+pinned in Cargo.toml) cut the cycle count ~13.5x (7.9M -> 587k for a
+3-tx anchored block) — keccak dominates because every witness trie node is
+hashed. Correctness is identical (precompiles are drop-in); the win is what
+makes CPU groth16 proving tractable. A guest change invalidates the vkey
+and any committed proof fixture.

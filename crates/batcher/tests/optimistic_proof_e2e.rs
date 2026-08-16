@@ -92,7 +92,9 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
         std::fs::read(fx.join("proof.bin")),
         std::fs::read_to_string(fx.join("vkey.hex")),
     ) else {
-        eprintln!("SKIP: real-proof fixtures absent (see fixtures/README.md to regenerate)");
+        eprintln!(
+            "SKIP: real-proof fixtures absent — generate on GPU/capable hardware (fixtures/README.md); the CPU groth16 wrap is a ~1h job"
+        );
         return;
     };
     let Some(anvil) = Anvil::new().try_spawn().ok() else {
