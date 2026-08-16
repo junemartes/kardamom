@@ -398,3 +398,27 @@ are production-real (writer apply, feed prepare, ctx build). Software
 knobs are exhausted; the LLC hypothesis now requires hardware counters
 (perf/resctrl) before further engineering — or CCX separation on a
 host that has one to give.
+
+### Counter data (perf unlocked) + allocation-diet effect (2026-08-16)
+
+Worker-core counters (paranoid lowered; AMD generic cache events — LLC
+events unsupported on this PMU): pipeline workers run at **+37%
+cache-misses per instruction** vs block-at-a-time (1.36 vs 0.99 per
+kilo-instruction, equal ~9-10% miss rate); the raw misses/s doubling is
+duty cycle (pipeline workers execute back-to-back). Moderate,
+consistent with the mv-layer probe level plus co-tenant streaming —
+the LLC-pressure attribution stands at reduced magnitude after the
+allocation diet.
+
+Allocation diet (user-directed): 19.3 → 11.7 KB/tx (-39%), realloc
+churn zeroed (warm mv scrub), STM now allocates less often than the
+sequential engine (23.1 vs 27.8 allocs/tx). Effect on the gap: at 24
+flow blocks (pools warm for 20+), block-at-a-time 2.67x vs pipeline
+2.62x — TIED within noise, from a 0.3x deficit before the diet.
+
+Remaining, in leverage order: (1) span packing (~1.4ms dispatch slack
+— now the largest single item on the cadence); (2) the mv-layer probe
+level (skip it when the window is empty — steady-state windows shrink
+as the writer keeps up; check window occupancy stats first); (3) the
+last co-tenant streams (writer apply, feed) via CCX separation on
+hosts that have one.
