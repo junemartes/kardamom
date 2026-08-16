@@ -92,20 +92,30 @@ case_cluster_member_rejoin() {
   # restart time of members whose dirs survive; that path is asserted by
   # cluster-follower-kill). Full log replay is deterministic, so the
   # correct outcome here is: a FRESH-at-genesis service start, the whole
-  # log replayed (proven via a post-rejoin snapshot TAKEN), 3/3 running,
+  # log replayed (proven via the post-wipe snapshot position reaching the
+  # wipe-time head), 3/3 running,
   # pipeline unaffected throughout (quorum 2/3 held). First run of this case
   # proved exactly that (the wiped member replayed to the live head and
   # resumed serving replay sessions). NOTE the cost this documents: a
   # blank member's rejoin time grows with the lifetime log — bounding it
   # needs log purge after snapshot, tracked as audit follow-up.
-  local leader follower f0 f1 taken0 taken1 t
+  local leader follower f0 f1 t head_at_wipe catchup_block first_block=0 moved=0
   leader="$(cluster_leader)"
   for follower in 0 1 2; do [ "${follower}" != "${leader}" ] && break; done
 
-  # Baselines BEFORE the wipe (counts, not presence: bring-up also logs a
-  # fresh start, and every earlier scheduler tick adds TAKEN lines).
+  # Baseline BEFORE the wipe (a count, not presence: bring-up also logs a
+  # fresh start).
   f0="$(count_log_lines "${CLUSTER_TASK}" "sealer state FRESH at genesis memberId=${follower}" --stdout-only)"
-  taken0="$(count_log_lines "${CLUSTER_TASK}" "sealer snapshot TAKEN memberId=${follower}" --stdout-only)"
+  # Head at wipe time — the position the blank member must replay back to
+  # before this case may pass (see the catch-up proof below). A REAL reading is
+  # mandatory: executor_progress prints empty when every scrape fails (metric
+  # blackouts are routine right after the previous case's kill), and defaulting
+  # that to 0 would make the proof below vacuous all over again — "replayed to
+  # block >= 0" is satisfied by a member that has done nothing but log
+  # FRESH at genesis. Read it BEFORE any injection, so failing here is clean.
+  head_at_wipe="$(executor_progress || true)"
+  { [ -n "${head_at_wipe}" ] && [ "${head_at_wipe}" -gt 0 ]; } \
+    || fail "cluster-member-rejoin: could not read the executor head before the wipe (got '${head_at_wipe}') — refusing to run: the catch-up proof needs a real target position or it proves nothing"
 
   log "cluster-member-rejoin: leader=memberId=${leader}; killing FOLLOWER memberId=${follower} and WIPING its cluster + archive dirs"
   inject_hard "kardamom-sealer-${follower}" "${CLUSTER_TASK}"
@@ -120,26 +130,69 @@ case_cluster_member_rejoin() {
 
   # The restarted member must (a) start BLANK — fresh-at-genesis count
   # grew, proving the wipe took and this is genuinely the empty-state
-  # path — and (b) finish the full log replay. Catch-up proof: the member
-  # logs a NEW 'sealer snapshot TAKEN' — snapshots run on every member at
-  # the same replicated log position, so taking one at a post-rejoin
-  # position requires having replayed the log all the way there. (A
-  # FOLLOWER role line cannot serve: a member that STARTS as follower
-  # never gets an onRoleChange — round 2 measured role count 0 -> 0 on a
-  # healthy rejoin.) Budget: full replay + one scheduler interval.
+  # path — and (b) finish the full log replay.
+  #
+  # CATCH-UP PROOF (corrected 2026-08-07). The old proof was "the member
+  # logged a NEW 'snapshot TAKEN'", justified as "members snapshot at the
+  # same replicated log position, so a post-rejoin TAKEN means it replayed
+  # to there". That reasoning is INVERTED, and it made this case vacuous.
+  # The SNAPSHOT action is itself an entry in the replicated log, so a
+  # blank member replaying from position 0 RE-EXECUTES every historical
+  # snapshot action and emits `TAKEN block=30`, `TAKEN block=60`, ... as it
+  # goes. Those lines are emitted BECAUSE it is still catching up, not
+  # because it finished. Measured: the case passed in 0s while the member
+  # was ~10 minutes of replay behind the head.
+  #
+  # That vacuity had teeth: the suite moved on to the next case with one
+  # member minutes from converged. cluster-quorum-loss-recover then kills
+  # sealer-1+sealer-2 (hardcoded), so when the wipe had landed on sealer-0
+  # the ONLY survivor was the un-caught-up member — and the pipeline stayed
+  # flat for the whole remaining replay, blowing that case's SLO. Which
+  # member got wiped depends on who was leader here, so it failed roughly
+  # every other run: the coin flip behind the rotating-shard flakiness.
+  #
+  # The real proof is positional: the member's LATEST POST-WIPE snapshot
+  # block must reach the live head. Scoped to lines after the last FRESH
+  # marker so pre-wipe history cannot satisfy it. Replay measured at ~12.5
+  # blocks/s on this host, so CLUSTER_REJOIN_SLO_S covers the log this
+  # suite builds — and a member that never converges now fails HERE, where
+  # the diagnosis is obvious, instead of as a mystery stall two cases
+  # later. (What "never converges" looks like in practice: issue #195, a
+  # join wedge in Election.init/awaitLocalSocketsClosed with the member
+  # frozen INACTIVE after a fast partial replay.)
   t=0
   while :; do
     f1="$(count_log_lines "${CLUSTER_TASK}" "sealer state FRESH at genesis memberId=${follower}" --stdout-only)"
-    taken1="$(count_log_lines "${CLUSTER_TASK}" "sealer snapshot TAKEN memberId=${follower}" --stdout-only)"
-    [ "${f1}" -gt "${f0}" ] && [ "${taken1}" -gt "${taken0}" ] && break
+    # Latest TAKEN block emitted AFTER the most recent FRESH-at-genesis for
+    # this member (i.e. from the post-wipe boot only).
+    catchup_block="$(cluster_alloc_logs | awk -v m="${follower}" '
+        $0 ~ ("FRESH at genesis memberId=" m) { seen = 1; last = "" }
+        seen && $0 ~ ("snapshot TAKEN memberId=" m) { last = $0 }
+        END { print last }' \
+      | grep -oE 'block=[0-9]+' | cut -d= -f2 || true)"
+    catchup_block="${catchup_block:-0}"
+    # Track the FIRST non-zero position and whether it ever moved: the two
+    # failure modes look identical in a single end-of-window number but need
+    # different responses, and measurement says they are cleanly separable
+    # (2026-08-10, 10 runs) — a converging member reaches the head in 10-40s,
+    # a wedged one parks on its first position and never moves again.
+    [ "${catchup_block}" -gt 0 ] && [ "${first_block:-0}" -eq 0 ] && first_block="${catchup_block}"
+    [ "${catchup_block}" -gt "${first_block:-0}" ] && moved=1
+    # Converged when the replayed position reaches the head observed at
+    # wipe time (the head keeps advancing under load; reaching the wipe-time
+    # head proves the whole pre-existing log was replayed).
+    [ "${f1}" -gt "${f0}" ] && [ "${catchup_block}" -ge "${head_at_wipe}" ] && break
     sleep 10; t=$(( t + 10 ))
-    if [ "${t}" -ge 360 ]; then
+    if [ "${t}" -ge "${CLUSTER_REJOIN_SLO_S}" ]; then
       [ "${f1}" -gt "${f0}" ] \
         || fail "cluster-member-rejoin: restarted member did not start blank (fresh-at-genesis count ${f0} -> ${f1}) — the wipe did not take, this run proved nothing about empty-state rejoin"
-      fail "cluster-member-rejoin: blank member never took a post-rejoin snapshot within ${t}s (TAKEN count ${taken0} -> ${taken1}) — log-replay catch-up wedged or the scheduler is not running"
+      if [ "${moved:-0}" -eq 0 ]; then
+        fail "cluster-member-rejoin: blank member FROZE at block ${catchup_block} (head at wipe ${head_at_wipe}) — its replay position never advanced once in ${t}s, so this is the JOIN WEDGE of issue #195, not slow replay: the member fails to bind its catchup endpoint (Receiver.onAddDestination -> BindException), never receives the rest of the log, and parks in Election.init/awaitLocalSocketsClosed while reporting healthy to Nomad. Check the member's driver error log for 'Address already in use' on its 402x3 endpoint"
+      fi
+      fail "cluster-member-rejoin: blank member replayed to block ${catchup_block} of head-at-wipe ${head_at_wipe} in ${t}s — the position DID keep advancing, so this is genuinely slow catch-up rather than the #195 wedge: blank-member replay is O(lifetime log) and the log is never purged, see the log-purge follow-up in docs/reviews/2026-08-03-chaos-coverage-audit.md"
     fi
   done
-  log "cluster-member-rejoin: memberId=${follower} rejoined blank via full log replay (fresh ${f0}->${f1}, snapshot TAKEN ${taken0}->${taken1}, ${t}s); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
+  log "cluster-member-rejoin: memberId=${follower} rejoined blank via full log replay (fresh ${f0}->${f1}, replayed to block ${catchup_block} >= head-at-wipe ${head_at_wipe}, ${t}s); leader now memberId=$(cluster_leader 2>/dev/null || echo '?')"
 }
 
 case_cluster_quorum_loss_recover() {
@@ -153,7 +206,7 @@ case_cluster_quorum_loss_recover() {
   # restart re-pulls images, so use CHAOS_RESCHEDULE_SLO_S for the rejoin.
   local victims=(kardamom-sealer-1 kardamom-sealer-2)
   log "cluster-quorum-loss-recover: docker kill TWO sealer nodes (${victims[*]}) → quorum lost (1/3 up)"
-  docker kill "${victims[@]}" >/dev/null || fail "could not kill sealer nodes ${victims[*]}"
+  kill_node "${victims[@]}"
   # Quorum lost → the pipeline must STALL (no commits, executor gauge flat).
   assert_executor_stalled 15
   log "cluster-quorum-loss-recover: docker start ${victims[0]} (quorum 2/3 returns)"
