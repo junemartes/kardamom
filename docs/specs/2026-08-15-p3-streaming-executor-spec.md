@@ -422,3 +422,33 @@ level (skip it when the window is empty — steady-state windows shrink
 as the writer keeps up; check window occupancy stats first); (3) the
 last co-tenant streams (writer apply, feed) via CCX separation on
 hosts that have one.
+
+### Allocation diet — final state (2026-08-16)
+
+User-directed target: only tx data + state diff + receipt per tx.
+Ladder, all measured on the bench's counting allocator (process-local,
+immune to box noise):
+
+    start                                19.3 KB/tx  (~77MB/4k block)
+    arena recycling (slots/results/nodes/mv)   14.1
+    read-record buffer recycling               13.1
+    warm mv scrub (keys+buffers kept)          11.7   reallocs -> 0
+    carcass vec + fold-delta shells             6.7   big bucket -90%
+    pooled journal state (table hand-back)      4.9   <4K bucket -99.5%
+
+The engine now allocates LESS than the sequential baseline (20.5 vs
+27.8 allocs/tx; 4.3 vs 8.0 KB/tx) and `perf` puts malloc at **0.07% of
+process cycles** — allocation is no longer a time cost. Remaining
+composition: ~2.4KB/tx of <512B objects (per-account journal storage
+maps, ws spills, receipt internals — attribution needs an alloc-site
+tracer, not cycle sampling, and has no measurable time payoff), ~0.6KB
+of receipts (the deliverable), small fry. The revm journal's state
+TABLE recycles via pub `Journal.inner.state` — no JournalTr
+reimplementation was needed. Seq-side equivalent (hand-back slot on
+the commit-cache db) left unimplemented: it would only lower the
+baseline denominator.
+
+Shared-box note: perf -C windows caught ANOTHER Claude session's V8
+"HeapHelper" threads at 50% on the worker cores (affinity 0-11).
+Process-scoped `perf record -p/-- cmd` is immune; timing comparisons
+on this box must check `pgrep claude` first.
