@@ -553,7 +553,23 @@ where
                                 .send(ReaderToExec::Deposit {
                                     tx_idx,
                                     deposit,
-                                    position,
+                                    // Each expanded item gets ITS OWN slot
+                                    // position (the record claimed the range;
+                                    // the sealer reserved one slot per item).
+                                    // Sharing the record's position gave
+                                    // every deposit of one epoch the same
+                                    // `Receipt.tx_idx` — the persisted
+                                    // receipts table and the validator's
+                                    // receipt cross-check both key on it, so
+                                    // later receipts overwrote earlier ones
+                                    // and multi-item records false-diverged
+                                    // the validator (caught by S14's
+                                    // two-message batch). Positions on the
+                                    // cluster stream are cumulative slot
+                                    // counts, so the item's own count IS its
+                                    // position — and it matches the offline
+                                    // replay's `global_pos` assignment.
+                                    position: BPosition::from_index(tx_idx.0),
                                 })
                                 .is_err()
                             {
@@ -601,7 +617,11 @@ where
                                     tx_idx,
                                     origin_chain_id,
                                     message: Box::new(message),
-                                    position,
+                                    // Own slot position per message — see the
+                                    // epoch-deposit expansion above for why
+                                    // sharing the record's position corrupts
+                                    // every position-keyed receipt consumer.
+                                    position: BPosition::from_index(tx_idx.0),
                                 })
                                 .is_err()
                             {
@@ -1106,11 +1126,21 @@ mod tests {
                     tx_idx,
                     origin_chain_id,
                     message,
-                    ..
+                    position,
                 } => {
                     assert_eq!(*tx_idx, TxIndex(1 + i as u64));
                     assert_eq!(*origin_chain_id, origin);
                     assert_eq!(message.source_hash, expected.source_hash);
+                    // Each message gets ITS OWN slot position — sharing the
+                    // record's position collided every position-keyed
+                    // receipt consumer (persisted receipts table, validator
+                    // receipt cross-check) on multi-message records: S14's
+                    // two-message batch false-diverged the validator.
+                    assert_eq!(
+                        *position,
+                        BPosition::from_index(1 + i as u64),
+                        "message {i} must carry its own slot position"
+                    );
                 }
                 other => panic!("expected XChain at {i}, got {other:?}"),
             }
