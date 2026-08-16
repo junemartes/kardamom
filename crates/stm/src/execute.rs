@@ -1224,6 +1224,58 @@ impl<S: StateDatabase> BlockCtx<S> {
     /// node's registration point, retire the edges that were registered
     /// while it was open, and hand whatever became ready to its thread.
     /// Takes no global lock — only the finished nodes' own mutexes.
+    /// BAG MODE completion, INLINE: the finishing worker closes its own
+    /// node right here — no per-worker completion buffer, no
+    /// cross-worker buffer scan, no `pending` counter round-trip. One
+    /// uncontended child-list lock, one indegree fetch_sub per child,
+    /// ready children go straight to the bag. Prune batching only ever
+    /// existed to amortize the OLD global graph lock; per-node locks
+    /// made it ceremony (measured ~0.8µs per completion on independent
+    /// transfers — the next wall after the feed).
+    fn complete_inline(&self, job: u32) {
+        let node = &self.nodes[job as usize];
+        let mut list = node.children.lock().expect("children poisoned");
+        if !node.open.swap(false, Ordering::AcqRel) {
+            debug_assert!(false, "stm: tx left the graph twice");
+            tracing::error!(
+                tx = job,
+                "stm: tx left the graph twice — scheduler invariant violated"
+            );
+            self.double_exit.fetch_add(1, Ordering::SeqCst);
+        }
+        // Collect under the lock, dispatch after (bag push is lock-free,
+        // but keeping the child-list critical section minimal matters
+        // for the feed racing to register on this node).
+        // Fixed-size stack buffer + spill: no per-completion allocation.
+        let mut ready_buf = [0u32; 8];
+        let mut n_ready = 0usize;
+        let mut spill: Vec<u32> = Vec::new();
+        for c in list.iter() {
+            let child = &self.nodes[*c as usize];
+            if child.indegree.fetch_sub(1, Ordering::AcqRel) == 1 {
+                if n_ready < ready_buf.len() {
+                    ready_buf[n_ready] = *c;
+                    n_ready += 1;
+                } else {
+                    spill.push(*c);
+                }
+            }
+        }
+        list.clear();
+        drop(list);
+        self.finished.fetch_add(1, Ordering::SeqCst);
+        self.metrics.completions.fetch_add(1, Ordering::Relaxed);
+        for c in ready_buf.iter().take(n_ready).chain(spill.iter()) {
+            self.push_ready(0, *c);
+        }
+        if self.drained() {
+            for q in &self.queues {
+                q.cv.notify_all();
+            }
+            self.done_cv.notify_all();
+        }
+    }
+
     fn prune(&self, forced: bool) -> usize {
         let t0 = std::time::Instant::now();
         let mut applied = 0usize;
@@ -3578,14 +3630,18 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         // counter (debug-build overflow panic; found by the P3b
         // adversarial test's abort storms). Incremented-but-unpushed
         // is the safe direction: a spurious prune drains nothing.
-        let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
-        {
-            let mut b = ctx.completed[worker].lock().expect("completed poisoned");
-            b.push(job);
-            ctx.completed_len[worker].0.fetch_add(1, Ordering::Release);
-        }
-        if owed as usize >= ctx.prune_batch {
-            ctx.prune(false);
+        if ctx.bag_mode {
+            ctx.complete_inline(job);
+        } else {
+            let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
+            {
+                let mut b = ctx.completed[worker].lock().expect("completed poisoned");
+                b.push(job);
+                ctx.completed_len[worker].0.fetch_add(1, Ordering::Release);
+            }
+            if owed as usize >= ctx.prune_batch {
+                ctx.prune(false);
+            }
         }
     }
 }
