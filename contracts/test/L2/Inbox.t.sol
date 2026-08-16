@@ -83,7 +83,9 @@ contract InboxTest is Test {
     }
 
     function test_innerRevertRecordsFailure_deliveryStillSucceeds() public {
-        deliverAsOrigin(1, address(receiver), abi.encodeCall(Receiver.alwaysReverts, (hex"")), noCb());
+        deliverAsOrigin(
+            1, address(receiver), abi.encodeCall(Receiver.alwaysReverts, (hex"")), noCb()
+        );
         assertEq(inbox.delivered(ORIGIN, 1), 2);
     }
 
@@ -93,8 +95,7 @@ contract InboxTest is Test {
     }
 
     function test_callbackEnqueuedThroughOwnOutbox_withoutNestedCallback() public {
-        XChain.Callback memory cb =
-            XChain.Callback(address(0xCB), 300_000, bytes32(uint256(42)));
+        XChain.Callback memory cb = XChain.Callback(address(0xCB), 300_000, bytes32(uint256(42)));
         deliverAsOrigin(2, address(receiver), abi.encodeCall(Receiver.poke, (hex"55")), cb);
 
         // The response consumed seq 0 of this chain's outbox lane back to the
@@ -104,7 +105,15 @@ contract InboxTest is Test {
             inbox.RESPONSE_SELECTOR(), true, keccak256(hex""), bytes32(uint256(42))
         );
         bytes32 expected = XChain.hashMessage(
-            SELF, ORIGIN, 0, XChain.INBOX, address(0xCB), 0, 300_000, keccak256(responseData), bytes32(0)
+            SELF,
+            ORIGIN,
+            0,
+            XChain.INBOX,
+            address(0xCB),
+            0,
+            300_000,
+            keccak256(responseData),
+            bytes32(0)
         );
         assertTrue(outbox.sentMessages(expected));
     }
@@ -130,7 +139,9 @@ contract InboxTest is Test {
     function test_nextSeqCountsInnerRevertsToo() public {
         // Status 2 is still a DELIVERY — the message was consumed from the
         // lane, so the cursor view must advance past it.
-        deliverAsOrigin(0, address(receiver), abi.encodeCall(Receiver.alwaysReverts, (hex"")), noCb());
+        deliverAsOrigin(
+            0, address(receiver), abi.encodeCall(Receiver.alwaysReverts, (hex"")), noCb()
+        );
         assertEq(inbox.delivered(ORIGIN, 0), 2);
         assertEq(inbox.nextSeq(ORIGIN), 1);
     }
