@@ -2671,8 +2671,14 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 )));
             }
             c.clear();
-            node.queued.store(false, Ordering::Release);
-            node.fifo_preds.lock().expect("fifo_preds poisoned").clear();
+            if !self.ctx.bag_mode {
+                // FIFO-scheduler state: the bag has no queue position to
+                // record and no take-time verification to feed, so this
+                // second mutex (per tx, on the serial feed) is pure
+                // ceremony there.
+                node.queued.store(false, Ordering::Release);
+                node.fifo_preds.lock().expect("fifo_preds poisoned").clear();
+            }
             node.open.store(true, Ordering::Release);
         }
         self.ctx.admitted.fetch_add(1, Ordering::SeqCst);
