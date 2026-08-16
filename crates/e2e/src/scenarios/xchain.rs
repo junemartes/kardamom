@@ -49,13 +49,13 @@ pub const ORIGIN_CHAIN_ID: u64 = 412_399;
 
 /// `keccak256("MessageDelivered(uint64,uint64,bool)")` — pinned by
 /// `forge inspect Inbox events`.
-fn message_delivered_topic0() -> B256 {
+pub(crate) fn message_delivered_topic0() -> B256 {
     keccak256("MessageDelivered(uint64,uint64,bool)")
 }
 
 /// `keccak256` of the MessageSent signature (the callback struct flattens to
 /// its tuple type) — pinned by `forge inspect Outbox events`.
-fn message_sent_topic0() -> B256 {
+pub(crate) fn message_sent_topic0() -> B256 {
     keccak256(
         "MessageSent(uint64,uint64,address,address,uint256,uint64,bytes,bytes32,(address,uint64,bytes32))",
     )
@@ -66,7 +66,7 @@ fn message_sent_topic0() -> B256 {
 /// slot 0. 12 bytes of init returning 14 bytes of runtime — no compiler in
 /// the loop, and the assertion (slot 0 == the payload word we sent from the
 /// "origin chain") proves the delivered calldata reached the target intact.
-const RECEIVER_INIT_CODE: [u8; 26] = [
+pub(crate) const RECEIVER_INIT_CODE: [u8; 26] = [
     // init: CODECOPY(0, 0x0c, 0x0e); RETURN(0, 0x0e)
     0x60, 0x0e, 0x60, 0x0c, 0x60, 0x00, 0x39, 0x60, 0x0e, 0x60, 0x00, 0xf3,
     // runtime: CALLDATACOPY(0, 0, 0x20); SSTORE(0, MLOAD(0)); STOP
@@ -86,7 +86,7 @@ pub(crate) fn inbox_delivered_slot(origin: u64, seq: u64) -> B256 {
 }
 
 /// Storage slot of `mapping(uint64 => uint64) Outbox.nonces` (slot 0).
-fn outbox_nonces_slot(dest: u64) -> B256 {
+pub(crate) fn outbox_nonces_slot(dest: u64) -> B256 {
     map_slot(u64_word(dest), 0)
 }
 
@@ -95,7 +95,7 @@ fn outbox_sent_messages_slot(msg_hash: B256) -> B256 {
     map_slot(msg_hash, 1)
 }
 
-fn u64_word(v: u64) -> B256 {
+pub(crate) fn u64_word(v: u64) -> B256 {
     let mut w = [0u8; 32];
     w[24..].copy_from_slice(&v.to_be_bytes());
     B256::from(w)
@@ -103,13 +103,13 @@ fn u64_word(v: u64) -> B256 {
 
 /// An address as a 32-byte topic word (left-padded), the indexed-address
 /// encoding.
-fn address_word(a: Address) -> B256 {
+pub(crate) fn address_word(a: Address) -> B256 {
     let mut w = [0u8; 32];
     w[12..].copy_from_slice(a.as_slice());
     B256::from(w)
 }
 
-fn map_slot(key: B256, base_slot: u64) -> B256 {
+pub(crate) fn map_slot(key: B256, base_slot: u64) -> B256 {
     keccak256([key.as_slice(), u64_word(base_slot).as_slice()].concat())
 }
 
@@ -121,7 +121,7 @@ pub(crate) fn read_slot(state_dir: &Path, address: Address, slot: B256) -> Resul
     snap.storage(address, slot).context("read storage slot")
 }
 
-fn feed_msg(
+pub(crate) fn feed_msg(
     seq: u64,
     origin_block: u64,
     target: Address,
@@ -514,15 +514,15 @@ pub async fn gap_halts_pair_not_chain(
     Ok(())
 }
 
-fn log_address(log: &serde_json::Value) -> Option<&str> {
+pub(crate) fn log_address(log: &serde_json::Value) -> Option<&str> {
     log.get("address").and_then(|a| a.as_str())
 }
 
-fn log_topic0(log: &serde_json::Value) -> Option<B256> {
+pub(crate) fn log_topic0(log: &serde_json::Value) -> Option<B256> {
     log_topic(log, 0)
 }
 
-fn log_topic(log: &serde_json::Value, i: usize) -> Option<B256> {
+pub(crate) fn log_topic(log: &serde_json::Value, i: usize) -> Option<B256> {
     log.get("topics")?
         .as_array()?
         .get(i)?
