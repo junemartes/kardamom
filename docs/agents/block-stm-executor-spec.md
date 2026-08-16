@@ -508,3 +508,63 @@ pessimistic scheduling.
 - `unpredictable` lane sizing under adversarial calldata (a griefing
   contract that randomizes its footprint) — the serial lane bounds the
   damage to sequential throughput; no worse than today.
+
+## P2 addendum (2026-08-16) — versioned reads: the parallel tax is data movement, not synchronization
+
+The question this answered: per-tx read cost grows from w=1 to w=4
+(engine-measured on the ladder), and the suspect was MvCache's
+RwLock-sharded reads — every read performs an atomic RMW on a shared
+lock word, so the theory was coherence traffic on lock lines. A full
+replacement was built to test it: fixed-capacity open-addressed tables,
+per-slot seqlocks over atomic words, readers performing ONLY loads
+(zero shared-line writes), epoch-tag O(1) reset, pooled reuse
+(`stash/flat-seqlock-tables` keeps the implementation + its torture
+suite: torn-read-detectable values, claim-storm chain-integrity,
+duplicate-cell regressions, oracle replay, cross-key happens-before).
+
+Measured, engine-level, clean-box A/B at identical flags (mdbx,
+4k-tx blocks, workers pinned + kept hot):
+
+| workload            | RwLock (old)     | flat seqlock     |
+|---------------------|------------------|------------------|
+| parcounter cw25 w4  | 1.71x, read 3.3ms| 1.74x, read 2.0ms|
+| parcounter cw100 w4 | 2.75x            | 2.73x            |
+| partransfer w4      | 1.59x            | 1.43x            |
+| transfers (chained) | 0.98x            | 0.98x            |
+
+The decisive split (mv-only timer carved out of the read path),
+partransfer: **mv time grows w1→w4 by the SAME absolute amount in both
+designs** (0.6→1.8ms old; 1.0→2.35ms flat). A table whose reads are
+pure loads inflates exactly as much as the lock-based one. The lock-RMW
+theory is falsified.
+
+What the growth actually is: data movement — publishes dirty the lines
+readers must subsequently pull (physics of any shared-memory MV store),
+plus shared-path effects (BaseCache, snapshot, all-core clocks). The
+non-mv read components grow by the same factor, same evidence.
+
+Two supporting structure-level facts from `stm-contention` (the bench
+built for exactly this question):
+
+- PARTITIONED access (the pattern domain dispatch actually generates):
+  the old design's per-tx cost DROPS with threads (462→271ns, t=1→4).
+  The mv cache was never the scaling bottleneck under real dispatch.
+- The flat design is 2–7x worse at multi-version cells (chained shape):
+  demote-per-publish turns its overflow mutex into the primary store,
+  and validation replay reads from there too. In-engine this hides
+  under the serial span (0.98x = 0.98x), but it prices the design out.
+
+Consequences, encoded:
+
+1. MvCache keeps the RwLock + sorted-Vec design. Its misses are
+   L2-resident map probes (~37ns); a sparse flat array's are capacity
+   misses (~62ns) — misses are the mv common case (reads precede own
+   publishes), so cheap misses win.
+2. Read-side RMW elimination is NOT a lever here. Do not respend it.
+3. The per-tx parallel premium that remains is data movement plus the
+   shared read path below mv (BaseCache/snapshot) — attack it by
+   reading LESS (fewer probes per read: layer-count discipline,
+   exclusive-cell fast path) rather than by synchronizing cheaper.
+4. Keeper from the unit: `hot_chain_streams_through_the_fifo` retries
+   for the streaming shape — workers outrunning the feed is a
+   legitimate schedule, not an engine fault.
