@@ -277,3 +277,38 @@ windows go empty (advance_base absorbs them into the base cache);
 unchanged: mv values pre-verdict equal fold values pre-verdict by
 construction, and a wound corrects/aborts through the existing
 protocol.
+
+### mv-as-layer — design decisions (pre-implementation)
+
+- **Release**: `MvRelease { block, mv: Arc<MvCache>, sink_final: Option<AccountInfo> }`
+  sent by the tail right after drain + extract + a fee-delta running
+  sum (~1.4ms past exec) — before phase-1/fold. `BlockCtx.mv` becomes
+  `Arc<MvCache>`; the reaper ships slots only.
+- **Reads**: `BlockInput` gains `mv_layers: &[Arc<MvCache>]`, probed
+  newest-first between own-mv and the delta layers: account/slot at
+  `u32::MAX` (top version == last writer == exactly what the fold
+  computes), `read_code` chained for CREATE-then-call across blocks.
+  Recorded as `SeenVersion::None` (block-input semantics — predecessor
+  caches are immutable after their drain; repair never writes mv).
+- **Sink**: mv skips the fee sink, so the release carries the final
+  sink account (start + fee-delta sum); `bind` requires it when mv
+  layers are present, probes through delta layers otherwise.
+- **Repair**: `MvCache::final_delta()` (top version per cell + code)
+  materializes each mv layer; the prefix merges base ← delta layers
+  (oldest first) ← mv layers (oldest first). Rare path, fold-cost.
+- **Wounds**: unchanged protocol. Pre-verdict mv content equals
+  pre-verdict fold content by construction; a wound corrects via the
+  existing DeltaRelease and the consumer rebinds with the corrected
+  DELTA layer (never the stale mv).
+- **Rejected alternative — absorb into the base cache at release**
+  ("advance early"): zero probe tax, but bind must wait for a
+  fold-equivalent materialization (final_delta + advance_base) before
+  the first read, putting the cost right back on the cadence; and a
+  wound would leave stale cells in the pool-lifetime cache that the
+  corrected delta does not necessarily overwrite (different execution
+  path → different write set) — cache deletion of stale-minus-
+  corrected keys would be required. The probe-level design keeps the
+  cache backend-mirroring and wound-clean.
+- **Expected**: cadence ≈ exec + ~1.4ms → ~3.0x at cw100; the
+  remaining gap to 3.5x is the mv-probe tax inside the span plus
+  ~1.4ms dispatch slack — both span-level work, after this lands.
