@@ -48,12 +48,12 @@ pub async fn submit_next_proof<P: Provider>(
     proofs_dir: &Path,
 ) -> Result<SubmitOutcome, BatcherError> {
     let oracle = IKardamomProofOracle::new(oracle_addr, &provider);
-    let last_proven = oracle
-        .lastProvenBatch()
+    let last_finalized = oracle
+        .lastFinalizedBatch()
         .call()
         .await
-        .map_err(|e| BatcherError::L1(format!("lastProvenBatch: {e}")))?;
-    let next = last_proven + 1;
+        .map_err(|e| BatcherError::L1(format!("lastFinalizedBatch: {e}")))?;
+    let next = last_finalized + 1;
 
     let settlement_addr = oracle
         .settlement()
