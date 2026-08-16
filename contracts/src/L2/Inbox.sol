@@ -21,6 +21,16 @@ contract Inbox {
     ///         call reverted).
     mapping(uint64 => mapping(uint64 => uint8)) public delivered;
 
+    /// @notice Count of messages delivered per origin lane — equivalently,
+    ///         the first seq not yet delivered. Because delivery is dense and
+    ///         in-order per lane by construction (the derivation pipeline's
+    ///         no-skip rule), a bare counter is exact: after delivering seq N
+    ///         it always equals N + 1. Status 2 (inner call reverted) counts —
+    ///         the message WAS delivered. This is the app-facing "how far has
+    ///         this lane delivered" view and the future authoritative source
+    ///         for watcher cursor reconciliation.
+    mapping(uint64 => uint64) public nextSeq;
+
     uint64 private _xdOrigin;
     address private _xdSender;
 
@@ -62,6 +72,12 @@ contract Inbox {
         // and FAILURE also triggers the callback: an origin app must never
         // wait forever on a revert.
         delivered[originChainId][seq] = ok ? 1 : 2;
+        unchecked {
+            // Exact under the density invariant (see nextSeq docs): the lane
+            // delivers 0, 1, 2, … with no skips, so counting deliveries and
+            // tracking seq + 1 are the same number.
+            nextSeq[originChainId]++;
+        }
         emit MessageDelivered(originChainId, seq, ok);
 
         if (!XChain.isNone(cb)) {

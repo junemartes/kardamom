@@ -109,6 +109,47 @@ contract InboxTest is Test {
         assertTrue(outbox.sentMessages(expected));
     }
 
+    function test_nextSeqCountsPerOriginIndependently() public {
+        assertEq(inbox.nextSeq(ORIGIN), 0);
+
+        deliverAsOrigin(0, address(receiver), abi.encodeCall(Receiver.poke, (hex"")), noCb());
+        assertEq(inbox.nextSeq(ORIGIN), 1);
+
+        // A second origin's lane starts at ITS seq 0 and counts alone.
+        uint64 other = ORIGIN + 1;
+        vm.prank(XChain.txSender(other));
+        inbox.deliver(other, 0, address(0xABCD), address(receiver), 0, 500_000, hex"", noCb());
+        assertEq(inbox.nextSeq(other), 1);
+        assertEq(inbox.nextSeq(ORIGIN), 1, "another origin's delivery must not move this lane");
+
+        deliverAsOrigin(1, address(receiver), abi.encodeCall(Receiver.poke, (hex"")), noCb());
+        assertEq(inbox.nextSeq(ORIGIN), 2);
+        assertEq(inbox.nextSeq(other), 1);
+    }
+
+    function test_nextSeqCountsInnerRevertsToo() public {
+        // Status 2 is still a DELIVERY — the message was consumed from the
+        // lane, so the cursor view must advance past it.
+        deliverAsOrigin(0, address(receiver), abi.encodeCall(Receiver.alwaysReverts, (hex"")), noCb());
+        assertEq(inbox.delivered(ORIGIN, 0), 2);
+        assertEq(inbox.nextSeq(ORIGIN), 1);
+    }
+
+    function test_nextSeqIsTheFirstUndeliveredSeq() public {
+        // The counter and "seq + 1 of the last delivery" are the same number
+        // under the density invariant — the property that makes it usable as
+        // a cursor-reconciliation source.
+        for (uint64 seq = 0; seq < 3; seq++) {
+            deliverAsOrigin(seq, address(receiver), abi.encodeCall(Receiver.poke, (hex"")), noCb());
+            assertEq(inbox.nextSeq(ORIGIN), seq + 1);
+        }
+        // A rejected double delivery must NOT count.
+        vm.prank(XChain.txSender(ORIGIN));
+        vm.expectRevert("Inbox: already delivered");
+        inbox.deliver(ORIGIN, 2, address(0xABCD), address(receiver), 0, 100_000, hex"", noCb());
+        assertEq(inbox.nextSeq(ORIGIN), 3);
+    }
+
     function test_failureAlsoTriggersCallback() public {
         XChain.Callback memory cb = XChain.Callback(address(0xCB), 300_000, bytes32(uint256(7)));
         deliverAsOrigin(3, address(receiver), abi.encodeCall(Receiver.alwaysReverts, (hex"")), cb);
