@@ -102,14 +102,21 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
     let pv = load_block_pv(pv_bytes);
     let proof = Bytes::from(proof_bytes);
     let vkey: B256 = vkey_hex.trim().parse().expect("vkey.hex is a bytes32");
-    assert_eq!(pv.raw.len(), 160, "single-block public values are 160 bytes");
+    assert_eq!(
+        pv.raw.len(),
+        160,
+        "single-block public values are 160 bytes"
+    );
 
     let provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .connect_http(anvil.endpoint_url());
     let bytes_hex = format!("0x{ERC7955_RUNTIME_HEX}");
     for req in [
-        ("anvil_setCode", serde_json::json!([ERC7955_FACTORY, bytes_hex])),
+        (
+            "anvil_setCode",
+            serde_json::json!([ERC7955_FACTORY, bytes_hex]),
+        ),
         (
             "anvil_setBalance",
             serde_json::json!([DEV_OWNER, U256::from(10u128.pow(21))]),
@@ -270,7 +277,17 @@ async fn real_groth16_proof_accepted_on_chain_challenge_and_grief_rejected() {
     // The honest claim survives untouched.
     let (claimer, _, _, _, _, _) = {
         let c = oracle.claims(1).call().await.unwrap();
-        (c.claimer, c.bond, c.claimedAt, c.preRoot, c.finalRoot, c.seqHash)
+        (
+            c.claimer,
+            c.bond,
+            c.claimedAt,
+            c.preRoot,
+            c.finalRoot,
+            c.seqHash,
+        )
     };
-    assert_eq!(claimer, DEV_OWNER, "honest claim intact after the grief attempt");
+    assert_eq!(
+        claimer, DEV_OWNER,
+        "honest claim intact after the grief attempt"
+    );
 }
