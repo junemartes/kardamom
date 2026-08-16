@@ -359,3 +359,34 @@ the inflation), and the remaining path to 3.5x is span packing
 all of this: callers 0,1,6,7 are ONLY TWO physical cores (SMT pairs
 0/6 and 1/7); workers 2,3,4,5 each own a physical core with an idle
 sibling.
+
+### Span-inflation: two more negatives, one surviving hypothesis
+
+- `mallopt(M_MMAP_THRESHOLD/M_TRIM_THRESHOLD, 1GB)` (heap recycling,
+  no per-block mmap/munmap, no TLB-shootdown IPIs): NO change
+  (pipeline busy 64.5, block-at-a-time 55.6). Reverted.
+- Together with the mimalloc negative, everything user-space-allocator
+  and kernel-mapping shaped is excluded.
+
+The surviving hypothesis is **LLC eviction**: the pipeline's services
+stream several MB through the shared L3 every block (settler
+delta-clone + finalize sort, writer apply, feed prepare, ctx build)
+concurrently with the span — and every established fact fits: a spin
+hog (no memory traffic) does not inflate; an alloc-storm (heavy
+streaming) reproduces the inflation exactly, from ANOTHER PROCESS
+(shared L3, not shared locks); allocator swaps move the same bytes and
+change nothing; the inflation shows in evm-not-read because L3 misses
+hit the interpreter's working set, not just state reads.
+
+To confirm and fix (next session):
+1. Confirm with LLC-miss counters (no `perf` on this box — install or
+   use resctrl occupancy MSRs if permitted).
+2. Reduce bytes moved per block: the settler's `out.delta.clone()` is
+   BENCH-ONLY pollution (outcomes retained for post-hoc asserts —
+   production consumes the delta); finalize could take ownership.
+   The writer's apply is production-real; its streaming footprint is
+   the honest floor.
+3. If the floor still inflates: L3 partitioning (resctrl/CAT) between
+   worker cores and service cores is the structural answer on shared
+   boxes; on production hosts with private-L3 core clusters, pinning
+   services to a different CCX than workers achieves the same free.
