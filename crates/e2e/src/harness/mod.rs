@@ -72,6 +72,10 @@ pub enum Genesis {
     /// `chains/dev-withdrawals.toml` — the `L2ToL1MessagePasser` predeploy at
     /// `0x42…16`, but only account #0 is prefunded.
     DevWithdrawals,
+    /// `chains/dev-interop.toml` — the cross-chain `Outbox`/`Inbox`
+    /// predeploys at `0x42…E0`/`0x42…E1`, only account #0 prefunded. The
+    /// xchain scenario needs it.
+    DevInterop,
 }
 
 impl Genesis {
@@ -79,6 +83,7 @@ impl Genesis {
         match self {
             Genesis::ClusterDev => repo.join("deploy/cluster/config/genesis/dev.toml"),
             Genesis::DevWithdrawals => repo.join("chains/dev-withdrawals.toml"),
+            Genesis::DevInterop => repo.join("chains/dev-interop.toml"),
         }
     }
 }
