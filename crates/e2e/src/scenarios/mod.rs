@@ -20,6 +20,7 @@ pub mod nonce_unordered;
 pub mod rpc_liveness;
 pub mod rpc_vectors;
 pub mod xchain;
+pub mod xchain_da_parity;
 
 use std::net::SocketAddr;
 use std::path::Path;

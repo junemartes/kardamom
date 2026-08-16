@@ -74,13 +74,13 @@ const RECEIVER_INIT_CODE: [u8; 26] = [
 ];
 
 /// Storage slot of `mapping(uint64 => uint64) Inbox.nextSeq` (slot 1; slot 0
-/// is `delivered`).
-fn inbox_next_seq_slot(origin: u64) -> B256 {
+/// is `delivered`). Shared with the DA-parity scenario.
+pub(crate) fn inbox_next_seq_slot(origin: u64) -> B256 {
     map_slot(u64_word(origin), 1)
 }
 
 /// Storage slot of `Inbox.delivered[origin][seq]` (double mapping at slot 0).
-fn inbox_delivered_slot(origin: u64, seq: u64) -> B256 {
+pub(crate) fn inbox_delivered_slot(origin: u64, seq: u64) -> B256 {
     let inner = map_slot(u64_word(origin), 0);
     keccak256([u64_word(seq).as_slice(), inner.as_slice()].concat())
 }
@@ -115,7 +115,7 @@ fn map_slot(key: B256, base_slot: u64) -> B256 {
 
 /// One storage slot of `address`, read from the executor's live state DB
 /// (MVCC read-only snapshot — the `read_validator_state_root` seam).
-fn read_slot(state_dir: &Path, address: Address, slot: B256) -> Result<U256> {
+pub(crate) fn read_slot(state_dir: &Path, address: Address, slot: B256) -> Result<U256> {
     let env = open_state_ro(state_dir)?;
     let snap = kardamom_state::StateSnapshot::open(&env).context("snapshot executor state")?;
     snap.storage(address, slot).context("read storage slot")
@@ -142,10 +142,23 @@ fn feed_msg(
     }
 }
 
-/// Everything [`delivery`] proved that [`gap_halts_pair_not_chain`] builds on.
+/// Everything [`delivery`] proved that [`gap_halts_pair_not_chain`] and the
+/// DA-parity scenario ([`super::xchain_da_parity`]) build on.
 pub struct DeliveryOutcome {
     /// The dev-mnemonic #0 signer's next unused nonce.
     pub next_nonce: u64,
+    /// Every user tx the flow submitted (the receiver deploy + the settle
+    /// nudges), in nonce order — the DA-parity scenario rebuilds the
+    /// canonical blocks from these plus the 0x7D receipts.
+    pub user_txs: Vec<l2::SignedTransfer>,
+    /// The outbox messages scripted into the feed, in seq order. The first
+    /// three were delivered; seq 3 stays pending (nothing closes its origin
+    /// block during the happy path).
+    pub messages: Vec<kardamom_types::xchain::OutboxMessage>,
+    /// The deployed receiver contract.
+    pub receiver: Address,
+    /// The calldata word seq 0 stored into the receiver's slot 0.
+    pub payload_word: B256,
 }
 
 /// The happy path: 3 messages across 2 origin blocks, delivered through the
@@ -160,10 +173,12 @@ pub async fn delivery(
     let signers = l2::dev_signers(2)?;
     let sender = &signers[0];
     let mut nonce = 0u64;
+    let mut user_txs: Vec<l2::SignedTransfer> = Vec::new();
 
     // --- Deploy the receiver via the harness (an ordinary CREATE tx). -----
     let deploy = l2::sign_create(sender, t.chain_id, nonce, &RECEIVER_INIT_CODE)?;
     nonce += 1;
+    user_txs.push(deploy.clone());
     t.rpc
         .send_raw(&deploy.raw)
         .await
@@ -194,14 +209,19 @@ pub async fn delivery(
         context: B256::repeat_byte(0x42),
     };
     let payee = signers[1].address;
-    feed.push_message(feed_msg(0, 100, receiver, payload_word.as_slice(), None));
-    feed.push_message(feed_msg(1, 100, payee, &[0xDE, 0xAD], None));
-    feed.push_message(feed_msg(2, 101, payee, &[0xBE, 0xEF], Some(cb)));
-    // Sentinel in a THIRD origin block: an origin block is only known
-    // complete when a later one appears, so this is what closes block 101.
-    // It stays pending itself (nothing closes 102), and is delivered by the
-    // gap arm.
-    feed.push_message(feed_msg(3, 102, payee, &[0x03], None));
+    let messages = vec![
+        feed_msg(0, 100, receiver, payload_word.as_slice(), None),
+        feed_msg(1, 100, payee, &[0xDE, 0xAD], None),
+        feed_msg(2, 101, payee, &[0xBE, 0xEF], Some(cb)),
+        // Sentinel in a THIRD origin block: an origin block is only known
+        // complete when a later one appears, so this is what closes block
+        // 101. It stays pending itself (nothing closes 102), and is
+        // delivered by the gap arm.
+        feed_msg(3, 102, payee, &[0x03], None),
+    ];
+    for m in &messages {
+        feed.push_message(m.clone());
+    }
 
     // --- The three 0x7D receipts, keyed by remote_source_hash. ------------
     let mut receipts = Vec::new();
@@ -301,6 +321,7 @@ pub async fn delivery(
         let nudge = l2::sign_transfer(sender, t.chain_id, nonce, payee, 1)?;
         if t.rpc.send_raw(&nudge.raw).await.result.is_ok() {
             nonce += 1;
+            user_txs.push(nudge);
         }
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
@@ -395,7 +416,13 @@ pub async fn delivery(
         "sequencer relay must have moved ≥3 remote messages (was {relayed_msgs_before}, now {relayed_msgs})"
     );
 
-    Ok(DeliveryOutcome { next_nonce: nonce })
+    Ok(DeliveryOutcome {
+        next_nonce: nonce,
+        user_txs,
+        messages,
+        receiver,
+        payload_word,
+    })
 }
 
 /// The adversarial arm: the feed swallows one seq. The watcher must
