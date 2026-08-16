@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, bail};
-use sp1_sdk::ProvingKey;
+use sp1_sdk::{HashableKey, ProvingKey};
 use sp1_sdk::blocking::{Elf, ProveRequest, Prover, ProverClient};
 use sp1_sdk::SP1Stdin;
 
@@ -59,7 +59,12 @@ fn main() -> anyhow::Result<()> {
         let pk = client.setup(elf).context("prover setup")?;
         let setup_dt = setup_t.elapsed();
         let prove_t = std::time::Instant::now();
-        let proof = client.prove(&pk, stdin).run().context("core proving")?;
+        let g16 = std::env::var("KARDAMOM_GROTH16").is_ok_and(|v| v == "1");
+        let proof = if g16 {
+            client.prove(&pk, stdin).groth16().run().context("groth16 proving")?
+        } else {
+            client.prove(&pk, stdin).run().context("core proving")?
+        };
         let prove_dt = prove_t.elapsed();
         let verify_t = std::time::Instant::now();
         client
@@ -73,9 +78,17 @@ fn main() -> anyhow::Result<()> {
         }
         let proof_path = format!("{dir}/proof.bin");
         proof.save(&proof_path).context("save proof")?;
+        if g16 {
+            std::fs::write(format!("{dir}/proof-onchain.bin"), proof.bytes())
+                .context("write on-chain proof bytes")?;
+            std::fs::write(format!("{dir}/vkey.hex"), pk.verifying_key().bytes32())
+                .context("write vkey")?;
+        }
         println!(
-            "PROOF OK: core proof generated, verified, public values identical.\n\
-             setup {setup_dt:?}, prove {prove_dt:?}, verify {verify_dt:?}; saved to {proof_path}"
+            "PROOF OK ({}): setup {setup_dt:?}, prove {prove_dt:?}, verify {verify_dt:?}; \
+             saved to {proof_path}{}",
+            if g16 { "groth16, on-chain-ready" } else { "core" },
+            if g16 { format!(" (+ proof-onchain.bin, vkey.hex in {dir})") } else { String::new() }
         );
         return Ok(());
     }
