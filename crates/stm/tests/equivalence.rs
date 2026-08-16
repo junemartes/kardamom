@@ -731,3 +731,130 @@ fn streaming_release_and_wound_correction() {
         eprintln!("streaming spec={speculative}: {wound_reps}/{reps} reps wounded");
     }
 }
+
+/// THE P3b ADVERSARIAL CASE (spec "Wound-abort adversarial"): block 2
+/// executes SPECULATIVELY on block 1's released delta while block 1 is
+/// still validating. When the lying-stats race fires a wound in block
+/// 1, the speculative release was wrong — the consumer aborts block 2,
+/// rebuilds it on the `corrected` release, and both blocks must come
+/// out byte-identical to the sequential chain. When no wound fires,
+/// block 2's speculative run IS the answer — asserted identical too,
+/// which is what makes the gamble sound: either way, bytes.
+#[test]
+fn speculative_pipeline_wound_aborts_and_recovers() {
+    let sg = signers(4);
+    let database = db(&sg);
+    let lying_stats = {
+        let obs: Vec<TxObs> = (0..4)
+            .map(|i| {
+                let sender = Address::with_last_byte(i as u8 + 0x10);
+                let mut buf = [0u8; 64];
+                buf[..32]
+                    .copy_from_slice(&U256::from_be_slice(sender.as_slice()).to_be_bytes::<32>());
+                buf[32..].copy_from_slice(&U256::from(3u8).to_be_bytes::<32>());
+                TxObs {
+                    index: i,
+                    block: 1,
+                    sender,
+                    to: Some(COUNTER),
+                    selector: Some(COUNTER_SEL),
+                    args: Vec::new(),
+                    gas: 30_000,
+                    has_value: false,
+                    reads: Vec::new(),
+                    writes: vec![Cell::Slot(COUNTER, keccak256(buf))],
+                }
+            })
+            .collect();
+        Stats::learn(&obs)
+    };
+    // Block 1: the wound-prone racing increments. Block 2: four MORE
+    // increments from the same senders — its every receipt depends on
+    // block 1's final counter value, so a stale layer cannot pass the
+    // byte-identical assert.
+    let recs1 = records(
+        (0..4)
+            .map(|i| tx(&sg[i], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let recs2 = records(
+        (0..4)
+            .map(|i| tx(&sg[i], 1, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let seq1 = execute_block_sequential(&database, None, env(), &recs1).unwrap();
+    let env2 = ExecEnv {
+        block_number: 2,
+        ..env()
+    };
+    let seq2 = execute_block_sequential(&database, Some(&seq1.1), env2, &recs2).unwrap();
+
+    let mut wound_reps = 0usize;
+    let mut reps = 0usize;
+    for rep in 0..200 {
+        let label = format!("spec-pipeline rep={rep}");
+        kardamom_stm::execute::with_pool(
+            kardamom_stm::execute::PoolConfig {
+                workers: 4,
+                ..Default::default()
+            },
+            |pool| {
+                let submit_block2 = |layer: std::sync::Arc<PendingDelta>| {
+                    let mut sess = pool
+                        .begin_block_layered(
+                            vec![database.clone(); 4],
+                            PendingDelta::new(),
+                            vec![layer],
+                            env2,
+                            &lying_stats,
+                        )
+                        .unwrap();
+                    for (t, p, e) in &recs2 {
+                        sess.push_tx(*t, *p, e.clone()).unwrap();
+                    }
+                    let (d2tx, _d2rx) = std::sync::mpsc::channel();
+                    sess.submit_streaming(d2tx, true).unwrap()
+                };
+                // Block 1: streaming speculative.
+                let mut sess1 = pool
+                    .begin_block(database.clone(), PendingDelta::new(), env(), &lying_stats)
+                    .unwrap();
+                for (t, p, e) in &recs1 {
+                    sess1.push_tx(*t, *p, e.clone()).unwrap();
+                }
+                let (d1tx, d1rx) = std::sync::mpsc::channel();
+                let ticket1 = sess1.submit_streaming(d1tx, true).unwrap();
+                // The SPECULATIVE release: block 1 is still validating.
+                let rel1 = d1rx.recv().expect("speculative release");
+                assert!(!rel1.corrected, "{label}: first release is speculative");
+                let ticket2 = submit_block2(rel1.delta.clone());
+                // Block 1's verdict.
+                let out1 = ticket1.wait().unwrap();
+                assert_identical(&seq1, &out1.receipts, &out1.delta, &label);
+                if out1.wounds == 0 {
+                    // The gamble held: block 2's speculative run is final.
+                    let out2 = ticket2.wait().unwrap();
+                    assert_identical(&seq2, &out2.receipts, &out2.delta, &label);
+                    assert!(d1rx.try_recv().is_err(), "{label}: no extra release");
+                } else {
+                    wound_reps += 1;
+                    // The release was WRONG. Unwind block 2 entirely:
+                    // abort, discard its ticket (Ok or Err — either is
+                    // garbage), rebuild on the corrected delta.
+                    let corrected = d1rx.recv().expect("corrected release");
+                    assert!(corrected.corrected, "{label}: wound re-issues");
+                    pool.abort_active();
+                    let _ = ticket2.wait();
+                    let ticket2b = submit_block2(corrected.delta.clone());
+                    let out2 = ticket2b.wait().unwrap();
+                    assert_identical(&seq2, &out2.receipts, &out2.delta, &label);
+                }
+            },
+        );
+        reps = rep + 1;
+        if wound_reps > 0 && rep >= 24 {
+            break;
+        }
+    }
+    eprintln!("spec-pipeline: {wound_reps}/{reps} reps wounded");
+}

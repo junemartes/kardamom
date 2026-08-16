@@ -1717,6 +1717,28 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         sess.seal()
     }
 
+    /// Abort the executing block and any staged successor: workers
+    /// stop at their next dispatch check, the drain completes on the
+    /// abort flag, and the affected tickets resolve (to an error when
+    /// txs were left unexecuted). The P3b wound-abort path: whoever
+    /// layered a block on a delta that a `corrected` release later
+    /// invalidated calls this to hurry the stale block out, then
+    /// rebuilds and resubmits from retained inputs — and must DISCARD
+    /// the stale ticket's outcome either way (a small block may finish
+    /// on stale layers before the flag lands; its bytes are garbage).
+    pub fn abort_active(&self) {
+        let st = self.shared.0.lock().expect("pool poisoned");
+        for c in st.ctx.iter().chain(st.next.iter()) {
+            c.aborted.store(true, Ordering::SeqCst);
+            for q in &c.queues {
+                q.cv.notify_all();
+            }
+            c.done_cv.notify_all();
+        }
+        drop(st);
+        self.shared.1.notify_all();
+    }
+
     /// Mirror a committed delta into the pool-lifetime backend cache.
     /// Call AFTER the state writer applies the same delta; skipping the
     /// call leaves stale entries and produces wrong reads — the harness's
@@ -2469,7 +2491,19 @@ fn block_tail<S: StateDatabase + Sync>(
         // re-execute against the exact materialized prefix. Strictly
         // sequential by nature, and rare enough that its cost is not
         // worth optimizing.
+        //
+        // The prefix starts from the FULL pre-block view: unsettled
+        // predecessor LAYERS (oldest first — `MvView` probes them
+        // newest-first over `base`, so base is the bottom) merged over
+        // the owned base delta. Dropping the layers here read
+        // pre-predecessor state into re-executed txs — found by the
+        // P3b adversarial pipeline test (rejected receipts from stale
+        // nonces), latent since the layers landed: the bench scenarios
+        // never wound.
         let mut layered = ctx.base.clone();
+        for l in ctx.layers.iter().rev() {
+            layered.merge_from(l);
+        }
         for (i, mut r) in tx_results.into_iter().enumerate() {
             if wounded_set.contains(&i) {
                 let (tx_idx, position, envelope) = &txs[i];
