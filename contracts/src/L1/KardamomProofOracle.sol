@@ -261,6 +261,7 @@ contract KardamomProofOracle is KardamomUUPSBase {
     /// @notice Pull bond refunds / slash rewards.
     function withdraw() external {
         uint256 amount = withdrawable[msg.sender];
+        // slither-disable-next-line incorrect-equality
         if (amount == 0) revert NothingToWithdraw();
         withdrawable[msg.sender] = 0;
         (bool ok,) = msg.sender.call{value: amount}("");
@@ -320,6 +321,7 @@ contract KardamomProofOracle is KardamomUUPSBase {
     ) internal view returns (bytes32) {
         (bytes32 pre, bytes32 post, uint256 blockNumber, bytes32 recordsDigest,) =
             abi.decode(publicValues, (bytes32, bytes32, uint256, bytes32, bytes32));
+        // slither-disable-next-line unused-return
         (uint64 postedStart,,) = settlement.batches(batchIndex);
         bytes32 expectedPre = blockOffset == 0 ? claimPreRoot : blockRoots[blockOffset - 1];
         if (pre != expectedPre) revert PreRootMismatch();
