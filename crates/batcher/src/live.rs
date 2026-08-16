@@ -356,31 +356,21 @@ pub fn run_feed<P: Provider>(
             }) => acc.observe_tx(envelope, position),
             // Deposits are absent from DA by design: re-derivable from L1
             // (mirrors MultiArchiveReader skipping DepositRefs offline).
-            // Deposits are absent from DA by design: re-derivable from L1.
             // The epoch marker is skipped for the same reason — a
             // reconstructor reads the origin off the block boundary and
             // re-derives that L1 block's deposits itself.
             Ok(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. }) => {}
-            // Remote-epoch records have no DA representation yet: unlike
+            // Remote-epoch records DO travel in DA (spec §16 Q8): unlike
             // deposits they are NOT re-derivable from this chain's L1 origin,
-            // so skipping them would post batches a reconstructor cannot
-            // replay into the same chain. Refuse loudly until the interop DA
-            // format lands (interop P1, reconstruction slice).
-            Ok(ReaderToExec::RemoteEpoch { record, .. }) => {
-                bail!(
-                    "remote epoch (origin {}, seq {}..={}) has no DA representation; \
-                     refusing to post a non-reconstructible batch",
-                    record.origin_chain_id,
-                    record.first_seq,
-                    record.last_seq()
-                )
-            }
-            Ok(ReaderToExec::XChain { .. }) => {
-                // Unreachable without a preceding RemoteEpoch marker (the
-                // reader always dispatches the marker first), which bails
-                // above.
-                bail!("cross-chain message outside a remote epoch on the batcher feed")
-            }
+            // so the record — messages by value, calldata included — is
+            // buffered into the block it leads and carried in the KAR1 v2
+            // payload for the reconstruction replay to re-execute.
+            Ok(ReaderToExec::RemoteEpoch { record, .. }) => acc.observe_remote_epoch(*record),
+            // The per-message expansion of the record above. The messages
+            // already travel by value INSIDE the buffered record, so the
+            // expanded dispatches carry nothing the batch does not have —
+            // skip, exactly as the exec side re-expands from the record.
+            Ok(ReaderToExec::XChain { .. }) => {}
             Ok(ReaderToExec::Boundary(b)) => {
                 let closed = acc.observe_boundary(b);
                 counter!(metric_names::BLOCKS_OBSERVED).increment(1);
