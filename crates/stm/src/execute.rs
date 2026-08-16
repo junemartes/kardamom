@@ -1033,6 +1033,9 @@ struct BlockCtx<S: StateDatabase> {
     mv: Arc<MvCache>,
     /// Shared read-through cache over the immutable block-input layer.
     base_cache: std::sync::Arc<BaseCache>,
+    /// Recycle pools (read-record buffers for workers; the tail ships
+    /// spent arenas back through the reaper).
+    recycle: std::sync::Arc<RecyclePools>,
     slots: Vec<std::sync::OnceLock<TxSlot>>,
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
@@ -1291,6 +1294,11 @@ struct RecyclePools {
     arenas: Mutex<Vec<SpentArena>>,
     mv_clean: Mutex<Vec<MvCache>>,
     mv_parked: Mutex<Vec<Arc<MvCache>>>,
+    /// Cleared per-tx read-record buffers, returned by the reaper in
+    /// one batch per block, taken by workers in batches of 64 — the
+    /// per-tx `Vec::with_capacity` + growth reallocs were the largest
+    /// STM-specific allocation (~4KB/tx at contract weight).
+    read_bufs: Mutex<Vec<Vec<ReadRecord>>>,
 }
 
 struct SpentArena {
@@ -1300,8 +1308,12 @@ struct SpentArena {
 }
 
 enum Reap {
-    /// Drop-only freight (result carcasses, odd teardowns).
-    Junk(#[allow(dead_code)] Box<dyn Send>),
+    /// A finished block's result carcass: read-record buffers recycle,
+    /// the rest drops.
+    Results {
+        results: Vec<TxResult>,
+        pools: std::sync::Arc<RecyclePools>,
+    },
     /// A finished block's recyclable structures.
     Arena {
         slots: Vec<std::sync::OnceLock<TxSlot>>,
@@ -1539,6 +1551,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         arenas: Mutex::new(Vec::new()),
         mv_clean: Mutex::new(Vec::new()),
         mv_parked: Mutex::new(Vec::new()),
+        read_bufs: Mutex::new(Vec::new()),
     });
     std::thread::scope(|scope| {
         // Reaper: drops junk freight and SCRUBS recyclable arenas (in
@@ -1548,7 +1561,17 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         scope.spawn(move || {
             while let Ok(r) = reap_rx.recv() {
                 match r {
-                    Reap::Junk(_) => {}
+                    Reap::Results { results, pools } => {
+                        let mut bufs: Vec<Vec<ReadRecord>> = Vec::with_capacity(results.len());
+                        for mut r in results {
+                            let mut b = std::mem::take(&mut r.reads);
+                            b.clear();
+                            bufs.push(b);
+                        }
+                        let mut g = pools.read_bufs.lock().expect("pools poisoned");
+                        let room = MAX_BLOCK_TXS.saturating_sub(g.len());
+                        g.extend(bufs.into_iter().take(room));
+                    }
                     Reap::Arena {
                         mut slots,
                         mut results,
@@ -1883,6 +1906,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                 .map(Arc::new)
                 .unwrap_or_else(|| Arc::new(MvCache::new())),
             base_cache: self.base_cache.clone(),
+            recycle: self.recycle.clone(),
             slots: r_slots.unwrap_or_else(|| {
                 (0..MAX_BLOCK_TXS)
                     .map(|_| std::sync::OnceLock::new())
@@ -2930,7 +2954,12 @@ fn block_tail<S: StateDatabase + Sync>(
             }
             receipts.push(std::mem::take(&mut r.receipt));
         }
-        reaper.send(Reap::Junk(Box::new(tx_results))).ok();
+        reaper
+            .send(Reap::Results {
+                results: tx_results,
+                pools: recycle.clone(),
+            })
+            .ok();
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
         // A speculative release (if any) was WRONG: drop our Arc and
@@ -3212,6 +3241,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         &ctx.base_cache,
         &ctx.metrics,
     );
+    let mut read_stash: Vec<Vec<ReadRecord>> = Vec::new();
     let mut evm = Context::mainnet()
         .with_db(view)
         .with_block(ctx.env.block_env())
@@ -3381,6 +3411,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             &slot.envelope,
             slot.decoded.as_ref(),
             bound.sink_start_balance,
+            &mut || take_read_buf(&mut read_stash, &ctx.recycle),
         );
         // Timestamps stay WORKER-LOCAL and fold once per block. Stamping
         // them globally cost two clock reads and two contended RMWs per
@@ -3524,6 +3555,23 @@ type WorkerEvm<'a, S> = revm::handler::MainnetEvm<
 /// sequential commit. The worker's EVM is reused across txs; only the
 /// view's index and read log are re-aimed.
 #[allow(clippy::too_many_arguments)]
+/// Pop a cleared read-record buffer (batch-refilled from the recycle
+/// pool, one lock per 64 txs); falls back to a fresh allocation while
+/// the pool warms up.
+fn take_read_buf(stash: &mut Vec<Vec<ReadRecord>>, pools: &RecyclePools) -> Vec<ReadRecord> {
+    if let Some(b) = stash.pop() {
+        return b;
+    }
+    {
+        let mut g = pools.read_bufs.lock().expect("pools poisoned");
+        let n = g.len().min(64);
+        let at = g.len() - n;
+        stash.extend(g.drain(at..));
+    }
+    stash.pop().unwrap_or_else(|| Vec::with_capacity(128))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn execute_one<S: StateDatabase>(
     evm: &mut WorkerEvm<'_, S>,
     mv: &MvCache,
@@ -3535,6 +3583,7 @@ fn execute_one<S: StateDatabase>(
     envelope: &TxEnvelope,
     decoded: Option<&alloy_consensus::TxEnvelope>,
     sink_start_balance: U256,
+    fresh_reads: &mut dyn FnMut() -> Vec<ReadRecord>,
 ) -> Result<TxResult, ExecutorError> {
     let skip = |reason: &str, nonce: u64, to: Option<alloy_primitives::Address>| {
         let (receipt, ws) = invalid_skip(
@@ -3625,13 +3674,13 @@ fn execute_one<S: StateDatabase>(
         .unwrap_or(U256::ZERO);
 
     let reads = {
-        // Take this tx's read log back out of the worker's view, leaving
-        // capacity behind: a bare `take` leaves an EMPTY Vec, so every tx
-        // re-grew it 4 -> 8 -> 16 — three reallocations per transaction
-        // for a log whose size is stable within a workload.
+        // Take this tx's read log back out of the worker's view. The
+        // replacement comes from the RECYCLE pool (cleared, capacity
+        // intact from a previous block's tx): the fresh
+        // per-tx Vec + its growth reallocs were the largest
+        // STM-specific allocation (~4KB/tx at contract weight).
         let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
-        let cap = db.reads.len().next_power_of_two().clamp(8, 64);
-        std::mem::replace(&mut db.reads, Vec::with_capacity(cap))
+        std::mem::replace(&mut db.reads, fresh_reads())
     };
     // Hashing now is pure waste when the commit pass must re-hash after
     // patching the accumulator's absolute balance.
