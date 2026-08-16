@@ -208,7 +208,7 @@ in this campaign — composes with, but is not required by, this spec);
 cold-barrier watermark (O(1) barriers — filed, independent); multi-node
 concerns (the pipeline is within one executor).
 
-## P3b первое измерение (2026-08-16) — the sync point is in the wrong place
+## P3b first measurement (2026-08-16) — the sync point is in the wrong place
 
 Engine protocol landed and adversarially tested (streaming release at
 fold, wound → corrected re-issue → consumer `abort_active` → rebuild;
