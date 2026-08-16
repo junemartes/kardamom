@@ -665,6 +665,52 @@ block count, so the sequence rides inside the ONE batch claim (32 bytes ×
   and one verifier — with DISTINCT program vkeys (batch guest for validity
   mode, single-block guest for disputes), both held by the oracle.
 
+### Why the three sharp edges cut the way they do (decision record)
+
+Running example: batch 5 covers blocks 100–199; honest roots `h_100..h_199`;
+a malicious claim `r_i = h_i` for i < 150, lie starts at `r_150 != h_150`.
+
+**The digest-fold check exists to keep claims challengeable.** The dispute
+compares the challenger's proven `records_digest` against the CLAIM's
+`blockDigests[i]` — L1 stores only the fold, so the claim's array is the
+per-block reference. Unchecked, a claimer rigs the reference instead of
+winning the dispute: describe a partition that moves a real tx from block
+150 to 151, and the honest challenger's proof (executing the POSTED block
+150) mismatches `blockDigests[150]` — the honest challenge bounces off the
+contract's own rule. The claim-time fold check makes such a claim
+UNCREATABLE: fixed 32-byte segments in fixed order mean exactly one
+sequence folds to the stored commitment — the posted one.
+
+**Rewind, because attestations are free and partial batches are not.**
+After the block-150 challenge wins, `r_151..r_199` are chained off a lie —
+worthless. Advancing to `h_150` would strand blocks 151–199 with no claim
+over them, forcing partial-batch re-claims keyed on (batch, offset), prefix
+window rules, and new interactions with pending claims above — real state-
+machine surface bought to preserve work that cost nothing to redo (the one
+expensive artifact, the proof, already did its whole job: killing the
+lie). Rewind restores the exact pre-claim state; the honest re-claim lists
+`h_100..h_199` through the normal window. Cascade-cancelled claims above
+get REFUNDS, not slashes: honest claimers could never have built on
+`r_199` (honest roots chain off `h_199`), so cascade victims are the liar
+or its copyists — but punishing without proof is what this design exists
+to avoid, and the block-150 bond already paid the challenger. Griefing
+math: one bond buys at most one forced single-block proof, so with
+`bond > proving cost + challenge gas`, the attack funds the defense.
+
+**An agreeing proof reverts because it has no sound transition.** At batch
+granularity an agreeing proof was a full validity proof (finalize early —
+sound). At block granularity it attests one block of a hundred: finalizing
+the claim on it is unsound; finalizing just that block reintroduces the
+partial-batch machinery rejected above. So `challengeBlock`'s precondition
+is "the claim is wrong here", an agreeing proof fails it, and the failed
+challenge is a STRICT no-op — the window must not move. No challenger bond
+is needed: a failed challenge imposes zero cost on the claimer, so its
+whole cost (proving + gas) self-prices the spam. Underneath sits the
+property that makes the verb clean: one honest post-root exists per
+`(pre_root, records)` and the verifier accepts only honest executions —
+so false challenges CANNOT succeed and true challenges CANNOT fail
+(modulo prover liveness inside the window).
+
 ### Single-block public outputs v2 (guest change, slice 0)
 
 The dispute check needs the block's records digest in the PROOF, so the
