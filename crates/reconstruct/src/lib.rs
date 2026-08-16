@@ -229,8 +229,8 @@ mod tests {
         // The real interop genesis: Outbox/Inbox runtime bytecode at their
         // canonical predeploys — the same file `kardamom-reconstruct --chain`
         // seeds from.
-        let genesis_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../chains/dev-interop.toml");
+        let genesis_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../chains/dev-interop.toml");
         let raw = std::fs::read_to_string(&genesis_path).expect("read dev-interop genesis");
         let chain: kardamom_types::Genesis = toml::from_str(&raw).expect("parse genesis");
         chain.validate().expect("valid genesis");
