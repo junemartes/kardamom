@@ -1281,7 +1281,36 @@ struct PoolState<S: StateDatabase> {
 type PoolShared<S> = (Mutex<PoolState<S>>, Condvar);
 
 /// A spent block's droppables, shipped to the reaper thread.
-type Reap = Box<dyn Send>;
+/// Recycle pools (steady-state zero-allocation blocks): the reaper
+/// scrubs spent block structures IN PLACE (drop entries, keep every
+/// buffer) and parks them here; session build pops instead of mapping
+/// ~8MB of fresh arenas per block. mv caches outlive their block as
+/// mv-as-layer references, so a still-shared cache parks until its
+/// last Arc drops and is swept at the next build.
+struct RecyclePools {
+    arenas: Mutex<Vec<SpentArena>>,
+    mv_clean: Mutex<Vec<MvCache>>,
+    mv_parked: Mutex<Vec<Arc<MvCache>>>,
+}
+
+struct SpentArena {
+    slots: Vec<std::sync::OnceLock<TxSlot>>,
+    results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
+    nodes: Vec<Node>,
+}
+
+enum Reap {
+    /// Drop-only freight (result carcasses, odd teardowns).
+    Junk(#[allow(dead_code)] Box<dyn Send>),
+    /// A finished block's recyclable structures.
+    Arena {
+        slots: Vec<std::sync::OnceLock<TxSlot>>,
+        results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
+        nodes: Arc<Vec<Node>>,
+        mv: Arc<MvCache>,
+        pools: std::sync::Arc<RecyclePools>,
+    },
+}
 
 /// One sealed block handed to the persistent TAIL thread (spec P3a):
 /// drain, release the pool slot, then `block_tail`.
@@ -1468,6 +1497,8 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// backend commit is mirrored here; the A/B harness asserts
     /// byte-identical results per block, which checks exactly that.
     base_cache: std::sync::Arc<BaseCache>,
+    /// Recycled block structures (see [`RecyclePools`]).
+    recycle: std::sync::Arc<RecyclePools>,
 }
 
 /// Spawn `workers` pool threads for the duration of `f`.
@@ -1504,10 +1535,65 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let avg_tx_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (reap_tx, reap_rx) = std::sync::mpsc::channel::<Reap>();
     let (tail_tx, tail_rx) = std::sync::mpsc::channel::<TailJob<S>>();
+    let recycle_pools = std::sync::Arc::new(RecyclePools {
+        arenas: Mutex::new(Vec::new()),
+        mv_clean: Mutex::new(Vec::new()),
+        mv_parked: Mutex::new(Vec::new()),
+    });
     std::thread::scope(|scope| {
-        // Reaper: drops spent block state so seal() does not pay for it.
-        // Exits when the pool drops the last sender.
-        scope.spawn(move || while reap_rx.recv().is_ok() {});
+        // Reaper: drops junk freight and SCRUBS recyclable arenas (in
+        // place — entries dropped, buffers kept) so seal() pays for
+        // neither, and the next session build maps nothing. Exits when
+        // the pool drops the last sender.
+        scope.spawn(move || {
+            while let Ok(r) = reap_rx.recv() {
+                match r {
+                    Reap::Junk(_) => {}
+                    Reap::Arena {
+                        mut slots,
+                        mut results,
+                        nodes,
+                        mv,
+                        pools,
+                    } => {
+                        for c in slots.iter_mut() {
+                            let _ = c.take();
+                        }
+                        for c in results.iter_mut() {
+                            let _ = c.take();
+                        }
+                        if let Ok(nodes) = Arc::try_unwrap(nodes) {
+                            for nd in nodes.iter() {
+                                nd.open.store(false, Ordering::Relaxed);
+                                nd.children.lock().expect("node poisoned").clear();
+                                nd.indegree.store(0, Ordering::Relaxed);
+                                nd.worker.store(0, Ordering::Relaxed);
+                                nd.queued.store(false, Ordering::Relaxed);
+                                nd.fifo_preds.lock().expect("node poisoned").clear();
+                            }
+                            pools
+                                .arenas
+                                .lock()
+                                .expect("pools poisoned")
+                                .push(SpentArena {
+                                    slots,
+                                    results,
+                                    nodes,
+                                });
+                        }
+                        match Arc::try_unwrap(mv) {
+                            Ok(cache) => {
+                                cache.scrub();
+                                pools.mv_clean.lock().expect("pools poisoned").push(cache);
+                            }
+                            Err(shared) => {
+                                pools.mv_parked.lock().expect("pools poisoned").push(shared)
+                            }
+                        }
+                    }
+                }
+            }
+        });
         // The persistent TAIL thread (spec P3a). One thread owns every
         // block's post-drain work in submission order; per-block scoped
         // threads for sub-millisecond phases measured as a net loss, and
@@ -1515,6 +1601,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         // block N validates and commits.
         {
             let reaper = reap_tx.clone();
+            let recycle = recycle_pools.clone();
             let pins = pin_cores.clone();
             let hot = cfg_keep_hot;
             let tow = cfg_tail_on_workers;
@@ -1620,7 +1707,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                     let t_drain = t_drain0.elapsed();
                     let _ = out.send(block_tail(
                         ctx, txs, t_exec_wall, t_drain, cold, edges, dispatch, hot, tow,
-                        &pins, &reaper, &avg, delta_out,
+                        &pins, &reaper, &avg, delta_out, &recycle,
                     ));
                 }
             });
@@ -1647,6 +1734,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             assign: std::cell::RefCell::new(FastMap::default()),
             assign_load: std::cell::RefCell::new(vec![0; workers]),
             base_cache: std::sync::Arc::new(BaseCache::new()),
+            recycle: recycle_pools.clone(),
             tail: tail_tx.clone(),
             parallel_worth_ns,
             dispatch_by_sender,
@@ -1761,19 +1849,50 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             "one state view per worker: {} given, {workers} needed",
             snapshots.len()
         );
+        // RECYCLE (steady-state zero-allocation blocks): sweep parked
+        // mv caches whose last layer reference has dropped, then pop
+        // scrubbed structures instead of mapping fresh arenas.
+        {
+            let mut parked = self.recycle.mv_parked.lock().expect("pools poisoned");
+            if !parked.is_empty() {
+                let mut clean = self.recycle.mv_clean.lock().expect("pools poisoned");
+                let drained: Vec<_> = std::mem::take(&mut *parked);
+                for arc in drained {
+                    match Arc::try_unwrap(arc) {
+                        Ok(cache) => {
+                            cache.scrub();
+                            clean.push(cache);
+                        }
+                        Err(still) => parked.push(still),
+                    }
+                }
+            }
+        }
+        let recycled = self.recycle.arenas.lock().expect("pools poisoned").pop();
+        let recycled_mv = self.recycle.mv_clean.lock().expect("pools poisoned").pop();
+        let (r_slots, r_results, r_nodes) = match recycled {
+            Some(a) => (Some(a.slots), Some(a.results), Some(a.nodes)),
+            None => (None, None, None),
+        };
         let ctx = Arc::new(BlockCtx {
             env,
             snapshots,
             base,
             binding: std::sync::OnceLock::new(),
-            mv: Arc::new(MvCache::new()),
+            mv: recycled_mv
+                .map(Arc::new)
+                .unwrap_or_else(|| Arc::new(MvCache::new())),
             base_cache: self.base_cache.clone(),
-            slots: (0..MAX_BLOCK_TXS)
-                .map(|_| std::sync::OnceLock::new())
-                .collect(),
-            results: (0..MAX_BLOCK_TXS)
-                .map(|_| std::sync::OnceLock::new())
-                .collect(),
+            slots: r_slots.unwrap_or_else(|| {
+                (0..MAX_BLOCK_TXS)
+                    .map(|_| std::sync::OnceLock::new())
+                    .collect()
+            }),
+            results: r_results.unwrap_or_else(|| {
+                (0..MAX_BLOCK_TXS)
+                    .map(|_| std::sync::OnceLock::new())
+                    .collect()
+            }),
             queues: (0..workers)
                 .map(|_| WorkerQueue {
                     q: Mutex::new(std::collections::VecDeque::new()),
@@ -1782,12 +1901,13 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                     parked: AtomicBool::new(false),
                 })
                 .collect(),
-            // Per-BLOCK arena: with pipelined admission two blocks are
-            // alive at once, so the pool-shared arena would alias. The
-            // allocation (~4096 default nodes) is off the critical path
-            // (admission of a block that has not started executing) and
-            // the reaper eats the drop.
-            nodes: Arc::new((0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
+            // Per-BLOCK arena (with pipelined admission two blocks are
+            // alive at once, so ONE pool-shared arena would alias) —
+            // but RECYCLED through the reaper's scrub, so steady state
+            // allocates none.
+            nodes: Arc::new(
+                r_nodes.unwrap_or_else(|| (0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
+            ),
             admitted: AtomicU32::new(0),
             finished: AtomicU32::new(0),
             sealed: AtomicBool::new(false),
@@ -2447,7 +2567,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
 /// block-at-a-time path calls it inline (seal = drain + tail).
 #[allow(clippy::too_many_arguments)]
 fn block_tail<S: StateDatabase + Sync>(
-    ctx: BlockCtx<S>,
+    mut ctx: BlockCtx<S>,
     txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
     t_exec_wall: std::time::Duration,
     t_drain: std::time::Duration,
@@ -2460,13 +2580,16 @@ fn block_tail<S: StateDatabase + Sync>(
     reaper: &std::sync::mpsc::Sender<Reap>,
     avg_tx_ns: &std::sync::atomic::AtomicU64,
     delta_out: Option<DeltaOut>,
+    recycle: &std::sync::Arc<RecyclePools>,
 ) -> Result<StmOutcome, ExecutorError> {
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
     let n = txs.len();
     let mut tx_results = Vec::with_capacity(n);
-    for cell in ctx.results.into_iter().take(n) {
-        match cell.into_inner() {
+    // take() IN PLACE: the spent OnceLock array keeps its buffer and
+    // recycles through the reaper (steady-state zero-allocation blocks).
+    for cell in ctx.results.iter_mut().take(n) {
+        match cell.take() {
             Some(Ok(r)) => tx_results.push(r),
             Some(Err(e)) => return Err(e),
             None => {
@@ -2807,7 +2930,7 @@ fn block_tail<S: StateDatabase + Sync>(
             }
             receipts.push(std::mem::take(&mut r.receipt));
         }
-        reaper.send(Box::new(tx_results)).ok();
+        reaper.send(Reap::Junk(Box::new(tx_results))).ok();
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
         // A speculative release (if any) was WRONG: drop our Arc and
@@ -2914,9 +3037,22 @@ fn block_tail<S: StateDatabase + Sync>(
     // drops here. `S` (the snapshots) stays inline, so no 'static
     // bound is needed on the payload.
     let BlockCtx {
-        mv, slots, metrics, ..
+        mv,
+        slots,
+        results,
+        nodes,
+        metrics,
+        ..
     } = ctx;
-    reaper.send(Box::new((mv, slots))).ok();
+    reaper
+        .send(Reap::Arena {
+            slots,
+            results,
+            nodes,
+            mv,
+            pools: recycle.clone(),
+        })
+        .ok();
     let m = &metrics;
     // Feed the stealing policy: mean per-tx execution time this block.
     if n > 0 {

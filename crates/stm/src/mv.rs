@@ -189,6 +189,22 @@ impl MvCache {
         (p > 0).then(|| list[p - 1])
     }
 
+    /// Between-block scrub for POOLED REUSE: drop every entry but keep
+    /// every allocation — shard tables, version vecs' buffers are gone
+    /// (entries dropped) but the maps' capacity stays, so the next
+    /// block's publishes re-fill warm pages instead of mapping fresh
+    /// ones. Caller guarantees quiescence (the reaper scrubs only
+    /// unwrapped caches).
+    pub fn scrub(&self) {
+        for sh in &self.accounts {
+            sh.write().expect("mv poisoned").clear();
+        }
+        for sh in &self.storage {
+            sh.write().expect("mv poisoned").clear();
+        }
+        self.code.write().expect("mv poisoned").clear();
+    }
+
     /// Materialize the block's FINAL write view: per cell, the highest
     /// version (== the last writer's value == exactly what the commit
     /// fold computes), plus all CREATEd code. The repair path uses this
