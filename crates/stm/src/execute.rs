@@ -2921,12 +2921,20 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         // COMPLETION: park the index in this worker's own buffer
         // (uncontended) and only touch the DAG once a batch has
         // accumulated. `prune_batch == 1` is the immediate policy.
+        //
+        // `pending` increments BEFORE the buffer push: prune runs
+        // concurrently (another worker's batch, the tail's drain
+        // loop) and subtracts what it drains — a completion visible
+        // in a buffer before its increment landed underflowed the
+        // counter (debug-build overflow panic; found by the P3b
+        // adversarial test's abort storms). Incremented-but-unpushed
+        // is the safe direction: a spurious prune drains nothing.
+        let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
         {
             let mut b = ctx.completed[worker].lock().expect("completed poisoned");
             b.push(job);
             ctx.completed_len[worker].0.fetch_add(1, Ordering::Release);
         }
-        let owed = ctx.pending.fetch_add(1, Ordering::SeqCst) + 1;
         if owed as usize >= ctx.prune_batch {
             ctx.prune(false);
         }

@@ -552,8 +552,7 @@ fn run_pipelined(
                     .map(|(_, d)| std::sync::Arc::new(d.clone()))
                     .collect()
             };
-            let mut engine_deltas: Vec<Option<std::sync::Arc<PendingDelta>>> =
-                vec![None; n_flow];
+            let mut engine_deltas: Vec<Option<std::sync::Arc<PendingDelta>>> = vec![None; n_flow];
             let (rel_tx, rel_rx) =
                 std::sync::mpsc::channel::<kardamom_stm::execute::DeltaRelease>();
             let layer_of = |engine_deltas: &[Option<std::sync::Arc<PendingDelta>>],
