@@ -50,12 +50,33 @@ impl std::hash::BuildHasher for FnvBuild {
 
 impl std::hash::Hasher for Fnv {
     fn finish(&self) -> u64 {
-        self.0
+        // Final avalanche so a 64-bit key that only differs in high
+        // bits still spreads across the table's low bits.
+        let mut h = self.0;
+        h ^= h >> 32;
+        h = h.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        h ^= h >> 29;
+        h
     }
+    /// WORD-AT-A-TIME. The keys this map family sees (addresses, slot
+    /// hashes, (address, slot) pairs) are already high-entropy, so a
+    /// per-8-byte multiply-xorshift mixes them fully; the byte-at-a-time
+    /// FNV loop it replaces was ~50 dependent-latency cycles per 20-byte
+    /// key and hashed twice per upsert — measured as the serial feed's
+    /// last-toucher stage (0.40µs/tx). Tail bytes fold in as one word.
     fn write(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.0 ^= *b as u64;
-            self.0 = self.0.wrapping_mul(0x100_0000_01b3);
+        const K: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let w = u64::from_le_bytes(c.try_into().unwrap());
+            self.0 = (self.0 ^ w).wrapping_mul(K).rotate_left(23);
+        }
+        let rem = chunks.remainder();
+        if !rem.is_empty() {
+            let mut buf = [0u8; 8];
+            buf[..rem.len()].copy_from_slice(rem);
+            let w = u64::from_le_bytes(buf) ^ ((rem.len() as u64) << 56);
+            self.0 = (self.0 ^ w).wrapping_mul(K).rotate_left(23);
         }
     }
     fn write_u64(&mut self, n: u64) {
