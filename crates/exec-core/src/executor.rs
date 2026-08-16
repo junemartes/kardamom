@@ -673,8 +673,11 @@ pub fn execute_deposit_tx<S: StateDatabase>(
     };
 
     // Build the write set from revm's final-state cache. Both the mint
-    // pre-credit and any inner-call writes contribute touched accounts.
+    // pre-credit and any inner-call writes contribute touched accounts;
+    // layer-seeded entries the tx did not change are filtered out (see
+    // `retain_changed` — capture must not depend on commit timing).
     let ws = write_set_from_cache(&cache.cache);
+    let ws = retain_changed(ws, snapshot, parent, delta, tx_idx)?;
     if let Some((bal, bal_index)) = bal {
         record_writeset_into_bal(bal, bal_index, &ws);
     }
@@ -827,6 +830,10 @@ pub fn execute_xchain_tx<S: StateDatabase>(
     };
 
     let ws = write_set_from_cache(&cache.cache);
+    // Same discipline as deposits: only true changes survive, so the capture
+    // is a pure function of execution rather than of what the pipelined
+    // commit happened to leave in the seeded layers.
+    let ws = retain_changed(ws, snapshot, parent, delta, tx_idx)?;
     if let Some((bal, bal_index)) = bal {
         record_writeset_into_bal(bal, bal_index, &ws);
     }
@@ -945,6 +952,84 @@ pub fn record_writeset_into_bal(bal: &mut revm::state::bal::Bal, bal_index: u64,
     for (addr, account) in &by_addr {
         bal.update_account(bal_index, *addr, account);
     }
+}
+
+/// Reduce a constructed (commit-cache) WriteSet to TRUE CHANGES against the
+/// pre-execution view `snapshot ∘ parent ∘ delta`.
+///
+/// WHY: [`write_set_from_cache`] sweeps every slot in a touched account's
+/// cache map — including entries that got there by LAYER SEEDING
+/// (`seed_cache_layer`), not by this tx. Which entries those are depends on
+/// what the pipelined commit happened to leave in the PARENT layer at
+/// execution time: an executor whose previous block was still unsettled
+/// seeded (and therefore "captured") that block's Inbox slots, while a
+/// validator that had already settled it did not — the claims and the
+/// `write_set_hash` of a deposit/0x7D record then differ by COMMIT TIMING,
+/// not by execution (S14's back-to-back delivery blocks caught this as a
+/// false claim divergence on `Inbox.delivered` of the PREVIOUS block).
+/// Filtering to values that actually differ from the pre-state makes the
+/// capture a pure function of (pre-state values, tx) — replica-deterministic
+/// regardless of which layer held a value. Unchanged-but-touched noise (the
+/// fee recipient at zero reward, the Inbox's cleared transient identity
+/// slots) disappears from claims on BOTH sides for the same reason.
+fn retain_changed<S: StateDatabase>(
+    ws: WriteSet,
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    delta: &PendingDelta,
+    idx: TxIndex,
+) -> Result<WriteSet, ExecutorError> {
+    // Kardamom's empty-code sentinel is B256::ZERO; revm's is KECCAK_EMPTY.
+    // Normalise so "empty" compares equal across the two conventions.
+    let norm = |h: B256| if h == KECCAK_EMPTY { B256::ZERO } else { h };
+    let state_err = |detail: String| ExecutorError::Execution { idx, detail };
+
+    let mut out = WriteSet::default();
+    for (addr, triple) in ws.accounts.iter() {
+        let pre = match delta
+            .accounts
+            .get(addr)
+            .or_else(|| parent.and_then(|p| p.accounts.get(addr)))
+        {
+            Some(v) => Some(*v),
+            None => snapshot
+                .basic(*addr)
+                .map_err(|e| state_err(format!("retain basic({addr:?}): {e}")))?,
+        };
+        let changed = match pre {
+            Some((n, b, c)) => triple.0 != n || triple.1 != b || norm(triple.2) != norm(c),
+            // No prior account: keep any non-trivial creation; drop the
+            // touched-into-existence empty account (beneficiary at zero
+            // reward and friends).
+            None => !(triple.0 == 0 && triple.1 == U256::ZERO && norm(triple.2) == B256::ZERO),
+        };
+        if changed {
+            out.accounts.push((*addr, *triple));
+        }
+    }
+    for ((addr, key), value) in ws.storage.iter() {
+        let pre = match delta
+            .storage
+            .get(&(*addr, *key))
+            .or_else(|| parent.and_then(|p| p.storage.get(&(*addr, *key))))
+        {
+            Some(v) => *v,
+            None => snapshot
+                .storage(*addr, *key)
+                .map_err(|e| state_err(format!("retain storage({addr:?}, {key:?}): {e}")))?,
+        };
+        if *value != pre {
+            out.storage.push(((*addr, *key), *value));
+        }
+    }
+    // Code entries only carry bytecode CREATED by this record — always a
+    // real change.
+    out.code = ws.code;
+    // Input was sorted (write_set_from_cache finished it); filtering
+    // preserves order, so no re-sort is needed — but finish() also
+    // re-checks the invariant in debug builds.
+    out.finish();
+    Ok(out)
 }
 
 fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
