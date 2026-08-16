@@ -567,6 +567,8 @@ pub struct StmOutcome {
     pub decode_us: u64,
     pub predict_us: u64,
     pub admit_us: u64,
+    pub feed_pre_us: u64,
+    pub feed_dag_us: u64,
     pub prune_us: u64,
     pub prune_calls: u64,
     pub prune_forced: u64,
@@ -763,6 +765,11 @@ pub struct PaddedLen64(pub std::sync::atomic::AtomicU64);
 pub struct Metrics {
     /// Nanoseconds spent HOLDING the graph lock, split by cause.
     pub admit_ns: std::sync::atomic::AtomicU64,
+    /// Feed pre-DAG bookkeeping: assignment + slot store + envelope
+    /// clone (everything before the last-toucher upsert).
+    pub feed_pre_ns: std::sync::atomic::AtomicU64,
+    /// Feed last-toucher upserts + preds build.
+    pub feed_dag_ns: std::sync::atomic::AtomicU64,
     pub prune_ns: std::sync::atomic::AtomicU64,
     /// Prune invocations and how many were STARVATION-forced (a worker had
     /// nothing to run and had to apply pending completions itself).
@@ -1372,7 +1379,7 @@ struct BoundLayers {
 
 struct TailJob<S: StateDatabase> {
     ctx: Arc<BlockCtx<S>>,
-    txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
+    n_txs: usize,
     started: std::time::Instant,
     cold: usize,
     edges: usize,
@@ -1679,7 +1686,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                 'jobs: while let Ok(job) = tail_rx.recv() {
                     let TailJob {
                         ctx,
-                        txs,
+                        n_txs,
                         started,
                         cold,
                         edges,
@@ -1775,7 +1782,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                     };
                     let t_drain = t_drain0.elapsed();
                     let _ = out.send(block_tail(
-                        ctx, txs, t_exec_wall, t_drain, cold, edges, dispatch, hot, tow,
+                        ctx, n_txs, t_exec_wall, t_drain, cold, edges, dispatch, hot, tow,
                         &pins, &reaper, &avg, delta_out, &recycle,
                     ));
                 }
@@ -1839,9 +1846,9 @@ pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     /// later admission takes an edge from it while it is outstanding.
     last_barrier: Option<u32>,
     dispatch: Vec<u32>,
-    /// Kept for the sequential-fallback path (envelope payloads are
-    /// refcounted; this is index metadata, not a byte copy).
-    txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
+    /// Admitted count; the envelopes live in the ctx slots (the repair
+    /// path reads them there — no parallel copy).
+    n_txs: usize,
     started: std::time::Instant,
 }
 
@@ -2053,7 +2060,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             last_toucher: FastMap::default(),
             last_barrier: None,
             dispatch: vec![0; workers],
-            txs: Vec::new(),
+            n_txs: 0,
             started: std::time::Instant::now(),
         };
         let binder = LayerBinder {
@@ -2310,7 +2317,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     ) -> Result<(), ExecutorError> {
         let _ = tx_idx;
         let t_feed = std::time::Instant::now();
-        let i = self.txs.len();
+        let i = self.n_txs;
         if i >= MAX_BLOCK_TXS {
             return Err(ExecutorError::State(format!(
                 "stm pool: block exceeds MAX_BLOCK_TXS={MAX_BLOCK_TXS} (gas-limit math says impossible)"
@@ -2345,48 +2352,64 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         } else {
             domain
         };
-        let hashed = match domain {
-            Some(DomainKey::Account(a)) => domain_hash(a.as_slice(), self.workers),
-            Some(DomainKey::Fixed(a, k)) => {
-                let mut b = [0u8; 8];
-                b[..4].copy_from_slice(&a.as_slice()[16..20]);
-                b[4..].copy_from_slice(&k.as_slice()[28..32]);
-                domain_hash(&b, self.workers)
-            }
-            // ⊤ and empty predictions: canonical round-robin.
-            None => i % self.workers,
-        };
-        let worker = match (self.pool.sticky_assign, domain) {
-            (true, Some(key)) => {
-                let mut map = self.pool.assign.borrow_mut();
-                if let Some(w) = map.get(&key) {
-                    *w
-                } else if map.len() >= STICKY_CAP {
-                    hashed
-                } else {
-                    let load = self.pool.assign_load.borrow();
-                    let w = (0..self.workers).min_by_key(|w| load[*w]).unwrap_or(hashed);
-                    drop(load);
-                    map.insert(key, w);
-                    w
+        // BAG MODE: no owner, so no assignment at all — the whole
+        // hash/sticky block below was 0.68µs of serial feed per tx
+        // (measured: the largest single feed stage) computing a value
+        // the bag never reads.
+        let worker = if self.ctx.bag_mode {
+            0
+        } else {
+            let hashed = match domain {
+                Some(DomainKey::Account(a)) => domain_hash(a.as_slice(), self.workers),
+                Some(DomainKey::Fixed(a, k)) => {
+                    let mut b = [0u8; 8];
+                    b[..4].copy_from_slice(&a.as_slice()[16..20]);
+                    b[4..].copy_from_slice(&k.as_slice()[28..32]);
+                    domain_hash(&b, self.workers)
                 }
+                // ⊤ and empty predictions: canonical round-robin.
+                None => i % self.workers,
+            };
+            let worker = match (self.pool.sticky_assign, domain) {
+                (true, Some(key)) => {
+                    let mut map = self.pool.assign.borrow_mut();
+                    if let Some(w) = map.get(&key) {
+                        *w
+                    } else if map.len() >= STICKY_CAP {
+                        hashed
+                    } else {
+                        let load = self.pool.assign_load.borrow();
+                        let w = (0..self.workers).min_by_key(|w| load[*w]).unwrap_or(hashed);
+                        drop(load);
+                        map.insert(key, w);
+                        w
+                    }
+                }
+                _ => hashed,
+            };
+            if self.pool.sticky_assign {
+                self.pool.assign_load.borrow_mut()[worker] += 1;
             }
-            _ => hashed,
+            worker
         };
-        if self.pool.sticky_assign {
-            self.pool.assign_load.borrow_mut()[worker] += 1;
-        }
 
+        // The slot OWNS the envelope: no clone, no parallel vec (the
+        // repair path reads slots too).
         self.ctx.slots[i]
             .set(TxSlot {
                 tx_idx,
                 position,
-                envelope: envelope.clone(),
+                envelope,
                 decoded,
             })
             .unwrap_or_else(|_| unreachable!("slot set once per index"));
-        self.txs.push((tx_idx, position, envelope));
+        self.n_txs += 1;
         self.dispatch[worker] += 1;
+        let t_pre_end = std::time::Instant::now();
+        self.ctx
+            .metrics
+            .feed_pre_ns
+            .fetch_add((t_pre_end - t_feed).as_nanos() as u64, Ordering::Relaxed);
 
         // (2) Update the live DAG + (3) dispatch if ready.
         // Candidate predecessors come from the FEED-OWNED last-toucher
@@ -2414,6 +2437,10 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         }
 
         let t_admit = std::time::Instant::now();
+        self.ctx
+            .metrics
+            .feed_dag_ns
+            .fetch_add((t_admit - t_pre_end).as_nanos() as u64, Ordering::Relaxed);
         // NO GLOBAL LOCK. Open this node's registration point, seed the
         // admission guard, then register on each predecessor that is still
         // open. The guard (+1) means a predecessor finishing mid-admission
@@ -2531,7 +2558,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let BlockSession {
             pool,
             ctx,
-            txs,
+            n_txs,
             started,
             cold,
             edges,
@@ -2546,7 +2573,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         pool.tail
             .send(TailJob {
                 ctx,
-                txs,
+                n_txs,
                 started,
                 cold,
                 edges,
@@ -2578,7 +2605,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let BlockSession {
             pool,
             ctx,
-            txs,
+            n_txs,
             started,
             cold,
             edges,
@@ -2593,7 +2620,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         pool.tail
             .send(TailJob {
                 ctx,
-                txs,
+                n_txs,
                 started,
                 cold,
                 edges,
@@ -2617,7 +2644,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let BlockSession {
             pool,
             ctx,
-            txs,
+            n_txs,
             started,
             cold,
             edges,
@@ -2632,7 +2659,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         pool.tail
             .send(TailJob {
                 ctx,
-                txs,
+                n_txs,
                 started,
                 cold,
                 edges,
@@ -2656,7 +2683,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
 #[allow(clippy::too_many_arguments)]
 fn block_tail<S: StateDatabase + Sync>(
     mut ctx: BlockCtx<S>,
-    txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
+    n_txs: usize,
     t_exec_wall: std::time::Duration,
     t_drain: std::time::Duration,
     cold: usize,
@@ -2672,7 +2699,7 @@ fn block_tail<S: StateDatabase + Sync>(
 ) -> Result<StmOutcome, ExecutorError> {
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
-    let n = txs.len();
+    let n = n_txs;
     let mut tx_results = recycle
         .carcasses
         .lock()
@@ -3083,11 +3110,14 @@ fn block_tail<S: StateDatabase + Sync>(
         }
         for (i, mut r) in tx_results.into_iter().enumerate() {
             if wounded_set.contains(&i) {
-                let (tx_idx, position, envelope) = &txs[i];
+                // The slot holds the envelope for the whole block — no
+                // second copy in a parallel vec (that clone was 0.1µs of
+                // serial feed per tx).
+                let slot = ctx.slots[i].get().expect("slot set for every admitted tx");
+                let (tx_idx, position, envelope) = (slot.tx_idx, slot.position, &slot.envelope);
                 let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
-                let (mut receipt, ws) = scope.execute_tx(
-                    *tx_idx, *position, envelope, i as u64, cumulative, None, None,
-                )?;
+                let (mut receipt, ws) = scope
+                    .execute_tx(tx_idx, position, envelope, i as u64, cumulative, None, None)?;
                 cumulative = receipt.cumulative_gas_used;
                 receipt.transaction_index = i as u64;
                 layered.apply(ws.clone());
@@ -3222,6 +3252,8 @@ fn block_tail<S: StateDatabase + Sync>(
         decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
         predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
         admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
+        feed_pre_us: m.feed_pre_ns.load(Ordering::Relaxed) / 1_000,
+        feed_dag_us: m.feed_dag_ns.load(Ordering::Relaxed) / 1_000,
         prune_us: m.prune_ns.load(Ordering::Relaxed) / 1_000,
         prune_calls,
         prune_forced: m.prune_forced.load(Ordering::Relaxed),

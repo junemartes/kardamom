@@ -890,6 +890,7 @@ fn run_mdbx_ab(
             let (mut prune_calls_s, mut prune_forced_s, mut prune_us_s, mut steals_s) =
                 (0u64, 0u64, 0u64, 0u64);
             let mut admit_us_s = 0u64;
+            let (mut fpre_s, mut fdag_s) = (0u64, 0u64);
             let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
             let (mut stm_allocs, mut stm_abytes) = (0u64, 0u64);
             let mut seq_buckets = [(0u64, 0u64); 6];
@@ -1080,6 +1081,8 @@ fn run_mdbx_ab(
                         prune_forced_s += out.prune_forced;
                         prune_us_s += out.prune_us;
                         admit_us_s += out.admit_us;
+                        fpre_s += out.feed_pre_us;
+                        fdag_s += out.feed_dag_us;
                         steals_s += out.steals;
                         w_own += out.writes_own;
                         w_foreign += out.writes_foreign;
@@ -1185,7 +1188,9 @@ fn run_mdbx_ab(
                     8 * 1000usize,
                 );
                 println!(
-                    "     feed split: admit(graph) {:.1}ms | prune(graph) {:.1}ms | feed total {:.1}ms",
+                    "     feed split: pre(assign+slot+clone) {:.1}ms | dag(last-toucher) {:.1}ms | admit(graph) {:.1}ms | prune(graph) {:.1}ms | feed total {:.1}ms",
+                    fpre_s as f64 / 1000.0,
+                    fdag_s as f64 / 1000.0,
                     admit_us_s as f64 / 1000.0,
                     prune_us_s as f64 / 1000.0,
                     feed as f64 / 1000.0,
