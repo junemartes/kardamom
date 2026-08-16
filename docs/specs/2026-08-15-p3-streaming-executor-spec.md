@@ -390,3 +390,11 @@ To confirm and fix (next session):
    worker cores and service cores is the structural answer on shared
    boxes; on production hosts with private-L3 core clusters, pinning
    services to a different CCX than workers achieves the same free.
+
+Fourth negative: removing the settler's on-clock delta clone
+(KARDAMOM_PIPE_ASSERT=0 pure-timing mode, settler consumes the
+outcome) — busy unchanged (63-66ms). The inflation's remaining feeders
+are production-real (writer apply, feed prepare, ctx build). Software
+knobs are exhausted; the LLC hypothesis now requires hardware counters
+(perf/resctrl) before further engineering — or CCX separation on a
+host that has one to give.

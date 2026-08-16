@@ -493,6 +493,14 @@ fn run_pipelined(
             .collect();
 
         let n_flow = baseline.len();
+        // KARDAMOM_PIPE_ASSERT=0 = pure-timing mode: the settler
+        // consumes outcomes (production shape, no on-clock clone) and
+        // the post-hoc byte-asserts are skipped. Default = 1: assert
+        // every block (the correctness pass; slightly pessimistic
+        // timing).
+        let retain_outcomes = std::env::var("KARDAMOM_PIPE_ASSERT")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         let mut asserted = 0usize;
         let mut outcomes: Vec<(usize, kardamom_stm::execute::StmOutcome)> = Vec::new();
         let t_pipe = Instant::now();
@@ -526,6 +534,7 @@ fn run_pipelined(
                     .collect();
                 let env_of2 = env_of;
                 let timing2 = std::env::var_os("KARDAMOM_STM_PHASE_TIMING").is_some();
+                let retain2 = retain_outcomes;
                 move || -> anyhow::Result<()> {
                     while let Ok((pfi, t)) = settle_rx.recv() {
                         let out = t.wait()?;
@@ -539,12 +548,25 @@ fn run_pipelined(
                         }
                         let bi = warm + pfi;
                         let e = env_of2(bi);
-                        let bd = out
-                            .delta
-                            .clone()
-                            .finalize(e.block_number, out.receipts.clone());
-                        delta_tx.send(WriteBatch::new(boundary(bi, ends[pfi]), bd))?;
-                        outcomes_c.lock().unwrap().push((pfi, out));
+                        // PRODUCTION SHAPE by default: the outcome is
+                        // CONSUMED — finalize by value, no clone. The
+                        // clone + retention exist only for the post-hoc
+                        // byte-asserts (KARDAMOM_PIPE_ASSERT=1, the
+                        // correctness pass) — cloning multi-MB deltas on
+                        // the clock streams through the shared L3 the
+                        // executing span depends on (see the spec's
+                        // span-inflation note).
+                        if retain2 {
+                            let bd = out
+                                .delta
+                                .clone()
+                                .finalize(e.block_number, out.receipts.clone());
+                            delta_tx.send(WriteBatch::new(boundary(bi, ends[pfi]), bd))?;
+                            outcomes_c.lock().unwrap().push((pfi, out));
+                        } else {
+                            let bd = out.delta.finalize(e.block_number, out.receipts);
+                            delta_tx.send(WriteBatch::new(boundary(bi, ends[pfi]), bd))?;
+                        }
                         settled_c.store(pfi + 1, std::sync::atomic::Ordering::Release);
                     }
                     Ok(())
@@ -741,6 +763,11 @@ fn run_pipelined(
             Ok(())
         })?;
         let stm_ms = t_pipe.elapsed().as_secs_f64() * 1e3;
+        if !retain_outcomes {
+            println!(
+                "  (pure-timing mode: byte-asserts skipped — run KARDAMOM_PIPE_ASSERT=1 for the correctness pass)"
+            );
+        }
         // Verification AFTER the clock: every block, byte-identical.
         for (pfi, out) in &outcomes {
             assert_identical(
