@@ -29,8 +29,8 @@ use std::sync::Arc;
 use kardamom_engine::{ExecutorError, RemoteEpochObserver};
 use kardamom_types::xchain::{RemoteEpochRecord, remote_source_hash};
 
-use crate::metrics;
 use crate::Divergence;
+use crate::metrics;
 
 /// Why a remote-epoch record failed the inline checks. Every variant is a
 /// chain-level fault — the record is already ON the canonical stream, so
@@ -39,10 +39,18 @@ use crate::Divergence;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteEpochFault {
     /// The pair's seq went backwards (or repeated): `got < expected`.
-    SeqRegressed { origin: u64, expected: u64, got: u64 },
+    SeqRegressed {
+        origin: u64,
+        expected: u64,
+        got: u64,
+    },
     /// The pair's seq skipped ahead: the messages in between are
     /// unaccounted for.
-    SeqSkipped { origin: u64, expected: u64, got: u64 },
+    SeqSkipped {
+        origin: u64,
+        expected: u64,
+        got: u64,
+    },
     /// An empty record — invalid by construction (remote origins advance
     /// only when messages exist).
     Empty { origin: u64 },

@@ -482,8 +482,8 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
     // XChain arms sequentially through the shared executor entry point.
     let seen_kinds = Arc::new(Mutex::new(Vec::<&'static str>::new()));
     let seen = seen_kinds.clone();
-    let strategy: BlockExec<MockStateDatabase> = Box::new(
-        move |snapshot, _parent, records, env, _block| {
+    let strategy: BlockExec<MockStateDatabase> =
+        Box::new(move |snapshot, _parent, records, env, _block| {
             let mut receipts = Vec::new();
             let mut delta = PendingDelta::new();
             let mut cumulative = 0u64;
@@ -518,8 +518,7 @@ fn whole_block_strategy_receives_buffered_xchain_records() {
                 }
             }
             Ok(BlockExecOutput { receipts, delta })
-        },
-    );
+        });
 
     let h = spawn_exec(
         ExecutorConfig::default(),

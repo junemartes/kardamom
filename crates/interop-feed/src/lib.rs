@@ -303,7 +303,9 @@ pub enum AttestationEventDto {
     /// The subscriber fell behind retention; recover by re-subscribing from
     /// the cursor ([`OutboxEventDto::Lagged`] semantics).
     #[serde(rename_all = "camelCase")]
-    Lagged { skipped: u64 },
+    Lagged {
+        skipped: u64,
+    },
 }
 
 /// The attestation stream surface (spec §5). Served by every public

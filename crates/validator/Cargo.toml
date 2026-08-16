@@ -13,6 +13,8 @@ edition.workspace = true
 # Epoch verification reads L1 through the SAME source the producer uses, so a
 # derivation bug cannot cancel itself out between the two sides.
 kardamom-da-watcher = { path = "../da_watcher" }
+kardamom-interop-feed = { workspace = true }
+jsonrpsee = { workspace = true }
 async-trait = "0.1"
 bytes.workspace = true
 serde_json.workspace = true

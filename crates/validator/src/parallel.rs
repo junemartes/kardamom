@@ -1385,7 +1385,10 @@ mod engine_tests {
         // Tamper the delivery's claimed nonce write (the aliased sender's
         // nonce bump at bal index 1).
         let aliased = kardamom_types::xchain::xchain_tx_sender(origin);
-        let w = claims.nonce.get_mut(&aliased).expect("delivery nonce claim");
+        let w = claims
+            .nonce
+            .get_mut(&aliased)
+            .expect("delivery nonce claim");
         let entry = w.iter_mut().find(|(i, _)| *i == 1).expect("index 1");
         entry.1 += 7;
 

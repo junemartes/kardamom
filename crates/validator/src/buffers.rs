@@ -263,6 +263,18 @@ impl ClaimBuffer {
         self.core.insert(block, (granularity, Arc::new(claims)));
     }
 
+    /// [`insert`](Self::insert) for an already-shared index — the BAL pump
+    /// decodes each frame once and feeds BOTH the parallel engine's buffer
+    /// and the outbox extractor's without cloning the index.
+    pub fn insert_arc(
+        &self,
+        block: u64,
+        granularity: u16,
+        claims: Arc<crate::parallel::ClaimIndex>,
+    ) {
+        self.core.insert(block, (granularity, claims));
+    }
+
     /// Take `block`'s claims, waiting up to `timeout`. `None` ⇒ the caller
     /// re-executes sequentially for this block.
     pub fn take(
