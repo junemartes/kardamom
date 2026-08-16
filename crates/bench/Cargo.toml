@@ -76,3 +76,7 @@ kardamom-validator.workspace = true
 dhat = "0.3"
 kardamom-engine.workspace = true
 kardamom-types.workspace = true
+
+[features]
+# Assembly keccak for the whole build graph (see exec-core).
+asm-keccak = ["kardamom-stm/asm-keccak"]

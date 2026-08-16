@@ -892,6 +892,7 @@ fn run_mdbx_ab(
                 (0u64, 0u64, 0u64, 0u64);
             let mut admit_us_s = 0u64;
             let (mut fpre_s, mut fdag_s) = (0u64, 0u64);
+            let (mut c_fold, mut c_lane) = (0u64, 0u64);
             let (mut seq_allocs, mut seq_abytes) = (0u64, 0u64);
             let (mut stm_allocs, mut stm_abytes) = (0u64, 0u64);
             let mut seq_buckets = [(0u64, 0u64); 6];
@@ -1071,6 +1072,8 @@ fn run_mdbx_ab(
                         span += out.parallel_span_us;
                         commit += out.commit_us;
                         c_hash += out.commit_hash_us;
+                        c_fold += out.commit_fold_us;
+                        c_lane += out.commit_lane_us;
                         c_delta += out.commit_delta_us;
                         feed += out.feed_us;
                         snap_us += snap_open;
@@ -1170,8 +1173,10 @@ fn run_mdbx_ab(
             }
             if rt > 0 {
                 println!(
-                    "     commit: hash {:.1}ms | delta {:.1}ms | rest {:.1}ms",
+                    "     commit scope {:.1}ms = fold-body {:.1}ms vs lanes-body {:.1}ms (gap = spawn/join) | delta {:.1}ms | rest {:.1}ms",
                     c_hash as f64 / 1000.0,
+                    c_fold as f64 / 1000.0,
+                    c_lane as f64 / 1000.0,
                     c_delta as f64 / 1000.0,
                     (commit as f64 - c_hash as f64 - c_delta as f64) / 1000.0,
                 );

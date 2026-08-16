@@ -567,6 +567,8 @@ pub struct StmOutcome {
     pub decode_us: u64,
     pub predict_us: u64,
     pub admit_us: u64,
+    pub commit_fold_us: u64,
+    pub commit_lane_us: u64,
     pub feed_pre_us: u64,
     pub feed_dag_us: u64,
     pub prune_us: u64,
@@ -798,6 +800,11 @@ pub struct Metrics {
     pub feed_pre_ns: std::sync::atomic::AtomicU64,
     /// Feed last-toucher upserts + preds build.
     pub feed_dag_ns: std::sync::atomic::AtomicU64,
+    /// Tail: the fold thread's own body, and the hash+validate lanes'
+    /// own bodies (aggregate). The gap to the scope's wall is thread
+    /// spawn/join.
+    pub commit_fold_ns: std::sync::atomic::AtomicU64,
+    pub commit_lane_ns: std::sync::atomic::AtomicU64,
     pub prune_ns: std::sync::atomic::AtomicU64,
     /// Prune invocations and how many were STARVATION-forced (a worker had
     /// nothing to run and had to apply pending completions itself).
@@ -3083,7 +3090,14 @@ fn block_tail<S: StateDatabase + Sync>(
     // + the two shared caller cores; see the topology note in the
     // bench). Validation runs FIRST so a wound skips the wasted fold
     // and hash entirely.
-    let serial_tail = delta_out.as_ref().is_some_and(|d| d.mv_tx.is_some());
+    // Pipeline tails run their lanes on the CALLER cores (tail_on_workers
+    // is false there), so parallelism costs the executing block nothing
+    // but memory bandwidth. Fully serial was the first cut — fine when
+    // the tail is much shorter than the span it hides behind, wrong when
+    // it is not (micro-tx blocks: serial tail ~7ms vs span ~5ms, so the
+    // TAIL becomes the pacer). Opt back in with KARDAMOM_STM_SERIAL_TAIL.
+    let serial_tail = delta_out.as_ref().is_some_and(|d| d.mv_tx.is_some())
+        && std::env::var_os("KARDAMOM_STM_SERIAL_TAIL").is_some();
     let (delta_arc, wounded): (std::sync::Arc<PendingDelta>, Vec<usize>) = if serial_tail {
         let t0 = std::time::Instant::now();
         let wounded: Vec<usize> = tx_results
@@ -3133,12 +3147,10 @@ fn block_tail<S: StateDatabase + Sync>(
                 .expect("pools poisoned")
                 .pop()
                 .unwrap_or_default();
-            let fold = sc.spawn(move || {
-                if !tail_pins.is_empty() {
-                    let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                        id: tail_pins[tail_pins.len() - 1],
-                    });
-                }
+            // The fold runs on THIS thread (the tail thread, on a caller
+            // core): it frees a worker core for a hash lane, drops a
+            // spawn, and reaches the release point without a join.
+            let fold = move || {
                 let mut sink_final: Option<(u64, U256, B256)> = None;
                 let mut d = warm_delta;
                 d.accounts.reserve(results_ref.len() * 2);
@@ -3162,7 +3174,7 @@ fn block_tail<S: StateDatabase + Sync>(
                     d.accounts.insert(FEE_SINK, v);
                 }
                 d
-            });
+            };
             // Hash+validate lanes: read ws, write ONLY the side array
             // and a local wounded list.
             let hash_parts: Vec<(usize, &mut [B256])> = {
@@ -3183,12 +3195,14 @@ fn block_tail<S: StateDatabase + Sync>(
                 let results_ref: &[TxResult] = &tx_results;
                 let mv = &ctx.mv;
                 let val_ns = &val_ns;
+                let lane_metrics = &ctx.metrics;
                 lanes.push(sc.spawn(move || {
                     if !tail_pins.is_empty() {
                         let _ = core_affinity::set_for_current(core_affinity::CoreId {
                             id: tail_pins[ti % tail_pins.len().max(1)],
                         });
                     }
+                    let t_lane0 = std::time::Instant::now();
                     let len = out_slice.len();
                     for (j, slot) in out_slice.iter_mut().enumerate() {
                         let r = &results_ref[base + j];
@@ -3209,10 +3223,13 @@ fn block_tail<S: StateDatabase + Sync>(
                         }
                     }
                     val_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    lane_metrics
+                        .commit_lane_ns
+                        .fetch_add(t_lane0.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     wounded_local
                 }));
             }
-            let delta_arc = std::sync::Arc::new(fold.join().expect("fold thread"));
+            let delta_arc = std::sync::Arc::new(fold());
             // SPECULATIVE RELEASE (spec P3b): the delta ships here,
             // while validation is still running. Measured wound rate
             // across the campaign: zero — the gamble prices only when
@@ -3468,6 +3485,8 @@ fn block_tail<S: StateDatabase + Sync>(
         decode_us: m.decode_ns.load(Ordering::Relaxed) / 1_000,
         predict_us: m.predict_ns.load(Ordering::Relaxed) / 1_000,
         admit_us: m.admit_ns.load(Ordering::Relaxed) / 1_000,
+        commit_fold_us: m.commit_fold_ns.load(Ordering::Relaxed) / 1_000,
+        commit_lane_us: m.commit_lane_ns.load(Ordering::Relaxed) / 1_000,
         feed_pre_us: m.feed_pre_ns.load(Ordering::Relaxed) / 1_000,
         feed_dag_us: m.feed_dag_ns.load(Ordering::Relaxed) / 1_000,
         prune_us: m.prune_ns.load(Ordering::Relaxed) / 1_000,

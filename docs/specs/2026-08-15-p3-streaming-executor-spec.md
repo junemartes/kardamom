@@ -622,3 +622,64 @@ feed binds again, or (b) the pipeline has hidden the tail and the feed
 resurfaces as the span. Shard threads must live on the CALLER cores
 (the worker cores stay dedicated), which on this host is 2 physical
 cores — so K=2..3 in practice.
+
+## The commit tail, decomposed (2026-08-16)
+
+Measured per 4000-tx block, both workloads (the tail is TX-COUNT driven,
+not gas driven — it is the same ~3.6ms for 21k transfers and for
+100-round contract calls):
+
+    extract            0.85 ms   OnceLock takes + 1.8MB of TxResult moves
+    overlap scope      2.26 ms   fold ∥ (hash + validate) lanes
+      lanes' own work  5.77 ms aggregate = 1.44 µs/tx
+        write-set hash   ~1.1 µs/tx   <-- 70% of the tail's work
+        validation       ~0.3 µs/tx
+      spawn/join gap   ~0.34 ms
+    delta assign       0.40 ms
+    -------------------------------------------------
+    tail total         ~3.6 ms  (40% of a micro-tx block's serial time)
+
+### The hash is the tail, and it is NOT cache misses
+
+`WriteSet::hash` microbenchmark (`exec-core/tests/hash_cost.rs`), 3
+accounts, data HOT in L1: **1110 ns/tx**; cold-ish: 1247. So the cost is
+the keccak permutations themselves, not the data path — a transfer's
+write set encodes to 297 bytes = 3 Keccak-f permutations at ~290ns
+each, which is simply what Keccak-f[1600] costs on this core.
+
+Consequences:
+
+1. **Both engines pay it.** Sequential hashes inline per tx (~22% of a
+   transfer block's sequential time); STM pays it in parallel lanes. So
+   making keccak cheaper improves ABSOLUTE throughput on both sides and
+   moves the RATIO only slightly (and in either direction, depending on
+   which side's share is larger).
+2. `asm-keccak` (XKCP assembly, identical output — the byte-identical
+   harness proves it) measured: hash 1110 -> 874 ns/tx; engine
+   parcounter 2.95 -> 3.09x with stm 134 -> 125ms; partransfer stm 64 ->
+   62ms with the ratio inside noise. Wired as an OPT-IN feature
+   (`kardamom-stm/asm-keccak` -> `exec-core/asm-keccak`), never default:
+   zkVM/RISC-V guests must keep the portable backend. Recommend enabling
+   it on native node binaries.
+3. **The only large remaining lever is the ENCODING, and it is a
+   consensus-format decision, not a perf change.** Today each account
+   costs 20 (addr) + 8 (nonce) + 32 (balance) + 32 (code_hash) = 92
+   bytes, so 3 accounts + section tags = 297 bytes = 3 permutations.
+   Encoding the balance and nonce as varints and omitting `code_hash`
+   when it is empty/unchanged puts a transfer's write set near ~130
+   bytes = ONE permutation — a ~3x cut of the single largest fixed cost
+   in BOTH engines. It changes every receipt's `write_set_hash`, so it
+   needs operator sign-off and a coordinated rollout; flagged, not done.
+
+### What was done here
+
+- The fold moved off its own spawned thread onto the TAIL thread (a
+  caller core): one fewer spawn, the release point is reached without a
+  join, and all four worker cores now run hash lanes (was 3 + fold).
+  partransfer 2.13 -> 2.18x, parcounter 2.93 -> 2.95x, commit 18.9 ->
+  18.4ms per 7 blocks.
+- Hiding the tail instead of shaving it was RE-MEASURED and remains a
+  loss on this host: pipeline 1.18-1.31x vs block-at-a-time 2.18x
+  (partransfer), 2.56-2.62x vs 2.92x (parcounter), with a parallel tail
+  and with a serial one. The pipeline's cadence is dominated by the
+  span-inflation effect, not by the tail it removes.

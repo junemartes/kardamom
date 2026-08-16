@@ -24,6 +24,15 @@ edition.workspace = true
 
 [features]
 default = ["std"]
+# ASSEMBLY keccak (XKCP via keccak-asm) instead of the portable soft
+# backend. Same function, same bytes — the consensus witness is
+# unchanged and the byte-identical harness proves it — but the soft
+# backend measured ~300ns per permutation, making `WriteSet::hash`
+# 1.1µs/tx and ~70% of the STM commit tail's parallel work.
+#
+# OPT-IN, never default: zkVM/RISC-V guests must keep the portable
+# backend. Native binaries (bench, node) enable it.
+asm-keccak = ["alloy-primitives/asm-keccak"]
 # `std` adds the operational side-channels (tracing + metrics on the
 # invalid-tx skip path) and the `state` mock module. Execution semantics are
 # IDENTICAL with and without — receipts, write sets, and deltas carry all
