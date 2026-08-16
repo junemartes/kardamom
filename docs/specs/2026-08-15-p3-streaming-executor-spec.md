@@ -248,3 +248,32 @@ Next unit, in order of leverage:
 3. Ceiling then ≈ span + install ≈ 15.4 ms → ~3.5x at cw100 — the
    goal number, with span-slack packing (~2.6 ms of imperfect
    dispatch) as the remaining margin.
+
+## P3b late-bound layers (2026-08-16) — feed recovered; the fold chain is next
+
+Landed: `begin_block_deferred` + `LayerBinder` (weak — a binder must
+never stall the tail's ctx unwrap; found as a 30s STALL_TIMEOUT burn by
+the never-bind test), worker late-bind gate, bench sequencing that
+builds/feeds/submits fi during fi-1's execution and binds at fi-1's
+release. Adversarial test upgraded to this exact sequencing.
+
+Measured (same protocol): 2.08x → **2.20x**; block-at-a-time 2.56x on
+that run. Loop split per block: feed 4ms (now hidden), bind-wait
+17-18ms. The bind-wait decomposes as fi-1's remaining execution
+(~13ms, the irreducible sequential dependency) + drain 0.3 + extract
+~1 + phase-1 + fold ~2.5 — i.e., ~4ms of fold-chain still serial,
+plus the pipeline's layer-probe tax inside the span.
+
+Sharpened ceiling math (cw100, w=4, seq 50ms/block): ideal span =
+busy/4 = 13.8ms → 3.62x; block-at-a-time span 15.2 (slack 1.4);
+3.5x = 14.3ms/block. So the goal needs ALL of: (a) release before the
+fold — the mv cache IS the delta (top version per cell == last
+writer's write set == what the fold computes); the release then needs
+only drain + extract + the sink running-sum (~1.4ms), with the fold
+running off-path for writer settlement only; (b) the layer tax held
+down — at steady state the writer confirms fast enough that layer
+windows go empty (advance_base absorbs them into the base cache);
+(c) span packing (~1.4ms of dispatch slack). Wound semantics
+unchanged: mv values pre-verdict equal fold values pre-verdict by
+construction, and a wound corrects/aborts through the existing
+protocol.

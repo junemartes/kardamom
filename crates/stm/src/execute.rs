@@ -960,9 +960,16 @@ struct BlockCtx<S: StateDatabase> {
     snapshots: Vec<S>,
     base: PendingDelta,
     /// Unsettled predecessor deltas, newest first (see `BlockInput`).
-    layers: Vec<std::sync::Arc<PendingDelta>>,
-    sink_start: Option<AccountInfo>,
-    sink_start_balance: U256,
+    /// Unsettled predecessor deltas + the fee-sink block-start view —
+    /// everything about the block's READ BASE that depends on its
+    /// predecessor's outcome. LATE-BOUND (spec P3b): admission is
+    /// layer-independent, so a pipelined consumer builds, feeds, and
+    /// submits this block during its predecessor's execution and binds
+    /// the layers when the predecessor's delta releases. Workers gate on
+    /// the bind before executing (see `run_worker_block`); the
+    /// block-at-a-time path binds at session build, making the gate
+    /// free.
+    binding: std::sync::OnceLock<BoundLayers>,
     mv: MvCache,
     /// Shared read-through cache over the immutable block-input layer.
     base_cache: std::sync::Arc<BaseCache>,
@@ -1218,6 +1225,13 @@ type Reap = Box<dyn Send>;
 
 /// One sealed block handed to the persistent TAIL thread (spec P3a):
 /// drain, release the pool slot, then `block_tail`.
+/// The late-bound part of a block's read base (see `BlockCtx::binding`).
+struct BoundLayers {
+    layers: Vec<std::sync::Arc<PendingDelta>>,
+    sink_start: Option<AccountInfo>,
+    sink_start_balance: U256,
+}
+
 struct TailJob<S: StateDatabase> {
     ctx: Arc<BlockCtx<S>>,
     txs: Vec<(TxIndex, BPosition, TxEnvelope)>,
@@ -1239,6 +1253,53 @@ pub struct DeltaRelease {
     /// release was invalidated by a wound: everything layered on the
     /// stale release must be aborted and rebuilt on THIS delta.
     pub corrected: bool,
+}
+
+/// Binds a deferred session's read base (see
+/// [`PoolHandle::begin_block_deferred`]). Consumed by `bind`; a binder
+/// dropped without binding leaves the block gated — `abort_active` it.
+/// Holds only a WEAK reference: the tail's ctx unwrap must not wait on
+/// a consumer that decided to abort instead of bind.
+pub struct LayerBinder<S: StateDatabase> {
+    ctx: std::sync::Weak<BlockCtx<S>>,
+}
+
+impl<S: StateDatabase> LayerBinder<S> {
+    /// Install the unsettled predecessor layers (newest first) and
+    /// probe the fee-sink block-start view through them; wakes the
+    /// gated workers.
+    pub fn bind(self, layers: Vec<std::sync::Arc<PendingDelta>>) -> Result<(), ExecutorError> {
+        let Some(ctx) = self.ctx.upgrade() else {
+            return Err(ExecutorError::State(
+                "stm: deferred block gone before bind (aborted)".into(),
+            ));
+        };
+        let probe = BlockInput {
+            snapshot: ctx.snapshots.first().expect("at least one snapshot"),
+            base: Some(&ctx.base),
+            layers: &layers,
+        };
+        let sink_start = probe
+            .basic_ref(FEE_SINK)
+            .map_err(|e| ExecutorError::State(format!("fee-sink read: {e}")))?;
+        let sink_start_balance = sink_start.as_ref().map(|a| a.balance).unwrap_or(U256::ZERO);
+        if ctx
+            .binding
+            .set(BoundLayers {
+                layers,
+                sink_start,
+                sink_start_balance,
+            })
+            .is_err()
+        {
+            return Err(ExecutorError::State("layers already bound".into()));
+        }
+        for q in &ctx.queues {
+            q.cv.notify_all();
+        }
+        ctx.done_cv.notify_all();
+        Ok(())
+    }
 }
 
 struct DeltaOut {
@@ -1569,6 +1630,25 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         env: ExecEnv,
         stats: &'p Stats,
     ) -> Result<BlockSession<'p, 'a, S>, ExecutorError> {
+        let (sess, binder) = self.begin_block_deferred(snapshots, base, env, stats)?;
+        binder.bind(layers)?;
+        Ok(sess)
+    }
+
+    /// [`Self::begin_block_layered`] with the layer bind DEFERRED (spec
+    /// P3b): admission is layer-independent, so the pipelined consumer
+    /// builds, feeds, and even submits this session while the
+    /// predecessor still executes, then calls [`LayerBinder::bind`]
+    /// when the predecessor's delta releases. Workers wait on the bind
+    /// before touching state; a consumer that will never bind must
+    /// `abort_active` instead (the drain watchdog is the backstop).
+    pub fn begin_block_deferred<'p>(
+        &'p self,
+        snapshots: Vec<S>,
+        base: PendingDelta,
+        env: ExecEnv,
+        stats: &'p Stats,
+    ) -> Result<(BlockSession<'p, 'a, S>, LayerBinder<S>), ExecutorError> {
         let (workers, prune_batch) = {
             let st = self.shared.0.lock().expect("pool poisoned");
             (st.cfg.workers, st.cfg.prune_batch)
@@ -1578,22 +1658,11 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             "one state view per worker: {} given, {workers} needed",
             snapshots.len()
         );
-        let probe = BlockInput {
-            snapshot: snapshots.first().expect("at least one snapshot"),
-            base: Some(&base),
-            layers: &layers,
-        };
-        let sink_start = probe
-            .basic_ref(FEE_SINK)
-            .map_err(|e| ExecutorError::State(format!("fee-sink read: {e}")))?;
-        let sink_start_balance = sink_start.as_ref().map(|a| a.balance).unwrap_or(U256::ZERO);
         let ctx = Arc::new(BlockCtx {
             env,
             snapshots,
             base,
-            layers,
-            sink_start,
-            sink_start_balance,
+            binding: std::sync::OnceLock::new(),
             mv: MvCache::new(),
             base_cache: self.base_cache.clone(),
             slots: (0..MAX_BLOCK_TXS)
@@ -1679,7 +1748,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             }
         }
         self.shared.1.notify_all();
-        Ok(BlockSession {
+        let sess = BlockSession {
             pool: self,
             ctx,
             stats,
@@ -1691,7 +1760,11 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             dispatch: vec![0; workers],
             txs: Vec::new(),
             started: std::time::Instant::now(),
-        })
+        };
+        let binder = LayerBinder {
+            ctx: Arc::downgrade(&sess.ctx),
+        };
+        Ok((sess, binder))
     }
 
     /// Feed a block whose txs were PREPARED upstream (decode + predict
@@ -2273,7 +2346,11 @@ fn block_tail<S: StateDatabase + Sync>(
     let mut receipts = Vec::with_capacity(n);
     let mut delta = PendingDelta::new();
     let mut cumulative = 0u64;
-    let mut sink_running = ctx.sink_start_balance;
+    let mut sink_running = ctx
+        .binding
+        .get()
+        .expect("layers bound before execution")
+        .sink_start_balance;
     // FAST-PATH PREFIX — runs before the validation verdict exists.
     //
     // The write-set hash is ~1.25us of keccak per tx and CANNOT be
@@ -2486,7 +2563,11 @@ fn block_tail<S: StateDatabase + Sync>(
         // below recomputes the same values, so restart the running
         // sums from zero.
         cumulative = 0;
-        sink_running = ctx.sink_start_balance;
+        sink_running = ctx
+            .binding
+            .get()
+            .expect("layers bound before execution")
+            .sink_start_balance;
         // REPAIR PATH: a wound fired, so txs from the first wound on
         // re-execute against the exact materialized prefix. Strictly
         // sequential by nature, and rare enough that its cost is not
@@ -2501,7 +2582,14 @@ fn block_tail<S: StateDatabase + Sync>(
         // nonces), latent since the layers landed: the bench scenarios
         // never wound.
         let mut layered = ctx.base.clone();
-        for l in ctx.layers.iter().rev() {
+        for l in ctx
+            .binding
+            .get()
+            .expect("layers bound before execution")
+            .layers
+            .iter()
+            .rev()
+        {
             layered.merge_from(l);
         }
         for (i, mut r) in tx_results.into_iter().enumerate() {
@@ -2702,15 +2790,31 @@ fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize, k
 /// edge and every FIFO obligation (low index → high), and completion only
 /// ever removes them.
 fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
+    // LATE-BIND GATE (spec P3b): a deferred session's txs are admitted
+    // and queued before its read base exists; nothing may execute until
+    // the consumer binds the layers. The wait is bind latency (the
+    // predecessor's fold), normally sub-millisecond; the block-at-a-time
+    // path binds at session build, so this is one free load. A consumer
+    // that never binds must abort; the tail's drain watchdog is the
+    // loud backstop.
+    let bound = loop {
+        if let Some(b) = ctx.binding.get() {
+            break b;
+        }
+        if ctx.aborted.load(Ordering::SeqCst) {
+            return;
+        }
+        std::thread::yield_now();
+    };
     let input = BlockInput {
         snapshot: &ctx.snapshots[worker % ctx.snapshots.len()],
         base: Some(&ctx.base),
-        layers: &ctx.layers,
+        layers: &bound.layers,
     };
     let view = MvView::new(
         &ctx.mv,
         &input,
-        ctx.sink_start.clone(),
+        bound.sink_start.clone(),
         &ctx.base_cache,
         &ctx.metrics,
     );
@@ -2882,7 +2986,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             slot.position,
             &slot.envelope,
             slot.decoded.as_ref(),
-            ctx.sink_start_balance,
+            bound.sink_start_balance,
         );
         // Timestamps stay WORKER-LOCAL and fold once per block. Stamping
         // them globally cost two clock reads and two contended RMWs per

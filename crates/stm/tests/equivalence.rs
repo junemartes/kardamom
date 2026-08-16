@@ -733,8 +733,9 @@ fn streaming_release_and_wound_correction() {
 }
 
 /// THE P3b ADVERSARIAL CASE (spec "Wound-abort adversarial"): block 2
-/// executes SPECULATIVELY on block 1's released delta while block 1 is
-/// still validating. When the lying-stats race fires a wound in block
+/// is built, fed, and submitted with DEFERRED layers while block 1
+/// still executes, binds on block 1's speculative release, and runs
+/// while block 1 is still validating. When the lying-stats race fires a wound in block
 /// 1, the speculative release was wrong — the consumer aborts block 2,
 /// rebuilds it on the `corrected` release, and both blocks must come
 /// out byte-identical to the sequential chain. When no wound fires,
@@ -824,10 +825,27 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
                 }
                 let (d1tx, d1rx) = std::sync::mpsc::channel();
                 let ticket1 = sess1.submit_streaming(d1tx, true).unwrap();
+                // THE PRODUCTION SEQUENCING (late-bound layers): block 2
+                // is built, fed, and SUBMITTED while block 1 still
+                // executes — before its read base exists. Workers gate
+                // on the bind.
+                let (mut sess2, binder2) = pool
+                    .begin_block_deferred(
+                        vec![database.clone(); 4],
+                        PendingDelta::new(),
+                        env2,
+                        &lying_stats,
+                    )
+                    .unwrap();
+                for (t, p, e) in &recs2 {
+                    sess2.push_tx(*t, *p, e.clone()).unwrap();
+                }
+                let (d2tx, _d2rx) = std::sync::mpsc::channel();
+                let ticket2 = sess2.submit_streaming(d2tx, true).unwrap();
                 // The SPECULATIVE release: block 1 is still validating.
                 let rel1 = d1rx.recv().expect("speculative release");
                 assert!(!rel1.corrected, "{label}: first release is speculative");
-                let ticket2 = submit_block2(rel1.delta.clone());
+                binder2.bind(vec![rel1.delta.clone()]).unwrap();
                 // Block 1's verdict.
                 let out1 = ticket1.wait().unwrap();
                 assert_identical(&seq1, &out1.receipts, &out1.delta, &label);
@@ -857,4 +875,44 @@ fn speculative_pipeline_wound_aborts_and_recovers() {
         }
     }
     eprintln!("spec-pipeline: {wound_reps}/{reps} reps wounded");
+}
+
+/// A deferred session whose consumer never binds must not hang: abort
+/// resolves its ticket (error or stale-Ok), loudly and promptly.
+#[test]
+fn deferred_never_bound_aborts_cleanly() {
+    let sg = signers(2);
+    let database = db(&sg);
+    let recs = records(vec![
+        tx(&sg[0], 0, TxKind::Call(sg[1].address()), 5, &[]),
+        tx(&sg[1], 0, TxKind::Call(sg[0].address()), 3, &[]),
+    ]);
+    kardamom_stm::execute::with_pool(
+        kardamom_stm::execute::PoolConfig {
+            workers: 2,
+            ..Default::default()
+        },
+        |pool| {
+            let stats = Stats::default();
+            let (mut sess, _binder) = pool
+                .begin_block_deferred(
+                    vec![database.clone(); 2],
+                    PendingDelta::new(),
+                    env(),
+                    &stats,
+                )
+                .unwrap();
+            for (t, p, e) in &recs {
+                sess.push_tx(*t, *p, e.clone()).unwrap();
+            }
+            let (dtx, _drx) = std::sync::mpsc::channel();
+            let ticket = sess.submit_streaming(dtx, true).unwrap();
+            pool.abort_active();
+            let r = ticket.wait();
+            assert!(
+                r.is_err(),
+                "never-bound block must resolve to the abort error"
+            );
+        },
+    );
 }

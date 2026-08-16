@@ -565,72 +565,125 @@ fn run_pipelined(
                 }
             };
             let mut advanced_to: usize = 0;
-            for fi in 0..n_flow {
-                let t0 = Instant::now();
-                if speculative && fi > 0 {
-                    // Releases arrive in submission order (one tail
-                    // thread): drain until fi-1's is in hand.
-                    while engine_deltas[fi - 1].is_none() {
-                        let rel = rel_rx.recv().expect("tail release channel");
-                        assert!(
-                            !rel.corrected,
-                            "wound in pipeline bench (block {}) — scenario must be wound-free",
-                            rel.block
+            if speculative {
+                // THE P3b SEQUENCING (late-bound layers): block fi is
+                // built, FED, and SUBMITTED while fi-1 still executes —
+                // admission is layer-independent — and its read base
+                // binds when fi-1's delta releases at the fold. The
+                // first measurement of the naive order (build AFTER the
+                // release) measured 2.08x vs 2.68x block-at-a-time: the
+                // feed had moved back onto the critical path.
+                for fi in 0..n_flow {
+                    let t1 = Instant::now();
+                    let views: Vec<kardamom_state::StateSnapshot> = (0..w)
+                        .map(|_| kardamom_state::StateSnapshot::open(&env_b))
+                        .collect::<Result<_, _>>()?;
+                    let t_views = t1.elapsed();
+                    let t2 = Instant::now();
+                    let (mut sess, binder) = pool.begin_block_deferred(
+                        views,
+                        PendingDelta::new(),
+                        env_of(warm + fi),
+                        &stats_b,
+                    )?;
+                    for (t, p, en, prep) in std::mem::take(&mut feed_payloads[fi]) {
+                        sess.push_prepared(t, p, en, prep)?;
+                    }
+                    let ticket = sess.submit_streaming(rel_tx.clone(), true)?;
+                    settle_tx.send((fi, ticket)).expect("settler alive");
+                    let t_feed = t2.elapsed();
+                    // BIND: wait out fi-1's fold. Releases arrive in
+                    // submission order (one tail thread).
+                    let t0 = Instant::now();
+                    if fi > 0 {
+                        while engine_deltas[fi - 1].is_none() {
+                            let rel = rel_rx.recv().expect("tail release channel");
+                            assert!(
+                                !rel.corrected,
+                                "wound in pipeline bench (block {}) — scenario must be wound-free",
+                                rel.block
+                            );
+                            let k = (rel.block as usize)
+                                .checked_sub(warm + 1)
+                                .expect("flow-range release");
+                            engine_deltas[k] = Some(rel.delta);
+                        }
+                    }
+                    let h = writer_b
+                        .snapshot_rx
+                        .current()
+                        .map(|s| s.block_number())
+                        .unwrap_or(0);
+                    while advanced_to < fi {
+                        let bn = (warm + advanced_to) as u64 + 1;
+                        if bn > h {
+                            break;
+                        }
+                        pool.advance_base(&layer_of(&engine_deltas, advanced_to));
+                        advanced_to += 1;
+                    }
+                    // NEWEST FIRST.
+                    let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
+                        .rev()
+                        .map(|k| layer_of(&engine_deltas, k))
+                        .collect();
+                    binder
+                        .bind(layers)
+                        .map_err(|e| anyhow::anyhow!("bind block {fi}: {e}"))?;
+                    if timing {
+                        eprintln!(
+                            "pipe block {fi}: views {t_views:?} feed {t_feed:?} bind-wait {:?}",
+                            t0.elapsed()
                         );
-                        let k = (rel.block as usize)
-                            .checked_sub(warm + 1)
-                            .expect("flow-range release");
-                        engine_deltas[k] = Some(rel.delta);
                     }
                 }
-                let h = writer_b
-                    .snapshot_rx
-                    .current()
-                    .map(|s| s.block_number())
-                    .unwrap_or(0);
-                while advanced_to < fi {
-                    let bn = (warm + advanced_to) as u64 + 1;
-                    if bn > h {
-                        break;
+            } else {
+                for fi in 0..n_flow {
+                    let t0 = Instant::now();
+                    let h = writer_b
+                        .snapshot_rx
+                        .current()
+                        .map(|s| s.block_number())
+                        .unwrap_or(0);
+                    while advanced_to < fi {
+                        let bn = (warm + advanced_to) as u64 + 1;
+                        if bn > h {
+                            break;
+                        }
+                        pool.advance_base(&layer_of(&engine_deltas, advanced_to));
+                        advanced_to += 1;
                     }
-                    pool.advance_base(&layer_of(&engine_deltas, advanced_to));
-                    advanced_to += 1;
-                }
-                // NEWEST FIRST.
-                let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
-                    .rev()
-                    .map(|k| layer_of(&engine_deltas, k))
-                    .collect();
-                let t_base = t0.elapsed();
-                let t1 = Instant::now();
-                let views: Vec<kardamom_state::StateSnapshot> = (0..w)
-                    .map(|_| kardamom_state::StateSnapshot::open(&env_b))
-                    .collect::<Result<_, _>>()?;
-                let t_views = t1.elapsed();
-                let t2 = Instant::now();
-                let mut sess = pool.begin_block_layered(
-                    views,
-                    PendingDelta::new(),
-                    layers,
-                    env_of(warm + fi),
-                    &stats_b,
-                )?;
-                for (t, p, en, prep) in std::mem::take(&mut feed_payloads[fi]) {
-                    sess.push_prepared(t, p, en, prep)?;
-                }
-                let t_feed = t2.elapsed();
-                let t3 = Instant::now();
-                let ticket = if speculative {
-                    sess.submit_streaming(rel_tx.clone(), true)?
-                } else {
-                    sess.submit()?
-                };
-                settle_tx.send((fi, ticket)).expect("settler alive");
-                if timing {
-                    eprintln!(
-                        "pipe block {fi}: base {t_base:?} views {t_views:?} feed {t_feed:?} hand {:?}",
-                        t3.elapsed()
-                    );
+                    // NEWEST FIRST.
+                    let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
+                        .rev()
+                        .map(|k| layer_of(&engine_deltas, k))
+                        .collect();
+                    let t_base = t0.elapsed();
+                    let t1 = Instant::now();
+                    let views: Vec<kardamom_state::StateSnapshot> = (0..w)
+                        .map(|_| kardamom_state::StateSnapshot::open(&env_b))
+                        .collect::<Result<_, _>>()?;
+                    let t_views = t1.elapsed();
+                    let t2 = Instant::now();
+                    let mut sess = pool.begin_block_layered(
+                        views,
+                        PendingDelta::new(),
+                        layers,
+                        env_of(warm + fi),
+                        &stats_b,
+                    )?;
+                    for (t, p, en, prep) in std::mem::take(&mut feed_payloads[fi]) {
+                        sess.push_prepared(t, p, en, prep)?;
+                    }
+                    let t_feed = t2.elapsed();
+                    let t3 = Instant::now();
+                    settle_tx.send((fi, sess.submit()?)).expect("settler alive");
+                    if timing {
+                        eprintln!(
+                            "pipe block {fi}: base {t_base:?} views {t_views:?} feed {t_feed:?} hand {:?}",
+                            t3.elapsed()
+                        );
+                    }
                 }
             }
             drop(settle_tx);
