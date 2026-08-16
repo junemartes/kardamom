@@ -189,6 +189,36 @@ impl MvCache {
         (p > 0).then(|| list[p - 1])
     }
 
+    /// Materialize the block's FINAL write view: per cell, the highest
+    /// version (== the last writer's value == exactly what the commit
+    /// fold computes), plus all CREATEd code. The repair path uses this
+    /// to turn a predecessor's mv layer into a mergeable delta; it is
+    /// fold-cost and only runs on the rare paths that need a
+    /// `PendingDelta` shape instead of probing the cache directly.
+    pub fn final_delta(&self) -> kardamom_exec_core::delta::PendingDelta {
+        let mut d = kardamom_exec_core::delta::PendingDelta::new();
+        for sh in &self.accounts {
+            let g = sh.read().expect("mv poisoned");
+            for (addr, list) in g.iter() {
+                if let Some((_, v)) = list.last() {
+                    d.accounts.insert(*addr, (v.nonce, v.balance, v.code_hash));
+                }
+            }
+        }
+        for sh in &self.storage {
+            let g = sh.read().expect("mv poisoned");
+            for ((addr, key), list) in g.iter() {
+                if let Some((_, v)) = list.last() {
+                    d.storage.insert((*addr, *key), *v);
+                }
+            }
+        }
+        for (h, b) in self.code.read().expect("mv poisoned").iter() {
+            d.code.insert(*h, b.clone());
+        }
+        d
+    }
+
     pub fn read_code(&self, hash: &B256) -> Option<Bytes> {
         self.code.read().expect("mv poisoned").get(hash).cloned()
     }

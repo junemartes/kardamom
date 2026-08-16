@@ -312,3 +312,50 @@ protocol.
 - **Expected**: cadence ≈ exec + ~1.4ms → ~3.0x at cw100; the
   remaining gap to 3.5x is the mv-probe tax inside the span plus
   ~1.4ms dispatch slack — both span-level work, after this lands.
+
+## mv-as-layer landed + the span-inflation investigation (2026-08-16)
+
+Landed and adversarially green (25/25 wound reps byte-identical):
+`MvRelease` (early release at drain+extract, pre-fold, sink
+materialized alongside), `submit_streaming_mv`, `bind_with` (mv layers
++ sink override), mv probes in `BlockInput` AND `MvView`'s own walks,
+`MvCache::final_delta()` for the repair prefix, serial tail for the mv
+pipeline (validate-first, one thread — parallel lanes are pointless
+when the tail hides behind the next span).
+
+Ladder of measurements (parcounter cw100 4k w=4, clean protocol):
+
+    naive speculative (fold-gated build)    2.08x
+    late-bound layers (feed overlapped)     2.20x   bind-wait 17.4ms
+    mv-as-layer (fold off the path)         2.38x   bind-wait 15.1ms
+    block-at-a-time (reference)             2.53x
+
+**The blocker, isolated**: pipeline worker busy = 63-66ms vs 55.3
+block-at-a-time (+13-19%), while the read path is FLAT (3.4 vs 3.3ms
+— the mv probe tax is negligible). Facts established:
+
+1. A pure CPU spin hog on the caller cores does NOT inflate worker
+   busy (55.4 ≈ 55.3): not core stealing, not frequency.
+2. An external ALLOC-STORM hog on the caller cores inflates
+   block-at-a-time busy to 64-65ms — reproducing the pipeline's
+   inflation exactly. The channel is allocation-related crosstalk.
+3. mimalloc as global allocator: REVERTED — raised block-at-a-time
+   busy (+11%) without helping the pipeline. So NOT user-space arena
+   locks; prime suspect is the kernel mmap_lock / page-fault path
+   (per-block ctx construction maps fresh 4096-slot arenas + MvCache
+   while the reaper unmaps the predecessor's — all during the span).
+4. The delta-baseline pipeline shows the same inflation (62.5-63.6):
+   it is pipeline-generic, has been present since P3a, and explains
+   why the pipeline never beat block-at-a-time on micro-tail
+   workloads.
+
+Next unit, first experiment: POOL the block ctx allocations (nodes
+arena, slots/results OnceLock arrays, MvCache — the reverted MvPool on
+`stash/flat-seqlock-tables` is the pattern) so steady-state blocks map
+no new memory and the reaper unmaps none. If busy returns to ~55, the
+pipeline immediately reads ~2.9-3.0x (cadence 16.9ms measured minus
+the inflation), and the remaining path to 3.5x is span packing
+(~1.4ms slack) plus caller-side loop slop (~2ms). Topology note for
+all of this: callers 0,1,6,7 are ONLY TWO physical cores (SMT pairs
+0/6 and 1/7); workers 2,3,4,5 each own a physical core with an idle
+sibling.

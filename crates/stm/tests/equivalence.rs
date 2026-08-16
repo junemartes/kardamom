@@ -916,3 +916,140 @@ fn deferred_never_bound_aborts_cleanly() {
         },
     );
 }
+
+/// MV-AS-LAYER (spec P3b): block 2 binds on block 1's EARLY release —
+/// the mv cache itself, shipped before block 1's fold, hash, or
+/// validation ran. Wound in block 1 ⇒ the corrected DELTA release
+/// arrives, block 2 aborts and rebuilds on the delta layer (never the
+/// stale mv). Byte-identical to the sequential chain in every path.
+#[test]
+fn mv_as_layer_pipeline_wound_aborts_and_recovers() {
+    let sg = signers(4);
+    let database = db(&sg);
+    let lying_stats = {
+        let obs: Vec<TxObs> = (0..4)
+            .map(|i| {
+                let sender = Address::with_last_byte(i as u8 + 0x10);
+                let mut buf = [0u8; 64];
+                buf[..32]
+                    .copy_from_slice(&U256::from_be_slice(sender.as_slice()).to_be_bytes::<32>());
+                buf[32..].copy_from_slice(&U256::from(3u8).to_be_bytes::<32>());
+                TxObs {
+                    index: i,
+                    block: 1,
+                    sender,
+                    to: Some(COUNTER),
+                    selector: Some(COUNTER_SEL),
+                    args: Vec::new(),
+                    gas: 30_000,
+                    has_value: false,
+                    reads: Vec::new(),
+                    writes: vec![Cell::Slot(COUNTER, keccak256(buf))],
+                }
+            })
+            .collect();
+        Stats::learn(&obs)
+    };
+    let recs1 = records(
+        (0..4)
+            .map(|i| tx(&sg[i], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let recs2 = records(
+        (0..4)
+            .map(|i| tx(&sg[i], 1, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let seq1 = execute_block_sequential(&database, None, env(), &recs1).unwrap();
+    let env2 = ExecEnv {
+        block_number: 2,
+        ..env()
+    };
+    let seq2 = execute_block_sequential(&database, Some(&seq1.1), env2, &recs2).unwrap();
+
+    let mut wound_reps = 0usize;
+    let mut reps = 0usize;
+    for rep in 0..200 {
+        let label = format!("mv-layer rep={rep}");
+        kardamom_stm::execute::with_pool(
+            kardamom_stm::execute::PoolConfig {
+                workers: 4,
+                ..Default::default()
+            },
+            |pool| {
+                // Block 1: early mv release + fold delta release.
+                let mut sess1 = pool
+                    .begin_block(database.clone(), PendingDelta::new(), env(), &lying_stats)
+                    .unwrap();
+                for (t, p, e) in &recs1 {
+                    sess1.push_tx(*t, *p, e.clone()).unwrap();
+                }
+                let (mv1_tx, mv1_rx) = std::sync::mpsc::channel();
+                let (d1tx, d1rx) = std::sync::mpsc::channel();
+                let ticket1 = sess1.submit_streaming_mv(mv1_tx, d1tx).unwrap();
+                // Block 2: deferred, submitted before block 1's release.
+                let (mut sess2, binder2) = pool
+                    .begin_block_deferred(
+                        vec![database.clone(); 4],
+                        PendingDelta::new(),
+                        env2,
+                        &lying_stats,
+                    )
+                    .unwrap();
+                for (t, p, e) in &recs2 {
+                    sess2.push_tx(*t, *p, e.clone()).unwrap();
+                }
+                let (d2tx, _d2rx) = std::sync::mpsc::channel();
+                let ticket2 = sess2.submit_streaming(d2tx, true).unwrap();
+                // The EARLY release: block 1's mv, pre-fold, pre-verdict.
+                let rel1 = mv1_rx.recv().expect("early mv release");
+                binder2
+                    .bind_with(
+                        vec![rel1.mv.clone()],
+                        Vec::new(),
+                        Some(rel1.sink_final.clone()),
+                    )
+                    .unwrap();
+                let out1 = ticket1.wait().unwrap();
+                assert_identical(&seq1, &out1.receipts, &out1.delta, &label);
+                if out1.wounds == 0 {
+                    let out2 = ticket2.wait().unwrap();
+                    assert_identical(&seq2, &out2.receipts, &out2.delta, &label);
+                } else {
+                    wound_reps += 1;
+                    // The mv layer is stale. Unwind block 2 onto the
+                    // CORRECTED delta.
+                    let first = d1rx.recv().expect("first delta release");
+                    let corrected = if first.corrected {
+                        first
+                    } else {
+                        d1rx.recv().expect("corrected delta release")
+                    };
+                    assert!(corrected.corrected, "{label}: wound re-issues");
+                    pool.abort_active();
+                    let _ = ticket2.wait();
+                    let mut sess = pool
+                        .begin_block_layered(
+                            vec![database.clone(); 4],
+                            PendingDelta::new(),
+                            vec![corrected.delta.clone()],
+                            env2,
+                            &lying_stats,
+                        )
+                        .unwrap();
+                    for (t, p, e) in &recs2 {
+                        sess.push_tx(*t, *p, e.clone()).unwrap();
+                    }
+                    let (d2btx, _d2brx) = std::sync::mpsc::channel();
+                    let out2 = sess.submit_streaming(d2btx, true).unwrap().wait().unwrap();
+                    assert_identical(&seq2, &out2.receipts, &out2.delta, &label);
+                }
+            },
+        );
+        reps = rep + 1;
+        if wound_reps > 0 && rep >= 24 {
+            break;
+        }
+    }
+    eprintln!("mv-layer: {wound_reps}/{reps} reps wounded");
+}

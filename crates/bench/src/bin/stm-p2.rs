@@ -13,6 +13,7 @@
 //! Wall-clock numbers are indicative (shared dev host); the assertion is
 //! the point — the speedup column is the shape, not a benchmark citation.
 
+
 use std::time::Instant;
 
 use alloy_primitives::U256;
@@ -205,6 +206,11 @@ fn bucket_snap() -> [(u64, u64); 6] {
     })
 }
 
+// mimalloc as the backing store was TRIED and REVERTED (2026-08-16):
+// it raised block-at-a-time worker busy (+11%) more than it helped the
+// pipeline's span inflation (unchanged) — the contention is not
+// user-space arena locks; see the spec's pipeline-span-inflation note
+// (mmap_lock / page-fault path is the open suspect).
 #[global_allocator]
 static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
 
@@ -520,9 +526,18 @@ fn run_pipelined(
                     .map(|r| r.last().map(|x| x.0.0 + 1).unwrap_or(0))
                     .collect();
                 let env_of2 = env_of;
+                let timing2 = std::env::var_os("KARDAMOM_STM_PHASE_TIMING").is_some();
                 move || -> anyhow::Result<()> {
                     while let Ok((pfi, t)) = settle_rx.recv() {
                         let out = t.wait()?;
+                        if timing2 {
+                            eprintln!(
+                                "settle block {pfi}: busy {:.1}ms read {:.1}ms wounds {}",
+                                out.busy_per_worker_us.iter().sum::<u64>() as f64 / 1000.0,
+                                out.read_us as f64 / 1000.0,
+                                out.wounds
+                            );
+                        }
                         let bi = warm + pfi;
                         let e = env_of2(bi);
                         let bd = out
@@ -555,6 +570,15 @@ fn run_pipelined(
             let mut engine_deltas: Vec<Option<std::sync::Arc<PendingDelta>>> = vec![None; n_flow];
             let (rel_tx, rel_rx) =
                 std::sync::mpsc::channel::<kardamom_stm::execute::DeltaRelease>();
+            // mv-as-layer: the EARLY release (pre-fold) that block fi
+            // actually binds on; the DeltaRelease above is drained
+            // lazily for base-cache advancement bookkeeping only.
+            type MvSlot = (
+                std::sync::Arc<kardamom_stm::mv::MvCache>,
+                Option<revm::state::AccountInfo>,
+            );
+            let mut engine_mvs: Vec<Option<MvSlot>> = vec![None; n_flow];
+            let (mv_tx, mv_rx) = std::sync::mpsc::channel::<kardamom_stm::execute::MvRelease>();
             let layer_of = |engine_deltas: &[Option<std::sync::Arc<PendingDelta>>],
                             k: usize|
              -> std::sync::Arc<PendingDelta> {
@@ -589,25 +613,27 @@ fn run_pipelined(
                     for (t, p, en, prep) in std::mem::take(&mut feed_payloads[fi]) {
                         sess.push_prepared(t, p, en, prep)?;
                     }
-                    let ticket = sess.submit_streaming(rel_tx.clone(), true)?;
+                    let ticket = sess.submit_streaming_mv(mv_tx.clone(), rel_tx.clone())?;
                     settle_tx.send((fi, ticket)).expect("settler alive");
                     let t_feed = t2.elapsed();
-                    // BIND: wait out fi-1's fold. Releases arrive in
-                    // submission order (one tail thread).
-                    let t0 = Instant::now();
-                    if fi > 0 {
-                        while engine_deltas[fi - 1].is_none() {
-                            let rel = rel_rx.recv().expect("tail release channel");
-                            assert!(
-                                !rel.corrected,
-                                "wound in pipeline bench (block {}) — scenario must be wound-free",
-                                rel.block
-                            );
-                            let k = (rel.block as usize)
-                                .checked_sub(warm + 1)
-                                .expect("flow-range release");
-                            engine_deltas[k] = Some(rel.delta);
-                        }
+                    // BIND: wait out fi-1's EARLY release (drain +
+                    // extract — pre-fold; spec P3b mv-as-layer).
+                    // Releases arrive in submission order.
+                    // Advancement bookkeeping FIRST — it overlaps
+                    // fi-1's still-running execution instead of sitting
+                    // on the cadence after the bind-wait. Fold deltas
+                    // arrive lazily; drain without blocking.
+                    let t_a = Instant::now();
+                    while let Ok(rel) = rel_rx.try_recv() {
+                        assert!(
+                            !rel.corrected,
+                            "wound in pipeline bench (block {}) — scenario must be wound-free",
+                            rel.block
+                        );
+                        let k = (rel.block as usize)
+                            .checked_sub(warm + 1)
+                            .expect("flow-range release");
+                        engine_deltas[k] = Some(rel.delta);
                     }
                     let h = writer_b
                         .snapshot_rx
@@ -616,23 +642,41 @@ fn run_pipelined(
                         .unwrap_or(0);
                     while advanced_to < fi {
                         let bn = (warm + advanced_to) as u64 + 1;
-                        if bn > h {
+                        if bn > h || engine_deltas[advanced_to].is_none() {
                             break;
                         }
                         pool.advance_base(&layer_of(&engine_deltas, advanced_to));
                         advanced_to += 1;
                     }
-                    // NEWEST FIRST.
-                    let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
+                    let t_adv = t_a.elapsed();
+                    let t0 = Instant::now();
+                    if fi > 0 {
+                        while engine_mvs[fi - 1].is_none() {
+                            let rel = mv_rx.recv().expect("mv release channel");
+                            let k = (rel.block as usize)
+                                .checked_sub(warm + 1)
+                                .expect("flow-range release");
+                            engine_mvs[k] = Some((rel.mv, rel.sink_final));
+                        }
+                    }
+                    // NEWEST FIRST: the mv caches of unsettled
+                    // predecessors; the sink rides the newest release.
+                    let mv_layers: Vec<std::sync::Arc<kardamom_stm::mv::MvCache>> = (advanced_to
+                        ..fi)
                         .rev()
-                        .map(|k| layer_of(&engine_deltas, k))
+                        .map(|k| engine_mvs[k].as_ref().expect("drained in order").0.clone())
                         .collect();
+                    let sink = if fi > 0 {
+                        Some(engine_mvs[fi - 1].as_ref().expect("just drained").1.clone())
+                    } else {
+                        None
+                    };
                     binder
-                        .bind(layers)
+                        .bind_with(mv_layers, Vec::new(), sink)
                         .map_err(|e| anyhow::anyhow!("bind block {fi}: {e}"))?;
                     if timing {
                         eprintln!(
-                            "pipe block {fi}: views {t_views:?} feed {t_feed:?} bind-wait {:?}",
+                            "pipe block {fi}: views {t_views:?} feed {t_feed:?} adv {t_adv:?} bind-wait {:?}",
                             t0.elapsed()
                         );
                     }

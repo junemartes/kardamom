@@ -48,6 +48,13 @@ pub struct BlockInput<'a, S: StateDatabase> {
     /// clone + advance were a measured, growing multi-ms drag on the
     /// pipeline loop).
     pub layers: &'a [std::sync::Arc<PendingDelta>],
+    /// Predecessor MULTI-VERSION CACHES, NEWEST FIRST, probed before
+    /// everything else (spec P3b mv-as-layer): a drained block's mv top
+    /// version per cell IS its final delta — before any fold ran. Reads
+    /// probe at `u32::MAX`. Immutable once the block drained; a wound
+    /// invalidates the whole layer through the corrected-release
+    /// protocol, never by mutation.
+    pub mv_layers: &'a [std::sync::Arc<crate::mv::MvCache>],
 }
 
 impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
@@ -57,6 +64,21 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
         &self,
         address: alloy_primitives::Address,
     ) -> Result<Option<AccountInfo>, Self::Error> {
+        for mv in self.mv_layers.iter() {
+            if let Some((_, a)) = mv.read_account(u32::MAX, &address) {
+                return Ok(Some(AccountInfo {
+                    nonce: a.nonce,
+                    balance: a.balance,
+                    code_hash: if a.code_hash == B256::ZERO {
+                        revm::primitives::KECCAK_EMPTY
+                    } else {
+                        a.code_hash
+                    },
+                    account_id: None,
+                    code: None,
+                }));
+            }
+        }
         for layer in self.layers.iter().map(|l| l.as_ref()).chain(self.base) {
             if let Some((nonce, balance, code_hash)) = layer.accounts.get(&address) {
                 let code_hash = if *code_hash == B256::ZERO {
@@ -80,6 +102,13 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
     }
 
     fn code_by_hash_ref(&self, code_hash: B256) -> Result<revm::state::Bytecode, Self::Error> {
+        for mv in self.mv_layers.iter() {
+            if let Some(code) = mv.read_code(&code_hash) {
+                return Ok(revm::state::Bytecode::new_raw(
+                    alloy_primitives::Bytes::copy_from_slice(&code),
+                ));
+            }
+        }
         for layer in self.layers.iter().map(|l| l.as_ref()).chain(self.base) {
             if let Some(code) = layer.code.get(&code_hash)
                 && !code.is_empty()
@@ -101,6 +130,11 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
         index: U256,
     ) -> Result<U256, Self::Error> {
         let key = B256::from(index.to_be_bytes::<32>());
+        for mv in self.mv_layers.iter() {
+            if let Some((_, v)) = mv.read_slot(u32::MAX, &address, &key) {
+                return Ok(v);
+            }
+        }
         for layer in self.layers.iter().map(|l| l.as_ref()).chain(self.base) {
             if let Some(v) = layer.storage.get(&(address, key)) {
                 return Ok(*v);
@@ -263,9 +297,27 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             }));
         }
         self.reads.push(ReadRecord::Account(address, None));
-        // Pending-delta LAYERS (newest first) then the base layer, all
-        // BEFORE the cache: the pool-lifetime cache mirrors the BACKEND
-        // only, and these layers change per block.
+        // Predecessor MV LAYERS first (newest first, at u32::MAX — the
+        // top version is the final value; spec P3b mv-as-layer), then
+        // pending-delta LAYERS, then the base layer, all BEFORE the
+        // cache: the pool-lifetime cache mirrors the BACKEND only, and
+        // these layers change per block.
+        for mv in self.base.mv_layers.iter() {
+            if let Some((_, a)) = mv.read_account(u32::MAX, &address) {
+                self.n_base_hit += 1;
+                return Ok(Some(AccountInfo {
+                    nonce: a.nonce,
+                    balance: a.balance,
+                    code_hash: if a.code_hash == B256::ZERO {
+                        revm::primitives::KECCAK_EMPTY
+                    } else {
+                        a.code_hash
+                    },
+                    account_id: None,
+                    code: None,
+                }));
+            }
+        }
         for layer in self
             .base
             .layers
@@ -354,6 +406,12 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             return Ok(v);
         }
         self.reads.push(ReadRecord::Slot(address, key, None));
+        for mv in self.base.mv_layers.iter() {
+            if let Some((_, v)) = mv.read_slot(u32::MAX, &address, &key) {
+                self.n_base_hit += 1;
+                return Ok(v);
+            }
+        }
         for layer in self
             .base
             .layers
@@ -970,7 +1028,9 @@ struct BlockCtx<S: StateDatabase> {
     /// block-at-a-time path binds at session build, making the gate
     /// free.
     binding: std::sync::OnceLock<BoundLayers>,
-    mv: MvCache,
+    /// Arc: outlives the block as a predecessor mv layer (mv-as-layer
+    /// releases clone it; the last holder drops it, usually the reaper).
+    mv: Arc<MvCache>,
     /// Shared read-through cache over the immutable block-input layer.
     base_cache: std::sync::Arc<BaseCache>,
     slots: Vec<std::sync::OnceLock<TxSlot>>,
@@ -1227,6 +1287,8 @@ type Reap = Box<dyn Send>;
 /// drain, release the pool slot, then `block_tail`.
 /// The late-bound part of a block's read base (see `BlockCtx::binding`).
 struct BoundLayers {
+    /// Predecessor mv caches, newest first (spec P3b mv-as-layer).
+    mv_layers: Vec<std::sync::Arc<MvCache>>,
     layers: Vec<std::sync::Arc<PendingDelta>>,
     sink_start: Option<AccountInfo>,
     sink_start_balance: U256,
@@ -1269,23 +1331,49 @@ impl<S: StateDatabase> LayerBinder<S> {
     /// probe the fee-sink block-start view through them; wakes the
     /// gated workers.
     pub fn bind(self, layers: Vec<std::sync::Arc<PendingDelta>>) -> Result<(), ExecutorError> {
+        self.bind_with(Vec::new(), layers, None)
+    }
+
+    /// [`Self::bind`] with predecessor MV LAYERS (spec P3b
+    /// mv-as-layer), newest first, probed before the delta layers. The
+    /// fee sink is never published to an mv cache, so `sink_final`
+    /// (from the predecessor's [`MvRelease`]) is REQUIRED whenever mv
+    /// layers are present; without mv layers it may be None and the
+    /// sink is probed through the delta layers as usual.
+    pub fn bind_with(
+        self,
+        mv_layers: Vec<std::sync::Arc<MvCache>>,
+        layers: Vec<std::sync::Arc<PendingDelta>>,
+        sink_final: Option<Option<AccountInfo>>,
+    ) -> Result<(), ExecutorError> {
         let Some(ctx) = self.ctx.upgrade() else {
             return Err(ExecutorError::State(
                 "stm: deferred block gone before bind (aborted)".into(),
             ));
         };
-        let probe = BlockInput {
-            snapshot: ctx.snapshots.first().expect("at least one snapshot"),
-            base: Some(&ctx.base),
-            layers: &layers,
+        let sink_start = match sink_final {
+            Some(sink) => sink,
+            None => {
+                assert!(
+                    mv_layers.is_empty(),
+                    "mv layers cannot serve the fee sink — pass the release's sink_final"
+                );
+                let probe = BlockInput {
+                    snapshot: ctx.snapshots.first().expect("at least one snapshot"),
+                    base: Some(&ctx.base),
+                    layers: &layers,
+                    mv_layers: &[],
+                };
+                probe
+                    .basic_ref(FEE_SINK)
+                    .map_err(|e| ExecutorError::State(format!("fee-sink read: {e}")))?
+            }
         };
-        let sink_start = probe
-            .basic_ref(FEE_SINK)
-            .map_err(|e| ExecutorError::State(format!("fee-sink read: {e}")))?;
         let sink_start_balance = sink_start.as_ref().map(|a| a.balance).unwrap_or(U256::ZERO);
         if ctx
             .binding
             .set(BoundLayers {
+                mv_layers,
                 layers,
                 sink_start,
                 sink_start_balance,
@@ -1302,8 +1390,23 @@ impl<S: StateDatabase> LayerBinder<S> {
     }
 }
 
+/// The EARLY streaming release (spec P3b mv-as-layer): block N's
+/// multi-version cache, shipped right after drain + extract — before
+/// phase-1/fold/validation. Its top version per cell equals what the
+/// fold will compute; the sink (never published to mv) rides along,
+/// already materialized. Pre-verdict by construction: a wound
+/// invalidates it through the corrected `DeltaRelease` that follows.
+pub struct MvRelease {
+    pub block: u64,
+    pub mv: std::sync::Arc<MvCache>,
+    /// The fee sink's FINAL account for this block (start + fee sum).
+    pub sink_final: Option<AccountInfo>,
+}
+
 struct DeltaOut {
     tx: std::sync::mpsc::Sender<DeltaRelease>,
+    /// mv-as-layer early release channel (implies speculative).
+    mv_tx: Option<std::sync::mpsc::Sender<MvRelease>>,
     /// Speculative (spec P3b): release at fold, CONCURRENT with
     /// validation — a wound invalidates the release (a `corrected`
     /// re-issue follows). Conservative (P3a): release only after the
@@ -1663,7 +1766,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             snapshots,
             base,
             binding: std::sync::OnceLock::new(),
-            mv: MvCache::new(),
+            mv: Arc::new(MvCache::new()),
             base_cache: self.base_cache.clone(),
             slots: (0..MAX_BLOCK_TXS)
                 .map(|_| std::sync::OnceLock::new())
@@ -2253,6 +2356,51 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     /// (P3b); after the verdict when not (P3a). On a wound the tail
     /// sends a second, `corrected` release; the consumer must abort
     /// anything layered on the first.
+    /// `submit_streaming` speculative, plus the EARLY mv release (spec
+    /// P3b mv-as-layer): `mv_tx` receives this block's multi-version
+    /// cache right after drain + extract — the earliest point a
+    /// successor can bind on — and `delta_tx` still receives the folded
+    /// delta (for base-cache advancement and writer settlement), plus
+    /// the `corrected` re-issue on a wound.
+    pub fn submit_streaming_mv(
+        self,
+        mv_tx: std::sync::mpsc::Sender<MvRelease>,
+        delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
+    ) -> Result<BlockTicket, ExecutorError> {
+        let BlockSession {
+            pool,
+            ctx,
+            txs,
+            started,
+            cold,
+            edges,
+            dispatch,
+            ..
+        } = self;
+        ctx.sealed.store(true, Ordering::SeqCst);
+        for q in &ctx.queues {
+            q.cv.notify_all();
+        }
+        let (out, rx) = std::sync::mpsc::channel();
+        pool.tail
+            .send(TailJob {
+                ctx,
+                txs,
+                started,
+                cold,
+                edges,
+                dispatch,
+                out,
+                delta_out: Some(DeltaOut {
+                    tx: delta_tx,
+                    mv_tx: Some(mv_tx),
+                    speculative: true,
+                }),
+            })
+            .map_err(|_| ExecutorError::State("stm pool: tail thread gone".into()))?;
+        Ok(BlockTicket { rx })
+    }
+
     pub fn submit_streaming(
         self,
         delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
@@ -2284,6 +2432,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 out,
                 delta_out: Some(DeltaOut {
                     tx: delta_tx,
+                    mv_tx: None,
                     speculative,
                 }),
             })
@@ -2331,6 +2480,41 @@ fn block_tail<S: StateDatabase + Sync>(
     }
 
     let t_extract = t_extract0.elapsed();
+    // EARLY RELEASE (spec P3b mv-as-layer): the mv cache's top version
+    // per cell IS the final delta — before any fold ran. Ship it now,
+    // with the fee sink materialized alongside (never published to
+    // mv). Pre-verdict by construction: a wound invalidates it through
+    // the corrected DeltaRelease that follows the repair.
+    if let Some(DeltaOut {
+        mv_tx: Some(mv_tx), ..
+    }) = &delta_out
+    {
+        let b0 = ctx.binding.get().expect("layers bound before execution");
+        let mut fee_sum = U256::ZERO;
+        for r in tx_results.iter() {
+            fee_sum += r.fee_delta;
+        }
+        let sink_final = match &b0.sink_start {
+            Some(a) => {
+                let mut a = a.clone();
+                a.balance = b0.sink_start_balance + fee_sum;
+                Some(a)
+            }
+            None if fee_sum > U256::ZERO => Some(AccountInfo {
+                nonce: 0,
+                balance: fee_sum,
+                code_hash: revm::primitives::KECCAK_EMPTY,
+                account_id: None,
+                code: None,
+            }),
+            None => None,
+        };
+        let _ = mv_tx.send(MvRelease {
+            block: ctx.env.block_number,
+            mv: ctx.mv.clone(),
+            sink_final,
+        });
+    }
 
     // Canonical-order commit. A wounded tx is RE-EXECUTED here against
     // the exact materialized prefix (the delta as of its position), so
@@ -2402,7 +2586,75 @@ fn block_tail<S: StateDatabase + Sync>(
     let chunk = n_res.div_ceil(hash_threads);
     let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
     let val_ns = std::sync::atomic::AtomicU64::new(0);
-    let (delta_arc, wounded): (std::sync::Arc<PendingDelta>, Vec<usize>) =
+    let fold_inline = |results: &[TxResult]| -> PendingDelta {
+        let mut sink_final: Option<(u64, U256, B256)> = None;
+        let mut d = PendingDelta::new();
+        d.accounts.reserve(results.len() * 2);
+        d.storage.reserve(results.len());
+        for r in results.iter() {
+            for (a, v) in r.ws.accounts.iter() {
+                if *a == FEE_SINK {
+                    sink_final = Some(*v);
+                } else {
+                    d.accounts.insert(*a, *v);
+                }
+            }
+            for (k, v) in r.ws.storage.iter() {
+                d.storage.insert(*k, *v);
+            }
+            for (h, b) in r.ws.code.iter() {
+                d.code.insert(*h, b.clone());
+            }
+        }
+        if let Some(v) = sink_final {
+            d.accounts.insert(FEE_SINK, v);
+        }
+        d
+    };
+    // The mv pipeline runs the tail SEQUENTIALLY on this one thread:
+    // its latency hides behind the NEXT block's execution (the early
+    // release already shipped), so the goal is not speed but QUIET —
+    // four parallel lanes of keccak + hashmap builds co-running with
+    // the executing span measured +19% worker busy (memory bandwidth
+    // + the two shared caller cores; see the topology note in the
+    // bench). Validation runs FIRST so a wound skips the wasted fold
+    // and hash entirely.
+    let serial_tail = delta_out.as_ref().is_some_and(|d| d.mv_tx.is_some());
+    let (delta_arc, wounded): (std::sync::Arc<PendingDelta>, Vec<usize>) = if serial_tail {
+        let t0 = std::time::Instant::now();
+        let wounded: Vec<usize> = tx_results
+            .iter()
+            .enumerate()
+            .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
+            .map(|(i, _)| i)
+            .collect();
+        val_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if wounded.is_empty() {
+            let delta_arc = std::sync::Arc::new(fold_inline(&tx_results));
+            if let Some(DeltaOut {
+                tx,
+                speculative: true,
+                ..
+            }) = &delta_out
+            {
+                let _ = tx.send(DeltaRelease {
+                    block: ctx.env.block_number,
+                    delta: delta_arc.clone(),
+                    corrected: false,
+                });
+            }
+            for (i, r) in tx_results.iter().enumerate() {
+                if r.sink_touched {
+                    hashes[i] = r.ws.hash();
+                }
+            }
+            (delta_arc, wounded)
+        } else {
+            // Fold and hash skipped: the repair path rebuilds both, and
+            // the corrected release follows it.
+            (std::sync::Arc::new(PendingDelta::new()), wounded)
+        }
+    } else {
         std::thread::scope(|sc| {
             // Fold thread: read-only copy, plain upserts in canonical
             // order ("later tx wins" is the map's own semantics), on
@@ -2498,6 +2750,7 @@ fn block_tail<S: StateDatabase + Sync>(
             if let Some(DeltaOut {
                 tx,
                 speculative: true,
+                ..
             }) = &delta_out
             {
                 let _ = tx.send(DeltaRelease {
@@ -2511,7 +2764,8 @@ fn block_tail<S: StateDatabase + Sync>(
                 .flat_map(|h| h.join().expect("hash+validate lane"))
                 .collect();
             (delta_arc, wounded)
-        });
+        })
+    };
     hash_ns += t_h.elapsed().as_nanos() as u64;
     let t_validate = std::time::Duration::from_nanos(val_ns.load(Ordering::Relaxed));
     let wounds = wounded.len();
@@ -2534,6 +2788,7 @@ fn block_tail<S: StateDatabase + Sync>(
         if let Some(DeltaOut {
             tx,
             speculative: false,
+            ..
         }) = &delta_out
         {
             let _ = tx.send(DeltaRelease {
@@ -2582,15 +2837,17 @@ fn block_tail<S: StateDatabase + Sync>(
         // nonces), latent since the layers landed: the bench scenarios
         // never wound.
         let mut layered = ctx.base.clone();
-        for l in ctx
-            .binding
-            .get()
-            .expect("layers bound before execution")
-            .layers
-            .iter()
-            .rev()
         {
-            layered.merge_from(l);
+            let b = ctx.binding.get().expect("layers bound before execution");
+            for l in b.layers.iter().rev() {
+                layered.merge_from(l);
+            }
+            // mv layers are NEWER than the delta layers (probed first on
+            // the read path), so they merge last; `final_delta` is the
+            // fold-shaped materialization — rare path, fold cost.
+            for mv in b.mv_layers.iter().rev() {
+                layered.merge_from(&mv.final_delta());
+            }
         }
         for (i, mut r) in tx_results.into_iter().enumerate() {
             if wounded_set.contains(&i) {
@@ -2810,6 +3067,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         snapshot: &ctx.snapshots[worker % ctx.snapshots.len()],
         base: Some(&ctx.base),
         layers: &bound.layers,
+        mv_layers: &bound.mv_layers,
     };
     let view = MvView::new(
         &ctx.mv,
