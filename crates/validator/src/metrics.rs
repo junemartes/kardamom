@@ -17,6 +17,17 @@ pub const EPOCH_FAULTS_TOTAL: &str = "validator_epoch_faults_total";
 /// not read as a divergence. Sustained non-zero means verification coverage
 /// has holes.
 pub const EPOCHS_UNVERIFIED_TOTAL: &str = "validator_epochs_unverified_total";
+/// Remote-epoch records (interop) that passed the inline pair-sequence checks.
+pub const REMOTE_EPOCHS_VERIFIED_TOTAL: &str = "validator_remote_epochs_verified_total";
+/// Remote-epoch records that FAILED verification — a chain fault, always
+/// paired with a divergence.
+pub const REMOTE_EPOCH_FAULTS_TOTAL: &str = "validator_remote_epoch_faults_total";
+/// Outbox messages extracted from re-executed receipts and fed to the serving
+/// feed store (egress spec E1).
+pub const OUTBOX_EXTRACTED_TOTAL: &str = "validator_outbox_extracted_total";
+/// Blocks whose extracted outbox messages could not be cross-checked against
+/// BAL claims (claims never arrived). NOT a fault — the bal_missing posture.
+pub const OUTBOX_UNCHECKED_TOTAL: &str = "validator_outbox_unchecked_total";
 
 /// Register metric descriptions. Call once at startup (after `kardamom_obs::init`).
 pub fn describe() {
@@ -78,6 +89,22 @@ pub fn counter_epoch_fault() {
 
 pub fn counter_epoch_unverified() {
     metrics::counter!(EPOCHS_UNVERIFIED_TOTAL).increment(1);
+}
+
+pub fn counter_remote_epoch_verified() {
+    metrics::counter!(REMOTE_EPOCHS_VERIFIED_TOTAL).increment(1);
+}
+
+pub fn counter_remote_epoch_fault() {
+    metrics::counter!(REMOTE_EPOCH_FAULTS_TOTAL).increment(1);
+}
+
+pub fn counter_outbox_extracted(n: usize) {
+    metrics::counter!(OUTBOX_EXTRACTED_TOTAL).increment(n as u64);
+}
+
+pub fn counter_outbox_unchecked() {
+    metrics::counter!(OUTBOX_UNCHECKED_TOTAL).increment(1);
 }
 
 /// Blocks re-executed as seeded parallel batches (label: batch count).

@@ -661,6 +661,16 @@ async fn main() -> Result<()> {
             }
         };
 
+    // Remote-epoch verification (interop): inline pair-sequence checks on
+    // every RemoteEpochRecord, always on — they need no transport, exactly
+    // like the L1 origin sequence rules. Content-vs-origin verification (§10
+    // postures) is a later phase; see `interop::verify`'s module docs.
+    let remote_epoch_observer: Option<Box<dyn kardamom_engine::RemoteEpochObserver>> = Some(
+        Box::new(kardamom_validator::interop::RemoteEpochVerifier::new(
+            divergence.clone(),
+        )),
+    );
+
     let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
         Executor::run(
             cfg,
@@ -679,9 +689,7 @@ async fn main() -> Result<()> {
             block_exec,
             join_recovery,
             epoch_observer,
-            // Remote-epoch check: wired by the destination validator only
-            // (interop P1); None until the RemoteEpochVerifier lands.
-            None,
+            remote_epoch_observer,
         )
     });
 
