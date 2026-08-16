@@ -528,3 +528,97 @@ Risks: single bag CAS traffic (fine at ~200k dispatches/s vs multi-M
 capability; shard the bag if ever hot), chain affinity via local-next
 instead of sticky domains, fifo_covered/steal metrics + tests retire
 with the machinery.
+
+## Sharded admission (design; build when the feed binds again)
+
+### Why it is possible at all
+
+The feed is serial for exactly ONE reason: `last_toucher` (cell -> most
+recent toucher) must be read and written in canonical order. Everything
+else admission does is already concurrency-safe per node — the
+registration point (`open` under the child-list lock) and the indegree
+guard were built that way. So the serialization is a property of ONE
+data structure, not of the algorithm.
+
+Partition the CELL SPACE, not the tx stream: cell `c` belongs to shard
+`h(c) % K`, and each shard owns its own `TouchTable`. No shard ever
+writes another's table, so the shards need no locks between them.
+
+### Protocol
+
+Router (serial, ~0.15µs/tx — slot store + node init + enqueue):
+
+    S_j   = { h(c) % K : c in cells(j) }      // from prepare()'s hashes
+    node[j].indegree = |S_j|                  // one guard PER SHARD
+    node[j].open = true; children.clear()
+    for s in S_j: queue[s].push(j)            // in canonical index order
+
+Shard s (parallel, one thread each, processes its subsequence IN INDEX
+ORDER):
+
+    for each c in cells(j) with h(c)%K == s:
+        if let Some(p) = table[s].upsert(h(c), j):   register edge p->j
+    drop this shard's guard: if indegree.fetch_sub(1) == 1 { dispatch j }
+
+### Why it is correct
+
+1. **No conflict edge can be missed.** For any i < j sharing cell c,
+   the shard owning c sees both, in index order (each shard's queue is
+   canonical). When it processes j it finds `last_toucher[c] == i` and
+   registers — or finds i already finished, which needs no edge (its
+   writes are published). Cells map to exactly one shard, so exactly
+   one shard is responsible for each real dependency.
+2. **No premature dispatch.** j carries |S_j| guards; every shard drops
+   one only AFTER registering all of its edges for j, so j cannot
+   dispatch while any shard still owes it an edge. This is today's +1
+   guard, generalized.
+3. **No half-initialized node.** The router initializes node j before
+   publishing j to any shard, and a predecessor can only learn of j
+   through a shard's table.
+4. **Duplicate edges are harmless.** Two cells in different shards can
+   share the same last toucher p: p's child list then holds j twice and
+   decrements j's indegree twice, matching the two increments. Only
+   the within-shard dedup survives; cross-shard duplicates cost two
+   atomics, never correctness.
+5. **Validation is untouched.** The read-set replay still convicts any
+   dependency the PREDICTOR missed — sharding changes who registers a
+   predicted edge, not what is checked.
+
+### Cold (⊤) barriers need a global sync
+
+A cold tx conflicts with everything: it must take edges from all
+outstanding txs, become the barrier every later tx depends on, and
+clear every shard's table. The router therefore quiesces all shards at
+a cold tx (wait until each has drained past index i), performs the
+barrier registration serially, then resumes. Cold txs are rare by
+construction (untrained selectors; steady-state blocks measure zero),
+so a stall there is simpler and cheaper than any lock-free alternative.
+
+### What it is worth (fan-out math — read before building)
+
+A shard's work is CELL-events, not txs. With `m` cells per tx and K
+shards, each shard handles `n*m/K` cell-events, so the parallel speedup
+of the expensive part is `K/m` capped by the router:
+
+    pacing = max( router_per_tx , (m/K) * shard_cost_per_cell )
+
+For transfers (m = 2): K=4 halves the shard portion (~0.35 -> ~0.18
+µs/tx), and the router floor (~0.15-0.18) then dominates — total
+admission pacing ~0.18µs/tx vs 0.51 today, i.e. ~2.8x headroom, NOT
+Kx. Pushing further means shrinking the router (readers doing node init
+themselves, with a monotone `prepared_upto` watermark so shards can
+scan a per-shard index bitmap in order and skip the router entirely).
+
+### When to build it
+
+NOT NOW. The Amdahl budget is `per-tx busy / workers`; measured today
+at w=4: transfers 1.18µs (feed uses 43%), contract calls 3.6µs (14%).
+Admission stopped being the binding constraint when it fell to
+0.51µs/tx — the binder on micro-tx blocks is now the COMMIT TAIL
+(~2.7ms per 4k block, ~29% of block wall), which is what the P3b
+pipeline hides. Build sharded admission when either (a) worker counts
+go to 8-12 on micro-txs, where the budget falls to 0.6/0.4µs and the
+feed binds again, or (b) the pipeline has hidden the tail and the feed
+resurfaces as the span. Shard threads must live on the CALLER cores
+(the worker cores stay dedicated), which on this host is 2 physical
+cores — so K=2..3 in practice.
