@@ -32,6 +32,12 @@ pub const BAL_ENCODE_SECONDS: &str = "kardamom_executor_bal_encode_seconds";
 pub const BAL_PUBLISH_TOTAL: &str = "kardamom_executor_bal_publish_total";
 pub const BAL_RETAINED_BLOCKS: &str = "kardamom_executor_bal_retained_blocks";
 
+/// Health-beacon beats recorded (i.e. blocks closed with the health-check
+/// feature active). Flat at 0 while the feature is dormant; once activated it
+/// advances once per block, so a stalled counter against a rising
+/// `BLOCK_NUMBER` means the feature stopped firing.
+pub const HEALTH_BEACON_BEATS_TOTAL: &str = "kardamom_executor_health_beacon_beats_total";
+
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
 // The invalid-tx-skip counter is emitted from inside the `no_std` exec core
 // (`invalid_skip`), so the constant and its `record_` helper live there;
