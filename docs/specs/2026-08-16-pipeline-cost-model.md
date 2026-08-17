@@ -33,13 +33,60 @@ transfer throughput needs ~22 recovery cores; at contract weight, ~9.
 
 4000-tx blocks, mdbx, w=4, quiet host:
 
+BOTH engines are fed pre-decoded transactions (see the fairness fix
+below); ratios here are 2-9% lower than the first cut of this document,
+which charged RLP decode to the sequential side only.
+
 | Scenario | Sequential | Parallel | Speedup | Util | Seq tx/s | Parallel tx/s |
 |----------|-----------|----------|---------|------|----------|---------------|
-| transfers (chained senders) | 7.7 ms | 6.0 ms | 1.28x | 64% | 519 k | 667 k |
-| partransfer (independent) | 17.4 ms | 7.6 ms | 2.29x | 87% | 230 k | 526 k |
-| defi (mixed cross-contract) | 25.1 ms | 19.3 ms | 1.31x | 43% | 159 k | 207 k |
-| uniswap (8 pools) | 49.9 ms | 19.0 ms | 2.63x | 95% | 80 k | 211 k |
-| parcounter (contract calls) | 58.4 ms | 18.6 ms | 3.14x | 95% | 68 k | 215 k |
+| transfers (chained senders) | 7.3 ms | 5.9 ms | 1.23x | 67% | 547 k | 673 k |
+| partransfer (independent) | 17.1 ms | 7.7 ms | 2.24x | 88% | 233 k | 519 k |
+| defi (mixed cross-contract) | 24.9 ms | 18.9 ms | 1.32x | 43% | 161 k | 212 k |
+| uniswap (8 pools) | 49.7 ms | 19.0 ms | 2.61x | 95% | 80 k | 211 k |
+| parcounter (contract calls) | 55.4 ms | 18.1 ms | 3.07x | 96% | 72 k | 220 k |
+
+## Gas throughput and latency
+
+| Scenario | Gas/tx | 1 core | 4 workers | Ideal 4x | Gas per µs CPU |
+|----------|--------|--------|-----------|----------|----------------|
+| transfers | 21 k | 11.5 Ggas/s | 14.3 Ggas/s | 46.1 | 11 500 |
+| partransfer | 21 k | 4.9 | 10.9 | 19.6 | 4 900 |
+| defi | 44.5 k | 7.2 | 9.4 | 28.7 | 7 200 |
+| uniswap | 46.2 k | 3.7 | 9.7 | 14.9 | 3 700 |
+| parcounter | 49.7 k | 3.6 | 10.9 | 14.3 | 3 600 |
+
+The engine sits at 9-14 Ggas/s on every workload — an order of magnitude
+past the 1 Ggas/s target. Gas is a poor proxy for CPU: real work per gas
+varies 3.2x across these rows, so a gigagas figure is only meaningful
+against a stated mix.
+
+CEILING: the engine cannot go below its serial sections — commit tail
+(1.8-3.5 ms/block) + serial feed (~0.5 µs/tx ~ 2 ms per 4000-tx block).
+At unbounded cores that floor is 4-5 ms/block, i.e. **40-70 Ggas/s**.
+Past that needs sharded admission and a persistent-lane tail (both
+designed in the P3 spec).
+
+| Latency | Value | Condition |
+|---------|-------|-----------|
+| Receipt p50 | 11 ms | deployed, at the 6 k edge |
+| Receipt p95 | 12-16 ms | deployed, through 3,000 tx/s |
+| Receipt p99 | <=23 ms at 3 k; 47 ms at the edge | was 600-900 ms pre depth-4 commit |
+| Executor block wall | 5.9 - 18.9 ms | 4000-tx block, measured here |
+| Commit fsync | 10 - 27 ms/block | pipelined, residual wait 0.0 ms |
+
+Above ~3,500 tx/s the whole distribution rises with host CPU pressure
+1:1 — co-location, not the executor. The deployed cluster's ~0.08
+Ggas/s is about 1% of what the engine measures.
+
+## Measurement fairness (fixed 2026-08-16)
+
+The A/B harness fed the parallel engine pre-decoded envelopes (from
+`prepare`, outside the timed region) while the sequential engine decoded
+INSIDE its timed region. RLP decode is 178-192 ns/tx = 0.71-0.77 ms per
+4000-tx block, so every ratio was inflated 2-9% (most on the cheapest
+workload). `ExecScope::execute_tx_decoded` and
+`execute_block_sequential_decoded` now let both engines take pre-decoded
+input, which is also a production win for the sequential fallback.
 
 `defi` (43% util, 58,709 real edges) and `transfers` (same-sender chains)
 are bound by their own dependency graphs, not by the engine; the decline
