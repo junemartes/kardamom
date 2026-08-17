@@ -683,3 +683,29 @@ Consequences:
   (partransfer), 2.56-2.62x vs 2.92x (parcounter), with a parallel tail
   and with a serial one. The pipeline's cadence is dominated by the
   span-inflation effect, not by the tail it removes.
+
+### Compact witness encoding — DONE (2026-08-16, operator-approved)
+
+Consensus format v2 (`WriteSet::encode`, version byte 0x02): minimal-
+width balances/values with carried widths, varint nonces and counts, a
+2-bit code-hash tag (KECCAK_EMPTY and ZERO cost nothing), and the
+address emitted once per run of slots sharing it. Canonical and
+injective; one encoder now feeds both the stack-buffer and streaming
+sinks so they cannot drift.
+
+    WriteSet::hash   1110 -> 483 ns/tx   (384 with asm-keccak)
+    partransfer      seq 139 -> 120ms, stm 64 -> 58ms, tail -33%
+    parcounter       seq 394 -> 389ms, stm 134 -> 127ms, 2.95 -> 3.05x
+
+Note the RATIO barely moves while both engines get faster: sequential
+pays this hash inline and serially, the engine pays it across four
+lanes, so removing shared work helps the denominator more. The right
+read is absolute: ~14% more sequential transfer throughput, ~9% more
+parallel. Ratio-chasing would have argued against this change; product
+throughput argues for it.
+
+Tail after this change (per 4000-tx block): extract 0.85 + scope ~1.2 +
+delta 0.4 ~= 2.4ms (was 3.6). Next tail items, in order: extract
+(0.85ms of OnceLock takes + 1.8MB of moves — workers could place
+results in a contiguous arena the tail borrows), then validation
+(~0.3µs/tx of read replay).
