@@ -78,85 +78,192 @@ impl WriteSet {
     /// identical bytes.
     pub fn hash(&self) -> B256 {
         // The byte SEQUENCE is the consensus contract; how it reaches the
-        // sponge is not. Two earlier shapes were both wrong in different
-        // ways: building a per-tx `Vec` allocated (3.1KB/tx on CLOB
-        // workloads, the largest allocation site post-ExecScope), while
-        // streaming every field individually paid ~15 sponge calls per tx
-        // — measured at 1.4us/tx, and on the STM engine's SERIAL commit
-        // tail that was 72% of it, a fixed tax no worker count reduces.
-        //
-        // So: buffer into a fixed STACK array and absorb once. A write set
-        // too large for it (a CREATE carrying bytecode) falls back to
-        // streaming, where the per-call overhead is negligible next to the
-        // bytes involved.
+        // sponge is not. ONE encoder ([`WriteSet::encode`]) feeds two
+        // sinks — a stack buffer for the common case, the sponge itself
+        // for a write set too large for it (a CREATE carrying bytecode)
+        // — so the two paths cannot drift apart.
         debug_assert!(
             self.accounts.windows(2).all(|w| w[0].0 < w[1].0)
                 && self.storage.windows(2).all(|w| w[0].0 < w[1].0),
             "WriteSet::finish() not called before hash()"
         );
-        // 3 accounts + 8 slots + tags is a typical DeFi tx; 512B covers
-        // the overwhelming majority without touching the heap.
-        const INLINE: usize = 512;
-        let need = 3
-            + 4
-            + self.accounts.len() * (20 + 8 + 32 + 32)
-            + 3
-            + 4
-            + self.storage.len() * (20 + 32 + 32)
-            + 3
-            + 4;
         let mut h = alloy_primitives::Keccak256::new();
+        const INLINE: usize = 1024;
+        // Worst case per entry (every field at full width).
+        let need = 1
+            + 10
+            + self.accounts.len() * (20 + 1 + 10 + 32 + 32)
+            + 10
+            + self.storage.len() * (1 + 20 + 32 + 32)
+            + 10;
         if self.code.is_empty() && need <= INLINE {
-            let mut buf = [0u8; INLINE];
-            let mut n = 0usize;
-            let mut put = |src: &[u8], n: &mut usize| {
-                buf[*n..*n + src.len()].copy_from_slice(src);
-                *n += src.len();
+            let mut sink = BufSink {
+                buf: [0u8; INLINE],
+                n: 0,
             };
-            put(b"ACC", &mut n);
-            put(&(self.accounts.len() as u32).to_be_bytes(), &mut n);
-            for (addr, (nonce, balance, code_hash)) in &self.accounts {
-                put(addr.as_slice(), &mut n);
-                put(&nonce.to_le_bytes(), &mut n);
-                put(&balance.to_be_bytes::<32>(), &mut n);
-                put(code_hash.as_slice(), &mut n);
-            }
-            put(b"STO", &mut n);
-            put(&(self.storage.len() as u32).to_be_bytes(), &mut n);
-            for ((addr, key), value) in &self.storage {
-                put(addr.as_slice(), &mut n);
-                put(key.as_slice(), &mut n);
-                put(&value.to_be_bytes::<32>(), &mut n);
-            }
-            put(b"COD", &mut n);
-            put(&0u32.to_be_bytes(), &mut n);
-            h.update(&buf[..n]);
-            return h.finalize();
-        }
-        h.update(b"ACC");
-        h.update((self.accounts.len() as u32).to_be_bytes());
-        for (addr, (nonce, balance, code_hash)) in &self.accounts {
-            h.update(addr.as_slice());
-            h.update(nonce.to_le_bytes());
-            h.update(balance.to_be_bytes::<32>());
-            h.update(code_hash.as_slice());
-        }
-        h.update(b"STO");
-        h.update((self.storage.len() as u32).to_be_bytes());
-        for ((addr, key), value) in &self.storage {
-            h.update(addr.as_slice());
-            h.update(key.as_slice());
-            h.update(value.to_be_bytes::<32>());
-        }
-        h.update(b"COD");
-        h.update((self.code.len() as u32).to_be_bytes());
-        for (code_hash, bytes) in &self.code {
-            h.update(code_hash.as_slice());
-            h.update((bytes.len() as u64).to_le_bytes());
-            h.update(bytes.as_ref());
+            self.encode(&mut sink);
+            h.update(&sink.buf[..sink.n]);
+        } else {
+            self.encode(&mut h);
         }
         h.finalize()
     }
+
+    /// THE CONSENSUS ENCODING (v2, compact). Canonical and injective:
+    /// every integer is minimal-width with its width carried, and the
+    /// entry order is the sorted order `finish()` establishes, so one
+    /// write set has exactly one encoding and one encoding describes
+    /// exactly one write set.
+    ///
+    /// ```text
+    /// u8   version (0x02)
+    /// var  n_accounts
+    ///   per account, sorted by address:
+    ///     [20] address
+    ///     u8   flags: bits0-5 = balance byte length (0..=32)
+    ///                 bits6-7 = 0 KECCAK_EMPTY, 1 ZERO, 2 explicit
+    ///     var  nonce
+    ///     [..] balance, big-endian, leading zeros stripped
+    ///     [32] code_hash            (only when flags bits6-7 == 2)
+    /// var  n_storage
+    ///   per slot, sorted by (address, key):
+    ///     u8   flags: bits0-5 = value byte length (0..=32)
+    ///                 bit6    = address equals the previous entry's
+    ///     [20] address              (only when bit6 == 0)
+    ///     [32] key
+    ///     [..] value, big-endian, leading zeros stripped
+    /// var  n_code
+    ///   per entry, sorted by hash: [32] hash, var len, [len] bytes
+    /// ```
+    ///
+    /// WHY the compaction: this hash is the per-tx determinism witness
+    /// and BOTH engines pay it — measured at 1.1µs/tx, ~22% of a
+    /// sequential transfer block and ~70% of the STM commit tail's
+    /// work. The cost is Keccak-f permutations (~290ns each), so the
+    /// only real lever is BYTES: the previous fixed-width encoding put
+    /// a 3-account transfer at 297 bytes (3 permutations); minimal-width
+    /// balances, varint nonces and a code-hash tag put it near 100 (ONE
+    /// permutation). Nothing about the witness's meaning changes — same
+    /// inputs, same coverage, fewer bytes.
+    fn encode<S: WsSink>(&self, s: &mut S) {
+        s.put(&[WS_ENCODING_V2]);
+        put_varint(s, self.accounts.len() as u64);
+        for (addr, (nonce, balance, code_hash)) in &self.accounts {
+            let (bal, blen) = minimal_be(balance);
+            let code_tag: u8 = if *code_hash == KECCAK_EMPTY_HASH {
+                0
+            } else if code_hash.is_zero() {
+                1
+            } else {
+                2
+            };
+            s.put(addr.as_slice());
+            s.put(&[blen as u8 | (code_tag << 6)]);
+            put_varint(s, *nonce);
+            s.put(&bal[32 - blen..]);
+            if code_tag == 2 {
+                s.put(code_hash.as_slice());
+            }
+        }
+        put_varint(s, self.storage.len() as u64);
+        let mut prev: Option<&Address> = None;
+        for ((addr, key), value) in &self.storage {
+            let (val, vlen) = minimal_be(value);
+            let same = prev == Some(addr);
+            s.put(&[vlen as u8 | (u8::from(same) << 6)]);
+            if !same {
+                s.put(addr.as_slice());
+            }
+            s.put(key.as_slice());
+            s.put(&val[32 - vlen..]);
+            prev = Some(addr);
+        }
+        put_varint(s, self.code.len() as u64);
+        for (code_hash, bytes) in &self.code {
+            s.put(code_hash.as_slice());
+            put_varint(s, bytes.len() as u64);
+            s.put(bytes.as_ref());
+        }
+    }
+}
+
+impl WriteSet {
+    /// Encoded length — test-only, so the "a transfer fits in one keccak
+    /// block" property can be asserted structurally.
+    pub fn encoded_len_for_test(&self) -> usize {
+        struct Counter(usize);
+        impl WsSink for Counter {
+            fn put(&mut self, b: &[u8]) {
+                self.0 += b.len();
+            }
+        }
+        let mut c = Counter(0);
+        self.encode(&mut c);
+        c.0
+    }
+}
+
+/// Version byte of the write-set encoding (see [`WriteSet::encode`]).
+const WS_ENCODING_V2: u8 = 0x02;
+
+/// `keccak256([])` — revm's code hash for every account without code, so
+/// it is worth one tag value instead of 32 bytes on every EOA.
+const KECCAK_EMPTY_HASH: B256 = B256::new([
+    0xc5, 0xd2, 0x46, 0x01, 0x86, 0xf7, 0x23, 0x3c, 0x92, 0x7e, 0x7d, 0xb2, 0xdc, 0xc7, 0x03, 0xc0,
+    0xe5, 0x00, 0xb6, 0x53, 0xca, 0x82, 0x27, 0x3b, 0x7b, 0xfa, 0xd8, 0x04, 0x5d, 0x85, 0xa4, 0x70,
+]);
+
+/// Where the canonical encoding goes: a stack buffer, or the sponge.
+trait WsSink {
+    fn put(&mut self, bytes: &[u8]);
+}
+
+struct BufSink<const N: usize> {
+    buf: [u8; N],
+    n: usize,
+}
+
+impl<const N: usize> WsSink for BufSink<N> {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.buf[self.n..self.n + bytes.len()].copy_from_slice(bytes);
+        self.n += bytes.len();
+    }
+}
+
+impl WsSink for alloy_primitives::Keccak256 {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.update(bytes);
+    }
+}
+
+/// LEB128, canonical (minimal length).
+#[inline]
+fn put_varint<S: WsSink>(s: &mut S, mut v: u64) {
+    let mut buf = [0u8; 10];
+    let mut n = 0;
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf[n] = byte;
+            n += 1;
+            break;
+        }
+        buf[n] = byte | 0x80;
+        n += 1;
+    }
+    s.put(&buf[..n]);
+}
+
+/// Big-endian bytes with leading zeros stripped, plus the length. Zero
+/// encodes as length 0.
+#[inline]
+fn minimal_be(v: &U256) -> ([u8; 32], usize) {
+    let bytes = v.to_be_bytes::<32>();
+    let lead = bytes.iter().take_while(|b| **b == 0).count();
+    (bytes, 32 - lead)
 }
 
 /// Mutable per-block accumulator the exec thread carries between txs. Holds
