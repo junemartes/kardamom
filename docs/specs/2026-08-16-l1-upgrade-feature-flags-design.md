@@ -2,7 +2,9 @@
 
 **Date:** 2026-08-16 (revised 2026-08-17: authority + permanence resolved;
 health-check replaces the throwaway `hello` mock)
-**Status:** Approved (design) → implementation
+**Status:** Implemented — 4 PRs on `feat/l1-upgrade-feature-flags`; S13a/b/c
+pass against a live local stack (real anvil L1, Aeron, Java Raft sealer,
+executor + validator).
 **Scope (milestone 1):** An L1-initiated upgrade path: a privileged L1 transaction
 to the messaging box (`ETHLockbox`) schedules a feature flag in a new L2
 `KardamomChainState` predeploy, with an optional activation timestamp; the
@@ -50,9 +52,11 @@ diverging (see §8) — the same fail-safe posture the validator already takes.
 - The first real feature — **health check (id 1)**: once active, the engine
   records a **health beacon** (count, block number, block timestamp, packed into
   one storage word) in the chain-state predeploy **every block** and logs a
-  heartbeat line. The beacon is consensus state (delta → BAL → state root), so
-  the validator independently proves activation parity; it is also a genuinely
-  useful liveness signal, kept permanently rather than removed after the test.
+  heartbeat line. The beacon is consensus state — it rides in the block's
+  `BlockDelta`, which the validator compares against the executor's published
+  one and which feeds the state root — so the validator independently proves
+  activation parity. It is also a genuinely useful liveness signal, kept
+  permanently rather than removed after the test.
 - E2E scenarios exercising the full flow (immediate + scheduled + negative
   controls) in the chain-semantics suite.
 
@@ -79,7 +83,7 @@ diverging (see §8) — the same fail-safe posture the validator already takes.
 | 5 | L2 write authority | Fixed system sender `SYSTEM_UPGRADER`, checked by the contract | Only derivation can mint a deposit from this address (see §7 security argument); users can't call `setFeature`. |
 | 6 | Where the engine reads flags | **`on_boundary`** (block close), through the `snapshot ∘ parent ∘ delta` layering | `on_boundary` is engine-shared code — executor, validator (streaming *and* parallel, which funnels through it), so one hook covers all roles. Layered read is mandatory: the snapshot alone misses the current block's own `setFeature` write and up to K=4 unsettled parent blocks. |
 | 7 | Activation predicate | `active(f, N) ⇔ activation(f) ≠ 0 ∧ activation(f) ≤ header_timestamp(N)` | `header_timestamp(N)` = boundary N's `l2_timestamp`, canonical stream data, identical on every replica. Immediate (`0` on L1) stores `block.timestamp` at execution (= boundary N−1's stamp, see §6), which is strictly less than boundary N's — so the upgrade's own block already beats. |
-| 8 | First feature | **Health check**: heartbeat log **+ a packed health-beacon word per block** | The log satisfies "a message every block"; the storage write makes activation **consensus-observable** (delta → BAL → `write_set_eq` → state root), so the validator cross-check proves both roles activated at the same block — and unlike a throwaway `hello` counter it is worth keeping (§5.4.1). |
+| 8 | First feature | **Health check**: heartbeat log **+ a packed health-beacon word per block** | The log satisfies "a message every block"; the storage write makes activation **consensus-observable** — it lands in the `BlockDelta`, which the validator compares via `write_set_eq` and which feeds the state root — so the cross-check proves both roles activated at the same block. Unlike a throwaway `hello` counter it is worth keeping (§5.4.1). It is deliberately NOT written into the EIP-7928 BAL; see §5.4. |
 | 9 | Beacon shape | **One packed word** (count ‖ block ‖ timestamp), not three slots | One write-set entry per block instead of three; the triple is atomic by construction; an external monitor reads the whole health record in a single `eth_getStorageAt`. |
 | 10 | Timestamp unit | **Milliseconds** | `l2_timestamp` is epoch-ms everywhere (sealer stamps `leaderClockMillis` floored to the 250 ms tick; the EVM `TIMESTAMP` opcode yields ms on this chain). `activationTimestamp` on L1 is therefore also **ms**. This is a footgun; it is pinned in the ABI docs, the contract natspec, and the e2e test. |
 | 11 | Receipt shape | Reuse `TX_TYPE_DEPOSIT` (`0x7E`) | Same as OP: system txs are a deposit subspecies. Receipt `tx_hash` = domain-1 `source_hash`; consumers distinguish system txs by sender/`is_system_transaction`, not by a new type byte. |
@@ -375,6 +379,12 @@ consumer. The health beacon earns its place three times over:
    neither `eth_getLogs` nor `eth_getBlockByNumber`). Monitors and dashboards
    get a first-class chain-progress probe, and because the beacon carries the
    L2 timestamp, a stale beacon is distinguishable from a stalled reader.
+
+   **The beacon tracks block production, not wall-clock.** The sealer only
+   forces a boundary when new records were sealed, so an idle chain produces no
+   blocks and therefore no beats. A monitor must read "beacon unchanged" as
+   "the chain has not advanced", which on a quiet chain is correct and healthy —
+   `(block, timestamp)` in the same word is what lets it tell idle from stuck.
 2. **Standing canary for the upgrade path.** Kept shipped-dormant, it can be
    activated on a testnet after any release to exercise the entire
    multisig → L1 → derivation → activation chain without touching protocol
@@ -536,7 +546,7 @@ Operational notes:
   immediate-vs-scheduled storage, `isActive`.
 - Deployer pins: ChainState genesis bytecode sync; selector/constant sync.
 
-### 10.2 E2E (chain-semantics suite, Target L) — **S12: upgrade feature flags**
+### 10.2 E2E (chain-semantics suite, Target L) — **S13: upgrade feature flags**
 
 New driver `crates/e2e/src/scenarios/upgrade.rs`, bindings in
 `tests/chain_semantics/upgrades.rs` (same `include!` pattern). Stack:
@@ -544,7 +554,7 @@ New driver `crates/e2e/src/scenarios/upgrade.rs`, bindings in
 The upgrade tx is sent exactly like `applyDeployments` in the harness today:
 from the impersonated `DEV_OWNER`.
 
-- **S12a `s12a_health_check_activates_immediately`** — the requested full-flow
+- **S13a `s13a_health_check_activates_immediately`** — the requested full-flow
   exercise:
   1. Pre: one mdbx snapshot of executor state → `activation(1) == 0`,
      beacon word `== 0`; no heartbeat lines in logs.
@@ -564,7 +574,7 @@ from the impersonated `DEV_OWNER`.
      `VALIDATOR_DIVERGENCE == 0` and `VALIDATOR_BAL_MISSING` flat.
   5. The literal per-block message: `wait_for_log_line` on the heartbeat, on
      both executor and validator logs.
-- **S12b `s12b_health_check_activates_at_timestamp`**:
+- **S13b `s13b_health_check_activates_at_timestamp`**:
   1. Send `initiateUpgrade(1, T)` with `T = now_ms + 4000`; await the
      `setFeature` receipt (block S).
   2. While heads have header-ts < T: snapshot reads assert `activation == T`
@@ -572,8 +582,8 @@ from the impersonated `DEV_OWNER`.
   3. After T: from `read_all_headers`, compute **F** = first block with
      `l2_timestamp ≥ T`; assert `F > S`, that header F−1 is < T, and
      snapshot-exact `beacon.count == snapshot_block − F + 1`.
-  4. Validator parity as in S12a.
-- **S12c `s12c_upgrade_authority_is_enforced`** (negative controls):
+  4. Validator parity as in S13a.
+- **S13c `s13c_upgrade_authority_is_enforced`** (negative controls):
   1. L1: `initiateUpgrade` from `DEPOSITOR_KEY` reverts; no epoch content
      changes (executor head advances, `activation(2) == 0`).
   2. L2: a normal user tx calling `setFeature(2, 0)` directly lands with
@@ -588,7 +598,8 @@ new tests up automatically — mind the ~30 min budget: three more L1-backed
 stacks ≈ +3–4 min).
 
 Scenario catalog (`docs/agents/chain-semantics-e2e-suite-spec.md`) gains the
-S12 row at implementation time.
+S13 row at implementation time. (Numbered S13, not S12: #171 landed the
+verified-L1 light-client scenarios as S12a–d while this design was in review.)
 
 ## 11. Implementation plan (4 PRs, stacked)
 
@@ -596,11 +607,25 @@ S12 row at implementation time.
 |---|---|---|
 | 1. `feat(contracts): upgrade tx + chain-state predeploy` | `ETHLockbox.initiateUpgrade` + event; `KardamomChainState.sol`; foundry tests; genesis alloc in `chains/dev-withdrawals.toml`; deployer pin tests | S |
 | 2. `feat(derivation): system upgrade deposits` | `types::upgrades`; `source_hash_system`; `LockboxLog`; `derive_epoch`; watcher filter/decode; `L1Source` rename; verifier/mock updates; unit tests | M |
-| 3. `feat(engine): feature gate + health-check hook` | `exec-core::features`; layered read helper; `on_boundary` hook (+BAL); `drive_blocks` mirror; engine/validator unit tests | M |
-| 4. `test(e2e): S12 upgrade scenarios` | harness bindings + helpers; `scenarios/upgrade.rs`; S12a/b/c bindings; catalog doc row | M |
+| 3. `feat(engine): feature gate + health-check hook` | `exec-core::features`; layered read; `on_boundary` hook; `drive_blocks` mirror; engine/exec-core unit tests | M |
+| 4. `test(e2e): S13 upgrade scenarios` | harness bindings + helpers; `scenarios/upgrade.rs`; S13a/b/c bindings; failure-modes section | M |
 
 Each lands green independently (1–3 ship dormant behavior; nothing activates
 until an upgrade tx exists, which only the e2e PR exercises).
+
+**Two design points changed during implementation**, both recorded above:
+
+- The block-close action does **not** write the EIP-7928 BAL (decision 8's
+  original sketch said it did). The BAL attributes accesses to transaction
+  indices and the validator verifies claims per tx-index range, so attributing
+  a block-close write to a transaction would misdescribe the block *and*
+  diverge against a validator recomputing claims from transactions. It still
+  rides in the `BlockDelta`, which is what `write_set_eq` compares — so the
+  cross-role proof is unaffected.
+- `apply_block_close_actions` lives in `exec-core`, not in the engine, because
+  the workspace has four block drivers and the zk guest is a fifth consumer of
+  the shared sequential driver. One implementation, parameterised by how the
+  caller reads state.
 
 ## 12. Resolved / remaining questions
 

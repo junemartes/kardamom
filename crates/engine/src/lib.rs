@@ -25,7 +25,7 @@ pub mod state;
 // zk-guest-linkable). Module re-exports keep every pre-split path working:
 // `kardamom_engine::executor::…`, `crate::delta::…` etc. all still resolve.
 pub use kardamom_exec_core::{
-    anchor, bal_ladder, block_env, delta, error, exec_types, executor, stateless, witness,
+    anchor, bal_ladder, block_env, delta, error, exec_types, executor, features, stateless, witness,
 };
 
 pub use actor::{
