@@ -709,3 +709,28 @@ delta 0.4 ~= 2.4ms (was 3.6). Next tail items, in order: extract
 (0.85ms of OnceLock takes + 1.8MB of moves — workers could place
 results in a contiguous arena the tail borrows), then validation
 (~0.3µs/tx of read replay).
+
+### Tail after the witness change — two measured negatives
+
+Per 4000-tx block the tail is now ~1.9ms (was 3.6): extract 0.04
+(gone — results are read in place), scope ~1.4, delta ~0.35. Inside
+the scope the lanes' own work is only ~0.85ms; the rest is SPAWN/JOIN
+(~0.5ms). Two attempts to reclaim it, both REVERTED on measurement:
+
+- 128KB lane stacks (theory: 2MB stacks mean mmap + first-touch faults
+  per spawn): no change (scope 9.6 -> 10.0ms per 7 blocks).
+- Giving the TAIL THREAD its own chunk (theory: it idles on a caller
+  core waiting for joins): WORSE — partransfer 2.30 -> 2.09x, scope 9.5
+  -> 13.4ms. The caller cores (0,1,6,7 = two physical cores, shared
+  with the harness main thread and the writer) are not equivalent to a
+  dedicated worker core, so the tail's chunk straggles and becomes the
+  pole. Lane chunks must go only to dedicated cores.
+
+What remains is a PERSISTENT lane pool: the spawn/join cost is
+scheduling four fresh threads onto cores that keep-hot workers are
+spinning on. The fix is to make the workers themselves serve tail
+chunks (they are already pinned, hot, and idle at tail time), posted
+through a pool-level job slot with lifetime erasure — the tail blocks
+until all chunks finish, which is the same guarantee `thread::scope`
+gives, so the unsafe is contained and testable. Worth ~0.5ms/block
+(~7% on micro-tx blocks, ~3% at contract weight).
