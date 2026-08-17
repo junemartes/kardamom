@@ -1517,9 +1517,6 @@ struct RecyclePools {
     /// per-tx `Vec::with_capacity` + growth reallocs were the largest
     /// STM-specific allocation (~4KB/tx at contract weight).
     read_bufs: Mutex<Vec<Vec<ReadRecord>>>,
-    /// Cleared result-carcass vecs (4096 x ~450B TxResult — one of the
-    /// ~16 huge per-block allocations the size histogram exposed).
-    carcasses: Mutex<Vec<Vec<TxResult>>>,
     /// Cleared PendingDelta shells for the fold (the maps' tables are
     /// the other huge per-block allocation); returned by the consumer
     /// via [`PoolHandle::recycle_delta`] once a release settles.
@@ -1533,12 +1530,6 @@ struct SpentArena {
 }
 
 enum Reap {
-    /// A finished block's result carcass: read-record buffers recycle,
-    /// the rest drops.
-    Results {
-        results: Vec<TxResult>,
-        pools: std::sync::Arc<RecyclePools>,
-    },
     /// A finished block's recyclable structures.
     Arena {
         slots: Vec<std::sync::OnceLock<TxSlot>>,
@@ -1551,6 +1542,29 @@ enum Reap {
 
 /// One sealed block handed to the persistent TAIL thread (spec P3a):
 /// drain, release the pool slot, then `block_tail`.
+/// Shared, read-only view of a drained block's results, read IN PLACE
+/// out of the block arena (see the presence prepass in `block_tail`).
+/// Every slot is known to hold `Some(Ok(_))` before this is built.
+#[derive(Clone, Copy)]
+struct Results<'a>(&'a [std::sync::OnceLock<Result<TxResult, ExecutorError>>]);
+
+impl<'a> Results<'a> {
+    #[inline]
+    fn get(&self, i: usize) -> &'a TxResult {
+        match self.0[i].get() {
+            Some(Ok(r)) => r,
+            _ => unreachable!("presence prepass proved every result present"),
+        }
+    }
+    #[inline]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn iter(&self) -> impl Iterator<Item = &'a TxResult> + '_ {
+        (0..self.0.len()).map(|i| self.get(i))
+    }
+}
+
 /// The late-bound part of a block's read base (see `BlockCtx::binding`).
 struct BoundLayers {
     /// Predecessor mv caches, newest first (spec P3b mv-as-layer).
@@ -1781,7 +1795,6 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         mv_clean: Mutex::new(Vec::new()),
         mv_parked: Mutex::new(Vec::new()),
         read_bufs: Mutex::new(Vec::new()),
-        carcasses: Mutex::new(Vec::new()),
         deltas: Mutex::new(Vec::new()),
     });
     std::thread::scope(|scope| {
@@ -1792,26 +1805,6 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         scope.spawn(move || {
             while let Ok(r) = reap_rx.recv() {
                 match r {
-                    Reap::Results { mut results, pools } => {
-                        let mut bufs: Vec<Vec<ReadRecord>> = Vec::with_capacity(results.len());
-                        for r in results.iter_mut() {
-                            let mut b = std::mem::take(&mut r.reads);
-                            b.clear();
-                            bufs.push(b);
-                        }
-                        {
-                            let mut g = pools.read_bufs.lock().expect("pools poisoned");
-                            let room = MAX_BLOCK_TXS.saturating_sub(g.len());
-                            g.extend(bufs.into_iter().take(room));
-                        }
-                        // The carcass vec itself recycles: drop the spent
-                        // TxResults in place, keep the 4096-slot buffer.
-                        results.clear();
-                        let mut g = pools.carcasses.lock().expect("pools poisoned");
-                        if g.len() < 4 {
-                            g.push(results);
-                        }
-                    }
                     Reap::Arena {
                         mut slots,
                         mut results,
@@ -1822,8 +1815,21 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         for c in slots.iter_mut() {
                             let _ = c.take();
                         }
+                        // Harvest read-record buffers on the way out (the
+                        // tail no longer builds a carcass Vec, so this is
+                        // where spent results are dropped).
+                        let mut bufs: Vec<Vec<ReadRecord>> = Vec::new();
                         for c in results.iter_mut() {
-                            let _ = c.take();
+                            if let Some(Ok(mut r)) = c.take() {
+                                let mut b = std::mem::take(&mut r.reads);
+                                b.clear();
+                                bufs.push(b);
+                            }
+                        }
+                        if !bufs.is_empty() {
+                            let mut g = pools.read_bufs.lock().expect("pools poisoned");
+                            let room = MAX_BLOCK_TXS.saturating_sub(g.len());
+                            g.extend(bufs.into_iter().take(room));
                         }
                         if let Ok(nodes) = Arc::try_unwrap(nodes) {
                             for nd in nodes.iter() {
@@ -2923,19 +2929,23 @@ fn block_tail<S: StateDatabase + Sync>(
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
     let n = n_txs;
-    let mut tx_results = recycle
-        .carcasses
-        .lock()
-        .expect("pools poisoned")
-        .pop()
-        .unwrap_or_else(|| Vec::with_capacity(n));
-    // take() IN PLACE: the spent OnceLock array keeps its buffer and
-    // recycles through the reaper (steady-state zero-allocation blocks).
-    for cell in ctx.results.iter_mut().take(n) {
-        match cell.take() {
-            Some(Ok(r)) => tx_results.push(r),
-            Some(Err(e)) => return Err(e),
+    // PRESENCE PREPASS, not an extraction. Building a `Vec<TxResult>`
+    // moved ~450 bytes x n (1.8MB per 4k block, 0.88ms measured) for
+    // nothing: the tail only ever INDEXES results, and the arena that
+    // holds them already recycles through the reaper. So check that
+    // every slot holds a success and then read them in place.
+    for (i, cell) in ctx.results.iter_mut().take(n).enumerate() {
+        match cell.get_mut() {
+            Some(Ok(_)) => {}
+            Some(Err(_)) => {
+                // Take it out to return by value (the arena is ours).
+                match cell.take() {
+                    Some(Err(e)) => return Err(e),
+                    _ => unreachable!("just observed an error here"),
+                }
+            }
             None => {
+                let _ = i;
                 return Err(ExecutorError::State(if aborted {
                     "stm pool: block aborted".into()
                 } else {
@@ -2957,8 +2967,10 @@ fn block_tail<S: StateDatabase + Sync>(
     {
         let b0 = ctx.binding.get().expect("layers bound before execution");
         let mut fee_sum = U256::ZERO;
-        for r in tx_results.iter() {
-            fee_sum += r.fee_delta;
+        for cell in ctx.results.iter().take(n) {
+            if let Some(Ok(r)) = cell.get() {
+                fee_sum += r.fee_delta;
+            }
         }
         let sink_final = match &b0.sink_start {
             Some(a) => {
@@ -3018,7 +3030,11 @@ fn block_tail<S: StateDatabase + Sync>(
     // materialization. Safe before the verdict: the repair path's
     // kept-prefix arm performs these exact mutations itself
     // (idempotent), and re-executed txs are rebuilt from scratch.
-    for r in tx_results.iter_mut() {
+    for cell in ctx.results.iter_mut().take(n) {
+        let r = match cell.get_mut() {
+            Some(Ok(r)) => r,
+            _ => unreachable!("presence prepass proved every result present"),
+        };
         cumulative += r.receipt.gas_used;
         r.receipt.cumulative_gas_used = cumulative;
         sink_running += r.fee_delta;
@@ -3028,6 +3044,8 @@ fn block_tail<S: StateDatabase + Sync>(
             entry.1.1 = sink_running;
         }
     }
+    // The shared view is taken AFTER the serial prefix's mutations.
+    let tx_results = Results(&ctx.results[..n]);
     // Fold + hash + VALIDATION, one overlap scope (fusing hash and
     // fold measured worse twice; OVERLAP won — validation now joins
     // the same scope): the fold builds the delta; each hash lane
@@ -3052,7 +3070,7 @@ fn block_tail<S: StateDatabase + Sync>(
     let chunk = n_res.div_ceil(hash_threads);
     let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
     let val_ns = std::sync::atomic::AtomicU64::new(0);
-    let fold_inline = |results: &[TxResult]| -> PendingDelta {
+    let fold_inline = |results: Results<'_>| -> PendingDelta {
         let mut sink_final: Option<(u64, U256, B256)> = None;
         let mut d = recycle
             .deltas
@@ -3100,15 +3118,18 @@ fn block_tail<S: StateDatabase + Sync>(
         && std::env::var_os("KARDAMOM_STM_SERIAL_TAIL").is_some();
     let (delta_arc, wounded): (std::sync::Arc<PendingDelta>, Vec<usize>) = if serial_tail {
         let t0 = std::time::Instant::now();
-        let wounded: Vec<usize> = tx_results
-            .iter()
-            .enumerate()
-            .filter(|(i, r)| r.reads.iter().any(|rec| !ctx.mv.validate(*i as u32, rec)))
-            .map(|(i, _)| i)
+        let wounded: Vec<usize> = (0..tx_results.len())
+            .filter(|i| {
+                tx_results
+                    .get(*i)
+                    .reads
+                    .iter()
+                    .any(|rec| !ctx.mv.validate(*i as u32, rec))
+            })
             .collect();
         val_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         if wounded.is_empty() {
-            let delta_arc = std::sync::Arc::new(fold_inline(&tx_results));
+            let delta_arc = std::sync::Arc::new(fold_inline(tx_results));
             if let Some(DeltaOut {
                 tx,
                 speculative: true,
@@ -3140,7 +3161,7 @@ fn block_tail<S: StateDatabase + Sync>(
             // entries are COPIED (Bytes is refcounted), not drained:
             // the released delta must carry CREATEd code for the next
             // block's readers.
-            let results_ref: &[TxResult] = &tx_results;
+            let results_ref = tx_results;
             let warm_delta = recycle
                 .deltas
                 .lock()
@@ -3192,7 +3213,7 @@ fn block_tail<S: StateDatabase + Sync>(
             };
             let mut lanes = Vec::with_capacity(hash_parts.len());
             for (ti, (base, out_slice)) in hash_parts.into_iter().enumerate() {
-                let results_ref: &[TxResult] = &tx_results;
+                let results_ref = tx_results;
                 let mv = &ctx.mv;
                 let val_ns = &val_ns;
                 let lane_metrics = &ctx.metrics;
@@ -3205,7 +3226,7 @@ fn block_tail<S: StateDatabase + Sync>(
                     let t_lane0 = std::time::Instant::now();
                     let len = out_slice.len();
                     for (j, slot) in out_slice.iter_mut().enumerate() {
-                        let r = &results_ref[base + j];
+                        let r = results_ref.get(base + j);
                         if r.sink_touched {
                             *slot = r.ws.hash();
                         }
@@ -3214,7 +3235,8 @@ fn block_tail<S: StateDatabase + Sync>(
                     let mut wounded_local = Vec::new();
                     for j in 0..len {
                         let i = base + j;
-                        if results_ref[i]
+                        if results_ref
+                            .get(i)
                             .reads
                             .iter()
                             .any(|rec| !mv.validate(i as u32, rec))
@@ -3288,18 +3310,21 @@ fn block_tail<S: StateDatabase + Sync>(
         // out, then ship the WHOLE results vec (write sets + read logs)
         // to the reaper as one move — a per-element carcass copy here
         // measured 10-13ms of pure memmove and ate the overlap's win.
-        for (i, r) in tx_results.iter_mut().enumerate() {
+        // The shared view is Copy and simply goes out of use here; the
+        // arena becomes mutable again for the receipt epilogue.
+        for (i, cell) in ctx.results.iter_mut().take(n).enumerate() {
+            let r = match cell.get_mut() {
+                Some(Ok(r)) => r,
+                _ => unreachable!("presence prepass proved every result present"),
+            };
             if r.sink_touched {
                 r.receipt.write_set_hash = hashes[i];
             }
             receipts.push(std::mem::take(&mut r.receipt));
         }
-        reaper
-            .send(Reap::Results {
-                results: tx_results,
-                pools: recycle.clone(),
-            })
-            .ok();
+        // The spent results (write sets + read logs) ride the arena to
+        // the reaper, which harvests their read buffers and recycles the
+        // whole array — no carcass Vec, no per-block moves.
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
         // A speculative release (if any) was WRONG: drop our Arc and
@@ -3341,7 +3366,16 @@ fn block_tail<S: StateDatabase + Sync>(
                 layered.merge_from(&mv.final_delta());
             }
         }
-        for (i, mut r) in tx_results.into_iter().enumerate() {
+        let spent: Vec<TxResult> = ctx
+            .results
+            .iter_mut()
+            .take(n)
+            .map(|c| match c.take() {
+                Some(Ok(r)) => r,
+                _ => unreachable!("presence prepass proved every result present"),
+            })
+            .collect();
+        for (i, mut r) in spent.into_iter().enumerate() {
             if wounded_set.contains(&i) {
                 // The slot holds the envelope for the whole block — no
                 // second copy in a parallel vec (that clone was 0.1µs of
