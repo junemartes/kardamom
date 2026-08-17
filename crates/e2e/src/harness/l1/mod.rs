@@ -329,21 +329,43 @@ impl L1 {
         Ok(block.header.number)
     }
 
-    /// Every `DepositInitiated` log the lockbox emitted in `[from, to]`,
+    /// Every lockbox log — deposits **and** upgrades — emitted in `[from, to]`,
     /// decoded through the SAME rule the producer uses.
     ///
     /// Tests compare the chain against this, so re-implementing the decode
     /// here would let a producer bug and a test bug cancel out.
+    pub async fn lockbox_logs(
+        &self,
+        from_block: u64,
+        to_block: u64,
+    ) -> Result<Vec<kardamom_types::epoch::LockboxLog>> {
+        // Via `provider_for` rather than `provider()`: the method returns an
+        // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
+        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
+        kardamom_da_watcher::L1Source::lockbox_logs(&source, self.lockbox, from_block, to_block)
+            .await
+            .context("read lockbox logs")
+    }
+
+    /// Just the `DepositInitiated` logs from [`Self::lockbox_logs`].
+    ///
+    /// Deliberately filtered rather than fetched separately: callers key on the
+    /// USER-domain `source_hash`, which an upgrade log does not have (system
+    /// deposits derive under domain 1), so handing them the union would compute
+    /// ids that match nothing.
     pub async fn deposit_logs(
         &self,
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<kardamom_types::DepositLog>> {
-        // Via `provider_for` rather than `provider()`: the method returns an
-        // `impl Provider` capturing `&self`, and `L1Source` needs `'static`.
-        let source = kardamom_da_watcher::RpcL1Source::new(provider_for(self.anvil.endpoint()));
-        kardamom_da_watcher::L1Source::deposit_logs(&source, self.lockbox, from_block, to_block)
-            .await
-            .context("read deposit logs")
+        Ok(self
+            .lockbox_logs(from_block, to_block)
+            .await?
+            .into_iter()
+            .filter_map(|l| match l {
+                kardamom_types::epoch::LockboxLog::Deposit(d) => Some(d),
+                kardamom_types::epoch::LockboxLog::Upgrade(_) => None,
+            })
+            .collect())
     }
 }
