@@ -927,6 +927,14 @@ fn run_mdbx_ab(
                     // core downclocks. Skipping the interleave keeps the
                     // worker hot; if the drag vanishes, it was frequency.
                     let stm_only = std::env::var_os("KARDAMOM_STM_ONLY").is_some();
+                    // FAIR BASELINE: decode once, OUTSIDE both timers, and
+                    // hand it to the sequential engine the way `prepare`
+                    // hands it to the parallel one. Charging decode to one
+                    // side only inflated every ratio by 2-9%.
+                    let seq_decoded: Vec<Option<alloy_consensus::TxEnvelope>> = recs
+                        .iter()
+                        .map(|(t, _, en)| kardamom_stm::decode_alloy_envelope(&en.raw_tx, *t).ok())
+                        .collect();
                     let a0 = alloc_snap();
                     let b0 = bucket_snap();
                     let t0 = Instant::now();
@@ -955,7 +963,13 @@ fn run_mdbx_ab(
                             .expect("seq thread")
                         })?
                     } else {
-                        execute_block_sequential(&snapshot, None, e, &recs)?
+                        kardamom_stm::execute::execute_block_sequential_decoded(
+                            &snapshot,
+                            None,
+                            e,
+                            &recs,
+                            &seq_decoded,
+                        )?
                     };
                     let s_ms = t0.elapsed().as_secs_f64() * 1e3;
 

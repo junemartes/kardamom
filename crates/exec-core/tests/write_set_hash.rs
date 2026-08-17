@@ -10,32 +10,84 @@
 use alloy_primitives::{Address, B256, Keccak256, U256, address};
 use kardamom_exec_core::delta::WriteSet;
 
-/// The contract, spelled out: "ACC" ‖ u32be(count) ‖ per account
-/// (addr ‖ u64le(nonce) ‖ u256be(balance) ‖ code_hash), then "STO" ‖
-/// u32be(count) ‖ per slot (addr ‖ key ‖ u256be(value)), then "COD" ‖
-/// u32be(count) ‖ per entry (hash ‖ u64le(len) ‖ bytes).
+/// The v2 contract, spelled out independently of the implementation:
+///
+/// ```text
+/// u8   0x02 (version)
+/// var  n_accounts                       (LEB128)
+///   per account: addr[20]
+///                u8 flags: bits0-5 = balance byte length
+///                          bits6-7 = 0 KECCAK_EMPTY, 1 ZERO, 2 explicit
+///                var nonce
+///                balance big-endian, leading zeros stripped
+///                [32] code_hash            (only when tag == 2)
+/// var  n_storage
+///   per slot:    u8 flags: bits0-5 = value byte length
+///                          bit6    = address equals the previous entry's
+///                [20] address              (only when bit6 == 0)
+///                [32] key
+///                value big-endian, leading zeros stripped
+/// var  n_code
+///   per entry:   [32] hash, var len, [len] bytes
+/// ```
+fn varint(h: &mut Keccak256, mut v: u64) {
+    loop {
+        let b = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            h.update([b]);
+            return;
+        }
+        h.update([b | 0x80]);
+    }
+}
+
+/// Minimal big-endian bytes (zero encodes as nothing).
+fn minimal(v: &U256) -> Vec<u8> {
+    let be = v.to_be_bytes::<32>();
+    let lead = be.iter().take_while(|b| **b == 0).count();
+    be[lead..].to_vec()
+}
+
 fn expected(ws: &WriteSet) -> B256 {
+    let keccak_empty = alloy_primitives::keccak256([]);
     let mut h = Keccak256::new();
-    h.update(b"ACC");
-    h.update((ws.accounts.len() as u32).to_be_bytes());
+    h.update([0x02u8]);
+    varint(&mut h, ws.accounts.len() as u64);
     for (addr, (nonce, balance, code_hash)) in &ws.accounts {
+        let bal = minimal(balance);
+        let tag: u8 = if *code_hash == keccak_empty {
+            0
+        } else if code_hash.is_zero() {
+            1
+        } else {
+            2
+        };
         h.update(addr.as_slice());
-        h.update(nonce.to_le_bytes());
-        h.update(balance.to_be_bytes::<32>());
-        h.update(code_hash.as_slice());
+        h.update([bal.len() as u8 | (tag << 6)]);
+        varint(&mut h, *nonce);
+        h.update(&bal);
+        if tag == 2 {
+            h.update(code_hash.as_slice());
+        }
     }
-    h.update(b"STO");
-    h.update((ws.storage.len() as u32).to_be_bytes());
+    varint(&mut h, ws.storage.len() as u64);
+    let mut prev: Option<Address> = None;
     for ((addr, key), value) in &ws.storage {
-        h.update(addr.as_slice());
+        let val = minimal(value);
+        let same = prev == Some(*addr);
+        h.update([val.len() as u8 | (u8::from(same) << 6)]);
+        if !same {
+            h.update(addr.as_slice());
+        }
         h.update(key.as_slice());
-        h.update(value.to_be_bytes::<32>());
+        h.update(&val);
+        prev = Some(*addr);
     }
-    h.update(b"COD");
-    h.update((ws.code.len() as u32).to_be_bytes());
+    varint(&mut h, ws.code.len() as u64);
     for (code_hash, bytes) in &ws.code {
         h.update(code_hash.as_slice());
-        h.update((bytes.len() as u64).to_le_bytes());
+        varint(&mut h, bytes.len() as u64);
         h.update(bytes.as_ref());
     }
     h.finalize()

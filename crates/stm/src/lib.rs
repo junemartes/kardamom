@@ -94,6 +94,10 @@ impl std::hash::Hasher for Fnv {
 pub type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
 
 pub mod execute;
+
+/// Re-exported so harnesses can pre-decode for BOTH engines (see
+/// `execute::execute_block_sequential_decoded`).
+pub use kardamom_exec_core::executor::decode_alloy_envelope;
 pub mod mv;
 pub mod schedule;
 

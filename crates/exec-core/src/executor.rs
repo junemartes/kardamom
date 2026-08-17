@@ -342,6 +342,38 @@ impl<S: StateDatabase> ExecScope<S> {
                 ));
             }
         };
+        self.execute_tx_decoded(
+            tx_idx,
+            tx_position,
+            inbound_envelope,
+            &alloy_env,
+            tx_index_in_block,
+            cumulative_gas_used_before,
+            bal,
+            touches,
+        )
+    }
+
+    /// [`Self::execute_tx`] with the RLP already decoded.
+    ///
+    /// Decoding is ~180ns/tx and is naturally done by whoever reads the
+    /// tx stream (the STM engine's `prepare` does exactly this, off the
+    /// execution thread). Exposing the pre-decoded entry point lets the
+    /// SEQUENTIAL path have the same benefit — and lets the A/B harness
+    /// compare the two engines on equal footing instead of charging
+    /// decode to one side only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tx_decoded(
+        &mut self,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        alloy_env: &alloy_consensus::TxEnvelope,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+        touches: Option<&mut TouchSet>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
         let signer = inbound_envelope.sender; // trusted from proxy; no recovery
         let nonce = alloy_env.nonce();
         let to = alloy_env.to();
@@ -352,7 +384,7 @@ impl<S: StateDatabase> ExecScope<S> {
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas());
 
-        let tx_env = tx_env_from_alloy(&alloy_env, signer);
+        let tx_env = tx_env_from_alloy(alloy_env, signer);
         let outcome = match self.evm.transact(tx_env) {
             Ok(o) => o,
             // Deterministic input-invalidity: every replica computes the same

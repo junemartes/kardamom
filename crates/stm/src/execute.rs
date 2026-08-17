@@ -3899,6 +3899,58 @@ pub fn execute_block_stm<S: StateDatabase + Sync + Clone + 'static>(
 
 /// The sequential reference path (also the fallback): `ExecScope` per
 /// block, canonical order — the executor's streaming semantics.
+/// [`execute_block_sequential`] with the RLP already decoded — the
+/// FAIR baseline for A/B against the parallel engine.
+///
+/// The parallel path receives pre-decoded envelopes from `prepare`
+/// (readers do it, off the execution thread); the sequential path used
+/// to decode inline, so a naive A/B charged ~180ns/tx to sequential
+/// only — 0.7ms per 4000-tx block, which inflated every ratio by 2-9%.
+/// Production gets the same benefit: whoever reads the stream can hand
+/// the decode to either engine.
+pub fn execute_block_sequential_decoded<S: StateDatabase + Sync>(
+    snapshot: &S,
+    base: Option<&PendingDelta>,
+    env: ExecEnv,
+    txs: &[(TxIndex, BPosition, TxEnvelope)],
+    decoded: &[Option<alloy_consensus::TxEnvelope>],
+) -> Result<(Vec<Receipt>, PendingDelta), ExecutorError> {
+    debug_assert_eq!(txs.len(), decoded.len(), "one decode slot per tx");
+    let mut scope = ExecScope::new(snapshot, base, env)?;
+    let mut receipts = Vec::with_capacity(txs.len());
+    let mut delta = PendingDelta::new();
+    let mut cumulative = 0u64;
+    let timing = std::env::var_os("KARDAMOM_SEQ_TIMING").is_some();
+    let mut exec_ns = 0u64;
+    for (i, (tx_idx, position, envelope)) in txs.iter().enumerate() {
+        let t0 = timing.then(std::time::Instant::now);
+        let (receipt, ws) = match decoded.get(i).and_then(|d| d.as_ref()) {
+            Some(d) => scope.execute_tx_decoded(
+                *tx_idx, *position, envelope, d, i as u64, cumulative, None, None,
+            )?,
+            // Undecodable: the inline path produces the skip receipt.
+            None => scope.execute_tx(
+                *tx_idx, *position, envelope, i as u64, cumulative, None, None,
+            )?,
+        };
+        if let Some(t0) = t0 {
+            exec_ns += t0.elapsed().as_nanos() as u64;
+        }
+        cumulative = receipt.cumulative_gas_used;
+        delta.apply(ws);
+        receipts.push(receipt);
+    }
+    if timing && !txs.is_empty() {
+        eprintln!(
+            "seq block {}: execute_tx sum {:.1}ms ({} txs, pre-decoded)",
+            env.block_number,
+            exec_ns as f64 / 1e6,
+            txs.len()
+        );
+    }
+    Ok((receipts, delta))
+}
+
 pub fn execute_block_sequential<S: StateDatabase + Sync>(
     snapshot: &S,
     base: Option<&PendingDelta>,
