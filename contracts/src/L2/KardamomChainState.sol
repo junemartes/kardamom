@@ -56,6 +56,11 @@ contract KardamomChainState {
     ///         Packing keeps the triple atomic and costs one write-set entry
     ///         per block instead of three. Must match
     ///         `kardamom_exec_core::features::{HEALTH_BEACON_SLOT, pack_beacon}`.
+    // Having NO Solidity writer is the design, not an oversight: the engine
+    // writes this slot into the block's state delta at block close, where no
+    // transaction exists to carry it. A setter would be an unauthorized write
+    // path into consensus state — exactly what this contract exists to prevent.
+    // slither-disable-next-line uninitialized-state
     uint256 public healthBeacon;
 
     /// @notice Emitted when a feature is scheduled. `activationTimestamp` is the
