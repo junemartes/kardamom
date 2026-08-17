@@ -1790,6 +1790,16 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let avg_tx_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (reap_tx, reap_rx) = std::sync::mpsc::channel::<Reap>();
     let (tail_tx, tail_rx) = std::sync::mpsc::channel::<TailJob<S>>();
+    // Persistent tail lanes (see crate::lanes): the hash+validate chunks
+    // run on threads created ONCE, not spawned per block.
+    let lane_pool = std::sync::Arc::new(crate::lanes::LanePool::new(
+        workers.max(1),
+        if cfg_keep_hot && cfg_tail_on_workers {
+            pin_cores.clone()
+        } else {
+            Vec::new()
+        },
+    ));
     let recycle_pools = std::sync::Arc::new(RecyclePools {
         arenas: Mutex::new(Vec::new()),
         mv_clean: Mutex::new(Vec::new()),
@@ -1871,6 +1881,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         {
             let reaper = reap_tx.clone();
             let recycle = recycle_pools.clone();
+            let lanes_h = lane_pool.clone();
             let pins = pin_cores.clone();
             let hot = cfg_keep_hot;
             let tow = cfg_tail_on_workers;
@@ -1976,7 +1987,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                     let t_drain = t_drain0.elapsed();
                     let _ = out.send(block_tail(
                         ctx, n_txs, t_exec_wall, t_drain, cold, edges, dispatch, hot, tow,
-                        &pins, &reaper, &avg, delta_out, &recycle,
+                        &pins, &reaper, &avg, delta_out, &recycle, &lanes_h,
                     ));
                 }
             });
@@ -2925,6 +2936,7 @@ fn block_tail<S: StateDatabase + Sync>(
     avg_tx_ns: &std::sync::atomic::AtomicU64,
     delta_out: Option<DeltaOut>,
     recycle: &std::sync::Arc<RecyclePools>,
+    lanes: &crate::lanes::LanePool,
 ) -> Result<StmOutcome, ExecutorError> {
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
@@ -3061,13 +3073,8 @@ fn block_tail<S: StateDatabase + Sync>(
     // are still running.
     let t_h = std::time::Instant::now();
     let n_res = tx_results.len();
-    let tail_pins: &[usize] = if keep_hot && tail_on_workers {
-        pin_cores
-    } else {
-        &[]
-    };
-    let hash_threads = ctx.queues.len().saturating_sub(1).max(1).min(n_res.max(1));
-    let chunk = n_res.div_ceil(hash_threads);
+    // Lane pinning is decided once, when the pool builds its lanes.
+    let _ = (keep_hot, tail_on_workers, pin_cores);
     let mut hashes: Vec<B256> = vec![B256::ZERO; n_res];
     let val_ns = std::sync::atomic::AtomicU64::new(0);
     let fold_inline = |results: Results<'_>| -> PendingDelta {
@@ -3149,113 +3156,78 @@ fn block_tail<S: StateDatabase + Sync>(
             }
             (delta_arc, wounded)
         } else {
-            // Fold and hash skipped: the repair path rebuilds both, and
-            // the corrected release follows it.
             (std::sync::Arc::new(PendingDelta::new()), wounded)
         }
     } else {
-        std::thread::scope(|sc| {
-            // Fold thread: read-only copy, plain upserts in canonical
-            // order ("later tx wins" is the map's own semantics), on
-            // the last worker core (hot, parked, longest pole). Code
-            // entries are COPIED (Bytes is refcounted), not drained:
-            // the released delta must carry CREATEd code for the next
-            // block's readers.
-            let results_ref = tx_results;
-            let warm_delta = recycle
-                .deltas
-                .lock()
-                .expect("pools poisoned")
-                .pop()
-                .unwrap_or_default();
-            // The fold runs on THIS thread (the tail thread, on a caller
-            // core): it frees a worker core for a hash lane, drops a
-            // spawn, and reaches the release point without a join.
-            let fold = move || {
-                let mut sink_final: Option<(u64, U256, B256)> = None;
-                let mut d = warm_delta;
-                d.accounts.reserve(results_ref.len() * 2);
-                d.storage.reserve(results_ref.len());
-                for r in results_ref.iter() {
-                    for (a, v) in r.ws.accounts.iter() {
-                        if *a == FEE_SINK {
-                            sink_final = Some(*v);
-                        } else {
-                            d.accounts.insert(*a, *v);
-                        }
-                    }
-                    for (k, v) in r.ws.storage.iter() {
-                        d.storage.insert(*k, *v);
-                    }
-                    for (h, b) in r.ws.code.iter() {
-                        d.code.insert(*h, b.clone());
-                    }
-                }
-                if let Some(v) = sink_final {
-                    d.accounts.insert(FEE_SINK, v);
-                }
-                d
-            };
-            // Hash+validate lanes: read ws, write ONLY the side array
-            // and a local wounded list.
-            let hash_parts: Vec<(usize, &mut [B256])> = {
-                let mut out = Vec::new();
-                let mut rest: &mut [B256] = &mut hashes;
-                let mut base = 0usize;
-                while rest.len() > chunk {
-                    let (head, tail_s) = rest.split_at_mut(chunk);
-                    out.push((base, head));
-                    base += chunk;
-                    rest = tail_s;
-                }
-                out.push((base, rest));
-                out
-            };
-            let mut lanes = Vec::with_capacity(hash_parts.len());
-            for (ti, (base, out_slice)) in hash_parts.into_iter().enumerate() {
-                let results_ref = tx_results;
-                let mv = &ctx.mv;
-                let val_ns = &val_ns;
-                let lane_metrics = &ctx.metrics;
-                lanes.push(sc.spawn(move || {
-                    if !tail_pins.is_empty() {
-                        let _ = core_affinity::set_for_current(core_affinity::CoreId {
-                            id: tail_pins[ti % tail_pins.len().max(1)],
-                        });
-                    }
-                    let t_lane0 = std::time::Instant::now();
-                    let len = out_slice.len();
-                    for (j, slot) in out_slice.iter_mut().enumerate() {
-                        let r = results_ref.get(base + j);
-                        if r.sink_touched {
-                            *slot = r.ws.hash();
-                        }
-                    }
-                    let t0 = std::time::Instant::now();
-                    let mut wounded_local = Vec::new();
-                    for j in 0..len {
-                        let i = base + j;
-                        if results_ref
-                            .get(i)
-                            .reads
-                            .iter()
-                            .any(|rec| !mv.validate(i as u32, rec))
-                        {
-                            wounded_local.push(i);
-                        }
-                    }
-                    val_ns.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    lane_metrics
-                        .commit_lane_ns
-                        .fetch_add(t_lane0.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    wounded_local
-                }));
+        // PERSISTENT LANES (crate::lanes): hash + validate, chunked by
+        // index, on threads the pool created once. Per-block scoped
+        // spawns cost 0.5ms of the 1.9ms tail once the witness hash got
+        // cheap. The fold runs HERE, on the tail thread, concurrently
+        // with the lanes and without a join before the release point.
+        let n_lanes = lanes.lanes().max(1);
+        let n_ch = n_lanes.min(n_res.max(1));
+        let chunk = n_res.div_ceil(n_ch);
+        let wounded_parts: Vec<Mutex<Vec<usize>>> =
+            (0..n_ch).map(|_| Mutex::new(Vec::new())).collect();
+        // Each chunk owns a disjoint slice of `hashes`; lanes never share
+        // an index (crate::lanes hands each out exactly once).
+        struct HashOut(*mut B256);
+        // SAFETY: chunk i writes only hashes[i*chunk .. (i+1)*chunk],
+        // disjoint from every other chunk's range, and `lanes.run` hands
+        // each chunk index out exactly once.
+        unsafe impl Sync for HashOut {}
+        impl HashOut {
+            /// # Safety
+            /// `i` must lie in the calling chunk's exclusive range.
+            unsafe fn set(&self, i: usize, v: B256) {
+                unsafe { *self.0.add(i) = v };
             }
-            let delta_arc = std::sync::Arc::new(fold());
-            // SPECULATIVE RELEASE (spec P3b): the delta ships here,
-            // while validation is still running. Measured wound rate
-            // across the campaign: zero — the gamble prices only when
-            // it fires, and a `corrected` re-issue follows if it does.
+        }
+        let out = HashOut(hashes.as_mut_ptr());
+        let mv = &ctx.mv;
+        let val_ns_ref = &val_ns;
+        let lane_metrics = &ctx.metrics;
+        let results_ref = tx_results;
+        let lane_body = |ci: usize| {
+            let t_lane0 = std::time::Instant::now();
+            let base = ci * chunk;
+            let end = (base + chunk).min(n_res);
+            for i in base..end {
+                let r = results_ref.get(i);
+                if r.sink_touched {
+                    // SAFETY: `i` lies in this chunk's exclusive range.
+                    unsafe { out.set(i, r.ws.hash()) };
+                }
+            }
+            let t0 = std::time::Instant::now();
+            let mut local = Vec::new();
+            for i in base..end {
+                if results_ref
+                    .get(i)
+                    .reads
+                    .iter()
+                    .any(|rec| !mv.validate(i as u32, rec))
+                {
+                    local.push(i);
+                }
+            }
+            val_ns_ref.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            lane_metrics
+                .commit_lane_ns
+                .fetch_add(t_lane0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if !local.is_empty() {
+                wounded_parts[ci]
+                    .lock()
+                    .expect("wounded part poisoned")
+                    .extend(local);
+            }
+        };
+        std::thread::scope(|sc| {
+            // One scoped thread ONLY to drive the lanes, so the fold can
+            // run on this thread concurrently and reach the release
+            // point without waiting for the hash work.
+            let driver = sc.spawn(|| lanes.run(n_ch, &lane_body));
+            let delta_arc = std::sync::Arc::new(fold_inline(tx_results));
             if let Some(DeltaOut {
                 tx,
                 speculative: true,
@@ -3268,9 +3240,12 @@ fn block_tail<S: StateDatabase + Sync>(
                     corrected: false,
                 });
             }
-            let wounded: Vec<usize> = lanes
-                .into_iter()
-                .flat_map(|h| h.join().expect("hash+validate lane"))
+            driver.join().expect("lane driver");
+            // Lanes are done (run() returned inside the driver), so the
+            // borrow is over; drain the per-chunk lists in order.
+            let wounded: Vec<usize> = wounded_parts
+                .iter()
+                .flat_map(|m| std::mem::take(&mut *m.lock().expect("wounded part poisoned")))
                 .collect();
             (delta_arc, wounded)
         })
