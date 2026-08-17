@@ -18,6 +18,7 @@ bytes = "1"
 revm.workspace = true
 tracing.workspace = true
 crossbeam-queue = "0.3.13"
+smallvec.workspace = true
 
 [dev-dependencies]
 alloy-eips.workspace = true

@@ -1208,3 +1208,124 @@ fn bag_hot_chain_byte_identical() {
     let key = (COUNTER, B256::ZERO);
     assert_eq!(seq.1.storage.get(&key), Some(&U256::from(24u64)));
 }
+
+/// SHARDED ADMISSION: dependency discovery split across cell-space
+/// shards must produce the same bytes as the serial feed. The shapes
+/// that matter are the ones where a shard boundary could hide an edge:
+/// a hot single-cell chain (all txs in ONE shard), transfers (two cells
+/// per tx, usually different shards), and racing lying-stats reps.
+#[test]
+fn sharded_admission_byte_identical() {
+    let sg = signers(4);
+    let database = db(&sg);
+    let run_sharded = |recs: &[(TxIndex, BPosition, TxEnvelope)],
+                       stats: &Stats,
+                       workers: usize,
+                       shards: usize| {
+        kardamom_stm::execute::with_pool(
+            kardamom_stm::execute::PoolConfig {
+                workers,
+                admit_shards: shards,
+                ..Default::default()
+            },
+            |pool| {
+                pool.run_block(
+                    vec![database.clone(); workers.max(1)],
+                    PendingDelta::new(),
+                    env(),
+                    recs,
+                    stats,
+                )
+                .unwrap()
+            },
+        )
+    };
+
+    // 1. Hot chain: 24 increments of ONE slot — every tx's conflict cell
+    //    lands in the same shard, so one shard carries the whole chain.
+    let recs = records(
+        (0..8u64)
+            .flat_map(|n| sg.iter().take(3).map(move |s| (s, n)).collect::<Vec<_>>())
+            .map(|(s, n)| tx(s, n, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let seq = execute_block_sequential(&database, None, env(), &recs).unwrap();
+    let stats = counter_stats();
+    for shards in [1, 2, 3, 4] {
+        for workers in [1, 4] {
+            let out = run_sharded(&recs, &stats, workers, shards);
+            assert_eq!(out.wounds, 0, "ordered chain must not wound (k={shards})");
+            assert_identical(
+                &seq,
+                &out.receipts,
+                &out.delta,
+                &format!("sharded chain k={shards} w={workers}"),
+            );
+        }
+    }
+
+    // 2. Transfers: two cells per tx, so most txs span shards and the
+    //    per-batch guard is what keeps them from dispatching early.
+    let recs2 = records(vec![
+        tx(&sg[0], 0, TxKind::Call(sg[1].address()), 500, &[]),
+        tx(&sg[1], 0, TxKind::Call(sg[2].address()), 300, &[]),
+        tx(&sg[2], 0, TxKind::Call(sg[3].address()), 200, &[]),
+        tx(&sg[0], 1, TxKind::Call(sg[2].address()), 100, &[]),
+        tx(&sg[3], 0, TxKind::Call(sg[0].address()), 50, &[]),
+        tx(&sg[1], 1, TxKind::Call(sg[3].address()), 25, &[]),
+    ]);
+    let seq2 = execute_block_sequential(&database, None, env(), &recs2).unwrap();
+    for shards in [2, 3] {
+        for workers in [1, 2, 4] {
+            let out = run_sharded(&recs2, &Stats::default(), workers, shards);
+            assert_identical(
+                &seq2,
+                &out.receipts,
+                &out.delta,
+                &format!("sharded transfers k={shards} w={workers}"),
+            );
+        }
+    }
+
+    // 3. Lying stats: mispredicted footprints race, so validation and
+    //    repair must still land on identical bytes under sharding.
+    let lying = {
+        let obs: Vec<TxObs> = (0..4)
+            .map(|i| {
+                let sender = Address::with_last_byte(i as u8 + 0x10);
+                let mut buf = [0u8; 64];
+                buf[..32]
+                    .copy_from_slice(&U256::from_be_slice(sender.as_slice()).to_be_bytes::<32>());
+                buf[32..].copy_from_slice(&U256::from(3u8).to_be_bytes::<32>());
+                TxObs {
+                    index: i,
+                    block: 1,
+                    sender,
+                    to: Some(COUNTER),
+                    selector: Some(COUNTER_SEL),
+                    args: Vec::new(),
+                    gas: 30_000,
+                    has_value: false,
+                    reads: Vec::new(),
+                    writes: vec![Cell::Slot(COUNTER, keccak256(buf))],
+                }
+            })
+            .collect();
+        Stats::learn(&obs)
+    };
+    let recs3 = records(
+        (0..4)
+            .map(|i| tx(&sg[i], 0, TxKind::Call(COUNTER), 0, &COUNTER_SEL))
+            .collect(),
+    );
+    let seq3 = execute_block_sequential(&database, None, env(), &recs3).unwrap();
+    for rep in 0..25 {
+        let out = run_sharded(&recs3, &lying, 4, 3);
+        assert_identical(
+            &seq3,
+            &out.receipts,
+            &out.delta,
+            &format!("sharded lying rep={rep}"),
+        );
+    }
+}

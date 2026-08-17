@@ -742,6 +742,9 @@ const PARK_POLL: std::time::Duration = std::time::Duration::from_micros(200);
 /// intrinsic gas = 1,428, with ~2.8x headroom. Slots are pre-allocated per
 /// block so workers address them lock-free while the feed is still
 /// admitting (slab reuse across blocks is a noted follow-up).
+/// Transactions per sharded-admission batch (see `flush_admit_batch`).
+const ADMIT_BATCH: usize = 512;
+
 const MAX_BLOCK_TXS: usize = 4_096;
 
 /// One admitted tx. Its slot is set BEFORE its index becomes visible to
@@ -751,6 +754,10 @@ struct TxSlot {
     position: BPosition,
     envelope: TxEnvelope,
     decoded: Option<alloy_consensus::TxEnvelope>,
+    /// Predicted cell hashes (from `prepare`, off-thread). Sharded
+    /// admission reads them from here; the serial feed uses the
+    /// `Prepared` copy directly and leaves this empty.
+    hashes: smallvec::SmallVec<[u64; 4]>,
 }
 
 /// One worker's FIFO. The feed pushes (single producer), the worker pops
@@ -944,6 +951,16 @@ pub struct PoolConfig {
     /// partransfer 1.57 -> 2.0, defi 1.31 -> 1.34, transfers 1.00 ->
     /// 1.07). `false` selects the legacy per-worker FIFO scheduler.
     pub bag_scheduler: bool,
+    /// SHARDED ADMISSION (spec: "Sharded admission"): number of cell-space
+    /// shards the feed's dependency discovery is split across, 0 = the
+    /// serial feed. Cell `c` belongs to shard `h(c) % K`, so every real
+    /// conflict is owned by exactly one shard and no shard writes
+    /// another's table. Discovery is BATCHED — the batch boundary is the
+    /// synchronization point, so a transaction cannot dispatch until
+    /// every shard has registered its edges, and no per-shard guards are
+    /// needed. Shard lanes live on the CALLER cores; the worker cores
+    /// stay dedicated to execution.
+    pub admit_shards: usize,
     /// Between blocks, workers SPIN-YIELD instead of sleeping on the
     /// condvar. schedutil drops a core to base clock (2.1 vs 4.2GHz
     /// measured) the moment it idles, and burst-park execution never
@@ -992,6 +1009,7 @@ impl Default for PoolConfig {
             eager_chain: true,
             sticky_assign: false,
             bag_scheduler: true,
+            admit_shards: 0,
             keep_hot: false,
             tail_on_workers: true,
             pin_cores: Vec::new(),
@@ -1542,6 +1560,38 @@ enum Reap {
 
 /// One sealed block handed to the persistent TAIL thread (spec P3a):
 /// drain, release the pool slot, then `block_tail`.
+/// Per-shard last-toucher tables for sharded admission.
+///
+/// SAFETY: table `k` is touched only from the lane executing chunk `k`,
+/// and `LanePool::run` hands each chunk index to exactly one lane and
+/// returns only after every lane has finished — so accesses to a given
+/// table are serialized, and the batch boundary orders them against the
+/// router's reads.
+struct ShardTables(Vec<std::cell::UnsafeCell<TouchTable>>);
+
+unsafe impl Sync for ShardTables {}
+unsafe impl Send for ShardTables {}
+
+impl ShardTables {
+    fn new(k: usize, capacity_per_shard: usize) -> Self {
+        Self(
+            (0..k)
+                .map(|_| std::cell::UnsafeCell::new(TouchTable::new(capacity_per_shard)))
+                .collect(),
+        )
+    }
+    /// # Safety
+    /// Caller must be the sole accessor of shard `k` for the duration
+    /// (guaranteed by the one-chunk-per-lane contract).
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn table(&self, k: usize) -> &mut TouchTable {
+        unsafe { &mut *self.0[k].get() }
+    }
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 /// Shared, read-only view of a drained block's results, read IN PLACE
 /// out of the block arena (see the presence prepass in `block_tail`).
 /// Every slot is known to hold `Some(Ok(_))` before this is built.
@@ -1754,6 +1804,12 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// O(1) stamp reset per block) and feed-owned, exactly like
     /// `assign`: only the single admission thread ever touches it.
     touch: std::cell::RefCell<TouchTable>,
+    /// SHARDED ADMISSION: one last-toucher table per cell-space shard,
+    /// plus the lanes that drive them. Shard k is touched only by the
+    /// lane running chunk k, and lanes run one chunk each per batch.
+    shards: std::sync::Arc<ShardTables>,
+    admit_lanes: Option<std::sync::Arc<crate::lanes::LanePool>>,
+    admit_shards: usize,
 }
 
 /// Spawn `workers` pool threads for the duration of `f`.
@@ -1770,6 +1826,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let pin_cores = cfg.pin_cores.clone();
     let cfg_keep_hot = cfg.keep_hot;
     let cfg_tail_on_workers = cfg.tail_on_workers;
+    let cfg_admit_shards = cfg.admit_shards;
     let (sticky_assign, parallel_worth_ns, dispatch_by_sender, eager_chain) = (
         cfg.sticky_assign,
         cfg.parallel_worth_ns,
@@ -2019,6 +2076,16 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             // most ~2 per tx, so load factor stays <= 0.5 (about 1.5
             // probes) at 256KB total.
             touch: std::cell::RefCell::new(TouchTable::new(MAX_BLOCK_TXS * 4)),
+            shards: std::sync::Arc::new(ShardTables::new(
+                cfg_admit_shards.max(1),
+                (MAX_BLOCK_TXS * 4) / cfg_admit_shards.max(1),
+            )),
+            admit_lanes: (cfg_admit_shards > 0).then(|| {
+                // Caller cores: the worker cores stay dedicated to
+                // execution, which is running while the feed admits.
+                std::sync::Arc::new(crate::lanes::LanePool::new(cfg_admit_shards, Vec::new()))
+            }),
+            admit_shards: cfg_admit_shards,
             tail: tail_tx.clone(),
             parallel_worth_ns,
             dispatch_by_sender,
@@ -2055,6 +2122,8 @@ pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     /// `KARDAMOM_STM_FEED_STAGES`: per-stage feed timers (off by default
     /// — they cost what they measure).
     stage_timing: bool,
+    /// Sharded admission: indices awaiting dependency discovery.
+    admit_batch: Vec<u32>,
     /// The most recent ⊤ (cold) tx: conflicts with everything, so every
     /// later admission takes an edge from it while it is outstanding.
     last_barrier: Option<u32>,
@@ -2159,6 +2228,9 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         }
         // O(1) reset of the feed's last-toucher index for this block.
         self.touch.borrow_mut().clear();
+        if self.admit_shards > 0 {
+            self.shards_clear();
+        }
         let recycled = self.recycle.arenas.lock().expect("pools poisoned").pop();
         let recycled_mv = self.recycle.mv_clean.lock().expect("pools poisoned").pop();
         let (r_slots, r_results, r_nodes) = match recycled {
@@ -2274,6 +2346,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             edges: 0,
             preds_buf: Vec::with_capacity(8),
             stage_timing: std::env::var_os("KARDAMOM_STM_FEED_STAGES").is_some(),
+            admit_batch: Vec::with_capacity(ADMIT_BATCH),
             last_barrier: None,
             dispatch: vec![0; workers],
             n_txs: 0,
@@ -2320,6 +2393,15 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         let mut g = self.recycle.deltas.lock().expect("pools poisoned");
         if g.len() < 4 {
             g.push(d);
+        }
+    }
+
+    /// Clear every shard's last-toucher table (⊤ barrier, and per
+    /// block). Safe because admission is quiesced at both call sites.
+    fn shards_clear(&self) {
+        for k in 0..self.shards.len() {
+            // SAFETY: no lane is running (the batch was flushed first).
+            unsafe { self.shards.table(k) }.clear();
         }
     }
 
@@ -2484,6 +2566,73 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
 }
 
 impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
+    /// Run dependency discovery for the queued batch: lane `k` owns
+    /// cell-space shard `k`, walks the batch IN INDEX ORDER, upserts its
+    /// own cells and registers the edges it finds. Returns with every
+    /// edge in place, so the guards can be dropped and the ready
+    /// transactions dispatched.
+    fn flush_admit_batch(&mut self) {
+        if self.admit_batch.is_empty() {
+            return;
+        }
+        let k = self.pool.admit_shards.max(1);
+        let batch: &[u32] = &self.admit_batch;
+        let ctx = &self.ctx;
+        let shards = &self.pool.shards;
+        let edges = std::sync::atomic::AtomicUsize::new(0);
+        let body = |sh: usize| {
+            // SAFETY: chunk `sh` is executed by exactly one lane, and no
+            // other chunk touches table `sh`.
+            let table = unsafe { shards.table(sh) };
+            for &idx in batch.iter() {
+                let slot = ctx.slots[idx as usize]
+                    .get()
+                    .expect("slot set before admission batch");
+                for h in slot.hashes.iter() {
+                    if (*h % k as u64) as usize != sh {
+                        continue;
+                    }
+                    if let Some(p) = table.upsert(*h, idx) {
+                        if p == idx {
+                            continue;
+                        }
+                        let pn = &ctx.nodes[p as usize];
+                        let mut list = pn.children.lock().expect("children poisoned");
+                        if pn.open.load(Ordering::Acquire) {
+                            ctx.nodes[idx as usize]
+                                .indegree
+                                .fetch_add(1, Ordering::AcqRel);
+                            list.push(idx);
+                            edges.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        };
+        match &self.pool.admit_lanes {
+            Some(l) => l.run(k.min(l.lanes()), &body),
+            None => {
+                for sh in 0..k {
+                    body(sh);
+                }
+            }
+        }
+        self.edges += edges.load(Ordering::Relaxed);
+        // Every edge for this batch is registered: drop the router
+        // guards, dispatching whatever is ready.
+        for &idx in self.admit_batch.iter() {
+            if self.ctx.nodes[idx as usize]
+                .indegree
+                .fetch_sub(1, Ordering::AcqRel)
+                == 1
+            {
+                let w = self.ctx.nodes[idx as usize].worker.load(Ordering::Acquire);
+                self.ctx.push_ready(w, idx);
+            }
+        }
+        self.admit_batch.clear();
+    }
+
     /// Admit the next canonical tx: ONE function computation, then an
     /// assignment to a thread.
     ///
@@ -2612,12 +2761,18 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
 
         // The slot OWNS the envelope: no clone, no parallel vec (the
         // repair path reads slots too).
+        let sharded = self.pool.admit_shards > 0;
         self.ctx.slots[i]
             .set(TxSlot {
                 tx_idx,
                 position,
                 envelope,
                 decoded,
+                hashes: if sharded {
+                    hashes.iter().copied().collect()
+                } else {
+                    smallvec::SmallVec::new()
+                },
             })
             .unwrap_or_else(|_| unreachable!("slot set once per index"));
         self.n_txs += 1;
@@ -2639,6 +2794,65 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         // Candidate predecessors come from the FEED-OWNED last-toucher
         // index — no lock needed, because admission is single-threaded and
         // prune never reads it.
+        if sharded {
+            // SHARDED ADMISSION. The router does node init and queues the
+            // index; dependency discovery (last-toucher upserts + edge
+            // registration) happens in the batch flush, one lane per
+            // cell-space shard. No tx can dispatch before its batch
+            // completes, because the router's guard is dropped only
+            // there — which is why per-shard guards are unnecessary.
+            {
+                let node = &self.ctx.nodes[i];
+                node.worker.store(worker, Ordering::Release);
+                node.indegree.store(1, Ordering::Release);
+                let mut c = node.children.lock().expect("children poisoned");
+                if node.open.load(Ordering::Acquire) {
+                    return Err(ExecutorError::State(format!(
+                        "stm: tx index {i} admitted twice"
+                    )));
+                }
+                c.clear();
+                node.open.store(true, Ordering::Release);
+            }
+            self.ctx.admitted.fetch_add(1, Ordering::SeqCst);
+            // The barrier edge is global, so the router registers it.
+            if let Some(b) = self.last_barrier {
+                let pn = &self.ctx.nodes[b as usize];
+                let mut list = pn.children.lock().expect("children poisoned");
+                if pn.open.load(Ordering::Acquire) {
+                    self.ctx.nodes[i].indegree.fetch_add(1, Ordering::AcqRel);
+                    list.push(idx);
+                    self.edges += 1;
+                }
+            }
+            if is_cold {
+                // T conflicts with everything: settle the batch, then do
+                // the barrier serially (edges from all outstanding, all
+                // shard tables cleared).
+                self.flush_admit_batch();
+                for p in 0..idx {
+                    let pn = &self.ctx.nodes[p as usize];
+                    let mut list = pn.children.lock().expect("children poisoned");
+                    if pn.open.load(Ordering::Acquire) {
+                        self.ctx.nodes[i].indegree.fetch_add(1, Ordering::AcqRel);
+                        list.push(idx);
+                        self.edges += 1;
+                    }
+                }
+                self.last_barrier = Some(idx);
+                self.pool.shards_clear();
+            }
+            self.admit_batch.push(idx);
+            if self.admit_batch.len() >= ADMIT_BATCH {
+                self.flush_admit_batch();
+            }
+            self.ctx
+                .metrics
+                .feed_ns
+                .fetch_add(t_feed.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            return Ok(());
+        }
+
         let mut preds = std::mem::take(&mut self.preds_buf);
         preds.clear();
         if let Some(b) = self.last_barrier {
@@ -2795,6 +3009,10 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     /// drains, so the caller may begin feeding the NEXT block while this
     /// one validates and commits on the tail thread.
     pub fn submit(self) -> Result<BlockTicket, ExecutorError> {
+        // SETTLE FIRST: sealing with a partial batch would strand
+        // its router guards and the block would never drain.
+        let mut this = self;
+        this.flush_admit_batch();
         let BlockSession {
             pool,
             ctx,
@@ -2804,7 +3022,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             edges,
             dispatch,
             ..
-        } = self;
+        } = this;
         ctx.sealed.store(true, Ordering::SeqCst);
         for q in &ctx.queues {
             q.cv.notify_all();
@@ -2842,6 +3060,10 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         mv_tx: std::sync::mpsc::Sender<MvRelease>,
         delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
     ) -> Result<BlockTicket, ExecutorError> {
+        // SETTLE FIRST: sealing with a partial batch would strand
+        // its router guards and the block would never drain.
+        let mut this = self;
+        this.flush_admit_batch();
         let BlockSession {
             pool,
             ctx,
@@ -2851,7 +3073,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             edges,
             dispatch,
             ..
-        } = self;
+        } = this;
         ctx.sealed.store(true, Ordering::SeqCst);
         for q in &ctx.queues {
             q.cv.notify_all();
@@ -2881,6 +3103,10 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
         speculative: bool,
     ) -> Result<BlockTicket, ExecutorError> {
+        // SETTLE FIRST: sealing with a partial batch would strand
+        // its router guards and the block would never drain.
+        let mut this = self;
+        this.flush_admit_batch();
         let BlockSession {
             pool,
             ctx,
@@ -2890,7 +3116,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             edges,
             dispatch,
             ..
-        } = self;
+        } = this;
         ctx.sealed.store(true, Ordering::SeqCst);
         for q in &ctx.queues {
             q.cv.notify_all();

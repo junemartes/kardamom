@@ -130,6 +130,10 @@ struct Args {
     /// per-worker FIFO scheduler (stealing + eager coverage) for A/B.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     bag_scheduler: bool,
+    /// Sharded admission: cell-space shards for dependency discovery
+    /// (0 = serial feed). Lanes run on the caller cores.
+    #[arg(long, default_value_t = 0)]
+    admit_shards: usize,
 }
 
 /// Counting allocator: every alloc through one pair of relaxed counters.
@@ -353,6 +357,7 @@ fn run_pipelined(
     dispatch_by_sender: bool,
     eager_chain: bool,
     bag_scheduler: bool,
+    admit_shards: usize,
     sticky_assign: bool,
     pin_cores: Vec<usize>,
     warmup_blocks: usize,
@@ -449,6 +454,7 @@ fn run_pipelined(
             dispatch_by_sender,
             eager_chain,
             bag_scheduler,
+            admit_shards,
             sticky_assign,
             keep_hot,
             tail_on_workers: false,
@@ -813,6 +819,7 @@ fn run_mdbx_ab(
     dispatch_by_sender: bool,
     eager_chain: bool,
     bag_scheduler: bool,
+    admit_shards: usize,
     sticky_assign: bool,
     per_block: bool,
     pin_cores: Vec<usize>,
@@ -870,6 +877,7 @@ fn run_mdbx_ab(
                 dispatch_by_sender,
                 eager_chain,
                 bag_scheduler,
+                admit_shards,
                 sticky_assign,
                 keep_hot,
                 tail_on_workers: true,
@@ -1608,6 +1616,7 @@ fn main() -> anyhow::Result<()> {
                 dispatch_by_sender,
                 eager_chain,
                 a.bag_scheduler,
+                a.admit_shards,
                 sticky_assign,
                 pin_cores.clone(),
                 a.warmup_blocks,
@@ -1634,6 +1643,7 @@ fn main() -> anyhow::Result<()> {
             dispatch_by_sender,
             eager_chain,
             a.bag_scheduler,
+            a.admit_shards,
             sticky_assign,
             a.per_block,
             pin_cores,
@@ -1773,6 +1783,7 @@ fn main() -> anyhow::Result<()> {
                 dispatch_by_sender,
                 eager_chain,
                 bag_scheduler: true,
+                admit_shards: 0,
                 sticky_assign,
                 keep_hot: false,
                 tail_on_workers: true,
