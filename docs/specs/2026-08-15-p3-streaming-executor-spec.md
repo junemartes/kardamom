@@ -734,3 +734,48 @@ through a pool-level job slot with lifetime erasure — the tail blocks
 until all chunks finish, which is the same guarantee `thread::scope`
 gives, so the unsafe is contained and testable. Worth ~0.5ms/block
 (~7% on micro-tx blocks, ~3% at contract weight).
+
+### Sharded admission — built, measured, DEFAULT OFF (2026-08-16)
+
+Implemented per the design above with one simplification: discovery is
+BATCHED (512 txs), so the batch boundary is the synchronization point
+and the per-shard `|S_j|` guards are unnecessary — one router guard,
+dropped after the flush, is enough. Router keeps the per-tx serial work
+(slot store, node init, barrier edge); lanes own one cell-space shard
+each and run on the CALLER cores.
+
+Measured (4k blocks, w=4, quiet box, seq pinned), K=0 vs K=2:
+
+    transfers    1.30 -> 1.41x   feed 21.7 -> 12.7ms   util 62 -> 77%
+    parcounter   3.32 -> 3.24x   (3 paired reps each; feed 8.5 -> 10.0)
+    uniswap      2.62 -> 2.65x   (single rep, within noise)
+    partransfer  2.36 -> 2.29x
+    defi         1.35 -> 1.28x
+
+K sweep on transfers: k=2 1.41x, k=3 1.36x, k=4 1.38x — two physical
+caller cores, so K=2 is the optimum and more shards only add
+contention.
+
+DECISION: `admit_shards` stays 0 by default and is documented as a
+workload knob. Sharding pays exactly where the model said the feed
+binds — cheap transactions — and costs a little where it does not
+(contract-heavy blocks spend 6-8% of their time in the feed, so there
+is nothing to win and caller-core contention to lose). Turn it on for
+transfer-heavy deployments; leave it off otherwise. It becomes broadly
+correct at w>=8, where the feed binds for more workloads.
+
+Two defects found on the way, both worth remembering:
+
+- Per-shard table capacity was `MAX_BLOCK_TXS*4/K`, which is not a
+  power of two for K=3 — and `TouchTable` probes with `index & mask`,
+  so the walk reached a subset of slots and `upsert` spun FOREVER once
+  that subset filled. `TouchTable::new` now asserts power-of-two.
+- The test suite missed it: k=1..4 cases used 24-tx blocks, which never
+  fill a table. A hash-table test that never applies load only tests
+  the empty case. Added a 1500-tx pressure case.
+
+### Goal metric after the tail work
+
+parcounter cw100, 4k blocks, w=4, three clean reps: 3.29 / 3.37 / 3.30
+= **3.32x mean** — the campaign's best, up from 3.07 before persistent
+tail lanes.
