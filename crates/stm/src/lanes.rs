@@ -41,6 +41,14 @@ struct Shared {
     /// Current job, generation-stamped so a lane never runs a stale one.
     job: Mutex<Option<Job>>,
     wake: Condvar,
+    /// Signalled by the last lane to finish, so the caller can BLOCK
+    /// instead of spinning. Spinning here is fine when the lanes have
+    /// their own cores and catastrophic when they do not: with three
+    /// admission lanes on two physical caller cores, a spin-only wait
+    /// turned a 4-minute benchmark into 11+ minutes, because the waiter
+    /// was competing with the lanes it was waiting for.
+    done: Condvar,
+    done_lock: Mutex<()>,
     generation: AtomicU64,
     n_chunks: AtomicUsize,
     next_chunk: AtomicUsize,
@@ -62,6 +70,8 @@ impl LanePool {
         let shared = Arc::new(Shared {
             job: Mutex::new(None),
             wake: Condvar::new(),
+            done: Condvar::new(),
+            done_lock: Mutex::new(()),
             generation: AtomicU64::new(0),
             n_chunks: AtomicUsize::new(0),
             next_chunk: AtomicUsize::new(0),
@@ -109,7 +119,11 @@ impl LanePool {
                                 // out once.
                                 unsafe { (job.call)(job.data, i) };
                             }
-                            sh.active.fetch_sub(1, Ordering::AcqRel);
+                            if sh.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+                                // Last one out wakes the caller.
+                                let _g = sh.done_lock.lock().expect("lane done poisoned");
+                                sh.done.notify_all();
+                            }
                         }
                     })
                     .expect("lane spawn"),
@@ -154,16 +168,26 @@ impl LanePool {
             self.shared.generation.fetch_add(1, Ordering::AcqRel);
         }
         self.shared.wake.notify_all();
-        // Wait out the lanes. Spin first — a chunk is tens of microseconds
-        // — then yield rather than burn a caller core.
+        // Wait out the lanes: a short spin catches the common case where
+        // the chunks are tens of microseconds, then BLOCK. Never spin
+        // indefinitely — the lanes may be sharing this thread's core.
         let mut spins = 0u32;
         while self.shared.active.load(Ordering::Acquire) != 0 {
             spins += 1;
-            if spins < 512 {
+            if spins < 256 {
                 std::hint::spin_loop();
-            } else {
-                std::thread::yield_now();
+                continue;
             }
+            let mut g = self.shared.done_lock.lock().expect("lane done poisoned");
+            while self.shared.active.load(Ordering::Acquire) != 0 {
+                let (ng, _) = self
+                    .shared
+                    .done
+                    .wait_timeout(g, std::time::Duration::from_micros(200))
+                    .expect("lane done poisoned");
+                g = ng;
+            }
+            break;
         }
         // Drop the job so a spurious wake cannot re-run it.
         let mut g = self.shared.job.lock().expect("lane job poisoned");

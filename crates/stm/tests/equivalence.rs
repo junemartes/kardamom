@@ -1287,7 +1287,36 @@ fn sharded_admission_byte_identical() {
         }
     }
 
-    // 3. Lying stats: mispredicted footprints race, so validation and
+    // 3. TABLE PRESSURE: a block big enough to fill the per-shard
+    //    tables. The 24-tx cases above pass even with a broken probe
+    //    walk (they never fill a table); this one is what catches a
+    //    mis-sized shard table — the real bug it was written for made
+    //    `upsert` spin forever at k=3.
+    let many: Vec<TxEnvelope> = (0..1500u64)
+        .map(|n| {
+            let s = &sg[(n % 4) as usize];
+            tx(
+                s,
+                n / 4,
+                TxKind::Call(sg[((n + 1) % 4) as usize].address()),
+                1,
+                &[],
+            )
+        })
+        .collect();
+    let recs_many = records(many);
+    let seq_many = execute_block_sequential(&database, None, env(), &recs_many).unwrap();
+    for shards in [2, 3, 5] {
+        let out = run_sharded(&recs_many, &Stats::default(), 4, shards);
+        assert_identical(
+            &seq_many,
+            &out.receipts,
+            &out.delta,
+            &format!("sharded pressure k={shards}"),
+        );
+    }
+
+    // 4. Lying stats: mispredicted footprints race, so validation and
     //    repair must still land on identical bytes under sharding.
     let lying = {
         let obs: Vec<TxObs> = (0..4)

@@ -1049,6 +1049,14 @@ pub(crate) struct TouchTable {
 
 impl TouchTable {
     fn new(capacity_pow2: usize) -> Self {
+        // NOT a debug_assert: with a non-power-of-two capacity the
+        // `& mask` probe walk reaches only a subset of the slots, and
+        // `upsert` spins forever once that subset fills. Cheap to check
+        // once per table, impossible to diagnose later.
+        assert!(
+            capacity_pow2.is_power_of_two(),
+            "TouchTable capacity must be a power of two, got {capacity_pow2}"
+        );
         Self {
             slots: (0..capacity_pow2)
                 .map(|_| TouchSlot {
@@ -2078,7 +2086,10 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             touch: std::cell::RefCell::new(TouchTable::new(MAX_BLOCK_TXS * 4)),
             shards: std::sync::Arc::new(ShardTables::new(
                 cfg_admit_shards.max(1),
-                (MAX_BLOCK_TXS * 4) / cfg_admit_shards.max(1),
+                // Per shard, rounded UP to a power of two: the probe walk
+                // requires it, and rounding down would also crowd the
+                // table (cells do not divide evenly across shards).
+                ((MAX_BLOCK_TXS * 4) / cfg_admit_shards.max(1)).next_power_of_two(),
             )),
             admit_lanes: (cfg_admit_shards > 0).then(|| {
                 // Caller cores: the worker cores stay dedicated to
