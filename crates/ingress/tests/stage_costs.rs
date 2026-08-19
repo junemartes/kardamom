@@ -85,6 +85,35 @@ fn ingress_stage_costs() {
         std::hint::black_box(secp.recover_ecdsa(*msg, sig).unwrap());
     }
     let libsecp = t.elapsed().as_nanos() as f64 / sigs.len() as f64;
+    // Does recovery scale across threads? (The batch verifier's
+    // process_batch runs them in a plain sequential loop today.)
+    for threads in [1usize, 2, 4] {
+        let chunk = envs.len() / threads;
+        let t = std::time::Instant::now();
+        std::thread::scope(|sc| {
+            for w in 0..threads {
+                let envs = &envs;
+                let raws = &raws;
+                sc.spawn(move || {
+                    let lo = w * chunk;
+                    let hi = if w == threads - 1 { envs.len() } else { lo + chunk };
+                    for i in lo..hi {
+                        std::hint::black_box(
+                            kardamom_ingress::sig_verify::recover_single(&envs[i], &raws[i]).unwrap(),
+                        );
+                    }
+                });
+            }
+        });
+        let el = t.elapsed().as_secs_f64();
+        eprintln!(
+            "INGRESS recovery threads={threads}: {:.0} tx/s ({:.1}x vs 1 thread, {:.1} µs/tx effective)",
+            envs.len() as f64 / el,
+            (envs.len() as f64 / el) / (1e9 / recover),
+            el * 1e6 / envs.len() as f64
+        );
+    }
+
     eprintln!(
         "INGRESS recovery backends: k256 {:.0} ns/tx | libsecp256k1 {libsecp:.0} ns/tx => {:.1}x, {:.0} tx/s per core",
         recover - hash,
