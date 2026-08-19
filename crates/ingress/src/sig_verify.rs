@@ -146,24 +146,46 @@ impl BatchVerifier {
         }
         // Below the threshold, splitting costs more than it saves: one
         // chunk is 42µs of work against a spawn_blocking hop.
-        let chunks = if batch.len() < PARALLEL_THRESHOLD || parallelism <= 1 {
+        let workers = if batch.len() < PARALLEL_THRESHOLD || parallelism <= 1 {
             1
         } else {
             parallelism.min(batch.len())
         };
-        let per = batch.len().div_ceil(chunks);
-        let mut handles = Vec::with_capacity(chunks);
-        let mut rest = batch;
-        while !rest.is_empty() {
-            let take = per.min(rest.len());
-            let tail = rest.split_off(take);
-            let head = std::mem::replace(&mut rest, tail);
+        if workers == 1 {
+            let _ = tokio::task::spawn_blocking(move || Self::recover_chunk(batch)).await;
+            return;
+        }
+        // A SHARED CURSOR, not a split. `split_off` reallocates and copies
+        // the remaining TAIL once per chunk — a 64-deep ring cut into 8
+        // chunks moves 224 requests through 7 progressively smaller
+        // allocations, which the CI allocation gate caught as +1374 B/op
+        // over the 4254 B/op baseline (allocs/op was unchanged: few
+        // allocations, large ones). Handing every worker the same iterator
+        // moves each request exactly once and allocates one Arc for the
+        // whole batch. It also load-balances: recovery is uniform per
+        // signature, but the blocking pool's threads are not, and a worker
+        // that starts late simply takes fewer requests.
+        //
+        // Lock cost is irrelevant here — one uncontended acquire per
+        // request against 42µs of ECDSA on the other side of it.
+        let cursor = Arc::new(std::sync::Mutex::new(batch.into_iter()));
+        let mut handles = Vec::with_capacity(workers);
+        for _ in 0..workers {
+            let cursor = cursor.clone();
             handles.push(tokio::task::spawn_blocking(move || {
-                Self::recover_chunk(head);
+                loop {
+                    let next = cursor
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .next();
+                    let Some(req) = next else { break };
+                    let res = recover_single(&req.env, &req.raw_tx);
+                    let _ = req.respond.send(res);
+                }
             }));
         }
         for h in handles {
-            // A panicking chunk drops its senders, so the awaiting
+            // A panicking worker drops its senders, so the awaiting
             // callers see the verifier as gone rather than hanging.
             let _ = h.await;
         }
