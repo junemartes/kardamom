@@ -49,7 +49,7 @@ fn retry_must_deliver(
 }
 
 pub(crate) fn spawn_commit<C>(
-    mut c_pub: C,
+    mut tx_receipts_pub: C,
     rx: Receiver<ExecToCommit>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
@@ -102,7 +102,7 @@ where
                 let mut attempts: u32 = 0;
                 let mut from = 0usize;
                 while from < receipts.len() {
-                    let (published, err) = c_pub.publish_receipts(&receipts[from..]);
+                    let (published, err) = tx_receipts_pub.publish_receipts(&receipts[from..]);
                     from += published;
                     if let Some(e) = err {
                         retry_must_deliver(
@@ -114,7 +114,7 @@ where
                 }
                 if let Some(b) = boundary {
                     let mut attempts: u32 = 0;
-                    while let Err(e) = c_pub.publish(CMessage::BlockBoundary(b.clone())) {
+                    while let Err(e) = tx_receipts_pub.publish(CMessage::BlockBoundary(b.clone())) {
                         retry_must_deliver(
                             &mut attempts,
                             e,

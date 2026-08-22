@@ -11,7 +11,7 @@ use kardamom_types::BlockBoundaryStart;
 use revm::primitives::KECCAK_EMPTY;
 
 use crate::exec_types::TxIndex;
-use crate::reader::ReaderToExec;
+use crate::reader::{NoEpochCheck, ReaderToExec};
 use crate::state::{MockStateDatabase, StaticSnapshotSource};
 
 use super::test_support::{ImmediateCommit, RecordingQueue, StagedCommit, legacy, pos};
@@ -88,7 +88,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -163,7 +163,7 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -235,7 +235,7 @@ fn exec_settles_inflight_commits_while_idle() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
 
     // The writer catches up on its own; the exec thread must notice via

@@ -28,10 +28,10 @@ use revm::state::Bytecode;
 use kardamom_executor::block_env::ExecEnv;
 use kardamom_executor::executor::execute_tx;
 use kardamom_executor::{
-    BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, PendingDelta, StateWriterSignal, TxDataSubscription,
-    TxEnvelope as KtTxEnvelope, TxIndex, TxOrderingMessage, TxOrderingSubscription,
-    TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
+    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, PendingDelta,
+    RoleHooks, Start, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope, TxIndex,
+    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
@@ -172,11 +172,11 @@ fn bench_sstore_step(c: &mut Criterion) {
 }
 
 // Actor end-to-end: BATCH txs per iter; reports throughput in tx/s.
-struct ChanASub {
+struct ChanTxDataSub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
 }
-impl TxDataSubscription for ChanASub {
+impl TxDataSubscription for ChanTxDataSub {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -189,14 +189,14 @@ impl TxDataSubscription for ChanASub {
             })
     }
 }
-struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
-impl TxOrderingSubscription for ChanBSub {
+struct ChanTxOrderingSub(Receiver<(BPosition, TxOrderingMessage)>);
+impl TxOrderingSubscription for ChanTxOrderingSub {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::TxOrderingClosed)
     }
 }
-struct ChanCPub(Sender<CMessage>);
-impl TxReceiptsPublication for ChanCPub {
+struct ChanReceiptsPub(Sender<CMessage>);
+impl TxReceiptsPublication for ChanReceiptsPub {
     fn publish(&mut self, m: CMessage) -> Result<(), ExecutorError> {
         self.0.send(m).map_err(|_| ExecutorError::TxReceiptsClosed)
     }
@@ -209,6 +209,18 @@ impl StateWriterSignal for Imm {
     fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
         Ok(b)
     }
+}
+
+/// Port types for the bench's channel-backed fakes.
+struct BenchWiring;
+impl EngineWiring for BenchWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
+    type Snapshots = MutatingSnapshotSource;
+    type WriterSignal = Imm;
+    type WriterQueue = WriterApplyingQueue;
+    type Epoch = NoEpochCheck;
 }
 
 fn bench_actor_throughput(c: &mut Criterion) {
@@ -264,33 +276,30 @@ fn bench_actor_throughput(c: &mut Criterion) {
             drop(a_tx);
             drop(b_tx);
 
-            let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(ChanASub {
+            let tx_data_subs = vec![ChanTxDataSub {
                 sequencer_id: 0,
                 rx: a_rx,
-            })];
-            let b_sub: Box<dyn TxOrderingSubscription> = Box::new(ChanBSub(b_rx));
+            }];
             let h = thread::spawn(move || {
-                Executor::run(
+                Executor::run::<BenchWiring>(
                     ExecutorConfig {
                         chain_id: 1,
                         receipt_queue_depth: 512,
                         ..Default::default()
                     },
-                    a_subs,
-                    b_sub,
-                    ChanCPub(c_tx),
-                    snapshots,
-                    Imm,
-                    writer_q,
-                    0,
-                    None,
-                    None,
-                    // Whole-block exec strategy (validator parallel path).
-                    None,
-                    None,
-                    // The executor trusts the ordered stream (phase 2 would
-                    // give it its own L1 dependency); only the validator verifies.
-                    None,
+                    Inbound {
+                        tx_data: tx_data_subs,
+                        tx_ordering: ChanTxOrderingSub(b_rx),
+                        join_recovery: None,
+                    },
+                    Outbound {
+                        tx_receipts: ChanReceiptsPub(c_tx),
+                        snapshots,
+                        writer_signal: Imm,
+                        writer_queue: writer_q,
+                    },
+                    Start::default(),
+                    RoleHooks::none(),
                 )
             });
 
