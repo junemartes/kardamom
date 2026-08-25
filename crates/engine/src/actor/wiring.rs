@@ -125,6 +125,11 @@ pub struct RoleHooks<W: EngineWiring> {
     /// EIP-7928 capture hand-off to the BAL publisher thread (executor
     /// role); `None` skips capture entirely.
     pub bal_capture: Option<Sender<BalHandoff>>,
+    /// P1 footprint shadow (`crate::shadow`): per-block capture handoff to
+    /// the grader thread (executor role, `KARDAMOM_FOOTPRINT_SHADOW=1`);
+    /// `None` skips capture entirely. Ignored on the whole-block
+    /// (validator) path — captures ride the streaming arm.
+    pub footprint_shadow: Option<Sender<crate::shadow::ShadowBlock>>,
     /// Whole-block execution strategy (validator parallel path); `None`
     /// keeps the per-tx streaming path untouched.
     pub block_exec: Option<BlockExec<SnapshotDb<W>>>,
@@ -139,6 +144,7 @@ impl<W: EngineWiring> RoleHooks<W> {
     pub fn none() -> Self {
         Self {
             bal_capture: None,
+            footprint_shadow: None,
             block_exec: None,
             epoch_observer: None,
         }

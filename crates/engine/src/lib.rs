@@ -19,6 +19,7 @@ pub mod metrics;
 pub mod persist;
 pub mod reader;
 pub mod replay;
+pub mod shadow;
 pub mod state;
 
 // The pure state-transition slice lives in `kardamom-exec-core` (`no_std`,

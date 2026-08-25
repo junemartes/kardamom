@@ -1,0 +1,30 @@
+[package]
+name = "kardamom-stm"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "kardamom_stm"
+path = "src/lib.rs"
+
+[dependencies]
+core_affinity = "0.8"
+kardamom-exec-core = { workspace = true }
+kardamom-footprint = { path = "../footprint" }
+kardamom-types = { workspace = true }
+alloy-primitives.workspace = true
+alloy-consensus.workspace = true
+bytes = "1"
+revm.workspace = true
+tracing.workspace = true
+crossbeam-queue = "0.3.13"
+smallvec.workspace = true
+
+[dev-dependencies]
+alloy-eips.workspace = true
+alloy-network.workspace = true
+alloy-signer-local.workspace = true
+
+[features]
+# Forwarded to exec-core (assembly keccak; native builds only).
+asm-keccak = ["kardamom-exec-core/asm-keccak"]

@@ -137,7 +137,10 @@ pub(super) fn write_set_from_cache(state: &revm::database::Cache) -> WriteSet {
     ws
 }
 
-pub(super) fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
+/// Public: the Block-STM engine (`kardamom-stm`) builds per-tx write sets
+/// from its own revm outcomes with exactly these emission rules — touched
+/// accounts, changed slots, created code only.
+pub fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSet {
     let mut ws = WriteSet::default();
     for (addr, account) in state.iter() {
         // Only emit accounts revm marked as touched. Untouched entries are
@@ -180,7 +183,8 @@ pub(super) fn write_set_from_evm_state(state: &revm::state::EvmState) -> WriteSe
     ws
 }
 
-pub(super) fn wire_log(log: &Log) -> WireLog {
+/// Public: the Block-STM engine mirrors the receipt log encoding.
+pub fn wire_log(log: &Log) -> WireLog {
     WireLog {
         address: log.address,
         topics: log.data.topics().to_vec(),

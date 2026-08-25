@@ -32,6 +32,25 @@ pub const BAL_ENCODE_SECONDS: &str = "kardamom_executor_bal_encode_seconds";
 pub const BAL_PUBLISH_TOTAL: &str = "kardamom_executor_bal_publish_total";
 pub const BAL_RETAINED_BLOCKS: &str = "kardamom_executor_bal_retained_blocks";
 
+/// P1 footprint shadow (spec: block-stm-executor §P1) — emitted by the
+/// `footprint-shadow` thread (`crate::shadow`), executor role only, behind
+/// `KARDAMOM_FOOTPRINT_SHADOW=1`. The spec's `footprint_prediction_hit_rate`
+/// / `footprint_false_independent_total` names, namespaced like every other
+/// executor series.
+pub const FOOTPRINT_BLOCKS_TOTAL: &str = "kardamom_executor_footprint_blocks_total";
+pub const FOOTPRINT_PREDICTION_HIT_RATE: &str = "kardamom_executor_footprint_prediction_hit_rate";
+pub const FOOTPRINT_FALSE_INDEPENDENT_TOTAL: &str =
+    "kardamom_executor_footprint_false_independent_total";
+pub const FOOTPRINT_FALSE_EDGE_TOTAL: &str = "kardamom_executor_footprint_false_edge_total";
+pub const FOOTPRINT_COLD_TX_TOTAL: &str = "kardamom_executor_footprint_cold_tx_total";
+pub const FOOTPRINT_ACCUMULATOR_READ_TOTAL: &str =
+    "kardamom_executor_footprint_accumulator_read_total";
+pub const FOOTPRINT_PREDICTED_WAVES: &str = "kardamom_executor_footprint_predicted_waves";
+pub const FOOTPRINT_PREDICTED_WIDTH: &str = "kardamom_executor_footprint_predicted_width";
+pub const FOOTPRINT_PREDICTED_EDGES: &str = "kardamom_executor_footprint_predicted_edges";
+pub const FOOTPRINT_PREDICTED_CP_RATIO: &str = "kardamom_executor_footprint_predicted_cp_ratio";
+pub const FOOTPRINT_ORACLE_CP_RATIO: &str = "kardamom_executor_footprint_oracle_cp_ratio";
+
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
 // The invalid-tx-skip counter is emitted from inside the `no_std` exec core
 // (`invalid_skip`), so the constant and its `record_` helper live there;
@@ -64,5 +83,49 @@ pub fn describe() {
     metrics::describe_counter!(
         RESYNC_TOTAL,
         "full-resync fallbacks after a cluster replay-window overrun, by outcome"
+    );
+    metrics::describe_counter!(
+        FOOTPRINT_BLOCKS_TOTAL,
+        "footprint-shadow blocks, labelled by outcome (graded|dropped)"
+    );
+    metrics::describe_gauge!(
+        FOOTPRINT_PREDICTION_HIT_RATE,
+        "per-block share of actual (non-excluded) cells the footprint predictor contained"
+    );
+    metrics::describe_counter!(
+        FOOTPRINT_FALSE_INDEPENDENT_TOTAL,
+        "true-conflicting tx pairs predicted independent — the dangerous miss class (would abort under STM)"
+    );
+    metrics::describe_counter!(
+        FOOTPRINT_FALSE_EDGE_TOTAL,
+        "predicted-conflicting tx pairs with no true conflict — over-merge, forfeited parallelism"
+    );
+    metrics::describe_counter!(
+        FOOTPRINT_COLD_TX_TOTAL,
+        "graded txs with an untrained selector (wildcard/Tail lane)"
+    );
+    metrics::describe_counter!(
+        FOOTPRINT_ACCUMULATOR_READ_TOTAL,
+        "txs whose execution took a pure BALANCE read of the fee sink (P2 Accumulator-guard trigger rate)"
+    );
+    metrics::describe_gauge!(
+        FOOTPRINT_PREDICTED_WAVES,
+        "per-block level count of the predicted dependency DAG"
+    );
+    metrics::describe_gauge!(
+        FOOTPRINT_PREDICTED_WIDTH,
+        "per-block widest level of the predicted dependency DAG"
+    );
+    metrics::describe_gauge!(
+        FOOTPRINT_PREDICTED_EDGES,
+        "per-block predicted direct-conflict pair count"
+    );
+    metrics::describe_gauge!(
+        FOOTPRINT_PREDICTED_CP_RATIO,
+        "per-block gas / predicted critical-path gas — the schedule's speedup bound"
+    );
+    metrics::describe_gauge!(
+        FOOTPRINT_ORACLE_CP_RATIO,
+        "per-block gas / true critical-path gas — the bound no predictor beats"
     );
 }

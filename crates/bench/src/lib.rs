@@ -11,6 +11,7 @@ pub mod mnemonic;
 pub mod perf;
 pub mod report;
 pub mod signers;
+pub mod stm;
 pub mod workflow;
 pub mod workflows;
 

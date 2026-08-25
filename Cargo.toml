@@ -27,15 +27,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-flame = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
-humantime-serde = "1"
 toml = "1"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 hdrhistogram = "7"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
-
-# Deposit bridge: OP wire types plus dev-only e2e helpers.
-op-alloy-consensus = "2"
 alloy-provider = "2.0"
 alloy-contract = "2.0"
 alloy-sol-types = { version = "1.6", features = ["json"] }
@@ -47,7 +43,6 @@ kardamom-log = { path = "crates/log" }
 kardamom-engine = { path = "crates/engine" }
 kardamom-validator = { path = "crates/validator" }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "bytes-1"] }
-io-uring = "0.7"
 # NOTE: rusteron's `static` feature links Aeron statically but is broken on
 # Linux release builds (rust-lld "undefined symbol: aeron_*"; the crate's own
 # build.rs flags static on Linux as unreliable). So we link Aeron DYNAMICALLY

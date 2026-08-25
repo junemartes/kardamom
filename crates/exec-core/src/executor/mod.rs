@@ -29,9 +29,9 @@ mod write_set;
 
 pub use db::{SnapshotDb, SnapshotRef, StateRefError};
 pub use deposit::execute_deposit_tx;
-pub use scope::{ExecScope, execute_tx};
+pub use scope::{ExecScope, TouchSet, execute_tx, invalid_skip};
 pub use tx_env::{decode_alloy_envelope, tx_env_from_alloy};
-pub use write_set::record_writeset_into_bal;
+pub use write_set::{record_writeset_into_bal, wire_log, write_set_from_evm_state};
 
 #[cfg(test)]
 pub(crate) mod test_support {
