@@ -39,7 +39,8 @@ contract Inbox {
     /// @notice Selector the auto-enqueued response carries back to the
     ///         origin-side callback target:
     ///         `onXChainResult(bool success, bytes32 returnDataHash, bytes32 context)`.
-    bytes4 public constant RESPONSE_SELECTOR = bytes4(keccak256("onXChainResult(bool,bytes32,bytes32)"));
+    bytes4 public constant RESPONSE_SELECTOR =
+        bytes4(keccak256("onXChainResult(bool,bytes32,bytes32)"));
 
     /// @notice Deliver one derived cross-chain message. Callable only by the
     ///         aliased origin Outbox (see contract docs).
@@ -63,6 +64,10 @@ contract Inbox {
         // reverts rather than reading stale identity.
         _xdOrigin = originChainId;
         _xdSender = originSender;
+        // A low-level call is the POINT here: the inner call's revert must be
+        // recorded as a failed delivery (and trigger the callback), never
+        // bubble up and fail the delivery tx itself — the deposit posture.
+        // solhint-disable-next-line avoid-low-level-calls
         (bool ok, bytes memory ret) = target.call{gas: gasLimit}(data);
         _xdOrigin = 0;
         _xdSender = address(0);
@@ -83,14 +88,19 @@ contract Inbox {
         if (!XChain.isNone(cb)) {
             // The response is an ordinary message on this chain's own Outbox,
             // sent WITHOUT a callback — depth is capped at one by
-            // construction, so auto-responses can never ping-pong.
-            Outbox(XChain.OUTBOX).sendMessage(
-                originChainId,
-                cb.target,
-                cb.gasLimit,
-                abi.encodeWithSelector(RESPONSE_SELECTOR, ok, keccak256(ret), cb.context),
-                XChain.Callback(address(0), 0, bytes32(0))
-            );
+            // construction, so auto-responses can never ping-pong. The
+            // returned seq is deliberately dropped: the response's identity
+            // travels in the Outbox's own MessageSent event / commitment, and
+            // the Inbox records nothing per-response.
+            // slither-disable-next-line unused-return
+            Outbox(XChain.OUTBOX)
+                .sendMessage(
+                    originChainId,
+                    cb.target,
+                    cb.gasLimit,
+                    abi.encodeWithSelector(RESPONSE_SELECTOR, ok, keccak256(ret), cb.context),
+                    XChain.Callback(address(0), 0, bytes32(0))
+                );
         }
     }
 

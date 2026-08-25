@@ -120,7 +120,9 @@ contract OutboxTest is Test {
             SELF, DEST, 0, address(this), address(0xBEEF), 0, 200_000, keccak256(data), bytes32(0)
         );
         vm.expectEmit(true, true, true, true);
-        emit MessageSent(DEST, 0, address(this), address(0xBEEF), 0, 200_000, data, expected, noCb());
+        emit MessageSent(
+            DEST, 0, address(this), address(0xBEEF), 0, 200_000, data, expected, noCb()
+        );
         outbox.sendMessage(DEST, address(0xBEEF), 200_000, data, noCb());
         assertTrue(outbox.sentMessages(expected));
     }

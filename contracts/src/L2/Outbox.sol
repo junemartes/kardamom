@@ -14,6 +14,11 @@ import {XChain} from "./XChain.sol";
 ///         (never trusted from the event).
 /// @dev    Genesis predeploy at `XChain.OUTBOX`: runtime bytecode seeded at a
 ///         fixed address, not upgradeable, no constructor-time state.
+// `sendMessage` is payable ONLY for ABI stability with the value-transfer
+// phase (spec §13); until that ships it requires `msg.value == 0`, so no ether
+// can ever accumulate here and a withdraw function would be dead code. The
+// L2ToL1MessagePasser carries the same suppression for the same reason.
+// slither-disable-next-line locked-ether
 contract Outbox {
     /// @notice Next sequence number per destination chain. Dense per pair —
     ///         the destination enforces its no-skip rule on exactly this
@@ -80,6 +85,8 @@ contract Outbox {
             XChain.hashCallback(cb)
         );
         sentMessages[msgHash] = true;
-        emit MessageSent(destChainId, seq, msg.sender, target, msg.value, gasLimit, data, msgHash, cb);
+        emit MessageSent(
+            destChainId, seq, msg.sender, target, msg.value, gasLimit, data, msgHash, cb
+        );
     }
 }

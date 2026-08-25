@@ -31,7 +31,9 @@ library XChain {
     function aliasRemote(uint64 originChainId, address sender) internal pure returns (address) {
         return address(
             uint160(
-                uint256(keccak256(abi.encodePacked("KARDAMOM_XCHAIN_ALIAS_V0", originChainId, sender)))
+                uint256(
+                    keccak256(abi.encodePacked("KARDAMOM_XCHAIN_ALIAS_V0", originChainId, sender))
+                )
             )
         );
     }
@@ -76,7 +78,16 @@ library XChain {
     ) internal pure returns (bytes32) {
         return keccak256(
             abi.encode(
-                LEAF_DOMAIN, originChainId, destChainId, seq, sender, target, value, gasLimit, dataHash, cbHash
+                LEAF_DOMAIN,
+                originChainId,
+                destChainId,
+                seq,
+                sender,
+                target,
+                value,
+                gasLimit,
+                dataHash,
+                cbHash
             )
         );
     }
