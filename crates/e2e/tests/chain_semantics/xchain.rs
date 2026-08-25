@@ -213,15 +213,45 @@ async fn s13_xchain_da_parity() {
         .expect("S13 L1 batch log");
     let recon_dir = tempfile::tempdir().expect("recon dir");
     let genesis = e2e::harness::services::repo_root().join("chains/dev-interop.toml");
-    da_parity::reconstruct_and_compare(
+    if let Err(e) = da_parity::reconstruct_and_compare(
         &l1.rpc_url(),
         l1.settlement,
         da_dir.path(),
         &genesis,
         recon_dir.path(),
         expected_root,
-    )
-    .expect("S13 DA parity");
+    ) {
+        // FORENSICS before the panic: a root mismatch from two opaque hashes
+        // is undiagnosable once CI drops the temp dirs (this fired ONCE on a
+        // CI runner and never reproduced locally across contention, repeated
+        // runs, and the same block composition). Name the collected set and
+        // the first differing rows table-by-table so the next occurrence is
+        // attributable from the log alone. (headers/receipts rows differ
+        // benignly: replay synthesizes timestamps and carries l1_origin 0 —
+        // the accounts/storage lines are the signal.)
+        eprintln!("S13 collected canonical set:");
+        for b in &canonical.blocks {
+            eprintln!(
+                "  block {}: {} record(s), {} tx(s)",
+                b.block_number,
+                b.remote_epochs.len(),
+                b.txs.len()
+            );
+        }
+        match xchain_da_parity::state_diff(recon_dir.path(), &exec_dir) {
+            Ok(diffs) if diffs.is_empty() => {
+                eprintln!("S13 deep_compare: no table diffs (?)")
+            }
+            Ok(diffs) => {
+                eprintln!("S13 deep_compare (reconstructed vs live executor):");
+                for d in diffs {
+                    eprintln!("  {d}");
+                }
+            }
+            Err(de) => eprintln!("S13 deep_compare failed: {de:#}"),
+        }
+        panic!("S13 DA parity: {e:#}");
+    }
 
     // 6. The rebuilt DB reproduces the interop substance: lane state equal to
     //    the live executor's, receiver calldata intact, 0x7D receipts
