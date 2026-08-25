@@ -24,7 +24,7 @@ use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_executor::{
     CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, Inbound,
     MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, Start, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
+    RoleHooks, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
@@ -298,21 +298,18 @@ async fn main() -> Result<()> {
     // the cluster client replays the canonical stream FROM this cursor and the
     // reader/exec threads seed their absolute counters from it (see
     // `ResumePoint`).
-    let resume = if recovery.last_committed_block > 0 {
-        let rp = ResumePoint {
-            block: recovery.last_committed_block,
-            record_count: recovery.last_fsynced_b_position.as_index(),
-            l2_timestamp: recovery.last_committed_l2_timestamp,
-        };
+    let start = ResumePoint {
+        block: recovery.last_committed_block,
+        record_count: recovery.last_fsynced_b_position.as_index(),
+        l2_timestamp: recovery.last_committed_l2_timestamp,
+    };
+    if start.is_resume() {
         tracing::info!(
-            resume_block = rp.block,
-            resume_record_count = rp.record_count,
+            resume_block = start.block,
+            resume_record_count = start.record_count,
             "resuming from persisted state cursor via cluster canonical replay"
         );
-        Some(rp)
-    } else {
-        None
-    };
+    }
 
     // M tx_data subscriptions + tx_deposits, async→sync bridged (shared with
     // the validator binary — see `bin_support`). ALWAYS live: the down-window
@@ -320,8 +317,7 @@ async fn main() -> Result<()> {
     // against the remote durability archives (the resume-gated replay-merge
     // this replaces pointed at the consumer's LOCAL archive, which records
     // neither stream — a resuming process had no tx_data source at all).
-    let tx_data_subs: Vec<Box<dyn TxDataSubscription>> =
-        bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -344,12 +340,12 @@ async fn main() -> Result<()> {
     let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
         args.aeron_dir.as_deref(),
         file_cfg.cluster.to_live(),
-        bin_support::cluster_replay_cursor(resume.as_ref()),
+        bin_support::cluster_replay_cursor(&start),
     )?;
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
     // The executor is the blessed emitter of the kardamom_sealer_* re-export
     // (default-on in the shared subscription; the validator suppresses it).
-    let tx_ordering_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
+    let tx_ordering_sub = cluster_sub;
 
     // tx_receipts publication. With MDS (fan-in) enabled, this replica
     // publishes both the receipt stream and the boundary side-stream to its
@@ -439,9 +435,7 @@ async fn main() -> Result<()> {
     // loudly hands recovery to the designed loop: nomad restarts the task and
     // crash recovery replays the tx_data gap from the archive. See
     // `bounded_join_timeout` for why the fresh-start bound exceeds resume's.
-    cfg.reader.join_timeout = bin_support::bounded_join_timeout(resume.is_some());
-    // Resume at the persisted cursor — 0 for a fresh genesis DB.
-    let initial_block = recovery.last_committed_block;
+    cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
 
     // Block-STM execution strategy (opt-in): the pool server spins up at
     // startup and lives for the process; blocks route through it at each
@@ -488,13 +482,10 @@ async fn main() -> Result<()> {
                 writer_signal,
                 writer_queue,
             },
-            // On crash recovery `resume` carries the persisted cursor; the
-            // cluster source replays from it and the reader/exec counters seed
-            // from it. `None` on a fresh start.
-            Start {
-                initial_block,
-                resume,
-            },
+            // The persisted cursor (GENESIS-valued on a fresh DB): the
+            // cluster source replays from it and the reader/exec counters
+            // seed from it.
+            start,
             RoleHooks {
                 // EIP-7928 capture handoff.
                 bal_capture: Some(bal_tx),
@@ -578,14 +569,14 @@ async fn main() -> Result<()> {
 // Role-specific adapter: tx_receipts publication.
 // ---------------------------------------------------------------------------
 
-/// The executor role's port types. The subscriptions stay boxed because the
-/// transport is chosen at runtime (`bin_support::open_tx_data_subs`); the
-/// rest are the concrete mdbx/Aeron implementations.
+/// The executor role's port types: the concrete mdbx/Aeron implementations
+/// throughout — this binary makes no runtime impl choices, so nothing needs
+/// the boxed-wiring escape hatch.
 struct ExecutorWiring;
 
 impl EngineWiring for ExecutorWiring {
-    type TxData = Box<dyn TxDataSubscription>;
-    type TxOrdering = Box<dyn TxOrderingSubscription>;
+    type TxData = bin_support::LiveTxDataSub;
+    type TxOrdering = bin_support::LiveTxOrderingSub;
     type TxReceipts = LiveTxReceiptsPub;
     type Snapshots = MdbxSnapshotSource;
     type WriterSignal = MdbxWriterSignal;

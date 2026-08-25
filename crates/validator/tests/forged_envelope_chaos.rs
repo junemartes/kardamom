@@ -38,8 +38,8 @@ use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use kardamom_engine::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, RoleHooks, Start,
-    StateDatabase, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
+    RoleHooks, StateDatabase, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
     TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 use kardamom_validator::{Divergence, latch_integrity_failure};
@@ -188,7 +188,7 @@ fn run_pipeline(
                 writer_signal: Imm,
                 writer_queue: writer_q,
             },
-            Start::default(),
+            ResumePoint::GENESIS,
             RoleHooks::none(),
         )
     });

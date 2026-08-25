@@ -30,8 +30,9 @@ use kardamom_executor::executor::execute_tx;
 use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, PendingDelta,
-    RoleHooks, Start, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope, TxIndex,
-    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    TxIndex, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef,
+    WriterApplyingQueue,
 };
 
 const SSTORE_42_AT_VAR_KEY: [u8; 8] = [
@@ -298,7 +299,7 @@ fn bench_actor_throughput(c: &mut Criterion) {
                         writer_signal: Imm,
                         writer_queue: writer_q,
                     },
-                    Start::default(),
+                    ResumePoint::GENESIS,
                     RoleHooks::none(),
                 )
             });

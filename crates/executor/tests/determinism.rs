@@ -21,9 +21,9 @@ use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, RoleHooks, Start,
-    StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage,
-    TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
+    RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 
 struct ChanTxDataSub {
@@ -181,7 +181,7 @@ fn run_one(signer: PrivateKeySigner) -> Vec<CMessage> {
                 writer_signal: Imm,
                 writer_queue: writer_q,
             },
-            Start::default(),
+            ResumePoint::GENESIS,
             RoleHooks::none(),
         )
     });

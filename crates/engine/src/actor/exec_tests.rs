@@ -15,7 +15,7 @@ use crate::reader::{NoEpochCheck, ReaderToExec};
 use crate::state::{MockStateDatabase, StaticSnapshotSource};
 
 use super::test_support::{ImmediateCommit, RecordingQueue, legacy, pos};
-use super::{BalHandoff, ExecToCommit, ExecutorConfig, spawn_exec};
+use super::{BalHandoff, ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
 
 #[test]
 fn exec_runs_two_txs_and_emits_slim_boundary() {
@@ -65,8 +65,7 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,
@@ -170,8 +169,7 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,
@@ -235,8 +233,7 @@ fn exec_handoff_carries_a_populated_bal() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         Some(bal_tx),
         None,
         None,
@@ -302,8 +299,7 @@ fn exec_rejects_misaligned_boundary() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,
@@ -359,8 +355,7 @@ fn exec_hands_off_shadow_captures_at_boundary() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         Some(stx),
         None,

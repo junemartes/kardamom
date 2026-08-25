@@ -35,8 +35,7 @@ use clap::Parser;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
     EngineWiring, Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource,
-    MdbxWriterQueue, MdbxWriterSignal, Outbound, ResumePoint, RoleHooks, Start, TxDataSubscription,
-    TxOrderingSubscription, TxReceiptsPublication,
+    MdbxWriterQueue, MdbxWriterSignal, Outbound, ResumePoint, RoleHooks, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
@@ -49,15 +48,15 @@ use kardamom_validator::{
 
 use args::{Args, ValidatorFileConfig, resolve_attester_key};
 
-/// The validator role's port types. The subscriptions and the receipts sink
-/// stay boxed because both are chosen at runtime (transport selection; the
-/// optional attester tee around the receipt sink); the epoch check is the
-/// L1-re-deriving [`epoch_verify::EpochVerifier`].
+/// The validator role's port types. Only the receipts sink stays boxed —
+/// it is genuinely chosen at runtime (the optional attester tee wraps the
+/// plain sink); the epoch check is the L1-re-deriving
+/// [`epoch_verify::EpochVerifier`].
 struct ValidatorWiring;
 
 impl EngineWiring for ValidatorWiring {
-    type TxData = Box<dyn TxDataSubscription>;
-    type TxOrdering = Box<dyn TxOrderingSubscription>;
+    type TxData = bin_support::LiveTxDataSub;
+    type TxOrdering = bin_support::LiveTxOrderingSub;
     type TxReceipts = Box<dyn TxReceiptsPublication>;
     type Snapshots = MdbxSnapshotSource;
     type WriterSignal = MdbxWriterSignal;
@@ -118,28 +117,24 @@ async fn main() -> Result<()> {
         .open()
         .with_context(|| format!("open state env at {}", args.state_dir.display()))?;
     let recovery = read_recovery_point(&env).context("read state recovery point")?;
-    let resume = if recovery.last_committed_block > 0 {
-        let rp = ResumePoint {
-            block: recovery.last_committed_block,
-            record_count: recovery.last_fsynced_b_position.as_index(),
-            l2_timestamp: recovery.last_committed_l2_timestamp,
-        };
+    let start = ResumePoint {
+        block: recovery.last_committed_block,
+        record_count: recovery.last_fsynced_b_position.as_index(),
+        l2_timestamp: recovery.last_committed_l2_timestamp,
+    };
+    if start.is_resume() {
         tracing::info!(
-            resume_block = rp.block,
+            resume_block = start.block,
             "validator resuming from persisted cursor"
         );
-        Some(rp)
-    } else {
-        None
-    };
+    }
 
     // M tx_data subscriptions + tx_deposits (async→sync bridged), identical to
     // the executor: ALWAYS live, with the down-window/lapse gap recovered
     // in-band by the reader's join-miss refetch against the remote durability
     // archives (the resume-gated replay-merge this replaces pointed at the
     // LOCAL archive, which records neither stream).
-    let tx_data_subs: Vec<Box<dyn TxDataSubscription>> =
-        bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -163,14 +158,13 @@ async fn main() -> Result<()> {
     let (cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
         args.aeron_dir.as_deref(),
         file_cfg.cluster.to_live(),
-        bin_support::cluster_replay_cursor(resume.as_ref()),
+        bin_support::cluster_replay_cursor(&start),
     )?;
     tracing::info!("kardamom-validator: tx_ordering via Aeron Cluster");
     // The kardamom_sealer_* re-export is the EXECUTOR's job — a validator
     // emitting a second (lagging) copy of the series would break sum()-style
     // queries and contradict the documented observation point.
-    let tx_ordering_sub: Box<dyn TxOrderingSubscription> =
-        Box::new(cluster_sub.suppress_sealer_metrics());
+    let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
 
     // --- Verification streams: tx_bal (BAL) + tx_receipts (see `pumps`). ---
     let divergence = Divergence::new();
@@ -290,8 +284,7 @@ async fn main() -> Result<()> {
     // loop, not hang forever mid-join. (Divergence fail-stops stay
     // distinguishable by their 'halted on divergence' log line.) See
     // `bounded_join_timeout` for why fresh > resume.
-    cfg.reader.join_timeout = bin_support::bounded_join_timeout(resume.is_some());
-    let initial_block = recovery.last_committed_block;
+    cfg.reader.join_timeout = bin_support::bounded_join_timeout(start.is_resume());
 
     // Parallel validation strategy (opt-in): seeded batches driven by the
     // BAL. `None` keeps the engine's streaming per-tx path byte-for-byte.
@@ -380,10 +373,7 @@ async fn main() -> Result<()> {
                 writer_signal,
                 writer_queue,
             },
-            Start {
-                initial_block,
-                resume,
-            },
+            start,
             RoleHooks {
                 // No BAL capture: the validator VERIFIES BALs, never
                 // publishes them.

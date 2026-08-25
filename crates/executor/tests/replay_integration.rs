@@ -25,7 +25,7 @@ use revm::primitives::KECCAK_EMPTY;
 use kardamom_executor::{
     BPosition, BlockBoundary, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig,
     ExecutorError, Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound,
-    RoleHooks, Start, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
     TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 
@@ -204,7 +204,7 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
                 writer_signal: Imm,
                 writer_queue: writer_q,
             },
-            Start::default(),
+            ResumePoint::GENESIS,
             RoleHooks::none(),
         )
     });
