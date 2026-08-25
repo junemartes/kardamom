@@ -3,7 +3,7 @@
 //! path (#92).
 
 use alloy_consensus::Transaction;
-use alloy_primitives::Address;
+use alloy_primitives::{Address, B256};
 use kardamom_types::{BPosition, Receipt, StateDatabase, TxEnvelope};
 use revm::context::result::ExecutionResult;
 use revm::database::CacheDB;
@@ -20,6 +20,27 @@ use crate::exec_types::{ReceiptStatus, TxIndex};
 use super::db::{SnapshotDb, seed_cache_layer};
 use super::tx_env::{decode_alloy_envelope, tx_env_from_alloy};
 use super::write_set::{wire_log, write_set_from_evm_state};
+
+/// Per-tx READ-touch capture for the footprint shadow scheduler
+/// (spec: block-stm-executor §P1). The block-level EIP-7928 BAL cannot
+/// attribute reads per tx — a slot read after another tx wrote it leaves no
+/// trace at all (revm keeps writer indexes only), and `storage_reads` is
+/// block-scoped — so the shadow captures the read side here, at the same
+/// point the BAL capture runs, from the same `outcome.state`. Writes need no
+/// capture: the returned `WriteSet` already carries them exactly.
+///
+/// `account_reads` holds accounts revm loaded but never TOUCHED — the
+/// BALANCE / EXTCODE* / STATICCALL / DELEGATECALL subject class. Note that
+/// plain CALL targets do NOT appear: EIP-161 marks even a zero-value CALL's
+/// recipient as touched (the state-clearing rule), which revm mirrors, so a
+/// call target is only visible through its storage reads / `WriteSet` entry.
+/// `slot_reads` holds every accessed slot whose value did not change, on
+/// touched and untouched accounts alike.
+#[derive(Debug, Default, Clone)]
+pub struct TouchSet {
+    pub account_reads: Vec<Address>,
+    pub slot_reads: Vec<(Address, B256)>,
+}
 
 /// Per-BLOCK execution scope: ONE `CacheDB` (layered over
 /// `parent ∘ snapshot`) that revm COMMITS into after each tx, and ONE EVM
@@ -95,6 +116,8 @@ impl<S: StateDatabase> ExecScope<S> {
         seed_cache_layer(cache, layer).map_err(ExecutorError::State)
     }
 
+    #[allow(clippy::too_many_arguments)] // matches the free execute_tx's shape;
+    // see the equivalent allow there for the rationale.
     pub fn execute_tx(
         &mut self,
         tx_idx: TxIndex,
@@ -104,6 +127,9 @@ impl<S: StateDatabase> ExecScope<S> {
         cumulative_gas_used_before: u64,
         // EIP-7928 capture: see the free `execute_tx`.
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
+        // Footprint-shadow read capture: see [`TouchSet`]. `None` everywhere
+        // except the executor's streaming path with the shadow enabled.
+        touches: Option<&mut TouchSet>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
         // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
         // invalid — undecodable bytes, or a tx revm rejects at validation
@@ -136,6 +162,38 @@ impl<S: StateDatabase> ExecScope<S> {
                 ));
             }
         };
+        self.execute_tx_decoded(
+            tx_idx,
+            tx_position,
+            inbound_envelope,
+            &alloy_env,
+            tx_index_in_block,
+            cumulative_gas_used_before,
+            bal,
+            touches,
+        )
+    }
+
+    /// [`Self::execute_tx`] with the RLP already decoded.
+    ///
+    /// Decoding is ~180ns/tx and is naturally done by whoever reads the
+    /// tx stream (the STM engine's `prepare` does exactly this, off the
+    /// execution thread). Exposing the pre-decoded entry point lets the
+    /// SEQUENTIAL path have the same benefit — and lets the A/B harness
+    /// compare the two engines on equal footing instead of charging
+    /// decode to one side only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_tx_decoded(
+        &mut self,
+        tx_idx: TxIndex,
+        tx_position: BPosition,
+        inbound_envelope: &TxEnvelope,
+        alloy_env: &alloy_consensus::TxEnvelope,
+        tx_index_in_block: u64,
+        cumulative_gas_used_before: u64,
+        bal: Option<(&mut revm::state::bal::Bal, u64)>,
+        touches: Option<&mut TouchSet>,
+    ) -> Result<(Receipt, WriteSet), ExecutorError> {
         let signer = inbound_envelope.sender; // trusted from proxy; no recovery
         let nonce = alloy_env.nonce();
         let to = alloy_env.to();
@@ -146,7 +204,7 @@ impl<S: StateDatabase> ExecScope<S> {
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas());
 
-        let tx_env = tx_env_from_alloy(&alloy_env, signer);
+        let tx_env = tx_env_from_alloy(alloy_env, signer);
         let outcome = match self.evm.transact(tx_env) {
             Ok(o) => o,
             // Deterministic input-invalidity: every replica computes the same
@@ -202,6 +260,19 @@ impl<S: StateDatabase> ExecScope<S> {
         if let Some((bal, bal_index)) = bal {
             for (addr, account) in outcome.state.iter() {
                 bal.update_account(bal_index, *addr, account);
+            }
+        }
+        if let Some(t) = touches {
+            for (addr, account) in outcome.state.iter() {
+                if !account.is_touched() {
+                    t.account_reads.push(*addr);
+                }
+                for (key, slot) in account.storage.iter() {
+                    if slot.original_value == slot.present_value {
+                        t.slot_reads
+                            .push((*addr, B256::from(key.to_be_bytes::<32>())));
+                    }
+                }
             }
         }
         // Fold this tx's writes into the block cache: later txs read them
@@ -293,6 +364,7 @@ pub fn execute_tx<S: StateDatabase>(
         tx_index_in_block,
         cumulative_gas_used_before,
         bal,
+        None,
     )
 }
 
@@ -303,9 +375,11 @@ pub fn execute_tx<S: StateDatabase>(
 /// sides), gas accounting unchanged. Loud by design: log + counter — a skip
 /// existing at all means an upstream guard (sequencer nonce fence, cluster
 /// dedup, resync floors) let an invalid record reach the canonical log.
+/// Public: the Block-STM engine (`kardamom-stm`) produces the identical
+/// skip artifact on its parallel path — one definition, one wire shape.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "std"), allow(unused_variables))]
-fn invalid_skip(
+pub fn invalid_skip(
     reason: &str,
     tx_position: BPosition,
     inbound_envelope: &TxEnvelope,

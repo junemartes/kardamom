@@ -378,6 +378,9 @@ async fn main() -> Result<()> {
                 // No BAL capture: the validator VERIFIES BALs, never
                 // publishes them.
                 bal_capture: None,
+                // No footprint shadow either: P1 measures on the EXECUTOR
+                // role.
+                footprint_shadow: None,
                 // Whole-block exec strategy (the parallel-validation path).
                 block_exec,
                 epoch_observer,

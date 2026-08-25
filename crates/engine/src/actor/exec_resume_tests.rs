@@ -81,6 +81,7 @@ fn resume_executes_from_cursor_with_absolute_counts() {
         }),
         None,
         None,
+        None,
         None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
@@ -153,6 +154,7 @@ fn resume_after_empty_block_backlog() {
         }),
         None,
         None,
+        None,
         None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
@@ -220,6 +222,7 @@ fn resume_boundary_alignment_still_checked() {
         }),
         None,
         None,
+        None,
         None::<NoEpochCheck>,
     );
     let res = h.join().expect("no panic");
@@ -268,6 +271,7 @@ fn no_resume_executes_and_commits_block_one() {
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
         0,
+        None,
         None,
         None,
         None,

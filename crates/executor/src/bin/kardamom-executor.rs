@@ -404,6 +404,11 @@ async fn main() -> Result<()> {
         .context("spawn BAL publisher")?;
     // The legacy writer-queue tee is superseded by the publisher thread.
     let writer_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
+    // P1 footprint shadow (spec: block-stm-executor §P1): behind
+    // KARDAMOM_FOOTPRINT_SHADOW=1, the exec thread hands each block's tx
+    // captures to a grading thread (measurement only — execution stays
+    // sequential). None when the env flag is unset: zero cost.
+    let footprint_shadow = kardamom_engine::shadow::spawn_from_env();
 
     // `verify_record_identity` stays OFF here by decision, not omission:
     // with the validator checking every record (3a.1), a forged envelope
@@ -454,6 +459,8 @@ async fn main() -> Result<()> {
             RoleHooks {
                 // EIP-7928 capture handoff.
                 bal_capture: Some(bal_tx),
+                // Footprint-shadow capture handoff (Some only under the flag).
+                footprint_shadow,
                 // No whole-block strategy (that's the validator's parallel
                 // path) and no epoch check: the executor trusts the ordered
                 // stream (phase 2 would give it its own L1 dependency).

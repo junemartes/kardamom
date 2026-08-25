@@ -124,6 +124,7 @@ impl Executor {
         } = start;
         let RoleHooks {
             bal_capture,
+            footprint_shadow,
             block_exec,
             epoch_observer,
         } = hooks;
@@ -163,6 +164,7 @@ impl Executor {
             initial_block,
             resume,
             bal_capture,
+            footprint_shadow,
             block_exec,
             epoch_observer,
         );

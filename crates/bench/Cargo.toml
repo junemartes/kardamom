@@ -20,11 +20,25 @@ name = "kardamom-load"
 path = "src/bin/load.rs"
 
 [[bin]]
+name = "kardamom-stm-p0"
+path = "src/bin/stm-p0.rs"
+
+[[bin]]
+name = "kardamom-stm-p2"
+path = "src/bin/stm-p2.rs"
+
+[[bin]]
 name = "kardamom-perf"
 path = "src/bin/perf.rs"
 
 [dependencies]
+core_affinity = "0.8"
 kardamom-types.workspace = true
+kardamom-footprint = { path = "../footprint" }
+kardamom-stm = { path = "../stm" }
+# mdbx-backed A/B: the honest baseline, where a state read costs real work.
+kardamom-state = { path = "../state" }
+tempfile.workspace = true
 kardamom-ingress = { path = "../ingress" }
 
 alloy-primitives.workspace = true
@@ -52,6 +66,9 @@ jsonrpsee = { workspace = true }
 # Apple Silicon enables frame pointers by default, so no extra rustflags
 # are needed here.
 pprof = { version = "0.14", features = ["flamegraph", "frame-pointer"] }
+# STM lab (src/stm): offline capture through the real engine.
+revm.workspace = true
+kardamom-engine.workspace = true
 
 [dev-dependencies]
 revm.workspace = true
@@ -59,3 +76,7 @@ kardamom-validator.workspace = true
 dhat = "0.3"
 kardamom-engine.workspace = true
 kardamom-types.workspace = true
+
+[features]
+# Assembly keccak for the whole build graph (see exec-core).
+asm-keccak = ["kardamom-stm/asm-keccak"]

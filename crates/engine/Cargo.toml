@@ -22,6 +22,8 @@ kardamom-log = { workspace = true }
 kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-state = { path = "../state" }
 kardamom-obs = { path = "../obs" }
+# P1 footprint shadow (`crate::shadow`): the P0 classifier/grader core.
+kardamom-footprint = { path = "../footprint" }
 serde = { workspace = true }
 revm.workspace = true
 alloy-primitives.workspace = true

@@ -69,6 +69,7 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         None,
         None,
         None,
+        None,
         None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
@@ -173,6 +174,7 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
         None,
         None,
         None,
+        None,
         None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
@@ -236,6 +238,7 @@ fn exec_handoff_carries_a_populated_bal() {
         0,
         None,
         Some(bal_tx),
+        None,
         None,
         None::<NoEpochCheck>,
     );
@@ -303,8 +306,94 @@ fn exec_rejects_misaligned_boundary() {
         None,
         None,
         None,
+        None,
         None::<NoEpochCheck>,
     );
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
+}
+
+/// P1 footprint shadow: with `shadow_tx` wired, each non-empty block
+/// hands its per-tx captures (envelope + gas + read/write cells) to the
+/// shadow channel at the boundary — and the handed-off block survives a
+/// full `process_block` pass (grade + train) without touching execution
+/// outputs.
+#[test]
+fn exec_hands_off_shadow_captures_at_boundary() {
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("00000000000000000000000000000000000ABCDE");
+
+    let snap = MockStateDatabase::builder()
+        .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
+        .build();
+    let writer_log = Arc::new(Mutex::new(Vec::new()));
+
+    let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
+    let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
+    let (stx, srx) = bounded::<crate::shadow::ShadowBlock>(8);
+
+    for (i, value) in [(0u64, 100u64), (1, 50)] {
+        tx_r2e
+            .send(ReaderToExec::Tx {
+                tx_idx: TxIndex(i),
+                envelope: legacy(&signer, to, i, value),
+                position: pos(i as i32),
+            })
+            .unwrap();
+    }
+    tx_r2e
+        .send(ReaderToExec::Boundary(BlockBoundaryStart {
+            block_number: 1,
+            end_tx_idx: pos(2),
+            l2_timestamp: 1_700_000_000,
+            l1_origin: 0,
+        }))
+        .unwrap();
+    drop(tx_r2e);
+
+    let h = spawn_exec(
+        ExecutorConfig::default(),
+        rx_r2e,
+        tx_e2c,
+        StaticSnapshotSource(snap),
+        ImmediateCommit,
+        RecordingQueue(writer_log.clone()),
+        0,
+        None,
+        None,
+        Some(stx),
+        None,
+        None::<NoEpochCheck>,
+    );
+    h.join().expect("no panic").expect("exec ok");
+    drop(rx_e2c);
+
+    let blk = srx.recv().expect("one shadow block handed off");
+    assert_eq!(blk.block_number, 1);
+    assert_eq!(blk.serial_records, 0);
+    assert_eq!(blk.captures.len(), 2);
+    for (i, c) in blk.captures.iter().enumerate() {
+        assert_eq!(c.envelope.sender, from);
+        // A value transfer writes both account tuples; zero gas price
+        // keeps the fee sink out (gas_price = 0 in `legacy`).
+        assert!(
+            c.write_cells
+                .contains(&kardamom_footprint::Cell::Account(from))
+        );
+        assert!(
+            c.write_cells
+                .contains(&kardamom_footprint::Cell::Account(to))
+        );
+        assert!(c.touches.slot_reads.is_empty(), "transfers read no slots");
+        assert!(c.gas_used > 0, "capture {i} carries gas");
+    }
+    assert!(srx.try_recv().is_err(), "exactly one block");
+
+    // The handed-off shape feeds the grading path end-to-end: native
+    // transfers are tier-1 (never cold) and same-sender => one chain.
+    let mut stats = kardamom_footprint::classifier::Stats::default();
+    let mut exclude = std::collections::HashSet::new();
+    exclude.insert(kardamom_footprint::Cell::Account(crate::shadow::FEE_SINK));
+    crate::shadow::process_block(blk, &mut stats, &exclude);
 }

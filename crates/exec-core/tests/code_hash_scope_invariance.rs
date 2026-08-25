@@ -124,10 +124,10 @@ fn second_tx_write_set_is_scope_invariant() {
     let db_a = genesis_db();
     let mut scope = ExecScope::new(&db_a, None, env()).unwrap();
     let (r0_same, _ws0_same) = scope
-        .execute_tx(TxIndex(0), pos(0), &tx0, 0, 0, None)
+        .execute_tx(TxIndex(0), pos(0), &tx0, 0, 0, None, None)
         .unwrap();
     let (r1_same, _ws1_same) = scope
-        .execute_tx(TxIndex(1), pos(1), &tx1, 1, r0_same.gas_used, None)
+        .execute_tx(TxIndex(1), pos(1), &tx1, 1, r0_same.gas_used, None, None)
         .unwrap();
     assert!(r0_same.status && r1_same.status, "setup: txs must succeed");
 

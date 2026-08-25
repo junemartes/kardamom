@@ -68,6 +68,15 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     pub(super) sw_signal: Q,
     pub(super) sw_queue: P,
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
+    /// P1 footprint shadow (`crate::shadow`): per-block capture handoff,
+    /// executor role only, `None` everywhere else. Ignored on the
+    /// whole-block (validator) path — captures ride the streaming arm.
+    pub(super) shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
+    /// Per-block shadow tx captures + serial-lane count, handed off
+    /// (try_send, never blocking) at each boundary. Both stay empty when
+    /// the shadow is off.
+    pub(super) shadow_captures: Vec<crate::shadow::ShadowTxCapture>,
+    pub(super) shadow_serial: u32,
     pub(super) block_exec: Option<BlockExec<S::Db>>,
     /// Role-specific epoch check, statically dispatched (see
     /// [`crate::reader::EpochObserver`]); `None` trusts the ordered stream.
@@ -181,6 +190,7 @@ where
         initial_block: u64,
         resume: Option<ResumePoint>,
         bal_tx: Option<Sender<BalHandoff>>,
+        shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
         block_exec: Option<BlockExec<S::Db>>,
         epoch_observer: Option<E>,
     ) -> Self {
@@ -194,6 +204,9 @@ where
             sw_signal,
             sw_queue,
             bal_tx,
+            shadow_tx,
+            shadow_captures: Vec::new(),
+            shadow_serial: 0,
             block_exec,
             epoch_observer,
             snapshot,
@@ -378,6 +391,12 @@ where
                 self.scope.insert(sc)
             }
         };
+        // Shadow read capture: a default TouchSet only when the shadow is
+        // on — the None path is free.
+        let mut touches = self
+            .shadow_tx
+            .as_ref()
+            .map(|_| crate::executor::TouchSet::default());
         let result = sc.execute_tx(
             tx_idx,
             position,
@@ -387,6 +406,7 @@ where
             self.bal_tx
                 .as_ref()
                 .map(|_| (&mut self.block_bal, self.tx_index_in_block + 1)),
+            touches.as_mut(),
         );
         // Progress log fires only for an applied tx (an error propagates in
         // `record_applied` below before it would have logged).
@@ -401,6 +421,17 @@ where
                 ws_accounts = ws.accounts.len(),
                 "BAL capture progress"
             );
+        }
+        // Shadow capture BEFORE the WriteSet is consumed by
+        // `record_applied`: envelope clone is a refcount, cell extraction
+        // one pass over the (small) per-tx sets.
+        if let (Some(t), Ok((receipt, ws))) = (touches.take(), &result) {
+            self.shadow_captures.push(crate::shadow::ShadowTxCapture {
+                envelope: envelope.clone(),
+                gas_used: receipt.gas_used,
+                touches: t,
+                write_cells: crate::shadow::write_cells(ws),
+            });
         }
         self.record_applied("execute_tx", position, result, apply_start)
     }
@@ -469,6 +500,11 @@ where
             let mut layer = PendingDelta::new();
             layer.apply(ws.clone());
             sc.seed_layer(&layer)?;
+        }
+        // Shadow: deposits take the serial barrier lane (spec strategy #1)
+        // — counted, not modeled.
+        if self.shadow_tx.is_some() && result.is_ok() {
+            self.shadow_serial += 1;
         }
         self.record_applied("execute_deposit_tx", position, result, apply_start)
     }
@@ -611,6 +647,33 @@ where
                 }
             }
         }
+        // Footprint-shadow handoff: same never-block discipline as the
+        // BAL. A dropped block costs one block of measurement (counted),
+        // not the chain. Empty blocks are skipped — nothing to grade.
+        if let Some(stx) = self.shadow_tx.as_ref()
+            && (!self.shadow_captures.is_empty() || self.shadow_serial > 0)
+        {
+            let blk = crate::shadow::ShadowBlock {
+                block_number,
+                captures: std::mem::take(&mut self.shadow_captures),
+                serial_records: std::mem::take(&mut self.shadow_serial),
+            };
+            match stx.try_send(blk) {
+                Ok(()) => {}
+                Err(crossbeam_channel::TrySendError::Full(_)) => {
+                    metrics::counter!(
+                        crate::metrics::FOOTPRINT_BLOCKS_TOTAL,
+                        "outcome" => "dropped"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        block = block_number,
+                        "footprint-shadow handoff full; dropping this block's capture"
+                    );
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {}
+            }
+        }
         match self.parent.as_mut() {
             Some(m) => m.merge_from(&pending),
             None => self.parent = Some(pending.clone()),
@@ -652,6 +715,7 @@ pub(crate) fn spawn_exec<S, Q, P, E>(
     initial_block: u64,
     resume: Option<ResumePoint>,
     bal_tx: Option<Sender<BalHandoff>>,
+    shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     block_exec: Option<BlockExec<S::Db>>,
     epoch_observer: Option<E>,
 ) -> JoinHandle<Result<(), ExecutorError>>
@@ -674,6 +738,7 @@ where
                 initial_block,
                 resume,
                 bal_tx,
+                shadow_tx,
                 block_exec,
                 epoch_observer,
             )

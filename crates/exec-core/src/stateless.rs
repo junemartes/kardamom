@@ -151,7 +151,15 @@ pub fn execute_record_in_scope<'a, S: StateDatabase>(
             tx_idx,
             envelope,
             position,
-        } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, bal),
+        } => scope.execute_tx(
+            *tx_idx,
+            *position,
+            envelope,
+            idx_in_block,
+            cumulative,
+            bal,
+            None,
+        ),
         BufferedRecord::Deposit {
             tx_idx,
             deposit,

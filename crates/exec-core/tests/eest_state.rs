@@ -238,6 +238,7 @@ fn run_case(unit: &TestUnit, t: &Test) -> Outcome {
         0,
         0,
         None,
+        None,
     ) {
         Ok(r) => r,
         Err(e) => return Outcome::Fail(format!("executor error: {e}")),
