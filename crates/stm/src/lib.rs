@@ -93,7 +93,7 @@ impl std::hash::Hasher for Fnv {
 pub type FastMap<K, V> = std::collections::HashMap<K, V, FnvBuild>;
 
 pub mod execute;
-mod lanes;
+pub mod pool;
 
 /// Re-exported so harnesses can pre-decode for BOTH engines (see
 /// `execute::execute_block_sequential_decoded`).

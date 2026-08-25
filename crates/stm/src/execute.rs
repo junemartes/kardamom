@@ -1571,7 +1571,7 @@ enum Reap {
 /// Per-shard last-toucher tables for sharded admission.
 ///
 /// SAFETY: table `k` is touched only from the lane executing chunk `k`,
-/// and `LanePool::run` hands each chunk index to exactly one lane and
+/// and `WorkerPool::run` hands each chunk index to exactly one lane and
 /// returns only after every lane has finished — so accesses to a given
 /// table are serialized, and the batch boundary orders them against the
 /// router's reads.
@@ -1816,7 +1816,7 @@ pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     /// plus the lanes that drive them. Shard k is touched only by the
     /// lane running chunk k, and lanes run one chunk each per batch.
     shards: std::sync::Arc<ShardTables>,
-    admit_lanes: Option<std::sync::Arc<crate::lanes::LanePool>>,
+    admit_lanes: Option<std::sync::Arc<crate::pool::WorkerPool>>,
     admit_shards: usize,
 }
 
@@ -1855,9 +1855,9 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let avg_tx_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (reap_tx, reap_rx) = std::sync::mpsc::channel::<Reap>();
     let (tail_tx, tail_rx) = std::sync::mpsc::channel::<TailJob<S>>();
-    // Persistent tail lanes (see crate::lanes): the hash+validate chunks
+    // Persistent tail lanes (see crate::pool): the hash+validate chunks
     // run on threads created ONCE, not spawned per block.
-    let lane_pool = std::sync::Arc::new(crate::lanes::LanePool::new(
+    let lane_pool = std::sync::Arc::new(crate::pool::WorkerPool::new(
         workers.max(1),
         if cfg_keep_hot && cfg_tail_on_workers {
             pin_cores.clone()
@@ -2094,7 +2094,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
             admit_lanes: (cfg_admit_shards > 0).then(|| {
                 // Caller cores: the worker cores stay dedicated to
                 // execution, which is running while the feed admits.
-                std::sync::Arc::new(crate::lanes::LanePool::new(cfg_admit_shards, Vec::new()))
+                std::sync::Arc::new(crate::pool::WorkerPool::new(cfg_admit_shards, Vec::new()))
             }),
             admit_shards: cfg_admit_shards,
             tail: tail_tx.clone(),
@@ -2621,7 +2621,9 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             }
         };
         match &self.pool.admit_lanes {
-            Some(l) => l.run(k.min(l.lanes()), &body),
+            Some(l) => l
+                .run(k.min(l.workers()), &|_lane, sh| body(sh))
+                .expect("admission lane panicked"),
             None => {
                 for sh in 0..k {
                     body(sh);
@@ -3173,7 +3175,7 @@ fn block_tail<S: StateDatabase + Sync>(
     avg_tx_ns: &std::sync::atomic::AtomicU64,
     delta_out: Option<DeltaOut>,
     recycle: &std::sync::Arc<RecyclePools>,
-    lanes: &crate::lanes::LanePool,
+    lanes: &crate::pool::WorkerPool,
 ) -> Result<StmOutcome, ExecutorError> {
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
@@ -3396,18 +3398,18 @@ fn block_tail<S: StateDatabase + Sync>(
             (std::sync::Arc::new(PendingDelta::new()), wounded)
         }
     } else {
-        // PERSISTENT LANES (crate::lanes): hash + validate, chunked by
+        // PERSISTENT LANES (crate::pool): hash + validate, chunked by
         // index, on threads the pool created once. Per-block scoped
         // spawns cost 0.5ms of the 1.9ms tail once the witness hash got
         // cheap. The fold runs HERE, on the tail thread, concurrently
         // with the lanes and without a join before the release point.
-        let n_lanes = lanes.lanes().max(1);
+        let n_lanes = lanes.workers().max(1);
         let n_ch = n_lanes.min(n_res.max(1));
         let chunk = n_res.div_ceil(n_ch);
         let wounded_parts: Vec<Mutex<Vec<usize>>> =
             (0..n_ch).map(|_| Mutex::new(Vec::new())).collect();
         // Each chunk owns a disjoint slice of `hashes`; lanes never share
-        // an index (crate::lanes hands each out exactly once).
+        // an index (crate::pool hands each out exactly once).
         struct HashOut(*mut B256);
         // SAFETY: chunk i writes only hashes[i*chunk .. (i+1)*chunk],
         // disjoint from every other chunk's range, and `lanes.run` hands
@@ -3463,7 +3465,11 @@ fn block_tail<S: StateDatabase + Sync>(
             // One scoped thread ONLY to drive the lanes, so the fold can
             // run on this thread concurrently and reach the release
             // point without waiting for the hash work.
-            let driver = sc.spawn(|| lanes.run(n_ch, &lane_body));
+            let driver = sc.spawn(|| {
+                lanes
+                    .run(n_ch, &|_lane, i| lane_body(i))
+                    .expect("tail lane panicked")
+            });
             let delta_arc = std::sync::Arc::new(fold_inline(tx_results));
             if let Some(DeltaOut {
                 tx,

@@ -151,6 +151,13 @@ impl MockStateDatabaseBuilder {
 impl StateDatabase for MockStateDatabase {
     type Error = MockStateError;
 
+    /// The mock has no per-view cursor to contend on, so a "fork" is a
+    /// plain clone (shared inner map). Implemented so tests exercise the
+    /// forked code path the mdbx snapshot takes in production.
+    fn fork_view(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
         let g = self.inner.read().expect("MockStateDatabase poisoned");
         Ok(g.accounts.get(&address).copied())
