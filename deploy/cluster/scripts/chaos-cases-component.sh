@@ -85,7 +85,7 @@ case_node_failure_executor() {
   # the lost replica can't reschedule onto a peer (none free), so the cluster
   # degrades to 2 and must keep progressing; bringing the node back recovers 3.
   log "node-failure: docker kill kardamom-executor-2 (whole node)"
-  docker kill kardamom-executor-2 >/dev/null || fail "could not kill node kardamom-executor-2"
+  kill_node kardamom-executor-2
   assert_count executor 2 "${CHAOS_RESTART_SLO_S}"
   # Wide window here too: killing a whole NODE thrashes the runner (docker
   # teardown + nomad node-down churn) enough that on 4-core CI hosts even

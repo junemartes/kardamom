@@ -20,6 +20,10 @@ pub enum ContractId {
     /// Permissioned attester proposes outputs; permissioned challenger deletes
     /// within the finalization window.
     WithdrawalOutputOracle,
+    /// L1 zk root chain (spec: no-std-exec-core, PR 4): running state root
+    /// advanced one posted batch at a time on a verified validity proof
+    /// whose public values match the settlement's stored batch entry.
+    KardamomProofOracle,
 }
 
 impl ContractId {
@@ -28,6 +32,7 @@ impl ContractId {
     pub const ALL: &'static [Self] = &[
         Self::EthLockbox,
         Self::KardamomL2Settlement,
+        Self::KardamomProofOracle,
         Self::WithdrawalOutputOracle,
     ];
 
@@ -37,6 +42,7 @@ impl ContractId {
             ContractId::EthLockbox => "kardamom.l1.ETHLockbox",
             ContractId::KardamomL2Settlement => "kardamom.l2.KardamomL2Settlement",
             ContractId::WithdrawalOutputOracle => "kardamom.l1.WithdrawalOutputOracle",
+            ContractId::KardamomProofOracle => "kardamom.l1.KardamomProofOracle",
         }
     }
 
@@ -49,6 +55,8 @@ impl ContractId {
             ContractId::KardamomL2Settlement => "initialize(address)",
             // WithdrawalOutputOracle.initialize(address attester, address challenger, uint64 window)
             ContractId::WithdrawalOutputOracle => "initialize(address,address,uint64)",
+            // KardamomProofOracle.initialize(settlement, verifier, programVKey, genesisRoot)
+            ContractId::KardamomProofOracle => "initialize(address,address,bytes32,bytes32)",
         }
     }
 
@@ -87,6 +95,7 @@ impl ContractId {
     pub fn creation_bytecode(self) -> Bytes {
         match self {
             ContractId::EthLockbox => embedded::eth_lockbox_creation(),
+            ContractId::KardamomProofOracle => embedded::kardamom_proof_oracle_creation(),
             ContractId::KardamomL2Settlement => embedded::kardamom_l2_settlement_creation(),
             ContractId::WithdrawalOutputOracle => embedded::withdrawal_output_oracle_creation(),
         }

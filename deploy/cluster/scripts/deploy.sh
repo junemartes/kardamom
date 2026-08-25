@@ -347,8 +347,34 @@ run_job "executor.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # The validator is a passive follower (subscribes to the same multicast
 # channels + its own cluster egress session); it can come up alongside the
 # executors — it re-executes from genesis regardless of join order.
+# L1 light client (issue #163): when configured, the validator verifies epochs
+# against a beacon-authenticated L1 view instead of a blindly-trusted RPC.
+#
+# Off by default, and deliberately so: every kardamom test environment runs
+# anvil as L1, and anvil is execution-only — no beacon chain for a consensus
+# light client to sync from. This path only functions against a real network,
+# so nothing in CI exercises it. Enable by setting the three env vars below.
+VALIDATOR_ARGS=()
+if [ -n "${L1_LIGHT_CLIENT_EXECUTION_RPC:-}" ] && [ -n "${L1_LIGHT_CLIENT_CONSENSUS_RPC:-}" ]; then
+  : "${L1_LIGHT_CLIENT_CHECKPOINT:?set L1_LIGHT_CLIENT_CHECKPOINT (weak-subjectivity beacon block root) to run the light client}"
+  echo "==> l1-light-client: verifying L1 view via helios (${L1_LIGHT_CLIENT_NETWORK:-mainnet})"
+  run_job "l1-light-client.nomad.hcl" \
+    -var "execution_rpc=${L1_LIGHT_CLIENT_EXECUTION_RPC}" \
+    -var "consensus_rpc=${L1_LIGHT_CLIENT_CONSENSUS_RPC}" \
+    -var "checkpoint=${L1_LIGHT_CLIENT_CHECKPOINT}" \
+    -var "network=${L1_LIGHT_CLIENT_NETWORK:-mainnet}"
+  wait_running "l1-light-client" 240
+  # The validator reads L1 through the LIGHT CLIENT, never the upstream RPC —
+  # routing it back to the upstream would silently restore the blind trust
+  # this exists to remove. Both jobs are constrained to the aux node
+  # (ip_start 61 in ansible group_vars), so this is a node-local hop.
+  VALIDATOR_ARGS=(
+    -var "l1_rpc_url=http://${AUX_IP:-192.168.56.61}:${L1_LIGHT_CLIENT_PORT:-8548}"
+    -var "lockbox_address=${LOCKBOX_ADDRESS}"
+  )
+fi
 image_ref_args validator
-run_job "validator.nomad.hcl" ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
+run_job "validator.nomad.hcl" ${VALIDATOR_ARGS[@]+"${VALIDATOR_ARGS[@]}"} ${IMAGE_REF_ARGS[@]+"${IMAGE_REF_ARGS[@]}"}
 # (The ${arr[@]+...} expansion keeps `set -u` happy on bash 3.2 — macOS'
 # /bin/bash — where expanding an empty array is an "unbound variable" error.)
 image_ref_args da-watcher

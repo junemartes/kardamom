@@ -13,6 +13,7 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use kardamom_engine::actor::BufferedRecord;
+use kardamom_engine::block_env::ExecEnv;
 use kardamom_types::Receipt;
 
 use crate::parallel::ClaimIndex;
@@ -25,6 +26,9 @@ const RING_CAP: usize = 6;
 struct BlockCapture {
     block: u64,
     granularity: u16,
+    /// The exec env the block ran under (boundary timestamp etc.) — the
+    /// prover spool re-executes with capture under the SAME env.
+    env: ExecEnv,
     records: Vec<BufferedRecord>,
     /// `None` when the block validated on the sequential path (claims never
     /// arrived) — the records alone still let the block replay offline.
@@ -49,6 +53,7 @@ impl FlightRing {
         &self,
         block: u64,
         granularity: u16,
+        env: ExecEnv,
         records: &[BufferedRecord],
         claims: Option<Arc<ClaimIndex>>,
     ) {
@@ -59,9 +64,19 @@ impl FlightRing {
         g.push_back(BlockCapture {
             block,
             granularity,
+            env,
             records: records.to_vec(),
             claims,
         });
+    }
+
+    /// One block's inputs back out of the ring (the prover spool's feed).
+    /// Cheap: record payloads are refcounted `Bytes`.
+    pub fn records_for(&self, block: u64) -> Option<(u16, ExecEnv, Vec<BufferedRecord>)> {
+        let g = self.ring.lock().expect("flight ring poisoned");
+        g.iter()
+            .find(|c| c.block == block)
+            .map(|c| (c.granularity, c.env, c.records.clone()))
     }
 
     /// Serialize the ring + both receipts for offline replay. Best-effort:

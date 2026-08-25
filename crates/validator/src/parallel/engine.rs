@@ -85,60 +85,11 @@ pub fn build_seed<S: StateDatabase>(
     Ok(seed)
 }
 
-/// One canonical record through a block/batch execution scope — THE shared
-/// dispatch for the seeded-parallel batches and the sequential fallback.
-/// Txs run inside the scope; deposits run outside it (own commit semantics —
-/// the mint is durable even when the inner call reverts) with `delta`
-/// carrying this scope's earlier writes, and their writes are folded back
-/// into the scope cache so later records observe them (mirrors the actor's
-/// streaming path).
-///
-/// `parent` is whichever layer plays the parent role at the call site (the
-/// batch seed, or the pipelined-commit parent). The validator must dispatch
-/// records exactly like the executor: this helper and the actor's streaming
-/// arms are the two copies left — keep them in lockstep.
-#[allow(clippy::too_many_arguments)]
-fn exec_record_in_scope<'a, S: StateDatabase>(
-    scope: &mut kardamom_engine::executor::ExecScope<&'a S>,
-    snapshot: &'a S,
-    parent: Option<&PendingDelta>,
-    delta: &PendingDelta,
-    env: ExecEnv,
-    rec: &BufferedRecord,
-    idx_in_block: u64,
-    cumulative: u64,
-    bal: Option<(&mut revm::state::bal::Bal, u64)>,
-) -> Result<(Receipt, kardamom_engine::delta::WriteSet), ExecutorError> {
-    match rec {
-        BufferedRecord::Tx {
-            tx_idx,
-            envelope,
-            position,
-        } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, bal),
-        BufferedRecord::Deposit {
-            tx_idx,
-            deposit,
-            position,
-        } => {
-            let out = kardamom_engine::executor::execute_deposit_tx(
-                snapshot,
-                parent,
-                delta,
-                env,
-                *tx_idx,
-                *position,
-                deposit,
-                idx_in_block,
-                cumulative,
-                bal,
-            )?;
-            let mut layer = PendingDelta::new();
-            layer.apply(out.1.clone());
-            scope.seed_layer(&layer)?;
-            Ok(out)
-        }
-    }
-}
+// Record dispatch (Tx-vs-Deposit + the deposit fold) lives in the exec core
+// (`stateless::execute_record_in_scope`) — the batch path below runs the
+// same monomorphized dispatch as the sequential driver and the zk guest, so
+// the actor's streaming arms are the only other dispatch left in the tree.
+use kardamom_engine::stateless::execute_record_in_scope;
 
 /// Execute one batch sequentially over `snapshot ∘ seed`. `first_index` is
 /// the batch's first bal index (1-based); receipts carry LOCAL cumulative
@@ -173,7 +124,7 @@ pub fn execute_batch<S: StateDatabase>(
         // synthetic WriteSet path for deposits). Comparing a WriteSet
         // projection instead diverged on every live transfer — symmetric
         // construction is the only drift-proof comparison.
-        let (receipt, ws) = exec_record_in_scope(
+        let (receipt, ws) = execute_record_in_scope(
             &mut scope,
             snapshot,
             Some(seed),
@@ -386,18 +337,23 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
               env: ExecEnv,
               block: u64| {
             if records.is_empty() {
+                // Empty blocks still enter the flight ring: the prover
+                // spool proves every block, and a gap here would stall it.
+                if let Some(f) = flight.as_ref() {
+                    f.push(block, 1, env, records, None);
+                }
                 return execute_block_sequential(snapshot, parent, records, env);
             }
             let Some((granularity, idx)) = claims.take(block, CLAIM_WAIT) else {
                 crate::metrics::counter_parallel_fallback();
                 tracing::debug!(block, "no BAL claims in time; sequential re-execution");
                 if let Some(f) = flight.as_ref() {
-                    f.push(block, 1, records, None);
+                    f.push(block, 1, env, records, None);
                 }
                 return execute_block_sequential(snapshot, parent, records, env);
             };
             if let Some(f) = flight.as_ref() {
-                f.push(block, granularity, records, Some(Arc::clone(&idx)));
+                f.push(block, granularity, env, records, Some(Arc::clone(&idx)));
             }
             let out = match execute_block_parallel(
                 snapshot,

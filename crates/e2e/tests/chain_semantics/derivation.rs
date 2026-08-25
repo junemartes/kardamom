@@ -119,3 +119,68 @@ async fn s11_forged_epoch_halts_validator() {
         .await
         .expect("S11");
 }
+
+// ---------------------------------------------------------------------------
+// S12 — the validator's L1 view comes through an interposed endpoint.
+//
+// Production points --l1-rpc-url at a light client rather than a raw RPC
+// (issue #163). The real client needs a beacon chain and our L1 is anvil, so
+// it cannot run here; what these cover is the contract between the validator
+// and whatever serves it L1 data — including that a lying server is REJECTED.
+//
+// They do NOT cover helios's cryptography. A green run here says nothing
+// about sync-committee verification or Merkle proofs.
+// ---------------------------------------------------------------------------
+
+/// S12a: a FAITHFUL interposed endpoint must not disturb verification. The
+/// baseline — without it the lying cases below could pass for the wrong reason.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s12a_verified_l1_passthrough_still_verifies() {
+    run_verified_l1_case(e2e::harness::l1_verified::Fault::None).await;
+}
+
+/// S12b: an endpoint serving a WRONG BLOCK HASH must halt the validator.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s12b_verified_l1_wrong_block_hash_halts_validator() {
+    run_verified_l1_case(e2e::harness::l1_verified::Fault::WrongBlockHash { from_block: 0 }).await;
+}
+
+/// S12c: an endpoint whose blocks each look right but do NOT chain must halt
+/// the validator. This is the case only parent-hash chaining catches — every
+/// block's own hash is correct, so per-block verification passes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s12c_verified_l1_broken_parent_chain_halts_validator() {
+    run_verified_l1_case(e2e::harness::l1_verified::Fault::BrokenParentChain { from_block: 0 })
+        .await;
+}
+
+/// S12d: an endpoint that SWALLOWS deposit logs must halt the validator —
+/// censorship seen from the L1 side rather than the sequencer's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "full local stack + anvil; run via `just test-e2e-local` or with --ignored"]
+async fn s12d_verified_l1_swallowed_logs_halt_validator() {
+    run_verified_l1_case(e2e::harness::l1_verified::Fault::SwallowLogs).await;
+}
+
+async fn run_verified_l1_case(fault: e2e::harness::l1_verified::Fault) {
+    let Some(mut stack) = LocalStack::launch_opt(StackConfig {
+        l1: true,
+        validator: true,
+        verified_l1: true,
+        ..StackConfig::default()
+    })
+    .await
+    .expect("stack") else {
+        eprintln!("SKIP: anvil not available");
+        return;
+    };
+    let t = stack
+        .target(client_timeout(Duration::from_secs(30)))
+        .expect("target");
+    divergence::verified_l1_endpoint(&mut stack, &t, fault)
+        .await
+        .expect("S12");
+}

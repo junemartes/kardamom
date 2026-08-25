@@ -101,7 +101,7 @@ async fn deploy_settlement_and_post_batch_emits_event() {
     // versioned hashes and emits the event.
     let blob_hashes = vec![B256::repeat_byte(0xA1), B256::repeat_byte(0xA2)];
     let receipt = settlement
-        .postBatch(0, blob_hashes.clone(), 100, 105)
+        .postBatch(0, blob_hashes.clone(), 100, 105, B256::repeat_byte(0x4C))
         .from(BATCHER)
         .send()
         .await
@@ -137,7 +137,7 @@ async fn deploy_settlement_and_post_batch_emits_event() {
 
     // Replay protection: same prev index rejected.
     let res = settlement
-        .postBatch(0, blob_hashes, 106, 110)
+        .postBatch(0, blob_hashes, 106, 110, B256::repeat_byte(0x4C))
         .from(BATCHER)
         .send()
         .await;
@@ -267,7 +267,13 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
 
     // A foreign writer advances the CAS behind the sender's back...
     let receipt = settlement
-        .postBatch(1, vec![B256::repeat_byte(0xEE)], 2, 9)
+        .postBatch(
+            1,
+            vec![B256::repeat_byte(0xEE)],
+            2,
+            9,
+            B256::repeat_byte(0x4C),
+        )
         .send()
         .await
         .expect("foreign post sends")

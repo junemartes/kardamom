@@ -186,7 +186,7 @@ pub fn open_tx_data_subs(
     channels: &ChannelsConfig,
     shards: u8,
 ) -> Result<Vec<Box<dyn TxDataSubscription>>> {
-    let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(shards as usize);
+    let mut tx_data_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(shards as usize);
     for shard_id in 0..shards {
         let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
         let mut handle = TxDataSubscriberHandle::open(rt, channels, shard_id)
@@ -198,12 +198,12 @@ pub fn open_tx_data_subs(
                 }
             }
         });
-        a_subs.push(Box::new(LiveTxDataSub {
+        tx_data_subs.push(Box::new(LiveTxDataSub {
             sequencer_id: shard_id,
             rx,
         }));
     }
-    Ok(a_subs)
+    Ok(tx_data_subs)
 }
 
 // ---------------------------------------------------------------------------

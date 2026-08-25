@@ -22,9 +22,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_executor::{
-    CMessage, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, MdbxSnapshotSource,
-    MdbxWriterQueue, MdbxWriterSignal, ResumePoint, TxDataSubscription, TxOrderingSubscription,
-    TxReceiptsPublication,
+    CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, Inbound,
+    MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, NoEpochCheck, Outbound, ResumePoint,
+    RoleHooks, Start, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
@@ -308,7 +308,7 @@ async fn main() -> Result<()> {
     // against the remote durability archives (the resume-gated replay-merge
     // this replaces pointed at the consumer's LOCAL archive, which records
     // neither stream — a resuming process had no tx_data source at all).
-    let a_subs: Vec<Box<dyn TxDataSubscription>> =
+    let tx_data_subs: Vec<Box<dyn TxDataSubscription>> =
         bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
@@ -337,7 +337,7 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
     // The executor is the blessed emitter of the kardamom_sealer_* re-export
     // (default-on in the shared subscription; the validator suppresses it).
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
+    let tx_ordering_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
 
     // tx_receipts publication. With MDS (fan-in) enabled, this replica
     // publishes both the receipt stream and the boundary side-stream to its
@@ -347,7 +347,7 @@ async fn main() -> Result<()> {
     // single-channel path so single-host/local behaviour is unchanged. Either
     // way the commit thread's must-deliver retry drives the same
     // publish_receipt/publish_boundary surface.
-    let c_handle = if channels.tx_receipts_mds_enabled() {
+    let receipts_handle = if channels.tx_receipts_mds_enabled() {
         tracing::info!(
             replica_idx = args.recorder_id,
             endpoint = channels.tx_receipts_endpoint(args.recorder_id).as_deref(),
@@ -359,7 +359,9 @@ async fn main() -> Result<()> {
         TxReceiptsPublisherHandle::open(&rt_pub, &channels)
             .context("open TxReceiptsPublisherHandle")?
     };
-    let c_pub = LiveTxReceiptsPub { handle: c_handle };
+    let tx_receipts_pub = LiveTxReceiptsPub {
+        handle: receipts_handle,
+    };
 
     // Seed genesis once into a fresh env (no-op if already seeded, e.g. on
     // recovery). Must run before StateWriter::spawn so the writer's initial
@@ -380,7 +382,7 @@ async fn main() -> Result<()> {
     // delta channel feeds writes.
     let writer = StateWriter::spawn(env).context("spawn state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
-    let sw_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
+    let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
     // BAL publication: tee each block's BlockDelta onto tx_bal so validators can
     // cross-check their re-execution. Published on the isolated publication
     // runtime (rt_pub), like receipts, so it never stalls the subscription poll.
@@ -401,7 +403,7 @@ async fn main() -> Result<()> {
         .spawn(move || kardamom_executor::bal::run_bal_publisher(bal_rx, bal_pub))
         .context("spawn BAL publisher")?;
     // The legacy writer-queue tee is superseded by the publisher thread.
-    let sw_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
+    let writer_queue = MdbxWriterQueue::new(writer.delta_tx.clone());
 
     // `verify_record_identity` stays OFF here by decision, not omission:
     // with the validator checking every record (3a.1), a forged envelope
@@ -428,28 +430,36 @@ async fn main() -> Result<()> {
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
     let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-        Executor::run(
+        Executor::run::<ExecutorWiring>(
             cfg,
-            a_subs,
-            b_sub,
-            c_pub,
-            snapshots,
-            sw_signal,
-            sw_queue,
-            initial_block,
+            Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: tx_ordering_sub,
+                // Join-miss archive refetch (None on single-host/IPC runs).
+                join_recovery,
+            },
+            Outbound {
+                tx_receipts: tx_receipts_pub,
+                snapshots,
+                writer_signal,
+                writer_queue,
+            },
             // On crash recovery `resume` carries the persisted cursor; the
             // cluster source replays from it and the reader/exec counters seed
             // from it. `None` on a fresh start.
-            resume,
-            // EIP-7928 capture handoff.
-            Some(bal_tx),
-            // Join-miss archive refetch (None on single-host/IPC runs).
-            // Whole-block exec strategy (validator parallel path).
-            None,
-            join_recovery,
-            // The executor trusts the ordered stream (phase 2 would
-            // give it its own L1 dependency); only the validator verifies.
-            None,
+            Start {
+                initial_block,
+                resume,
+            },
+            RoleHooks {
+                // EIP-7928 capture handoff.
+                bal_capture: Some(bal_tx),
+                // No whole-block strategy (that's the validator's parallel
+                // path) and no epoch check: the executor trusts the ordered
+                // stream (phase 2 would give it its own L1 dependency).
+                block_exec: None,
+                epoch_observer: None,
+            },
         )
     });
 
@@ -520,6 +530,22 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // Role-specific adapter: tx_receipts publication.
 // ---------------------------------------------------------------------------
+
+/// The executor role's port types. The subscriptions stay boxed because the
+/// transport is chosen at runtime (`bin_support::open_tx_data_subs`); the
+/// rest are the concrete mdbx/Aeron implementations.
+struct ExecutorWiring;
+
+impl EngineWiring for ExecutorWiring {
+    type TxData = Box<dyn TxDataSubscription>;
+    type TxOrdering = Box<dyn TxOrderingSubscription>;
+    type TxReceipts = LiveTxReceiptsPub;
+    type Snapshots = MdbxSnapshotSource;
+    type WriterSignal = MdbxWriterSignal;
+    type WriterQueue = MdbxWriterQueue;
+    // No epoch verification: the executor trusts the ordered stream.
+    type Epoch = NoEpochCheck;
+}
 
 struct LiveTxReceiptsPub {
     handle: TxReceiptsPublisherHandle,

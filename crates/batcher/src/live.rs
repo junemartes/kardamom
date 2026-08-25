@@ -487,7 +487,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         aeron_cfg.aeron_dir = dir.clone();
     }
     let rt = AeronRuntime::spawn(args.aeron_dir.as_deref()).context("spawn AeronRuntime")?;
-    let a_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -505,13 +505,13 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         kardamom_engine::reader::cluster::ReplayCursor::new(cursor.next_index, cursor.next_block),
     )?;
     // The kardamom_sealer_* re-export is the executor's job.
-    let b_sub = cluster_sub.suppress_sealer_metrics();
+    let tx_ordering_sub = cluster_sub.suppress_sealer_metrics();
     info!("kardamom-batcher: tx_ordering via Aeron Cluster");
 
     let join_buffer = JoinBuffer::new();
     let mut reader_handles = Vec::new();
-    for a_sub in a_subs {
-        reader_handles.push(spawn_tx_data_reader(a_sub, join_buffer.clone()));
+    for sub in tx_data_subs {
+        reader_handles.push(spawn_tx_data_reader(sub, join_buffer.clone()));
     }
     // No tx_deposits reader: deposits ride inside the epoch record on the
     // canonical stream, so there is nothing to join against.
@@ -526,7 +526,7 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         ..ReaderConfig::default()
     };
     let ordering_handle = spawn_tx_ordering_reader(
-        b_sub,
+        tx_ordering_sub,
         join_buffer,
         reader_cfg,
         feed_tx,

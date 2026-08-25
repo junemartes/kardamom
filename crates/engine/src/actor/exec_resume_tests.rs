@@ -17,7 +17,7 @@ use revm::primitives::KECCAK_EMPTY;
 
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::reader::ReaderToExec;
+use crate::reader::{NoEpochCheck, ReaderToExec};
 use crate::state::{MockStateDatabase, StaticSnapshotSource};
 
 use super::test_support::{ImmediateCommit, RecordingQueue, drain_commits, legacy, pos};
@@ -81,7 +81,7 @@ fn resume_executes_from_cursor_with_absolute_counts() {
         }),
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -153,7 +153,7 @@ fn resume_after_empty_block_backlog() {
         }),
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -220,7 +220,7 @@ fn resume_boundary_alignment_still_checked() {
         }),
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
@@ -271,7 +271,7 @@ fn no_resume_executes_and_commits_block_one() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 

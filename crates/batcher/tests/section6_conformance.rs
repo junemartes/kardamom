@@ -299,6 +299,7 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
             versioned_hashes.clone(),
             posted.l2_block_start,
             posted.l2_block_end,
+            posted.records_commitment,
         )
         .from(BATCHER)
         .send()

@@ -24,11 +24,13 @@
 pub mod cursor;
 pub mod node;
 pub mod prefix_set;
+pub mod proofs;
 pub mod walker;
 
 #[cfg(test)]
 mod incremental_tests;
 
+pub use alloy_trie::Nibbles;
 pub use prefix_set::PrefixSet;
 pub use walker::TrieUpdates;
 
@@ -119,7 +121,7 @@ pub struct TrieTables {
 }
 
 impl TrieTables {
-    pub fn open(txn: &RwTxSync) -> Result<Self, StateError> {
+    pub fn open<K: cursor::ReadKind>(txn: &signet_libmdbx::TxSync<K>) -> Result<Self, StateError> {
         use crate::schema::{
             TABLE_ACCOUNT_TRIE, TABLE_HASHED_ACCOUNTS, TABLE_HASHED_STORAGE, TABLE_STORAGE_TRIE,
         };

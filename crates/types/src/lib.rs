@@ -29,6 +29,7 @@ pub mod epoch;
 pub mod genesis;
 pub mod limits;
 pub mod position;
+pub mod prover;
 pub mod receipt;
 pub mod state;
 pub mod tx_error;
@@ -47,10 +48,14 @@ pub use envelope::TxEnvelope;
 pub use epoch::{DepositLog, EpochError, EpochRecord, derive_epoch};
 pub use genesis::{AllocEntry, Genesis, GenesisError};
 pub use position::{BPosition, TxDataLoc};
+pub use prover::{
+    BatchProverInput, BatchPublicOutputs, BlockRecordsDigest, ProverInput, ProverRecord,
+    PublicOutputs, batch_records_commitment,
+};
 pub use receipt::{Receipt, TX_TYPE_DEPOSIT, TX_TYPE_LEGACY, WireLog, tx_type_of};
 pub use state::{SnapshotSource, StateDatabase, StateError};
 pub use tx_error::{TxError, TxErrorReason};
 pub use tx_ordering::TxOrderingMessage;
 pub use txref::TxRef;
 pub use watermark::{FsyncWatermark, QuorumWatermark};
-pub use witness::{ExecutionWitness, WitnessAccount, WitnessSlot};
+pub use witness::{ExecutionWitness, WitnessAccount, WitnessProofs, WitnessSlot};

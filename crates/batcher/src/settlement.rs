@@ -45,6 +45,7 @@ pub struct PostBatchParams {
     pub versioned_hashes: Vec<B256>,
     pub l2_block_start: u64,
     pub l2_block_end: u64,
+    pub records_commitment: B256,
 }
 
 impl PostBatchParams {
@@ -55,6 +56,7 @@ impl PostBatchParams {
         versioned_hashes: Vec<B256>,
         l2_block_start: u64,
         l2_block_end: u64,
+        records_commitment: B256,
     ) -> Result<Self, BatcherError> {
         if blobs.len() != versioned_hashes.len() {
             return Err(BatcherError::L1(
@@ -74,6 +76,7 @@ impl PostBatchParams {
             versioned_hashes,
             l2_block_start,
             l2_block_end,
+            records_commitment,
         })
     }
 }

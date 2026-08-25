@@ -1,0 +1,61 @@
+# DRAFT — the bot cannot push .github/workflows/*.yml (token scope).
+# Operator: review and move to .github/workflows/zk-guest.yml verbatim.
+#
+# Guest-BUILD gate for phase 3c (spec: docs/agents/no-std-exec-core-spec.md):
+# proves the SP1 guest ELF still builds from unmodified exec-core, and runs
+# the guest/host round-trip (SP1 executor, no proving — CPU-only, fast).
+# Proving in CI is a separate, cost-gated decision.
+name: zk-guest
+
+on:
+  pull_request:
+    paths:
+      - 'crates/exec-core/**'
+      - 'crates/types/**'
+      - 'guest/**'
+      - '.github/workflows/zk-guest.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'crates/exec-core/**'
+      - 'crates/types/**'
+      - 'guest/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  guest-roundtrip:
+    name: guest build + executor round-trip
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc (sp1-sdk build dep)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+      - name: Install SP1 toolchain (pinned)
+        run: |
+          curl -sSfL https://sp1up.succinct.xyz | bash
+          ~/.sp1/bin/sp1up --version v6.4.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: v0-rust-zkguest
+          workspaces: |
+            .
+            guest/kardamom-zk-guest
+            guest/kardamom-zk-host
+      - name: Build guest ELF
+        working-directory: guest/kardamom-zk-guest
+        run: PATH="$HOME/.sp1/bin:$PATH" cargo prove build
+      - name: Emit prover fixture
+        run: |
+          mkdir -p /tmp/zk-fixture
+          KARDAMOM_EMIT_PROVER_FIXTURE=/tmp/zk-fixture \
+            cargo test -p kardamom-validator --test witness_anchoring --locked
+      - name: Guest/host round-trip (executor, no proving)
+        working-directory: guest/kardamom-zk-host
+        run: cargo run --release -- /tmp/zk-fixture

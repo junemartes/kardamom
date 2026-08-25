@@ -60,7 +60,7 @@ pub(super) enum Flow {
 
 /// The exec thread's mutable loop state. One instance per `spawn_exec`
 /// thread; every `ReaderToExec` arm of the old inline loop is now a method.
-pub(super) struct ExecState<S: SnapshotSource, Q, P> {
+pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     pub(super) cfg: ExecutorConfig,
     pub(super) rx: Receiver<ReaderToExec>,
     pub(super) tx: Sender<ExecToCommit>,
@@ -69,7 +69,9 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P> {
     pub(super) sw_queue: P,
     pub(super) bal_tx: Option<Sender<BalHandoff>>,
     pub(super) block_exec: Option<BlockExec<S::Db>>,
-    pub(super) epoch_observer: Option<Box<dyn EpochObserver>>,
+    /// Role-specific epoch check, statically dispatched (see
+    /// [`crate::reader::EpochObserver`]); `None` trusts the ordered stream.
+    pub(super) epoch_observer: Option<E>,
     /// The snapshot source hands back owned snapshots keyed by block
     /// number: the block *just committed* — `initial_block` (== the
     /// persisted `resume.block` on a resume, 0 on a fresh start).
@@ -155,11 +157,12 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P> {
     pub(super) tx_applied_error: metrics::Counter,
 }
 
-impl<S, Q, P> ExecState<S, Q, P>
+impl<S, Q, P, E> ExecState<S, Q, P, E>
 where
     S: SnapshotSource + 'static,
     Q: StateWriterSignal + 'static,
     P: StateWriterQueue + 'static,
+    E: EpochObserver + 'static,
 {
     /// Seed the loop state. Resume-from-cursor: the canonical stream source
     /// delivers from the persisted cursor onward (the cluster client's
@@ -179,7 +182,7 @@ where
         resume: Option<ResumePoint>,
         bal_tx: Option<Sender<BalHandoff>>,
         block_exec: Option<BlockExec<S::Db>>,
-        epoch_observer: Option<Box<dyn EpochObserver>>,
+        epoch_observer: Option<E>,
     ) -> Self {
         let resume_count = resume.map(|r| r.record_count).unwrap_or(0);
         let snapshot = snapshots.snapshot_after(initial_block);
@@ -634,11 +637,12 @@ where
     }
 }
 
-// 8 args mirrors `Executor::run`'s shape (readers/exec/commit wiring); a config
-// struct would just shuffle the same fields behind one name. See the note on
-// `Executor::run`.
+// Internal seam between `Executor::run` (which takes the grouped
+// `Inbound`/`Outbound`/`Start`/`RoleHooks` structs) and `ExecState::new`;
+// the args are the already-destructured fields, so a struct here would just
+// re-wrap what the caller unwrapped.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_exec<S, Q, P>(
+pub(crate) fn spawn_exec<S, Q, P, E>(
     cfg: ExecutorConfig,
     rx: Receiver<ReaderToExec>,
     tx: Sender<ExecToCommit>,
@@ -649,12 +653,13 @@ pub(crate) fn spawn_exec<S, Q, P>(
     resume: Option<ResumePoint>,
     bal_tx: Option<Sender<BalHandoff>>,
     block_exec: Option<BlockExec<S::Db>>,
-    epoch_observer: Option<Box<dyn EpochObserver>>,
+    epoch_observer: Option<E>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
     S: SnapshotSource + 'static,
     Q: StateWriterSignal + 'static,
     P: StateWriterQueue + 'static,
+    E: EpochObserver + 'static,
 {
     thread::Builder::new()
         .name("executor-exec".into())

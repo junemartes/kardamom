@@ -24,11 +24,12 @@ use super::types::ExecToCommit;
 /// block in `submit` instead.
 pub(super) const COMMIT_PIPELINE_DEPTH: usize = 4;
 
-impl<S, Q, P> ExecState<S, Q, P>
+impl<S, Q, P, E> ExecState<S, Q, P, E>
 where
     S: SnapshotSource + 'static,
     Q: StateWriterSignal + 'static,
     P: StateWriterQueue + 'static,
+    E: crate::reader::EpochObserver + 'static,
 {
     /// The settle sweep: pop every in-flight commit at or below `durable`
     /// and forward its boundary — downstream never observes a boundary a

@@ -170,17 +170,27 @@ phase 1's "no behavior change" claim is explicit about what it did NOT do:
   shape: envelope.sender = victim, signature by attacker) and asserts halt +
   latch with the flag on, and — the documented blind spot — a committed
   theft with it off.
-- **PR 3b** — witness MPT anchoring: account/storage proofs against
+- **PR 3b (delivered 2026-08-15)** — witness MPT anchoring: account/storage proofs against
   `pre_state_root`, absence proofs, sparse post-state-root recompute over
   `alloy-trie` in the guest. Design notes below.
-- **PR 3c** — the zkVM guest program (SP1/RISC Zero) + async prover harness
-  behind a flag; guest-build kzg decision (gap 1).
+- **PR 3c** — the zkVM guest program + async prover harness behind a flag.
+  Design below (2026-08-15); gap 1 resolved without a decision — see it.
 - **PR 4** — batch-boundary wiring: one proof per posted batch aligned with
   the live batcher's L1-as-truth cursor; L1 submission/verification.
 
 ## Phase 3b design — MPT-anchoring the witness (design notes, 2026-08-08)
 
-Design only; no implementation yet. Status of the inputs it builds on:
+DELIVERED as designed (see the crate docs for the shipped shapes:
+`kardamom-types::WitnessProofs`, `exec-core::anchor`,
+`kardamom-state::trie::proofs`, `validator::witness::anchor_block_witness`,
+`stateless::execute_block_anchored`; acceptance gates in exec-core's
+`anchor_sparse`/`anchor_state` tests and the validator's
+`witness_anchoring` pipeline test, whose closing assertion is guest
+recompute == live `update_for_block` root). The one deviation from the
+notes below: `MissingNode` names (hash, path, account) rather than a hash
+alone — the live-trie retainer addresses paths, not hashes. Original
+design notes kept for the reasoning record. Status of the inputs it built
+on:
 `ExecutionWitness.pre_state_root: Option<B256>` already exists on the wire
 type (phase 2 left the anchor point ready, currently unpopulated);
 `kardamom-state::{state_root, storage_root}` is the pure full-trie oracle the
@@ -382,3 +392,366 @@ proving cannot slow the chain.
   in its own change, not in a rebase: publish the per-record step from
   exec-core and have `exec_record_in_scope` delegate to it, putting the
   parallel path under the same invariant.
+
+## Phase 3c design — the guest program and prover harness (2026-08-15)
+
+Design only. What 3a/3b left for 3c is deliberately thin: the guest BODY
+already exists (`stateless::execute_block_anchored` — riscv32-gated all
+series), the prover input is fully specified (witness + `WitnessProofs` +
+records + BAL frame + `ExecEnv`), and the public outputs are the anchored
+tuple `(pre_state_root, post_state_root, bal_commitment, block_number)`.
+3c is packaging: a zkVM entry point around that function, and a host-side
+harness that feeds it.
+
+### Gap 1 is closed, and not by us
+
+The phase-1 soundness list carried "0x0A has no pure-Rust fallback" from
+the revm-19 era. revm 38 registers the point-evaluation precompile
+UNCONDITIONALLY with a backend cascade — c-kzg → blst → pure-Rust
+arkworks — so the `no_std` guest build has carried 0x0A through arkworks
+since the upgrade (our riscv32 gate has been compiling it all along; revm's
+own doc comment claiming c-kzg gating is stale against its code). Backend
+equivalence is revm's tested contract over the shared c-kzg-4844 vectors;
+the live side is EEST-attested. What remains is PERFORMANCE (a BLS pairing
+in-guest is expensive) — addressed by zkVM precompile patches below, and
+irrelevant for blocks that never call 0x0A.
+
+### zkVM selection: SP1 first, RISC Zero as the check
+
+Criterion: our guest's hot operations are keccak (every trie node + every
+tx identity), secp256k1 recovery (every tx), and — rarely — bls12-381
+pairing (0x0A). SP1 ships audited precompile patches for exactly these
+(`sp1-patches` for keccak/k256/bls12-381) and has the closest architectural
+precedent: succinctlabs/rsp proves reth/revm block execution in-guest from
+a witness, which is structurally our `execute_block_anchored`. RISC Zero
+(zeth) proves the same shape and stays the fallback if SP1's toolchain or
+patch pins fight our revm 38 / alloy pins. The decision is made AT
+IMPLEMENTATION START by building the guest against both toolchains'
+current releases and keeping whichever compiles our unmodified exec-core
+first — the one-code-path invariant forbids maintaining a patched fork of
+our own execution crates.
+
+### Guest crate shape
+
+`guest/kardamom-zk-guest` OUTSIDE the workspace (its own lockfile,
+toolchain pin, and target — zkVM builds must not perturb workspace feature
+unification; precedent: rsp's layout):
+
+1. read the rkyv-serialized prover input (the wire types already exist);
+2. `execute_block_anchored(...)`;
+3. commit the public-output tuple; receipts/delta stay private (the BAL
+   commitment + roots are what L1 verifies — S0's slim-boundary decision
+   holds).
+
+Determinism guards ALREADY hold in exec-core (no clocks, no randomness, no
+HashMap iteration); the guest adds nothing but I/O.
+
+### Prover harness (validator-side, behind `--prove-batches`)
+
+The validator already produces every prover input: `capture_block_witness`
+at the snapshot seam, `anchor_block_witness` once the parent commit
+settles. The harness is an async task fed by a bounded channel from the
+commit path (drop-oldest under backpressure — proving lags, never stalls,
+matching the PR 4 cursor's gap tolerance); it shells out to the zkVM
+prover SDK and persists `(batch_id, proof, public_outputs)` for PR 4's L1
+submission. Proof cadence follows the batcher's L1-as-truth cursor — one
+proof per posted batch, the alignment PR 4 wires.
+
+### Toolchain and CI reality
+
+zkVM guest builds need vendor toolchains (`sp1up` / `rzup` — external
+installers). CI gets a dedicated `zk-guest` job that installs the pinned
+toolchain and builds (not proves) the guest ELF; proving in CI is a later,
+cost-gated decision. Workflow edits are operator-applied from `docs/ci/`
+drafts (bot scope). Locally, toolchain installation is an OPERATOR step —
+sessions must not curl-install toolchains; the guest crate carries a
+`rust-toolchain.toml` + README pin so the build is reproducible wherever
+the toolchain exists.
+
+### 3c step 2 delivered (2026-08-15): the round-trip contract holds
+
+`witness_anchoring` doubles as the prover-fixture generator
+(`KARDAMOM_EMIT_PROVER_FIXTURE=dir`, deterministic signer): it emits the
+exact `ProverInput` it just validated plus the expected 104-byte
+`PublicOutputs`. `guest/kardamom-zk-host` (workspace-detached, sp1-sdk
+blocking API) executes the REAL guest ELF in SP1's executor against them.
+First run: **104 bytes identical, 7,893,786 cycles** for the 3-tx pipeline
+block (transfer + storage-zeroing call + storage-writing call, full
+anchoring) — UNPATCHED; the accelerator patches land with the prover
+harness and will cut the keccak/ecrecover share substantially. CI shape in
+`docs/ci/zk-guest.yml.draft` (operator applies): guest build → fixture →
+round trip on every exec-core/types/guest change. Remaining for 3c: the
+validator `--prove-batches` harness (live capture wiring + prover
+shell-out + PR-4 batch alignment).
+
+### The first proof (2026-08-16)
+
+`kardamom-zk-host --prove` generated, verified, and persisted a REAL SP1
+core proof of the pipeline fixture block — the series' destination:
+
+- **setup 8.9s, prove 401s, verify 145ms**; 4.2M proof artifact
+- public values byte-identical to the host expectation
+- CPU-only, UNPATCHED guest (~7.9M cycles → ~20k cycles/s core proving)
+
+Numbers to design PR 4's cadence against: unpatched CPU proving runs
+~200x slower than the chain (401s for a block that executes in ms), so
+production proving needs the accelerator patches (keccak/k256 dominate
+the cycle count), prover hardware (GPU: sp1 cuda mode), and PR 4's
+proof-per-batch cadence rather than proof-per-block. Verification cost
+(145ms core; the L1 path uses the groth16/plonk wrap, ~constant and
+cheap) is a non-issue.
+## PR 4 design — batch proofs on L1 (2026-08-16; DELIVERED same day)
+
+The last phase: one proof per POSTED batch, aligned with the batcher's
+L1-as-truth cursor, verified on L1 against a running root. Shipped as
+designed; the delivery evidence is the layered test stack — forge suite
+(oracle rejects every mismatch class + verifier consultation), the batch
+guest round trip over a REAL two-block spool (160 bytes, root chain
+internal), and `proof_submission_e2e` on anvil: a real accumulator batch
+posted with its records commitment, the submitter's three cursor-lag
+outcomes, and the oracle root advancing. One deviation: the deployer CLI
+defers `KardamomProofOracle` flags to prover-ops work (library-API deploys
+only, as the e2e does).
+
+### The DA binding, closed with a records commitment
+
+A proof of "blocks [a,b] transition pre→post" is only useful if it attests
+THE POSTED BATCH — otherwise a prover could prove different records than
+the DA carries. Re-deriving the blob encoding in-guest (KAR1 + zstd) is a
+non-starter; instead both sides compute a `records_commitment` over the
+CANONICAL RECORD IDENTITIES and L1 stores it at post time:
+
+```text
+block_digest  = keccak("KREC" || block_number(8 LE)
+                 || per record: 0x01 || len(4 LE) || raw_tx      (tx)
+                              | 0x02 || source_hash               (deposit))
+records_commitment = keccak("KBAT" || block_digest_a || .. || block_digest_b)
+```
+
+- The BATCHER computes it from its accumulator at batch close and passes
+  it to `postBatch`; the settlement contract now STORES
+  `batches[index] = (l2BlockStart, l2BlockEnd, recordsCommitment)`.
+- The GUEST computes the same over its input records (raw_tx bytes it
+  already identity-verifies; deposits by `source_hash`, their canonical
+  id — consistent with the S0 deposit-trust posture) and commits it.
+- The ORACLE requires equality. A prover that proves different records
+  than the batch posted cannot produce the stored commitment.
+
+### The batch guest
+
+`BatchProverInput { blocks: Vec<ProverInput> }` — the guest runs
+`execute_block_anchored` per block, requiring each block's
+`pre_state_root` to equal the previous block's recomputed post root (the
+root chain INTERNAL to the proof), folds block digests into the records
+commitment, and commits 160 bytes (5×32, abi-friendly):
+
+```text
+pre_state_root || post_state_root || first_block(u256) || last_block(u256)
+  || records_commitment
+```
+
+Single-block proving (the 104-byte layout) remains for dev/round-trip.
+
+### Contracts
+
+- `KardamomL2Settlement` v2: `postBatch(..., recordsCommitment)` + stored
+  `batches` mapping (2 slots/batch) + commitment in the event.
+- `KardamomProofOracle` (L1): holds the running `stateRoot` (genesis root
+  at init), `lastProvenBatch`, the settlement address, an `ISP1Verifier`
+  (Succinct's standard `verifyProof(bytes32 vkey, bytes publicValues,
+  bytes proof)` gateway interface) and the guest `programVKey`.
+  `submitBatchProof(batchIndex, publicValues, proof)`: strict batch-index
+  succession, public values must match the STORED batch entry and the
+  running root, then the verifier call, then advance. Permissionless
+  submission — the proof is the authorization.
+- Tests run against a mock verifier (accept/reject variants); the real
+  SP1 groth16 verifier address is a deploy parameter (the wrap step needs
+  prover-side circuit artifacts — an ops concern, not a contract one).
+
+### Roles
+
+- `kardamom-zk-host batch <spool> <first> <last>` assembles a
+  `BatchProverInput` from the spool's per-block frames, executes (or
+  `--prove`s) it, writes `(public-values.bin, proof.bin)`.
+- `kardamom-proof-submitter` (batcher crate, where the L1 plumbing
+  lives): reads the settlement's posted-batch cursor, submits available
+  proof files for the next unproven batch, permissionlessly.
+- Proving stays OFF every hot path: the spool queues, the prover drains,
+  the submitter posts — three decoupled cadences, gaps tolerated
+  end-to-end.
+
+## PR 5 design — optimistic validation, proofs on dispute (2026-08-16)
+
+Validity mode (PR 4) proves every batch: ~8M cycles/block spent proving
+things nobody disputes. This phase inverts the default: batches advance the
+root chain OPTIMISTICALLY under a bonded claim and a challenge window;
+proving happens only on dispute. In equilibrium (rational actors, slashed
+bonds) the proving cost of the happy path is ZERO. The pattern is known in
+the wild as "zk fault proofs" (RISC Zero Kailua, op-succinct-lite): no
+interactive bisection — the dispute is settled by ONE validity proof.
+
+### Division of labor (all three detection layers already exist)
+
+- **Detection is NATIVE, live, and already running.** The validator
+  re-executes every block at chain speed and fail-stops on proven
+  divergence (receipts, BAL write-sets, anchored roots). Detection never
+  touches the zkVM — native re-execution is strictly faster than
+  zkVM-executor re-execution and it is the validator's existing duty.
+  A new, thin L1-CLAIM WATCHER compares each posted claim's root against
+  the local committed root (`snapshot.state_root()` — the attester poller's
+  shape) and triggers a challenge on disagreement.
+- **The dispute unit is the BATCH; the tx is diagnostics.** Detection
+  names the diverging tx (receipt mismatch is per-tx), but refutation
+  needs only the existing batch proof: it establishes the true post-root
+  for the claimed range, and a claim that disagrees is dead regardless of
+  which tx diverged. The spool already queues the anchored per-block
+  frames; `zk-host batch --prove` already produces the proof. The
+  challenge event carries the tx index as evidence for humans.
+- **Both lie classes are covered by one mechanism.** (a) A proposer lies
+  on L1 about honest L2 execution: the local root disagrees → challenge
+  with the proof of the honest batch. (b) The L2 stream itself is forged:
+  3a.1 identity checks + 3b anchoring make honest validators halt, and
+  because a proof must reproduce the settlement's stored records
+  commitment, no honest proof of the forged claim can exist — the
+  unanswerable challenge exposes it.
+
+### Per-block granularity inside the batch claim (2026-08-16 refinement)
+
+A batch may be arbitrarily heavy; a dispute must never require proving one.
+The claim therefore carries PER-BLOCK attestations, and the dispute unit is
+ONE BLOCK — the challenge window becomes independent of batch size, and the
+dispute proof is the SINGLE-BLOCK guest (~8M cycles, bounded by the block
+gas limit), not the batch guest.
+
+Kardamom has no block-header hash (S0's slim boundary carries no
+commitment), so the per-block attestation is the pair
+`(post_root_i, records_digest_i)` — exactly what the system natively
+commits to. And per-block attestation TRANSACTIONS would scale L1 gas with
+block count, so the sequence rides inside the ONE batch claim (32 bytes ×
+2 per block of calldata): per-block granularity at batch cadence.
+
+### Contract: KardamomProofOracle v2 — three new verbs, one root chain
+
+- `claimBatch(batchIndex, blockRoots[], blockDigests[])` payable (bond):
+  strict succession; the batch must exist in the settlement; array lengths
+  must equal the posted range; and — the anti-smuggling check —
+  `fold(blockDigests) == settlement.batches[batchIndex].recordsCommitment`
+  (one keccak pass at claim time; a claimer cannot partition the records
+  differently than the batcher posted). The contract stores
+  `keccak(blockRoots ‖ blockDigests)` and the claimed final root
+  (`blockRoots[last]`); the full sequences live in calldata + the event,
+  which is what challengers replay. Claims CHAIN optimistically: claim
+  N+1's implicit pre-root is claim N's pending final root.
+- `finalizeBatch(batchIndex)`: window elapsed, unchallenged → `stateRoot`
+  advances to the claimed final root, bond refunds. Strictly sequential.
+- `challengeBlock(batchIndex, blockOffset, blockRoots[], blockDigests[],
+  publicValues, proof)`: the challenger targets the FIRST divergent block —
+  at the first divergence the claimed `root[i-1]` is still honest, so an
+  honest single-block proof anchored at it EXISTS and refutes `root[i]`
+  (no bisection, ever). The contract re-derives the stored sequence hash
+  from the provided arrays, then requires of the proof's public values:
+  `pre_state_root == blockRoots[i-1]` (or the previous batch's finalized/
+  claimed root for i = 0), `block_number == range.start + i`,
+  `records_digest == blockDigests[i]`, verifier accepts, and
+  `post_state_root != blockRoots[i]`. Then: claim cancelled, bond slashed
+  to the challenger, dependent pending claims cascade-cancelled with
+  refunds. The root chain REWINDS to the last finalized root — the proven
+  single block does not advance it (later blocks of the batch are now
+  unattested); an honest re-claim follows.
+  A proof that AGREES with `blockRoots[i]` refutes nothing and reverts
+  (challenges are targeted, not exploratory; gas discourages noise).
+- `submitBatchProof` (validity mode) REMAINS: proof-first advancement for
+  operators that want instant finality. Both modes share one root chain
+  and one verifier — with DISTINCT program vkeys (batch guest for validity
+  mode, single-block guest for disputes), both held by the oracle.
+
+### Why the three sharp edges cut the way they do (decision record)
+
+Running example: batch 5 covers blocks 100–199; honest roots `h_100..h_199`;
+a malicious claim `r_i = h_i` for i < 150, lie starts at `r_150 != h_150`.
+
+**The digest-fold check exists to keep claims challengeable.** The dispute
+compares the challenger's proven `records_digest` against the CLAIM's
+`blockDigests[i]` — L1 stores only the fold, so the claim's array is the
+per-block reference. Unchecked, a claimer rigs the reference instead of
+winning the dispute: describe a partition that moves a real tx from block
+150 to 151, and the honest challenger's proof (executing the POSTED block
+150) mismatches `blockDigests[150]` — the honest challenge bounces off the
+contract's own rule. The claim-time fold check makes such a claim
+UNCREATABLE: fixed 32-byte segments in fixed order mean exactly one
+sequence folds to the stored commitment — the posted one.
+
+**Rewind, because attestations are free and partial batches are not.**
+After the block-150 challenge wins, `r_151..r_199` are chained off a lie —
+worthless. Advancing to `h_150` would strand blocks 151–199 with no claim
+over them, forcing partial-batch re-claims keyed on (batch, offset), prefix
+window rules, and new interactions with pending claims above — real state-
+machine surface bought to preserve work that cost nothing to redo (the one
+expensive artifact, the proof, already did its whole job: killing the
+lie). Rewind restores the exact pre-claim state; the honest re-claim lists
+`h_100..h_199` through the normal window. Cascade-cancelled claims above
+get REFUNDS, not slashes: honest claimers could never have built on
+`r_199` (honest roots chain off `h_199`), so cascade victims are the liar
+or its copyists — but punishing without proof is what this design exists
+to avoid, and the block-150 bond already paid the challenger. Griefing
+math: one bond buys at most one forced single-block proof, so with
+`bond > proving cost + challenge gas`, the attack funds the defense.
+
+**An agreeing proof reverts because it has no sound transition.** At batch
+granularity an agreeing proof was a full validity proof (finalize early —
+sound). At block granularity it attests one block of a hundred: finalizing
+the claim on it is unsound; finalizing just that block reintroduces the
+partial-batch machinery rejected above. So `challengeBlock`'s precondition
+is "the claim is wrong here", an agreeing proof fails it, and the failed
+challenge is a STRICT no-op — the window must not move. No challenger bond
+is needed: a failed challenge imposes zero cost on the claimer, so its
+whole cost (proving + gas) self-prices the spam. Underneath sits the
+property that makes the verb clean: one honest post-root exists per
+`(pre_root, records)` and the verifier accepts only honest executions —
+so false challenges CANNOT succeed and true challenges CANNOT fail
+(modulo prover liveness inside the window).
+
+### Single-block public outputs v2 (guest change, slice 0)
+
+The dispute check needs the block's records digest in the PROOF, so the
+single-block guest's outputs move from the 104-byte layout to the batch
+guest's 160-byte abi shape: `pre_state_root ‖ post_state_root ‖
+block_number(u256) ‖ records_digest ‖ bal_commitment`. The guest already
+iterates its records to identity-check them; folding the digest is one
+hasher alongside. (bal_commitment stays: it binds the L2-published BAL
+artifact for off-chain accountability even though L1 does not store it.)
+
+### Window and bond
+
+The window must cover detection (instant, live) + proving (minutes with
+patches/GPU; ~40min/6-block batch unpatched CPU) + L1 INCLUSION under
+censorship — the last term dominates, as on every optimistic rollup.
+Default window: 24h, configurable at init. Bond: ≥ challenge gas + margin;
+slashing pays the challenger, making the honest-challenger liveness
+assumption also an incentive.
+
+### The endgame this unlocks
+
+`WithdrawalOutputOracle`'s doc comment has always said its permissioned
+challenger is "the stand-in for a trustless ZK fault proof" — this is that
+replacement arriving. Follow-up (deferred): point withdrawal finalization
+at the proof oracle's FINALIZED roots and retire the permissioned
+attester/challenger pair; one root chain serves batches and withdrawals.
+
+### Delivery slices
+
+0. Single-block guest outputs v2 (160-byte layout + records digest) +
+   zk-host + spool expected-outputs updated in lockstep; round trip green.
+1. Oracle v2 (claim/finalize/challengeBlock + bonds + cascade + sequence
+   commitments) + forge suite incl. the first-divergence rule and the
+   digest-fold anti-smuggling check.
+2. Validator claim watcher (per-block root comparison against the claim
+   event's sequence — names the exact divergent offset) + challenge
+   trigger wired into the divergence path (a halting validator fires its
+   challenge BEFORE it halts — the halt protects the node, the challenge
+   protects L1).
+3. Claim poster (batcher-side: roots from the validator's committed chain,
+   digests from pack_blocks — both already computed).
+4. Anvil e2e: honest claim finalizes unproven; a claim lying at block k
+   challenged at offset k with a REAL spool-derived single-block proof
+   shape; cascade cancellation; rewind-and-reclaim.

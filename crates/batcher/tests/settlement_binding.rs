@@ -8,7 +8,7 @@ use kardamom_batcher::settlement::{
 
 #[test]
 fn post_batch_selector_matches_signature() {
-    let computed = &keccak256(b"postBatch(uint64,bytes32[],uint64,uint64)")[..4];
+    let computed = &keccak256(b"postBatch(uint64,bytes32[],uint64,uint64,bytes32)")[..4];
     assert_eq!(
         IKardamomL2Settlement::postBatchCall::SELECTOR.as_slice(),
         computed
@@ -42,7 +42,15 @@ fn post_batch_params_constructor_rejects_mismatched_lengths() {
     use alloy_eips::eip4844::Blob;
     let blobs = vec![Blob::default(), Blob::default()];
     let hashes = vec![B256::ZERO];
-    let res = PostBatchParams::new(Address::ZERO, 0, blobs, hashes, 1, 2);
+    let res = PostBatchParams::new(
+        Address::ZERO,
+        0,
+        blobs,
+        hashes,
+        1,
+        2,
+        B256::repeat_byte(0x4C),
+    );
     assert!(res.is_err());
 }
 
@@ -56,6 +64,7 @@ fn post_batch_params_rejects_inverted_block_range() {
         vec![B256::ZERO],
         10,
         5,
+        B256::repeat_byte(0x4C),
     );
     assert!(res.is_err());
 }

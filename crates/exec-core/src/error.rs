@@ -30,6 +30,15 @@ pub enum ExecutorError {
     #[error("record identity mismatch: {0}")]
     RecordIdentity(String),
 
+    /// The witness could not be tied to `pre_state_root` (phase 3b): a
+    /// missing/undecodable proof node, a witness entry the trie refutes, or
+    /// a post-root recompute the carried node set cannot complete. Aborts a
+    /// stateless execution BEFORE the first EVM step (verification) or
+    /// after it (recompute) — fail-closed either way, same philosophy as
+    /// the witness's own incompleteness errors.
+    #[error("witness unanchored: {0}")]
+    WitnessUnanchored(String),
+
     #[error("out-of-order tx_idx: got {got:?}, expected {expected:?}")]
     OutOfOrderTx { got: TxIndex, expected: TxIndex },
 

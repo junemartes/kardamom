@@ -46,6 +46,7 @@ zstd = "0.13"
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
 metrics.workspace = true
 kardamom-obs = { path = "../obs" }
 
@@ -86,3 +87,7 @@ path = "src/bin/kardamom-archive-rereplicate.rs"
 [[bench]]
 name = "pack_throughput"
 harness = false
+
+[[bin]]
+name = "kardamom-proof-submitter"
+path = "src/bin/kardamom-proof-submitter.rs"

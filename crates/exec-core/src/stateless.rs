@@ -105,49 +105,78 @@ fn execute_block_inner<S: StateDatabase>(
         // revm's Bal convention: index 0 = pre-execution, 1..=n = txs in
         // block order (same as the actor's `tx_index_in_block + 1`).
         let bal_arg = bal.as_deref_mut().map(|b| (b, idx_in_block + 1));
-        let (receipt, ws) = match rec {
-            BufferedRecord::Tx {
-                tx_idx,
-                envelope,
-                position,
-            } => scope.execute_tx(
-                *tx_idx,
-                *position,
-                envelope,
-                idx_in_block,
-                cumulative,
-                bal_arg,
-            )?,
-            BufferedRecord::Deposit {
-                tx_idx,
-                deposit,
-                position,
-            } => {
-                let out = execute_deposit_tx(
-                    snapshot,
-                    parent,
-                    &delta,
-                    env,
-                    *tx_idx,
-                    *position,
-                    deposit,
-                    idx_in_block,
-                    cumulative,
-                    bal_arg,
-                )?;
-                // Fold deposit writes into the scope cache (mirrors the
-                // actor's streaming path) so later txs observe them.
-                let mut layer = PendingDelta::new();
-                layer.apply(out.1.clone());
-                scope.seed_layer(&layer)?;
-                out
-            }
-        };
+        let (receipt, ws) = execute_record_in_scope(
+            &mut scope,
+            snapshot,
+            parent,
+            &delta,
+            env,
+            rec,
+            idx_in_block,
+            cumulative,
+            bal_arg,
+        )?;
         cumulative = receipt.cumulative_gas_used;
         delta.apply(ws);
         receipts.push(receipt);
     }
     Ok((BlockExecOutput { receipts, delta }, ()))
+}
+
+/// Execute ONE canonical record inside an existing block scope — the
+/// Tx-vs-Deposit dispatch every whole-block strategy shares. A Tx runs in
+/// the scope; a Deposit runs outside it (rare, own commit semantics) against
+/// `snapshot ∘ parent ∘ delta`, and its writes are folded into the scope
+/// cache so later records observe them. `delta` is the caller's accumulated
+/// block/batch delta; `parent` its seed layer.
+///
+/// This is the single home of consensus-critical record dispatch: the
+/// sequential driver above, the validator's parallel batches, and (through
+/// the driver) the zk guest all execute records through here.
+#[allow(clippy::too_many_arguments)] // mirrors execute_tx/execute_deposit_tx;
+// a params struct would rename the same nine fields without removing any.
+pub fn execute_record_in_scope<'a, S: StateDatabase>(
+    scope: &mut ExecScope<&'a S>,
+    snapshot: &'a S,
+    parent: Option<&PendingDelta>,
+    delta: &PendingDelta,
+    env: ExecEnv,
+    rec: &BufferedRecord,
+    idx_in_block: u64,
+    cumulative: u64,
+    bal: Option<(&mut revm::state::bal::Bal, u64)>,
+) -> Result<(Receipt, crate::delta::WriteSet), ExecutorError> {
+    match rec {
+        BufferedRecord::Tx {
+            tx_idx,
+            envelope,
+            position,
+        } => scope.execute_tx(*tx_idx, *position, envelope, idx_in_block, cumulative, bal),
+        BufferedRecord::Deposit {
+            tx_idx,
+            deposit,
+            position,
+        } => {
+            let out = execute_deposit_tx(
+                snapshot,
+                parent,
+                delta,
+                env,
+                *tx_idx,
+                *position,
+                deposit,
+                idx_in_block,
+                cumulative,
+                bal,
+            )?;
+            // Fold deposit writes into the scope cache (mirrors the
+            // actor's streaming path) so later txs observe them.
+            let mut layer = PendingDelta::new();
+            layer.apply(out.1.clone());
+            scope.seed_layer(&layer)?;
+            Ok(out)
+        }
+    }
 }
 
 /// Re-derive a tx record's identity from its raw bytes — the in-guest
@@ -218,6 +247,51 @@ pub fn execute_block_stateless(
         )));
     }
     Ok(out)
+}
+
+/// The 3b proof shape: a stateless execution ANCHORED to the chain's root
+/// history. These are the proof's public outputs — an inductive chain from
+/// genesis: the L1 verifier holds the running root, checks
+/// `pre_state_root` continuity, `bal_commitment` against the posted frame,
+/// and advances to `post_state_root`.
+#[derive(Debug)]
+pub struct AnchoredBlockOutput {
+    pub out: BlockExecOutput,
+    pub pre_state_root: alloy_primitives::B256,
+    pub post_state_root: alloy_primitives::B256,
+    pub bal_commitment: alloy_primitives::B256,
+    pub block_number: u64,
+}
+
+/// The FULL guest entry (spec: no-std-exec-core, phase 3b):
+/// [`execute_block_stateless`]'s three fail-closed layers (identity,
+/// witness completeness, BAL equality) plus the MPT anchor on both ends —
+/// the witness is proven against `pre_state_root` BEFORE the first EVM
+/// step, and the post-state root is recomputed from the carried node set
+/// after the last. A prover that fabricates state now has nowhere left to
+/// stand: the witness must hash-link into a root the L1 already holds.
+pub fn execute_block_anchored(
+    witness: &ExecutionWitness,
+    proofs: &kardamom_types::WitnessProofs,
+    parent: Option<&PendingDelta>,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+    expected_bal: &alloy_eip7928::BlockAccessList,
+    granularity: u16,
+) -> Result<AnchoredBlockOutput, ExecutorError> {
+    let pre = crate::anchor::verify_witness_anchored(witness, proofs)?;
+    let pre_state_root = witness
+        .pre_state_root
+        .expect("verify_witness_anchored requires the root");
+    let out = execute_block_stateless(witness, parent, records, env, expected_bal, granularity)?;
+    let post_state_root = crate::anchor::recompute_post_root(witness, proofs, &pre, &out.delta)?;
+    Ok(AnchoredBlockOutput {
+        pre_state_root,
+        post_state_root,
+        bal_commitment: bal_commitment(expected_bal),
+        block_number: env.block_number,
+        out,
+    })
 }
 
 /// Canonical commitment to a (quantized) access list: keccak256 of its RLP

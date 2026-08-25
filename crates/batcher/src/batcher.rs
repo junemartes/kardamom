@@ -54,6 +54,12 @@ pub struct PostedBatch {
     pub blobs: Vec<Blob>,
     pub l2_block_start: u64,
     pub l2_block_end: u64,
+    /// Batch records commitment (spec: PR 4): the fold of per-block digests
+    /// over the batch's L2 tx identities, computed with the SAME
+    /// `kardamom-types::prover` primitives the batch guest uses. Stored by
+    /// the settlement contract; the proof oracle requires the proof's
+    /// public values to carry it.
+    pub records_commitment: alloy_primitives::B256,
 }
 
 /// Sink for posted batches. The production impl wraps an alloy provider and
@@ -148,10 +154,18 @@ pub fn pack_blocks(
     }
     let l2_block_start = blocks.first().map(|b| b.block_number).unwrap_or(0);
     let l2_block_end = blocks.last().map(|b| b.block_number).unwrap_or(0);
+    let records_commitment = kardamom_types::batch_records_commitment(blocks.iter().map(|b| {
+        let mut d = kardamom_types::BlockRecordsDigest::new(b.block_number);
+        for t in &b.txs {
+            d.add_tx(&t.envelope.raw_tx);
+        }
+        d.finish()
+    }));
     Ok(PostedBatch {
         blobs,
         l2_block_start,
         l2_block_end,
+        records_commitment,
     })
 }
 

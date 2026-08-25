@@ -25,7 +25,7 @@ fn high_byte_of_every_field_element_is_zero() {
     let payload: Vec<u8> = (0..1000u32).map(|i| (i & 0xFF) as u8).collect();
     let blobs = pack_to_blobs(&payload).unwrap();
     let raw = blobs[0].as_slice();
-    for chunk in raw.chunks_exact(32) {
+    for chunk in raw.as_chunks::<32>().0 {
         assert_eq!(chunk[0], 0, "high byte of every field element must be 0");
     }
 }

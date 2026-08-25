@@ -46,6 +46,121 @@ pub fn capture_block_witness<S: StateDatabase>(
     Ok((out, recorder.into_witness(env.block_number), bal))
 }
 
+/// Anchor a captured witness to the committed trie (spec: phase 3b): stamp
+/// `pre_state_root`, then build the [`WitnessProofs`] node set by
+/// RECOMPUTE-GUIDED COMPLETION — run the guest's own verify + post-root
+/// recompute, and resolve each named `MissingNode` by re-walking the stored
+/// trie with that position as a proof-retainer target. Completeness holds
+/// by construction: this function returning `Ok` IS the proof that the
+/// guest's identical recompute will succeed on the returned set.
+///
+/// `tx` must be a read view of the COMMITTED state the witness was captured
+/// against — the root after block N-1, stamped here into the witness. The
+/// caller obtains it when the parent's commit settles (never block capture
+/// on an fsync; proving is asynchronous and batch-aligned).
+///
+/// Returns the canonical proof set and the recomputed post-state root.
+pub fn anchor_block_witness<K: kardamom_state::trie::cursor::ReadKind>(
+    tx: &kardamom_state::signet_libmdbx::TxSync<K>,
+    tables: &kardamom_state::trie::TrieTables,
+    pre_state_root: alloy_primitives::B256,
+    witness: &mut ExecutionWitness,
+    delta: &PendingDelta,
+) -> Result<(kardamom_types::WitnessProofs, alloy_primitives::B256), EngineError> {
+    use alloy_primitives::keccak256;
+    use kardamom_engine::anchor::{AnchorError, recompute_post_root, verify_witness_anchored};
+    use kardamom_engine::error::ExecutorError;
+    use kardamom_state::trie::Nibbles;
+    use kardamom_state::trie::proofs::{account_proof_nodes, storage_proof_nodes};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    witness.pre_state_root = Some(pre_state_root);
+
+    // Initial targets: the read set + the write set, per trie.
+    let mut acct_targets: BTreeSet<Nibbles> = BTreeSet::new();
+    let mut slot_targets: BTreeMap<alloy_primitives::Address, BTreeSet<Nibbles>> = BTreeMap::new();
+    for a in &witness.accounts {
+        acct_targets.insert(Nibbles::unpack(keccak256(a.address)));
+    }
+    for s in &witness.storage {
+        slot_targets
+            .entry(s.address)
+            .or_default()
+            .insert(Nibbles::unpack(keccak256(s.key)));
+    }
+    for addr in delta.accounts.keys() {
+        acct_targets.insert(Nibbles::unpack(keccak256(addr)));
+    }
+    for (addr, key) in delta.storage.keys() {
+        acct_targets.insert(Nibbles::unpack(keccak256(addr)));
+        slot_targets
+            .entry(*addr)
+            .or_default()
+            .insert(Nibbles::unpack(keccak256(key)));
+    }
+
+    // Each round adds at least one NEW target; a repeat means the walk
+    // cannot supply what the recompute demands — a real incompleteness, not
+    // a fixed-point step. Fail closed rather than spin.
+    loop {
+        let mut nodes: Vec<bytes::Bytes> = Vec::new();
+        let targets: Vec<Nibbles> = acct_targets.iter().copied().collect();
+        let (walked_root, mut acct_nodes) =
+            account_proof_nodes(tx, tables.account_trie, tables.hashed_accounts, &targets)
+                .map_err(|e| ExecutorError::State(format!("account proof walk: {e}")))?;
+        if walked_root != pre_state_root {
+            return Err(ExecutorError::WitnessUnanchored(format!(
+                "committed trie root {walked_root} != claimed pre_state_root {pre_state_root} \
+                 — the read view is not the state the witness was captured against"
+            )));
+        }
+        nodes.append(&mut acct_nodes);
+        for (addr, keys) in &slot_targets {
+            let stargets: Vec<Nibbles> = keys.iter().copied().collect();
+            let (_, mut snodes) = storage_proof_nodes(
+                tx,
+                tables.storage_trie,
+                tables.hashed_storage,
+                keccak256(addr),
+                &stargets,
+            )
+            .map_err(|e| ExecutorError::State(format!("storage proof walk {addr}: {e}")))?;
+            nodes.append(&mut snodes);
+        }
+        // Canonical wire form: sorted by keccak, unique.
+        let mut keyed: Vec<(alloy_primitives::B256, bytes::Bytes)> =
+            nodes.into_iter().map(|n| (keccak256(&n), n)).collect();
+        keyed.sort_by_key(|(h, _)| *h);
+        keyed.dedup_by_key(|(h, _)| *h);
+        let proofs = kardamom_types::WitnessProofs {
+            nodes: keyed.into_iter().map(|(_, n)| n).collect(),
+        };
+
+        match verify_witness_anchored(witness, &proofs)
+            .and_then(|pre| recompute_post_root(witness, &proofs, &pre, delta))
+        {
+            Ok(post_root) => return Ok((proofs, post_root)),
+            Err(AnchorError::MissingNode {
+                path,
+                account,
+                hash,
+            }) => {
+                let fresh = match account {
+                    None => acct_targets.insert(path),
+                    Some(addr) => slot_targets.entry(addr).or_default().insert(path),
+                };
+                if !fresh {
+                    return Err(ExecutorError::WitnessUnanchored(format!(
+                        "capture fixed point stalled: node {hash} at {path:?} \
+                         (account {account:?}) missing from its own walk"
+                    )));
+                }
+            }
+            Err(e) => return Err(ExecutorError::from(e)),
+        }
+    }
+}
+
 /// Replay `records` over NOTHING but a witness — no state DB, no snapshot.
 /// Fail-closed three times over (phase 3): every tx record's identity is
 /// re-derived from its raw bytes (keccak tx_hash + k256 sender recovery),

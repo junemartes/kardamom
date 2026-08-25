@@ -11,7 +11,7 @@ use revm::primitives::KECCAK_EMPTY;
 
 use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
-use crate::reader::ReaderToExec;
+use crate::reader::{NoEpochCheck, ReaderToExec};
 use crate::state::{MockStateDatabase, StaticSnapshotSource};
 
 use super::test_support::{ImmediateCommit, RecordingQueue, legacy, pos};
@@ -69,7 +69,7 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
     drop(rx_e2c);
@@ -173,7 +173,7 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -237,7 +237,7 @@ fn exec_handoff_carries_a_populated_bal() {
         None,
         Some(bal_tx),
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     h.join().expect("no panic").expect("exec ok");
 
@@ -303,7 +303,7 @@ fn exec_rejects_misaligned_boundary() {
         None,
         None,
         None,
-        None,
+        None::<NoEpochCheck>,
     );
     let res = h.join().expect("no panic");
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));

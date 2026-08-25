@@ -16,9 +16,26 @@ contract KardamomL2Settlement is KardamomUUPSBase {
     ///         monotonically increasing.
     uint64 public lastBatchIndex;
 
+    /// @notice One posted batch's on-chain record (spec: no-std-exec-core,
+    ///         PR 4). `recordsCommitment` binds the batch's canonical record
+    ///         identities so a validity proof attests THE POSTED DATA — the
+    ///         proof oracle cross-reads this entry.
+    struct BatchEntry {
+        uint64 l2BlockStart;
+        uint64 l2BlockEnd;
+        bytes32 recordsCommitment;
+    }
+
+    /// @notice Posted batches by index (index 0 is never used).
+    mapping(uint64 => BatchEntry) public batches;
+
     /// @notice Emitted on every successful `postBatch` call.
     event BatchPosted(
-        uint64 indexed batchIndex, bytes32[] blobHashes, uint64 l2BlockStart, uint64 l2BlockEnd
+        uint64 indexed batchIndex,
+        bytes32[] blobHashes,
+        uint64 l2BlockStart,
+        uint64 l2BlockEnd,
+        bytes32 recordsCommitment
     );
 
     error NotBatcher();
@@ -45,15 +62,19 @@ contract KardamomL2Settlement is KardamomUUPSBase {
         uint64 prevBatchIndex,
         bytes32[] calldata blobVersionedHashes,
         uint64 l2BlockStart,
-        uint64 l2BlockEnd
+        uint64 l2BlockEnd,
+        bytes32 recordsCommitment
     ) external {
         if (msg.sender != l1Batcher) revert NotBatcher();
         if (prevBatchIndex != lastBatchIndex) revert StaleBatchIndex();
         if (blobVersionedHashes.length == 0) revert EmptyBlobs();
         if (l2BlockEnd < l2BlockStart) revert BadBlockRange();
 
-        uint64 newIndex = prevBatchIndex + 1;
-        lastBatchIndex = newIndex;
-        emit BatchPosted(newIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd);
+        uint64 next = prevBatchIndex + 1;
+        lastBatchIndex = next;
+        batches[next] = BatchEntry({
+            l2BlockStart: l2BlockStart, l2BlockEnd: l2BlockEnd, recordsCommitment: recordsCommitment
+        });
+        emit BatchPosted(next, blobVersionedHashes, l2BlockStart, l2BlockEnd, recordsCommitment);
     }
 }

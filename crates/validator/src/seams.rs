@@ -432,6 +432,11 @@ mod tests {
         ring.push(
             7,
             20,
+            kardamom_engine::block_env::ExecEnv {
+                chain_id: 1,
+                block_number: 7,
+                l2_timestamp: 1_700_000_000,
+            },
             &[BufferedRecord::Tx {
                 tx_idx: TxIndex(0),
                 position: BPosition::from_index(0),

@@ -10,7 +10,16 @@
 use alloy_primitives::{B256, U256};
 use alloy_trie::{BranchNodeCompact, Nibbles};
 use signet_libmdbx::Database;
-use signet_libmdbx::tx::aliases::RwTxSync;
+use std::sync::Arc;
+
+use signet_libmdbx::tx::{PtrSync, SyncKind};
+use signet_libmdbx::{TransactionKind, TxSync};
+
+/// Any sync transaction kind (read-only or read-write) — the walker and
+/// cursors only READ, so both are welcome; proof generation runs them over
+/// a read txn against the committed snapshot.
+pub trait ReadKind: TransactionKind + SyncKind<Access = Arc<PtrSync>> {}
+impl<K: TransactionKind + SyncKind<Access = Arc<PtrSync>>> ReadKind for K {}
 
 use super::AccountTrieParts;
 use super::node::decode_branch_node;
@@ -34,8 +43,8 @@ pub(crate) fn node_key(account_hash: Option<&B256>, path: &Nibbles) -> Vec<u8> {
 }
 
 /// Fetch the stored branch node at `path` (exact), if present.
-pub(crate) fn get_branch_node(
-    tx: &RwTxSync,
+pub(crate) fn get_branch_node<K: ReadKind>(
+    tx: &TxSync<K>,
     db: Database,
     account_hash: Option<&B256>,
     path: &Nibbles,
@@ -68,8 +77,8 @@ pub(crate) fn decode_account_leaf(b: &[u8]) -> Result<AccountTrieParts, StateErr
 }
 
 /// Exact `hashed_accounts` lookup by `keccak(addr)`.
-pub(crate) fn get_hashed_account(
-    tx: &RwTxSync,
+pub(crate) fn get_hashed_account<K: ReadKind>(
+    tx: &TxSync<K>,
     db: Database,
     account_hash: &B256,
 ) -> Result<Option<AccountTrieParts>, StateError> {
@@ -113,8 +122,8 @@ fn key_starts_with(key: &B256, prefix: &Nibbles) -> bool {
 
 /// Collect `(keccak(addr), AccountTrieParts)` for every hashed account whose key
 /// is under `prefix`, in ascending key order.
-pub(crate) fn collect_hashed_accounts_under(
-    tx: &RwTxSync,
+pub(crate) fn collect_hashed_accounts_under<K: ReadKind>(
+    tx: &TxSync<K>,
     db: Database,
     prefix: &Nibbles,
 ) -> Result<Vec<(B256, AccountTrieParts)>, StateError> {
@@ -138,8 +147,8 @@ pub(crate) fn collect_hashed_accounts_under(
 
 /// Collect `(keccak(slot), value)` for one account's hashed storage under
 /// `prefix`, ascending. Keys in `hashed_storage` are `account_hash ++ keccak(slot)`.
-pub(crate) fn collect_hashed_storage_under(
-    tx: &RwTxSync,
+pub(crate) fn collect_hashed_storage_under<K: ReadKind>(
+    tx: &TxSync<K>,
     db: Database,
     account_hash: &B256,
     prefix: &Nibbles,

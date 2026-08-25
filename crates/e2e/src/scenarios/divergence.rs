@@ -182,3 +182,156 @@ pub async fn forged_epoch_halts_validator(
     );
     Ok(())
 }
+
+/// S12 — the validator reads L1 through an interposed endpoint, and rejects it
+/// when it lies.
+///
+/// Production points `--l1-rpc-url` at a light client rather than a raw RPC
+/// (issue #163), but the real client needs a beacon chain and our L1 is anvil,
+/// so it cannot run here. What this covers is the half that is ours: the
+/// contract between the validator and whatever serves it L1 data.
+///
+/// `fault` selects the lie. `Fault::None` is the baseline — verification must
+/// still SUCCEED through an interposed endpoint, or the lying cases prove
+/// nothing about detection and only that something broke.
+pub async fn verified_l1_endpoint(
+    stack: &mut LocalStack,
+    t: &Target,
+    fault: crate::harness::l1_verified::Fault,
+) -> Result<()> {
+    use crate::harness::l1_verified::Fault;
+
+    // Warm up: the verdict must land on a validator that was verifying happily.
+    poll_until(
+        "validator verifying (warmup)",
+        Duration::from_secs(30),
+        Duration::from_millis(250),
+        || async {
+            let v = t
+                .validator_metric(super::VALIDATOR_BLOCKS_VERIFIED)
+                .await
+                .unwrap_or(0.0);
+            Ok((v > 0.0).then_some(()))
+        },
+    )
+    .await?;
+    anyhow::ensure!(
+        t.validator_metric(super::VALIDATOR_DIVERGENCE)
+            .await
+            .unwrap_or(0.0)
+            == 0.0,
+        "diverged before the fault was armed"
+    );
+
+    // Non-vacuity: the validator must actually be reading through the mock.
+    // Without this the whole scenario could pass with the endpoint bypassed.
+    anyhow::ensure!(
+        stack.verified_l1().context("mock verified L1")?.served() > 0,
+        "validator never queried the interposed endpoint — it is not in the L1 path"
+    );
+
+    if fault == Fault::None {
+        // Baseline: epochs keep verifying through the interposed endpoint.
+        let verified_before = t
+            .validator_metric(super::VALIDATOR_EPOCHS_VERIFIED)
+            .await
+            .unwrap_or(0.0);
+        stack.l1().context("l1")?.mine(8).await?;
+        poll_until(
+            "epochs verifying through the interposed endpoint",
+            Duration::from_secs(60),
+            Duration::from_millis(500),
+            || async {
+                let v = t
+                    .validator_metric(super::VALIDATOR_EPOCHS_VERIFIED)
+                    .await
+                    .unwrap_or(0.0);
+                Ok((v > verified_before).then_some(()))
+            },
+        )
+        .await
+        .context("verification must still pass through a faithful endpoint")?;
+        anyhow::ensure!(
+            t.validator_metric(super::VALIDATOR_DIVERGENCE)
+                .await
+                .unwrap_or(0.0)
+                == 0.0,
+            "a FAITHFUL endpoint produced a divergence — the check is over-eager"
+        );
+        return Ok(());
+    }
+
+    // Arm the lie from the next L1 block on, so already-verified epochs stay
+    // verified and the fault lands on fresh ones.
+    let from = stack.l1().context("l1")?.finalized_block_number().await? + 1;
+    let served_at_arm = stack.verified_l1().context("mock verified L1")?.served();
+    let verified_at_arm = t
+        .validator_metric(super::VALIDATOR_EPOCHS_VERIFIED)
+        .await
+        .unwrap_or(0.0);
+    stack
+        .verified_l1()
+        .context("mock verified L1")?
+        .set_fault(match fault {
+            Fault::WrongBlockHash { .. } => Fault::WrongBlockHash { from_block: from },
+            Fault::BrokenParentChain { .. } => Fault::BrokenParentChain { from_block: from },
+            other => other,
+        });
+    // SwallowLogs is only a lie if there is a log to swallow. Arm FIRST, then
+    // make the deposit: the da-watcher reads anvil directly, so it builds an
+    // epoch that CARRIES the deposit, while the validator's interposed view
+    // reports none. Without this ordering the epoch is empty on both sides and
+    // the case passes while testing nothing.
+    if fault == Fault::SwallowLogs {
+        let signers = l2::dev_signers(3)?;
+        stack
+            .l1()
+            .context("l1")?
+            .deposit_eth(
+                signers[2].address,
+                alloy_primitives::U256::from(2_000_000_000_000_000u64),
+            )
+            .await
+            .context("stage a deposit for the swallowed-logs case")?;
+    }
+    stack.l1().context("l1")?.mine(16).await?;
+
+    // Assert on the EXIT, not on a metric. The fail-stop kills the process, so
+    // its /metrics goes with it — polling a gauge here reads the halt we are
+    // waiting for as `unwrap_or(0.0)`, i.e. as "no divergence", and the
+    // scenario times out while the validator has been dead and correct the
+    // whole time. (Observed exactly that; the same scrape-failure-as-zero trap
+    // the lag-resync work hit.) Exit code 2 is the divergence fail-stop, and
+    // the log line names the reason.
+    let served_since_arm = stack
+        .verified_l1()
+        .context("mock verified L1")?
+        .served()
+        .saturating_sub(served_at_arm);
+    let code = stack
+        .wait_validator_exit(Duration::from_secs(90))
+        .with_context(|| {
+            format!(
+                "validator did NOT fail-stop on a lying L1 view ({fault:?}) — armed from L1 \
+                 block {from}; endpoint served {} requests since arming; epochs verified \
+                 was {verified_at_arm} at arming",
+                served_since_arm,
+            )
+        })?;
+    anyhow::ensure!(
+        code == Some(2),
+        "validator exited with {code:?}, expected the divergence fail-stop's exit 2"
+    );
+
+    // And it must have halted on an EPOCH fault: exiting 2 for some unrelated
+    // divergence would satisfy the check above while proving nothing about L1
+    // verification.
+    let log = stack
+        .validator_log()
+        .context("read validator log for the halt reason")?;
+    anyhow::ensure!(
+        log.contains("epoch verification failed"),
+        "validator fail-stopped but not on an epoch fault — halted for another reason"
+    );
+    Ok(())
+}

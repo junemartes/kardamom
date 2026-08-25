@@ -126,6 +126,16 @@ pub fn encode_oracle_init_args(attester: Address, challenger: Address, window: u
     Bytes::from((attester, challenger, window).abi_encode_params())
 }
 
+/// Init args for `KardamomProofOracle.initialize(address,address,bytes32,bytes32)`.
+pub fn encode_proof_oracle_init_args(
+    settlement: Address,
+    verifier: Address,
+    program_vkey: alloy_primitives::B256,
+    genesis_root: alloy_primitives::B256,
+) -> Bytes {
+    Bytes::from((settlement, verifier, program_vkey, genesis_root).abi_encode_params())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

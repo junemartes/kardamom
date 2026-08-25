@@ -9,8 +9,14 @@ contract KardamomL2SettlementTest is Test {
     KardamomL2Settlement settlement;
     address constant BATCHER = address(0xBA7);
 
+    bytes32 constant RC = keccak256("records");
+
     event BatchPosted(
-        uint64 indexed batchIndex, bytes32[] blobHashes, uint64 l2BlockStart, uint64 l2BlockEnd
+        uint64 indexed batchIndex,
+        bytes32[] blobHashes,
+        uint64 l2BlockStart,
+        uint64 l2BlockEnd,
+        bytes32 recordsCommitment
     );
 
     function setUp() public {
@@ -35,55 +41,59 @@ contract KardamomL2SettlementTest is Test {
     function test_only_batcher_can_post() public {
         bytes32[] memory hashes = _hashes(1);
         vm.expectRevert(KardamomL2Settlement.NotBatcher.selector);
-        settlement.postBatch(0, hashes, 1, 1);
+        settlement.postBatch(0, hashes, 1, 1, RC);
     }
 
     function test_post_emits_event_and_advances_index() public {
         bytes32[] memory hashes = _hashes(2);
         vm.prank(BATCHER);
         vm.expectEmit(true, false, false, true);
-        emit BatchPosted(1, hashes, 10, 15);
-        settlement.postBatch(0, hashes, 10, 15);
+        emit BatchPosted(1, hashes, 10, 15, RC);
+        settlement.postBatch(0, hashes, 10, 15, RC);
         assertEq(settlement.lastBatchIndex(), 1);
+        (uint64 s0, uint64 e0, bytes32 rc) = settlement.batches(1);
+        assertEq(s0, 10);
+        assertEq(e0, 15);
+        assertEq(rc, RC);
     }
 
     function test_post_rejects_stale_prev_index() public {
         bytes32[] memory hashes = _hashes(1);
         vm.prank(BATCHER);
-        settlement.postBatch(0, hashes, 0, 0);
+        settlement.postBatch(0, hashes, 0, 0, RC);
         // lastBatchIndex is now 1; reposting with prevBatchIndex=0 must revert.
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.StaleBatchIndex.selector);
-        settlement.postBatch(0, hashes, 1, 1);
+        settlement.postBatch(0, hashes, 1, 1, RC);
     }
 
     function test_post_rejects_future_prev_index() public {
         bytes32[] memory hashes = _hashes(1);
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.StaleBatchIndex.selector);
-        settlement.postBatch(5, hashes, 0, 0);
+        settlement.postBatch(5, hashes, 0, 0, RC);
     }
 
     function test_post_rejects_empty_blob_array() public {
         bytes32[] memory empty = new bytes32[](0);
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.EmptyBlobs.selector);
-        settlement.postBatch(0, empty, 0, 0);
+        settlement.postBatch(0, empty, 0, 0, RC);
     }
 
     function test_post_rejects_inverted_block_range() public {
         bytes32[] memory hashes = _hashes(1);
         vm.prank(BATCHER);
         vm.expectRevert(KardamomL2Settlement.BadBlockRange.selector);
-        settlement.postBatch(0, hashes, 10, 5);
+        settlement.postBatch(0, hashes, 10, 5, RC);
     }
 
     function test_index_advances_monotonically_across_three_posts() public {
         bytes32[] memory h = _hashes(1);
         vm.startPrank(BATCHER);
-        settlement.postBatch(0, h, 0, 0);
-        settlement.postBatch(1, h, 1, 2);
-        settlement.postBatch(2, h, 3, 5);
+        settlement.postBatch(0, h, 0, 0, RC);
+        settlement.postBatch(1, h, 1, 2, RC);
+        settlement.postBatch(2, h, 3, 5, RC);
         vm.stopPrank();
         assertEq(settlement.lastBatchIndex(), 3);
     }
@@ -100,7 +110,7 @@ contract KardamomL2SettlementTest is Test {
         bytes32[] memory h = _hashes(1);
         vm.startPrank(BATCHER);
         for (uint64 i = 0; i < n; i++) {
-            settlement.postBatch(i, h, i, i);
+            settlement.postBatch(i, h, i, i, RC);
         }
         vm.stopPrank();
         assertEq(settlement.lastBatchIndex(), n);
