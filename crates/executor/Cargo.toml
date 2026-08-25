@@ -42,7 +42,7 @@ dashmap = { workspace = true }
 
 [[bin]]
 name = "kardamom-executor"
-path = "src/bin/kardamom-executor.rs"
+path = "src/bin/kardamom-executor/main.rs"
 
 [dev-dependencies]
 # : hermetic unit tests use kardamom-log's in-memory fakes.

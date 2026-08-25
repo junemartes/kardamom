@@ -113,35 +113,38 @@ where
     seed_genesis(&env, genesis_accounts, genesis_code)?;
 
     let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental)?;
-    let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
-    let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
-    let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
 
     let mut counters = Counters::default();
-    let drive = drive_blocks(
-        &mut queue,
-        &mut signal,
-        &source,
-        chain_id,
-        blocks,
-        &mut counters,
-    );
+    // The writer adapters live inside this helper scope: everything holding a
+    // delta sender drops at its end, which is what lets the writer thread
+    // exit — `handle.shutdown()` below joins it and would deadlock while any
+    // sender were still alive.
+    let (drive, root) = {
+        let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
+        let mut signal = MdbxWriterSignal::new(handle.snapshot_rx.clone());
+        let source = MdbxSnapshotSource::new(handle.snapshot_rx.clone());
 
-    // Read the final root while the drive succeeded and before tearing down.
-    let root = match &drive {
-        Ok(()) => source
-            .snapshot_after(counters.head)
-            .state_root()
-            .map_err(ReplayError::from)
-            .and_then(|o| o.ok_or(ReplayError::NoStateRoot)),
-        Err(_) => Ok(B256::ZERO), // unused; `drive?` below returns first
+        let drive = drive_blocks(
+            &mut queue,
+            &mut signal,
+            &source,
+            chain_id,
+            blocks,
+            &mut counters,
+        );
+
+        // Read the final root while the drive succeeded and before tearing
+        // down.
+        let root = match &drive {
+            Ok(()) => source
+                .snapshot_after(counters.head)
+                .state_root()
+                .map_err(ReplayError::from)
+                .and_then(|o| o.ok_or(ReplayError::NoStateRoot)),
+            Err(_) => Ok(B256::ZERO), // unused; `drive?` below returns first
+        };
+        (drive, root)
     };
-
-    // Release everything holding a delta sender so the writer thread can exit,
-    // then join it to surface any writer-side error.
-    drop(queue);
-    drop(signal);
-    drop(source);
     let shutdown = handle.shutdown();
 
     drive?;
