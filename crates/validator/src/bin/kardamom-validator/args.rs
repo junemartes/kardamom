@@ -138,9 +138,18 @@ pub struct Args {
     #[arg(long, env = "KARDAMOM_PROVE_BATCHES")]
     pub prove_batches: Option<std::path::PathBuf>,
     /// Transactions per parallel batch (scheduling granularity — independent
-    /// of the BAL's attribution granularity).
+    /// of the BAL's attribution granularity). Only meaningful at wire
+    /// granularity K = 1: at K > 1 (the K=8 wire default) batches are
+    /// chunk-aligned to the frame's K, and the worker count below is the
+    /// real parallelism knob.
     #[arg(long, env = "KARDAMOM_VALIDATION_BATCH_SIZE", default_value_t = 8)]
     pub validation_batch_size: usize,
+    /// Worker threads in the parallel-validation pool. 0 = auto
+    /// (`min(available_parallelism, 8)`). Hard-capped at 40: the mdbx
+    /// reader-slot budget (`MAX_READERS = 64`) reserves the rest for the
+    /// exec thread, RPC, and compaction.
+    #[arg(long, env = "KARDAMOM_VALIDATION_WORKERS", default_value_t = 0)]
+    pub validation_workers: usize,
 
     #[arg(long, env = "KARDAMOM_ATTESTER_POST_INTERVAL", default_value_t = 1)]
     pub attester_post_interval: u64,

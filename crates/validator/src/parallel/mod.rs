@@ -37,5 +37,5 @@ pub use claims::{ClaimIndex, ClaimSlice, batch_ranges};
 pub(crate) use dump::{claims_json, records_json};
 pub use engine::{
     BatchOutcome, BlockOutcome, build_seed, execute_batch, execute_block_parallel,
-    execute_block_sequential, parallel_block_exec,
+    execute_block_parallel_scoped, execute_block_sequential, parallel_block_exec,
 };

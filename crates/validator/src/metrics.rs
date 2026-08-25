@@ -91,6 +91,14 @@ pub fn counter_parallel_fallback() {
     metrics::counter!("kardamom_validator_parallel_fallback_total").increment(1);
 }
 
+/// Pool workers that could not mint an independent snapshot fork
+/// (`StateDatabase::fork_view` refused — writer advanced mid-mint) and fell
+/// back to sharing the strategy's snapshot. Correct but serialized; a
+/// sustained non-zero rate means the mdbx read-parallelism fix is off.
+pub fn counter_fork_fallback(workers: u64) {
+    metrics::counter!("kardamom_validator_snapshot_fork_fallback_total").increment(workers);
+}
+
 pub fn counter_block_verified() {
     metrics::counter!(BLOCKS_VERIFIED_TOTAL).increment(1);
 }
