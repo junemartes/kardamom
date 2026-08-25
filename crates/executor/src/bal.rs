@@ -26,16 +26,36 @@ use kardamom_engine::actor::BalHandoff;
 use kardamom_log::aeron_live::PubHandle;
 use kardamom_types::{BalFrame, BlockDelta};
 
-/// Attribution granularity written into the frame. 1 = per-tx (default);
-/// K > 1 quantizes BalIndex into K-tx chunks (the size ladder — under the
-/// seeded execution model this costs no parallelism, only artifact
-/// fineness). Overridable for measurement via `KARDAMOM_BAL_GRANULARITY`.
+/// Default attribution granularity written into the frame: K-tx chunks
+/// matching the validator's scheduling unit (`--validation-batch-size`,
+/// default 8 — at K > 1 the validator chunk-aligns its batches to the
+/// frame's K anyway, see `parallel::execute_block_parallel`).
+///
+/// The BAL is a SEEDING artifact: its claims exist so the validator's
+/// batches can re-execute in parallel, and the seeding induction only ever
+/// consumes chunk-final values — so chunk-boundary verification is all the
+/// artifact needs, and quantizing costs no parallelism. Per-tx execution
+/// integrity is carried by the per-tx receipts cross-check
+/// (`write_set_hash`), not by BAL attribution. Chunk-collapsing shrinks
+/// frames (within-chunk writes to one item collapse to the chunk-final
+/// value), which protects the validator's lapse window (#113).
+///
+/// `1` (per-tx, the standard EIP-7928 artifact) remains available via the
+/// override for external consumers or divergence forensics. If the
+/// chunk-collapsed path ever diverges live again (the unexplained K=20
+/// DeFi incident), the flight recorder dumps replay inputs at the point of
+/// failure — see `kardamom_validator::flight`.
+const DEFAULT_GRANULARITY: u16 = 8;
+
+/// Attribution granularity written into the frame, [`DEFAULT_GRANULARITY`]
+/// unless overridden via `KARDAMOM_BAL_GRANULARITY` (1 = per-tx; other K =
+/// K-tx chunks, the size ladder's rungs).
 fn configured_granularity() -> u16 {
     std::env::var("KARDAMOM_BAL_GRANULARITY")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|k| *k >= 1)
-        .unwrap_or(1)
+        .unwrap_or(DEFAULT_GRANULARITY)
 }
 
 /// Per-frame publish deadline. A frame that cannot be delivered live within
@@ -102,8 +122,18 @@ pub fn run_bal_publisher(rx: Receiver<BalHandoff>, pubh: PubHandle) {
     loop {
         let (boundary, delta, bal) = match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(v) => v,
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                // Idle tick: no block closed in the last 500ms. trace, not
+                // debug — this fires twice a second on a quiet chain.
+                tracing::trace!("BAL publisher idle: no handoff in 500ms");
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                tracing::debug!(
+                    "BAL handoff channel closed (exec thread gone); stopping publisher"
+                );
+                break;
+            }
         };
         let block = boundary.block_number;
 

@@ -99,16 +99,20 @@ footprints can exceed the 2MB Aeron frame ceiling (term/8 at the default
 When the encoded V2 frame exceeds `MAX_BAL_FRAME_BYTES`, the encoder walks
 a ladder instead of dropping attribution outright:
 
-1. `granularity = 1` — full per-tx attribution (default).
-2. `granularity = K` (5, then 10) — quantize BalIndex to tx chunks:
-   within-chunk writes to a slot collapse to the chunk-final value.
-   Under the seeded execution model (see the validator engine) this
-   costs NO parallelism — batches execute from claimed values, not in
-   conflict order — it only coarsens the artifact itself (claims are
-   verifiable at chunk granularity rather than per tx; the per-tx
-   receipt cross-check still covers per-tx outcomes). Kept as a
-   fallback rather than the default to preserve the standard per-tx
-   EIP-7928 artifact when it fits.
+1. `granularity = 1` — full per-tx attribution (the standard EIP-7928
+   artifact; selectable via `KARDAMOM_BAL_GRANULARITY=1`).
+2. `granularity = K` — quantize BalIndex to tx chunks: within-chunk
+   writes to a slot collapse to the chunk-final value. Under the seeded
+   execution model (see the validator engine) this costs NO parallelism —
+   batches execute from claimed values, not in conflict order — it only
+   coarsens the artifact itself (claims are verifiable at chunk
+   granularity rather than per tx; the per-tx receipt cross-check still
+   covers per-tx outcomes). **Review decision (2026-08-25): K = the
+   validator's scheduling unit (8) is the DEFAULT.** The BAL is a seeding
+   artifact — the induction only consumes chunk-final values, and per-tx
+   correctness is carried by the receipts cross-check — so chunk-boundary
+   fidelity is all the wire artifact needs; per-tx stays available for
+   external consumers via the override.
 3. `V1` — no attribution; sequential validation for that block. Liveness
    never depends on attribution fitting.
 
