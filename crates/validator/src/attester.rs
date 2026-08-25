@@ -156,9 +156,7 @@ impl<P: Provider<Ethereum> + Clone> OutputPoster<P> {
     /// leaving it stranded.
     pub async fn latest_attested_block(&self) -> Result<Option<u64>, AttesterError> {
         let oracle = IWithdrawalOutputOracle::new(self.oracle, self.provider.clone());
-        let mut i = self.output_count().await?;
-        while i > 0 {
-            i -= 1;
+        for i in (0..self.output_count().await?).rev() {
             let o = oracle.getOutput(U256::from(i)).call().await?;
             if !o.deleted {
                 return Ok(Some(o.l2BlockNumber));
