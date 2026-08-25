@@ -20,6 +20,9 @@ kardamom-cluster-adapter = { path = "../cluster-adapter" }
 kardamom-obs = { path = "../obs" }
 # libmdbx-backed production state backend (StateWriter + snapshot-swap channel).
 kardamom-state = { path = "../state" }
+# Block-STM engine for --parallel-execution (scheduler unification B2).
+kardamom-stm = { path = "../stm" }
+kardamom-footprint = { path = "../footprint" }
 revm.workspace = true
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true

@@ -33,3 +33,4 @@ pub use kardamom_engine::{
 /// Executor-side BAL publication (the sequencer-role behaviour layered on the
 /// shared engine: publish each block's `BlockDelta` on `tx_bal`).
 pub mod bal;
+pub mod parallel;

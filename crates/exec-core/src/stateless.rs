@@ -58,6 +58,14 @@ pub enum BufferedRecord {
 pub struct BlockExecOutput {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
+    /// EIP-7928 capture, when the strategy produced one (the executor's
+    /// parallel path captures per-tx fragments and folds them via
+    /// [`crate::bal_ladder::merge_bal_fragments`] so BAL publication
+    /// survives the strategy swap). `None` from strategies that never
+    /// publish (the validator verifies BALs, it does not emit them) and
+    /// from the sequential drivers, whose callers capture through
+    /// [`execute_block_with_bal`] instead.
+    pub bal: Option<revm::state::bal::Bal>,
 }
 
 /// Execute a block's records sequentially over `snapshot ∘ parent`: ONE
@@ -78,6 +86,23 @@ pub fn execute_block<S: StateDatabase>(
 /// (granularity-1) access list, built through the SAME per-tx capture hooks
 /// the live executor publishes from — `Bal::update_account` for txs,
 /// the synthetic-WriteSet path for deposits.
+/// [`execute_block`] with EIP-7928 capture kept in revm form: the output's
+/// `bal` field carries the block's `Bal` (granularity 1), ready for the
+/// executor's boundary handoff to the BAL publisher. This is the executor
+/// strategy's sequential/decline arm — same driver, same capture hooks as
+/// [`execute_block_with_bal`], different artifact form.
+pub fn execute_block_capture<S: StateDatabase>(
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    records: &[BufferedRecord],
+    env: ExecEnv,
+) -> Result<BlockExecOutput, ExecutorError> {
+    let mut bal = revm::state::bal::Bal::new();
+    let (mut out, _) = execute_block_inner(snapshot, parent, records, env, Some(&mut bal))?;
+    out.bal = Some(bal);
+    Ok(out)
+}
+
 pub fn execute_block_with_bal<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -120,7 +145,14 @@ fn execute_block_inner<S: StateDatabase>(
         delta.apply(ws);
         receipts.push(receipt);
     }
-    Ok((BlockExecOutput { receipts, delta }, ()))
+    Ok((
+        BlockExecOutput {
+            receipts,
+            delta,
+            bal: None,
+        },
+        (),
+    ))
 }
 
 /// Execute ONE canonical record inside an existing block scope — the

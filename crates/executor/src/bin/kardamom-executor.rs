@@ -62,6 +62,18 @@ struct Args {
     /// the default `partition_count` in the sequencer).
     #[arg(long, default_value_t = 8)]
     shards: u8,
+    /// Execute blocks through the Block-STM engine (block-at-a-time; the
+    /// streaming P3 pipeline is the follow-up). Off = the streaming
+    /// per-tx path, byte-for-byte as before. Output is byte-identical
+    /// either way — receipts, deltas and published BALs are the same
+    /// artifacts; the validator cross-check fail-stops on any drift.
+    #[arg(long, env = "KARDAMOM_PARALLEL_EXECUTION", default_value_t = false)]
+    parallel_execution: bool,
+    /// Worker threads for --parallel-execution. 0 = auto
+    /// (`min(available_parallelism, 8)`). Hard-capped at 40: the mdbx
+    /// reader-slot budget (`MAX_READERS = 64`) reserves the rest.
+    #[arg(long, env = "KARDAMOM_EXECUTION_WORKERS", default_value_t = 0)]
+    execution_workers: usize,
     /// This node's cluster-egress endpoint `ip:port` (cluster mode). Overrides/sets
     /// the [cluster] egress_channel as `aeron:udp?endpoint=<ip:port>`. Injected per
     /// node by the Nomad job as ${meta.node_ip}:<cluster_egress_port>.
@@ -431,6 +443,33 @@ async fn main() -> Result<()> {
     // Resume at the persisted cursor — 0 for a fresh genesis DB.
     let initial_block = recovery.last_committed_block;
 
+    // Block-STM execution strategy (opt-in): the pool server spins up at
+    // startup and lives for the process; blocks route through it at each
+    // boundary. `None` keeps the engine's streaming per-tx path untouched.
+    let block_exec = if args.parallel_execution {
+        // 0 = auto; hard cap 40 per the mdbx reader-slot budget
+        // (geometry::MAX_READERS = 64, shared with exec/RPC/compaction).
+        let workers = match args.execution_workers {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4),
+            n => n.min(40),
+        };
+        tracing::info!(
+            workers,
+            "parallel execution ENABLED (Block-STM, block-at-a-time)"
+        );
+        Some(kardamom_executor::parallel::stm_block_exec(
+            kardamom_executor::parallel::StmExecConfig {
+                workers,
+                pin_cores: Vec::new(),
+                keep_hot: false,
+            },
+        ))
+    } else {
+        None
+    };
+
     // The executor's main loop is sync (std::thread spawns underneath).
     // Run it inside spawn_blocking so the runtime stays responsive for
     // shutdown handling.
@@ -461,10 +500,11 @@ async fn main() -> Result<()> {
                 bal_capture: Some(bal_tx),
                 // Footprint-shadow capture handoff (Some only under the flag).
                 footprint_shadow,
-                // No whole-block strategy (that's the validator's parallel
-                // path) and no epoch check: the executor trusts the ordered
-                // stream (phase 2 would give it its own L1 dependency).
-                block_exec: None,
+                // Whole-block Block-STM strategy under --parallel-execution;
+                // None keeps the streaming per-tx path. No epoch check
+                // either way: the executor trusts the ordered stream
+                // (phase 2 would give it its own L1 dependency).
+                block_exec,
                 epoch_observer: None,
             },
         )
