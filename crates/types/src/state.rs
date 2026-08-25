@@ -27,6 +27,25 @@ pub trait StateDatabase: Send + Sync {
 
     /// tx_hash → BPosition (the `tx_hash_index` table in S6).
     fn get_tx_position(&self, tx_hash: B256) -> Result<Option<BPosition>, Self::Error>;
+
+    /// Open an INDEPENDENT read view anchored at the same state as `self`
+    /// (mdbx: a fresh RO txn at the same MVCC anchor), so sibling worker
+    /// threads read without contending on this view's backend cursor —
+    /// sharing one mdbx snapshot across W workers serializes their reads
+    /// (measured slower than sequential at w=4 in the Block-STM campaign).
+    ///
+    /// `None` when the backend cannot mint one, or cannot PROVE the fresh
+    /// view anchors at the same state (the writer advanced mid-mint) —
+    /// callers then share `self`, which is always correct, merely
+    /// serialized. The blanket `&T` impl keeps this default (it cannot
+    /// return an owned `&T` from a mint); parallel strategies hold a
+    /// concrete `S`, so the default only ever means "share".
+    fn fork_view(&self) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 /// Borrowed databases are databases: lets [`ExecScope`]-style owners hold
 /// either an owned snapshot (executor per-block scope) or a borrow

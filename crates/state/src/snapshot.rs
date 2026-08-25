@@ -55,7 +55,14 @@ impl StateSnapshot {
     /// Open a fresh snapshot anchored at the writer's current
     /// `last_committed_block` cursor.
     pub fn open(env: &StateEnv) -> Result<Self, StateError> {
-        let txn = env.raw().begin_ro_sync()?;
+        Self::open_on(env.env.clone())
+    }
+
+    /// [`Self::open`] from the raw environment handle — the shared body of
+    /// `open` and [`StateDatabase::fork_view`] (a fork mints its sibling
+    /// txn from the env the snapshot already keeps alive).
+    fn open_on(env: Arc<Environment>) -> Result<Self, StateError> {
+        let txn = env.begin_ro_sync()?;
         let meta = txn.open_db(Some(TABLE_META))?;
         let block_number = read_meta_u64(&txn, meta, KEY_LAST_COMMITTED_BLOCK)?.unwrap_or(0);
         let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS))?;
@@ -72,7 +79,7 @@ impl StateSnapshot {
                 code_db,
                 receipts_db,
                 tx_hash_db,
-                _env: env.env.clone(),
+                _env: env,
             }),
         })
     }
@@ -100,6 +107,21 @@ impl StateSnapshot {
 
 impl StateDatabase for StateSnapshot {
     type Error = StateError;
+
+    /// Mint a sibling snapshot with its OWN RO txn. mdbx serializes reads
+    /// through a txn's cursors, so W workers sharing one snapshot read
+    /// serially — the Block-STM campaign measured that shape SLOWER than
+    /// sequential execution at w=4 (`PoolHandle::begin_block_per_worker`
+    /// exists for the same reason). The fresh txn anchors at the CURRENT
+    /// committed block, so the fork is returned only when that still
+    /// equals this snapshot's block; a writer that advanced mid-mint (the
+    /// depth-K commit pipeline makes this routine under load) yields
+    /// `None` and the caller shares `self` — correct, merely serialized.
+    /// Note `Clone` does NOT do this: cloning shares the inner txn.
+    fn fork_view(&self) -> Option<Self> {
+        let fork = Self::open_on(self.inner._env.clone()).ok()?;
+        (fork.inner.block_number == self.inner.block_number).then_some(fork)
+    }
 
     fn basic(&self, address: Address) -> Result<Option<(u64, U256, B256)>, Self::Error> {
         let key = encode_account_key(address);
