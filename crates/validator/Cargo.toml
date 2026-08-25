@@ -21,6 +21,9 @@ rkyv.workspace = true
 alloy-eip7928.workspace = true
 alloy-rlp.workspace = true
 kardamom-engine = { workspace = true }
+# The shared persistent worker pool (scheduler unification B1): BAL-seeded
+# batches dispatch onto it instead of spawning one OS thread per batch.
+kardamom-stm = { path = "../stm" }
 kardamom-types = { workspace = true }
 kardamom-log = { workspace = true }
 kardamom-state = { path = "../state" }

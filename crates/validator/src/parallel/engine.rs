@@ -10,6 +10,7 @@ use kardamom_engine::actor::{BlockExec, BlockExecOutput, BufferedRecord};
 use kardamom_engine::block_env::ExecEnv;
 use kardamom_engine::delta::PendingDelta;
 use kardamom_engine::error::ExecutorError;
+use kardamom_stm::pool::WorkerPool;
 use kardamom_types::{Receipt, StateDatabase};
 
 use super::claims::{ClaimIndex, batch_ranges};
@@ -203,7 +204,10 @@ pub struct BlockOutcome {
 /// recomputed writes differ from what the executor claimed — the claim was
 /// checked at its producing batch, so a false claim cannot be laundered by
 /// later batches that merely consume it.
+#[allow(clippy::too_many_arguments)] // the pool handle + the block-execution
+// inputs; a params struct would rename the same eight fields without removing any.
 pub fn execute_block_parallel<S: StateDatabase + Sync>(
+    pool: &WorkerPool,
     snapshot: &S,
     parent: Option<&PendingDelta>,
     txs: &[BufferedRecord],
@@ -224,7 +228,8 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     // K > 1, execution batches must be chunk-ALIGNED — batch size == K and
     // ranges tile from index 1 — so the chunk a batch verifies is exactly
     // the chunk the executor collapsed. Claims (and therefore seeds) are
-    // chunk-indexed at K > 1.
+    // chunk-indexed at K > 1. The pool only distributes the INDICES of
+    // these pre-computed ranges, so it cannot re-batch.
     let k = u64::from(granularity.max(1));
     let effective_batch = if granularity > 1 {
         granularity as usize
@@ -233,42 +238,50 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     };
     let ranges = batch_ranges(txs.len(), effective_batch);
 
-    // Every batch runs concurrently: its inputs come from the claims, so no
-    // batch waits on another.
-    let results: Vec<Result<BatchOutcome, ExecutorError>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = ranges
-            .iter()
-            .map(|(from, to)| {
-                let slice = &txs[(*from as usize - 1)..(*to as usize)];
-                let from = *from;
-                scope.spawn(move || {
-                    // Seeds look up "latest claim strictly before this
-                    // batch" in the CLAIM index space: tx indices at K = 1,
-                    // chunk ordinals at K > 1.
-                    let before = if k > 1 {
-                        kardamom_engine::bal_ladder::chunk_of(from, k)
-                    } else {
-                        from
-                    };
-                    let seed = build_seed(snapshot, parent, claims, before)?;
-                    execute_batch(snapshot, &seed, slice, claims, env, from, granularity)
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(ExecutorError::State("batch worker panicked".into())))
-            })
-            .collect()
-    });
+    // One INDEPENDENT snapshot per pool worker (fork_view): sharing one
+    // mdbx snapshot serializes every worker's reads through its single RO
+    // txn's cursors — the Block-STM campaign measured that shape SLOWER
+    // than sequential at w=4. A fork can be refused (the writer advanced
+    // mid-mint, routine under the depth-K commit pipeline); that worker
+    // then shares the strategy's snapshot — correct, merely serialized —
+    // and the fallback is counted so a silent loss of the fix shows up
+    // on the dashboard.
+    let forks: Vec<Option<S>> = (0..pool.workers()).map(|_| snapshot.fork_view()).collect();
+    let refused = forks.iter().filter(|f| f.is_none()).count();
+    if refused > 0 {
+        crate::metrics::counter_fork_fallback(refused as u64);
+    }
+
+    // Every batch runs concurrently on the persistent pool: its inputs come
+    // from the claims, so no batch waits on another. Results land in
+    // per-chunk slots (already in first_index order — ranges tile from 1).
+    let slots: Vec<std::sync::OnceLock<Result<BatchOutcome, ExecutorError>>> =
+        ranges.iter().map(|_| std::sync::OnceLock::new()).collect();
+    let body = |lane: usize, ci: usize| {
+        let (from, to) = ranges[ci];
+        let slice = &txs[(from as usize - 1)..(to as usize)];
+        let snap: &S = forks[lane].as_ref().unwrap_or(snapshot);
+        // Seeds look up "latest claim strictly before this batch" in the
+        // CLAIM index space: tx indices at K = 1, chunk ordinals at K > 1.
+        let before = if k > 1 {
+            kardamom_engine::bal_ladder::chunk_of(from, k)
+        } else {
+            from
+        };
+        let out = build_seed(snap, parent, claims, before)
+            .and_then(|seed| execute_batch(snap, &seed, slice, claims, env, from, granularity));
+        let _ = slots[ci].set(out);
+    };
+    pool.run(ranges.len(), &body)
+        .map_err(|p| ExecutorError::State(format!("batch worker panicked: {p}")))?;
 
     // Verify each batch's claims, then fold in block order.
-    let mut outcomes = Vec::with_capacity(results.len());
-    for r in results {
-        outcomes.push(r?);
+    let mut outcomes = Vec::with_capacity(slots.len());
+    for s in slots {
+        outcomes.push(s.into_inner().expect("pool ran every chunk")?);
     }
+    // Slots are already in block order; the sort is kept as a cheap,
+    // explicit statement of the fold's ordering invariant.
     outcomes.sort_by_key(|o| o.first_index);
 
     let mut delta = PendingDelta::new();
@@ -289,6 +302,83 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
         }
     }
 
+    Ok(BlockOutcome {
+        receipts,
+        delta,
+        batches: ranges.len(),
+    })
+}
+
+/// The pre-pool implementation — one `std::thread::scope` spawn per batch —
+/// kept compiling as the A/B reference for the pooled path (engine_tests +
+/// the bench repro sweep compare the two byte-for-byte). Not a production
+/// path: `parallel_block_exec` always dispatches onto the persistent pool.
+#[doc(hidden)]
+pub fn execute_block_parallel_scoped<S: StateDatabase + Sync>(
+    snapshot: &S,
+    parent: Option<&PendingDelta>,
+    txs: &[BufferedRecord],
+    claims: &ClaimIndex,
+    env: ExecEnv,
+    batch_size: usize,
+    granularity: u16,
+) -> Result<BlockOutcome, ExecutorError> {
+    if txs.is_empty() {
+        return Ok(BlockOutcome {
+            receipts: Vec::new(),
+            delta: PendingDelta::new(),
+            batches: 0,
+        });
+    }
+    let k = u64::from(granularity.max(1));
+    let effective_batch = if granularity > 1 {
+        granularity as usize
+    } else {
+        batch_size
+    };
+    let ranges = batch_ranges(txs.len(), effective_batch);
+    let results: Vec<Result<BatchOutcome, ExecutorError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = ranges
+            .iter()
+            .map(|(from, to)| {
+                let slice = &txs[(*from as usize - 1)..(*to as usize)];
+                let from = *from;
+                scope.spawn(move || {
+                    let before = if k > 1 {
+                        kardamom_engine::bal_ladder::chunk_of(from, k)
+                    } else {
+                        from
+                    };
+                    let seed = build_seed(snapshot, parent, claims, before)?;
+                    execute_batch(snapshot, &seed, slice, claims, env, from, granularity)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(ExecutorError::State("batch worker panicked".into())))
+            })
+            .collect()
+    });
+    let mut outcomes = Vec::with_capacity(results.len());
+    for r in results {
+        outcomes.push(r?);
+    }
+    outcomes.sort_by_key(|o| o.first_index);
+    let mut delta = PendingDelta::new();
+    let mut receipts = Vec::with_capacity(txs.len());
+    let mut cumulative = 0u64;
+    for o in outcomes.iter() {
+        delta.merge_from(&o.delta);
+        for r in &o.receipts {
+            let mut r = r.clone();
+            cumulative += r.gas_used;
+            r.cumulative_gas_used = cumulative;
+            receipts.push(r);
+        }
+    }
     Ok(BlockOutcome {
         receipts,
         delta,
@@ -328,8 +418,14 @@ pub fn execute_block_sequential<S: StateDatabase>(
 pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
     claims: Arc<crate::ClaimBuffer>,
     batch_size: usize,
+    workers: usize,
     flight: Option<Arc<crate::flight::FlightRing>>,
 ) -> BlockExec<D> {
+    // The pool is built ONCE and captured: persistent workers across
+    // blocks. The previous shape spawned one OS thread per batch per
+    // block (~500 spawns for a 4k-tx block at K=8) with no bound tied to
+    // the machine.
+    let pool = Arc::new(WorkerPool::new(workers.max(1), Vec::new()));
     Box::new(
         move |snapshot: &D,
               parent: Option<&PendingDelta>,
@@ -356,6 +452,7 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
                 f.push(block, granularity, env, records, Some(Arc::clone(&idx)));
             }
             let out = match execute_block_parallel(
+                &pool,
                 snapshot,
                 parent,
                 records,

@@ -296,13 +296,23 @@ async fn main() -> Result<()> {
     // Parallel validation strategy (opt-in): seeded batches driven by the
     // BAL. `None` keeps the engine's streaming per-tx path byte-for-byte.
     let block_exec = if args.parallel_validation {
+        // 0 = auto; hard cap 40 per the mdbx reader-slot budget
+        // (geometry::MAX_READERS = 64, shared with exec/RPC/compaction).
+        let workers = match args.validation_workers {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4),
+            n => n.min(40),
+        };
         tracing::info!(
             batch_size = args.validation_batch_size,
-            "parallel validation ENABLED (seeded BAL batches)"
+            workers,
+            "parallel validation ENABLED (seeded BAL batches on the shared pool)"
         );
         Some(kardamom_validator::parallel::parallel_block_exec(
             claims.clone(),
             args.validation_batch_size,
+            workers,
             Some(flight.clone()),
         ))
     } else if args.prove_batches.is_some() {

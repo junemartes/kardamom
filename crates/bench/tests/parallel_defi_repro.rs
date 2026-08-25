@@ -56,6 +56,13 @@ fn xs(state: &mut u64) -> u64 {
     x
 }
 
+/// Shared pool for the sweep (persistent, like production).
+fn repro_pool() -> &'static kardamom_stm::pool::WorkerPool {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<kardamom_stm::pool::WorkerPool> = OnceLock::new();
+    POOL.get_or_init(|| kardamom_stm::pool::WorkerPool::new(4, Vec::new()))
+}
+
 #[test]
 fn k20_defi_parallel_matches_sequential_across_compositions() {
     let signers = mnemonic::derive_signers(ANVIL_PHRASE, SENDERS).unwrap();
@@ -181,8 +188,7 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
         for k in [1u16, 20] {
             let q = kardamom_engine::bal_ladder::quantize(alloy_bal.clone(), k);
             let claims = ClaimIndex::from_alloy(&q);
-            let out = execute_block_parallel(
-                &snap,
+            let out = execute_block_parallel(repro_pool(), &snap,
                 Some(&parent),
                 &block_txs,
                 &claims,
@@ -284,7 +290,7 @@ fn create_then_call_across_chunks_in_one_block() {
     for k in [20u16, 1] {
         let q = kardamom_engine::bal_ladder::quantize(alloy_bal.clone(), k);
         let claims = ClaimIndex::from_alloy(&q);
-        let out = execute_block_parallel(&snap, None, &block_txs, &claims, env, 8, k)
+        let out = execute_block_parallel(repro_pool(), &snap, None, &block_txs, &claims, env, 8, k)
             .unwrap_or_else(|e| panic!("K={k} create-then-call diverged: {e:?}"));
         assert_eq!(out.delta.storage, seq_delta.storage, "K={k}: storage");
         assert_eq!(out.delta.accounts, seq_delta.accounts, "K={k}: accounts");

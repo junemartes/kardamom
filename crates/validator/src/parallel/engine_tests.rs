@@ -15,6 +15,7 @@ use kardamom_engine::executor::{execute_deposit_tx, execute_tx};
 use kardamom_engine::state::MockStateDatabase;
 use kardamom_types::{BPosition, BlockBoundaryStart, Deposit, StateDatabase, TxEnvelope};
 
+use super::engine::execute_block_parallel_scoped;
 use super::{ClaimIndex, execute_block_parallel};
 
 fn tx(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64, i: u64) -> BufferedRecord {
@@ -191,6 +192,12 @@ fn seq_delta<S: StateDatabase>(snap: &S, records: &[BufferedRecord]) -> PendingD
 /// state to sequential execution — including for a CONFLICTING workload
 /// (one sender, dependent nonces, shared recipient) where every tx depends
 /// on its predecessor. Seeding, not ordering, is what makes that safe.
+/// One small pool per test: the production strategy holds a persistent
+/// pool; tests mint a fresh one so each case is isolated.
+fn test_pool() -> kardamom_stm::pool::WorkerPool {
+    kardamom_stm::pool::WorkerPool::new(4, Vec::new())
+}
+
 #[test]
 fn parallel_batches_equal_sequential_on_a_fully_dependent_chain() {
     let signer = PrivateKeySigner::random();
@@ -211,8 +218,17 @@ fn parallel_batches_equal_sequential_on_a_fully_dependent_chain() {
     let expected = seq_delta(&snap, &txs);
 
     for batch_size in [1usize, 5, 10] {
-        let out = execute_block_parallel(&snap, None, &txs, &claims, env(), batch_size, 1)
-            .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
+        let out = execute_block_parallel(
+            &test_pool(),
+            &snap,
+            None,
+            &txs,
+            &claims,
+            env(),
+            batch_size,
+            1,
+        )
+        .unwrap_or_else(|e| panic!("batch_size {batch_size}: {e:?}"));
         assert_eq!(
             out.delta.accounts, expected.accounts,
             "batch_size {batch_size}: account state must equal sequential"
@@ -252,7 +268,7 @@ fn a_forged_claim_fails_stop_at_its_producing_batch() {
         entry.1 += U256::from(1_000_000u64);
     }
 
-    let err = execute_block_parallel(&snap, None, &txs, &claims, env(), 5, 1)
+    let err = execute_block_parallel(&test_pool(), &snap, None, &txs, &claims, env(), 5, 1)
         .expect_err("a forged claim must be caught");
     match err {
         ExecutorError::Divergence(msg) => {
@@ -289,8 +305,8 @@ fn quantized_claims_verify_with_aligned_batches() {
     let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 20);
     let claims = ClaimIndex::from_alloy(&quantized);
 
-    let out =
-        execute_block_parallel(&snap, None, &txs, &claims, env(), 8, 20).expect("quantized parity");
+    let out = execute_block_parallel(&test_pool(), &snap, None, &txs, &claims, env(), 8, 20)
+        .expect("quantized parity");
     assert_eq!(out.delta.accounts, expected.accounts);
     assert_eq!(out.batches, 3, "47 txs at K=20 -> 3 aligned chunks");
 
@@ -301,7 +317,7 @@ fn quantized_claims_verify_with_aligned_batches() {
     {
         e.1 += U256::from(999u64);
     }
-    let err = execute_block_parallel(&snap, None, &txs, &forged, env(), 8, 20)
+    let err = execute_block_parallel(&test_pool(), &snap, None, &txs, &forged, env(), 8, 20)
         .expect_err("forged chunk claim must be caught");
     match err {
         ExecutorError::Divergence(msg) => {
@@ -334,7 +350,8 @@ fn parent_layer_bridges_the_uncommitted_gap() {
     // semantics: the mock snapshot still says nonce 0).
     let b1: Vec<BufferedRecord> = (0..4).map(|i| tx(&signer, to, i, 100, i)).collect();
     let claims1 = honest_claims(&snap, &b1);
-    let out1 = execute_block_parallel(&snap, None, &b1, &claims1, env(), 2, 1).expect("block 1");
+    let out1 = execute_block_parallel(&test_pool(), &snap, None, &b1, &claims1, env(), 2, 1)
+        .expect("block 1");
     let parent = out1.delta.clone();
 
     // Block 2: nonces 4..7. Against the bare snapshot every tx is a
@@ -346,15 +363,24 @@ fn parent_layer_bridges_the_uncommitted_gap() {
     let claims2 = ClaimIndex::from_alloy(&bal.into_alloy_bal());
 
     // WITHOUT parent: the stale-state bug — every tx skips.
-    let stale = execute_block_parallel(&snap, None, &b2, &claims2, env(), 2, 1);
+    let stale = execute_block_parallel(&test_pool(), &snap, None, &b2, &claims2, env(), 2, 1);
     assert!(
         stale.is_err(),
         "without the parent layer the block must diverge (skips vs claims)"
     );
 
     // WITH parent: byte-identical to the sequential-with-parent run.
-    let out2 = execute_block_parallel(&snap, Some(&parent), &b2, &claims2, env(), 2, 1)
-        .expect("block 2 with parent");
+    let out2 = execute_block_parallel(
+        &test_pool(),
+        &snap,
+        Some(&parent),
+        &b2,
+        &claims2,
+        env(),
+        2,
+        1,
+    )
+    .expect("block 2 with parent");
     assert_eq!(out2.delta.accounts, delta.accounts);
     assert!(out2.receipts.iter().all(|r| r.status));
 }
@@ -362,8 +388,17 @@ fn parent_layer_bridges_the_uncommitted_gap() {
 #[test]
 fn empty_block_is_a_no_op() {
     let snap = MockStateDatabase::builder().build();
-    let out =
-        execute_block_parallel(&snap, None, &[], &ClaimIndex::default(), env(), 5, 1).unwrap();
+    let out = execute_block_parallel(
+        &test_pool(),
+        &snap,
+        None,
+        &[],
+        &ClaimIndex::default(),
+        env(),
+        5,
+        1,
+    )
+    .unwrap();
     assert!(out.receipts.is_empty() && out.batches == 0);
 }
 
@@ -399,7 +434,7 @@ fn deposit_mint_seeds_later_batches() {
     let expected = seq_delta(&snap, &records);
 
     // batch_size 1: the spends run in batches seeded ONLY from claims.
-    let out = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+    let out = execute_block_parallel(&test_pool(), &snap, None, &records, &claims, env(), 1, 1)
         .expect("deposit-seeded parallel block");
     assert_eq!(out.delta.accounts, expected.accounts);
     assert_eq!(out.delta.storage, expected.storage);
@@ -448,7 +483,7 @@ fn create_deposit_code_seeds_later_calls() {
         "sequential call must hit the deployed contract"
     );
 
-    let out = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+    let out = execute_block_parallel(&test_pool(), &snap, None, &records, &claims, env(), 1, 1)
         .expect("CREATE-deposit-seeded parallel block");
     assert_eq!(out.delta.accounts, expected.accounts);
     assert_eq!(out.delta.storage, expected.storage);
@@ -489,7 +524,7 @@ fn quantized_chunk_containing_a_deposit_verifies() {
     let quantized = kardamom_engine::bal_ladder::quantize(bal.into_alloy_bal(), 4);
     let claims = ClaimIndex::from_alloy(&quantized);
 
-    let out = execute_block_parallel(&snap, None, &records, &claims, env(), 3, 4)
+    let out = execute_block_parallel(&test_pool(), &snap, None, &records, &claims, env(), 3, 4)
         .expect("deposit-in-chunk quantized parity");
     assert_eq!(out.delta.accounts, expected.accounts);
     assert_eq!(out.delta.storage, expected.storage);
@@ -516,7 +551,7 @@ fn a_forged_deposit_claim_fails_stop() {
     let entry = w.iter_mut().find(|(i, _)| *i == 1).expect("index 1");
     entry.1 += U256::from(7u64);
 
-    let err = execute_block_parallel(&snap, None, &records, &claims, env(), 1, 1)
+    let err = execute_block_parallel(&test_pool(), &snap, None, &records, &claims, env(), 1, 1)
         .expect_err("forged deposit claim must be caught");
     match err {
         ExecutorError::Divergence(msg) => {
@@ -525,4 +560,123 @@ fn a_forged_deposit_claim_fails_stop() {
         }
         other => panic!("expected Divergence, got {other:?}"),
     }
+}
+
+/// A/B: the pooled dispatch must be BYTE-IDENTICAL to the scope-spawn
+/// reference on the same compositions — receipts, delta, and (on a forged
+/// claim) the error text. The pool changes only WHERE batches run.
+#[test]
+fn pooled_dispatch_matches_scoped_reference() {
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("00000000000000000000000000000000000ABCDE");
+    let snap = MockStateDatabase::builder()
+        .account(
+            from,
+            U256::from(10u128.pow(18)),
+            0,
+            revm::primitives::KECCAK_EMPTY,
+        )
+        .build();
+    let txs: Vec<BufferedRecord> = (0..23).map(|i| tx(&signer, to, i, 100 + i, i)).collect();
+    // Per-tx capture once; at K > 1 the wire claims are chunk-collapsed
+    // through the SHARED quantize, exactly as the executor publishes them.
+    let (_, bal) = seq_capture(&snap, None, &txs, false);
+    let raw = bal.into_alloy_bal();
+
+    for (batch_size, granularity) in [(5usize, 1u16), (8, 1), (8, 8)] {
+        let claims = ClaimIndex::from_alloy(&kardamom_engine::bal_ladder::quantize(
+            raw.clone(),
+            granularity,
+        ));
+        let pooled = execute_block_parallel(
+            &test_pool(),
+            &snap,
+            None,
+            &txs,
+            &claims,
+            env(),
+            batch_size,
+            granularity,
+        )
+        .expect("pooled");
+        let scoped = execute_block_parallel_scoped(
+            &snap,
+            None,
+            &txs,
+            &claims,
+            env(),
+            batch_size,
+            granularity,
+        )
+        .expect("scoped");
+        assert_eq!(
+            pooled.batches, scoped.batches,
+            "bs={batch_size} k={granularity}"
+        );
+        assert_eq!(
+            pooled.receipts, scoped.receipts,
+            "bs={batch_size} k={granularity}"
+        );
+        assert_eq!(
+            pooled.delta.accounts, scoped.delta.accounts,
+            "bs={batch_size} k={granularity}"
+        );
+        assert_eq!(
+            pooled.delta.storage, scoped.delta.storage,
+            "bs={batch_size} k={granularity}"
+        );
+    }
+}
+
+/// Real-mdbx equivalence: the pooled path with PER-WORKER SNAPSHOT FORKS
+/// (`fork_view`) produces byte-identical output to sequential execution
+/// against the same mdbx snapshot. This is the state-backed proof for the
+/// shared-read-txn fix — mock tests cannot exercise the fork path's mdbx
+/// anchor semantics.
+#[test]
+fn pooled_with_forks_matches_sequential_on_mdbx() {
+    use kardamom_engine::stateless::execute_block;
+
+    let signer = PrivateKeySigner::random();
+    let from = signer.address();
+    let to = address!("00000000000000000000000000000000000ABCDE");
+
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let env_ = kardamom_state::StateEnvBuilder::new(dir.path())
+        .durability(kardamom_state::Durability::SafeNoSync)
+        .open()
+        .expect("open state env");
+    // Fund the sender at genesis so transfers execute.
+    kardamom_state::seed_genesis(
+        &env_,
+        &[kardamom_types::AccountChange {
+            address: from,
+            nonce: 0,
+            balance: U256::from(10u128.pow(18)),
+            code_hash: revm::primitives::KECCAK_EMPTY,
+        }],
+        &[],
+    )
+    .expect("seed genesis");
+    let writer = kardamom_state::StateWriter::spawn(env_).expect("spawn writer");
+    let snap = writer.snapshot_rx.recv().expect("genesis snapshot");
+    // Sanity: forks mint (writer quiescent at genesis).
+    assert!(
+        snap.fork_view().is_some(),
+        "fork must mint at a quiet anchor"
+    );
+
+    let txs: Vec<BufferedRecord> = (0..17).map(|i| tx(&signer, to, i, 50 + i, i)).collect();
+    let claims = honest_claims(&snap, &txs);
+
+    let sequential = execute_block(&snap, None, &txs, env()).expect("sequential");
+    let pooled = execute_block_parallel(&test_pool(), &snap, None, &txs, &claims, env(), 8, 1)
+        .expect("pooled with forks");
+
+    assert_eq!(pooled.receipts, sequential.receipts);
+    assert_eq!(pooled.delta.accounts, sequential.delta.accounts);
+    assert_eq!(pooled.delta.storage, sequential.delta.storage);
+    drop(snap);
+    writer.shutdown().expect("writer shutdown");
 }
