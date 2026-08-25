@@ -151,7 +151,10 @@ pub fn bounded_join_timeout(resuming: bool) -> Duration {
 // Async log handles → sync engine traits, with the per-shard pump tasks.
 // ---------------------------------------------------------------------------
 
-struct LiveTxDataSub {
+/// The live tx_data subscription both role binaries run: one Aeron
+/// subscriber handle per shard, async→sync bridged through a pump task.
+/// Public so a binary's `EngineWiring` can name it as its `TxData` type.
+pub struct LiveTxDataSub {
     sequencer_id: u8,
     rx: sync_mpsc::Receiver<(TxDataLoc, TxEnvelope)>,
 }
@@ -185,8 +188,8 @@ pub fn open_tx_data_subs(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
     shards: u8,
-) -> Result<Vec<Box<dyn TxDataSubscription>>> {
-    let mut tx_data_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(shards as usize);
+) -> Result<Vec<LiveTxDataSub>> {
+    let mut tx_data_subs: Vec<LiveTxDataSub> = Vec::with_capacity(shards as usize);
     for shard_id in 0..shards {
         let (tx, rx) = sync_mpsc::channel::<(TxDataLoc, TxEnvelope)>();
         let mut handle = TxDataSubscriberHandle::open(rt, channels, shard_id)
@@ -198,10 +201,10 @@ pub fn open_tx_data_subs(
                 }
             }
         });
-        tx_data_subs.push(Box::new(LiveTxDataSub {
+        tx_data_subs.push(LiveTxDataSub {
             sequencer_id: shard_id,
             rx,
-        }));
+        });
     }
     Ok(tx_data_subs)
 }
@@ -355,14 +358,18 @@ pub fn cluster_replay_cursor(
 /// cluster session must never contend with tx_data/receipts work on the main
 /// runtimes) and connect the cluster tx_ordering subscription from `cursor`.
 /// The returned `LiveCluster` guard MUST outlive the engine loop.
+/// The live tx_ordering subscription both role binaries run: the Aeron
+/// Cluster (Raft) egress behind the replay/dedup adapter. Public so a
+/// binary's `EngineWiring` can name it as its `TxOrdering` type without a
+/// direct `kardamom-cluster-adapter` dependency.
+pub type LiveTxOrderingSub =
+    crate::reader::cluster::ClusterTxOrderingSubscription<kardamom_cluster_adapter::LiveEgress>;
+
 pub fn connect_cluster_ordering(
     aeron_dir: Option<&Path>,
     cfg: kardamom_cluster_adapter::LiveClusterConfig,
     cursor: crate::reader::cluster::ReplayCursor,
-) -> Result<(
-    kardamom_cluster_adapter::LiveCluster,
-    crate::reader::cluster::ClusterTxOrderingSubscription<kardamom_cluster_adapter::LiveEgress>,
-)> {
+) -> Result<(kardamom_cluster_adapter::LiveCluster, LiveTxOrderingSub)> {
     let cluster_rt = AeronRuntime::spawn(aeron_dir).context("spawn cluster AeronRuntime")?;
     crate::reader::cluster::cluster_tx_ordering_subscription(cluster_rt, cfg, cursor)
         .context("connect cluster tx_ordering subscription")

@@ -24,7 +24,7 @@ use kardamom_engine::bin_support::{self, StateDurabilityArg};
 use kardamom_executor::{
     CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError, ExecutorFileConfig, Inbound,
     MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal, NoEpochCheck, Outbound, ResumePoint,
-    RoleHooks, Start, TxDataSubscription, TxOrderingSubscription, TxReceiptsPublication,
+    RoleHooks, Start, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::{AeronRuntime, TxReceiptsPublisherHandle};
 use kardamom_log::config::LogConfig;
@@ -320,8 +320,7 @@ async fn main() -> Result<()> {
     // against the remote durability archives (the resume-gated replay-merge
     // this replaces pointed at the consumer's LOCAL archive, which records
     // neither stream — a resuming process had no tx_data source at all).
-    let tx_data_subs: Vec<Box<dyn TxDataSubscription>> =
-        bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
+    let tx_data_subs = bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
         &aeron_cfg,
@@ -349,7 +348,7 @@ async fn main() -> Result<()> {
     tracing::info!("kardamom-executor: tx_ordering via Aeron Cluster");
     // The executor is the blessed emitter of the kardamom_sealer_* re-export
     // (default-on in the shared subscription; the validator suppresses it).
-    let tx_ordering_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub);
+    let tx_ordering_sub = cluster_sub;
 
     // tx_receipts publication. With MDS (fan-in) enabled, this replica
     // publishes both the receipt stream and the boundary side-stream to its
@@ -578,14 +577,14 @@ async fn main() -> Result<()> {
 // Role-specific adapter: tx_receipts publication.
 // ---------------------------------------------------------------------------
 
-/// The executor role's port types. The subscriptions stay boxed because the
-/// transport is chosen at runtime (`bin_support::open_tx_data_subs`); the
-/// rest are the concrete mdbx/Aeron implementations.
+/// The executor role's port types: the concrete mdbx/Aeron implementations
+/// throughout — this binary makes no runtime impl choices, so nothing needs
+/// the boxed-wiring escape hatch.
 struct ExecutorWiring;
 
 impl EngineWiring for ExecutorWiring {
-    type TxData = Box<dyn TxDataSubscription>;
-    type TxOrdering = Box<dyn TxOrderingSubscription>;
+    type TxData = bin_support::LiveTxDataSub;
+    type TxOrdering = bin_support::LiveTxOrderingSub;
     type TxReceipts = LiveTxReceiptsPub;
     type Snapshots = MdbxSnapshotSource;
     type WriterSignal = MdbxWriterSignal;
