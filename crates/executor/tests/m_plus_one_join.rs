@@ -37,10 +37,10 @@ use rand_chacha::ChaCha8Rng;
 use revm::primitives::KECCAK_EMPTY;
 
 use kardamom_executor::{
-    BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, ReaderConfig, StateWriterSignal, TxDataSubscription,
-    TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication,
-    TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
+    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ReaderConfig,
+    RoleHooks, Start, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 use kardamom_log::testing::{
     FakeBus, FakeTxDataPublication, FakeTxDataSubscription, FakeTxOrderingPublication,
@@ -51,7 +51,7 @@ use kardamom_log::testing::{
 /// real-Aeron equivalent is `kardamom_log::TxDataSubscriber` opened directly on a
 /// dedicated OS thread (one Aeron client per thread, since the client is
 /// `!Send + !Sync`).
-struct FakeASubAdapter {
+struct FakeTxDataSubAdapter {
     sequencer_id: u8,
     sub: FakeTxDataSubscription,
     /// Set by the test driver once it has finished publishing; the
@@ -60,7 +60,7 @@ struct FakeASubAdapter {
     closed: Arc<AtomicBool>,
 }
 
-impl TxDataSubscription for FakeASubAdapter {
+impl TxDataSubscription for FakeTxDataSubAdapter {
     fn sequencer_id(&self) -> u8 {
         self.sequencer_id
     }
@@ -89,11 +89,11 @@ impl TxDataSubscription for FakeASubAdapter {
     }
 }
 
-struct FakeBSubAdapter {
+struct FakeTxOrderingSubAdapter {
     sub: FakeTxOrderingSubscription,
     closed: Arc<AtomicBool>,
 }
-impl TxOrderingSubscription for FakeBSubAdapter {
+impl TxOrderingSubscription for FakeTxOrderingSubAdapter {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         loop {
             let mut out: Option<(BPosition, TxOrderingMessage)> = None;
@@ -116,8 +116,8 @@ impl TxOrderingSubscription for FakeBSubAdapter {
     }
 }
 
-struct ChanCPub(Sender<CMessage>);
-impl TxReceiptsPublication for ChanCPub {
+struct ChanReceiptsPub(Sender<CMessage>);
+impl TxReceiptsPublication for ChanReceiptsPub {
     fn publish(&mut self, msg: CMessage) -> Result<(), ExecutorError> {
         self.0
             .send(msg)
@@ -133,6 +133,18 @@ impl StateWriterSignal for Imm {
     fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
         Ok(b)
     }
+}
+
+/// Port types for these tests' fake-bus adapters.
+struct TestWiring;
+impl EngineWiring for TestWiring {
+    type TxData = FakeTxDataSubAdapter;
+    type TxOrdering = FakeTxOrderingSubAdapter;
+    type TxReceipts = ChanReceiptsPub;
+    type Snapshots = MutatingSnapshotSource;
+    type WriterSignal = Imm;
+    type WriterQueue = WriterApplyingQueue;
+    type Epoch = NoEpochCheck;
 }
 
 fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address) -> KtTxEnvelope {
@@ -186,15 +198,15 @@ fn m4_canonical_b_order_drives_receipts() {
     // Per-sequencer tx_data pub/sub pairs. Channel URI / stream-id match
     // the `ChannelsConfig::tx_data_channel_template` convention.
     let mut a_pubs: Vec<FakeTxDataPublication> = Vec::with_capacity(M as usize);
-    let mut a_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
+    let mut tx_data_sub_handles: Vec<FakeTxDataSubscription> = Vec::with_capacity(M as usize);
     for sid in 0..M {
         let chan = format!("aeron:ipc?alias=a-{sid}");
         let stream_id = 2000 + (sid as i32);
         a_pubs.push(FakeTxDataPublication::open(&bus, sid, &chan, stream_id));
-        a_sub_handles.push(FakeTxDataSubscription::open(&bus, &chan, stream_id));
+        tx_data_sub_handles.push(FakeTxDataSubscription::open(&bus, &chan, stream_id));
     }
     let b_pub = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
-    let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
+    let tx_ordering_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     // Phase 1: every sequencer publishes its envelopes onto tx_data.
     // Record (sid, tx_data_position, tx_hash) so we can assert canonical order.
@@ -266,22 +278,22 @@ fn m4_canonical_b_order_drives_receipts() {
     let a_closed: Vec<Arc<AtomicBool>> = (0..M).map(|_| Arc::new(AtomicBool::new(false))).collect();
     let b_closed = Arc::new(AtomicBool::new(false));
 
-    let mut a_subs: Vec<Box<dyn TxDataSubscription>> = Vec::with_capacity(M as usize);
-    for (sid, (sub, closed)) in a_sub_handles
+    let mut tx_data_subs: Vec<FakeTxDataSubAdapter> = Vec::with_capacity(M as usize);
+    for (sid, (sub, closed)) in tx_data_sub_handles
         .into_iter()
         .zip(a_closed.iter().cloned())
         .enumerate()
     {
-        a_subs.push(Box::new(FakeASubAdapter {
+        tx_data_subs.push(FakeTxDataSubAdapter {
             sequencer_id: sid as u8,
             sub,
             closed,
-        }));
+        });
     }
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(FakeBSubAdapter {
-        sub: b_sub_handle,
+    let tx_ordering_sub = FakeTxOrderingSubAdapter {
+        sub: tx_ordering_sub_handle,
         closed: b_closed.clone(),
-    });
+    };
 
     let (c_tx, c_rx) = bounded::<CMessage>(512);
     let cfg = ExecutorConfig {
@@ -305,23 +317,21 @@ fn m4_canonical_b_order_drives_receipts() {
     });
 
     let join = thread::spawn(move || {
-        Executor::run(
+        Executor::run::<TestWiring>(
             cfg,
-            a_subs,
-            b_sub,
-            ChanCPub(c_tx),
-            snapshots,
-            Imm,
-            writer_q,
-            0,
-            None,
-            None,
-            // Whole-block exec strategy (validator parallel path).
-            None,
-            None,
-            // The executor trusts the ordered stream (phase 2 would
-            // give it its own L1 dependency); only the validator verifies.
-            None,
+            Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: tx_ordering_sub,
+                join_recovery: None,
+            },
+            Outbound {
+                tx_receipts: ChanReceiptsPub(c_tx),
+                snapshots,
+                writer_signal: Imm,
+                writer_queue: writer_q,
+            },
+            Start::default(),
+            RoleHooks::none(),
         )
     });
 
@@ -379,9 +389,9 @@ fn tx_ref_arriving_before_envelope_still_joins() {
 
     let bus = FakeBus::new();
     let a_pub = FakeTxDataPublication::open(&bus, 0, "aeron:ipc?alias=a-0", 2000);
-    let a_sub_handle = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-0", 2000);
+    let tx_data_sub_handle = FakeTxDataSubscription::open(&bus, "aeron:ipc?alias=a-0", 2000);
     let b_pub = FakeTxOrderingPublication::open(&bus, "aeron:ipc?alias=b", 1001);
-    let b_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
+    let tx_ordering_sub_handle = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
 
     let env = transfer(&signer, 0, to);
     let expected_hash = env.tx_hash;
@@ -437,15 +447,15 @@ fn tx_ref_arriving_before_envelope_still_joins() {
 
     let a_closed = Arc::new(AtomicBool::new(false));
     let b_closed = Arc::new(AtomicBool::new(false));
-    let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(FakeASubAdapter {
+    let tx_data_subs = vec![FakeTxDataSubAdapter {
         sequencer_id: 0,
-        sub: a_sub_handle,
+        sub: tx_data_sub_handle,
         closed: a_closed.clone(),
-    })];
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(FakeBSubAdapter {
-        sub: b_sub_handle,
+    }];
+    let tx_ordering_sub = FakeTxOrderingSubAdapter {
+        sub: tx_ordering_sub_handle,
         closed: b_closed.clone(),
-    });
+    };
     let (c_tx, c_rx) = bounded::<CMessage>(8);
 
     // After the inserter has had time to fire and the executor has had
@@ -472,23 +482,21 @@ fn tx_ref_arriving_before_envelope_still_joins() {
     };
 
     let join = thread::spawn(move || {
-        Executor::run(
+        Executor::run::<TestWiring>(
             cfg,
-            a_subs,
-            b_sub,
-            ChanCPub(c_tx),
-            snapshots,
-            Imm,
-            writer_q,
-            0,
-            None,
-            None,
-            // Whole-block exec strategy (validator parallel path).
-            None,
-            None,
-            // The executor trusts the ordered stream (phase 2 would
-            // give it its own L1 dependency); only the validator verifies.
-            None,
+            Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: tx_ordering_sub,
+                join_recovery: None,
+            },
+            Outbound {
+                tx_receipts: ChanReceiptsPub(c_tx),
+                snapshots,
+                writer_signal: Imm,
+                writer_queue: writer_q,
+            },
+            Start::default(),
+            RoleHooks::none(),
         )
     });
 

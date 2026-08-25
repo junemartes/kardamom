@@ -1,7 +1,9 @@
 //! Outbound ports of the executor actor: the tx_receipts publication and the
 //! two state-writer seams (durability signal + hand-off queue). Trait objects
-//! get forwarding impls so a binary can box role-specific wrappers (e.g. the
-//! validator's attester tee) without monomorphising `Executor::run` twice.
+//! get forwarding impls so a binary that picks a role-specific wrapper at
+//! runtime (e.g. the validator's attester tee) can name `Box<dyn …>` as that
+//! associated type in its [`EngineWiring`](super::EngineWiring) — the boxing
+//! is the caller's choice, not the API's.
 
 use kardamom_types::{BlockBoundary, BlockDelta, Receipt};
 
@@ -51,9 +53,9 @@ pub trait StateWriterQueue: Send {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError>;
 }
 
-// Lets a binary pick between role-specific queue wrappers at runtime (e.g. the
-// validator's optional attester tee) without monomorphising `Executor::run`
-// twice.
+// Lets a binary pick between role-specific queue wrappers at runtime (e.g.
+// the validator's optional attester tee) by naming the boxed type in its
+// wiring.
 impl StateWriterQueue for Box<dyn StateWriterQueue> {
     fn submit(&mut self, block: BlockBoundary, delta: BlockDelta) -> Result<(), ExecutorError> {
         (**self).submit(block, delta)

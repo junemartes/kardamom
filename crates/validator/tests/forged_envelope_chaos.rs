@@ -37,10 +37,10 @@ use alloy_signer_local::PrivateKeySigner;
 use bytes::Bytes;
 use crossbeam_channel::{Receiver, Sender, bounded};
 use kardamom_engine::{
-    BPosition, BlockBoundaryStart, CMessage, Executor, ExecutorConfig, ExecutorError,
-    MockStateDatabase, MutatingSnapshotSource, StateDatabase, StateWriterSignal,
-    TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage, TxOrderingSubscription,
-    TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
+    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, RoleHooks, Start,
+    StateDatabase, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 use kardamom_validator::{Divergence, latch_integrity_failure};
 use revm::primitives::KECCAK_EMPTY;
@@ -49,10 +49,10 @@ const CHAIN_ID: u64 = 1;
 const SINK: Address = address!("00000000000000000000000000000000DEAD0666");
 const LOOT: u64 = 250_000;
 
-struct ChanASub {
+struct ChanTxDataSub {
     rx: Receiver<(BPosition, KtTxEnvelope)>,
 }
-impl TxDataSubscription for ChanASub {
+impl TxDataSubscription for ChanTxDataSub {
     fn sequencer_id(&self) -> u8 {
         0
     }
@@ -63,14 +63,14 @@ impl TxDataSubscription for ChanASub {
             .map_err(|_| ExecutorError::TxDataClosed { sequencer_id: 0 })
     }
 }
-struct ChanBSub(Receiver<(BPosition, TxOrderingMessage)>);
-impl TxOrderingSubscription for ChanBSub {
+struct ChanTxOrderingSub(Receiver<(BPosition, TxOrderingMessage)>);
+impl TxOrderingSubscription for ChanTxOrderingSub {
     fn next(&mut self) -> Result<(BPosition, TxOrderingMessage), ExecutorError> {
         self.0.recv().map_err(|_| ExecutorError::TxOrderingClosed)
     }
 }
-struct ChanCPub(Sender<CMessage>);
-impl TxReceiptsPublication for ChanCPub {
+struct ChanReceiptsPub(Sender<CMessage>);
+impl TxReceiptsPublication for ChanReceiptsPub {
     fn publish(&mut self, m: CMessage) -> Result<(), ExecutorError> {
         self.0.send(m).map_err(|_| ExecutorError::TxReceiptsClosed)
     }
@@ -83,6 +83,18 @@ impl StateWriterSignal for Imm {
     fn wait_committed(&mut self, b: u64) -> Result<u64, ExecutorError> {
         Ok(b)
     }
+}
+
+/// Port types for this test's channel-backed fakes.
+struct TestWiring;
+impl EngineWiring for TestWiring {
+    type TxData = ChanTxDataSub;
+    type TxOrdering = ChanTxOrderingSub;
+    type TxReceipts = ChanReceiptsPub;
+    type Snapshots = MutatingSnapshotSource;
+    type WriterSignal = Imm;
+    type WriterQueue = WriterApplyingQueue;
+    type Epoch = NoEpochCheck;
 }
 
 fn bpos(off: i32) -> BPosition {
@@ -161,23 +173,23 @@ fn run_pipeline(
         verify_record_identity,
         ..Default::default()
     };
-    let a_subs: Vec<Box<dyn TxDataSubscription>> = vec![Box::new(ChanASub { rx: a_rx })];
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(ChanBSub(b_rx));
+    let tx_data_subs = vec![ChanTxDataSub { rx: a_rx }];
     let h = thread::spawn(move || {
-        Executor::run(
+        Executor::run::<TestWiring>(
             cfg,
-            a_subs,
-            b_sub,
-            ChanCPub(c_tx),
-            snapshots,
-            Imm,
-            writer_q,
-            0,
-            None,
-            None,
-            None,
-            None,
-            None,
+            Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: ChanTxOrderingSub(b_rx),
+                join_recovery: None,
+            },
+            Outbound {
+                tx_receipts: ChanReceiptsPub(c_tx),
+                snapshots,
+                writer_signal: Imm,
+                writer_queue: writer_q,
+            },
+            Start::default(),
+            RoleHooks::none(),
         )
     });
 

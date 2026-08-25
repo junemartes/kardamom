@@ -215,9 +215,9 @@ fn b_reader_joins_against_a_buffer_in_canonical_order() {
 
     // Walk B in canonical order; assert we recover the canonical sequence of
     // (sender, correlation_id).
-    let mut b_sub = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
+    let mut tx_ordering_sub = FakeTxOrderingSubscription::open(&bus, "aeron:ipc?alias=b", 1001);
     let mut canonical: Vec<u64> = Vec::new();
-    b_sub.poll(
+    tx_ordering_sub.poll(
         |_b_pos, msg| {
             if let TxOrderingMessage::TxRef(r) = msg {
                 let env = a_buffer

@@ -34,8 +34,9 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kardamom_engine::bin_support;
 use kardamom_engine::{
-    Executor, ExecutorConfig, ExecutorError, MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal,
-    ResumePoint, StateWriterQueue, TxDataSubscription, TxOrderingSubscription,
+    EngineWiring, Executor, ExecutorConfig, ExecutorError, Inbound, MdbxSnapshotSource,
+    MdbxWriterQueue, MdbxWriterSignal, Outbound, ResumePoint, RoleHooks, Start, TxDataSubscription,
+    TxOrderingSubscription, TxReceiptsPublication,
 };
 use kardamom_log::aeron_live::AeronRuntime;
 use kardamom_log::config::LogConfig;
@@ -47,6 +48,22 @@ use kardamom_validator::{
 };
 
 use args::{Args, ValidatorFileConfig, resolve_attester_key};
+
+/// The validator role's port types. The subscriptions and the receipts sink
+/// stay boxed because both are chosen at runtime (transport selection; the
+/// optional attester tee around the receipt sink); the epoch check is the
+/// L1-re-deriving [`epoch_verify::EpochVerifier`].
+struct ValidatorWiring;
+
+impl EngineWiring for ValidatorWiring {
+    type TxData = Box<dyn TxDataSubscription>;
+    type TxOrdering = Box<dyn TxOrderingSubscription>;
+    type TxReceipts = Box<dyn TxReceiptsPublication>;
+    type Snapshots = MdbxSnapshotSource;
+    type WriterSignal = MdbxWriterSignal;
+    type WriterQueue = ValidatorWriterQueue<MdbxWriterQueue>;
+    type Epoch = epoch_verify::EpochVerifier;
+}
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
@@ -121,7 +138,7 @@ async fn main() -> Result<()> {
     // in-band by the reader's join-miss refetch against the remote durability
     // archives (the resume-gated replay-merge this replaces pointed at the
     // LOCAL archive, which records neither stream).
-    let a_subs: Vec<Box<dyn TxDataSubscription>> =
+    let tx_data_subs: Vec<Box<dyn TxDataSubscription>> =
         bin_support::open_tx_data_subs(&rt, &channels, args.shards)?;
     let join_recovery = bin_support::archive_join_recovery(
         &channels,
@@ -152,7 +169,8 @@ async fn main() -> Result<()> {
     // The kardamom_sealer_* re-export is the EXECUTOR's job — a validator
     // emitting a second (lagging) copy of the series would break sum()-style
     // queries and contradict the documented observation point.
-    let b_sub: Box<dyn TxOrderingSubscription> = Box::new(cluster_sub.suppress_sealer_metrics());
+    let tx_ordering_sub: Box<dyn TxOrderingSubscription> =
+        Box::new(cluster_sub.suppress_sealer_metrics());
 
     // --- Verification streams: tx_bal (BAL) + tx_receipts (see `pumps`). ---
     let divergence = Divergence::new();
@@ -193,8 +211,8 @@ async fn main() -> Result<()> {
     let writer =
         StateWriter::spawn_with_trie(env, trie_mode).context("spawn trie-aware state writer")?;
     let snapshots = MdbxSnapshotSource::new(writer.snapshot_rx.clone());
-    let sw_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
-    let sw_queue = ValidatorWriterQueue::new(
+    let writer_signal = MdbxWriterSignal::new(writer.snapshot_rx.clone());
+    let writer_queue = ValidatorWriterQueue::new(
         MdbxWriterQueue::new(writer.delta_tx.clone()),
         bals.clone(),
         divergence.clone(),
@@ -234,7 +252,6 @@ async fn main() -> Result<()> {
              (got a partial set)"
         ),
     };
-    let sw_queue: Box<dyn StateWriterQueue> = Box::new(sw_queue);
 
     // Tee each block's withdrawal leaves into the attester from the RECEIPT
     // stream (a plain sink when attestation is disabled).
@@ -248,7 +265,7 @@ async fn main() -> Result<()> {
     // Always on — the receipt cross-check runs on the sequential path too,
     // and the F3-era wsh mismatch is exactly the class it captures.
     let flight = kardamom_validator::flight::FlightRing::new();
-    let c_pub: Box<dyn kardamom_engine::TxReceiptsPublication> = {
+    let tx_receipts_pub: Box<dyn TxReceiptsPublication> = {
         let sink = ValidatorReceiptSink::new(receipts.clone(), divergence.clone())
             .with_flight(flight.clone());
         match &attester_handle {
@@ -311,7 +328,7 @@ async fn main() -> Result<()> {
     // Epoch verification (phase 1). Sequence rules 1-2 are local and always
     // enforced once an epoch appears; the CONTENT check needs L1, so it is
     // only wired when both the RPC URL and the lockbox address are given.
-    let epoch_observer: Option<Box<dyn kardamom_engine::EpochObserver>> =
+    let epoch_observer: Option<epoch_verify::EpochVerifier> =
         match (args.l1_rpc_url.as_deref(), args.lockbox) {
             (Some(url), Some(lockbox)) => {
                 let provider = alloy_provider::ProviderBuilder::new()
@@ -322,12 +339,12 @@ async fn main() -> Result<()> {
                     %lockbox,
                     "epoch verification enabled: epochs are re-derived from L1"
                 );
-                Some(Box::new(epoch_verify::EpochVerifier::spawn(
+                Some(epoch_verify::EpochVerifier::spawn(
                     source,
                     lockbox,
                     divergence.clone(),
                     &tokio::runtime::Handle::current(),
-                )))
+                ))
             }
             _ => {
                 tracing::info!(
@@ -339,23 +356,32 @@ async fn main() -> Result<()> {
         };
 
     let mut join = tokio::task::spawn_blocking(move || -> Result<(), ExecutorError> {
-        Executor::run(
+        Executor::run::<ValidatorWiring>(
             cfg,
-            a_subs,
-            b_sub,
-            c_pub,
-            snapshots,
-            sw_signal,
-            sw_queue,
-            initial_block,
-            resume,
-            // No BAL capture: the validator VERIFIES BALs, never publishes them.
-            None,
-            // Join-miss archive refetch (None on single-host/IPC runs).
-            // Whole-block exec strategy (validator parallel path).
-            block_exec,
-            join_recovery,
-            epoch_observer,
+            Inbound {
+                tx_data: tx_data_subs,
+                tx_ordering: tx_ordering_sub,
+                // Join-miss archive refetch (None on single-host/IPC runs).
+                join_recovery,
+            },
+            Outbound {
+                tx_receipts: tx_receipts_pub,
+                snapshots,
+                writer_signal,
+                writer_queue,
+            },
+            Start {
+                initial_block,
+                resume,
+            },
+            RoleHooks {
+                // No BAL capture: the validator VERIFIES BALs, never
+                // publishes them.
+                bal_capture: None,
+                // Whole-block exec strategy (the parallel-validation path).
+                block_exec,
+                epoch_observer,
+            },
         )
     });
 

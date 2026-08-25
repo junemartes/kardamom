@@ -22,7 +22,7 @@ proptest! {
         let blobs = pack_to_blobs(&payload).unwrap();
         for blob in &blobs {
             let raw: &[u8] = blob.as_slice();
-            for chunk in raw.chunks_exact(32) {
+            for chunk in raw.as_chunks::<32>().0 {
                 prop_assert_eq!(chunk[0], 0);
             }
         }

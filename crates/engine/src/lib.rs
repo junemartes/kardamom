@@ -29,8 +29,8 @@ pub use kardamom_exec_core::{
 };
 
 pub use actor::{
-    Executor, ExecutorConfig, ResumePoint, StateWriterQueue, StateWriterSignal,
-    TxReceiptsPublication,
+    EngineWiring, Executor, ExecutorConfig, Inbound, Outbound, ResumePoint, RoleHooks, SnapshotDb,
+    Start, StateWriterQueue, StateWriterSignal, TxReceiptsPublication,
 };
 pub use block_env::ExecEnv;
 pub use delta::{PendingDelta, WriteSet};
@@ -41,7 +41,7 @@ pub use kardamom_exec_core::{
 };
 pub use persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 pub use reader::{
-    EpochObserver, JoinBuffer, ReaderConfig, ReaderToExec, TxDataSubscription,
+    EpochObserver, JoinBuffer, NoEpochCheck, ReaderConfig, ReaderToExec, TxDataSubscription,
     TxOrderingSubscription,
 };
 pub use replay::{ReplayBlock, ReplayError, ReplayOutcome, replay_blocks};

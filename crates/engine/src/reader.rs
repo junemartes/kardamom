@@ -289,23 +289,23 @@ pub enum ReaderToExec {
     Boundary(BlockBoundaryStart),
 }
 
-/// Spawn one tx_data reader thread for `a_sub`. Inserts every
+/// Spawn one tx_data reader thread for `tx_data_sub`. Inserts every
 /// `(TxDataLoc, envelope)` into `buffer` keyed by
-/// `(a_sub.sequencer_id(), loc.session_id, loc.position)`. Returns when the
+/// `(tx_data_sub.sequencer_id(), loc.session_id, loc.position)`. Returns when the
 /// subscription closes cleanly (`Ok(())`) or propagates the first error.
-pub fn spawn_tx_data_reader<A>(
-    mut a_sub: A,
+pub fn spawn_tx_data_reader<D>(
+    mut tx_data_sub: D,
     buffer: JoinBuffer,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
-    A: TxDataSubscription + 'static,
+    D: TxDataSubscription + 'static,
 {
-    let sid = a_sub.sequencer_id();
+    let sid = tx_data_sub.sequencer_id();
     thread::Builder::new()
         .name(format!("executor-reader-a{sid}"))
         .spawn(move || {
             loop {
-                match a_sub.next() {
+                match tx_data_sub.next() {
                     Ok((loc, env)) => buffer.insert(sid, loc.session_id, loc.position, env),
                     Err(ExecutorError::TxDataClosed { .. }) => return Ok(()),
                     Err(e) => return Err(e),
@@ -331,6 +331,28 @@ where
 /// background task with a deferred verdict, not inline here.
 pub trait EpochObserver: Send {
     fn observe(&mut self, epoch: &EpochRecord) -> Result<(), ExecutorError>;
+}
+
+/// The no-check [`EpochObserver`] for roles that trust the ordered stream
+/// (the executor role, and most tests): every epoch passes. Exists so an
+/// [`EngineWiring`](crate::actor::EngineWiring) that runs no epoch
+/// verification still has a concrete type to name.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEpochCheck;
+
+impl EpochObserver for NoEpochCheck {
+    fn observe(&mut self, _epoch: &EpochRecord) -> Result<(), ExecutorError> {
+        Ok(())
+    }
+}
+
+// Runtime-choice seam, same pattern as the subscription forwarding impls
+// above: a binary that must pick its observer at runtime names the boxed
+// type in its wiring.
+impl EpochObserver for Box<dyn EpochObserver> {
+    fn observe(&mut self, epoch: &EpochRecord) -> Result<(), ExecutorError> {
+        (**self).observe(epoch)
+    }
 }
 
 /// Bounded first-seen window for canonical-id dedup, FIFO-evicted.
@@ -383,8 +405,8 @@ impl DedupWindow {
 /// `recovery_factory`, when wired, turns a join miss into an archive refetch
 /// instead of an immediate death — see [`JoinRecovery`]. It runs once, inside
 /// this thread (the recovery's Aeron resources are thread-bound).
-pub fn spawn_tx_ordering_reader<B>(
-    mut b_sub: B,
+pub fn spawn_tx_ordering_reader<O>(
+    mut tx_ordering_sub: O,
     buffer: JoinBuffer,
     cfg: ReaderConfig,
     exec_out: Sender<ReaderToExec>,
@@ -392,7 +414,7 @@ pub fn spawn_tx_ordering_reader<B>(
     recovery_factory: Option<JoinRecoveryFactory>,
 ) -> JoinHandle<Result<(), ExecutorError>>
 where
-    B: TxOrderingSubscription + 'static,
+    O: TxOrderingSubscription + 'static,
 {
     thread::Builder::new()
         .name("executor-reader-b".into())
@@ -411,7 +433,7 @@ where
             // share a flat namespace (both B256) so we use one window.
             let mut seen_canonical_ids = DedupWindow::new(cfg.dedup_window);
             loop {
-                let (position, msg) = match b_sub.next() {
+                let (position, msg) = match tx_ordering_sub.next() {
                     Ok(p) => p,
                     Err(ExecutorError::TxOrderingClosed) => return Ok(()),
                     Err(e) => return Err(e),
