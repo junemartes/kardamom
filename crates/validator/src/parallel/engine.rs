@@ -475,6 +475,8 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
             Ok(BlockExecOutput {
                 receipts: out.receipts,
                 delta: out.delta,
+                // The validator VERIFIES BALs; it never publishes one.
+                bal: None,
             })
         },
     )

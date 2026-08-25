@@ -564,6 +564,24 @@ where
             *self.block_apply_elapsed.get_or_insert(Duration::ZERO) += apply_start.elapsed();
             self.buffered.clear();
             self.delta = out.delta;
+            // BAL parity across strategies: a capturing strategy hands its
+            // folded per-block Bal here so the boundary handoff below
+            // publishes it exactly as the streaming capture would. A
+            // publishing role whose strategy captured nothing would
+            // silently emit EMPTY BALs — every validator degrades to
+            // sequential fallback with no signal — so that combination is
+            // loud.
+            match out.bal {
+                Some(b) => self.block_bal = b,
+                None if self.bal_tx.is_some() => {
+                    tracing::warn!(
+                        block = block_number,
+                        "block-exec strategy returned no BAL while BAL \
+                         publication is on; publishing an empty capture"
+                    );
+                }
+                None => {}
+            }
             for r in out.receipts {
                 self.block_receipts.push(r.clone());
                 if self.tx.send(ExecToCommit::Receipt(r)).is_err() {

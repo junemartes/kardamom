@@ -9,6 +9,72 @@
 
 use alloc::vec::Vec;
 
+/// Merge per-tx BAL FRAGMENTS — each captured independently by a parallel
+/// worker via the same `Bal::update_account` call the streaming path makes
+/// — into one block BAL. Fragments MUST be supplied in ascending canonical
+/// (bal-index) order: per-key write lists are index-ordered by
+/// construction only when the append order is the canonical order, and
+/// the dedup rule below compares against the last KEPT write.
+/// Account insertion order is irrelevant
+/// (`into_alloy_bal` sorts by address; storage keys live in a BTreeMap),
+/// so the merged artifact is wire-identical to a single sequential
+/// capture.
+///
+/// This lives in the ENGINE core for the same reason `quantize` does: the
+/// executor's parallel (Block-STM) capture and the sequential capture must
+/// transform identically by construction — the validator's cross-check is
+/// structural equality on the published artifact.
+#[must_use]
+pub fn merge_bal_fragments(
+    fragments: impl IntoIterator<Item = revm::state::bal::Bal>,
+) -> revm::state::bal::Bal {
+    // Append `src`'s writes replaying the SEQUENTIAL capture's dedup rule:
+    // a write at a NEW index is recorded only when its value differs from
+    // the last recorded one (`BalWrites::update_with_key`) — context a
+    // per-tx fragment cannot have (its list saw only its own tx). Without
+    // this, an unchanged-value write (a deposit touching the fee sink, a
+    // slot rewritten to its previous value) appears in the merged artifact
+    // but not in the sequential one. `key` mirrors revm's comparison
+    // domain: whole value for nonce/balance/storage, code HASH for code.
+    fn append<T: Clone + PartialEq, K: PartialEq + ?Sized>(
+        dst: &mut revm::state::bal::BalWrites<T>,
+        src: revm::state::bal::BalWrites<T>,
+        key: impl Fn(&T) -> &K,
+    ) {
+        for (idx, v) in src.writes {
+            match dst.writes.last() {
+                Some((_, last)) if key(last) == key(&v) => {}
+                _ => dst.writes.push((idx, v)),
+            }
+        }
+    }
+
+    let mut out = revm::state::bal::Bal::new();
+    for frag in fragments {
+        for (addr, acct) in frag.accounts {
+            if let Some(tgt) = out.accounts.get_mut(&addr) {
+                append(&mut tgt.account_info.nonce, acct.account_info.nonce, |v| v);
+                append(
+                    &mut tgt.account_info.balance,
+                    acct.account_info.balance,
+                    |v| v,
+                );
+                append(&mut tgt.account_info.code, acct.account_info.code, |v| &v.0);
+                for (slot, writes) in acct.storage.storage {
+                    if let Some(dw) = tgt.storage.storage.get_mut(&slot) {
+                        append(dw, writes, |v| v);
+                    } else {
+                        tgt.storage.storage.insert(slot, writes);
+                    }
+                }
+            } else {
+                out.accounts.insert(addr, acct);
+            }
+        }
+    }
+    out
+}
+
 /// Chunk ordinal for a 1-based bal index at granularity `k`.
 #[must_use]
 pub fn chunk_of(index: u64, k: u64) -> u64 {

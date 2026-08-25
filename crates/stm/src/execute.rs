@@ -492,6 +492,15 @@ struct TxResult {
     receipt: Receipt,
     ws: WriteSet,
     reads: Vec<ReadRecord>,
+    /// EIP-7928 capture fragment: this tx's BAL updates at its
+    /// BLOCK-GLOBAL index (`bal_base + local_idx + 1`), recorded through
+    /// the same `Bal::update_account` the streaming path uses. `None`
+    /// when capture is off or the tx was an invalid skip (skips carry no
+    /// fragment in either mode). The commit pass rewrites the fee-sink
+    /// balance write to the materialized prefix value (workers see the
+    /// block-start sink, not the canonical running sum) and folds the
+    /// fragments in canonical order.
+    bal_frag: Option<revm::state::bal::Bal>,
     /// This tx's exact credit to the fee sink (post − block-start seen).
     fee_delta: U256,
     /// The write set contains the fee sink, so its hash is finalized at
@@ -506,6 +515,13 @@ struct TxResult {
 pub struct StmOutcome {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
+    /// EIP-7928 capture: the block's per-tx fragments folded in canonical
+    /// order (see `merge_bal_fragments`), with the fee-sink writes
+    /// materialized to the canonical prefix and wounded txs' fragments
+    /// replaced by their repair capture. `Some` only when the session was
+    /// opened with capture (`begin_block_layered_bal`). Wire-identical to
+    /// the streaming path's sequential capture by construction.
+    pub bal: Option<revm::state::bal::Bal>,
     /// Txs WOUNDED at validation — a conflict the marks missed, repaired
     /// by re-executing at the canonical position (per-tx; the whole block
     /// never re-runs). Zero on every measured workload so far.
@@ -1179,6 +1195,13 @@ struct BlockCtx<S: StateDatabase> {
     /// the same committed block, so the view is identical.
     snapshots: Vec<S>,
     base: PendingDelta,
+    /// EIP-7928 capture: `Some(base_index)` turns on per-tx fragment
+    /// capture, with fragment indices `base_index + local_idx + 1`
+    /// (block-global — the caller passes the count of canonical records
+    /// before this run, non-zero when a block is segmented around
+    /// deposits). `None` = no capture (the default; validators and
+    /// benches never pay for it).
+    bal_base: Option<u64>,
     /// Unsettled predecessor deltas, newest first (see `BlockInput`).
     /// Unsettled predecessor deltas + the fee-sink block-start view —
     /// everything about the block's READ BASE that depends on its
@@ -2209,6 +2232,40 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         env: ExecEnv,
         stats: &'p Stats,
     ) -> Result<(BlockSession<'p, 'a, S>, LayerBinder<S>), ExecutorError> {
+        self.begin_block_deferred_inner(snapshots, base, env, stats, None)
+    }
+
+    /// [`Self::begin_block_layered`] with EIP-7928 CAPTURE on: every tx
+    /// records its per-tx BAL fragment at block-global index
+    /// `bal_base + local_idx + 1` (`bal_base` = canonical records before
+    /// this run — non-zero when the caller segments a block around
+    /// deposits), and the sealed [`StmOutcome::bal`] carries the folded,
+    /// sink-materialized block BAL. The executor's `--parallel-execution`
+    /// strategy is the intended caller; roles that never publish a BAL
+    /// (validator, benches) use the capture-free variants and pay nothing.
+    pub fn begin_block_layered_bal<'p>(
+        &'p self,
+        snapshots: Vec<S>,
+        base: PendingDelta,
+        layers: Vec<std::sync::Arc<PendingDelta>>,
+        env: ExecEnv,
+        stats: &'p Stats,
+        bal_base: u64,
+    ) -> Result<BlockSession<'p, 'a, S>, ExecutorError> {
+        let (sess, binder) =
+            self.begin_block_deferred_inner(snapshots, base, env, stats, Some(bal_base))?;
+        binder.bind(layers)?;
+        Ok(sess)
+    }
+
+    fn begin_block_deferred_inner<'p>(
+        &'p self,
+        snapshots: Vec<S>,
+        base: PendingDelta,
+        env: ExecEnv,
+        stats: &'p Stats,
+        bal_base: Option<u64>,
+    ) -> Result<(BlockSession<'p, 'a, S>, LayerBinder<S>), ExecutorError> {
         let (workers, prune_batch, bag_mode) = {
             let st = self.shared.0.lock().expect("pool poisoned");
             (st.cfg.workers, st.cfg.prune_batch, st.cfg.bag_scheduler)
@@ -2252,6 +2309,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             env,
             snapshots,
             base,
+            bal_base,
             binding: std::sync::OnceLock::new(),
             mv: recycled_mv
                 .map(Arc::new)
@@ -2511,9 +2569,21 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// the same statistic the stealing policy runs on. A fresh pool has no
     /// measurement yet and is given the benefit of the doubt; one block is
     /// enough to correct course.
-    fn parallel_worth_it(&self) -> bool {
+    pub fn parallel_worth_it(&self) -> bool {
         let avg = self.avg_tx_ns.load(Ordering::Relaxed);
         avg == 0 || avg >= self.parallel_worth_ns
+    }
+
+    /// Feed the decline gate after a block executed OUTSIDE the pool (a
+    /// caller-side sequential path, e.g. the executor strategy's own
+    /// decline branch). Without this the gate is a trap door: `avg_tx_ns`
+    /// would hold the value that caused the decline forever. Mirrors what
+    /// [`decline`](Self::decline) does for pool-internal declines.
+    pub fn learn_sequential(&self, elapsed: std::time::Duration, txs: usize) {
+        if txs > 0 {
+            self.avg_tx_ns
+                .store(elapsed.as_nanos() as u64 / txs as u64, Ordering::Relaxed);
+        }
     }
 
     /// Run the block on this thread, through the SAME code path the
@@ -3159,6 +3229,19 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
 /// validation, wound repair, the canonical commit, learning, teardown
 /// hand-off. Standalone so P3's persistent tail thread can own it; the
 /// block-at-a-time path calls it inline (seal = drain + tail).
+/// Rewrite a per-tx BAL fragment's fee-sink balance write(s) to the
+/// materialized canonical prefix value — the fragment-side mirror of the
+/// commit pass's WriteSet sink rewrite (workers execute against the
+/// block-start sink, so their captured value is `start + own_fee`, not the
+/// running sum the sequential capture records).
+fn rewrite_frag_sink(frag: &mut revm::state::bal::Bal, value: U256) {
+    if let Some(acct) = frag.accounts.get_mut(&FEE_SINK) {
+        for w in acct.account_info.balance.writes.iter_mut() {
+            w.1 = value;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn block_tail<S: StateDatabase + Sync>(
     mut ctx: BlockCtx<S>,
@@ -3293,6 +3376,11 @@ fn block_tail<S: StateDatabase + Sync>(
             && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
         {
             entry.1.1 = sink_running;
+            // Same materialization for the capture fragment (see
+            // `rewrite_frag_sink`); a wound rebuilds both from scratch.
+            if let Some(frag) = r.bal_frag.as_mut() {
+                rewrite_frag_sink(frag, sink_running);
+            }
         }
     }
     // The shared view is taken AFTER the serial prefix's mutations.
@@ -3497,6 +3585,9 @@ fn block_tail<S: StateDatabase + Sync>(
     let t_validate = std::time::Duration::from_nanos(val_ns.load(Ordering::Relaxed));
     let wounds = wounded.len();
     let mut wounded_set: HashSet<usize> = wounded.into_iter().collect();
+    // Capture fragments, collected in canonical order by whichever arm
+    // runs (empty when capture is off). Folded once, at the outcome.
+    let mut out_frags: Vec<revm::state::bal::Bal> = Vec::new();
     // A tx after a re-executed one may also be stale: once ANY wound
     // fires, later txs are re-checked against the live prefix.
     if let Some(first) = wounded_set.iter().copied().min() {
@@ -3538,6 +3629,7 @@ fn block_tail<S: StateDatabase + Sync>(
             if r.sink_touched {
                 r.receipt.write_set_hash = hashes[i];
             }
+            out_frags.extend(r.bal_frag.take());
             receipts.push(std::mem::take(&mut r.receipt));
         }
         // The spent results (write sets + read logs) ride the arena to
@@ -3601,13 +3693,25 @@ fn block_tail<S: StateDatabase + Sync>(
                 let slot = ctx.slots[i].get().expect("slot set for every admitted tx");
                 let (tx_idx, position, envelope) = (slot.tx_idx, slot.position, &slot.envelope);
                 let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
-                let (mut receipt, ws) = scope
-                    .execute_tx(tx_idx, position, envelope, i as u64, cumulative, None, None)?;
+                // Repair capture replaces the wounded fragment: this
+                // execution runs against the materialized prefix, so its
+                // capture (fee sink included) is canonical directly.
+                let mut repair_frag = ctx.bal_base.map(|_| revm::state::bal::Bal::new());
+                let bal_arg = match (repair_frag.as_mut(), ctx.bal_base) {
+                    (Some(f), Some(b)) => Some((f, b + i as u64 + 1)),
+                    _ => None,
+                };
+                let (mut receipt, ws) = scope.execute_tx(
+                    tx_idx, position, envelope, i as u64, cumulative, bal_arg, None,
+                )?;
                 cumulative = receipt.cumulative_gas_used;
                 receipt.transaction_index = i as u64;
                 layered.apply(ws.clone());
                 delta.apply(ws);
                 receipts.push(receipt);
+                // A repaired skip captures nothing — same hole a skipped
+                // tx leaves on the streaming path.
+                out_frags.extend(repair_frag.filter(|f| !f.accounts.is_empty()));
                 continue;
             }
             cumulative += r.receipt.gas_used;
@@ -3617,8 +3721,12 @@ fn block_tail<S: StateDatabase + Sync>(
                 if let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK) {
                     entry.1.1 = sink_running;
                 }
+                if let Some(frag) = r.bal_frag.as_mut() {
+                    rewrite_frag_sink(frag, sink_running);
+                }
                 r.receipt.write_set_hash = r.ws.hash();
             }
+            out_frags.extend(r.bal_frag.take());
             layered.apply(r.ws.clone());
             delta.apply(r.ws);
             receipts.push(r.receipt);
@@ -3690,6 +3798,10 @@ fn block_tail<S: StateDatabase + Sync>(
     Ok(StmOutcome {
         receipts,
         delta,
+        bal: ctx
+            .bal_base
+            .is_some()
+            .then(|| kardamom_exec_core::bal_ladder::merge_bal_fragments(out_frags)),
         wounds,
         fallback: wounds > 0,
         declined: false,
@@ -4024,6 +4136,7 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             &slot.envelope,
             slot.decoded.as_ref(),
             bound.sink_start_balance,
+            ctx.bal_base,
             &mut || take_read_buf(&mut read_stash, &ctx.recycle),
         );
         // Timestamps stay WORKER-LOCAL and fold once per block. Stamping
@@ -4252,6 +4365,7 @@ fn execute_one<S: StateDatabase>(
     envelope: &TxEnvelope,
     decoded: Option<&alloy_consensus::TxEnvelope>,
     sink_start_balance: U256,
+    bal_base: Option<u64>,
     fresh_reads: &mut dyn FnMut() -> Vec<ReadRecord>,
 ) -> Result<TxResult, ExecutorError> {
     let skip = |reason: &str, nonce: u64, to: Option<alloy_primitives::Address>| {
@@ -4271,6 +4385,7 @@ fn execute_one<S: StateDatabase>(
             reads: Vec::new(),
             fee_delta: U256::ZERO,
             sink_touched: false,
+            bal_frag: None,
         }
     };
 
@@ -4326,6 +4441,20 @@ fn execute_one<S: StateDatabase>(
     };
 
     let ws = write_set_from_evm_state(&outcome.state);
+    // EIP-7928 capture: this tx's fragment at its BLOCK-GLOBAL index,
+    // through the SAME update_account the streaming path uses on the same
+    // `outcome.state`. Everything the MV cache tracks reads canonically
+    // here (a wound would replace this fragment); the fee sink is the one
+    // untracked account — the commit pass rewrites its balance write to
+    // the materialized prefix, exactly as it rewrites the WriteSet's.
+    let bal_frag = bal_base.map(|b| {
+        let mut frag = revm::state::bal::Bal::new();
+        let idx = b + local_idx as u64 + 1;
+        for (addr, account) in outcome.state.iter() {
+            frag.update_account(idx, *addr, account);
+        }
+        frag
+    });
     // POOLED JOURNAL: revm's finalize mem::takes the state map out of
     // the journal into `outcome.state`, leaving a capacity-0 map behind
     // — every tx then regrew a fresh table (measured as the shared
@@ -4398,5 +4527,6 @@ fn execute_one<S: StateDatabase>(
         reads,
         fee_delta,
         sink_touched,
+        bal_frag,
     })
 }
