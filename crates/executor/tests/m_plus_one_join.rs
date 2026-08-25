@@ -39,7 +39,7 @@ use revm::primitives::KECCAK_EMPTY;
 use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
     Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ReaderConfig,
-    RoleHooks, Start, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    ResumePoint, RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
     TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 use kardamom_log::testing::{
@@ -330,7 +330,7 @@ fn m4_canonical_b_order_drives_receipts() {
                 writer_signal: Imm,
                 writer_queue: writer_q,
             },
-            Start::default(),
+            ResumePoint::GENESIS,
             RoleHooks::none(),
         )
     });
@@ -495,7 +495,7 @@ fn tx_ref_arriving_before_envelope_still_joins() {
                 writer_signal: Imm,
                 writer_queue: writer_q,
             },
-            Start::default(),
+            ResumePoint::GENESIS,
             RoleHooks::none(),
         )
     });

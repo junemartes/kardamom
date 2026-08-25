@@ -82,8 +82,8 @@ pub(super) struct ExecState<S: SnapshotSource, Q, P, E> {
     /// [`crate::reader::EpochObserver`]); `None` trusts the ordered stream.
     pub(super) epoch_observer: Option<E>,
     /// The snapshot source hands back owned snapshots keyed by block
-    /// number: the block *just committed* — `initial_block` (== the
-    /// persisted `resume.block` on a resume, 0 on a fresh start).
+    /// number: the block *just committed* — the [`ResumePoint`]'s `block`
+    /// (0 on a fresh start).
     pub(super) snapshot: S::Db,
     pub(super) delta: PendingDelta,
     /// EIP-7928 capture: per-block Bal, reset at each boundary; only
@@ -173,12 +173,12 @@ where
     P: StateWriterQueue + 'static,
     E: EpochObserver + 'static,
 {
-    /// Seed the loop state. Resume-from-cursor: the canonical stream source
-    /// delivers from the persisted cursor onward (the cluster client's
-    /// REPLAY_FROM; below-cursor records are deduped in reader::cluster), so
-    /// the exec thread seeds its absolute counters from [`ResumePoint`]
-    /// instead of replaying from record 0 and skip-counting. On a fresh
-    /// start (`resume == None`) everything seeds at genesis values.
+    /// Seed the loop state from the [`ResumePoint`] cursor: the canonical
+    /// stream source delivers from the persisted cursor onward (the cluster
+    /// client's REPLAY_FROM; below-cursor records are deduped in
+    /// reader::cluster), so the exec thread seeds its absolute counters here
+    /// instead of replaying from record 0 and skip-counting. A fresh start
+    /// is [`ResumePoint::GENESIS`] — the same seeding with all-zero values.
     #[allow(clippy::too_many_arguments)] // mirrors `spawn_exec`'s shape; see the note there.
     fn new(
         cfg: ExecutorConfig,
@@ -187,15 +187,13 @@ where
         snapshots: S,
         sw_signal: Q,
         sw_queue: P,
-        initial_block: u64,
-        resume: Option<ResumePoint>,
+        start: ResumePoint,
         bal_tx: Option<Sender<BalHandoff>>,
         shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
         block_exec: Option<BlockExec<S::Db>>,
         epoch_observer: Option<E>,
     ) -> Self {
-        let resume_count = resume.map(|r| r.record_count).unwrap_or(0);
-        let snapshot = snapshots.snapshot_after(initial_block);
+        let snapshot = snapshots.snapshot_after(start.block);
         Self {
             cfg,
             rx,
@@ -217,11 +215,11 @@ where
             parent: None,
             inflight: VecDeque::new(),
             block_receipts: Vec::new(),
-            current_block: initial_block + 1,
-            current_l2_ts: resume.map(|r| r.l2_timestamp).unwrap_or(0),
+            current_block: start.block + 1,
+            current_l2_ts: start.l2_timestamp,
             tx_index_in_block: 0,
             cumulative_gas_used: 0,
-            expected_tx_idx: TxIndex(resume_count),
+            expected_tx_idx: TxIndex(start.record_count),
             block_apply_elapsed: None,
             tx_applied_ok: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "ok"),
             tx_applied_error: metrics::counter!(crate::metrics::TX_APPLIED_TOTAL, "outcome" => "error"),
@@ -730,8 +728,7 @@ pub(crate) fn spawn_exec<S, Q, P, E>(
     snapshots: S,
     sw_signal: Q,
     sw_queue: P,
-    initial_block: u64,
-    resume: Option<ResumePoint>,
+    start: ResumePoint,
     bal_tx: Option<Sender<BalHandoff>>,
     shadow_tx: Option<Sender<crate::shadow::ShadowBlock>>,
     block_exec: Option<BlockExec<S::Db>>,
@@ -753,8 +750,7 @@ where
                 snapshots,
                 sw_signal,
                 sw_queue,
-                initial_block,
-                resume,
+                start,
                 bal_tx,
                 shadow_tx,
                 block_exec,

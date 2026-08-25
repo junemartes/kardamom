@@ -9,12 +9,14 @@ use crate::delta::PendingDelta;
 use crate::error::ExecutorError;
 use crate::reader::ReaderConfig;
 
-/// Where a restarted executor resumes from, derived from the persisted state
-/// cursor (`kardamom_state::RecoveryPoint`). The canonical stream source (the
-/// cluster's `REPLAY_FROM` on connect) delivers **from this cursor onward** —
-/// records below it are deduped inside [`crate::reader::cluster`] — so the
-/// reader and exec threads seed their counters here instead of replaying from
-/// record 0 and skip-counting:
+/// Where a run starts: the persisted state cursor
+/// (`kardamom_state::RecoveryPoint`), or [`ResumePoint::GENESIS`] on a fresh
+/// chain — a fresh start IS a resume from the genesis cursor (all three
+/// fields zero), so there is no separate fresh-start mode to wire. The
+/// canonical stream source (the cluster's `REPLAY_FROM` on connect) delivers
+/// **from this cursor onward** — records below it are deduped inside
+/// [`crate::reader::cluster`] — so the reader and exec threads seed their
+/// counters here instead of replaying from record 0 and skip-counting:
 ///
 /// - `block` — the last durably-committed block (`last_committed_block`). The
 ///   first boundary delivered after resume is `block + 1`; the post-`block`
@@ -35,6 +37,29 @@ pub struct ResumePoint {
     pub block: u64,
     pub record_count: u64,
     pub l2_timestamp: u64,
+}
+
+impl ResumePoint {
+    /// The fresh-chain cursor: nothing committed, no records applied, no
+    /// boundary timestamp yet. Execution opens block 1 against the genesis
+    /// snapshot, exactly as a resume from block 0 would.
+    pub const GENESIS: Self = Self {
+        block: 0,
+        record_count: 0,
+        l2_timestamp: 0,
+    };
+
+    /// True when this cursor points mid-chain (a crash-recovery restart)
+    /// rather than at genesis.
+    pub fn is_resume(&self) -> bool {
+        self.block > 0
+    }
+}
+
+impl Default for ResumePoint {
+    fn default() -> Self {
+        Self::GENESIS
+    }
 }
 
 #[derive(Debug, Clone)]

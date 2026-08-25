@@ -78,7 +78,7 @@ pub use ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
 pub use types::{
     BalHandoff, BlockExec, BlockExecOutput, BufferedRecord, ExecutorConfig, ResumePoint,
 };
-pub use wiring::{EngineWiring, Inbound, Outbound, RoleHooks, SnapshotDb, Start};
+pub use wiring::{EngineWiring, Inbound, Outbound, RoleHooks, SnapshotDb};
 
 pub(crate) use commit_thread::spawn_commit;
 pub(crate) use exec_thread::spawn_exec;
@@ -96,15 +96,16 @@ impl Executor {
     ///
     /// The inputs arrive grouped by category — [`Inbound`] (what the reader
     /// threads consume), [`Outbound`] (the receipts publication + state-
-    /// writer seams), [`Start`] (fresh start or resume cursor), and
-    /// [`RoleHooks`] (optional role-specific behavior) — with every port
-    /// type named by one [`EngineWiring`] impl. See [`wiring`] for the full
-    /// design, including how a caller opts back into runtime dispatch.
+    /// writer seams), [`ResumePoint`] (the cursor execution starts from;
+    /// [`ResumePoint::GENESIS`] on a fresh chain), and [`RoleHooks`]
+    /// (optional role-specific behavior) — with every port type named by
+    /// one [`EngineWiring`] impl. See [`wiring`] for the full design,
+    /// including how a caller opts back into runtime dispatch.
     pub fn run<W: EngineWiring>(
         cfg: ExecutorConfig,
         inbound: Inbound<W>,
         outbound: Outbound<W>,
-        start: Start,
+        start: ResumePoint,
         hooks: RoleHooks<W>,
     ) -> Result<(), ExecutorError> {
         let Inbound {
@@ -118,10 +119,6 @@ impl Executor {
             writer_signal,
             writer_queue,
         } = outbound;
-        let Start {
-            initial_block,
-            resume,
-        } = start;
         let RoleHooks {
             bal_capture,
             footprint_shadow,
@@ -133,24 +130,22 @@ impl Executor {
         let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(cfg.receipt_queue_depth);
         let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(cfg.receipt_queue_depth);
 
-        // M tx_data reader threads, one per sequencer partition. Each
-        // owns its subscription for the duration; we collect the join
-        // handles to surface any error.
-        let mut tx_data_handles: Vec<JoinHandle<Result<(), ExecutorError>>> =
-            Vec::with_capacity(tx_data.len());
-        for sub in tx_data {
-            // The subscription's `next` already advertises sequencer_id.
-            tx_data_handles.push(spawn_tx_data_reader(sub, buffer.clone()));
-        }
+        // M tx_data reader threads, one per sequencer partition. Each owns
+        // its subscription for the duration (`next` already advertises the
+        // sequencer_id); the join handles surface any error below.
+        let tx_data_handles: Vec<JoinHandle<Result<(), ExecutorError>>> = tx_data
+            .into_iter()
+            .map(|sub| spawn_tx_data_reader(sub, buffer.clone()))
+            .collect();
 
         let tx_ordering_handle = spawn_tx_ordering_reader(
             tx_ordering,
             buffer.clone(),
             cfg.reader.clone(),
             tx_r2e,
-            // The canonical source delivers from the resume cursor; indices
+            // The canonical source delivers from the start cursor; indices
             // assigned here are checked against ABSOLUTE boundary counts.
-            TxIndex(resume.map(|r| r.record_count).unwrap_or(0)),
+            TxIndex(start.record_count),
             join_recovery,
         );
 
@@ -161,8 +156,7 @@ impl Executor {
             snapshots,
             writer_signal,
             writer_queue,
-            initial_block,
-            resume,
+            start,
             bal_capture,
             footprint_shadow,
             block_exec,
@@ -188,15 +182,12 @@ impl Executor {
         // subscriptions have already closed (tx_ordering exhausted), so the
         // tx_data joins return promptly and we drain them for clean shutdown.
         r_ordering.and(r_exec).and(r_commit)?;
-        let mut r_tx_data: Result<(), ExecutorError> = Ok(());
-        for h in tx_data_handles {
-            let res = h.join().expect("tx_data reader panic");
-            if r_tx_data.is_ok() {
-                r_tx_data = res;
-            }
-        }
-        // The pipeline was already checked above (Ok by here), so the result
-        // is determined by the tx_data reader joins.
-        r_tx_data
+        // The pipeline was Ok, so the result is determined by the tx_data
+        // reader joins: fold consumes the whole iterator, so EVERY reader is
+        // joined (no short-circuit), and `and` keeps the first error.
+        tx_data_handles
+            .into_iter()
+            .map(|h| h.join().expect("tx_data reader panic"))
+            .fold(Ok(()), Result::and)
     }
 }

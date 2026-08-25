@@ -9,8 +9,12 @@
 //!   dispatched — no `Box<dyn …>` anywhere in the hot path.
 //! - **Category structs** group the run's inputs by what they do:
 //!   [`Inbound`] (what the reader threads consume), [`Outbound`] (the
-//!   receipts publication + state-writer seams), [`Start`] (where execution
-//!   begins), [`RoleHooks`] (the optional role-specific behavior).
+//!   receipts publication + state-writer seams), [`ResumePoint`] (the
+//!   cursor execution starts from — [`GENESIS`] on a fresh chain),
+//!   [`RoleHooks`] (the optional role-specific behavior).
+//!
+//! [`ResumePoint`]: super::ResumePoint
+//! [`GENESIS`]: super::ResumePoint::GENESIS
 //!
 //! A caller that genuinely needs to pick an implementation at RUNTIME (e.g.
 //! the validator's optional attester tee around its receipts sink) still
@@ -37,7 +41,7 @@ use crate::reader::{
 };
 
 use super::ports::{StateWriterQueue, StateWriterSignal, TxReceiptsPublication};
-use super::types::{BalHandoff, BlockExec, ResumePoint};
+use super::types::{BalHandoff, BlockExec};
 
 /// The full set of port types one role plugs into [`Executor::run`] — the
 /// "parent trait" that bundles what would otherwise be seven independent
@@ -104,18 +108,6 @@ pub struct Outbound<W: EngineWiring> {
     pub snapshots: W::Snapshots,
     pub writer_signal: W::WriterSignal,
     pub writer_queue: W::WriterQueue,
-}
-
-/// Where the run starts: block 0 on a fresh chain, or the persisted cursor
-/// on crash recovery.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Start {
-    /// The last durably-committed block; execution opens block
-    /// `initial_block + 1`.
-    pub initial_block: u64,
-    /// The persisted resume cursor; `None` on a fresh start. See
-    /// [`ResumePoint`] for how its fields seed the reader/exec counters.
-    pub resume: Option<ResumePoint>,
 }
 
 /// Role-specific optional behavior. Everything here defaults to "off"

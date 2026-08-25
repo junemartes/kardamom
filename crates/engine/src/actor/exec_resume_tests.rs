@@ -72,13 +72,11 @@ fn resume_executes_from_cursor_with_absolute_counts() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        // initial_block == resume.block (the bins pass the same cursor).
-        1,
-        Some(ResumePoint {
+        ResumePoint {
             block: 1,
             record_count: 2,
             l2_timestamp: 1_700_000_000,
-        }),
+        },
         None,
         None,
         None,
@@ -146,12 +144,11 @@ fn resume_after_empty_block_backlog() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        3,
-        Some(ResumePoint {
+        ResumePoint {
             block: 3,
             record_count: 0,
             l2_timestamp: 1_700_000_003,
-        }),
+        },
         None,
         None,
         None,
@@ -214,12 +211,11 @@ fn resume_boundary_alignment_still_checked() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(Arc::new(Mutex::new(Vec::new()))),
-        1,
-        Some(ResumePoint {
+        ResumePoint {
             block: 1,
             record_count: 5,
             l2_timestamp: 1_700_000_000,
-        }),
+        },
         None,
         None,
         None,
@@ -270,8 +266,7 @@ fn no_resume_executes_and_commits_block_one() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,

@@ -342,16 +342,13 @@ pub fn restore_or_fetch_checkpoint(
 }
 
 /// Replay cursor for the cluster canonical stream: resume from the persisted
-/// state cursor, or genesis for a fresh node. The cluster re-offers retained
-/// frames from the cursor on every session establishment, so tx_ordering is
-/// gapless across restarts AND session loss.
-pub fn cluster_replay_cursor(
-    resume: Option<&crate::ResumePoint>,
-) -> crate::reader::cluster::ReplayCursor {
-    match resume {
-        Some(rp) => crate::reader::cluster::ReplayCursor::new(rp.record_count, rp.block + 1),
-        None => crate::reader::cluster::ReplayCursor::genesis(),
-    }
+/// state cursor. The cluster re-offers retained frames from the cursor on
+/// every session establishment, so tx_ordering is gapless across restarts
+/// AND session loss. [`ResumePoint::GENESIS`](crate::ResumePoint::GENESIS)
+/// yields `ReplayCursor::genesis()` — no records seen, first boundary is
+/// block 1 — so a fresh node needs no separate arm.
+pub fn cluster_replay_cursor(start: &crate::ResumePoint) -> crate::reader::cluster::ReplayCursor {
+    crate::reader::cluster::ReplayCursor::new(start.record_count, start.block + 1)
 }
 
 /// Spawn a DEDICATED cluster Aeron runtime (own thread, same aeron dir — the

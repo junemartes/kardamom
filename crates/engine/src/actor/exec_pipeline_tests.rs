@@ -15,7 +15,7 @@ use crate::reader::{NoEpochCheck, ReaderToExec};
 use crate::state::{MockStateDatabase, StaticSnapshotSource};
 
 use super::test_support::{ImmediateCommit, RecordingQueue, StagedCommit, legacy, pos};
-use super::{ExecToCommit, ExecutorConfig, spawn_exec};
+use super::{ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
 
 /// Pipelined commit: block N+1 executes against snapshot ∘ parent(N)
 /// while N's commit is unsettled, and boundaries still forward in order
@@ -84,8 +84,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
         StaticSnapshotSource(snap),
         ImmediateCommit,
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,
@@ -160,8 +159,7 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
             blocking_waits: blocking_waits.clone(),
         },
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,
@@ -233,8 +231,7 @@ fn exec_settles_inflight_commits_while_idle() {
             blocking_waits: blocking_waits.clone(),
         },
         RecordingQueue(writer_log.clone()),
-        0,
-        None,
+        ResumePoint::GENESIS,
         None,
         None,
         None,

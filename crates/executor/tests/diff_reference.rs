@@ -31,9 +31,9 @@ use revm::{Context, ExecuteCommitEvm, MainBuilder, MainContext};
 use kardamom_executor::executor::SnapshotRef;
 use kardamom_executor::{
     BPosition, BlockBoundaryStart, CMessage, EngineWiring, Executor, ExecutorConfig, ExecutorError,
-    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, RoleHooks, Start,
-    StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope, TxOrderingMessage,
-    TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
+    Inbound, MockStateDatabase, MutatingSnapshotSource, NoEpochCheck, Outbound, ResumePoint,
+    RoleHooks, StateWriterSignal, TxDataSubscription, TxEnvelope as KtTxEnvelope,
+    TxOrderingMessage, TxOrderingSubscription, TxReceiptsPublication, TxRef, WriterApplyingQueue,
 };
 
 // Minimal: PUSH1 0x42; PUSH1 0x00; SSTORE; STOP
@@ -293,7 +293,7 @@ fn actor_receipts_match_naive_reference() {
                 writer_signal: Imm,
                 writer_queue: writer_q,
             },
-            Start::default(),
+            ResumePoint::GENESIS,
             RoleHooks::none(),
         )
     });
