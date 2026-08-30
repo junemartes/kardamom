@@ -4,9 +4,13 @@
 # =============================================================================
 # SOURCED into ci-cluster.sh's shell (never executed as a child): a fatal
 # build error must abort the ONE ci-cluster process (set -e / explicit exit).
-# Reads the entry script's ROOT/REGISTRY/TAG/SERVICES constants at call time.
+# Reads the entry script's ROOT/REGISTRY/TAG/SERVICES/DIGEST_MANIFEST
+# constants at call time.
 # This file must NOT install traps (ci-cluster.sh owns the single EXIT trap).
-# Requires lib.sh (log).
+# Requires lib.sh (log) and lib-signing.sh (sign_pushed_image; ci-cluster.sh
+# signs the completed manifest itself via sign_digest_manifest — after the
+# LAST push, because a bundle over a half-written manifest would verify and
+# still lie).
 
 # Push a locally-built image to the in-cluster registry.
 #
@@ -25,13 +29,65 @@
 # the proxy. The other nodes still pull from the registry over the bridge as usual.
 push_image() {
   local img="$1"
+  local out
   if [[ -n "${REGISTRY_PUSH_NODE:-}" ]]; then
     log "push ${img} via kardamom-${REGISTRY_PUSH_NODE} (proxy-safe engine-to-engine load)"
     docker save "${img}" | docker exec -i "kardamom-${REGISTRY_PUSH_NODE}" docker load
-    docker exec "kardamom-${REGISTRY_PUSH_NODE}" docker push "${img}"
+    out="$(docker exec "kardamom-${REGISTRY_PUSH_NODE}" docker push "${img}" | tee /dev/stderr)"
   else
-    docker push "${img}"
+    out="$(docker push "${img}" | tee /dev/stderr)"
   fi
+  # Digest capture (attested-identity P0.1): record the digest of exactly this
+  # push so deploy.sh can pin the jobs. The digest comes from the push
+  # output's final "digest: sha256:..." line, NOT from
+  # `docker inspect --format='{{index .RepoDigests 0}}'`, for two reasons:
+  #   1. it works identically for both push paths above — in the
+  #      REGISTRY_PUSH_NODE path the push happens inside the node's INNER
+  #      docker, where a host-side inspect would find no RepoDigests at all;
+  #   2. RepoDigests is an unordered LIST that can carry digests for other
+  #      repos/registries the same image ID is tagged under, so index 0 is not
+  #      guaranteed to be this registry's digest — the push output line is by
+  #      definition the digest of exactly this push to exactly this repo.
+  # Defensive strip + shape validation: an invisible \r/space here would print
+  # clean in every log yet fail docker's reference parser at pull time. Fail
+  # loudly rather than fall back: a deploy that silently lost its digest
+  # would run the mutable :dev tag while claiming an audit record.
+  local digest
+  digest="$(awk '/digest: sha256:/ {d=$3} END {print d}' <<<"${out}" | tr -d '[:space:]\r')"
+  if [[ -z "${digest}" ]]; then
+    echo "ERROR: could not capture the pushed digest for ${img} from the push output" >&2
+    exit 1
+  fi
+  # Manifest line: "<svc> <repo>:<tag>@sha256:..." where <svc> is the image
+  # basename minus the kardamom- prefix (aeron, cluster, ingress, ...).
+  # deploy.sh maps each job to its <svc> line and passes the ref via
+  # -var image_ref=... .
+  #
+  # The COMBINED repo:tag@digest form (not bare repo@digest) is deliberate:
+  # Nomad 1.9.5's docker driver (drivers/docker/utils.go parseDockerImage)
+  # mis-parses a bare digest ref on a PORT-carrying registry host — the
+  # registry-port colon makes it take the "tag contains /" branch, append
+  # :latest, and the pull dies with "invalid reference format" (exactly what
+  # took down every aeron alloc on PR #212's first e2e run). With repo:tag@
+  # digest the driver pulls the advisory tag and then resolves the container
+  # image by the DIGEST ref (ImageInspectWithRaw on the full pinned string),
+  # so the digest still pins what runs: a moved tag fails the task instead
+  # of ever running unpinned bytes.
+  local ref name ref_re='^[a-z0-9./:-]+@sha256:[0-9a-f]{64}$'
+  ref="${img}@${digest}"
+  if [[ ! "${ref}" =~ ${ref_re} ]]; then
+    echo "ERROR: captured image ref fails shape validation: '${ref}'" >&2
+    exit 1
+  fi
+  name="${img##*/}"
+  name="${name%%:*}"
+  echo "${name#kardamom-} ${ref}" >>"${DIGEST_MANIFEST}"
+  log "pinned ${name#kardamom-} -> ${ref}"
+  # Attested-identity P0.5: keyless-sign the digest we just pinned (public
+  # Rekor). No-op with a log line outside CI-with-OIDC — the local harness
+  # (and the REGISTRY_PUSH_NODE proxy-safe path, which is local-dev by
+  # definition) deploys unsigned, exactly like deploy.sh's :dev-tag fallback.
+  sign_pushed_image "${ref}"
 }
 
 # Thin service images from prebuilt binaries (§5): the workflow ran
@@ -40,6 +96,9 @@ push_image() {
 build_service_images() {
   local staging found so svc bin
   log "building + pushing service images to ${REGISTRY}"
+  # Fresh digest manifest for THIS deploy (push_image appends one line per
+  # image; deploy.sh reads it to pin every job to repo@sha256:...).
+  : >"${DIGEST_MANIFEST}"
   # Aeron image (same canonical Dockerfile as make images).
   docker build -f "${ROOT}/crates/log/docker/aeron/Dockerfile" \
     -t "${REGISTRY}/kardamom-aeron:${TAG}" "${ROOT}/crates/log/docker/aeron"

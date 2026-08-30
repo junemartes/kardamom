@@ -26,6 +26,17 @@
 # with role constraints. Host networking exposes the archive control/response/
 # recording-events/replication UDP ports (8010/8011/8020/8021) directly.
 
+# Digest-pinned image (attested-identity P0.1): scripts/deploy.sh passes the
+# repo:tag@sha256:... reference captured at push time (deploy/cluster/
+# images.digests). The empty default falls back to the mutable :dev tag in
+# the task config — a dev affordance for manual `nomad job run` during
+# debugging, NOT a production path.
+variable "image_ref" {
+  type        = string
+  description = "Digest-pinned image reference (repo:tag@sha256:...) from the deploy's push manifest. Empty = mutable :dev tag fallback (dev-only)."
+  default     = ""
+}
+
 job "aeron" {
   datacenters = ["dc1"]
   type        = "system"
@@ -65,7 +76,17 @@ job "aeron" {
       driver = "docker"
 
       config {
-        image        = "192.168.56.10:5000/kardamom-aeron:dev"
+        image = var.image_ref != "" ? var.image_ref : "192.168.56.10:5000/kardamom-aeron:dev"
+        # (No force_pull here, matching the pre-digest behavior: the aeron
+        # image changes rarely and the digest pin makes staleness moot on the
+        # pinned path. The :dev fallback keeps the historical reuse-cache
+        # semantics.)
+        #
+        # NO readonly_rootfs (attested-identity P0.3, deliberately skipped):
+        # the ArchivingMediaDriver is a JVM and writes /tmp (hsperfdata, JVM
+        # temp files) in the rootfs besides its bind-mounted aeron/archive
+        # dirs. Needs a validated tmpfs /tmp before flipping — a wrong guess
+        # takes down the media driver on every worker node at once.
         network_mode = "host"
         # CRITICAL: the media driver and every service container must see
         # aeron.dir at the SAME ABSOLUTE PATH. Aeron records absolute paths in
@@ -84,11 +105,11 @@ job "aeron" {
       # Override the image's /aeron-mount defaults so the path matches the
       # services (see the volumes note above).
       env {
-        AERON_DIR                   = "/opt/kardamom/aeron-mount/dir"
-        AERON_ARCHIVE_MOUNT         = "/opt/kardamom/archive"
-        AERON_ARCHIVE_DIR           = "/opt/kardamom/archive/dir"
-        AERON_ARCHIVE_CLASS         = "io.aeron.archive.ArchivingMediaDriver"
-        AERON_TERM_BUFFER_LENGTH    = "4194304"
+        AERON_DIR                    = "/opt/kardamom/aeron-mount/dir"
+        AERON_ARCHIVE_MOUNT          = "/opt/kardamom/archive"
+        AERON_ARCHIVE_DIR            = "/opt/kardamom/archive/dir"
+        AERON_ARCHIVE_CLASS          = "io.aeron.archive.ArchivingMediaDriver"
+        AERON_TERM_BUFFER_LENGTH     = "4194304"
         AERON_IPC_TERM_BUFFER_LENGTH = "4194304"
         # Cap the ArchivingMediaDriver JVM heap so the task fits its trimmed
         # memory reservation below. The driver's hot data (4 MB term buffers) is
