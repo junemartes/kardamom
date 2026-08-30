@@ -1,23 +1,26 @@
 //! Outbound sink: the [`EpochPublisher`] trait the DA watcher writes
 //! [`kardamom_types::EpochRecord`]s to. Production binds this to a
-//! `kardamom_log::aeron_live::TxDepositsPublisherHandle`; tests use the
+//! `kardamom_log::aeron_live::TxDepositsPublisherHandle`. Tests use the
 //! in-memory fake in [`fakes`].
 //!
-//! The unit is an EPOCH, not a deposit: one record per finalized L1 block,
-//! carrying that block's deposits by value and emitted even when there are
-//! none. See `docs/agents/l1-origin-deposit-derivation-spec.md`.
+//! The unit is an epoch, not a deposit. One record covers one finalized L1
+//! block. It carries that block's deposits by value, and the watcher emits
+//! it even when there are no deposits. See
+//! `docs/agents/l1-origin-deposit-derivation-spec.md`.
 
 use kardamom_types::{BPosition, EpochRecord};
 
 /// Errors a publish can surface.
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
-    /// The transport is backpressured. The watcher's tick caller logs and
-    /// drops; the next tick will retry the same `(cursor, tip]` range.
+    /// The transport is backpressured. The watcher's tick caller logs this
+    /// and drops the publish. The next tick retries the same
+    /// `(cursor, tip]` range.
     #[error("publisher backpressured")]
     Backpressure,
-    /// The transport is closed (subscription torn down, daemon stopped).
-    /// Fatal at the watcher level — the spawn loop exits.
+    /// The transport is closed: the subscription is torn down, or the
+    /// daemon stopped. This is fatal at the watcher level, and the spawn
+    /// loop exits.
     #[error("publisher closed")]
     Closed,
     /// Other transport/encoding failure.
@@ -25,11 +28,11 @@ pub enum PublishError {
     Transport(String),
 }
 
-/// Sink for epochs the watcher emits. Implementors must be `Send + Sync`
-/// because the watcher's tokio task moves them between executions.
+/// Sink for epochs the watcher emits. An implementation must be
+/// `Send + Sync`, because the watcher's tokio task moves it between runs.
 pub trait EpochPublisher: Send + Sync + 'static {
-    /// Publish one epoch. Returns the assigned wire position (analogous to
-    /// Aeron's offer-position) so callers can correlate.
+    /// Publish one epoch. Return the assigned wire position, similar to
+    /// Aeron's offer position, so a caller can correlate it.
     fn publish(&self, epoch: &EpochRecord) -> Result<BPosition, PublishError>;
 }
 
@@ -40,8 +43,8 @@ pub mod fakes {
     use super::*;
 
     /// In-memory [`EpochPublisher`] that records every published epoch in
-    /// order. The synthesised `BPosition` advances by `64` per record so tests
-    /// can assert positions without coupling to Aeron framing.
+    /// order. Its synthetic `BPosition` advances by `64` per record, so a
+    /// test can check positions without depending on Aeron framing.
     #[derive(Default, Clone)]
     pub struct InMemoryEpochPublisher {
         pub published: Arc<Mutex<Vec<EpochRecord>>>,

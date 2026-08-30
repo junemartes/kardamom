@@ -1,7 +1,7 @@
-//! Four reader threads each hold a snapshot at a different block; each
-//! continuously reads its frozen view; the writer commits more blocks
-//! concurrently. Assert each reader sees only its own view and that no
-//! panics or page-reuse-during-read occurs.
+//! Four reader threads each hold a snapshot at a different block. Each
+//! continuously reads its frozen view, while the writer commits more
+//! blocks concurrently. This test asserts that each reader sees only
+//! its own view, and that no panics or page-reuse-during-read occur.
 
 mod common;
 
@@ -21,7 +21,7 @@ fn four_readers_with_distinct_snapshots() {
     // Drop the genesis snapshot.
     let _ = writer.snapshot_rx.recv();
 
-    // Pre-load 4 blocks; capture a snapshot after each.
+    // Preload 4 blocks, and capture a snapshot after each one.
     let mut snapshots = Vec::new();
     for block in 1..=4u64 {
         writer

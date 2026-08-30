@@ -1,17 +1,18 @@
 //! Real-Aeron e2e against the new Send-friendly `aeron_live` adapters.
 //!
-//! Exercises the publish + subscribe path through `AeronRuntime`,
-//! demonstrating that:
+//! Exercises the publish and subscribe path through `AeronRuntime`,
+//! showing that:
 //!
-//!   1. publisher and subscriber handles are `Send + Sync` — they live in a
-//!      `tokio::test(flavor = "multi_thread")` runtime where tasks freely
-//!      migrate across worker threads;
+//!   1. publisher and subscriber handles are `Send + Sync`, so they live
+//!      in a `tokio::test(flavor = "multi_thread")` runtime where tasks
+//!      freely migrate across worker threads;
 //!   2. the dedicated Aeron OS thread inside [`AeronRuntime`] correctly
 //!      bridges the `Rc<Aeron>` to the multi-threaded outside world;
-//!   3. published `TxEnvelope`s round-trip through real Aeron and emerge on
-//!      the subscriber in publish order, with non-zero `BPosition` cursors.
+//!   3. published `TxEnvelope`s round-trip through real Aeron and emerge
+//!      on the subscriber in publish order, with non-zero `BPosition`
+//!      cursors.
 //!
-//! Gated on the `docker-e2e` feature AND on Docker availability.
+//! Gated on the `docker-e2e` feature and on Docker availability.
 
 #![cfg(feature = "docker-e2e")]
 
@@ -37,9 +38,10 @@ async fn docker_available() -> bool {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Docker; run with `cargo test -p log --features docker-e2e --test aeron_live_e2e -- --ignored`"]
 async fn aeron_live_send_friendly_round_trip() {
-    // This test only runs when explicitly opted in (`--features docker-e2e --
-    // --ignored`), an environment where Docker is required — its absence is an
-    // error, not a skip condition (a silent return would count as a green pass).
+    // This test only runs when explicitly opted in (`--features
+    // docker-e2e -- --ignored`), an environment where Docker is required.
+    // Its absence is an error, not a skip condition; a silent return
+    // would count as a green pass.
     assert!(
         docker_available().await,
         "docker not available — required for this --ignored docker-e2e test"
@@ -55,15 +57,16 @@ async fn aeron_live_send_friendly_round_trip() {
 
     let mut cfg = LogConfig::default();
     // Use IPC over the shared `aeron.dir` (bind-mounted between host and
-    // container) — both processes are clients of the same Media Driver
-    // running inside the container, so no UDP is needed for this single-host
-    // smoke test. Override the per-shard tx_data template to a plain IPC URI
-    // for the single-shard test (sequencer_id=0).
+    // container). Both processes are clients of the same Media Driver
+    // running inside the container, so no UDP is needed for this
+    // single-host smoke test. This overrides the per-shard tx_data
+    // template to a plain IPC URI for the single-shard test
+    // (sequencer_id=0).
     cfg.channels.tx_data_channel_template = "aeron:ipc?alias=a-{sid}".to_string();
     cfg.channels.tx_data_stream_id_base = 4001;
 
-    // Spawn the runtime, pointing AeronContext at the bind-mounted aeron.dir
-    // so the host client joins the container's Media Driver.
+    // Spawn the runtime, pointing AeronContext at the bind-mounted
+    // aeron.dir, so the host client joins the container's Media Driver.
     let rt = AeronRuntime::spawn_with_dir(&aeron_dir).expect("aeron runtime");
 
     let sequencer_id = 0u8;
@@ -72,8 +75,8 @@ async fn aeron_live_send_friendly_round_trip() {
     let mut subscriber =
         TxDataSubscriberHandle::open(&rt, &cfg.channels, sequencer_id).expect("subscriber");
 
-    // Spawn the publisher on a tokio task — this proves the handle survives
-    // worker-thread migration (which `current_thread` could mask).
+    // Spawn the publisher on a tokio task. This proves the handle survives
+    // worker-thread migration, which `current_thread` could mask.
     let pub_task = tokio::task::spawn_blocking({
         let publisher = publisher.clone();
         move || {

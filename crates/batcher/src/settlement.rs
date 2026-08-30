@@ -1,8 +1,8 @@
-//! `KardamomL2Settlement` sol! bindings + Rust post helper.
+//! `KardamomL2Settlement` sol! bindings and a Rust post helper.
 //!
-//! The contract is the pure DA sink (S0). Calldata is the abi-encoded
-//! `(prevBatchIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd)` payload;
-//! blob bytes ride along in the 4844 sidecar.
+//! The contract is the pure DA sink. Calldata is the abi-encoded
+//! `(prevBatchIndex, blobVersionedHashes, l2BlockStart, l2BlockEnd)`
+//! payload. The blob bytes travel in the 4844 sidecar.
 
 use alloy_eips::eip4844::{Blob, kzg_to_versioned_hash};
 use alloy_primitives::{Address, B256};
@@ -20,11 +20,12 @@ sol!(
     )
 );
 
-/// Compute KZG → versioned-hash for each blob. Used to assemble the contract
-/// calldata. The blob → KZG commitment step requires the trusted setup; in v0
-/// we accept either pre-computed commitments (passed in) or, for tests, a
-/// deterministic stub. The real broadcast path (future task) uses
-/// `alloy-consensus::BlobTransactionSidecar` which carries its own
+/// Compute the versioned hash from the KZG commitment, for each blob. Used
+/// to assemble the contract calldata. Computing the KZG commitment from a
+/// blob needs the trusted setup. In v0, this function accepts either a
+/// precomputed commitment (passed in) or, for tests, a deterministic stub.
+/// The real broadcast path (a future task) uses
+/// `alloy-consensus::BlobTransactionSidecar`, which carries its own
 /// commitments.
 pub fn versioned_hashes_from_commitments(commitments: &[[u8; 48]]) -> Vec<B256> {
     commitments
@@ -33,10 +34,10 @@ pub fn versioned_hashes_from_commitments(commitments: &[[u8; 48]]) -> Vec<B256> 
         .collect()
 }
 
-/// Best-effort placeholder: assemble the parameters expected by
-/// `postBatch(...)`. The actual transaction broadcast (with sidecar) is a
-/// future-task concern; this helper just packages the fields together so the
-/// CLI + tests can inspect what would be sent.
+/// A placeholder that assembles the parameters `postBatch(...)` expects.
+/// The actual transaction broadcast (with sidecar) is a future task. This
+/// helper only packages the fields together, so the CLI and tests can
+/// inspect what would be sent.
 #[derive(Clone, Debug)]
 pub struct PostBatchParams {
     pub settlement: Address,

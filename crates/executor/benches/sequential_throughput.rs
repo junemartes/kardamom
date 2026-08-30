@@ -1,13 +1,13 @@
 //! Criterion: sequential executor throughput.
 //!
 //! Scenarios:
-//!   - `transfer_step`         : just `execute_tx` for plain transfers (per-tx CPU).
-//!   - `actor_throughput`      : full actor end-to-end via mock channels.
-//!   - `sstore_step`           : `execute_tx` against an SSTORE-heavy contract.
+//!   - `transfer_step`    : `execute_tx` for plain transfers (per-tx CPU).
+//!   - `actor_throughput` : the full actor, end-to-end, over mock channels.
+//!   - `sstore_step`      : `execute_tx` against an SSTORE-heavy contract.
 //!
-//! Throughput floors are not asserted (CI variance is real). Run `cargo
-//! bench` locally to compare hardware-relative numbers; the spec target
-//! is >50k tx/s on plain transfers on one core.
+//! This bench does not assert throughput floors, because CI variance is
+//! real. Run `cargo bench` locally to compare hardware-relative numbers.
+//! The spec target is over 50k tx/s on plain transfers, on one core.
 
 use std::thread;
 use std::time::Duration;
@@ -107,8 +107,8 @@ fn bench_transfer_step(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("transfer_step");
     group.throughput(Throughput::Elements(1));
-    // Bench the per-tx CPU cost of a single transfer at nonce 0; the
-    // snapshot is rebuilt each iteration so we don't accumulate state.
+    // Bench the per-tx CPU cost of a single transfer at nonce 0. The
+    // snapshot rebuilds each iteration, so state does not accumulate.
     group.bench_function("plain_transfer", |b| {
         b.iter(|| {
             let delta = PendingDelta::new();
@@ -172,7 +172,7 @@ fn bench_sstore_step(c: &mut Criterion) {
     group.finish();
 }
 
-// Actor end-to-end: BATCH txs per iter; reports throughput in tx/s.
+// Actor end-to-end: `BATCH` txs per iteration; reports throughput in tx/s.
 struct ChanTxDataSub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
@@ -240,11 +240,12 @@ fn bench_actor_throughput(c: &mut Criterion) {
             let writer_q = WriterApplyingQueue::new(snap.clone());
             let snapshots = MutatingSnapshotSource(snap);
 
-            // Post-S4-arch-update wiring: pre-load all envelopes onto a
-            // single tx_data and all TxRefs onto tx_ordering before the
-            // executor starts. The bench measures end-to-end actor
-            // throughput; the demux split itself adds one extra crossbeam
-            // hop per tx, which should be negligible vs. revm time.
+            // Wiring after the join-buffer architecture update: preload all
+            // envelopes onto a single tx_data, and all TxRefs onto
+            // tx_ordering, before the executor starts. This bench measures
+            // end-to-end actor throughput. The demux split itself adds one
+            // extra crossbeam hop per tx, which should be negligible next
+            // to revm time.
             let (a_tx, a_rx) = bounded::<(BPosition, KtTxEnvelope)>((BATCH as usize) + 8);
             let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>((BATCH as usize) + 8);
             let (c_tx, c_rx) = bounded::<CMessage>((BATCH as usize) + 8);
@@ -264,10 +265,11 @@ fn bench_actor_throughput(c: &mut Criterion) {
                 pos(BATCH as i32),
                 TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
                     block_number: 1,
-                    // end_tx_idx is the cumulative COUNT of canonical records
-                    // through this block (encoded via BPosition::from_index),
-                    // which the executor compares against its applied-record
-                    // count — here all BATCH txs. (Not the last tx's index.)
+                    // end_tx_idx is the cumulative count of canonical
+                    // records through this block (encoded through
+                    // `BPosition::from_index`). The executor compares this
+                    // against its applied-record count: here, all `BATCH`
+                    // txs. It is not the last tx's index.
                     end_tx_idx: BPosition::from_index(BATCH),
                     l2_timestamp: 0,
                     l1_origin: 0,

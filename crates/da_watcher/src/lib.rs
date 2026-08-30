@@ -1,53 +1,53 @@
 //! DA watcher: an async task that tails finalized L1 blocks, decodes
 //! `DepositInitiated` events from the per-L2 `ETHLockbox` proxy, and
-//! republishes each one onto the dedicated `tx_deposits` Aeron channel as a
+//! republishes each one on the dedicated `tx_deposits` Aeron channel as a
 //! [`kardamom_types::Deposit`].
 //!
 //! Sequencers subscribe to `tx_deposits`, derive a [`kardamom_types::DepositRef`]
 //! `(source_hash, deposit_position)`, and emit that ref on the canonical
-//! `tx_ordering` channel — mirroring the existing
-//! `tx_data → TxRef on tx_ordering` flow for regular L2 txs. Executors
-//! consume `tx_ordering` and resolve deposits from the `tx_deposits` archive
-//! by `deposit_position`.
+//! `tx_ordering` channel. This mirrors the existing `tx_data → TxRef on
+//! tx_ordering` flow for regular L2 transactions. Executors consume
+//! `tx_ordering` and resolve deposits from the `tx_deposits` archive by
+//! `deposit_position`.
 //!
 //! ## Layering
 //!
-//! - [`source::L1Source`] — async trait abstracting the two L1 reads the
-//!   watcher needs (`finalized_block_number`, `lockbox_logs`). The trait is
-//!   the seam for tests (mock impl) and production
-//!   ([`rpc_source::RpcL1Source`] — alloy-provider-backed).
-//! - [`publisher::EpochPublisher`] — sink for the
+//! - [`source::L1Source`]: an async trait for the two L1 reads the watcher
+//!   needs (`finalized_block_number`, `lockbox_logs`). The trait is the seam
+//!   for tests (a mock impl) and for production
+//!   ([`rpc_source::RpcL1Source`], backed by an alloy provider).
+//! - [`publisher::EpochPublisher`]: the sink for the
 //!   [`kardamom_types::Deposit`] records the watcher emits. Production wraps
-//!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`; tests use the
+//!   `kardamom_log::aeron_live::TxDepositsPublisherHandle`. Tests use the
 //!   in-memory fake in [`publisher::fakes`].
-//! - [`watcher::process_once`] — pure, single-pass function (one tick). The
-//!   integration shape: read finalized tip, fetch logs in `(cursor, tip]`,
-//!   build a `Deposit` from each log, publish on `tx_deposits`, advance
+//! - [`watcher::process_once`]: a pure, single-pass function for one tick.
+//!   It reads the finalized tip, fetches logs in `(cursor, tip]`, builds a
+//!   `Deposit` from each log, publishes on `tx_deposits`, and advances the
 //!   cursor.
-//! - [`watcher::spawn`] — wraps `process_once` in a `tokio::time::interval`
+//! - [`watcher::spawn`]: wraps `process_once` in a `tokio::time::interval`
 //!   loop with structured logging. Returns a [`watcher::WatcherHandle`].
 //!
 //! ## Spec inheritance
 //!
-//! Semantics (cursor lifecycle, NotFinalized handling, per-log error
-//! continuation, OP source-hash derivation, address aliasing) are inherited
-//! from `docs/agents/l1-deposit-monitor-spec.md` shipped on PR #10. This
-//! crate is the new-architecture port of that work: it preserves the
-//! L1-side logic and replaces the in-memory `Node::submit_deposit_transaction`
-//! call with publishing to the Aeron `tx_deposits` channel.
+//! This crate inherits its semantics (cursor lifecycle, NotFinalized
+//! handling, per-log error continuation, OP source-hash derivation, address
+//! aliasing) from `docs/agents/l1-deposit-monitor-spec.md`. This crate is
+//! the new-architecture port of that work. It keeps the L1-side logic and
+//! replaces the in-memory `Node::submit_deposit_transaction` call with a
+//! publish to the Aeron `tx_deposits` channel.
 //!
 //! Out of scope for this crate:
-//! - Executor deposit-execution (mint pre-credit + inner EVM call). That
-//!   lives downstream in `executor`: the executor consumes
+//! - Executor deposit execution (mint pre-credit plus the inner EVM call).
+//!   That lives downstream, in `executor`: the executor consumes
 //!   `tx_ordering`, dedups `DepositRef` by `source_hash`, resolves the
-//!   `Deposit` from `tx_deposits`, and runs the deposit. The wiring is a
+//!   `Deposit` from `tx_deposits`, and runs the deposit. Wiring this up is a
 //!   separate follow-up.
 //! - Reorg handling. Finalized blocks do not reorg in normal Ethereum
-//!   operation; the watcher trusts finality.
-//! - L1-attributes deposits (the OP block-attributes system tx). The OTHER
-//!   kind of system tx — the **upgrade transaction** — IS in scope: the
-//!   watcher reads `UpgradeInitiated` alongside `DepositInitiated` from the
-//!   same lockbox address and the same query, and
+//!   operation, so the watcher trusts finality.
+//! - L1-attributes deposits (the OP block-attributes system transaction).
+//!   The upgrade transaction, the other kind of system transaction, is in
+//!   scope: the watcher reads `UpgradeInitiated` alongside
+//!   `DepositInitiated` from the same lockbox address and the same query.
 //!   `kardamom_types::epoch::derive_epoch` turns it into a system deposit
 //!   (`is_system_transaction = true`). See
 //!   `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
@@ -58,10 +58,10 @@ pub mod rpc_source;
 pub mod source;
 pub mod watcher;
 
-// The deposit-derivation rule moved to `kardamom_types::epoch` so the
-// VERIFIER can share it — a second copy would verify nothing (see
-// docs/agents/l1-origin-deposit-derivation-spec.md). Re-exported here so
-// existing callers keep working.
+// The deposit-derivation rule moved to `kardamom_types::epoch`, so the
+// verifier can share it. A second copy would verify nothing (see
+// docs/agents/l1-origin-deposit-derivation-spec.md). This module re-exports
+// it, so existing callers keep working.
 pub use kardamom_types::epoch::{
     DepositLog, LockboxLog, UpgradeLog, alias_l1_address, deposit_from_log, source_hash,
     source_hash_system, upgrade_from_log,

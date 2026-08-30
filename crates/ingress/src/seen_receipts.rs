@@ -1,30 +1,31 @@
 //! First-wins tx-hash dedup set for the tx_receipts MDS fan-in.
 //!
-//! With the multi-destination subscription, all N executor replicas replay the
-//! SAME canonical order and emit IDENTICAL receipts, so each receipt arrives up
-//! to N times on ingress's aggregated stream. The proxy's receipt watcher calls
-//! [`SeenReceipts::insert`] for every receipt and only processes the ones it has
-//! not seen before, so a tx's must-deliver ack (and its cache/pending updates)
-//! fire exactly once.
+//! With the multi-destination subscription, all N executor replicas replay
+//! the same canonical order and emit identical receipts. So each receipt
+//! arrives up to N times on ingress's combined stream. The proxy's receipt
+//! watcher calls [`SeenReceipts::insert`] for every receipt, and only
+//! processes the ones it has not seen before. This makes a tx's
+//! must-deliver ack, and its cache and pending updates, fire exactly once.
 //!
-//! The set is **bounded** (FIFO eviction by insertion order) so it can't grow
-//! without limit on a long-running ingress. The capacity only needs to exceed
-//! the in-flight window between a receipt's first and last replica copy — those
-//! copies are produced by N executors replaying the same order at roughly the
-//! same rate, so they arrive close together. A capacity in the tens of
-//! thousands is far more than that window; the only failure mode of an
-//! undersized capacity is that a *very* late duplicate (evicted before its twin
-//! arrived) is reprocessed — which is harmless because `on_receipt`/`cache`
-//! insert are themselves idempotent. So this is a fast-path optimisation layered
-//! over already-idempotent sinks, not a correctness-critical unbounded set.
+//! The set has a bound: it evicts the oldest entry first, by insertion
+//! order. This keeps it from growing without limit on a long-running
+//! ingress. The capacity only needs to exceed the in-flight window between
+//! a receipt's first and last replica copy. The N executors replay the
+//! same order at close to the same rate, so those copies arrive close
+//! together. A capacity in the tens of thousands is far more than that
+//! window. If the capacity is too small, the only failure is that a very
+//! late duplicate, evicted before its twin arrived, gets reprocessed. This
+//! is harmless, because `on_receipt` and the cache insert are themselves
+//! idempotent. So this set is a fast-path optimization over sinks that are
+//! already idempotent, not a set that correctness depends on.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::Mutex;
 
 use alloy_primitives::B256;
 
-/// Default ring capacity. 1<<16 hashes ≈ 2 MiB — trivially small, and orders of
-/// magnitude larger than the N-replica duplicate window for any realistic N.
+/// Default ring capacity. 1<<16 hashes is about 2 MiB, a small cost. It is
+/// far larger than the N-replica duplicate window for any realistic N.
 pub const DEFAULT_CAPACITY: usize = 1 << 16;
 
 /// Thread-safe, bounded, first-wins set of receipt tx hashes.
@@ -35,7 +36,8 @@ pub struct SeenReceipts {
 
 struct Inner {
     set: HashSet<B256>,
-    /// Insertion order, for FIFO eviction once `set` reaches `capacity`.
+    /// Insertion order. Used to evict the oldest entry once `set` reaches
+    /// `capacity`.
     order: VecDeque<B256>,
 }
 
@@ -51,9 +53,10 @@ impl SeenReceipts {
         }
     }
 
-    /// Record `tx_hash`. Returns `true` if it was newly inserted (first-wins:
-    /// the caller should process this receipt), `false` if it was already
-    /// present (a duplicate replica copy: the caller should drop it).
+    /// Records `tx_hash`. Returns `true` if the hash was newly inserted; the
+    /// caller should process this receipt. Returns `false` if the hash was
+    /// already present, as a duplicate replica copy; the caller should
+    /// drop it.
     pub fn insert(&self, tx_hash: B256) -> bool {
         let mut g = self.inner.lock().expect("SeenReceipts poisoned");
         if !g.set.insert(tx_hash) {
@@ -88,9 +91,9 @@ mod tests {
     fn first_wins_then_duplicates_dropped() {
         let s = SeenReceipts::new(16);
         let h = B256::repeat_byte(0xAB);
-        // First copy: newly inserted → process.
+        // The first copy is newly inserted, so the caller must process it.
         assert!(s.insert(h), "first receipt must be accepted");
-        // Subsequent identical copies (replica 2..N): dropped.
+        // Later identical copies, from replica 2 through N, are dropped.
         assert!(!s.insert(h), "duplicate must be dropped");
         assert!(!s.insert(h), "duplicate must be dropped");
         assert_eq!(s.len(), 1);
@@ -103,21 +106,21 @@ mod tests {
             assert!(s.insert(B256::repeat_byte(i)));
         }
         assert_eq!(s.len(), 8);
-        // Re-inserting any of them is a duplicate.
+        // Inserting any of them again is a duplicate.
         assert!(!s.insert(B256::repeat_byte(3)));
     }
 
     #[test]
     fn fifo_eviction_bounds_size() {
         let s = SeenReceipts::new(4);
-        // Fill past capacity.
+        // Fill the set past its capacity.
         for i in 0..6u8 {
             assert!(s.insert(B256::repeat_byte(i)));
         }
         assert_eq!(s.len(), 4, "set is bounded to capacity");
-        // The two oldest (0, 1) were evicted, so they read as "new" again —
-        // harmless because the downstream sinks are idempotent. The newest are
-        // still present and dedup.
+        // The two oldest entries (0, 1) were evicted, so they read as new
+        // again. This is harmless, because the downstream sinks are
+        // idempotent. The newest entries are still present and dedup.
         assert!(!s.insert(B256::repeat_byte(5)), "recent hash still deduped");
         assert!(s.insert(B256::repeat_byte(0)), "evicted hash reads as new");
     }

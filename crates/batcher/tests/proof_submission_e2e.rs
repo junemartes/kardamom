@@ -1,13 +1,14 @@
-//! PR 4's closing contract, end to end on anvil: a REAL batch (accumulator
-//! → records commitment → `postBatch`) posted to the settlement, a batch
-//! proof's output files in the zk-host layout, and `submit_next_proof`
-//! advancing the `KardamomProofOracle`'s root chain — batcher, settlement,
-//! prover queue, and oracle aligned on the L1-as-truth cursor.
+//! An end-to-end anvil test of the closing contract: a real batch
+//! (accumulator, records commitment, `postBatch`) posted to the
+//! settlement, a batch proof's output files in the zk-host layout, and
+//! `submit_next_proof` advancing the `KardamomProofOracle`'s root chain.
+//! The batcher, settlement, prover queue, and oracle all align on the
+//! L1-as-truth cursor.
 //!
-//! The verifier here is the ACCEPTING mock (deployed from the forge test
-//! artifact): contract-level proof rejection is covered by the forge suite,
-//! and guest-side public-values authenticity by the zk-host batch round
-//! trip — this test owns the CURSOR-ALIGNMENT plumbing between them.
+//! The verifier here is the accepting mock, deployed from the forge test
+//! artifact. The forge suite covers contract-level proof rejection. The
+//! zk-host batch round trip covers guest-side public-values authenticity.
+//! This test owns the cursor-alignment plumbing between them.
 
 use std::path::PathBuf;
 
@@ -140,7 +141,7 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
         .unwrap();
     assert_eq!(out, SubmitOutcome::NoBatchPosted { batch_index: 1 });
 
-    // --- A REAL batch through the accumulator: two blocks, three txs; the
+    // --- A real batch through the accumulator: two blocks, three txs. The
     // records commitment comes out of the production close path.
     let mut acc = BatchAccumulator::new();
     acc.observe_tx(env_tx(0), BPosition::from_index(0));
@@ -183,15 +184,16 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
         .expect("postBatch receipt");
     assert!(receipt.status());
 
-    // Batch posted but the prover hasn't produced files yet.
+    // Batch posted, but the prover has not produced files yet.
     let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())
         .await
         .unwrap();
     assert_eq!(out, SubmitOutcome::ProofNotReady { batch_index: 1 });
 
-    // --- The prover's output files (zk-host batch layout). Public values
-    // must carry the SAME commitment the batcher posted — cross-computed
-    // here via the shared primitives, exactly as the batch guest commits.
+    // --- The prover's output files (zk-host batch layout). The public
+    // values must carry the same commitment the batcher posted. This is
+    // cross-computed here with the shared primitives, exactly as the batch
+    // guest commits.
     let expected_commitment = batch_records_commitment([7u64, 8].map(|n| {
         let mut d = kardamom_types::BlockRecordsDigest::new(n);
         match n {
@@ -228,7 +230,8 @@ async fn posted_batch_proof_advances_the_oracle_root_chain() {
     assert_eq!(oracle.stateRoot().call().await.unwrap(), POST_ROOT);
     assert_eq!(oracle.lastFinalizedBatch().call().await.unwrap(), 1);
 
-    // Idempotence at the cursor: batch 2 not posted → NoBatchPosted.
+    // Idempotence at the cursor: batch 2 is not posted, so this returns
+    // NoBatchPosted.
     let out = submit_next_proof(provider.clone(), oracle_addr, proofs_dir.path())
         .await
         .unwrap();

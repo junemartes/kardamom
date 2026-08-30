@@ -1,7 +1,8 @@
-//! Shared test helpers: open an env+writer, build deltas.
+//! Shared test helpers. These open an env and a writer, and build deltas.
 //!
-//! Each integration test imports this via `mod common;`, but each test binary
-//! only uses a subset of helpers — `#![allow(dead_code)]` keeps clippy quiet.
+//! Each integration test imports this module with `mod common;`. Each
+//! test binary uses only a subset of the helpers, so
+//! `#![allow(dead_code)]` keeps clippy quiet.
 
 #![allow(dead_code)]
 
@@ -10,8 +11,8 @@ use kardamom_state::env::Durability;
 use kardamom_state::{StateEnvBuilder, StateWriter, WriteBatch, WriterHandle};
 use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt, StorageChange};
 
-/// Spawn a fresh writer over a tempdir-backed env. Returns the tempdir guard
-/// so the caller controls its lifetime (drop it after the writer).
+/// Spawn a fresh writer over a tempdir-backed env. Returns the tempdir
+/// guard, so the caller controls its lifetime. Drop it after the writer.
 pub fn open_tmp_writer() -> (tempfile::TempDir, WriterHandle) {
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path())
@@ -29,11 +30,12 @@ pub fn bpos(block: u64) -> BPosition {
     }
 }
 
-/// Build a simple per-block delta: one account mutation + one storage slot +
-/// one receipt with a deterministic tx_hash. Used by Tasks 17-21.
+/// Build a simple per-block delta: one account mutation, one storage
+/// slot, and one receipt with a deterministic tx_hash.
 ///
-/// Per upstream `AccountChange` shape: `{ address, nonce, balance, code_hash }` —
-/// no storage_root field (v0 executor does not maintain MPT roots per).
+/// The upstream `AccountChange` shape is `{ address, nonce, balance,
+/// code_hash }`, with no `storage_root` field. The v0 executor does not
+/// maintain MPT roots.
 pub fn simple_delta(
     block: u64,
     addr: Address,

@@ -1,10 +1,10 @@
 //! Aeron subscribers for channels B, C, per-recorder watermark streams, and
 //! the aggregated quorum watermark.
 //!
-//! Gated behind the `aeron-live` cargo feature; see `publisher.rs` for the
-//! same caveats around `rusteron-client` API drift. Channel URIs cross the
-//! FFI boundary as `&CStr` (rusteron 0.1.16x) — we own a `CString` per
-//! subscription for the duration of the call.
+//! Gated behind the `aeron-live` cargo feature. See `publisher.rs` for the
+//! same caveats about `rusteron-client` API drift. Channel URIs cross the
+//! FFI boundary as `&CStr` (rusteron 0.1.16x). This module owns a `CString`
+//! per subscription for the duration of the call.
 
 use std::ffi::CString;
 use std::rc::Rc;
@@ -29,8 +29,8 @@ type Header = rusteron_client::AeronHeader;
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Generic single-stream subscriber over a typed message. Materializes each
-/// fragment into an owned `T` for ergonomics. Hot-path consumers that want
-/// zero-copy use [`TypedSubscriber::poll_zero_copy`] which hands
+/// fragment into an owned `T`, for convenience. Hot-path consumers that want
+/// zero copy use [`TypedSubscriber::poll_zero_copy`], which hands
 /// `&Archived<T>` directly to the callback.
 pub struct TypedSubscriber<T> {
     sub: Sub,
@@ -46,9 +46,9 @@ where
     pub fn open(aeron: &AeronClient, channel: &str, stream_id: i32) -> Result<Self, LogError> {
         let c = CString::new(channel)
             .map_err(|e| LogError::Aeron(format!("channel uri contains NUL: {e}")))?;
-        // `Handlers::no_*` provides the type-erased "None" the bindgen-generated
-        // generic add_subscription requires (a bare `None` cannot infer the
-        // callback generic parameter).
+        // `Handlers::no_*` gives the type-erased "None" that the bindgen-generated
+        // generic add_subscription needs. A bare `None` cannot infer the
+        // callback generic parameter.
         let sub = aeron
             .add_subscription(
                 c.as_c_str(),
@@ -101,8 +101,8 @@ where
 }
 
 /// Extract `(term_id, term_offset)` from an Aeron header. Returns `None` if
-/// the C bindings fail to populate the values struct (should be rare; we log
-/// and skip the fragment in that case).
+/// the C bindings fail to fill in the values struct. This is rare; the
+/// caller logs and skips the fragment in that case.
 fn header_pos(h: &Header) -> Option<BPosition> {
     let v = h.get_values().ok()?;
     let frame = v.frame();
@@ -113,13 +113,13 @@ fn header_pos(h: &Header) -> Option<BPosition> {
 }
 
 /// TxData[i]: per-sequencer subscription of full `TxEnvelope` bytes.
-/// Executors run M of these (one per sequencer); the per-A reader buffers
-/// envelopes keyed by `BPosition` until the corresponding `TxRef` arrives
-/// on tx_ordering.
+/// Executors run M of these, one per sequencer. The per-A reader buffers
+/// envelopes keyed by `BPosition` until the matching `TxRef` arrives on
+/// tx_ordering.
 pub type TxDataSubscriber = TypedSubscriber<TxEnvelope>;
 
-/// TxOrdering: canonical orderer. Yields [`TxOrderingMessage`] records
-/// (`TxRef | BoundaryStart`). The `BPosition` handed to the callback is the
+/// TxOrdering: the canonical orderer. Yields [`TxOrderingMessage`] records
+/// (`TxRef | BoundaryStart`). The `BPosition` passed to the callback is the
 /// fragment's canonical L2 position (system invariant I1).
 pub type TxOrderingSubscriber = TypedSubscriber<TxOrderingMessage>;
 pub type TxReceiptsSubscriber = TypedSubscriber<Receipt>;
@@ -128,17 +128,17 @@ pub type TxDepositsSubscriber = TypedSubscriber<Deposit>;
 pub type WatermarkSubscriber = TypedSubscriber<FsyncWatermark>;
 pub type QuorumSubscriber = TypedSubscriber<QuorumWatermark>;
 
-/// Convenience bundle. Uses `Rc` (not `Arc`) because `AeronClient` is
-/// thread-confined (`!Send + !Sync`) and the entire subscriber stack lives
-/// on one Aeron-client thread by design.
+/// Convenience bundle. Uses `Rc`, not `Arc`, because `AeronClient` is
+/// thread-confined (`!Send + !Sync`). The design keeps the whole subscriber
+/// stack on one Aeron-client thread.
 pub struct Subscribers {
     pub aeron: Rc<AeronClient>,
     pub ch: ChannelsConfig,
 }
 
 impl Subscribers {
-    /// Open the tx_data subscription for sequencer `sequencer_id`. Run
-    /// M of these on each executor host to feed the per-A buffer.
+    /// Open the tx_data subscription for sequencer `sequencer_id`. Run M
+    /// of these on each executor host, to feed the per-A buffer.
     pub fn tx_data(&self, sequencer_id: u8) -> Result<TxDataSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,
@@ -187,8 +187,9 @@ impl Subscribers {
         )
     }
 
-    /// Subscribe to a sequencer-local tx_data fsync watermark stream
-    /// (one publisher per sequencer; see `fsync_watermark_tx_data_channel_template`).
+    /// Subscribe to a sequencer-local tx_data fsync watermark stream. There
+    /// is one publisher per sequencer; see
+    /// `fsync_watermark_tx_data_channel_template`.
     pub fn watermark_a(&self, sequencer_id: u8) -> Result<WatermarkSubscriber, LogError> {
         TypedSubscriber::open(
             &self.aeron,

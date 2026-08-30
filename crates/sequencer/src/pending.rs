@@ -1,21 +1,21 @@
 //! Per-sender future-nonce buffer.
 //!
-//! Bounded `BTreeMap<u64, T>` keyed by nonce. On overflow we keep the **lowest**
-//! `capacity` nonces and drop the furthest-future one.
+//! A bounded `BTreeMap<u64, T>`, keyed by nonce. On overflow, it keeps the
+//! lowest `capacity` nonces and drops the furthest-future one.
 //!
-//! Why lowest-wins matters: the buffer holds nonces *above* the sender's
-//! expected nonce, waiting to drain as a contiguous run once the gap fills. The
-//! lowest buffered nonces are the ones closest to `expected` and most likely to
-//! become drainable soon; the highest are furthest away. Evicting the *smallest*
-//! (the historical behaviour) punches a gap directly in front of the run, which
-//! wedges the sender **permanently** — every later nonce stays "future" forever,
-//! with no recovery path (2026-07-18 load-saturation campaign). Dropping the
-//! *furthest-future* nonce instead never breaks the low run: the dropped tx is a
-//! far-future nonce the client re-submits long before it is needed, so overflow
-//! degrades to transient shedding rather than a permanent wedge.
+//! Why lowest-wins matters: the buffer holds nonces above the sender's
+//! expected nonce, waiting to drain as a contiguous run once the gap fills.
+//! The lowest buffered nonces are closest to `expected`, and most likely to
+//! become drainable soon. The highest are furthest away. Evicting the
+//! smallest nonce (the old behavior) punches a gap directly in front of the
+//! run. This wedges the sender permanently: every later nonce stays
+//! "future" forever, with no recovery path. Dropping the furthest-future
+//! nonce instead never breaks the low run. The dropped transaction is a
+//! far-future nonce that the client resubmits long before it is needed. So
+//! overflow degrades to transient shedding, not a permanent wedge.
 //!
-//! `drain_consecutive_from(start)` walks ascending keys and yields the
-//! contiguous run starting at `start`; the first gap stops the drain.
+//! `drain_consecutive_from(start)` walks ascending keys, and yields the
+//! contiguous run that starts at `start`. The first gap stops the drain.
 
 use std::collections::BTreeMap;
 
@@ -23,14 +23,16 @@ use std::collections::BTreeMap;
 pub enum InsertOutcome {
     Inserted,
     Replaced,
-    /// Buffer was full; the furthest-future buffered nonce (`evicted_nonce`) was
-    /// dropped to make room for this lower nonce, preserving the drainable run.
+    /// The buffer was full. The furthest-future buffered nonce
+    /// (`evicted_nonce`) was dropped to make room for this lower nonce,
+    /// to keep the drainable run.
     EvictedFuture {
         evicted_nonce: u64,
     },
-    /// Buffer was full and this nonce was itself the furthest-future — rejected
-    /// rather than buffered, so the lower drainable run is preserved. The
-    /// client re-submits when this nonce comes back within the window.
+    /// The buffer was full, and this nonce was itself the furthest in the
+    /// future. It was rejected, not buffered, so the lower drainable run is
+    /// kept. The client resubmits when this nonce comes back within the
+    /// window.
     RejectedTooFar {
         nonce: u64,
     },
@@ -72,8 +74,8 @@ impl<T> PendingBuffer<T> {
         if self.capacity == 0 {
             return InsertOutcome::DroppedBufferDisabled;
         }
-        // We pre-compute these so the subsequent match arms don't need to
-        // re-borrow `self.inner` after taking an entry handle.
+        // Pre-compute these values. Then the match arms below do not need
+        // to re-borrow `self.inner` after taking an entry handle.
         let already_present = self.inner.contains_key(&nonce);
         let at_capacity = !already_present && self.inner.len() >= self.capacity;
         if already_present {
@@ -81,16 +83,17 @@ impl<T> PendingBuffer<T> {
             return InsertOutcome::Replaced;
         }
         if at_capacity {
-            // Full: keep the lowest `capacity` nonces (the drainable run). The
-            // furthest-future nonce is the loser — either an already-buffered
-            // max, or this incoming nonce if it is itself the new max.
+            // The buffer is full. Keep the lowest `capacity` nonces (the
+            // drainable run). The furthest-future nonce loses: either an
+            // already-buffered max, or this incoming nonce if it is the
+            // new max.
             let max = *self
                 .inner
                 .keys()
                 .next_back()
                 .expect("non-empty since len >= capacity >= 1");
             if nonce > max {
-                // Incoming is the furthest-future: reject it, keep the run.
+                // The incoming nonce is the furthest future. Reject it, and keep the run.
                 return InsertOutcome::RejectedTooFar { nonce };
             }
             self.inner.remove(&max);
@@ -101,24 +104,26 @@ impl<T> PendingBuffer<T> {
         InsertOutcome::Inserted
     }
 
-    /// Insert WITHOUT capacity enforcement (and regardless of a disabled,
-    /// capacity-0 buffer). Used ONLY by the backpressure rebuffer path
-    /// ([`crate::state::PartitionState::reinsert_for_retry`]): the items being
-    /// re-inserted were just drained OUT of this buffer (plus at most one
-    /// in-flight ingress item), so enforcing capacity here could evict the
-    /// lowest re-buffered nonce — permanently losing a ref whose nonce the
-    /// state machine already advanced past (exactly the data-loss class the
-    /// rebuffer exists to prevent). Any overshoot is transient and bounded by
-    /// one drained batch; the next successful flush drains it back out.
+    /// Insert without capacity enforcement, even for a disabled, capacity-0
+    /// buffer. Only the backpressure rebuffer path
+    /// ([`crate::state::PartitionState::reinsert_for_retry`]) uses this.
+    /// The items being re-inserted were just drained out of this buffer
+    /// (plus at most one in-flight ingress item). Enforcing capacity here
+    /// could evict the lowest rebuffered nonce, and permanently lose a ref
+    /// whose nonce the state machine already advanced past. That is exactly
+    /// the data loss the rebuffer exists to prevent. Any overshoot is
+    /// transient and bounded to one drained batch; the next successful
+    /// flush drains it back out.
     pub fn reinsert(&mut self, nonce: u64, value: T) {
         self.inner.insert(nonce, value);
     }
 
-    /// Drop every buffered entry with nonce `< floor`, returning how many were
-    /// dropped. Used by the receipt-floor advance
-    /// ([`crate::state::PartitionState::advance_floor`]): entries below an
-    /// executed-truth floor are proven duplicates of already-executed txs, so
-    /// dropping them can never create a canonical gap.
+    /// Drop every buffered entry with a nonce below `floor`. Returns how
+    /// many were dropped. The receipt-floor advance
+    /// ([`crate::state::PartitionState::advance_floor`]) uses this. Entries
+    /// below an executed-truth floor are proven duplicates of already
+    /// executed transactions, so dropping them can never create a
+    /// canonical gap.
     pub fn drop_below(&mut self, floor: u64) -> usize {
         let keep = self.inner.split_off(&floor);
         let dropped = self.inner.len();
@@ -177,8 +182,8 @@ mod tests {
 
     #[test]
     fn insert_full_incoming_furthest_is_rejected() {
-        // Buffer {10,11}; incoming 12 is the furthest-future → rejected, and the
-        // low run {10,11} is preserved intact.
+        // Buffer holds {10,11}. Incoming 12 is the furthest future value,
+        // so it is rejected. The low run {10,11} stays intact.
         let mut b: PendingBuffer<u32> = PendingBuffer::new(2);
         assert!(matches!(b.insert(10, 1), InsertOutcome::Inserted));
         assert!(matches!(b.insert(11, 2), InsertOutcome::Inserted));
@@ -194,8 +199,9 @@ mod tests {
 
     #[test]
     fn insert_full_incoming_lower_evicts_furthest() {
-        // Buffer {10,12}; incoming 11 is lower than the max (12) → drop 12, keep
-        // {10,11}. Lowest-wins tightens the drainable run toward `expected`.
+        // Buffer holds {10,12}. Incoming 11 is lower than the max (12), so
+        // drop 12 and keep {10,11}. Lowest-wins tightens the drainable run
+        // toward `expected`.
         let mut b: PendingBuffer<u32> = PendingBuffer::new(2);
         assert!(matches!(b.insert(10, 1), InsertOutcome::Inserted));
         assert!(matches!(b.insert(12, 2), InsertOutcome::Inserted));
@@ -211,18 +217,19 @@ mod tests {
 
     #[test]
     fn overflow_never_wedges_the_front_of_the_run() {
-        // The regression this whole change exists for. `expected` is 10; the
-        // sender floods far-future nonces past capacity. With lowest-wins the
-        // contiguous run 10..=13 is always retained, so when 10 arrives the full
-        // run drains — no permanent gap. (Old evict-oldest would have dropped 10
-        // first and stranded the sender forever.)
+        // This is the regression this whole change exists for. `expected` is
+        // 10. The sender floods far-future nonces past capacity. With
+        // lowest-wins, the contiguous run 10..=13 is always kept, so when 10
+        // arrives the full run drains, with no permanent gap. The old
+        // evict-oldest behavior would have dropped 10 first and stranded
+        // the sender forever.
         let cap = 4;
         let mut b: PendingBuffer<u32> = PendingBuffer::new(cap);
         // Buffer the run just above expected first...
         for n in 10..10 + cap as u64 {
             assert!(matches!(b.insert(n, n as u32), InsertOutcome::Inserted));
         }
-        // ...then flood higher nonces; every one is rejected, run untouched.
+        // Then flood higher nonces. Every one is rejected, and the run is untouched.
         for n in 100..120u64 {
             assert!(matches!(
                 b.insert(n, n as u32),

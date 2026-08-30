@@ -1,34 +1,36 @@
-//! S8 — `da_parity_batcher_matches_validator`.
+//! `da_parity_batcher_matches_validator`.
 //!
-//! "The batcher's state matches the validator's", proven the only way that
-//! statement is falsifiable: take what the live pipeline actually executed,
-//! post it to L1 as **real EIP-4844 blobs**, throw the originals away, then
-//! rebuild the chain from L1 data alone and require the resulting state root
-//! to equal the root the validator independently computed and attests to.
+//! This test proves "the batcher's state matches the validator's state" the
+//! only way that claim is falsifiable. It takes what the live pipeline
+//! actually executed, posts it to L1 as real EIP-4844 blobs, and throws away
+//! the originals. Then it rebuilds the chain from L1 data alone. The
+//! rebuilt state root must equal the root the validator computed on its own
+//! and attests to.
 //!
-//! Where the canonical order comes from: the pipeline's own **receipts**.
-//! Each carries `blockNumber` + `transactionIndex`, so the scenario recovers
-//! the real block grouping and intra-block order of the transactions it
-//! submitted — no re-implementation of the executor's reader, and nothing
-//! invented. (`kardamom-reconstruct`'s own inputs are then exactly what a
-//! recovery operator would have: L1 logs + blobs + genesis.)
+//! The canonical order comes from the pipeline's own receipts. Each receipt
+//! carries `blockNumber` and `transactionIndex`, so the scenario recovers
+//! the real block grouping and the in-block order of the transactions it
+//! submitted. It does not reimplement the executor's reader, and it does
+//! not invent any data. (This also means `kardamom-reconstruct`'s inputs
+//! are exactly what a recovery operator would have: L1 logs, blobs, and
+//! genesis.)
 //!
-//! Two honest limits, both inherent to today's code rather than to the test:
+//! Two known limits come from today's code, not from the test:
 //!
-//! - **Deposit-free by construction.** Deposits are deliberately absent from
-//!   the DA payload (the `kardamom-reconstruct` crate documents it), so a workload with
-//!   deposits could never reconstruct — the minted ETH would simply be
-//!   missing and every later balance would diverge. Lifting this needs a
-//!   protocol change, not test plumbing: see
+//! - Deposit-free by construction. The DA payload deliberately excludes
+//!   deposits (the `kardamom-reconstruct` crate documents this). So a
+//!   workload with deposits could never reconstruct: the minted ETH would
+//!   be missing, and every later balance would diverge. Fixing this needs a
+//!   protocol change, not test code. See
 //!   `docs/agents/l1-origin-deposit-derivation-spec.md`, which derives
-//!   deposits from an `l1_origin` carried per block. S8 extends to deposits
-//!   for free once that lands.
-//! - **`l2_timestamp` is synthesized.** The receipt does not expose the
-//!   block's timestamp and no RPC serves it, so the rebuilt blocks carry
-//!   monotonic placeholders. For the transfer-only workload here the
-//!   timestamp cannot affect state (no `TIMESTAMP` opcode is executed), so
-//!   root parity is unaffected — but a workload that reads the block
-//!   timestamp would need a real source first.
+//!   deposits from an `l1_origin` value carried per block. This scenario
+//!   will extend to deposits for free once that change lands.
+//! - `l2_timestamp` is a synthetic value. The receipt does not expose the
+//!   block's timestamp, and no RPC serves it. So the rebuilt blocks carry
+//!   placeholder values that only increase. For the transfer-only workload
+//!   here, the timestamp cannot affect state, because no `TIMESTAMP` opcode
+//!   runs. So root parity is not affected. A workload that reads the block
+//!   timestamp would need a real timestamp source first.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -68,8 +70,8 @@ struct Executed {
     transaction_index: u64,
 }
 
-/// Run the workload and recover, from the pipeline's own receipts, the
-/// canonical blocks it produced.
+/// Run the workload, then recover the canonical blocks it produced from
+/// the pipeline's own receipts.
 pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
     let signers = l2::dev_signers((p.sender_base + p.senders) as u32)?;
     let to = Address::from([0x88u8; 20]);
@@ -95,9 +97,9 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
             .map_err(|e| anyhow::anyhow!("sender {} nonce {}: {e}", tx.sender, tx.nonce))?;
     }
 
-    // Locate every transaction in the canonical chain. The receipt appears at
-    // execute time, so this needs no drain — but the values are the
-    // executor's own, not the test's guess.
+    // Locate every transaction in the canonical chain. The receipt appears
+    // when the transaction executes, so this needs no drain. The values
+    // come from the executor, not from a guess by the test.
     let mut executed = Vec::with_capacity(planned.len());
     for tx in planned {
         let receipt = await_l2_receipt(t, tx.hash, &format!("workload tx {}", tx.hash)).await?;
@@ -125,9 +127,9 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
         let recorded: Vec<RecordedTx> = txs
             .iter()
             .map(|e| RecordedTx {
-                // Positions do not reach the blob payload (only
-                // block/timestamp + per-tx bytes do), so the canonical index
-                // is a faithful stand-in here.
+                // The blob payload does not carry positions (only the
+                // block, timestamp, and per-tx bytes do). So the canonical
+                // index is a faithful stand-in here.
                 position: BPosition::from_index(e.transaction_index),
                 envelope: TxEnvelope {
                     correlation_id: e.transaction_index,
@@ -140,7 +142,7 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
         let end = recorded.len() as u64;
         blocks.push(ClosedBlock {
             block_number,
-            // Synthesized — see the module docs.
+            // This value is synthetic. See the module docs.
             l2_timestamp: 1_700_000_000 + block_number,
             end_tx_idx: BPosition::from_index(end),
             txs: recorded,
@@ -151,8 +153,8 @@ pub async fn run_workload(t: &Target, p: &Params) -> Result<Vec<ClosedBlock>> {
 }
 
 /// Post `blocks` to the settlement contract as real EIP-4844 blob
-/// transactions, one batch per block, and assert L1's compare-and-set batch
-/// indices advance densely.
+/// transactions, one batch per block. Check that L1's compare-and-set
+/// batch indices advance with no gaps.
 pub async fn post_to_l1(
     l1: &L1,
     settlement: Address,
@@ -182,12 +184,12 @@ pub async fn post_to_l1(
     Ok(())
 }
 
-/// Rebuild the chain from L1 alone and require the root to equal
-/// `expected_root` (the validator's live root).
+/// Rebuild the chain from L1 alone. Require the root to equal
+/// `expected_root`, the validator's live root.
 ///
-/// Runs the real `kardamom-reconstruct` binary rather than the library, so
-/// the operator-facing path — including its `--expect-root` gate, which had
-/// no caller anywhere before this scenario — is what gets exercised.
+/// This runs the real `kardamom-reconstruct` binary, not the library. This
+/// exercises the operator-facing path, including its `--expect-root` gate.
+/// No caller used that gate anywhere before this scenario.
 pub fn reconstruct_and_compare(
     l1_rpc: &str,
     settlement: Address,
@@ -221,10 +223,11 @@ pub fn reconstruct_and_compare(
         "kardamom-reconstruct produced no result line:\n{stdout}"
     );
 
-    // NON-VACUITY: a root comparison that passes proves nothing unless it can
-    // fail. Re-run against a deliberately wrong root and require the gate to
-    // reject it — otherwise a silently-disabled `--expect-root` (or a
-    // reconstruct that quietly produced no blocks) would look like success.
+    // Non-vacuity check: a passing root comparison proves nothing unless it
+    // can also fail. Run the check again against a wrong root, and require
+    // the gate to reject it. Otherwise, a disabled `--expect-root` gate, or
+    // a reconstruct that silently produced no blocks, would look like a
+    // pass.
     let mut wrong = expected_root.0;
     wrong[0] ^= 0xFF;
     let control_dir = state_dir.with_extension("control");
@@ -248,8 +251,8 @@ pub fn reconstruct_and_compare(
     Ok(())
 }
 
-/// Verify that the L1 log alone yields the batches just posted (what a
-/// recovery operator starts from).
+/// Verify that the L1 log alone yields the batches just posted. This is
+/// what a recovery operator starts from.
 pub async fn assert_batches_on_l1(
     l1: &L1,
     settlement: Address,
@@ -277,7 +280,7 @@ pub async fn assert_batches_on_l1(
             d.index
         );
     }
-    // And the blobs L1 committed to are fetchable + decodable.
+    // Check that the blobs L1 committed to can be fetched and decoded.
     let frames = recover_blocks(&descriptors, da_store).context("recover blocks from blobs")?;
     anyhow::ensure!(
         frames.len() == expected,

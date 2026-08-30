@@ -8,9 +8,9 @@ async fn batcher_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
     kardamom_obs::init("batcher", addr, "local", "test", "test").expect("init");
 
-    // Touch every counter the batcher crate is expected to publish so
-    // describe_counter calls don't require us to also drive the binary.
-    // Uses the crate's constants so a rename in metric_names fails here.
+    // Touch every counter the batcher crate is expected to publish. This
+    // way, describe_counter calls do not require running the binary too.
+    // Use the crate's constants, so a rename in metric_names fails here.
     use kardamom_batcher::batcher::metric_names;
     metrics::counter!(metric_names::BLOCKS_OBSERVED).increment(0);
     metrics::counter!(metric_names::BATCHES_POSTED).increment(0);

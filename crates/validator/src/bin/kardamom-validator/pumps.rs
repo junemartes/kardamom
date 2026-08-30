@@ -12,21 +12,21 @@ use kardamom_state::SnapshotReceiver;
 use kardamom_validator::attester::AttesterHandle;
 use kardamom_validator::{BalBuffer, ClaimBuffer, ReceiptBuffer, metrics};
 
-/// tx_bal: per-block BlockDelta (BAL). Simple (multicast/IPC) subscription,
-/// wrapped in a SILENCE WATCHDOG (#144): a multicast image that never
-/// joins (or silently dies) starves verification while everything else
-/// works — observed as `validator_blocks_verified_total == 0` for a whole
-/// run. Executors publish one BAL per committed block (empty blocks
-/// included), so 60s of silence on a progressing chain is a dead
-/// subscription, not an idle one: drop it and reopen. On a genuinely idle
-/// cluster the reopen is a harmless no-op churn.
+/// tx_bal: per-block BlockDelta (BAL). This is a simple multicast or IPC
+/// subscription, wrapped in a silence watchdog. A multicast image that
+/// never joins, or silently dies, starves verification while everything
+/// else works, which shows up as `validator_blocks_verified_total == 0`
+/// for a whole run. Executors publish one BAL per committed block,
+/// including empty blocks, so 60s of silence on a progressing chain
+/// means a dead subscription, not an idle one: drop it and reopen it. On
+/// a genuinely idle cluster, the reopen is harmless no-op churn.
 ///
-/// The pump holds an AeronRuntime clone (needed to reopen), which is the
-/// documented SIGTERM-deadlock trap (see the tx_receipts comment on
-/// [`spawn_receipts_pump`]): the runtime only shuts down when its last clone
-/// drops. Hence the 5s wake tick + the `stop` flag, set BEFORE the main path
-/// drops `rt`, so this task releases its clone within one tick and graceful
-/// shutdown completes.
+/// The pump holds an AeronRuntime clone, needed to reopen the
+/// subscription. This is the documented SIGTERM-deadlock trap (see the
+/// tx_receipts comment on [`spawn_receipts_pump`]): the runtime shuts
+/// down only when its last clone drops. Hence the 5s wake tick and the
+/// `stop` flag, set before the main path drops `rt`, so this task
+/// releases its clone within one tick and graceful shutdown completes.
 pub fn spawn_bal_pump(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
@@ -36,10 +36,9 @@ pub fn spawn_bal_pump(
 ) -> Result<()> {
     const BAL_TICK: Duration = Duration::from_secs(5);
     const BAL_SILENCE_REOPEN: Duration = Duration::from_secs(60);
-    // BalFrame (spec: bal-attribution-parallel-validation): the merged
-    // delta plus the EIP-7928 access list; the write-set cross-check
-    // consumes the merged section, attribution drives the parallel
-    // engine.
+    // BalFrame is the merged delta plus the EIP-7928 access list. The
+    // write-set check uses the
+    // merged section; attribution drives the parallel engine.
     let mut bal_rx = rt
         .open_subscription::<kardamom_types::BalFrame>(
             &channels.tx_bal_channel,
@@ -53,14 +52,14 @@ pub fn spawn_bal_pump(
         let mut silent_for = Duration::ZERO;
         loop {
             if stop.load(std::sync::atomic::Ordering::SeqCst) {
-                return; // release the runtime clone promptly on shutdown
+                return; // Release the runtime clone promptly on shutdown.
             }
             let frame = match tokio::time::timeout(BAL_TICK, bal_rx.recv()).await {
                 Ok(Some((_pos, frame))) => {
                     silent_for = Duration::ZERO;
                     frame
                 }
-                Ok(None) => return, // runtime shutting down
+                Ok(None) => return, // The runtime is shutting down.
                 Err(_) => {
                     silent_for += BAL_TICK;
                     if silent_for >= BAL_SILENCE_REOPEN {
@@ -92,19 +91,19 @@ pub fn spawn_bal_pump(
                     delta,
                 } = &frame;
                 // Decode the access list into seed-lookup form for the
-                // parallel engine. A decode failure degrades to
-                // sequential re-execution (the merged cross-check below
-                // is unaffected), never to a verification gap.
+                // parallel engine. A decode failure falls back to
+                // sequential re-execution (the merged check below is
+                // unaffected), never to a verification gap.
                 let mut slice: &[u8] = bal_rlp;
                 match <alloy_eip7928::BlockAccessList as alloy_rlp::Decodable>::decode(&mut slice) {
-                    // Empty lists are skipped: empty blocks never take
-                    // claims (the parallel path short-circuits before
-                    // its take), so inserting them would grow the
-                    // buffer for the whole idle period — the cursor
-                    // only advances on takes. Quantized frames carry
-                    // their granularity so verification coarsens to
-                    // the chunk with batches aligned to it — the
-                    // validator's ladder view always follows the wire.
+                    // Skip empty lists: empty blocks never take claims,
+                    // since the parallel path short-circuits before its
+                    // take, so inserting them would grow the buffer for
+                    // the whole idle period. The cursor advances only on
+                    // takes. Quantized frames carry their granularity,
+                    // so verification coarsens to the chunk, with
+                    // batches aligned to it. The validator's ladder view
+                    // always follows the wire.
                     Ok(bal) if !bal.is_empty() => {
                         claims.insert(
                             delta.block_number,
@@ -129,17 +128,16 @@ pub fn spawn_bal_pump(
 
 /// tx_receipts: the executor's published receipts (MDS fan-in in the cluster).
 ///
-/// `into_receiver()` is load-bearing for shutdown: the handle carries an
-/// `AeronRuntime` clone (for MDS destination churn), and moving that clone
-/// into this pump task would deadlock process exit — the runtime shuts
-/// down only when its last clone drops, that shutdown is what ends
-/// `recv()`, and this task would be holding the clone that prevents it.
-/// The symptom was a validator that ignored SIGTERM entirely (`drop(rt)`
-/// became a no-op, so the engine's tx_data subscriptions never closed and
-/// the join below never returned) while the executor — which publishes
-/// receipts rather than subscribing — shut down fine. MDS destinations are
-/// attached inside `open_tx_receipts`, so nothing needs the clone after
-/// this point.
+/// Keep the `into_receiver()` call: it matters for shutdown. The handle
+/// carries an `AeronRuntime` clone, for MDS destination churn, and moving
+/// that clone into this pump task would deadlock process exit. The
+/// runtime shuts down only when its last clone drops, that shutdown is
+/// what ends `recv()`, and this task would hold the clone that blocks it.
+/// Without this, the validator would ignore SIGTERM entirely, since
+/// `drop(rt)` would become a no-op, leaving the engine's tx_data
+/// subscriptions open and the join below never returning. MDS
+/// destinations attach inside `open_tx_receipts`, so nothing needs the
+/// clone after this point.
 pub fn spawn_receipts_pump(
     rt: &AeronRuntime,
     channels: &ChannelsConfig,
@@ -158,11 +156,11 @@ pub fn spawn_receipts_pump(
     Ok(())
 }
 
-/// Background poller: expose committed-block + state-root height as
-/// metrics, and feed each block's observed MPT root to the attester.
+/// Background poller: expose the committed-block and state-root height
+/// as metrics, and feed each block's observed MPT root to the attester.
 /// `validator_state_root_block` is set only when the committed snapshot
-/// actually yielded a root — an independent measurement, not a mirror of
-/// the committed-block gauge.
+/// actually yielded a root. This is an independent measurement, not a
+/// mirror of the committed-block gauge.
 pub fn spawn_commit_poller(snap_rx: SnapshotReceiver, attester_handle: Option<AttesterHandle>) {
     tokio::spawn(async move {
         let mut last = 0u64;

@@ -1,9 +1,10 @@
 //! Sender-to-partition routing.
 //!
-//! Algorithm must match `kardamom_ingress::routing::partition_for` exactly:
-//! take the first 8 bytes of `keccak256(sender.as_slice())` as a big-endian
-//! `u64`, then `% m`. The proxy routes by this rule; the sequencer must agree
-//! byte-for-byte or messages land on the wrong partition.
+//! This algorithm must match `kardamom_ingress::routing::partition_for`
+//! exactly. Take the first 8 bytes of `keccak256(sender.as_slice())` as a
+//! big-endian `u64`, then compute `% m`. The proxy routes by this rule. The
+//! sequencer must agree byte-for-byte, or messages go to the wrong
+//! partition.
 
 use alloy_primitives::{Address, keccak256};
 
@@ -39,8 +40,8 @@ mod tests {
 
     #[test]
     fn matches_proxy_routing_byte_for_byte() {
-        // The proxy uses keccak256(sender)[..8] as big-endian u64 modulo m.
-        // We reproduce one concrete vector to lock this in.
+        // The proxy uses keccak256(sender)[..8] as a big-endian u64, modulo m.
+        // This test reproduces one concrete vector to lock in that behavior.
         let a = address!("00000000000000000000000000000000DeadBeef");
         let h = alloy_primitives::keccak256(a.as_slice());
         let expected = u64::from_be_bytes(h[..8].try_into().unwrap()) % 8;

@@ -1,9 +1,9 @@
-//! `kardamom-bench` — closed-loop RPC load generator.
+//! `kardamom-bench` is a closed-loop RPC load generator.
 //!
-//! Each subcommand picks one of the three built-in workflows
-//! (`transfers`, `calls`, `mixed`), each constructed via `Default` with
-//! hardcoded sensible values. External users skip this binary and build a
-//! `Benchmark<MyWorkflow>` directly.
+//! Each subcommand picks one of the three built-in workflows:
+//! `transfers`, `calls`, or `mixed`. Each workflow is built with
+//! `Default`, using fixed, sensible values. An external user skips this
+//! binary and builds a `Benchmark<MyWorkflow>` directly.
 
 use std::path::Path;
 use std::time::Duration;
@@ -28,21 +28,23 @@ struct Args {
     #[arg(long)]
     rpc: String,
 
-    /// Safety timeout applied to each phase (warmup and dispatch get one
-    /// each). Senders also stop when their work vec is drained, whichever
-    /// comes first.
+    /// A safety timeout for each phase. Warmup and dispatch each get
+    /// their own timeout. A sender also stops when its work vector is
+    /// drained, whichever comes first.
     #[arg(long, value_parser = humantime::parse_duration, default_value = DEFAULT_TIMEOUT_STR)]
     timeout: Duration,
 
-    /// Number of sender tasks (= number of derived signers, one per task).
+    /// The number of sender tasks. This equals the number of derived
+    /// signers, one per task.
     #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
     concurrency: u32,
 
-    /// Pre-signed transactions queued per sender task.
+    /// The number of pre-signed transactions in the queue of each
+    /// sender task.
     #[arg(long = "txs-per-task", default_value_t = DEFAULT_TXS_PER_TASK)]
     txs_per_task: u32,
 
-    /// Cap on outstanding requests per sender task.
+    /// The limit on outstanding requests for each sender task.
     #[arg(long = "max-in-flight", default_value_t = DEFAULT_MAX_IN_FLIGHT)]
     max_in_flight: u32,
 
@@ -104,8 +106,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn bench_with<W: BenchWorkflow>(workflow: W, args: &Args) -> Benchmark<W> {
-    // Plain field copy — kept as a regular fn rather than `const` because
-    // `Benchmark::workflow` is generic and may carry non-`const` data.
+    // This is a plain field copy. It stays a regular function, not a
+    // `const` function, because `Benchmark::workflow` is generic and can
+    // carry non-const data.
     Benchmark {
         workflow,
         timeout: args.timeout,

@@ -1,8 +1,8 @@
-//! Driver-level tests for the receipt-floor resync filter
-//! (docs/agents/sequencer-lag-resync-spec.md): skips happen ONLY with
-//! receipt proof and only in resync mode; everything unproven publishes
-//! (sole-survivor safety); receipt floors unstick a cold-rejoined replica's
-//! buffered run without ever publishing a canonical gap.
+//! Driver-level tests for the receipt-floor resync filter (see
+//! docs/agents/sequencer-lag-resync-spec.md). A skip happens only with
+//! receipt proof, and only in resync mode. Everything unproven publishes
+//! (sole-survivor safety). Receipt floors unstick a cold-rejoined
+//! replica's buffered run, without ever publishing a canonical gap.
 
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -65,9 +65,9 @@ fn pos(offset: i32) -> BPosition {
     }
 }
 
-/// A sequencer with resync enabled; returns the floor-update sender. The
-/// controller starts in resync mode (startup trigger), which is exactly the
-/// state these tests exercise.
+/// A sequencer with resync enabled. Returns the floor-update sender.
+/// The controller starts in resync mode (the startup trigger), which is
+/// exactly the state these tests exercise.
 type ResyncTestRig = (
     Sequencer,
     std::sync::mpsc::Sender<FloorUpdate>,
@@ -100,14 +100,14 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
     let mut rc = InMemoryTxErrorPublisher::default();
     let (mut seq, floor_tx) = resync_sequencer();
 
-    // A receipt for nonce 1 exists (twin covered it) → floor 2. (Nonce-0
-    // receipts are never evidence — deposit-indistinguishable — so the
-    // scenario starts at nonce 1.) The floor advances the state machine
-    // BEFORE the stale envelope is processed, so the envelope lands on the
-    // `Past` path — but as a receipt-PROVEN skip: no publish, and NO
-    // DuplicatedTx notice (the tx executed; reporting it as a duplicate to
-    // ingress would be spurious — and growing dropped_past here broke the
-    // load harness's seq_clean verdict).
+    // A receipt for nonce 1 exists (the twin covered it), so the floor
+    // advances to 2. (Nonce-0 receipts are never evidence, since they
+    // cannot be told apart from deposits, so this scenario starts at
+    // nonce 1.) The floor advances the state machine before the stale
+    // envelope is processed, so the envelope lands on the `Past` path,
+    // but as a receipt-proven skip: no publish, and no DuplicatedTx
+    // notice. The transaction executed, so reporting it as a duplicate
+    // to ingress would be spurious.
     floor_tx
         .send(FloorUpdate {
             deposit: false,
@@ -131,8 +131,9 @@ fn receipt_proven_nonce_is_skipped_unproven_published() {
 
 #[test]
 fn sole_survivor_publishes_everything() {
-    // Twin dead ⇒ no receipts ⇒ no floors: resync mode must publish the
-    // FULL backlog — no accepted tx is ever dropped on inference.
+    // The twin is dead, so there are no receipts and no floors. Resync
+    // mode must publish the full backlog. No accepted transaction is ever
+    // dropped on inference.
     let s = signer(2);
     let mut channel_a = ScriptedTxData::default();
     for n in 0..3u64 {
@@ -153,10 +154,10 @@ fn sole_survivor_publishes_everything() {
 
 #[test]
 fn receipt_floor_unsticks_cold_rejoin_buffer() {
-    // F02.1 partial closure: a cold-restarted replica (floors hydrate at 0)
-    // sees only live traffic at nonces 5,6 — twin ordered 0..=4 before the
-    // restart, so the buffered run can never become contiguous from 0. A
-    // receipt for nonce 4 advances the floor to 5 and the run drains.
+    // A cold-restarted replica (floors hydrate at 0) sees only live
+    // traffic at nonces 5,6. The twin ordered 0..=4 before the restart, so
+    // the buffered run can never become contiguous from 0. A receipt for
+    // nonce 4 advances the floor to 5, and the run drains.
     let s = signer(3);
     let mut channel_a = ScriptedTxData::default();
     channel_a
@@ -174,7 +175,7 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     assert!(b.refs.lock().unwrap().is_empty(), "stuck behind the gap");
 
-    // Execution evidence arrives: nonce 4 receipted → floor 5.
+    // Execution evidence arrives. Nonce 4 is receipted, so the floor becomes 5.
     floor_tx
         .send(FloorUpdate {
             deposit: false,
@@ -184,17 +185,17 @@ fn receipt_floor_unsticks_cold_rejoin_buffer() {
         })
         .unwrap();
 
-    // Next iteration: floor advances the state machine, the buffered run
-    // 5,6 becomes contiguous and publishes. Floor 5 does NOT prove 5/6
-    // executed, so the resync filter lets them through.
+    // On the next iteration, the floor advances the state machine. The
+    // buffered run 5,6 becomes contiguous and publishes. Floor 5 does not
+    // prove that 5 and 6 executed, so the resync filter lets them through.
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     let refs = b.refs.lock().unwrap();
     assert_eq!(refs.len(), 2, "buffered run drained after floor advance");
 }
 
-/// #85: an `Accepted` offer is NOT a commit — published refs stay in the
-/// unconfirmed ledger and are rewound + re-published when no receipt
-/// confirms them within the timeout; a receipt at/above the nonce
+/// An `Accepted` offer is not a commit. Published refs stay in the
+/// unconfirmed ledger, and are rewound and republished when no receipt
+/// confirms them within the timeout. A receipt at or above the nonce
 /// (cumulative per sender) retires them permanently.
 #[test]
 fn unconfirmed_refs_republish_until_receipt_confirms() {
@@ -210,12 +211,13 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     let mut rc = InMemoryTxErrorPublisher::default();
     let (mut seq, floor_tx) = resync_sequencer();
 
-    // Publish both refs at the default (15s) timeout — no republish churn.
+    // Publish both refs at the default 15 second timeout. No republish churn.
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     assert_eq!(b.refs.lock().unwrap().len(), 2);
 
-    // Confirm nonce 1: cumulative per sender, retires BOTH (0 and 1).
+    // Confirm nonce 1. This is cumulative per sender, and retires both
+    // (0 and 1).
     floor_tx
         .send(FloorUpdate {
             deposit: false,
@@ -226,7 +228,7 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
         .unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
 
-    // Timeout 0: were anything still unconfirmed it would republish NOW.
+    // With timeout 0, anything still unconfirmed would republish now.
     seq.set_confirm_timeout_ms(0);
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     assert_eq!(
@@ -235,8 +237,9 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
         "confirmed refs must never re-publish"
     );
 
-    // A third, never-confirmed ref: with timeout 0 every iteration rewinds
-    // and re-publishes it — offer-is-not-commit made recoverable.
+    // A third, never-confirmed ref. With timeout 0, every iteration
+    // rewinds and republishes it. This is the offer-is-not-commit
+    // guarantee made recoverable.
     channel_a
         .queue
         .push_back((TxDataLoc::new(0, pos(128)), signed_tx_envelope(&s, 2, 42)));
@@ -260,12 +263,12 @@ fn unconfirmed_refs_republish_until_receipt_confirms() {
     assert_eq!(b.refs.lock().unwrap().len(), stable);
 }
 
-/// #85 fix B: a contiguity reject with `nonce < expected` proves the ref
-/// already committed (the sealer's per-sender expected nonce is past it) —
-/// the unconfirmed entry is dropped like a receipt confirmation. Without the
-/// drop, a ref with no confirming receipt (nonce-0: deposit-indistinguishable
-/// receipts never confirm) republishes every confirm-timeout FOREVER once
-/// its dedup entry ages out (observed live: smoke-gate accounts).
+/// A contiguity reject with a nonce below expected proves the ref
+/// already committed (the sealer's per-sender expected nonce is past it).
+/// The unconfirmed entry is dropped, like a receipt confirmation. Without
+/// the drop, a ref with no confirming receipt (nonce-0 receipts cannot be
+/// told apart from deposits, so they never confirm) would republish on
+/// every confirm timeout forever, once its dedup entry ages out.
 #[test]
 fn committed_proof_reject_retires_unconfirmed_entry() {
     let s = signer(5);
@@ -277,9 +280,10 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
     let mut rc = InMemoryTxErrorPublisher::default();
     let (mut seq, _floor_tx, reject_tx) = resync_sequencer_with_rejects();
 
-    // Publish the sender's ONLY tx (nonce 0). No receipt will ever confirm
-    // it (nonce-0 receipts are excluded), so with timeout 0 it republishes
-    // on every iteration — the infinite loop this fix closes.
+    // Publish the sender's only transaction (nonce 0). No receipt will
+    // ever confirm it, since nonce-0 receipts are excluded. So with
+    // timeout 0 it republishes on every iteration: the infinite loop
+    // this fix closes.
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     assert_eq!(b.refs.lock().unwrap().len(), 1);
     seq.set_confirm_timeout_ms(0);
@@ -290,7 +294,7 @@ fn committed_proof_reject_retires_unconfirmed_entry() {
     );
 
     // The sealer answers a republish with a committed-proof reject
-    // (nonce 0 < expected 1): the entry retires permanently.
+    // (nonce 0 below expected 1). The entry retires permanently.
     reject_tx.send((s.address(), 0, 1)).unwrap();
     seq.run_once(&mut channel_a, &mut b, &mut rc).unwrap();
     let stable = b.refs.lock().unwrap().len();

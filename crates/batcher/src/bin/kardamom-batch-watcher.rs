@@ -1,12 +1,13 @@
-//! `kardamom-batch-watcher`: the honest challenger (spec: PR 5). Compares
-//! pending optimistic claims against the validator's prover spool and, on
-//! divergence, submits `challengeBlock` at the FIRST divergent offset with
-//! the single-block proof files the prover produced (`zk-host --prove` on
-//! the spooled frame).
+//! `kardamom-batch-watcher`: the honest challenger. It compares pending
+//! optimistic claims against the validator's prover spool. On divergence,
+//! it submits `challengeBlock` at the first divergent offset, with the
+//! single-block proof files the prover made (`zk-host --prove` on the
+//! spooled frame).
 //!
-//! Thin driver over [`kardamom_batcher::watch_and_challenge`]. This is the
-//! liveness assumption of the optimistic mode made concrete: at least one
-//! honest watcher runs. Slashing pays it, so the assumption is incentivized.
+//! A thin driver over [`kardamom_batcher::watch_and_challenge`]. This makes
+//! the optimistic mode's liveness assumption concrete: at least one honest
+//! watcher runs. Slashing pays that watcher, so the assumption has an
+//! incentive behind it.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -27,8 +28,8 @@ struct Args {
     private_key: String,
     #[arg(long, env = "KARDAMOM_PROOF_ORACLE")]
     oracle: Address,
-    /// The validator's prover spool: the ground truth roots are compared
-    /// from here, and single-block proof files are read from here.
+    /// The validator's prover spool. The ground-truth roots come from here,
+    /// and single-block proof files are read from here.
     #[arg(long, env = "KARDAMOM_SPOOL_DIR")]
     spool_dir: PathBuf,
     #[arg(long, default_value_t = 15)]

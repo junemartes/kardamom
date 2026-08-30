@@ -1,7 +1,7 @@
-//! Routing invariant: every tx submitted by sender S lands on partition
-//! `keccak(S) % M`, regardless of M. Verified end-to-end through the
-//! proxy with a fake executor that immediately satisfies receipt +
-//! watermark per arrival.
+//! Routing invariant. Every tx from sender S lands on partition
+//! `keccak(S) % M`, for any M. The test checks this end to end through
+//! the proxy, with a fake executor that sends a receipt and watermark
+//! update for each tx right away.
 
 mod common;
 
@@ -27,12 +27,13 @@ async fn each_tx_lands_on_keccak_partition() {
         let (mock, mut rx_vec) = MockChannels::new(m as usize);
         let proxy = Arc::new(IngressProxy::new(cfg, mock.clone(), mock.clone()));
 
-        // Fake executor — one task per partition, satisfies receipt +
-        // watermark immediately.
-        // One shared monotone position space across partitions — receipts
+        // Fake executor: one task per partition, sends a receipt and
+        // watermark update right away.
+        // All partitions share one increasing position space. Receipts
         // carry positions from the sealer's single tx_ordering stream. See
-        // the same note in end_to_end_test.rs: per-partition `term_id`s let
-        // the quorum watermark regress and strand parked receipts.
+        // the same note in end_to_end_test.rs: a per-partition `term_id`
+        // would let the quorum watermark go backward and strand parked
+        // receipts.
         let next_pos = Arc::new(std::sync::atomic::AtomicI32::new(0));
         let mut spawns = Vec::new();
         for mut rx in rx_vec.drain(..) {
@@ -63,10 +64,10 @@ async fn each_tx_lands_on_keccak_partition() {
             }));
         }
 
-        // 32 senders. The proxy's `partition_for` is the same function the
-        // proxy uses; the invariant is that the publication landed there.
-        // If routing were wrong, the executor for that partition would
-        // never see the message and the proxy would time out.
+        // This test uses 32 senders. It checks that each tx lands on the
+        // partition given by `partition_for`, the same function the proxy
+        // uses. If routing were wrong, the executor for that partition
+        // would never see the message, and the proxy would time out.
         let mut futs = Vec::new();
         for _ in 0..32 {
             let s = PrivateKeySigner::random();
@@ -91,9 +92,9 @@ async fn each_tx_lands_on_keccak_partition() {
     }
 }
 
-/// Decode just the `nonce` field out of an RLP-encoded legacy tx so the
-/// fake executor can fill in the `Receipt.nonce` field that the proxy uses
-/// to look up its pending entry.
+/// Decodes only the `nonce` field from an RLP-encoded legacy tx. The fake
+/// executor uses this to fill in the `Receipt.nonce` field, which the
+/// proxy uses to look up its pending entry.
 fn extract_nonce(raw: &bytes::Bytes) -> u64 {
     use alloy_consensus::TxEnvelope;
     use alloy_consensus::transaction::Transaction;

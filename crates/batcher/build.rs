@@ -1,12 +1,11 @@
-//! `rerun-if-changed` triggers for the forge artifact this crate's `sol!`
-//! macro loads.
+//! Sets `rerun-if-changed` triggers for the forge artifact used by this
+//! crate's `sol!` macro.
 //!
-//! The actual `forge build` is performed by `kardamom-deployer`'s build.rs,
-//! which this crate depends on (in `[dependencies]`) so cargo guarantees
-//! kardamom-deployer's build script has populated `contracts/out/` before
-//! our lib is compiled. We do not run forge here to avoid the parallel
-//! `forge install` race that would otherwise occur between sibling
-//! build scripts.
+//! `kardamom-deployer`'s build.rs runs the actual `forge build`. This crate
+//! depends on `kardamom-deployer`, so cargo builds it first and populates
+//! `contracts/out/` before this crate compiles. Do not run forge here. It
+//! would race with the parallel `forge install` step in the other build
+//! script.
 
 use std::path::{Path, PathBuf};
 

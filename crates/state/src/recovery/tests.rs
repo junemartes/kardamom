@@ -7,9 +7,10 @@ use crate::schema::{
 use alloy_primitives::{Address, B256, U256};
 use signet_libmdbx::WriteFlags;
 
-/// Adoption drill (#143): a plain trie-off state image (what an executor
-/// checkpoint restores to) bootstraps a mirror + trie whose root matches
-/// the pure full-rebuild oracle, and the probe flips accordingly.
+/// An adoption drill: a plain trie-off state image, which is what an
+/// executor checkpoint restores to, bootstraps a mirror and trie. The
+/// resulting root matches the pure full-rebuild oracle, and the trie
+/// probe flips accordingly.
 #[test]
 fn bootstrap_builds_trie_matching_oracle_on_trie_off_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -20,8 +21,8 @@ fn bootstrap_builds_trie_matching_oracle_on_trie_off_state() {
     let slot = B256::repeat_byte(0x03);
     let slot_val = U256::from(7u64);
 
-    // Write plain state the way a trie-off writer leaves it: accounts +
-    // storage tables only, no hashed mirror, no trie nodes.
+    // Write plain state the way a trie-off writer leaves it: only the
+    // accounts and storage tables, with no hashed mirror and no trie nodes.
     {
         let txn = env.raw().begin_rw_sync().unwrap();
         let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS)).unwrap();
@@ -59,8 +60,8 @@ fn bootstrap_builds_trie_matching_oracle_on_trie_off_state() {
     );
     assert_ne!(root, crate::trie::empty_root());
 
-    // Oracle: pure full rebuild over the same accounts, with B's storage
-    // root computed from its one slot.
+    // Oracle: a pure full rebuild over the same accounts. B's storage
+    // root is computed from its one slot.
     let storage_root = crate::trie::storage_root([(slot, slot_val)]);
     let want = crate::trie::state_root([
         (
@@ -84,17 +85,18 @@ fn bootstrap_builds_trie_matching_oracle_on_trie_off_state() {
     ]);
     assert_eq!(root, want, "bootstrap root must equal the rebuild oracle");
 
-    // Idempotent: re-running lands on the same root.
+    // This function is idempotent: running it again lands on the same root.
     assert_eq!(bootstrap_trie_from_state(&env).unwrap(), root);
 }
 
-/// The REAL adopted-executor-checkpoint shape (validator-join chaos case
-/// finding): every env carries the GENESIS-seeded mirror + trie (built by
-/// seed_genesis, then never updated by a trie-off writer), so an adopted
-/// image has a stale-at-genesis mirror under newer plain state. The
-/// bootstrap must converge that to the oracle root of the CURRENT state —
-/// and a presence probe alone would wrongly skip it (which is why
-/// adoption is marker-signaled, not probed).
+/// This test reflects the real shape of an adopted executor checkpoint.
+/// Every env carries the genesis-seeded mirror and trie, built by
+/// `seed_genesis` and never updated by a trie-off writer. So an adopted
+/// image has a mirror that is stale at genesis, under newer plain state.
+///
+/// Bootstrap must converge that mirror to the oracle root of the current
+/// state. A presence probe alone would wrongly skip this case. This is
+/// why adoption is signaled by a marker, not by a presence probe.
 #[test]
 fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
     let dir = tempfile::tempdir().unwrap();
@@ -102,7 +104,8 @@ fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
     let addr_a = Address::repeat_byte(0x11);
     let addr_b = Address::repeat_byte(0x22);
 
-    // Genesis: A exists with nonce 0 / balance 1000. Seeds mirror + trie.
+    // Genesis: A exists with nonce 0 and balance 1000. This seeds the
+    // mirror and trie.
     let genesis = [kardamom_types::AccountChange {
         address: addr_a,
         nonce: 0,
@@ -112,8 +115,8 @@ fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
     assert!(crate::genesis::seed_genesis(&env, &genesis, &[]).unwrap());
     assert!(has_trie(&env).unwrap(), "genesis seed builds the mirror");
 
-    // Trie-off progress (what an executor does): A changes, B appears —
-    // plain tables only, mirror left frozen at genesis.
+    // Trie-off progress, what an executor does: A changes, and B appears.
+    // Only the plain tables change; the mirror stays frozen at genesis.
     {
         let txn = env.raw().begin_rw_sync().unwrap();
         let accounts_db = txn.open_db(Some(TABLE_ACCOUNTS)).unwrap();
@@ -134,7 +137,8 @@ fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
         }
         txn.commit().unwrap();
     }
-    // The trap: the probe still says "trie present" (it is — stale).
+    // The trap: the probe still reports the trie as present. It is
+    // present, but stale.
     assert!(has_trie(&env).unwrap());
 
     let root = bootstrap_trie_from_state(&env).unwrap();
@@ -164,11 +168,12 @@ fn bootstrap_corrects_genesis_stale_mirror_under_newer_state() {
     );
 }
 
-/// The join must not just adopt — VERIFIED execution continues on top of
-/// the bootstrapped trie. After bootstrap, applying the next block
-/// INCREMENTALLY must land on the same root as a pure full rebuild over
-/// the merged state (the property the validator's post-adoption
-/// verification rides on).
+/// Joining must do more than adopt the trie. Verified execution
+/// continues on top of the bootstrapped trie.
+///
+/// After bootstrap, applying the next block incrementally must land on
+/// the same root as a pure full rebuild over the merged state. The
+/// validator's post-adoption verification depends on this property.
 #[test]
 fn incremental_block_on_bootstrapped_trie_matches_oracle() {
     let dir = tempfile::tempdir().unwrap();
@@ -196,7 +201,7 @@ fn incremental_block_on_bootstrapped_trie_matches_oracle() {
     }
     bootstrap_trie_from_state(&env).unwrap();
 
-    // "Next block": A bumps its nonce, C appears.
+    // The next block: A's nonce increases, and C appears.
     let delta = kardamom_types::BlockDelta {
         block_number: 1,
         accounts: vec![

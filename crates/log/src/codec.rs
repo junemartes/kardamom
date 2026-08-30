@@ -1,12 +1,12 @@
 //! rkyv zero-copy access helpers.
 //!
-//! The hot path reads `Archived<T>` views straight out of Aeron fragment
-//! buffers — no allocation, no decode pass. Convert to an owned `T` only when
-//! the caller explicitly asks (`materialize`), e.g. when they need to outlive
-//! the fragment buffer.
+//! The hot path reads `Archived<T>` views straight from Aeron fragment
+//! buffers, with no allocation and no decode pass. Convert to an owned `T`
+//! only when the caller asks for it (`materialize`), for example when the
+//! value must outlive the fragment buffer.
 //!
-//! Per: rkyv v0.8 replaces the earlier bincode choice. Wire types live
-//! in `kardamom-types`; this crate is transport only.
+//! This crate uses rkyv v0.8, not the earlier bincode choice. Wire types
+//! live in `kardamom-types`; this crate is transport only.
 
 use rkyv::api::high::{HighDeserializer, HighSerializer, HighValidator};
 use rkyv::rancor;
@@ -54,9 +54,9 @@ mod tests {
     use alloy_primitives::{Address, B256, U256};
     use kardamom_types::{AccountChange, BlockDelta, CodeEntry, StorageChange};
 
-    /// The BAL payload (`BlockDelta`) must survive an encode → materialize
-    /// round-trip unchanged — this is what the executor publishes on tx_bal and
-    /// the validator decodes to cross-check its re-execution.
+    /// The BAL payload (`BlockDelta`) must survive an encode-materialize
+    /// round trip unchanged. The executor publishes this on tx_bal, and the
+    /// validator decodes it to cross-check its re-execution.
     #[test]
     fn block_delta_bal_roundtrips() {
         let delta = BlockDelta {

@@ -1,25 +1,26 @@
-//! Feature flags and the **block-close protocol actions** they gate.
+//! Feature flags, and the block-close protocol actions they gate.
 //!
 //! A feature flag lives in the `KardamomChainState` predeploy
-//! ([`kardamom_types::upgrades::CHAIN_STATE`]) as
-//! `featureId => activation timestamp (ms)`, written only by a system deposit
-//! derived from an L1 upgrade transaction. The protocol reads the flag at
-//! every block boundary and acts on it.
+//! ([`kardamom_types::upgrades::CHAIN_STATE`]), as
+//! `featureId => activation timestamp (ms)`. Only a system deposit, derived
+//! from an L1 upgrade transaction, writes it. The protocol reads the flag at
+//! every block boundary, and acts on it.
 //!
-//! Everything here is pure: given the same stored activation word and the same
-//! block header fields, every role computes the same actions. That is what
-//! makes an upgrade activate at *the same block* on every node instead of
+//! Every function here is pure. Given the same stored activation word and
+//! the same block header fields, every role computes the same actions. This
+//! makes an upgrade activate at the same block on every node, instead of
 //! whenever each operator restarts a binary.
 //!
 //! ## Why this lives in `exec-core`
 //!
-//! There is more than one block driver in this workspace — the live engine's
-//! exec thread, the validator's parallel path (which funnels back through the
+//! This workspace has more than one block driver: the live engine's exec
+//! thread, the validator's parallel path (which funnels back through the
 //! engine's boundary), the offline replay driver, and the stateless/zk guest
-//! shape. A block-close action implemented in only some of them is a consensus
-//! divergence. [`apply_block_close_actions`] is therefore the single
-//! implementation, parameterised only by how the caller reads state, so a
-//! driver adopts it in one line and cannot get the semantics subtly different.
+//! shape. A block-close action implemented in only some of them causes a
+//! consensus divergence. [`apply_block_close_actions`] is the single
+//! implementation for all drivers. It takes only a state-read function as a
+//! parameter, so a driver adopts it in one line and cannot get the
+//! semantics subtly wrong.
 //!
 //! See `docs/specs/2026-08-16-l1-upgrade-feature-flags-design.md`.
 
@@ -28,50 +29,51 @@ use kardamom_types::upgrades::CHAIN_STATE;
 
 use crate::delta::PendingDelta;
 
-/// Health check — the first feature, and the one that exercises the upgrade
-/// path itself. Must match `KardamomChainState.FEATURE_HEALTH_CHECK`.
+/// Health check. This is the first feature, and it exercises the upgrade
+/// path itself. It must match `KardamomChainState.FEATURE_HEALTH_CHECK`.
 ///
 /// While active, every block records a [health beacon](HEALTH_BEACON_SLOT).
 pub const FEATURE_HEALTH_CHECK: u64 = 1;
 
-/// Storage slot of `KardamomChainState.healthBeacon` (declaration order puts
-/// the `_activation` mapping at slot 0 and this at slot 1). Pinned against the
-/// compiled storage layout by the contract's own test.
+/// Storage slot of `KardamomChainState.healthBeacon`. Declaration order puts
+/// the `_activation` mapping at slot 0 and this field at slot 1. The
+/// contract's own test pins this against the compiled storage layout.
 pub const HEALTH_BEACON_SLOT: B256 = B256::new([
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
 ]);
 
-/// Storage slot holding `featureId`'s activation timestamp — the Solidity
-/// mapping rule `keccak256(pad32(key) ++ pad32(slot))` with the mapping at
-/// slot 0.
+/// Storage slot that holds `featureId`'s activation timestamp. This follows
+/// the Solidity mapping rule `keccak256(pad32(key) ++ pad32(slot))`, with the
+/// mapping at slot 0.
 pub fn activation_slot(feature_id: u64) -> B256 {
     let mut buf = [0u8; 64];
     buf[..32].copy_from_slice(&U256::from(feature_id).to_be_bytes::<32>());
-    // buf[32..64] stays zero: the mapping's declaration slot.
+    // buf[32..64] stays zero. This is the mapping's declaration slot.
     keccak256(buf)
 }
 
-/// Is a feature active for a block with header timestamp `header_ts_ms`?
+/// Check if a feature is active for a block, given its header timestamp
+/// `header_ts_ms`.
 ///
-/// `stored == 0` means never scheduled. Activation is inclusive (`<=`), which
-/// matches `KardamomChainState.isActive`.
+/// `stored == 0` means the feature is never scheduled. Activation is
+/// inclusive (`<=`), matching `KardamomChainState.isActive`.
 ///
-/// The comparison is against the **header** timestamp of the block being
-/// closed, not the timestamp txs executed with (block N executes with boundary
-/// N−1's stamp). Both are canonical stream data, so the predicate is identical
-/// on every replica; using the header's own stamp is what makes "active from
-/// the first block at or after T" a statement about the chain rather than
-/// about execution plumbing.
+/// This compares against the header timestamp of the block being closed,
+/// not the timestamp txs executed with (block N executes with boundary
+/// N-1's timestamp). Both values come from the canonical stream, so the
+/// check gives the same result on every replica. Using the header's own
+/// timestamp is what makes "active from the first block at or after T" a
+/// statement about the chain, not about execution plumbing.
 pub fn is_active(stored_activation: U256, header_ts_ms: u64) -> bool {
     !stored_activation.is_zero() && stored_activation <= U256::from(header_ts_ms)
 }
 
 /// Pack a health beacon into one word: `count | block << 64 | timestamp << 128`.
 ///
-/// Fields **saturate** rather than wrap so an implausible overflow can never
-/// corrupt a neighbouring field (a wrapped count bleeding into the block-number
-/// field would read as a wildly wrong beacon rather than a stuck counter).
-/// Mirrors `KardamomChainState.health()`.
+/// Fields saturate instead of wrapping, so an unlikely overflow can never
+/// corrupt a neighbor field. A wrapped count bleeding into the block-number
+/// field would look like a wildly wrong beacon, not a stuck counter. This
+/// mirrors `KardamomChainState.health()`.
 pub fn pack_beacon(count: u64, block_number: u64, timestamp_ms: u64) -> U256 {
     U256::from(count) | (U256::from(block_number) << 64) | (U256::from(timestamp_ms) << 128)
 }
@@ -83,8 +85,8 @@ pub fn unpack_beacon(word: U256) -> (u64, u64, u64) {
     (field(0), field(64), field(128))
 }
 
-/// What the block-close pass did, for logging and metrics. Empty when no
-/// feature is active — the overwhelmingly common case.
+/// What the block-close pass did, for logging and metrics. This is empty
+/// when no feature is active, which is the common case.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct BlockCloseOutcome {
     /// `Some(beat)` if the health beacon was recorded for this block.
@@ -93,25 +95,25 @@ pub struct BlockCloseOutcome {
 
 /// Apply every block-close protocol action into `delta`.
 ///
-/// Call at block close, after all of the block's records have been folded into
-/// `delta` and before the delta is handed to the writer — the actions must see
-/// the block's own writes (an upgrade deposit landing in *this* block activates
-/// a feature for *this* block) and their writes must ride in the same delta.
+/// Call this at block close, after the block's records are folded into
+/// `delta` and before the delta goes to the writer. The actions must see the
+/// block's own writes (an upgrade deposit landing in this block activates a
+/// feature for this block), and their writes must go into the same delta.
 ///
-/// `read_slot` supplies the state layers this function cannot see: the caller's
-/// unsettled-parent layer and its state snapshot, in that precedence. The
-/// `delta` layer is consulted here, so the composed read is
-/// `delta → parent → snapshot`, the same precedence the EVM gets. Reading the
-/// snapshot alone would be wrong twice over: it lags by up to K unsettled
-/// blocks, and it cannot contain the current block's own writes.
+/// `read_slot` supplies the state layers this function cannot see: the
+/// caller's unsettled-parent layer, then its state snapshot, in that order.
+/// This function also reads the `delta` layer, so the full read order is
+/// `delta -> parent -> snapshot`, the same order the EVM uses. Reading the
+/// snapshot alone would be wrong for two reasons: it lags by up to K
+/// unsettled blocks, and it cannot hold the current block's own writes.
 ///
-/// Writes go into `delta` only — deliberately not into the block's EIP-7928
-/// BAL. The BAL attributes accesses to transaction indices and the validator
-/// verifies claims per tx-index range; a block-close action belongs to no
-/// transaction, so attributing it to one would both misdescribe the block and
-/// diverge against a validator that recomputes claims from transactions.
-/// The write is still cross-checked between roles, because the validator
-/// compares the whole `BlockDelta`.
+/// Writes go into `delta` only, not into the block's EIP-7928 BAL. The BAL
+/// attributes accesses to transaction indices, and the validator verifies
+/// claims per tx-index range. A block-close action belongs to no
+/// transaction, so attributing it to one would misdescribe the block and
+/// cause a mismatch with a validator that recomputes claims from
+/// transactions. The write is still cross-checked between roles, because
+/// the validator compares the whole `BlockDelta`.
 pub fn apply_block_close_actions<E, F>(
     delta: &mut PendingDelta,
     block_number: u64,
@@ -123,8 +125,8 @@ where
 {
     let mut out = BlockCloseOutcome::default();
 
-    // Read through delta first so a feature scheduled by a deposit in THIS
-    // block is visible to THIS block's close.
+    // Read through delta first, so a feature scheduled by a deposit in
+    // this block is visible to this block's close.
     let mut read = |addr: Address, slot: B256, delta: &PendingDelta| -> Result<U256, E> {
         match delta.storage.get(&(addr, slot)) {
             Some(v) => Ok(*v),
@@ -151,14 +153,14 @@ mod tests {
     use super::*;
     use core::convert::Infallible;
 
-    /// A state with nothing in it — every read misses.
+    /// A state with nothing in it. Every read misses.
     fn empty(_a: Address, _s: B256) -> Result<U256, Infallible> {
         Ok(U256::ZERO)
     }
 
     #[test]
     fn activation_slot_matches_the_solidity_mapping_rule() {
-        // keccak256(pad32(key) ++ pad32(0)) — cross-checked against the
+        // keccak256(pad32(key) ++ pad32(0)). Cross-checked against the
         // contract by KardamomChainState.t.sol.
         let mut expected_input = [0u8; 64];
         expected_input[31] = 1;
@@ -241,8 +243,9 @@ mod tests {
         assert_eq!(unpack_beacon(w), (1, 7, 1_500));
     }
 
-    /// The layering that makes an immediate upgrade activate in its OWN block:
-    /// the `setFeature` write exists only in this block's delta, nowhere else.
+    /// The layering that lets an immediate upgrade activate in its own
+    /// block. The `setFeature` write exists only in this block's delta,
+    /// nowhere else.
     #[test]
     fn activation_written_in_this_block_is_visible_to_this_block() {
         let mut delta = PendingDelta::new();
@@ -277,9 +280,9 @@ mod tests {
         );
     }
 
-    /// A beacon already written into this block's delta (not possible today,
-    /// but the read precedence must be delta-first regardless) is what the
-    /// increment builds on.
+    /// A beacon already written into this block's delta. This case is not
+    /// possible today, but the read precedence must still be delta-first,
+    /// and this is what the increment builds on.
     #[test]
     fn delta_takes_precedence_over_the_backing_read() {
         let mut delta = PendingDelta::new();
@@ -291,7 +294,7 @@ mod tests {
             .storage
             .insert((CHAIN_STATE, HEALTH_BEACON_SLOT), pack_beacon(4, 1, 1));
         let read = |_a: Address, _s: B256| -> Result<U256, Infallible> {
-            // Stale backing value that must NOT win.
+            // Stale backing value that must not win.
             Ok(pack_beacon(99, 99, 99))
         };
         let out = apply_block_close_actions(&mut delta, 2, 2, read).unwrap();

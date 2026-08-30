@@ -1,16 +1,18 @@
-//! The parallel block executor (spec §P2, offline milestone): workers pull
-//! DAG-ready txs, execute each against a per-tx multi-version view, publish
-//! versions, and a canonical-order commit pass materializes the exact
-//! sequential artifacts — receipts (cumulative gas, accumulator-fixed
-//! write-set hashes) and the block `PendingDelta`, byte-identical to
-//! `ExecScope` output by construction and re-checked by validation.
+//! The parallel block executor (an offline milestone): workers pull
+//! DAG-ready transactions, execute each against a per-transaction
+//! multi-version view, and publish versions. A canonical-order commit
+//! pass then computes the exact sequential artifacts: receipts
+//! (cumulative gas, accumulator-fixed write-set hashes) and the block
+//! `PendingDelta`. These are byte-identical to `ExecScope` output by
+//! construction, and validation re-checks this.
 //!
-//! Wound-wait runtime detection (ESTIMATE marks, child self-abort) is
-//! deliberately NOT here yet: under pessimistic scheduling a conflict is an
-//! ordered edge, so the miss classes it accelerates are expected ~never
-//! (P1 shadow: 0 across 18,400 graded txs). Validation + whole-block
-//! sequential fallback (invariant #3) carries correctness alone in P2a;
-//! the optimization lands with P2b once the A/B shows where it pays.
+//! Wound-wait runtime detection (ESTIMATE marks, child self-abort) is not
+//! here yet, by design. Under pessimistic scheduling, a conflict is an
+//! ordered edge, so the miss classes this detection would accelerate are
+//! expected almost never (the footprint shadow scheduler saw zero across
+//! 18,400 graded transactions). Validation plus whole-block sequential
+//! fallback (invariant #3) carries correctness alone at this stage. The
+//! optimization lands later, once the A/B test shows where it pays off.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -36,22 +38,22 @@ use crate::mv::{MvCache, ReadRecord};
 use crate::schedule;
 use crate::{FEE_SINK, FastMap};
 
-/// Layered block-input view: the pre-block delta over the snapshot — what
-/// sequential execution sees at the block's first tx. Read-only and shared
-/// by every worker.
+/// Layered block-input view: the pre-block delta over the snapshot, what
+/// sequential execution sees at the block's first transaction. Read-only
+/// and shared by every worker.
 pub struct BlockInput<'a, S: StateDatabase> {
     pub snapshot: &'a S,
     pub base: Option<&'a PendingDelta>,
-    /// Unsettled predecessor deltas, NEWEST FIRST, probed before `base`.
+    /// Unsettled predecessor deltas, newest first, probed before `base`.
     /// Arc-shared so pipelined submission builds a block's read layers
-    /// without cloning or merging a single entry (spec P3a: the merge
-    /// clone + advance were a measured, growing multi-ms drag on the
-    /// pipeline loop).
+    /// without cloning or merging a single entry. The older merge-clone
+    /// and advance step was a measured, growing multi-ms drag on the
+    /// pipeline loop.
     pub layers: &'a [std::sync::Arc<PendingDelta>],
-    /// Predecessor MULTI-VERSION CACHES, NEWEST FIRST, probed before
-    /// everything else (spec P3b mv-as-layer): a drained block's mv top
-    /// version per cell IS its final delta — before any fold ran. Reads
-    /// probe at `u32::MAX`. Immutable once the block drained; a wound
+    /// Predecessor multi-version caches, newest first, probed before
+    /// everything else: a drained block's mv top version per cell is
+    /// its final delta, before any fold ran. Reads probe at
+    /// `u32::MAX`. Immutable once the block drains; a wound
     /// invalidates the whole layer through the corrected-release
     /// protocol, never by mutation.
     pub mv_layers: &'a [std::sync::Arc<crate::mv::MvCache>],
@@ -154,15 +156,15 @@ impl<'a, S: StateDatabase> DatabaseRef for BlockInput<'a, S> {
     }
 }
 
-/// SHARED read-through cache over the block-input layer.
+/// Shared read-through cache over the block-input layer.
 ///
-/// The block input (pre-block delta ∘ snapshot) is immutable for the whole
-/// block, so every worker that misses the multi-version cache asks the
-/// same questions and gets the same answers. Per-worker memos made each
-/// thread re-answer them independently, which is why total CPU time GREW
-/// with worker count — 159ms at one worker, 325ms at eight, for the same
-/// 8000 transactions. Sharing the answers is what turns extra threads into
-/// extra throughput instead of extra work.
+/// The block input (the pre-block delta over the snapshot) is immutable
+/// for the whole block, so every worker that misses the multi-version
+/// cache asks the same questions and gets the same answers. Per-worker
+/// memos made each thread answer them independently, which is why total
+/// CPU time grew with worker count for the same set of transactions.
+/// Sharing the answers is what turns extra threads into extra throughput
+/// instead of extra work.
 ///
 /// Sharded like [`MvCache`], read-mostly, and correctness-neutral: it
 /// caches an immutable layer, so a stale entry is impossible.
@@ -194,31 +196,31 @@ impl BaseCache {
     }
 }
 
-/// Per-tx database view: multi-version cache at index `idx` over the block
-/// input, recording every first read for validation. The fee sink is served
-/// from the cached block-start info and never recorded — the `Accumulator`
-/// boundary (its correctness is the commit pass's prefix algebra, not
-/// version validation).
+/// Per-transaction database view: the multi-version cache at index `idx`
+/// over the block input, recording every first read for validation. The
+/// fee sink is served from the cached block-start info and never recorded
+/// (the `Accumulator` boundary). Its correctness comes from the commit
+/// pass's prefix algebra, not from version validation.
 struct MvView<'a, S: StateDatabase> {
     mv: &'a MvCache,
     base: &'a BlockInput<'a, S>,
     idx: u32,
     reads: Vec<ReadRecord>,
     sink_start: Option<AccountInfo>,
-    /// SHARED across workers — see [`BaseCache`].
+    /// Shared across workers. See [`BaseCache`].
     base_cache: &'a BaseCache,
     metrics: &'a Metrics,
-    /// Read counters accumulated WITHOUT atomics and flushed once per
-    /// block. Incrementing shared atomics per read had every worker
-    /// hammering the same cache lines — instrumentation distorting the
-    /// very contention it was measuring.
+    /// Read counters accumulated without atomics and flushed once per
+    /// block. Incrementing shared atomics on every read had every worker
+    /// hammering the same cache lines. The instrumentation was distorting
+    /// the very contention it aimed to measure.
     n_reads: u64,
     n_mv_hit: u64,
     n_base_hit: u64,
     n_backend: u64,
-    /// Wall nanoseconds inside the read path (basic/storage/code), split
-    /// out of `evm_ns` — the flamegraph inlines these frames into the
-    /// interpreter, so timing is the only way to see them.
+    /// Wall nanoseconds inside the read path (basic, storage, code),
+    /// split out of `evm_ns`. The flamegraph inlines these frames into
+    /// the interpreter, so timing is the only way to see them.
     n_read_ns: u64,
 }
 
@@ -246,7 +248,7 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
         }
     }
 
-    /// Fold this worker's counters into the shared metrics — once per
+    /// Fold this worker's counters into the shared metrics, once per
     /// block, not once per read.
     fn flush_counters(&mut self) {
         self.metrics
@@ -297,11 +299,11 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             }));
         }
         self.reads.push(ReadRecord::Account(address, None));
-        // Predecessor MV LAYERS first (newest first, at u32::MAX — the
-        // top version is the final value; spec P3b mv-as-layer), then
-        // pending-delta LAYERS, then the base layer, all BEFORE the
-        // cache: the pool-lifetime cache mirrors the BACKEND only, and
-        // these layers change per block.
+        // Probe predecessor mv layers first (newest first, at
+        // `u32::MAX`, where the top version is the final value), then
+        // pending-delta layers, then the base layer, all before the
+        // cache. The pool-lifetime cache mirrors
+        // the backend only, and these layers change per block.
         for mv in self.base.mv_layers.iter() {
             if let Some((_, a)) = mv.read_account(u32::MAX, &address) {
                 self.n_base_hit += 1;
@@ -365,8 +367,9 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
         &mut self,
         code_hash: B256,
     ) -> Result<revm::state::Bytecode, kardamom_exec_core::executor::StateRefError> {
-        // Content-addressed: no version, no record — memo both sources
-        // (Bytecode clones are refcounted; the copy happens once).
+        // Content-addressed: no version, no record. Memoize both
+        // sources; Bytecode clones are refcounted, so the copy happens
+        // once.
         if let Some(c) = self
             .base_cache
             .code
@@ -380,8 +383,9 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
             self.reads.push(ReadRecord::Code(code_hash, true));
             revm::state::Bytecode::new_raw(alloy_primitives::Bytes::copy_from_slice(&code))
         } else {
-            // A MISS is recorded too: if a concurrent CREATE publishes this
-            // hash later, this tx ran against absent code and is wounded.
+            // A miss is recorded too: if a concurrent CREATE publishes
+            // this hash later, this transaction ran against absent code
+            // and is wounded.
             self.reads.push(ReadRecord::Code(code_hash, false));
             self.base.code_by_hash_ref(code_hash)?
         };
@@ -449,10 +453,10 @@ impl<'a, S: StateDatabase> MvView<'a, S> {
 impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
     type Error = kardamom_exec_core::executor::StateRefError;
 
-    // Thin TIMED wrappers: the read path inlines into the interpreter and
-    // is invisible to a sampling profiler, so `n_read_ns` carves it out of
-    // `evm_ns` by measurement. Two clock reads per state access (~50ns)
-    // against multi-microsecond questions.
+    // Thin timed wrappers: the read path inlines into the interpreter and
+    // is invisible to a sampling profiler, so `n_read_ns` carves it out
+    // of `evm_ns` by direct measurement. Two clock reads per state
+    // access cost little against multi-microsecond questions.
     fn basic(
         &mut self,
         address: alloy_primitives::Address,
@@ -486,27 +490,29 @@ impl<'a, S: StateDatabase> revm::Database for MvView<'a, S> {
     }
 }
 
-/// One executed tx's artifacts, pre-commit (cumulative gas and the
-/// accumulator wsh fixup land in the canonical-order commit pass).
+/// One executed transaction's artifacts, before commit. The canonical-order
+/// commit pass adds cumulative gas and the accumulator write-set-hash fixup.
 struct TxResult {
     receipt: Receipt,
     ws: WriteSet,
     reads: Vec<ReadRecord>,
-    /// EIP-7928 capture fragment: this tx's BAL updates at its
-    /// BLOCK-GLOBAL index (`bal_base + local_idx + 1`), recorded through
+    /// EIP-7928 capture fragment: this transaction's BAL updates at its
+    /// block-global index (`bal_base + local_idx + 1`), recorded through
     /// the same `Bal::update_account` the streaming path uses. `None`
-    /// when capture is off or the tx was an invalid skip (skips carry no
-    /// fragment in either mode). The commit pass rewrites the fee-sink
-    /// balance write to the materialized prefix value (workers see the
-    /// block-start sink, not the canonical running sum) and folds the
-    /// fragments in canonical order.
+    /// when capture is off, or the transaction was an invalid skip (a
+    /// skip carries no fragment in either mode). The commit pass rewrites
+    /// the fee-sink balance write to the computed prefix value (workers
+    /// see the block-start sink, not the canonical running sum) and
+    /// folds the fragments in canonical order.
     bal_frag: Option<revm::state::bal::Bal>,
-    /// This tx's exact credit to the fee sink (post − block-start seen).
+    /// This transaction's exact credit to the fee sink (the value after,
+    /// minus the block-start value seen).
     fee_delta: U256,
     /// The write set contains the fee sink, so its hash is finalized at
-    /// COMMIT (after the prefix balance is materialized) and computing it
-    /// during execution would be thrown away. P0 measured this at 100% of
-    /// txs, so the saved keccak is not an edge case.
+    /// commit, after the prefix balance is computed. Hashing it during
+    /// execution would be wasted work. Offline measurement found this
+    /// case at nearly every transaction, so the saved keccak is not an
+    /// edge case.
     sink_touched: bool,
 }
 
@@ -515,48 +521,54 @@ struct TxResult {
 pub struct StmOutcome {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
-    /// EIP-7928 capture: the block's per-tx fragments folded in canonical
-    /// order (see `merge_bal_fragments`), with the fee-sink writes
-    /// materialized to the canonical prefix and wounded txs' fragments
-    /// replaced by their repair capture. `Some` only when the session was
-    /// opened with capture (`begin_block_layered_bal`). Wire-identical to
-    /// the streaming path's sequential capture by construction.
+    /// EIP-7928 capture: the block's per-transaction fragments folded in
+    /// canonical order (see `merge_bal_fragments`), with the fee-sink
+    /// writes computed to the canonical prefix and wounded transactions'
+    /// fragments replaced by their repair capture. `Some` only when the
+    /// session was opened with capture (`begin_block_layered_bal`).
+    /// Wire-identical to the streaming path's sequential capture by
+    /// construction.
     pub bal: Option<revm::state::bal::Bal>,
-    /// Txs WOUNDED at validation — a conflict the marks missed, repaired
-    /// by re-executing at the canonical position (per-tx; the whole block
-    /// never re-runs). Zero on every measured workload so far.
+    /// Transactions wounded at validation: a conflict the marks missed,
+    /// repaired by re-executing at the canonical position (per
+    /// transaction; the whole block never re-runs). Zero on every
+    /// measured workload so far.
     pub wounds: usize,
-    /// Any wound fired (spec invariant #3's counter, per block).
+    /// Whether any wound fired (spec invariant #3's counter, per block).
     pub fallback: bool,
-    /// The pool DECLINED this block and ran it sequentially, because the
+    /// The pool declined this block and ran it sequentially, because the
     /// work per transaction was too small for parallel execution to pay
     /// for its own coordination. See `PARALLEL_WORTH_NS`.
     pub declined: bool,
-    /// Mean per-tx execution time this block taught the pool — the input
-    /// to the next block's decline decision. Non-zero after a DECLINED
-    /// block too: that is what keeps the gate from being a trap door.
+    /// Mean per-transaction execution time this block taught the pool:
+    /// the input to the next block's decline decision. Non-zero after a
+    /// declined block too. That is what keeps the gate from being a trap
+    /// door.
     pub learned_tx_ns: u64,
     /// Account writes whose domain belongs to another worker.
     pub writes_own: u64,
     pub writes_foreign: u64,
     /// Chain links ordered by FIFO position instead of a DAG edge, and
-    /// how often a taken tx had to wait on a stolen FIFO predecessor.
+    /// how often a taken transaction had to wait on a stolen FIFO
+    /// predecessor.
     pub fifo_covered: u64,
     pub fifo_stalls: u64,
     pub read_us: u64,
-    /// Per-worker busy microseconds — see `Metrics::busy_per_worker`.
+    /// Per-worker busy microseconds. See `Metrics::busy_per_worker`.
     pub busy_per_worker_us: Vec<u64>,
-    /// ⊤ (cold, untrained-selector) txs — they wait out the prefix.
+    /// ⊤ (cold, untrained-selector) transactions. They wait out the
+    /// prefix.
     pub cold: usize,
     /// Live-DAG edges created across the block (only against predecessors
     /// that were still outstanding at admission).
     pub edges: usize,
-    /// Txs dispatched per worker queue — the domain-affinity histogram.
+    /// Transactions dispatched per worker queue: the domain-affinity
+    /// histogram.
     pub dispatch: Vec<u32>,
-    /// Nodes observed leaving the graph more than once. ALWAYS ZERO —
-    /// asserted by the test suite and worth an alert in production: a
-    /// non-zero value means a tx completed twice and the edges registered
-    /// in between were stranded.
+    /// Nodes observed leaving the graph more than once. Always zero.
+    /// Asserted by the test suite and worth an alert in production: a
+    /// non-zero value means a transaction completed twice and the edges
+    /// registered in between were stranded.
     pub double_exit: u32,
     /// Scheduler cost, measured (the numbers the prune-batch knob is
     /// tuned on): time held in the graph lock split by cause, prune
@@ -572,8 +584,9 @@ pub struct StmOutcome {
     pub evm_us: u64,
     pub publish_us: u64,
     /// Where the block's wall time went. `busy_us / (workers *
-    /// parallel_span_us)` is the honest core utilization; `ramp_us` and
-    /// `commit_us` are the serial head and tail no worker count reduces.
+    /// parallel_span_us)` is the honest core utilization. `ramp_us` and
+    /// `commit_us` are the serial head and tail that no worker count
+    /// reduces.
     pub busy_us: u64,
     pub parallel_span_us: u64,
     pub ramp_us: u64,
@@ -594,9 +607,9 @@ pub struct StmOutcome {
     pub idle_us: u64,
 }
 
-/// Stable domain → worker mapping. Quality only affects BALANCE across
-/// threads, never correctness: ordering comes from the DAG's edges, and
-/// an idle worker may steal from any queue.
+/// Stable domain-to-worker mapping. Its quality only affects balance
+/// across threads, never correctness: ordering comes from the DAG's
+/// edges, and an idle worker may steal from any queue.
 fn domain_hash(bytes: &[u8], workers: usize) -> usize {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
@@ -606,36 +619,36 @@ fn domain_hash(bytes: &[u8], workers: usize) -> usize {
     (h % workers as u64) as usize
 }
 
-/// How long `seal` waits for a block to drain before declaring a
-/// scheduler bug. Generous by orders of magnitude: a 30M-gas block is
-/// milliseconds of execution, so anything past this is a stranded edge,
+/// How long `seal` waits for a block to drain before it declares a
+/// scheduler bug. Generous by orders of magnitude: a 30M-gas block takes
+/// milliseconds to execute, so anything past this is a stranded edge,
 /// not slow work.
 const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Everything about a tx that can be derived WITHOUT touching the graph:
-/// the RLP decode and the footprint prediction. Both are pure functions of
-/// the envelope bytes and the stats snapshot, so they do not belong on the
-/// executor's single feed thread — the pipeline computes them upstream,
-/// where the work is already sharded.
+/// Everything about a transaction that can be derived without touching the
+/// graph: the RLP decode and the footprint prediction. Both are pure
+/// functions of the envelope bytes and the stats snapshot, so they do not
+/// belong on the executor's single feed thread. The pipeline computes them
+/// upstream, where the work is already sharded.
 ///
-/// In the live executor (P3) this is produced by the M tx_data reader
-/// threads, which touch every envelope anyway and run BEFORE the canonical
-/// order arrives (the join buffer exists precisely because tx_data leads
+/// In the live executor, the M tx_data reader threads produce this.
+/// They touch every envelope anyway and run before the canonical order
+/// arrives (the join buffer exists precisely because tx_data leads
 /// tx_ordering), so the work lands in slack that already exists.
 #[derive(Clone)]
 pub struct Prepared {
-    /// `None` when the envelope does not decode — the #92 skip path.
+    /// `None` when the envelope does not decode: the #92 skip path.
     pub decoded: Option<alloy_consensus::TxEnvelope>,
-    /// Predicted contention domains, fee sink already excluded.
+    /// Predicted contention domains, with the fee sink already excluded.
     pub domains: Vec<DomainKey>,
-    /// 64-bit hash per domain, computed HERE (off the feed thread, in
-    /// parallel with every other tx's preparation) so the serial feed
-    /// only probes. See [`TouchTable`] for why hashing by value is
-    /// sound.
+    /// A 64-bit hash per domain, computed here, off the feed thread, in
+    /// parallel with every other transaction's preparation, so the
+    /// serial feed only probes. See [`TouchTable`] for why hashing by
+    /// value is sound.
     pub domain_hashes: Vec<u64>,
-    /// The domain that decides which thread runs this tx.
+    /// The domain that decides which thread runs this transaction.
     pub primary: Option<DomainKey>,
-    /// ⊤: untrained selector — orders behind everything outstanding.
+    /// ⊤: an untrained selector. Orders behind everything outstanding.
     pub cold: bool,
 }
 
@@ -659,14 +672,14 @@ pub fn domain_hash64(d: &DomainKey) -> u64 {
     h.finish()
 }
 
-/// Decode + predict, off the feed thread. `stats` must be a snapshot
-/// trained on PRIOR blocks only (in the live executor: an `Arc<Stats>`
-/// swapped at each boundary, so readers never take a lock).
+/// Decode and predict, off the feed thread. `stats` must be a snapshot
+/// trained on prior blocks only (in the live executor, this is an
+/// `Arc<Stats>` swapped at each boundary, so readers never take a lock).
 ///
-/// Getting this wrong is not a correctness event: a bad prediction costs a
-/// mis-schedule, which surfaces as a wound and re-executes that one tx at
-/// its canonical position. That is what makes it safe to compute here,
-/// concurrently, ahead of canonical order.
+/// Getting this wrong is not a correctness problem: a bad prediction
+/// costs a mis-schedule, which surfaces as a wound and re-executes that
+/// one transaction at its canonical position. That is what makes it safe
+/// to compute here, concurrently, ahead of canonical order.
 pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepared {
     let decoded = decode_alloy_envelope(&envelope.raw_tx, tx_idx).ok();
     // The local index is irrelevant to prediction (it only labels the
@@ -682,10 +695,11 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
                     continue;
                 }
                 // The primary contention domain is the first non-sender
-                // cell in canonical order (stable across txs of one flow,
-                // which is what puts a pool's traffic on one thread),
-                // falling back to the sender cell — the SenderChain lane
-                // for tier-1-only txs.
+                // cell in canonical order. This is stable across
+                // transactions of one flow, which is what puts a pool's
+                // traffic on one thread. It falls back to the sender
+                // cell, the SenderChain lane, for tier-1-only
+                // transactions.
                 let is_sender = matches!(c, DomainKey::Account(a) if a == envelope.sender);
                 let primary_is_sender =
                     matches!(primary, Some(DomainKey::Account(a)) if a == envelope.sender);
@@ -710,31 +724,33 @@ pub fn prepare(envelope: &TxEnvelope, tx_idx: TxIndex, stats: &Stats) -> Prepare
 
 /// Spins before a dry worker parks. Sized so the spin costs far less than
 /// the park/unpark syscall pair it avoids, while still yielding promptly
-/// when a block really is drained.
-/// MEASURED: yielding partway through the spin was tried and REVERTED —
-/// it helped only the oversubscribed case (12 workers on 12 cores) and
-/// cost 20-35% everywhere else. Do not run more workers than cores minus
-/// the feed thread; that is the real fix for oversubscription.
-/// Mean per-tx execution time below which the pool DECLINES a block and
-/// runs it sequentially.
+/// when a block really has drained.
+/// Yielding partway through the spin was tested. It helped only the
+/// oversubscribed case (12 workers on 12 cores) and cost 20-35%
+/// everywhere else, so it was reverted. Do not run more workers than
+/// cores minus the feed thread; that is the real fix for
+/// oversubscription.
+/// Mean per-transaction execution time below which the pool declines a
+/// block and runs it sequentially.
 ///
-/// Parallel execution buys down only the execution span; it cannot buy
-/// down the serial feed (~0.4us/tx of admission) or the commit tail, and
-/// it adds cross-core traffic to every read and publish. Below some
-/// amount of work per transaction those fixed costs exceed anything more
-/// cores can return, and the honest thing is not to compete.
+/// Parallel execution buys down only the execution span. It cannot buy
+/// down the serial feed (about 0.4us/tx of admission) or the commit
+/// tail, and it adds cross-core traffic to every read and publish. Below
+/// some amount of work per transaction, those fixed costs exceed
+/// anything more cores can return, and the honest choice is not to
+/// compete.
 ///
-/// RECALIBRATED after the frequency root-cause fix: the original 8us
+/// Recalibrated after a frequency root-cause fix. The original 8us
 /// threshold came from measurements where worker cores ran at half
-/// clock and transfers lost (0.87x). With cores held at frequency,
-/// fully-independent 21k transfers (~4.6us/tx on the mdbx stack)
-/// measure 1.54x at 4 workers — they belong on the parallel path. The
-/// threshold now sits below transfer cost; only degenerate sub-2.5us
-/// work declines.
+/// clock, and transfers lost speed (0.87x) there. With cores held at
+/// full frequency, fully-independent 21k-gas transfers (about 4.6us/tx
+/// on the mdbx stack) measure 1.54x at 4 workers, so they belong on the
+/// parallel path. The threshold now sits below transfer cost; only
+/// degenerate sub-2.5us work declines.
 ///
-/// This is a FLOOR, not a verdict on transfers: the costs it defends
-/// against — the single-threaded feed and the serial delta fold — are
-/// implementation limits, and if they come down this constant should come
+/// This is a floor, not a verdict on transfers: the costs it defends
+/// against (the single-threaded feed and the serial delta fold) are
+/// implementation limits. If they come down, this constant should come
 /// down with them.
 pub const PARALLEL_WORTH_NS: u64 = 2_500;
 
@@ -743,10 +759,11 @@ const STICKY_CAP: usize = 65_536;
 
 const SPIN_BEFORE_PARK: u32 = 256;
 
-/// Mean per-tx execution time above which moving a ready tx to an idle
-/// core beats keeping its state warm on the owning one. Between a 21k-gas
-/// transfer (~2.75us, migration loses) and a uniswap swap (~15us,
-/// migration wins).
+/// Mean per-transaction execution time above which moving a ready
+/// transaction to an idle core beats keeping its state warm on the
+/// owning one. Set between a 21k-gas transfer (about 2.75us, where
+/// migration loses) and a uniswap swap (about 15us, where migration
+/// wins).
 const STEAL_WORTH_NS: u64 = 6_000;
 
 /// Longest a parked worker sleeps before re-checking its queue and the
@@ -754,17 +771,19 @@ const STEAL_WORTH_NS: u64 = 6_000;
 /// poll interval instead of a permanent hang.
 const PARK_POLL: std::time::Duration = std::time::Duration::from_micros(200);
 
-/// Gas-limit-derived hard cap on txs per block: `BLOCK_GAS_LIMIT` / 21k
-/// intrinsic gas = 1,428, with ~2.8x headroom. Slots are pre-allocated per
-/// block so workers address them lock-free while the feed is still
-/// admitting (slab reuse across blocks is a noted follow-up).
+/// Gas-limit-derived hard cap on transactions per block:
+/// `BLOCK_GAS_LIMIT` / 21k intrinsic gas = 1,428, with about 2.8x
+/// headroom. Slots are pre-allocated per block so workers address them
+/// lock-free while the feed is still admitting (slab reuse across blocks
+/// is a noted follow-up).
 /// Transactions per sharded-admission batch (see `flush_admit_batch`).
 const ADMIT_BATCH: usize = 512;
 
 const MAX_BLOCK_TXS: usize = 4_096;
 
-/// One admitted tx. Its slot is set BEFORE its index becomes visible to
-/// workers (via the ready heap), so workers read it lock-free.
+/// One admitted transaction. Its slot is set before its index becomes
+/// visible to workers (through the ready heap), so workers read it
+/// lock-free.
 struct TxSlot {
     tx_idx: TxIndex,
     position: BPosition,
@@ -776,35 +795,35 @@ struct TxSlot {
     hashes: smallvec::SmallVec<[u64; 4]>,
 }
 
-/// One worker's FIFO. The feed pushes (single producer), the worker pops
-/// (single consumer) — a two-party lock with near-zero contention, and
-/// canonical arrival order per thread means same-domain chains execute in
-/// order with no cross-thread coordination at all.
+/// One worker's FIFO. The feed pushes (single producer) and the worker
+/// pops (single consumer): a two-party lock with near-zero contention.
+/// Canonical arrival order per thread means same-domain chains execute
+/// in order with no cross-thread coordination at all.
 struct WorkerQueue {
     q: Mutex<std::collections::VecDeque<u32>>,
-    /// Length HINT, maintained alongside every queue mutation. Spinning
-    /// workers and the steal scan read this instead of taking the mutex:
-    /// a dry worker probing its queue every ~half-microsecond for up to
-    /// 60us, and every steal attempt locking EVERY queue just to read a
-    /// length, were contending with the feed's submissions — the measured
-    /// reason admission cost GREW with worker count (1.3us/tx at w=1 to
-    /// 2.15us at w=4 on fully-independent work). A stale read costs one
-    /// wasted lock attempt or one missed-then-caught item; the
-    /// authoritative empty-check before parking still happens under the
-    /// mutex.
+    /// Length hint, maintained alongside every queue mutation. Spinning
+    /// workers and the steal scan read this instead of taking the
+    /// mutex. A dry worker probing its queue for tens of microseconds,
+    /// and every steal attempt locking every queue just to read a
+    /// length, were contending with the feed's submissions. This was the
+    /// measured reason admission cost grew with worker count on
+    /// fully-independent work. A stale read costs one wasted lock
+    /// attempt or one missed-then-caught item; the authoritative
+    /// empty-check before parking still happens under the mutex.
     len: std::sync::atomic::AtomicUsize,
     cv: Condvar,
-    /// Whether this worker is PARKED on `cv`. Waking a thread that is
+    /// Whether this worker is parked on `cv`. Waking a thread that is
     /// already running costs a futex syscall for nothing, and dispatch
-    /// happens once per transaction — on a 21k-gas transfer that is ~2.7us
-    /// of real work, so a wasted wake is a large fraction of the budget.
+    /// happens once per transaction. On a 21k-gas transfer that is about
+    /// 2.7us of real work, so a wasted wake is a large fraction of the
+    /// budget.
     parked: AtomicBool,
 }
 
-/// Engine instrumentation — the numbers the prune-batch decision is made
-/// on (spec: "health is judged on the PAIR of error rates plus realized
-/// utilization"; the same discipline applies to the scheduler's own cost).
-/// One completion counter per worker, each on its OWN cache line.
+/// Engine instrumentation: the numbers the prune-batch decision is made
+/// on. Health is judged on the pair of error rates plus realized
+/// utilization; the same discipline applies to the scheduler's own
+/// cost. One completion counter per worker, each on its own cache line.
 #[derive(Default)]
 #[repr(align(64))]
 pub(crate) struct PaddedLen(pub(crate) AtomicU32);
@@ -816,100 +835,104 @@ pub struct PaddedLen64(pub std::sync::atomic::AtomicU64);
 
 #[derive(Default)]
 pub struct Metrics {
-    /// Nanoseconds spent HOLDING the graph lock, split by cause.
+    /// Nanoseconds spent holding the graph lock, split by cause.
     pub admit_ns: std::sync::atomic::AtomicU64,
-    /// Feed pre-DAG bookkeeping: assignment + slot store + envelope
+    /// Feed pre-DAG bookkeeping: assignment, slot store, and envelope
     /// clone (everything before the last-toucher upsert).
     pub feed_pre_ns: std::sync::atomic::AtomicU64,
-    /// Feed last-toucher upserts + preds build.
+    /// Feed last-toucher upserts plus predecessor list build.
     pub feed_dag_ns: std::sync::atomic::AtomicU64,
-    /// Tail: the fold thread's own body, and the hash+validate lanes'
-    /// own bodies (aggregate). The gap to the scope's wall is thread
-    /// spawn/join.
+    /// Tail: the fold thread's own body, and the hash-and-validate
+    /// lanes' own bodies (aggregate). The gap to the scope's wall is
+    /// thread spawn and join.
     pub commit_fold_ns: std::sync::atomic::AtomicU64,
     pub commit_lane_ns: std::sync::atomic::AtomicU64,
     pub prune_ns: std::sync::atomic::AtomicU64,
-    /// Prune invocations and how many were STARVATION-forced (a worker had
-    /// nothing to run and had to apply pending completions itself).
+    /// Prune invocations and how many were starvation-forced (a worker
+    /// had nothing to run and had to apply pending completions itself).
     pub prune_calls: std::sync::atomic::AtomicU64,
     pub prune_forced: std::sync::atomic::AtomicU64,
-    /// Completions applied by prunes (÷ prune_calls = realized batch).
+    /// Completions applied by prunes (divided by prune_calls gives the
+    /// realized batch size).
     pub completions: std::sync::atomic::AtomicU64,
     /// Nanoseconds workers spent parked with nothing to run.
     pub idle_ns: std::sync::atomic::AtomicU64,
-    /// Ready txs taken from another thread's queue to fix imbalance.
+    /// Ready transactions taken from another thread's queue to fix
+    /// imbalance.
     pub steals: std::sync::atomic::AtomicU64,
     /// Read-path breakdown. The multi-version path costs 1.7x sequential
     /// single-threaded, so which lookup dominates decides what to fix.
     pub reads_total: std::sync::atomic::AtomicU64,
-    /// Reads served by a version written earlier in THIS block.
+    /// Reads served by a version written earlier in this block.
     pub reads_mv_hit: std::sync::atomic::AtomicU64,
-    /// Reads that fell through to the shared base cache, and of those, the
-    /// ones that had to touch the backing store.
+    /// Reads that fell through to the shared base cache, and of those,
+    /// the ones that had to touch the backing store.
     pub reads_base_hit: std::sync::atomic::AtomicU64,
     pub reads_backend: std::sync::atomic::AtomicU64,
-    /// Split of a worker's per-tx time: inside revm (`transact`, which
-    /// includes the read path) vs publishing the write set into the
-    /// multi-version cache. Guessing which dominates has been wrong twice.
+    /// Split of a worker's per-transaction time: inside revm (`transact`,
+    /// which includes the read path) versus publishing the write set
+    /// into the multi-version cache. Guessing which dominates has been
+    /// wrong twice.
     pub evm_ns: std::sync::atomic::AtomicU64,
     pub publish_ns: std::sync::atomic::AtomicU64,
-    /// Nanoseconds workers spent INSIDE revm (the only work that is
-    /// actually the point). `busy / (workers x parallel_span)` is the true
-    /// core utilization — idle time alone cannot distinguish "the DAG had
-    /// no work to give" from "work existed and nobody picked it up".
+    /// Nanoseconds workers spent inside revm, the only work that is
+    /// actually the point. `busy / (workers x parallel_span)` is the true
+    /// core utilization. Idle time alone cannot tell "the DAG had no work
+    /// to give" apart from "work existed and nobody picked it up".
     pub busy_ns: std::sync::atomic::AtomicU64,
-    /// Wall from the block's FIRST dispatch to its LAST completion — the
-    /// span during which parallelism was even possible.
+    /// Wall time from the block's first dispatch to its last completion:
+    /// the span during which parallelism was even possible.
     pub parallel_span_ns: std::sync::atomic::AtomicU64,
-    /// Wall before the first dispatch (feed ramp) and after the last
-    /// completion (serial validate + commit tail). Both are per-block
-    /// costs that no worker count can reduce.
+    /// Wall time before the first dispatch (feed ramp) and after the
+    /// last completion (serial validate and commit tail). Both are
+    /// per-block costs that no worker count can reduce.
     pub ramp_ns: std::sync::atomic::AtomicU64,
     pub commit_ns: std::sync::atomic::AtomicU64,
-    /// Nanos of the first dispatch / last completion, as offsets from the
-    /// session start (interior mutability so workers can stamp them).
+    /// Nanoseconds of the first dispatch and last completion, as offsets
+    /// from the session start (interior mutability so workers can stamp
+    /// them).
     first_dispatch_ns: std::sync::atomic::AtomicU64,
     last_done_ns: std::sync::atomic::AtomicU64,
     /// Envelope decode and footprint prediction, the two pure-computation
-    /// parts of admission (the rest is the graph lock + dispatch).
+    /// parts of admission (the rest is the graph lock and dispatch).
     pub decode_ns: std::sync::atomic::AtomicU64,
     pub predict_ns: std::sync::atomic::AtomicU64,
-    /// Edges whose predecessor was assigned to the SAME thread AND was
-    /// already dispatched — the FIFO queue already orders those, so the
+    /// Edges whose predecessor was assigned to the same thread and was
+    /// already dispatched. The FIFO queue already orders those, so the
     /// edge enforces nothing. Measured to decide whether eliding them is
-    /// worth the subtlety (the elision is only sound for predecessors
-    /// ALREADY dispatched: one still waiting could be queued after its
-    /// own child).
+    /// worth the subtlety: eliding is only sound for predecessors
+    /// already dispatched, since one still waiting could be queued after
+    /// its own child.
     pub redundant_edges: std::sync::atomic::AtomicU64,
-    /// Commit-tail breakdown. The tail is SERIAL and flat in worker count
-    /// (~9.6ms of a 22ms transfers block), so whatever dominates it is a
-    /// fixed parallelization tax — the thing that caps speedup no matter
-    /// how many cores are available.
+    /// Commit-tail breakdown. The tail is serial and flat in worker
+    /// count (about 9.6ms of a 22ms transfers block), so whatever
+    /// dominates it is a fixed parallelization tax: the thing that caps
+    /// speedup no matter how many cores are available.
     pub commit_hash_ns: std::sync::atomic::AtomicU64,
     pub commit_delta_ns: std::sync::atomic::AtomicU64,
-    /// WHOLE-admission nanoseconds (decode + predict + graph + dispatch).
-    /// The feed is a single thread, so this is a hard serial floor on
-    /// block latency — the number that says whether the scheduler or the
-    /// workers are the constraint.
+    /// Whole-admission nanoseconds (decode, predict, graph, and
+    /// dispatch). The feed is a single thread, so this is a hard serial
+    /// floor on block latency: the number that says whether the
+    /// scheduler or the workers are the constraint.
     pub feed_ns: std::sync::atomic::AtomicU64,
     /// Account writes published, split by whether the account's domain
-    /// belongs to the publishing worker. A FOREIGN write is one two or
-    /// more workers can perform on the same account — the true sharing
+    /// belongs to the publishing worker. A foreign write is one that two
+    /// or more workers can perform on the same account: the true sharing
     /// that no lock granularity removes. Reasoning about which side of a
     /// transfer is foreign has been wrong twice; this counts it.
     pub writes_own: std::sync::atomic::AtomicU64,
     pub writes_foreign: std::sync::atomic::AtomicU64,
-    /// Predecessors covered by FIFO order instead of an edge, and takes
-    /// of a queued tx that found a FIFO predecessor still running (a
-    /// steal moved it) and had to wait.
+    /// Predecessors covered by FIFO order instead of an edge, and how
+    /// often a queued transaction found a FIFO predecessor still
+    /// running (a steal moved it) and had to wait.
     pub fifo_covered: std::sync::atomic::AtomicU64,
     pub fifo_stalls: std::sync::atomic::AtomicU64,
-    /// Nanoseconds inside MvView's read path — carved OUT of `evm_ns`.
+    /// Nanoseconds inside MvView's read path, carved out of `evm_ns`.
     pub read_ns: std::sync::atomic::AtomicU64,
-    /// Per-worker busy nanoseconds — the straggler detector. Dispatch can
-    /// be perfectly balanced and idle still high if CORES run at
-    /// different speeds (this box's bimodal memory state is per-thread):
-    /// the histogram shows it directly.
+    /// Per-worker busy nanoseconds: the straggler detector. Dispatch can
+    /// be perfectly balanced and idle time still high if cores run at
+    /// different speeds (this box's bimodal memory state is per-thread).
+    /// The histogram shows it directly.
     pub busy_per_worker: Vec<PaddedLen64>,
 }
 
@@ -918,101 +941,100 @@ pub struct Metrics {
 pub struct PoolConfig {
     pub workers: usize,
     /// Apply completions to the DAG in batches of this many. `1` updates
-    /// the graph on every completion (the immediate policy); larger values
-    /// trade graph-lock traffic for dispatch latency — a worker that runs
-    /// dry always force-prunes first, so batching can never starve the
-    /// pool, only delay a handoff.
+    /// the graph on every completion (the immediate policy). Larger
+    /// values trade graph-lock traffic for dispatch latency. A worker
+    /// that runs dry always force-prunes first, so batching can never
+    /// starve the pool, only delay a handoff.
     pub prune_batch: usize,
-    /// Mean per-tx execution time below which the pool DECLINES a block
-    /// and runs it sequentially. See `PARALLEL_WORTH_NS` for the measured
-    /// default. Injectable so the policy is testable without depending on
-    /// how loaded the machine is, and tunable per deployment.
+    /// Mean per-transaction execution time below which the pool declines
+    /// a block and runs it sequentially. See `PARALLEL_WORTH_NS` for the
+    /// measured default. Injectable so the policy is testable without
+    /// depending on how loaded the machine is, and tunable per
+    /// deployment.
     pub parallel_worth_ns: u64,
-    /// Dispatch on the SENDER rather than the first non-sender cell.
+    /// Dispatch on the sender rather than the first non-sender cell.
     ///
-    /// A transfer writes two accounts and dispatch can only own one of
-    /// them, so this chooses WHICH side is foreign. Measured at 4 workers
-    /// on transfers, the default (recipient) yields 62.2% own-domain
-    /// writes, matching `50% + 1/workers x 50%` exactly. Pure scheduling
-    /// policy — the DAG still takes edges on every cell either way — so
-    /// it cannot change results, only locality.
+    /// A transfer writes two accounts, and dispatch can only own one of
+    /// them, so this chooses which side is foreign. Measured at 4
+    /// workers on transfers, the default (recipient) yields 62.2%
+    /// own-domain writes, matching `50% + 1/workers x 50%` exactly. This
+    /// is pure scheduling policy: the DAG still takes edges on every
+    /// cell either way, so it cannot change results, only locality.
     pub dispatch_by_sender: bool,
-    /// Enqueue a tx at ADMISSION when every unfinished predecessor is
-    /// already released to the same worker's FIFO — queue order then
-    /// enforces the chain and the edge/prune hand-off is skipped
-    /// entirely. Per-link hand-off through batched pruning is the prime
-    /// suspect for the span floor (chains release one tx per prune).
+    /// Enqueue a transaction at admission when every unfinished
+    /// predecessor is already released to the same worker's FIFO. Queue
+    /// order then enforces the chain, and the edge and prune hand-off is
+    /// skipped entirely. Per-link hand-off through batched pruning is
+    /// the prime suspect for the span floor (chains release one
+    /// transaction per prune).
     pub eager_chain: bool,
-    /// Assign each NEW domain to the least-loaded worker and remember the
-    /// choice for the pool's lifetime, instead of hashing.
+    /// Assign each new domain to the least-loaded worker and remember
+    /// the choice for the pool's lifetime, instead of hashing.
     ///
     /// Hashing is stable but collision-blind: 4 hot pairs over 4 workers
-    /// land on 4 distinct threads only ~28% of the time, and a collision
-    /// puts TWO serial chains on one core — measured as dispatch
-    /// [2591, 4017, 694, 698] on the 4-pair scenario, the busiest worker
-    /// carrying half the block. Round-robin-on-first-sight was tried and
-    /// REVERTED because its assignment reshuffled every block; this keeps
-    /// the cross-block stickiness that made hashing win, and fixes only
-    /// the collisions.
+    /// land on 4 distinct threads only about 28% of the time, and a
+    /// collision puts two serial chains on one core, measured as one
+    /// worker carrying half the block in a 4-pair scenario.
+    /// Round-robin-on-first-sight was tested and reverted, because its
+    /// assignment reshuffled every block. This keeps the cross-block
+    /// stickiness that made hashing win, and fixes only the collisions.
     pub sticky_assign: bool,
-    /// BAG SCHEDULER (the DEFAULT; spec: "admission-queue redesign"):
-    /// every runnable tx goes into ONE shared lock-free bag popped by
-    /// whichever worker is free; completion is INLINE (the finishing
-    /// worker closes its node and dispatches children — no prune
-    /// batching) with CHAIN-LOCAL HAND-OFF (the first ready child stays
-    /// on the completing worker: chains stream on one core with zero
-    /// queue ops). No per-worker queues, no stealing, no eager coverage
-    /// (every dependency is an edge). Measured >= the FIFO scheduler on
-    /// every ladder rung (parcounter 2.78 -> 2.95x, uniswap 2.31 -> 2.50,
-    /// partransfer 1.57 -> 2.0, defi 1.31 -> 1.34, transfers 1.00 ->
-    /// 1.07). `false` selects the legacy per-worker FIFO scheduler.
+    /// Bag scheduler (the default): every runnable transaction goes
+    /// into one shared lock-free bag,
+    /// popped by whichever worker is free. Completion is inline (the
+    /// finishing worker closes its node and dispatches children, with no
+    /// prune batching) with chain-local hand-off (the first ready child
+    /// stays on the completing worker, so chains stream on one core with
+    /// zero queue operations). No per-worker queues, no stealing, no
+    /// eager coverage (every dependency is an edge). Measured at or
+    /// above the FIFO scheduler on every workload tested. `false`
+    /// selects the legacy per-worker FIFO scheduler.
     pub bag_scheduler: bool,
-    /// SHARDED ADMISSION (spec: "Sharded admission"): number of cell-space
-    /// shards the feed's dependency discovery is split across, 0 = the
-    /// serial feed. Cell `c` belongs to shard `h(c) % K`, so every real
-    /// conflict is owned by exactly one shard and no shard writes
-    /// another's table. Discovery is BATCHED — the batch boundary is the
-    /// synchronization point, so a transaction cannot dispatch until
-    /// every shard has registered its edges, and no per-shard guards are
-    /// needed. Shard lanes live on the CALLER cores; the worker cores
-    /// stay dedicated to execution.
+    /// Sharded admission: the number of
+    /// cell-space shards the feed's dependency discovery is split
+    /// across; 0 means the serial feed. Cell `c` belongs to shard
+    /// `h(c) % K`, so every real conflict is owned by exactly one shard
+    /// and no shard writes another's table. Discovery is batched: the
+    /// batch boundary is the synchronization point, so a transaction
+    /// cannot dispatch until every shard has registered its edges, and
+    /// no per-shard guards are needed. Shard lanes live on the caller
+    /// cores; the worker cores stay dedicated to execution.
     pub admit_shards: usize,
-    /// Between blocks, workers SPIN-YIELD instead of sleeping on the
-    /// condvar. schedutil drops a core to base clock (2.1 vs 4.2GHz
-    /// measured) the moment it idles, and burst-park execution never
-    /// ramps it back — the root cause of the long "bimodal machine"
-    /// hunt. A yielding spinner holds the governor's utilization signal
-    /// up while surrendering the core within microseconds to any real
-    /// work — including the commit tail's scoped threads, which pin to
-    /// these same cores. Costs idle watts; production executor pools
-    /// run continuously busy, so this mainly serves dedicated-core
-    /// deployments and honest benchmarking.
+    /// Between blocks, workers spin-yield instead of sleeping on the
+    /// condvar. schedutil drops a core to base clock the moment it
+    /// idles, and burst-park execution never ramps it back up. A
+    /// yielding spinner holds the governor's utilization signal up
+    /// while surrendering the core within microseconds to any real
+    /// work, including the commit tail's scoped threads, which pin to
+    /// these same cores. This costs idle watts; production executor
+    /// pools run continuously busy, so this setting mainly serves
+    /// dedicated-core deployments and honest benchmarking.
     pub keep_hot: bool,
-    /// Run the commit tail's parallel phases ON the worker cores.
-    /// Right for block-at-a-time (workers park during the tail, their
-    /// cores are hot and instantly yielded); WRONG for the pipeline,
-    /// where the next block executes on those cores while this block's
-    /// tail runs — the phases then stay on the caller's mask.
+    /// Run the commit tail's parallel phases on the worker cores. Right
+    /// for block-at-a-time, where workers park during the tail and
+    /// their cores are hot and instantly yielded. Wrong for the
+    /// pipeline, where the next block executes on those cores while
+    /// this block's tail runs; the phases then stay on the caller's
+    /// mask.
     pub tail_on_workers: bool,
     /// Pin worker i to `pin_cores[i % len]`.
     ///
-    /// MEASURED REASON (Ryzen 3600, two 3-core CCXes with SPLIT 16MB L3):
-    /// a worker sharing its CCX with the mdbx writer runs the SAME block
-    /// at 20.5us/tx that it runs at 10.6us/tx isolated — the writer's
-    /// page churn evicts the interpreter's working set from the shared
-    /// L3, a uniform memory-level tax no code-level timer can see (it
-    /// slowed evm and the read path by the same 28%). Empty = let the
-    /// scheduler place workers (it settles them ON the writer's CCX often
-    /// enough to produce a floating per-block performance step).
+    /// Measured reason: on a machine with two CPU core clusters sharing
+    /// a split L3 cache, a worker sharing its cluster with the mdbx
+    /// writer ran the same block roughly twice as slow as it ran
+    /// isolated. The writer's page churn evicts the interpreter's
+    /// working set from the shared cache, a memory-level tax that no
+    /// code-level timer can see. An empty list lets the scheduler place
+    /// workers, which settles them on the writer's cluster often enough
+    /// to produce a floating per-block performance step.
     pub pin_cores: Vec<usize>,
 }
 
-/// MEASURED default (uniswap 8-pair, 16x500, 8 workers): batching 8
-/// completions per graph-lock acquisition cuts prune time ~30% with no
-/// wall-clock cost — worth taking, but NOT the lever. The binding
-/// constraint is the serial feed (~33% of block wall, 57% of it
-/// footprint prediction), which is why `prune_batch` is a knob and not a
-/// fix. See the P2b notes in the PR.
+/// Measured default: batching 8 completions per graph-lock acquisition
+/// cuts prune time by about 30% with no wall-clock cost. Worth taking,
+/// but not the main lever. The binding constraint is the serial feed
+/// (about 33% of block wall time, 57% of that spent on footprint
+/// prediction), which is why `prune_batch` is a tuning knob, not a fix.
 pub const DEFAULT_PRUNE_BATCH: usize = 8;
 
 impl Default for PoolConfig {
@@ -1033,24 +1055,24 @@ impl Default for PoolConfig {
     }
 }
 
-/// The feed's LAST-TOUCHER index: cell-hash -> most recent toucher.
+/// The feed's last-toucher index: cell-hash to most recent toucher.
 ///
-/// Flat and hash-keyed, not a `HashMap<DomainKey, u32>`: the map held
-/// ~8k live entries of 53-byte keys (~512KB, L2-busting) and compared
-/// those keys on every probe, and the upsert pair was the serial feed's
-/// largest stage (0.29µs/tx measured). Here a slot is 16 bytes, the
-/// whole table is 256KB, a probe is ONE cache line, and the key
+/// Flat and hash-keyed, not a `HashMap<DomainKey, u32>`. The map held
+/// thousands of live entries with large keys, ran past the L2 cache
+/// size, and compared those keys on every probe. The upsert pair was
+/// the serial feed's largest stage. Here a slot is 16 bytes, the whole
+/// table fits in 256KB, a probe is one cache line, and the key
 /// comparison is a u64.
 ///
-/// COLLISIONS ARE SAFE BY CONSTRUCTION: a 64-bit collision fabricates a
-/// dependency EDGE between two txs that do not actually share a cell.
-/// The DAG is conservative — a false edge costs a sliver of parallelism
-/// and nothing else, while a MISSED edge (impossible here: equal cells
-/// hash equal) is what validation exists to catch.
+/// Collisions are safe by construction: a 64-bit collision fabricates a
+/// dependency edge between two transactions that do not actually share
+/// a cell. The DAG is conservative: a false edge costs a sliver of
+/// parallelism and nothing else, while a missed edge (impossible here,
+/// since equal cells hash equal) is what validation exists to catch.
 ///
 /// Reset is O(1): a slot belongs to the current block only if its
 /// `stamp` matches, so a new block bumps the stamp instead of clearing
-/// 256KB.
+/// the whole table.
 struct TouchSlot {
     hash: u64,
     idx: u32,
@@ -1065,10 +1087,11 @@ pub(crate) struct TouchTable {
 
 impl TouchTable {
     fn new(capacity_pow2: usize) -> Self {
-        // NOT a debug_assert: with a non-power-of-two capacity the
-        // `& mask` probe walk reaches only a subset of the slots, and
-        // `upsert` spins forever once that subset fills. Cheap to check
-        // once per table, impossible to diagnose later.
+        // This is a real assert, not a debug_assert: with a
+        // non-power-of-two capacity, the `& mask` probe walk reaches
+        // only a subset of the slots, and `upsert` spins forever once
+        // that subset fills. It is cheap to check once per table, and
+        // impossible to diagnose later.
         assert!(
             capacity_pow2.is_power_of_two(),
             "TouchTable capacity must be a power of two, got {capacity_pow2}"
@@ -1090,8 +1113,8 @@ impl TouchTable {
     fn clear(&mut self) {
         self.stamp = self.stamp.wrapping_add(1);
         if self.stamp == 0 {
-            // Wrapped after 4.3B blocks: hard-clear so no stale slot can
-            // resurrect, then restart at 1.
+            // The stamp wrapped after billions of blocks. Hard-clear so
+            // no stale slot can resurrect, then restart at 1.
             for s in self.slots.iter_mut() {
                 s.stamp = 0;
             }
@@ -1099,8 +1122,8 @@ impl TouchTable {
         }
     }
 
-    /// Record `idx` as the latest toucher of `hash`; return the previous
-    /// one, if this block has seen the cell.
+    /// Record `idx` as the latest toucher of `hash`, and return the
+    /// previous one, if this block has seen the cell.
     #[inline]
     fn upsert(&mut self, hash: u64, idx: u32) -> Option<u32> {
         let mut i = hash as usize & self.mask;
@@ -1122,60 +1145,61 @@ impl TouchTable {
     }
 }
 
-/// One tx's node in the LIVE dependency DAG — and its REGISTRATION POINT.
+/// One transaction's node in the live dependency DAG, and its
+/// registration point.
 ///
 /// The lock-free trick that removes the global admission lock: a node is
-/// "still in flight" exactly while its `children` list is OPEN. Admission
+/// "still in flight" exactly while its `children` list is open. Admission
 /// registers an edge by pushing into a predecessor's open list; the
-/// predecessor's completion CLOSES the list (`None`) and drains it. Both
-/// happen under that ONE node's tiny mutex, so "is p outstanding?" and
-/// "register my edge on p" are a single atomic step — which is precisely
-/// the guarantee a `Weak::upgrade` cannot give on its own (dropping the
+/// predecessor's completion closes the list (`None`) and drains it. Both
+/// happen under that one node's tiny mutex, so "is p outstanding?" and
+/// "register my edge on p" are a single atomic step. This is precisely
+/// the guarantee a `Weak::upgrade` cannot give on its own: dropping the
 /// last strong reference does not order against a concurrent
 /// registration, so an edge could be registered onto a list already
-/// drained, and its child would then wait forever for a decrement nobody
-/// will send).
+/// drained, and its child would then wait forever for a decrement that
+/// nobody sends.
 ///
 /// Contention is nil: only the single feed thread pushes, and only the
-/// one worker that executed p closes. There is no structure any two
-/// threads contend on for the whole block.
+/// one worker that executed p closes. No structure is contended by two
+/// threads for the whole block.
 #[derive(Default)]
 struct Node {
-    /// True while this tx is outstanding and accepting edges. Flipped
-    /// under `children`'s lock, which is what makes "is p outstanding?"
-    /// and "register my edge on p" one atomic step.
+    /// True while this transaction is outstanding and accepting edges.
+    /// Flipped under `children`'s lock, which is what makes "is p
+    /// outstanding?" and "register my edge on p" one atomic step.
     open: AtomicBool,
-    /// Children registered while open. Drained IN PLACE at close so the
+    /// Children registered while open. Drained in place at close so the
     /// buffer keeps its capacity for the next block that reuses this
-    /// arena slot — steady-state allocation is zero.
+    /// arena slot: steady-state allocation is zero.
     children: Mutex<Vec<u32>>,
-    /// Outstanding predecessors. Carries a +1 ADMISSION GUARD while the
-    /// feed is still registering this tx's edges, so a predecessor that
-    /// finishes mid-admission cannot drive the count to zero early and
-    /// dispatch a half-linked tx.
+    /// Outstanding predecessors. Carries a +1 admission guard while the
+    /// feed is still registering this transaction's edges, so a
+    /// predecessor that finishes mid-admission cannot drive the count to
+    /// zero early and dispatch a half-linked transaction.
     indegree: AtomicU32,
-    /// The thread this tx was assigned. Written before any edge naming it
-    /// exists, so whoever dispatches it reads a settled value.
+    /// The thread this transaction was assigned. Written before any edge
+    /// naming it exists, so whoever dispatches it reads a settled value.
     worker: std::sync::atomic::AtomicUsize,
-    /// TRUE once this node has been handed to a worker queue. The eager
-    /// coverage test reads THIS, not `indegree == 0`: prune decrements
-    /// indegrees first and pushes later, and in that window the feed
-    /// would otherwise enqueue a successor AHEAD of its predecessor —
-    /// the owner then spins forever on a head whose FIFO predecessor
-    /// sits behind it (measured: intermittent silent wedge on the
-    /// transfers shape, ~20% of runs). Set under the queue lock, so a
-    /// `true` read orders the predecessor's push before any subsequent
-    /// eager push to the same queue.
+    /// True once this node has been handed to a worker queue. The eager
+    /// coverage test reads this, not `indegree == 0`, because prune
+    /// decrements indegrees first and pushes later. In that window the
+    /// feed would otherwise enqueue a successor ahead of its
+    /// predecessor, and the owner would then spin forever on a head
+    /// whose FIFO predecessor sits behind it (an intermittent silent
+    /// wedge, observed on the transfers shape). This flag is set under
+    /// the queue lock, so a `true` read orders the predecessor's push
+    /// before any subsequent eager push to the same queue.
     queued: AtomicBool,
-    /// Predecessors covered by FIFO ORDER instead of an edge (eager chain
-    /// mode): they were already released to THIS tx's own queue when this
-    /// tx was admitted, so queue position orders them — no edge, no prune
-    /// hand-off. Written only by the serial feed before the tx can be
-    /// released; read by whoever takes the tx from a queue, which must
-    /// verify each one has a result before executing (work stealing can
-    /// move a FIFO predecessor to another thread mid-flight, and the
-    /// verification is what makes that race benign rather than a data
-    /// race on state).
+    /// Predecessors covered by FIFO order instead of an edge (eager
+    /// chain mode): they were already released to this transaction's own
+    /// queue when it was admitted, so queue position orders them, with
+    /// no edge and no prune hand-off. Written only by the serial feed
+    /// before the transaction can be released. Read by whoever takes
+    /// the transaction from a queue, which must verify each one has a
+    /// result before executing: work stealing can move a FIFO
+    /// predecessor to another thread mid-flight, and this verification
+    /// is what makes that race benign instead of a data race on state.
     fifo_preds: Mutex<Vec<u32>>,
 }
 
@@ -1183,38 +1207,38 @@ struct Node {
 /// duration.
 struct BlockCtx<S: StateDatabase> {
     env: ExecEnv,
-    /// One state view PER WORKER.
+    /// One state view per worker.
     ///
-    /// This is not an optimization, it is a requirement of the backend:
+    /// This is not an optimization; it is a requirement of the backend.
     /// mdbx's synchronized read transaction guards its pointer with a
-    /// mutex ("serialises access to the transaction pointer"), so workers
-    /// sharing ONE snapshot funnel every state read through one lock —
-    /// measured as parallel execution getting SLOWER with more workers
-    /// (0.86x at 4, 0.78x at 8) while the in-memory backend scaled. Each
-    /// worker therefore reads through its own transaction, all opened at
-    /// the same committed block, so the view is identical.
+    /// mutex, so workers sharing one snapshot funnel every state read
+    /// through one lock. This was measured as parallel execution getting
+    /// slower with more workers, while the in-memory backend scaled
+    /// normally. Each worker therefore reads through its own
+    /// transaction, all opened at the same committed block, so the view
+    /// is identical.
     snapshots: Vec<S>,
     base: PendingDelta,
-    /// EIP-7928 capture: `Some(base_index)` turns on per-tx fragment
-    /// capture, with fragment indices `base_index + local_idx + 1`
-    /// (block-global — the caller passes the count of canonical records
-    /// before this run, non-zero when a block is segmented around
-    /// deposits). `None` = no capture (the default; validators and
-    /// benches never pay for it).
+    /// EIP-7928 capture: `Some(base_index)` turns on per-transaction
+    /// fragment capture, with fragment indices `base_index + local_idx +
+    /// 1` (block-global; the caller passes the count of canonical
+    /// records before this run, non-zero when a block is segmented
+    /// around deposits). `None` means no capture (the default;
+    /// validators and benches never pay for it).
     bal_base: Option<u64>,
-    /// Unsettled predecessor deltas, newest first (see `BlockInput`).
-    /// Unsettled predecessor deltas + the fee-sink block-start view —
-    /// everything about the block's READ BASE that depends on its
-    /// predecessor's outcome. LATE-BOUND (spec P3b): admission is
-    /// layer-independent, so a pipelined consumer builds, feeds, and
-    /// submits this block during its predecessor's execution and binds
-    /// the layers when the predecessor's delta releases. Workers gate on
-    /// the bind before executing (see `run_worker_block`); the
-    /// block-at-a-time path binds at session build, making the gate
-    /// free.
+    /// Unsettled predecessor deltas, newest first (see `BlockInput`),
+    /// plus the fee-sink block-start view: everything about the block's
+    /// read base that depends on its predecessor's outcome. This is
+    /// late-bound: admission is layer-independent, so a pipelined
+    /// consumer builds, feeds, and submits this block during its
+    /// predecessor's execution, and binds the layers when the
+    /// predecessor's delta releases. Workers wait for the bind before
+    /// executing (see `run_worker_block`); the block-at-a-time path
+    /// binds at session build, making the wait free.
     binding: std::sync::OnceLock<BoundLayers>,
-    /// Arc: outlives the block as a predecessor mv layer (mv-as-layer
-    /// releases clone it; the last holder drops it, usually the reaper).
+    /// An Arc, so this outlives the block as a predecessor mv layer
+    /// (mv-as-layer releases clone it; the last holder drops it, usually
+    /// the reaper).
     mv: Arc<MvCache>,
     /// Shared read-through cache over the immutable block-input layer.
     base_cache: std::sync::Arc<BaseCache>,
@@ -1225,88 +1249,90 @@ struct BlockCtx<S: StateDatabase> {
     results: Vec<std::sync::OnceLock<Result<TxResult, ExecutorError>>>,
     queues: Vec<WorkerQueue>,
     /// Bag-scheduler mode (see PoolConfig::bag_scheduler): the shared
-    /// runnable set. Allocated always (16KB), used when `bag_mode`.
+    /// runnable set. Always allocated, used only when `bag_mode`.
     bag: crossbeam_queue::ArrayQueue<u32>,
     bag_mode: bool,
-    /// The pool's arena (see [`PoolHandle::arena`]) — shared, never
+    /// The pool's arena (see [`PoolHandle::arena`]): shared, never
     /// reallocated, indexed concurrently while the feed is still
     /// admitting.
     nodes: Arc<Vec<Node>>,
-    /// Admitted (feed-only writer) and finished (workers) counts; the
-    /// block is drained when sealed and the two agree.
+    /// Admitted (feed-only writer) and finished (workers) counts. The
+    /// block is drained when it is sealed and the two agree.
     admitted: AtomicU32,
     finished: AtomicU32,
     sealed: AtomicBool,
     /// Per-worker completion buffers: a finishing worker parks its index
-    /// here (uncontended — it owns the slot) instead of retiring edges on
-    /// every tx; a prune drains them.
+    /// here (uncontended, since it owns the slot) instead of retiring
+    /// edges on every transaction. A prune drains them.
     completed: Vec<Mutex<Vec<u32>>>,
-    /// Length of each buffer, readable WITHOUT taking its mutex. A prune
-    /// otherwise locks every worker's buffer just to find it empty, and
-    /// spinning workers force-prune often — measured at ~2us/tx on
-    /// micro-gas workloads, the largest single overhead there.
-    /// PADDED to a cache line each. These are RMW'd by every worker on
-    /// every completion and read by every prune; packed as a plain
-    /// `Vec<AtomicU32>` all eight counters shared ONE line, so each
-    /// completion invalidated it for every other worker.
+    /// Length of each buffer, readable without taking its mutex. A prune
+    /// would otherwise lock every worker's buffer just to find it empty,
+    /// and spinning workers force-prune often, which was the largest
+    /// single overhead on micro-gas workloads. Padded to a cache line
+    /// each: these counters are read-modify-written by every worker on
+    /// every completion and read by every prune, so packing them into a
+    /// plain array let each completion invalidate the cache line for
+    /// every other worker.
     completed_len: Vec<PaddedLen>,
-    /// Completions parked across all buffers, i.e. DAG updates owed.
+    /// Completions parked across all buffers: DAG updates owed.
     pending: std::sync::atomic::AtomicU64,
     prune_batch: usize,
-    /// Block start, so workers can stamp first-dispatch / last-completion
-    /// offsets without reaching into the session.
+    /// Block start, so workers can stamp first-dispatch and
+    /// last-completion offsets without reaching into the session.
     started: std::time::Instant,
-    /// Whether an idle worker may take a ready tx from another thread.
+    /// Whether an idle worker may take a ready transaction from another
+    /// thread.
     ///
-    /// Stealing migrates a transaction to a core whose caches know nothing
-    /// about the accounts it touches. That pays handsomely when the tx is
-    /// expensive (uniswap swaps, ~15us: 1.55x -> 1.67x) and LOSES badly
-    /// when it is not (21k-gas transfers, ~2.75us: 0.93x -> 0.60x), where
-    /// the migration costs more than the work it moves. So the policy is
-    /// measured, not fixed: the pool tracks mean per-tx execution time and
-    /// enables stealing only above a threshold.
+    /// Stealing migrates a transaction to a core whose caches know
+    /// nothing about the accounts it touches. That pays off well when
+    /// the transaction is expensive (a uniswap swap, about 15us) and
+    /// loses badly when it is not (a 21k-gas transfer, about 2.75us),
+    /// where the migration costs more than the work it moves. So the
+    /// policy is measured, not fixed: the pool tracks mean
+    /// per-transaction execution time and enables stealing only above a
+    /// threshold.
     steal_enabled: bool,
-    /// How long a dry worker spins before parking, in ns — sized from the
-    /// measured mean per-tx time. The old fixed 256 `spin_loop` hints
-    /// (<1us) were 25x SHORTER than the typical gap between chain-link
-    /// releases (~one tx execution), so workers parked into the exact
-    /// window their next transaction arrived in and paid up to the 200us
-    /// poll to notice it. MEASURED at w=4/4-pair: 25k dry cycles per 8k
-    /// txs, ~30% of worker capacity idle, while all prune work cost 8ms —
-    /// the idle was park latency, not scheduler cost.
+    /// How long a dry worker spins before parking, in nanoseconds, sized
+    /// from the measured mean per-transaction time. A short fixed spin
+    /// was much shorter than the typical gap between chain-link
+    /// releases (about one transaction's execution time), so workers
+    /// parked into the exact window their next transaction arrived in
+    /// and paid the full poll interval to notice it. Measurement showed
+    /// most of a worker's idle time was this park latency, not
+    /// scheduler cost.
     spin_ns: u64,
     done_cv: Condvar,
     aborted: AtomicBool,
-    /// Nodes observed leaving the graph more than once — always zero; a
-    /// non-zero value is a scheduler bug surfaced at seal rather than a
+    /// Nodes observed leaving the graph more than once. Always zero. A
+    /// non-zero value is a scheduler bug surfaced at seal, rather than a
     /// silently stranded edge.
     double_exit: AtomicU32,
     metrics: Metrics,
 }
 
-/// LOCK ORDER (the engine's one hard rule): the graph lock may be taken
+/// Lock order (the engine's one hard rule): the graph lock may be taken
 /// while holding nothing, and a queue lock may be taken while holding
-/// nothing or the graph lock's RESULTS — never while the graph lock is
-/// HELD. Every dispatch therefore collects its ready set under the graph
-/// lock, releases it, and only then pushes. The idle path takes the graph
-/// lock only after dropping its queue lock.
+/// nothing or the graph lock's results, but never while the graph lock
+/// is held. Every dispatch therefore collects its ready set under the
+/// graph lock, releases it, and only then pushes. The idle path takes
+/// the graph lock only after dropping its queue lock.
 impl<S: StateDatabase> BlockCtx<S> {
-    /// Steal one ready tx from the longest other queue.
+    /// Steal one ready transaction from the longest other queue.
     ///
-    /// Safe by VERIFICATION: under eager chain mode queue position DOES
+    /// Safe by verification: under eager chain mode, queue position does
     /// carry an ordering obligation (FIFO-covered predecessors have no
-    /// edge), so anything taken from a queue — here or by its owner — is
-    /// checked runnable first via `fifo_ready`. A mid-chain link fails
-    /// the check and stays put.
+    /// edge), so anything taken from a queue, here or by its owner, is
+    /// checked runnable first through `fifo_ready`. A mid-chain link
+    /// fails the check and stays put.
     ///
-    /// Taken from the BACK, leaving the owner its front: the owner's
-    /// front is the oldest (most likely to have warm state), and the two
-    /// ends rarely contend.
+    /// Taken from the back, leaving the owner its front: the owner's
+    /// front holds the oldest entries, most likely to have warm state,
+    /// and the two ends rarely contend.
     /// May `idx` execute right now? True when every FIFO-covered
     /// predecessor has a result. Ordinary FIFO drain makes this true by
-    /// construction (the predecessor sat AHEAD in the same queue); it is
-    /// false only when a steal moved a predecessor to another thread and
-    /// that thread is still running it.
+    /// construction, since the predecessor sat ahead in the same queue.
+    /// It is false only when a steal moved a predecessor to another
+    /// thread and that thread is still running it.
     fn fifo_ready(&self, idx: u32) -> bool {
         let preds = self.nodes[idx as usize]
             .fifo_preds
@@ -1323,28 +1349,30 @@ impl<S: StateDatabase> BlockCtx<S> {
             if w == thief {
                 continue;
             }
-            // Hint only — the victim's own lock confirms below.
+            // Hint only; the victim's own lock confirms below.
             let len = qh.len.load(Ordering::Acquire);
-            // ANY queued tx is stealable. The previous `len > 1` guard —
-            // "leave the owner its work" — silently disabled stealing
-            // altogether: under DAG chains a domain releases ONE ready tx
-            // at a time, so queues hold 0 or 1 items essentially always.
-            // That capped effective parallelism at roughly the number of
-            // domains that happened to hash to distinct workers.
+            // Any queued transaction is stealable. A previous `len > 1`
+            // guard, meant to leave the owner its work, silently disabled
+            // stealing altogether: under DAG chains, a domain releases
+            // one ready transaction at a time, so queues hold 0 or 1
+            // items almost always. That capped effective parallelism at
+            // roughly the number of domains that happened to hash to
+            // distinct workers.
             if len >= 1 && best.is_none_or(|(_, b)| len > b) {
                 best = Some((w, len));
             }
         }
         let (victim, _) = best?;
         let vq = &self.queues[victim];
-        // Verification stays UNDER the victim's lock, deliberately — this
-        // is the one place the pop/verify/putback triple must be atomic.
-        // A back-putback after an unlocked window reorders: the feed can
-        // eagerly enqueue the candidate's own FIFO-successor into the gap,
-        // the putback lands BEHIND it, and the owner livelocks on a head
-        // whose predecessor now sits behind it (measured: 3/6 test runs
-        // hung). The owner's pop-path verify can run unlocked because its
-        // FRONT-putback preserves relative order; back-putback cannot.
+        // Verification stays under the victim's lock, deliberately. This
+        // is the one place the pop, verify, and putback steps must be
+        // atomic. A back-putback after an unlocked window can reorder
+        // things: the feed can eagerly enqueue the candidate's own
+        // FIFO-successor into the gap, the putback lands behind it, and
+        // the owner livelocks on a head whose predecessor now sits
+        // behind it (this caused several test runs to hang). The owner's
+        // pop-path verify can run unlocked, because its front-putback
+        // preserves relative order; a back-putback cannot.
         let mut q = vq.q.lock().expect("queue poisoned");
         let cand = q.pop_back()?;
         if self.fifo_ready(cand) {
@@ -1356,13 +1384,14 @@ impl<S: StateDatabase> BlockCtx<S> {
         }
     }
 
-    /// Hand a READY tx to its assigned thread. Called only with no node
-    /// mutex held (lock order: node registration points are leaves).
+    /// Hand a ready transaction to its assigned thread. Called only with
+    /// no node mutex held (lock order: node registration points are
+    /// leaves).
     fn push_ready(&self, worker: usize, idx: u32) {
         if self.bag_mode {
-            // ONE shared lock-free runnable set: no assignment, no
+            // One shared lock-free runnable set: no assignment, no
             // per-worker locks, balanced by whoever pops first. `queued`
-            // is irrelevant (coverage is off in bag mode — every
+            // is irrelevant, since coverage is off in bag mode (every
             // dependency is an edge).
             let pushed = self.bag.push(idx).is_ok();
             debug_assert!(pushed, "bag sized at MAX_BLOCK_TXS");
@@ -1382,25 +1411,25 @@ impl<S: StateDatabase> BlockCtx<S> {
         q.push_back(idx);
         qh.len.fetch_add(1, Ordering::Release);
         drop(q);
-        // Only wake a worker that actually parked. Under load the queue is
-        // rarely empty, so this elides nearly every syscall.
+        // Only wake a worker that actually parked. Under load the queue
+        // is rarely empty, so this elides nearly every syscall.
         if qh.parked.load(Ordering::Acquire) {
             qh.cv.notify_one();
         }
     }
 
-    /// Apply parked completions to the live DAG: CLOSE each finished
+    /// Apply parked completions to the live DAG: close each finished
     /// node's registration point, retire the edges that were registered
     /// while it was open, and hand whatever became ready to its thread.
-    /// Takes no global lock — only the finished nodes' own mutexes.
-    /// BAG MODE completion, INLINE: the finishing worker closes its own
-    /// node right here — no per-worker completion buffer, no
-    /// cross-worker buffer scan, no `pending` counter round-trip. One
-    /// uncontended child-list lock, one indegree fetch_sub per child,
-    /// ready children go straight to the bag. Prune batching only ever
-    /// existed to amortize the OLD global graph lock; per-node locks
-    /// made it ceremony (measured ~0.8µs per completion on independent
-    /// transfers — the next wall after the feed).
+    /// Takes no global lock, only the finished nodes' own mutexes.
+    /// Bag-mode completion, inline: the finishing worker closes its own
+    /// node right here, with no per-worker completion buffer, no
+    /// cross-worker buffer scan, and no `pending` counter round-trip.
+    /// One uncontended child-list lock, one indegree fetch_sub per
+    /// child, and ready children go straight to the bag. Prune batching
+    /// only ever existed to amortize the old global graph lock;
+    /// per-node locks made it unnecessary ceremony, and this path is
+    /// faster on independent transfers.
     fn complete_inline(&self, job: u32) -> Option<u32> {
         let node = &self.nodes[job as usize];
         let mut list = node.children.lock().expect("children poisoned");
@@ -1412,10 +1441,11 @@ impl<S: StateDatabase> BlockCtx<S> {
             );
             self.double_exit.fetch_add(1, Ordering::SeqCst);
         }
-        // Collect under the lock, dispatch after (bag push is lock-free,
-        // but keeping the child-list critical section minimal matters
-        // for the feed racing to register on this node).
-        // Fixed-size stack buffer + spill: no per-completion allocation.
+        // Collect under the lock, dispatch after: the bag push is
+        // lock-free, but keeping the child-list critical section minimal
+        // matters while the feed races to register on this node.
+        // Fixed-size stack buffer, plus a spill vec: no per-completion
+        // allocation.
         let mut ready_buf = [0u32; 8];
         let mut n_ready = 0usize;
         let mut spill: Vec<u32> = Vec::new();
@@ -1434,11 +1464,12 @@ impl<S: StateDatabase> BlockCtx<S> {
         drop(list);
         self.finished.fetch_add(1, Ordering::SeqCst);
         self.metrics.completions.fetch_add(1, Ordering::Relaxed);
-        // CHAIN-LOCAL HAND-OFF: the FIRST ready child stays with the
-        // completing worker as its next job (returned, no bag op, warm
-        // cache — a chain streams on one core exactly as the FIFO
-        // scheduler streamed it, without a queue); the rest go to the
-        // bag for whoever is free.
+        // Chain-local hand-off: the first ready child stays with the
+        // completing worker as its next job. It is returned directly,
+        // with no bag operation, so the cache stays warm. A chain
+        // streams on one core exactly as the FIFO scheduler streamed
+        // it, without a queue. The rest go to the bag for whoever is
+        // free.
         let mut keep: Option<u32> = None;
         for c in ready_buf.iter().take(n_ready).chain(spill.iter()) {
             if keep.is_none() {
@@ -1477,10 +1508,10 @@ impl<S: StateDatabase> BlockCtx<S> {
             };
             for job in drained {
                 applied += 1;
-                // LEAVE ONCE. Closing IS the node's exit from the graph;
-                // a second close would strand every edge registered in
-                // between, so it is asserted rather than assumed. The
-                // list is drained IN PLACE so its capacity survives for
+                // Leave once. Closing is the node's exit from the graph.
+                // A second close would strand every edge registered in
+                // between, so this is asserted rather than assumed. The
+                // list is drained in place so its capacity survives for
                 // the next block that reuses this arena slot.
                 let node = &self.nodes[job as usize];
                 let mut list = node.children.lock().expect("children poisoned");
@@ -1539,7 +1570,7 @@ impl<S: StateDatabase> BlockCtx<S> {
 struct PoolState<S: StateDatabase> {
     generation: u64,
     ctx: Option<Arc<BlockCtx<S>>>,
-    /// The NEXT block, fed while `ctx` still executes (pipeline depth 2).
+    /// The next block, fed while `ctx` still executes (pipeline depth 2).
     /// The tail installs it the moment `ctx` drains; the generation bump
     /// walks the workers over. Feeding needs no workers, so admission of
     /// block N+1 overlaps execution of block N entirely.
@@ -1552,23 +1583,23 @@ type PoolShared<S> = (Mutex<PoolState<S>>, Condvar);
 
 /// A spent block's droppables, shipped to the reaper thread.
 /// Recycle pools (steady-state zero-allocation blocks): the reaper
-/// scrubs spent block structures IN PLACE (drop entries, keep every
-/// buffer) and parks them here; session build pops instead of mapping
-/// ~8MB of fresh arenas per block. mv caches outlive their block as
+/// scrubs spent block structures in place (drops entries, keeps every
+/// buffer) and parks them here. Session build pops from here instead of
+/// mapping fresh arenas per block. mv caches outlive their block as
 /// mv-as-layer references, so a still-shared cache parks until its
-/// last Arc drops and is swept at the next build.
+/// last Arc drops, and is swept at the next build.
 struct RecyclePools {
     arenas: Mutex<Vec<SpentArena>>,
     mv_clean: Mutex<Vec<MvCache>>,
     mv_parked: Mutex<Vec<Arc<MvCache>>>,
-    /// Cleared per-tx read-record buffers, returned by the reaper in
-    /// one batch per block, taken by workers in batches of 64 — the
-    /// per-tx `Vec::with_capacity` + growth reallocs were the largest
-    /// STM-specific allocation (~4KB/tx at contract weight).
+    /// Cleared per-transaction read-record buffers, returned by the
+    /// reaper in one batch per block, taken by workers in batches of
+    /// 64. The per-transaction `Vec::with_capacity` and its growth
+    /// reallocations were the largest STM-specific allocation.
     read_bufs: Mutex<Vec<Vec<ReadRecord>>>,
     /// Cleared PendingDelta shells for the fold (the maps' tables are
-    /// the other huge per-block allocation); returned by the consumer
-    /// via [`PoolHandle::recycle_delta`] once a release settles.
+    /// the other huge per-block allocation), returned by the consumer
+    /// through [`PoolHandle::recycle_delta`] once a release settles.
     deltas: Mutex<Vec<PendingDelta>>,
 }
 
@@ -1589,13 +1620,13 @@ enum Reap {
     },
 }
 
-/// One sealed block handed to the persistent TAIL thread (spec P3a):
-/// drain, release the pool slot, then `block_tail`.
+/// One sealed block handed to the persistent tail thread: drain,
+/// release the pool slot, then `block_tail`.
 /// Per-shard last-toucher tables for sharded admission.
 ///
 /// SAFETY: table `k` is touched only from the lane executing chunk `k`,
 /// and `WorkerPool::run` hands each chunk index to exactly one lane and
-/// returns only after every lane has finished — so accesses to a given
+/// returns only after every lane has finished. So accesses to a given
 /// table are serialized, and the batch boundary orders them against the
 /// router's reads.
 struct ShardTables(Vec<std::cell::UnsafeCell<TouchTable>>);
@@ -1623,7 +1654,7 @@ impl ShardTables {
     }
 }
 
-/// Shared, read-only view of a drained block's results, read IN PLACE
+/// Shared, read-only view of a drained block's results, read in place
 /// out of the block arena (see the presence prepass in `block_tail`).
 /// Every slot is known to hold `Some(Ok(_))` before this is built.
 #[derive(Clone, Copy)]
@@ -1648,7 +1679,7 @@ impl<'a> Results<'a> {
 
 /// The late-bound part of a block's read base (see `BlockCtx::binding`).
 struct BoundLayers {
-    /// Predecessor mv caches, newest first (spec P3b mv-as-layer).
+    /// Predecessor mv caches, newest first.
     mv_layers: Vec<std::sync::Arc<MvCache>>,
     layers: Vec<std::sync::Arc<PendingDelta>>,
     sink_start: Option<AccountInfo>,
@@ -1666,23 +1697,23 @@ struct TailJob<S: StateDatabase> {
     delta_out: Option<DeltaOut>,
 }
 
-/// Streaming delta hand-off (spec P3): block N's folded delta, released
-/// to whoever layers block N+1 — before N's receipts, and (in
-/// speculative mode) before N's validation verdict.
+/// Streaming delta hand-off: block N's folded delta, released to
+/// whoever layers block N+1, before N's receipts, and in speculative
+/// mode, before N's validation verdict.
 pub struct DeltaRelease {
     pub block: u64,
     pub delta: std::sync::Arc<PendingDelta>,
     /// True when this re-issues a block whose earlier speculative
-    /// release was invalidated by a wound: everything layered on the
-    /// stale release must be aborted and rebuilt on THIS delta.
+    /// release was invalidated by a wound. Everything layered on the
+    /// stale release must be aborted and rebuilt on this delta.
     pub corrected: bool,
 }
 
 /// Binds a deferred session's read base (see
-/// [`PoolHandle::begin_block_deferred`]). Consumed by `bind`; a binder
-/// dropped without binding leaves the block gated — `abort_active` it.
-/// Holds only a WEAK reference: the tail's ctx unwrap must not wait on
-/// a consumer that decided to abort instead of bind.
+/// [`PoolHandle::begin_block_deferred`]). Consumed by `bind`. A binder
+/// dropped without binding leaves the block gated; call `abort_active`
+/// on it. Holds only a weak reference, since the tail's ctx unwrap must
+/// not wait on a consumer that decided to abort instead of bind.
 pub struct LayerBinder<S: StateDatabase> {
     ctx: std::sync::Weak<BlockCtx<S>>,
 }
@@ -1695,11 +1726,11 @@ impl<S: StateDatabase> LayerBinder<S> {
         self.bind_with(Vec::new(), layers, None)
     }
 
-    /// [`Self::bind`] with predecessor MV LAYERS (spec P3b
-    /// mv-as-layer), newest first, probed before the delta layers. The
+    /// [`Self::bind`] with predecessor mv layers, newest first, probed
+    /// before the delta layers. The
     /// fee sink is never published to an mv cache, so `sink_final`
-    /// (from the predecessor's [`MvRelease`]) is REQUIRED whenever mv
-    /// layers are present; without mv layers it may be None and the
+    /// (from the predecessor's [`MvRelease`]) is required whenever mv
+    /// layers are present. Without mv layers it may be `None`, and the
     /// sink is probed through the delta layers as usual.
     pub fn bind_with(
         self,
@@ -1751,16 +1782,16 @@ impl<S: StateDatabase> LayerBinder<S> {
     }
 }
 
-/// The EARLY streaming release (spec P3b mv-as-layer): block N's
-/// multi-version cache, shipped right after drain + extract — before
-/// phase-1/fold/validation. Its top version per cell equals what the
-/// fold will compute; the sink (never published to mv) rides along,
-/// already materialized. Pre-verdict by construction: a wound
-/// invalidates it through the corrected `DeltaRelease` that follows.
+/// The early streaming release: block N's multi-version cache,
+/// shipped right after drain and extract, before phase-1, fold, or
+/// validation. Its top version per cell equals what
+/// the fold will compute; the sink (never published to mv) rides along,
+/// already computed. Pre-verdict by construction: a wound invalidates
+/// it through the corrected `DeltaRelease` that follows.
 pub struct MvRelease {
     pub block: u64,
     pub mv: std::sync::Arc<MvCache>,
-    /// The fee sink's FINAL account for this block (start + fee sum).
+    /// The fee sink's final account for this block (start plus fee sum).
     pub sink_final: Option<AccountInfo>,
 }
 
@@ -1768,10 +1799,10 @@ struct DeltaOut {
     tx: std::sync::mpsc::Sender<DeltaRelease>,
     /// mv-as-layer early release channel (implies speculative).
     mv_tx: Option<std::sync::mpsc::Sender<MvRelease>>,
-    /// Speculative (spec P3b): release at fold, CONCURRENT with
-    /// validation — a wound invalidates the release (a `corrected`
-    /// re-issue follows). Conservative (P3a): release only after the
-    /// verdict, when the delta can no longer change.
+    /// Speculative: release at fold, concurrent with validation. A
+    /// wound invalidates the release, and a `corrected` re-issue
+    /// follows. Conservative: release only after the verdict, when
+    /// the delta can no longer change.
     speculative: bool,
 }
 
@@ -1790,52 +1821,54 @@ impl BlockTicket {
     }
 }
 
-/// A persistent worker pool bound to one snapshot view for its lifetime —
-/// the PIPELINE shape the live executor needs: workers are spawned ONCE
-/// (no per-block thread cost); each block is a session whose txs are
-/// admitted AS THEY ARRIVE from the sealer stream. Canonical arrival makes
-/// the DAG incremental — a tx's predecessors are always already admitted,
-/// so execution overlaps the feed, and sealing at the boundary only waits
-/// out the tail, validates, and commits. `run_block` is the batch
-/// convenience; `begin_block`/`push_tx`/`seal` is the actor-shaped API
-/// (P3: the `ReaderToExec::Tx` arm pushes, the `Boundary` arm seals).
+/// A persistent worker pool bound to one snapshot view for its lifetime:
+/// the pipeline shape the live executor needs. Workers are spawned once
+/// (no per-block thread cost), and each block is a session whose
+/// transactions are admitted as they arrive from the sealer stream.
+/// Canonical arrival makes the DAG incremental: a transaction's
+/// predecessors are always already admitted, so execution overlaps the
+/// feed, and sealing at the boundary only waits out the tail, validates,
+/// and commits. `run_block` is the batch convenience; `begin_block`,
+/// `push_tx`, and `seal` form the actor-shaped API (the
+/// `ReaderToExec::Tx` arm pushes, the `Boundary` arm seals).
 pub struct PoolHandle<'a, S: StateDatabase + Sync> {
     shared: &'a PoolShared<S>,
-    /// Mean per-tx execution time of the last block, feeding the stealing
-    /// policy. Atomic (not `Cell`): P3's persistent tail thread updates
-    /// it after each block's fold while the feed thread reads it.
+    /// Mean per-transaction execution time of the last block, feeding
+    /// the stealing policy. Atomic, not `Cell`: the persistent tail
+    /// thread updates it after each block's fold while the feed thread
+    /// reads it.
     avg_tx_ns: std::sync::Arc<std::sync::atomic::AtomicU64>,
     parallel_worth_ns: u64,
     dispatch_by_sender: bool,
     eager_chain: bool,
     sticky_assign: bool,
-    /// Domain -> worker, pool-lifetime (feed-thread-owned). Capped: past
-    /// `STICKY_CAP` entries new domains fall back to hashing, so a
+    /// Domain to worker, pool-lifetime (feed-thread-owned). Capped: past
+    /// `STICKY_CAP` entries, new domains fall back to hashing, so a
     /// long-lived pool cannot grow this without bound.
     assign: std::cell::RefCell<FastMap<DomainKey, usize>>,
-    /// Cumulative txs dispatched per worker — the load the least-loaded
-    /// choice reads.
+    /// Cumulative transactions dispatched per worker: the load the
+    /// least-loaded choice reads.
     assign_load: std::cell::RefCell<Vec<u64>>,
-    /// The persistent TAIL thread's inbox (spec P3a): sealed blocks go
-    /// here; the thread drains, releases the pool slot, and runs
+    /// The persistent tail thread's inbox: sealed blocks go
+    /// here. The thread drains, releases the pool slot, and runs
     /// `block_tail` while the caller feeds the next block.
     tail: std::sync::mpsc::Sender<TailJob<S>>,
-    /// POOL-LIFETIME cache of the BACKEND layer (below any pending-delta
-    /// layer, which is probed before it — see `MvView`). parcounter
-    /// measured 100% of reads reaching mdbx: hot cells change every
-    /// block, so a per-block cache can never hit. But the block's own
-    /// delta CARRIES every new value — `advance_base` upserts it, turning
-    /// next block's backend reads into warm map hits. Valid iff every
-    /// backend commit is mirrored here; the A/B harness asserts
-    /// byte-identical results per block, which checks exactly that.
+    /// Pool-lifetime cache of the backend layer, below any pending-delta
+    /// layer, which is probed before it (see `MvView`). Measurement
+    /// showed almost all reads reach mdbx directly, because hot cells
+    /// change every block, so a per-block cache can never hit. But the
+    /// block's own delta carries every new value: `advance_base` upserts
+    /// it, turning next block's backend reads into warm map hits. This
+    /// is valid only if every backend commit is mirrored here, which the
+    /// A/B harness's byte-identical-results check confirms.
     base_cache: std::sync::Arc<BaseCache>,
     /// Recycled block structures (see [`RecyclePools`]).
     recycle: std::sync::Arc<RecyclePools>,
-    /// The feed's last-toucher index — POOL-LIFETIME (allocated once,
+    /// The feed's last-toucher index: pool-lifetime (allocated once,
     /// O(1) stamp reset per block) and feed-owned, exactly like
-    /// `assign`: only the single admission thread ever touches it.
+    /// `assign`. Only the single admission thread ever touches it.
     touch: std::cell::RefCell<TouchTable>,
-    /// SHARDED ADMISSION: one last-toucher table per cell-space shard,
+    /// Sharded admission: one last-toucher table per cell-space shard,
     /// plus the lanes that drive them. Shard k is touched only by the
     /// lane running chunk k, and lanes run one chunk each per batch.
     shards: std::sync::Arc<ShardTables>,
@@ -1878,8 +1911,8 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
     let avg_tx_ns = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
     let (reap_tx, reap_rx) = std::sync::mpsc::channel::<Reap>();
     let (tail_tx, tail_rx) = std::sync::mpsc::channel::<TailJob<S>>();
-    // Persistent tail lanes (see crate::pool): the hash+validate chunks
-    // run on threads created ONCE, not spawned per block.
+    // Persistent tail lanes (see crate::pool): the hash-and-validate
+    // chunks run on threads created once, not spawned per block.
     let lane_pool = std::sync::Arc::new(crate::pool::WorkerPool::new(
         workers.max(1),
         if cfg_keep_hot && cfg_tail_on_workers {
@@ -1896,8 +1929,8 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
         deltas: Mutex::new(Vec::new()),
     });
     std::thread::scope(|scope| {
-        // Reaper: drops junk freight and SCRUBS recyclable arenas (in
-        // place — entries dropped, buffers kept) so seal() pays for
+        // Reaper: drops junk freight and scrubs recyclable arenas in
+        // place (drops entries, keeps buffers), so seal() pays for
         // neither, and the next session build maps nothing. Exits when
         // the pool drops the last sender.
         scope.spawn(move || {
@@ -1913,9 +1946,9 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         for c in slots.iter_mut() {
                             let _ = c.take();
                         }
-                        // Harvest read-record buffers on the way out (the
-                        // tail no longer builds a carcass Vec, so this is
-                        // where spent results are dropped).
+                        // Harvest read-record buffers on the way out. The
+                        // tail no longer builds a leftover Vec, so this
+                        // is where spent results are dropped.
                         let mut bufs: Vec<Vec<ReadRecord>> = Vec::new();
                         for c in results.iter_mut() {
                             if let Some(Ok(mut r)) = c.take() {
@@ -1961,10 +1994,10 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                 }
             }
         });
-        // The persistent TAIL thread (spec P3a). One thread owns every
-        // block's post-drain work in submission order; per-block scoped
-        // threads for sub-millisecond phases measured as a net loss, and
-        // this thread is also what lets the caller feed block N+1 while
+        // The persistent tail thread. One thread owns every
+        // block's post-drain work, in submission order. Per-block scoped
+        // threads for sub-millisecond phases measured as a net loss.
+        // This thread is also what lets the caller feed block N+1 while
         // block N validates and commits.
         {
             let reaper = reap_tx.clone();
@@ -1987,8 +2020,9 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         delta_out,
                     } = job;
                     // Drain: wait out the in-flight tail of execution.
-                    // WATCHDOG as in the inline path — a stranded edge
-                    // fail-stops with forensics instead of freezing.
+                    // This is the same watchdog as the inline path: a
+                    // stranded edge fail-stops with forensics instead of
+                    // freezing.
                     let deadline = std::time::Instant::now() + STALL_TIMEOUT;
                     let mut drain_err: Option<ExecutorError> = None;
                     while !(ctx.aborted.load(Ordering::SeqCst) || ctx.drained()) {
@@ -2022,7 +2056,7 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         }
                         std::thread::yield_now();
                     }
-                    // Release the slot in ALL paths — and INSTALL the
+                    // Release the slot in every path, and install the
                     // staged block, if any: its admission ran while this
                     // block executed, so the workers walk straight onto
                     // full queues.
@@ -2046,10 +2080,10 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                         match Arc::try_unwrap(ctx_arc) {
                             Ok(c) => break c,
                             Err(back) => {
-                                // WATCHDOG: a worker that never drops its
+                                // Watchdog: a worker that never drops its
                                 // Arc (wedged in a stall path) would spin
-                                // this loop forever and hang every later
-                                // ticket SILENTLY. Fail loudly instead.
+                                // this loop forever and silently hang
+                                // every later ticket. Fail loudly instead.
                                 if std::time::Instant::now() > unwrap_deadline {
                                     let holders = Arc::strong_count(&back);
                                     eprintln!(
@@ -2115,8 +2149,9 @@ pub fn with_pool<S: StateDatabase + Sync + 'static, R>(
                 ((MAX_BLOCK_TXS * 4) / cfg_admit_shards.max(1)).next_power_of_two(),
             )),
             admit_lanes: (cfg_admit_shards > 0).then(|| {
-                // Caller cores: the worker cores stay dedicated to
-                // execution, which is running while the feed admits.
+                // These lanes run on caller cores; the worker cores stay
+                // dedicated to execution, which runs while the feed
+                // admits.
                 std::sync::Arc::new(crate::pool::WorkerPool::new(cfg_admit_shards, Vec::new()))
             }),
             admit_shards: cfg_admit_shards,
@@ -2145,25 +2180,27 @@ pub struct BlockSession<'p, 'a, S: StateDatabase + Sync> {
     workers: usize,
     cold: usize,
     edges: usize,
-    /// Per-DOMAIN last toucher — the index the edges come from. FEED-OWNED
-    /// (admission is single-threaded and prune never reads it), so it
-    /// lives here rather than in the shared graph: keeping it out of the
-    /// critical section removes ~8 hashmap operations per tx from the
-    /// lock. Keyed symbolically — no keccak on the hot path.
-    /// Reusable predecessor scratch — a fresh `Vec` per tx was a heap
-    /// allocation on the serial feed (~50ns/tx).
+    /// Per-domain last toucher: the index the edges come from.
+    /// Feed-owned, since admission is single-threaded and prune never
+    /// reads it, so it lives here rather than in the shared graph.
+    /// Keeping it out of the critical section removes several hashmap
+    /// operations per transaction from the lock. Keyed symbolically, so
+    /// there is no keccak on the hot path.
+    /// Reusable predecessor scratch: a fresh `Vec` per transaction was a
+    /// heap allocation on the serial feed.
     preds_buf: Vec<u32>,
-    /// `KARDAMOM_STM_FEED_STAGES`: per-stage feed timers (off by default
-    /// — they cost what they measure).
+    /// `KARDAMOM_STM_FEED_STAGES`: per-stage feed timers, off by default,
+    /// since they cost what they measure.
     stage_timing: bool,
     /// Sharded admission: indices awaiting dependency discovery.
     admit_batch: Vec<u32>,
-    /// The most recent ⊤ (cold) tx: conflicts with everything, so every
-    /// later admission takes an edge from it while it is outstanding.
+    /// The most recent ⊤ (cold) transaction: conflicts with everything,
+    /// so every later admission takes an edge from it while it is
+    /// outstanding.
     last_barrier: Option<u32>,
     dispatch: Vec<u32>,
-    /// Admitted count; the envelopes live in the ctx slots (the repair
-    /// path reads them there — no parallel copy).
+    /// Admitted count. The envelopes live in the ctx slots; the repair
+    /// path reads them there, with no parallel copy.
     n_txs: usize,
     started: std::time::Instant,
 }
@@ -2185,13 +2222,13 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             let st = self.shared.0.lock().expect("pool poisoned");
             st.cfg.workers.max(1)
         };
-        // Cloning shares one transaction; backends that serialise reads
+        // Cloning shares one transaction; backends that serialize reads
         // need `begin_block_per_worker` with independent views.
         self.begin_block_per_worker(vec![snapshot; workers], base, env, stats)
     }
 
-    /// [`Self::begin_block`] with an INDEPENDENT state view per worker —
-    /// see [`BlockCtx::snapshots`] for why the backend can require it.
+    /// [`Self::begin_block`] with an independent state view per worker.
+    /// See [`BlockCtx::snapshots`] for why the backend can require it.
     pub fn begin_block_per_worker<'p>(
         &'p self,
         snapshots: Vec<S>,
@@ -2203,8 +2240,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     }
 
     /// Like [`Self::begin_block_per_worker`], with unsettled predecessor
-    /// deltas layered (newest first) WITHOUT cloning or merging — the
-    /// pipelined caller's zero-copy read stack (spec P3a).
+    /// deltas layered (newest first) without cloning or merging: the
+    /// pipelined caller's zero-copy read stack.
     pub fn begin_block_layered<'p>(
         &'p self,
         snapshots: Vec<S>,
@@ -2218,13 +2255,13 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         Ok(sess)
     }
 
-    /// [`Self::begin_block_layered`] with the layer bind DEFERRED (spec
-    /// P3b): admission is layer-independent, so the pipelined consumer
+    /// [`Self::begin_block_layered`] with the layer bind deferred.
+    /// Admission is layer-independent, so the pipelined consumer
     /// builds, feeds, and even submits this session while the
     /// predecessor still executes, then calls [`LayerBinder::bind`]
     /// when the predecessor's delta releases. Workers wait on the bind
-    /// before touching state; a consumer that will never bind must
-    /// `abort_active` instead (the drain watchdog is the backstop).
+    /// before touching state. A consumer that will never bind must call
+    /// `abort_active` instead; the drain watchdog is the backstop.
     pub fn begin_block_deferred<'p>(
         &'p self,
         snapshots: Vec<S>,
@@ -2235,14 +2272,15 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         self.begin_block_deferred_inner(snapshots, base, env, stats, None)
     }
 
-    /// [`Self::begin_block_layered`] with EIP-7928 CAPTURE on: every tx
-    /// records its per-tx BAL fragment at block-global index
-    /// `bal_base + local_idx + 1` (`bal_base` = canonical records before
-    /// this run — non-zero when the caller segments a block around
-    /// deposits), and the sealed [`StmOutcome::bal`] carries the folded,
-    /// sink-materialized block BAL. The executor's `--parallel-execution`
-    /// strategy is the intended caller; roles that never publish a BAL
-    /// (validator, benches) use the capture-free variants and pay nothing.
+    /// [`Self::begin_block_layered`] with EIP-7928 capture on: every
+    /// transaction records its per-transaction BAL fragment at
+    /// block-global index `bal_base + local_idx + 1` (`bal_base` is the
+    /// count of canonical records before this run, non-zero when the
+    /// caller segments a block around deposits), and the sealed
+    /// [`StmOutcome::bal`] carries the folded, sink-computed block BAL.
+    /// The executor's `--parallel-execution` strategy is the intended
+    /// caller; roles that never publish a BAL (validator, benches) use
+    /// the capture-free variants and pay nothing.
     pub fn begin_block_layered_bal<'p>(
         &'p self,
         snapshots: Vec<S>,
@@ -2275,7 +2313,7 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             "one state view per worker: {} given, {workers} needed",
             snapshots.len()
         );
-        // RECYCLE (steady-state zero-allocation blocks): sweep parked
+        // Recycle (steady-state zero-allocation blocks): sweep parked
         // mv caches whose last layer reference has dropped, then pop
         // scrubbed structures instead of mapping fresh arenas.
         {
@@ -2336,10 +2374,10 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
                     parked: AtomicBool::new(false),
                 })
                 .collect(),
-            // Per-BLOCK arena (with pipelined admission two blocks are
-            // alive at once, so ONE pool-shared arena would alias) —
-            // but RECYCLED through the reaper's scrub, so steady state
-            // allocates none.
+            // A per-block arena: with pipelined admission, two blocks
+            // are alive at once, so one pool-shared arena would alias.
+            // It is recycled through the reaper's scrub, so steady
+            // state allocates none.
             nodes: Arc::new(
                 r_nodes.unwrap_or_else(|| (0..MAX_BLOCK_TXS).map(|_| Node::default()).collect()),
             ),
@@ -2353,15 +2391,16 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
             started: std::time::Instant::now(),
             steal_enabled: {
                 let avg = self.avg_tx_ns.load(Ordering::Relaxed);
-                // Unknown (first block of a pool): allow it, and let the
-                // measurement correct course from the next block on.
+                // Unknown on the first block of a pool: allow it, and
+                // let the measurement correct course from the next
+                // block on.
                 avg == 0 || avg >= STEAL_WORTH_NS
             },
             spin_ns: {
-                // Bridge roughly one link-release gap (~one tx), bounded:
-                // spinning a full core for more than ~60us of silence is
-                // waste, and below ~5us the spin cannot outlast even a
-                // fast release.
+                // Bridge roughly one link-release gap (about one
+                // transaction), bounded: spinning a full core for more
+                // than about 60us of silence is waste, and below about
+                // 5us the spin cannot outlast even a fast release.
                 let avg = self.avg_tx_ns.load(Ordering::Relaxed);
                 if avg == 0 {
                     20_000
@@ -2381,8 +2420,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         });
         {
             let mut st = self.shared.0.lock().expect("pool poisoned");
-            // Pipeline depth cap = 2: one block executing (`ctx`), one
-            // staged (`next`). Wait only when BOTH are occupied, bounded
+            // Pipeline depth cap of 2: one block executing (`ctx`), one
+            // staged (`next`). Wait only when both are occupied, bounded
             // by the drain watchdog.
             let deadline = std::time::Instant::now() + STALL_TIMEOUT;
             while st.next.is_some() {
@@ -2427,9 +2466,9 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         Ok((sess, binder))
     }
 
-    /// Feed a block whose txs were PREPARED upstream (decode + predict
-    /// already done, off this thread) — the pipelined shape P3's tx_data
-    /// readers will use.
+    /// Feed a block whose transactions were prepared upstream (decode
+    /// and predict already done, off this thread): the pipelined shape
+    /// the tx_data reader threads will use.
     pub fn run_block_prepared(
         &self,
         snapshots: Vec<S>,
@@ -2450,11 +2489,11 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         sess.seal()
     }
 
-    /// Return a settled release's delta shell for reuse: the fold's
-    /// PendingDelta hashmap tables are ~1MB per block, one of the huge
-    /// per-block allocations the size histogram exposed. The consumer
-    /// calls this once a release's Arc unwraps (after advance_base);
-    /// entries drop here, tables keep their capacity.
+    /// Return a settled release's delta shell for reuse. The fold's
+    /// PendingDelta hashmap tables are one of the largest per-block
+    /// allocations. The consumer calls this once a release's Arc
+    /// unwraps, after `advance_base`. Entries drop here, but the tables
+    /// keep their capacity.
     pub fn recycle_delta(&self, mut d: PendingDelta) {
         d.accounts.clear();
         d.storage.clear();
@@ -2477,12 +2516,14 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     /// Abort the executing block and any staged successor: workers
     /// stop at their next dispatch check, the drain completes on the
     /// abort flag, and the affected tickets resolve (to an error when
-    /// txs were left unexecuted). The P3b wound-abort path: whoever
-    /// layered a block on a delta that a `corrected` release later
-    /// invalidated calls this to hurry the stale block out, then
-    /// rebuilds and resubmits from retained inputs — and must DISCARD
-    /// the stale ticket's outcome either way (a small block may finish
-    /// on stale layers before the flag lands; its bytes are garbage).
+    /// transactions were left unexecuted). This is the speculative-
+    /// release wound-abort path: whoever layered a block on a delta
+    /// that a `corrected`
+    /// release later invalidated calls this to hurry the stale block
+    /// out, then rebuilds and resubmits from retained inputs. The stale
+    /// ticket's outcome must be discarded either way, since a small
+    /// block may finish on stale layers before the flag lands, making
+    /// its bytes garbage.
     pub fn abort_active(&self) {
         let st = self.shared.0.lock().expect("pool poisoned");
         for c in st.ctx.iter().chain(st.next.iter()) {
@@ -2497,15 +2538,16 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     }
 
     /// Mirror a committed delta into the pool-lifetime backend cache.
-    /// Call AFTER the state writer applies the same delta; skipping the
-    /// call leaves stale entries and produces wrong reads — the harness's
-    /// byte-identical assertion is the guard.
+    /// Call this after the state writer applies the same delta. Skipping
+    /// the call leaves stale entries and produces wrong reads; the
+    /// harness's byte-identical assertion is the guard against that.
     pub fn advance_base(&self, delta: &PendingDelta) {
-        // ONE write-lock per touched shard, not one per entry: the
-        // per-entry version acquired ~12k write locks against executing
-        // workers' read locks and measured as a GROWING multi-ms drag on
-        // the pipeline loop (and stretched the executing block's span by
-        // slowing its reads). Group first, lock once.
+        // One write-lock per touched shard, not one per entry. The
+        // per-entry version acquired thousands of write locks against
+        // executing workers' read locks, and measurement showed this as
+        // a growing multi-millisecond drag on the pipeline loop, since
+        // it also stretched the executing block's span by slowing its
+        // reads. Group entries first, then lock once.
         let mut acc_by_shard: Vec<Vec<(alloy_primitives::Address, Option<AccountInfo>)>> =
             (0..BASE_SHARDS).map(|_| Vec::new()).collect();
         for (addr, (nonce, balance, code_hash)) in delta.accounts.iter() {
@@ -2565,17 +2607,17 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
 
     /// Would parallel execution pay for itself on this workload?
     ///
-    /// Uses the mean per-tx execution time learned from previous blocks —
-    /// the same statistic the stealing policy runs on. A fresh pool has no
-    /// measurement yet and is given the benefit of the doubt; one block is
-    /// enough to correct course.
+    /// Uses the mean per-transaction execution time learned from
+    /// previous blocks: the same statistic the stealing policy runs on.
+    /// A fresh pool has no measurement yet and is given the benefit of
+    /// the doubt; one block is enough to correct course.
     pub fn parallel_worth_it(&self) -> bool {
         let avg = self.avg_tx_ns.load(Ordering::Relaxed);
         avg == 0 || avg >= self.parallel_worth_ns
     }
 
-    /// Feed the decline gate after a block executed OUTSIDE the pool (a
-    /// caller-side sequential path, e.g. the executor strategy's own
+    /// Feed the decline gate after a block executed outside the pool (a
+    /// caller-side sequential path, such as the executor strategy's own
     /// decline branch). Without this the gate is a trap door: `avg_tx_ns`
     /// would hold the value that caused the decline forever. Mirrors what
     /// [`decline`](Self::decline) does for pool-internal declines.
@@ -2586,8 +2628,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
         }
     }
 
-    /// Run the block on this thread, through the SAME code path the
-    /// sequential executor uses — not a reimplementation of it.
+    /// Run the block on this thread, through the same code path the
+    /// sequential executor uses, not a reimplementation of it.
     fn decline(
         &self,
         snapshot: &S,
@@ -2597,14 +2639,15 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
     ) -> Result<StmOutcome, ExecutorError> {
         let started = std::time::Instant::now();
         let (receipts, delta) = execute_block_sequential(snapshot, Some(&base), env, txs)?;
-        // KEEP MEASURING while declining. Without this the gate is a trap
-        // door: `avg_tx_ns` would hold the value that caused the decline
-        // forever, and a pool that once saw cheap transfers would refuse
-        // to parallelize a heavy contract block later in the same run.
-        // Sequential per-tx cost slightly OVERSTATES the pool's own (it
-        // hashes each write set inline, which the pool defers to its
-        // parallel commit phase), so the bias is toward re-entering
-        // parallel execution rather than staying out.
+        // Keep measuring while declining. Without this the gate is a
+        // trap door: `avg_tx_ns` would hold the value that caused the
+        // decline forever, and a pool that once saw cheap transfers
+        // would refuse to parallelize a heavy contract block later in
+        // the same run. Sequential per-transaction cost slightly
+        // overstates the pool's own, since it hashes each write set
+        // inline, which the pool defers to its parallel commit phase.
+        // So the bias favors re-entering parallel execution rather than
+        // staying out.
         if !txs.is_empty() {
             self.avg_tx_ns.store(
                 started.elapsed().as_nanos() as u64 / txs.len() as u64,
@@ -2648,8 +2691,8 @@ impl<'a, S: StateDatabase + Sync> PoolHandle<'a, S> {
 
 impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     /// Run dependency discovery for the queued batch: lane `k` owns
-    /// cell-space shard `k`, walks the batch IN INDEX ORDER, upserts its
-    /// own cells and registers the edges it finds. Returns with every
+    /// cell-space shard `k`, walks the batch in index order, upserts its
+    /// own cells, and registers the edges it finds. Returns with every
     /// edge in place, so the guards can be dropped and the ready
     /// transactions dispatched.
     fn flush_admit_batch(&mut self) {
@@ -2662,8 +2705,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         let shards = &self.pool.shards;
         let edges = std::sync::atomic::AtomicUsize::new(0);
         let body = |sh: usize| {
-            // SAFETY: chunk `sh` is executed by exactly one lane, and no
-            // other chunk touches table `sh`.
+            // SAFETY: chunk `sh` is executed by exactly one lane, and
+            // no other chunk touches table `sh`.
             let table = unsafe { shards.table(sh) };
             for &idx in batch.iter() {
                 let slot = ctx.slots[idx as usize]
@@ -2716,35 +2759,38 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         self.admit_batch.clear();
     }
 
-    /// Admit the next canonical tx: ONE function computation, then an
-    /// assignment to a thread.
+    /// Admit the next canonical transaction: one function computation,
+    /// then an assignment to a thread.
     ///
-    /// 1. PREDICT the footprint (the P0/P1 classifier) — pure, off-lock.
-    /// 2. UPDATE THE LIVE DAG: each predicted cell's last toucher becomes
-    ///    a predecessor **if it has not finished yet**; a ⊤ (cold) tx
-    ///    takes edges from everything outstanding and becomes the barrier
-    ///    every later tx depends on.
-    /// 3. ASSIGN a thread by hashing the primary contention domain, and
-    ///    dispatch immediately when the indegree is already zero.
+    /// 1. Predict the footprint (the footprint classifier), pure and
+    ///    off-lock.
+    /// 2. Update the live DAG: each predicted cell's last toucher becomes
+    ///    a predecessor if it has not finished yet. A ⊤ (cold)
+    ///    transaction takes edges from everything outstanding and
+    ///    becomes the barrier every later transaction depends on.
+    /// 3. Assign a thread by hashing the primary contention domain, and
+    ///    dispatch right away when the indegree is already zero.
     ///
     /// Domain-hashed assignment is what keeps the DAG's chains cheap:
-    /// same-domain txs land on the SAME thread in canonical order, so a
-    /// chain drains as a FIFO with no cross-thread handoff at all — the
-    /// graph only has to carry the cross-domain and multi-domain edges.
+    /// same-domain transactions land on the same thread in canonical
+    /// order, so a chain drains as a FIFO with no cross-thread handoff
+    /// at all. The graph only has to carry the cross-domain and
+    /// multi-domain edges.
     ///
-    /// Conflicts the prediction MISSED are not the graph's business: they
-    /// are caught at validation and repaired by wounding the later tx (see
-    /// [`BlockSession::seal`]) — the wound leg of wound-wait, with the DAG
-    /// edge as the wait leg.
+    /// Conflicts the prediction missed are not the graph's business.
+    /// They are caught at validation and repaired by wounding the later
+    /// transaction (see [`BlockSession::seal`]): the wound leg of
+    /// wound-wait, with the DAG edge as the wait leg.
     pub fn push_tx(
         &mut self,
         tx_idx: TxIndex,
         position: BPosition,
         envelope: TxEnvelope,
     ) -> Result<(), ExecutorError> {
-        // Convenience path: prepare inline. The pipelined caller (P3's
+        // Convenience path: prepare inline. The pipelined caller (the
         // tx_data readers) calls `prepare` upstream and `push_prepared`
-        // here, keeping decode+predict off this serial thread entirely.
+        // here, keeping decode and predict off this serial thread
+        // entirely.
         let t_prep = std::time::Instant::now();
         let prep = prepare(&envelope, tx_idx, self.stats);
         let dt = t_prep.elapsed().as_nanos() as u64;
@@ -2752,10 +2798,11 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         self.push_prepared(tx_idx, position, envelope, prep)
     }
 
-    /// Admit a tx whose decode and prediction were computed UPSTREAM (see
-    /// [`prepare`]). This is the executor's real hot path: everything left
-    /// here is graph work, which must stay serial and in canonical order
-    /// because an edge is "the previous tx that touched this domain".
+    /// Admit a transaction whose decode and prediction were computed
+    /// upstream (see [`prepare`]). This is the executor's real hot path:
+    /// everything left here is graph work, which must stay serial and
+    /// in canonical order, because an edge means "the previous
+    /// transaction that touched this domain".
     pub fn push_prepared(
         &mut self,
         tx_idx: TxIndex,
@@ -2783,13 +2830,13 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             self.cold += 1;
         }
 
-        // Domain -> worker by HASH, deliberately. Round-robin on first
-        // sight was tried and REVERTED: it spread domains exactly (the
-        // busiest thread's share fell 1.96x -> 1.50x) yet cost 9% wall,
-        // because hashing is STABLE ACROSS BLOCKS — a pool returns to the
-        // same worker every block, keeping its state warm in that core's
-        // caches — while first-seen ordering reshuffles the assignment
-        // each block. Locality beat balance.
+        // Domain to worker by hash, deliberately. Round-robin on first
+        // sight was tested: it spread domains more evenly, but cost
+        // wall-clock time, because hashing is stable across blocks (a
+        // pool returns to the same worker every block, keeping its
+        // state warm in that core's caches), while first-seen ordering
+        // reshuffles the assignment each block. Locality beat balance,
+        // so this reverted to hashing.
         // Policy: which side of a two-account transaction do we own?
         let domain = if self.pool.dispatch_by_sender {
             let sender_cell = DomainKey::Account(envelope.sender);
@@ -2801,10 +2848,10 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         } else {
             domain
         };
-        // BAG MODE: no owner, so no assignment at all — the whole
-        // hash/sticky block below was 0.68µs of serial feed per tx
-        // (measured: the largest single feed stage) computing a value
-        // the bag never reads.
+        // Bag mode: no owner, so no assignment at all. The hash and
+        // sticky-assign logic below was the largest single feed stage,
+        // measured per transaction, computing a value the bag never
+        // reads.
         let worker = if self.ctx.bag_mode {
             0
         } else {
@@ -2842,8 +2889,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             worker
         };
 
-        // The slot OWNS the envelope: no clone, no parallel vec (the
-        // repair path reads slots too).
+        // The slot owns the envelope: no clone, no parallel vec, since
+        // the repair path reads slots too.
         let sharded = self.pool.admit_shards > 0;
         self.ctx.slots[i]
             .set(TxSlot {
@@ -2860,8 +2907,9 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             .unwrap_or_else(|_| unreachable!("slot set once per index"));
         self.n_txs += 1;
         self.dispatch[worker] += 1;
-        // Stage timers are OPT-IN: two extra clock reads per tx measured
-        // ~5% of the serial feed, and the feed is the thing they measure.
+        // Stage timers are opt-in: two extra clock reads per transaction
+        // measured about 5% of the serial feed, and the feed is the
+        // thing they measure.
         let t_pre_end = if self.stage_timing {
             let t = std::time::Instant::now();
             self.ctx
@@ -2873,17 +2921,18 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             None
         };
 
-        // (2) Update the live DAG + (3) dispatch if ready.
-        // Candidate predecessors come from the FEED-OWNED last-toucher
-        // index — no lock needed, because admission is single-threaded and
-        // prune never reads it.
+        // (2) Update the live DAG, and (3) dispatch if ready.
+        // Candidate predecessors come from the feed-owned last-toucher
+        // index. No lock is needed, because admission is single-threaded
+        // and prune never reads it.
         if sharded {
-            // SHARDED ADMISSION. The router does node init and queues the
-            // index; dependency discovery (last-toucher upserts + edge
-            // registration) happens in the batch flush, one lane per
-            // cell-space shard. No tx can dispatch before its batch
-            // completes, because the router's guard is dropped only
-            // there — which is why per-shard guards are unnecessary.
+            // Sharded admission. The router does node init and queues
+            // the index; dependency discovery (last-toucher upserts and
+            // edge registration) happens in the batch flush, one lane
+            // per cell-space shard. No transaction can dispatch before
+            // its batch completes, because the router's guard is
+            // dropped only there. That is why per-shard guards are
+            // unnecessary.
             {
                 let node = &self.ctx.nodes[i];
                 node.worker.store(worker, Ordering::Release);
@@ -2909,9 +2958,9 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 }
             }
             if is_cold {
-                // T conflicts with everything: settle the batch, then do
-                // the barrier serially (edges from all outstanding, all
-                // shard tables cleared).
+                // ⊤ conflicts with everything: settle the batch, then do
+                // the barrier serially (edges from everything
+                // outstanding, and clear all shard tables).
                 self.flush_admit_batch();
                 for p in 0..idx {
                     let pn = &self.ctx.nodes[p as usize];
@@ -2944,9 +2993,9 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         {
             let mut touch = self.pool.touch.borrow_mut();
             if is_cold {
-                // ⊤: conflicts with everything — every outstanding tx is
-                // a candidate predecessor, and this tx becomes the
-                // barrier.
+                // ⊤: conflicts with everything. Every outstanding
+                // transaction is a candidate predecessor, and this
+                // transaction becomes the barrier.
                 preds.clear();
                 preds.extend(0..idx);
                 self.last_barrier = Some(idx);
@@ -2970,15 +3019,16 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                 .feed_dag_ns
                 .fetch_add((t_admit - t_pre_end).as_nanos() as u64, Ordering::Relaxed);
         }
-        // NO GLOBAL LOCK. Open this node's registration point, seed the
-        // admission guard, then register on each predecessor that is still
-        // open. The guard (+1) means a predecessor finishing mid-admission
-        // can never drive the count to zero and dispatch a half-linked tx;
-        // dropping it at the end is what actually releases this tx.
+        // No global lock. Open this node's registration point, seed the
+        // admission guard, then register on each predecessor that is
+        // still open. The guard (+1) means a predecessor finishing
+        // mid-admission can never drive the count to zero and dispatch a
+        // half-linked transaction. Dropping it at the end is what
+        // actually releases this transaction.
         {
-            // REGISTER ONCE. Unreachable through the public API — the
-            // local index comes from this session's own counter, so no
-            // caller can name an occupied slot — but asserted anyway,
+            // Register once. Unreachable through the public API, since
+            // the local index comes from this session's own counter, so
+            // no caller can name an occupied slot. Asserted anyway,
             // because a refactor that reused indices would otherwise
             // resurrect a closed registration point and hang whichever
             // child registered on it, with no diagnostic.
@@ -2995,8 +3045,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             if !self.ctx.bag_mode {
                 // FIFO-scheduler state: the bag has no queue position to
                 // record and no take-time verification to feed, so this
-                // second mutex (per tx, on the serial feed) is pure
-                // ceremony there.
+                // second mutex, per transaction, on the serial feed, is
+                // pure ceremony there.
                 node.queued.store(false, Ordering::Release);
                 node.fifo_preds.lock().expect("fifo_preds poisoned").clear();
             }
@@ -3013,14 +3063,15 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
             let pn = &self.ctx.nodes[p as usize];
             let mut list = pn.children.lock().expect("children poisoned");
             if pn.open.load(Ordering::Acquire) {
-                // p is unfinished. If it was already RELEASED to this
-                // tx's own queue (indegree 0 is definitive: admission is
-                // serial, so p's guard was dropped long ago and a
-                // released node is never re-blocked), FIFO position
-                // orders it — record for take-time verification instead
-                // of an edge, and the whole prune hand-off for this link
-                // disappears. A stale read of a nonzero indegree only
-                // costs an edge, never correctness.
+                // p is unfinished. If it was already released to this
+                // transaction's own queue (indegree 0 is definitive:
+                // admission is serial, so p's guard was dropped long ago
+                // and a released node is never re-blocked), FIFO
+                // position orders it. Record it for take-time
+                // verification instead of an edge, and the whole prune
+                // hand-off for this link disappears. A stale read of a
+                // nonzero indegree only costs an edge, never
+                // correctness.
                 if eager
                     && !self.ctx.bag_mode
                     && pn.worker.load(Ordering::Acquire) == worker
@@ -3033,7 +3084,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                         .push(p);
                     covered += 1;
                 } else {
-                    // Increment BEFORE publishing the edge: the matching
+                    // Increment before publishing the edge: the matching
                     // decrement can only happen once this child is
                     // visible in p's list, so the add always precedes
                     // its own subtract.
@@ -3050,7 +3101,7 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
                     }
                 }
             }
-            // else: p already finished and published — no edge needed.
+            // else: p already finished and published, no edge needed.
         }
         self.edges += deg as usize;
         if covered > 0 {
@@ -3078,22 +3129,22 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         Ok(())
     }
 
-    /// The boundary: no more txs. Wait out the in-flight tail, validate
-    /// every recorded read, and WOUND (re-execute at its canonical
-    /// position, sequentially, against the materialized prefix) any tx a
-    /// missed conflict convicted — per-tx, not whole-block. Then commit in
-    /// canonical order.
+    /// The boundary: no more transactions. Wait out the in-flight tail,
+    /// validate every recorded read, and wound (re-execute at its
+    /// canonical position, sequentially, against the computed prefix)
+    /// any transaction a missed conflict convicted, per transaction, not
+    /// whole-block. Then commit in canonical order.
     pub fn seal(self) -> Result<StmOutcome, ExecutorError> {
         self.submit()?.wait()
     }
 
-    /// Hand this block to the persistent tail thread and return
-    /// immediately (spec P3a). The pool slot frees once execution
-    /// drains, so the caller may begin feeding the NEXT block while this
-    /// one validates and commits on the tail thread.
+    /// Hand this block to the persistent tail thread and return right
+    /// away. The pool slot frees once execution drains, so
+    /// the caller may begin feeding the next block while this one
+    /// validates and commits on the tail thread.
     pub fn submit(self) -> Result<BlockTicket, ExecutorError> {
-        // SETTLE FIRST: sealing with a partial batch would strand
-        // its router guards and the block would never drain.
+        // Settle first: sealing with a partial batch would strand its
+        // router guards, and the block would never drain.
         let mut this = self;
         this.flush_admit_batch();
         let BlockSession {
@@ -3126,16 +3177,16 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         Ok(BlockTicket { rx })
     }
 
-    /// `submit`, plus a streaming delta release (spec P3): the tail
-    /// sends this block's folded delta on `delta_tx` as soon as it
-    /// exists — at the fold, before validation, when `speculative`
-    /// (P3b); after the verdict when not (P3a). On a wound the tail
-    /// sends a second, `corrected` release; the consumer must abort
-    /// anything layered on the first.
-    /// `submit_streaming` speculative, plus the EARLY mv release (spec
-    /// P3b mv-as-layer): `mv_tx` receives this block's multi-version
-    /// cache right after drain + extract — the earliest point a
-    /// successor can bind on — and `delta_tx` still receives the folded
+    /// `submit`, plus a streaming delta release: the tail sends this
+    /// block's folded delta on `delta_tx` as soon as it exists. That
+    /// is at the fold, before validation, when `speculative`; after
+    /// the verdict when not. On a wound, the tail sends a second,
+    /// `corrected` release; the consumer must abort anything layered
+    /// on the first.
+    /// `submit_streaming` speculative, plus the early mv release:
+    /// `mv_tx` receives this block's multi-version
+    /// cache right after drain and extract, the earliest point a
+    /// successor can bind on. `delta_tx` still receives the folded
     /// delta (for base-cache advancement and writer settlement), plus
     /// the `corrected` re-issue on a wound.
     pub fn submit_streaming_mv(
@@ -3143,8 +3194,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         mv_tx: std::sync::mpsc::Sender<MvRelease>,
         delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
     ) -> Result<BlockTicket, ExecutorError> {
-        // SETTLE FIRST: sealing with a partial batch would strand
-        // its router guards and the block would never drain.
+        // Settle first: sealing with a partial batch would strand its
+        // router guards, and the block would never drain.
         let mut this = self;
         this.flush_admit_batch();
         let BlockSession {
@@ -3186,8 +3237,8 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
         delta_tx: std::sync::mpsc::Sender<DeltaRelease>,
         speculative: bool,
     ) -> Result<BlockTicket, ExecutorError> {
-        // SETTLE FIRST: sealing with a partial batch would strand
-        // its router guards and the block would never drain.
+        // Settle first: sealing with a partial batch would strand its
+        // router guards, and the block would never drain.
         let mut this = self;
         this.flush_admit_batch();
         let BlockSession {
@@ -3225,15 +3276,16 @@ impl<'p, 'a, S: StateDatabase + Sync> BlockSession<'p, 'a, S> {
     }
 }
 
-/// The BLOCK TAIL: everything after the pool is released — extraction,
-/// validation, wound repair, the canonical commit, learning, teardown
-/// hand-off. Standalone so P3's persistent tail thread can own it; the
-/// block-at-a-time path calls it inline (seal = drain + tail).
-/// Rewrite a per-tx BAL fragment's fee-sink balance write(s) to the
-/// materialized canonical prefix value — the fragment-side mirror of the
-/// commit pass's WriteSet sink rewrite (workers execute against the
-/// block-start sink, so their captured value is `start + own_fee`, not the
-/// running sum the sequential capture records).
+/// The block tail: everything after the pool is released. This includes
+/// extraction, validation, wound repair, the canonical commit, learning,
+/// and the teardown hand-off. Standalone so the persistent tail thread
+/// can own it; the block-at-a-time path calls it inline (seal = drain
+/// plus tail).
+/// Rewrite a per-transaction BAL fragment's fee-sink balance write(s) to
+/// the computed canonical prefix value: the fragment-side mirror of the
+/// commit pass's WriteSet sink rewrite. Workers execute against the
+/// block-start sink, so their captured value is `start + own_fee`, not
+/// the running sum the sequential capture records.
 fn rewrite_frag_sink(frag: &mut revm::state::bal::Bal, value: U256) {
     if let Some(acct) = frag.accounts.get_mut(&FEE_SINK) {
         for w in acct.account_info.balance.writes.iter_mut() {
@@ -3263,11 +3315,11 @@ fn block_tail<S: StateDatabase + Sync>(
     let t_extract0 = std::time::Instant::now();
     let aborted = ctx.aborted.load(Ordering::SeqCst);
     let n = n_txs;
-    // PRESENCE PREPASS, not an extraction. Building a `Vec<TxResult>`
-    // moved ~450 bytes x n (1.8MB per 4k block, 0.88ms measured) for
-    // nothing: the tail only ever INDEXES results, and the arena that
-    // holds them already recycles through the reaper. So check that
-    // every slot holds a success and then read them in place.
+    // A presence prepass, not an extraction. Building a `Vec<TxResult>`
+    // moved hundreds of bytes per transaction for nothing: the tail
+    // only ever indexes results, and the arena that holds them already
+    // recycles through the reaper. So check that every slot holds a
+    // success and then read them in place.
     for (i, cell) in ctx.results.iter_mut().take(n).enumerate() {
         match cell.get_mut() {
             Some(Ok(_)) => {}
@@ -3290,11 +3342,11 @@ fn block_tail<S: StateDatabase + Sync>(
     }
 
     let t_extract = t_extract0.elapsed();
-    // EARLY RELEASE (spec P3b mv-as-layer): the mv cache's top version
-    // per cell IS the final delta — before any fold ran. Ship it now,
-    // with the fee sink materialized alongside (never published to
-    // mv). Pre-verdict by construction: a wound invalidates it through
-    // the corrected DeltaRelease that follows the repair.
+    // Early release: the mv cache's top version per cell is the final
+    // delta, before any fold ran. Ship it now,
+    // with the fee sink computed alongside (never published to mv).
+    // Pre-verdict by construction: a wound invalidates it through the
+    // corrected DeltaRelease that follows the repair.
     if let Some(DeltaOut {
         mv_tx: Some(mv_tx), ..
     }) = &delta_out
@@ -3328,14 +3380,14 @@ fn block_tail<S: StateDatabase + Sync>(
         });
     }
 
-    // Canonical-order commit. A wounded tx is RE-EXECUTED here against
-    // the exact materialized prefix (the delta as of its position), so
-    // its result is the sequential one by construction — the whole
+    // Canonical-order commit. A wounded transaction is re-executed here
+    // against the exact computed prefix (the delta as of its position),
+    // so its result is the sequential one by construction. The whole
     // block never re-runs. Everything after a wound sees the corrected
     // state through the same prefix, so a wound cascade re-executes
-    // only the txs it actually reaches.
+    // only the transactions it actually reaches.
     //
-    // SERIAL by definition: this is the block's tail, and no worker
+    // Serial by definition: this is the block's tail, and no worker
     // count shortens it.
     let t_com = std::time::Instant::now();
     let (mut hash_ns, mut delta_ns) = (0u64, 0u64);
@@ -3347,23 +3399,24 @@ fn block_tail<S: StateDatabase + Sync>(
         .get()
         .expect("layers bound before execution")
         .sink_start_balance;
-    // FAST-PATH PREFIX — runs before the validation verdict exists.
+    // Fast-path prefix, runs before the validation verdict exists.
     //
-    // The write-set hash is ~1.25us of keccak per tx and CANNOT be
-    // made cheaper (it is one permutation per 136 bytes of a
-    // contract the receipts depend on). On the serial commit tail
-    // it was 72% of that tail — the largest fixed parallelization
+    // The write-set hash costs about 1.25us of keccak per transaction
+    // and cannot be made cheaper, since it is one permutation per 136
+    // bytes of a contract the receipts depend on. On the serial commit
+    // tail it was 72% of that tail: the largest fixed parallelization
     // tax in the engine, untouched by worker count.
     //
-    // It does not have to be serial. The only thing forcing it
-    // there is the accumulator's absolute balance, and THAT is a
-    // prefix sum: computable in one cheap pass with no hashing, so
-    // afterwards every tx's hash is independent.
+    // It does not have to be serial. The only thing forcing it there is
+    // the accumulator's absolute balance, and that is a prefix sum:
+    // computable in one cheap pass with no hashing, so afterwards every
+    // transaction's hash is independent.
     //
-    // Phase 1 (serial, ~ns/tx): cumulative gas + accumulator
-    // materialization. Safe before the verdict: the repair path's
-    // kept-prefix arm performs these exact mutations itself
-    // (idempotent), and re-executed txs are rebuilt from scratch.
+    // Phase 1 (serial, fast per transaction): cumulative gas and
+    // accumulator computation. Safe before the verdict: the repair
+    // path's kept-prefix arm performs these exact mutations itself
+    // (idempotent), and re-executed transactions are rebuilt from
+    // scratch.
     for cell in ctx.results.iter_mut().take(n) {
         let r = match cell.get_mut() {
             Some(Ok(r)) => r,
@@ -3376,28 +3429,28 @@ fn block_tail<S: StateDatabase + Sync>(
             && let Some(entry) = r.ws.accounts.iter_mut().find(|(a, _)| *a == FEE_SINK)
         {
             entry.1.1 = sink_running;
-            // Same materialization for the capture fragment (see
+            // Same computation for the capture fragment (see
             // `rewrite_frag_sink`); a wound rebuilds both from scratch.
             if let Some(frag) = r.bal_frag.as_mut() {
                 rewrite_frag_sink(frag, sink_running);
             }
         }
     }
-    // The shared view is taken AFTER the serial prefix's mutations.
+    // The shared view is taken after the serial prefix's mutations.
     let tx_results = Results(&ctx.results[..n]);
-    // Fold + hash + VALIDATION, one overlap scope (fusing hash and
-    // fold measured worse twice; OVERLAP won — validation now joins
-    // the same scope): the fold builds the delta; each hash lane
-    // hashes its chunk into the side array, then VALIDATES the same
-    // chunk (read-only replay against the multi-version cache — every
+    // Fold, hash, and validation, in one overlap scope. Fusing hash and
+    // fold measured worse twice; overlap won, and validation now joins
+    // the same scope. The fold builds the delta; each hash lane hashes
+    // its chunk into the side array, then validates the same chunk
+    // (a read-only replay against the multi-version cache: every
     // recorded read must still be the highest version below the
-    // reader; a conviction is a WOUND). Validation was its own phase
-    // before the commit; hiding it under the fold, the longest pole,
-    // removes it from the wall.
+    // reader, and a conviction is a wound). Validation used to be its
+    // own phase before the commit; hiding it under the fold, the
+    // longest pole, removes it from the wall.
     //
-    // The fold joins FIRST: the delta exists at that point — the
-    // streaming release point (spec P3) — while hash+validate lanes
-    // are still running.
+    // The fold joins first: the delta exists at that point, the
+    // streaming release point, while the hash-and-validate
+    // lanes are still running.
     let t_h = std::time::Instant::now();
     let n_res = tx_results.len();
     // Lane pinning is decided once, when the pool builds its lanes.
@@ -3434,20 +3487,22 @@ fn block_tail<S: StateDatabase + Sync>(
         }
         d
     };
-    // The mv pipeline runs the tail SEQUENTIALLY on this one thread:
-    // its latency hides behind the NEXT block's execution (the early
-    // release already shipped), so the goal is not speed but QUIET —
-    // four parallel lanes of keccak + hashmap builds co-running with
-    // the executing span measured +19% worker busy (memory bandwidth
-    // + the two shared caller cores; see the topology note in the
-    // bench). Validation runs FIRST so a wound skips the wasted fold
-    // and hash entirely.
-    // Pipeline tails run their lanes on the CALLER cores (tail_on_workers
-    // is false there), so parallelism costs the executing block nothing
-    // but memory bandwidth. Fully serial was the first cut — fine when
-    // the tail is much shorter than the span it hides behind, wrong when
-    // it is not (micro-tx blocks: serial tail ~7ms vs span ~5ms, so the
-    // TAIL becomes the pacer). Opt back in with KARDAMOM_STM_SERIAL_TAIL.
+    // The mv pipeline runs the tail sequentially on this one thread. Its
+    // latency hides behind the next block's execution, since the early
+    // release already shipped, so the goal is not speed but quiet: four
+    // parallel lanes of keccak and hashmap builds co-running with the
+    // executing span measured a real increase in worker busy time (from
+    // memory bandwidth pressure and the two shared caller cores; see
+    // the topology note in the bench). Validation runs first, so a
+    // wound skips the wasted fold and hash entirely.
+    // Pipeline tails run their lanes on the caller cores
+    // (tail_on_workers is false there), so parallelism costs the
+    // executing block nothing but memory bandwidth. Fully serial was
+    // the first cut. It works fine when the tail is much shorter than
+    // the span it hides behind, but is wrong when it is not (on
+    // micro-transaction blocks, the serial tail can exceed the span, so
+    // the tail becomes the pacer). Opt back in with
+    // KARDAMOM_STM_SERIAL_TAIL.
     let serial_tail = delta_out.as_ref().is_some_and(|d| d.mv_tx.is_some())
         && std::env::var_os("KARDAMOM_STM_SERIAL_TAIL").is_some();
     let (delta_arc, wounded): (std::sync::Arc<PendingDelta>, Vec<usize>) = if serial_tail {
@@ -3486,18 +3541,18 @@ fn block_tail<S: StateDatabase + Sync>(
             (std::sync::Arc::new(PendingDelta::new()), wounded)
         }
     } else {
-        // PERSISTENT LANES (crate::pool): hash + validate, chunked by
+        // Persistent lanes (crate::pool): hash and validate, chunked by
         // index, on threads the pool created once. Per-block scoped
-        // spawns cost 0.5ms of the 1.9ms tail once the witness hash got
-        // cheap. The fold runs HERE, on the tail thread, concurrently
+        // spawns cost a large share of the tail once the witness hash
+        // got cheap. The fold runs here, on the tail thread, concurrently
         // with the lanes and without a join before the release point.
         let n_lanes = lanes.workers().max(1);
         let n_ch = n_lanes.min(n_res.max(1));
         let chunk = n_res.div_ceil(n_ch);
         let wounded_parts: Vec<Mutex<Vec<usize>>> =
             (0..n_ch).map(|_| Mutex::new(Vec::new())).collect();
-        // Each chunk owns a disjoint slice of `hashes`; lanes never share
-        // an index (crate::pool hands each out exactly once).
+        // Each chunk owns a disjoint slice of `hashes`. Lanes never
+        // share an index (crate::pool hands each out exactly once).
         struct HashOut(*mut B256);
         // SAFETY: chunk i writes only hashes[i*chunk .. (i+1)*chunk],
         // disjoint from every other chunk's range, and `lanes.run` hands
@@ -3550,7 +3605,7 @@ fn block_tail<S: StateDatabase + Sync>(
             }
         };
         std::thread::scope(|sc| {
-            // One scoped thread ONLY to drive the lanes, so the fold can
+            // One scoped thread only to drive the lanes, so the fold can
             // run on this thread concurrently and reach the release
             // point without waiting for the hash work.
             let driver = sc.spawn(|| {
@@ -3572,8 +3627,8 @@ fn block_tail<S: StateDatabase + Sync>(
                 });
             }
             driver.join().expect("lane driver");
-            // Lanes are done (run() returned inside the driver), so the
-            // borrow is over; drain the per-chunk lists in order.
+            // Lanes are done, since run() returned inside the driver, so
+            // the borrow is over. Drain the per-chunk lists in order.
             let wounded: Vec<usize> = wounded_parts
                 .iter()
                 .flat_map(|m| std::mem::take(&mut *m.lock().expect("wounded part poisoned")))
@@ -3588,8 +3643,9 @@ fn block_tail<S: StateDatabase + Sync>(
     // Capture fragments, collected in canonical order by whichever arm
     // runs (empty when capture is off). Folded once, at the outcome.
     let mut out_frags: Vec<revm::state::bal::Bal> = Vec::new();
-    // A tx after a re-executed one may also be stale: once ANY wound
-    // fires, later txs are re-checked against the live prefix.
+    // A transaction after a re-executed one may also be stale: once any
+    // wound fires, later transactions are re-checked against the live
+    // prefix.
     if let Some(first) = wounded_set.iter().copied().min() {
         for i in first..n {
             wounded_set.insert(i);
@@ -3597,12 +3653,12 @@ fn block_tail<S: StateDatabase + Sync>(
     }
     if wounds == 0 {
         let t_d = std::time::Instant::now();
-        // The consumer may still hold the released Arc — clone then
+        // The consumer may still hold the released Arc, so clone then
         // (pipeline mode); a sole owner unwraps for free
         // (block-at-a-time, no release).
         delta = std::sync::Arc::try_unwrap(delta_arc).unwrap_or_else(|a| (*a).clone());
-        // Conservative release (spec P3a): only now, when the delta
-        // can no longer change.
+        // Conservative release: only now, when the delta can
+        // no longer change.
         if let Some(DeltaOut {
             tx,
             speculative: false,
@@ -3616,11 +3672,12 @@ fn block_tail<S: StateDatabase + Sync>(
             });
         }
         // Serial epilogue: patch receipt hashes in place, move receipts
-        // out, then ship the WHOLE results vec (write sets + read logs)
-        // to the reaper as one move — a per-element carcass copy here
-        // measured 10-13ms of pure memmove and ate the overlap's win.
-        // The shared view is Copy and simply goes out of use here; the
-        // arena becomes mutable again for the receipt epilogue.
+        // out, then ship the whole results vec (write sets and read
+        // logs) to the reaper as one move. A per-element copy here
+        // measured many milliseconds of pure memmove and ate the
+        // overlap's win. The shared view is Copy and simply goes out of
+        // use here; the arena becomes mutable again for the receipt
+        // epilogue.
         for (i, cell) in ctx.results.iter_mut().take(n).enumerate() {
             let r = match cell.get_mut() {
                 Some(Ok(r)) => r,
@@ -3632,13 +3689,13 @@ fn block_tail<S: StateDatabase + Sync>(
             out_frags.extend(r.bal_frag.take());
             receipts.push(std::mem::take(&mut r.receipt));
         }
-        // The spent results (write sets + read logs) ride the arena to
-        // the reaper, which harvests their read buffers and recycles the
-        // whole array — no carcass Vec, no per-block moves.
+        // The spent results (write sets and read logs) ride the arena to
+        // the reaper, which harvests their read buffers and recycles
+        // the whole array, with no leftover Vec and no per-block moves.
         delta_ns += t_d.elapsed().as_nanos() as u64;
     } else {
-        // A speculative release (if any) was WRONG: drop our Arc and
-        // rebuild the delta on the repair path; a `corrected` release
+        // A speculative release, if any, was wrong: drop our Arc and
+        // rebuild the delta on the repair path. A `corrected` release
         // follows the repair.
         drop(delta_arc);
         // Phase 1 already ran over these results; the kept-prefix arm
@@ -3650,28 +3707,28 @@ fn block_tail<S: StateDatabase + Sync>(
             .get()
             .expect("layers bound before execution")
             .sink_start_balance;
-        // REPAIR PATH: a wound fired, so txs from the first wound on
-        // re-execute against the exact materialized prefix. Strictly
-        // sequential by nature, and rare enough that its cost is not
-        // worth optimizing.
+        // Repair path: a wound fired, so transactions from the first
+        // wound on re-execute against the exact computed prefix.
+        // Strictly sequential by nature, and rare enough that its cost
+        // is not worth optimizing.
         //
-        // The prefix starts from the FULL pre-block view: unsettled
-        // predecessor LAYERS (oldest first — `MvView` probes them
+        // The prefix starts from the full pre-block view: unsettled
+        // predecessor layers (oldest first, since `MvView` probes them
         // newest-first over `base`, so base is the bottom) merged over
         // the owned base delta. Dropping the layers here read
-        // pre-predecessor state into re-executed txs — found by the
-        // P3b adversarial pipeline test (rejected receipts from stale
-        // nonces), latent since the layers landed: the bench scenarios
-        // never wound.
+        // pre-predecessor state into re-executed transactions. This bug
+        // was found by the speculative-release adversarial pipeline test (rejected
+        // receipts from stale nonces) and had been latent since the
+        // layers landed, since the bench scenarios never wound.
         let mut layered = ctx.base.clone();
         {
             let b = ctx.binding.get().expect("layers bound before execution");
             for l in b.layers.iter().rev() {
                 layered.merge_from(l);
             }
-            // mv layers are NEWER than the delta layers (probed first on
-            // the read path), so they merge last; `final_delta` is the
-            // fold-shaped materialization — rare path, fold cost.
+            // mv layers are newer than the delta layers (probed first on
+            // the read path), so they merge last. `final_delta` is the
+            // fold-shaped computation: a rare path, paying the fold cost.
             for mv in b.mv_layers.iter().rev() {
                 layered.merge_from(&mv.final_delta());
             }
@@ -3687,14 +3744,13 @@ fn block_tail<S: StateDatabase + Sync>(
             .collect();
         for (i, mut r) in spent.into_iter().enumerate() {
             if wounded_set.contains(&i) {
-                // The slot holds the envelope for the whole block — no
-                // second copy in a parallel vec (that clone was 0.1µs of
-                // serial feed per tx).
+                // The slot holds the envelope for the whole block, so
+                // there is no second copy in a parallel vec.
                 let slot = ctx.slots[i].get().expect("slot set for every admitted tx");
                 let (tx_idx, position, envelope) = (slot.tx_idx, slot.position, &slot.envelope);
                 let mut scope = ExecScope::new(&ctx.snapshots[0], Some(&layered), ctx.env)?;
                 // Repair capture replaces the wounded fragment: this
-                // execution runs against the materialized prefix, so its
+                // execution runs against the computed prefix, so its
                 // capture (fee sink included) is canonical directly.
                 let mut repair_frag = ctx.bal_base.map(|_| revm::state::bal::Bal::new());
                 let bal_arg = match (repair_frag.as_mut(), ctx.bal_base) {
@@ -3709,8 +3765,8 @@ fn block_tail<S: StateDatabase + Sync>(
                 layered.apply(ws.clone());
                 delta.apply(ws);
                 receipts.push(receipt);
-                // A repaired skip captures nothing — same hole a skipped
-                // tx leaves on the streaming path.
+                // A repaired skip captures nothing, the same hole a
+                // skipped transaction leaves on the streaming path.
                 out_frags.extend(repair_frag.filter(|f| !f.accounts.is_empty()));
                 continue;
             }
@@ -3731,9 +3787,9 @@ fn block_tail<S: StateDatabase + Sync>(
             delta.apply(r.ws);
             receipts.push(r.receipt);
         }
-        // CORRECTED release: whoever consumed the speculative delta
-        // must unwind onto this one (spec P3b wound-abort). Sent in
-        // conservative mode too — it is simply the first release then.
+        // Corrected release: whoever consumed the speculative delta
+        // must unwind onto this one. Sent in
+        // conservative mode too; it is simply the first release then.
         if let Some(d) = &delta_out {
             let _ = d.tx.send(DeltaRelease {
                 block: ctx.env.block_number,
@@ -3764,10 +3820,10 @@ fn block_tail<S: StateDatabase + Sync>(
             ctx.env.block_number, n, t_exec_wall, t_drain, t_extract, t_validate, t_commit, wounds
         );
     }
-    // Destructure: the HEAVY parts (multi-version cache with ~n
-    // versions, a thousand tx slots) go to the reaper; the light rest
-    // drops here. `S` (the snapshots) stays inline, so no 'static
-    // bound is needed on the payload.
+    // Destructure: the heavy parts (the multi-version cache and its
+    // versions, and the block's transaction slots) go to the reaper;
+    // the light rest drops here. `S` (the snapshots) stays inline, so
+    // no 'static bound is needed on the payload.
     let BlockCtx {
         mv,
         slots,
@@ -3786,7 +3842,8 @@ fn block_tail<S: StateDatabase + Sync>(
         })
         .ok();
     let m = &metrics;
-    // Feed the stealing policy: mean per-tx execution time this block.
+    // Feed the stealing policy: mean per-transaction execution time
+    // this block.
     if n > 0 {
         avg_tx_ns.store(
             m.busy_ns.load(Ordering::Relaxed) / n as u64,
@@ -3905,31 +3962,32 @@ fn worker_loop<S: StateDatabase + Sync>(shared: &PoolShared<S>, worker: usize, k
             }
         };
         run_worker_block(&ctx, worker);
-        // Arc drops here — seal()'s try_unwrap spin depends on it.
+        // The Arc drops here; seal()'s try_unwrap spin depends on it.
     }
 }
 
-/// One worker's participation in one block: ONE EVM for the whole block
-/// (per-tx construction was ~90% of execution-path allocation), the view
-/// re-aimed per tx. Pops ONLY its own FIFO — same-domain txs were hashed
-/// here in canonical order, so a chain drains without any cross-thread
-/// handoff; the DAG carries only the cross-domain edges.
+/// One worker's participation in one block: one EVM for the whole block
+/// (per-transaction construction was most of the execution-path
+/// allocation), with the view re-aimed per transaction. Pops only its
+/// own FIFO: same-domain transactions were hashed here in canonical
+/// order, so a chain drains without any cross-thread handoff, and the
+/// DAG carries only the cross-domain edges.
 ///
-/// A worker (almost) never blocks on a dependency: a tx reaches a queue
-/// once its EDGE indegree is zero, and its FIFO-covered predecessors sit
-/// ahead of it in the same queue — verified at take time (`fifo_ready`),
-/// which is what keeps a stolen predecessor from breaking the order. No
-/// wait-graph deadlock is possible: the canonical total order bounds every
-/// edge and every FIFO obligation (low index → high), and completion only
-/// ever removes them.
+/// A worker almost never blocks on a dependency: a transaction reaches a
+/// queue once its edge indegree is zero, and its FIFO-covered
+/// predecessors sit ahead of it in the same queue, verified at take
+/// time (`fifo_ready`), which is what keeps a stolen predecessor from
+/// breaking the order. No wait-graph deadlock is possible: the
+/// canonical total order bounds every edge and every FIFO obligation
+/// (low index to high), and completion only ever removes them.
 fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
-    // LATE-BIND GATE (spec P3b): a deferred session's txs are admitted
-    // and queued before its read base exists; nothing may execute until
-    // the consumer binds the layers. The wait is bind latency (the
-    // predecessor's fold), normally sub-millisecond; the block-at-a-time
-    // path binds at session build, so this is one free load. A consumer
-    // that never binds must abort; the tail's drain watchdog is the
-    // loud backstop.
+    // Late-bind gate: a deferred session's transactions are
+    // admitted and queued before its read base exists. Nothing may
+    // execute until the consumer binds the layers. The wait is bind
+    // latency (the predecessor's fold), normally sub-millisecond; the
+    // block-at-a-time path binds at session build, so this load is
+    // free. A consumer that never binds must abort; the tail's drain
+    // watchdog is the loud backstop.
     let bound = loop {
         if let Some(b) = ctx.binding.get() {
             break b;
@@ -3960,10 +4018,11 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
         .with_cfg(ctx.env.cfg_env())
         .build_mainnet();
     let qh = &ctx.queues[worker];
-    // Timing and read counts accumulate LOCALLY and flush once per block.
-    // Per-read (and even per-tx) `fetch_add` on shared metrics had every
-    // worker writing the same cache lines — instrumentation generating the
-    // very cross-core traffic it was measuring.
+    // Timing and read counts accumulate locally and flush once per
+    // block. A `fetch_add` on shared metrics per read, or even per
+    // transaction, had every worker writing the same cache lines. The
+    // instrumentation was generating the very cross-core traffic it
+    // aimed to measure.
     let mut local_busy_ns: u64 = 0;
     let mut local_first_ns: u64 = u64::MAX;
     let mut local_last_ns: u64 = 0;
@@ -4004,8 +4063,9 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 }
                 if ctx.bag_mode {
                     // Chain-local hand-off first (see complete_inline),
-                    // then the shared bag. Bag entries are indegree-0-
-                    // dispatched with coverage off ⇒ nothing to verify.
+                    // then the shared bag. Bag entries dispatch at
+                    // indegree 0 with coverage off, so there is nothing
+                    // to verify.
                     if let Some(i) = local_next.take() {
                         drop(q);
                         break i;
@@ -4016,16 +4076,17 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     }
                 } else if let Some(i) = q.pop_front() {
                     qh.len.fetch_sub(1, Ordering::Release);
-                    // Verify with NO lock held — the check takes a node
-                    // mutex and scans results, and holding the queue lock
-                    // across it would block the feed's submissions.
+                    // Verify with no lock held. The check takes a node
+                    // mutex and scans results, and holding the queue
+                    // lock across it would block the feed's submissions.
                     drop(q);
                     if ctx.fifo_ready(i) {
                         break i;
                     }
                     // A FIFO predecessor was stolen and is still running
-                    // on another thread — rare, and bounded by that tx's
-                    // execution time. Put the head back and yield.
+                    // on another thread. This is rare, and bounded by
+                    // that transaction's execution time. Put the head
+                    // back and yield.
                     ctx.metrics.fifo_stalls.fetch_add(1, Ordering::Relaxed);
                     q = qh.q.lock().expect("queue poisoned");
                     q.push_front(i);
@@ -4035,12 +4096,13 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     q = qh.q.lock().expect("queue poisoned");
                     continue;
                 }
-                // Dry. Apply any parked completions MYSELF before parking:
-                // this is what makes batching safe — the pool can never sit
-                // idle on DAG updates nobody applied. The queue lock is
-                // dropped first (lock order: never hold a queue lock while
-                // taking the graph lock — and prune's push_ready re-locks
-                // queues, so holding one here self-deadlocks).
+                // Dry. Apply any parked completions myself before
+                // parking: this is what makes batching safe, since the
+                // pool can never sit idle on DAG updates nobody applied.
+                // The queue lock is dropped first (lock order: never
+                // hold a queue lock while taking the graph lock, since
+                // prune's push_ready re-locks queues, so holding one
+                // here self-deadlocks).
                 drop(q);
                 if ctx.pending.load(Ordering::SeqCst) > 0 {
                     ctx.prune(true);
@@ -4050,10 +4112,11 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 if ctx.drained() {
                     leave!(evm);
                 }
-                // Domain hashing collides when domains ~ workers (measured:
-                // the busiest thread took 1.7-2.3x its even share, and
-                // ~1.25 threads per block got nothing at all), so an idle
-                // worker helps the busiest one rather than parking.
+                // Domain hashing collides when the number of domains is
+                // close to the number of workers, so the busiest thread
+                // can take well over its even share while some threads
+                // get nothing at all. So an idle worker helps the
+                // busiest one rather than parking.
                 if ctx.steal_enabled
                     && let Some(stolen) = ctx.steal(worker)
                 {
@@ -4064,11 +4127,12 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 if !q.is_empty() || (ctx.bag_mode && !ctx.bag.is_empty()) {
                     continue;
                 }
-                // SPIN before parking: at high throughput the next tx is
-                // usually microseconds away, and a park/unpark pair costs
-                // two syscalls — more than a small transfer's entire
-                // execution. Only a worker that stays dry through the spin
-                // advertises itself as parked and blocks.
+                // Spin before parking: at high throughput the next
+                // transaction is usually microseconds away, and a
+                // park/unpark pair costs two syscalls, more than a small
+                // transfer's entire execution. Only a worker that stays
+                // dry through the spin advertises itself as parked and
+                // blocks.
                 let t_idle = std::time::Instant::now();
                 drop(q);
                 let mut spun = false;
@@ -4077,16 +4141,16 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                     for _ in 0..SPIN_BEFORE_PARK {
                         std::hint::spin_loop();
                     }
-                    // Lock-free probe: a dry worker spinning here for tens
-                    // of microseconds must not contend with the feed's
-                    // push into this very queue.
+                    // Lock-free probe: a dry worker spinning here for
+                    // tens of microseconds must not contend with the
+                    // feed's push into this very queue.
                     if qh.len.load(Ordering::Acquire) > 0 || (ctx.bag_mode && !ctx.bag.is_empty()) {
                         spun = true;
                         break;
                     }
-                    // Completions may be parked while we spin — apply them
-                    // ourselves rather than spin past the work they would
-                    // release.
+                    // Completions may be parked while we spin. Apply
+                    // them ourselves rather than spin past the work
+                    // they would release.
                     if ctx.pending.load(Ordering::SeqCst) > 0 {
                         ctx.prune(true);
                         continue;
@@ -4100,17 +4164,17 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
                 }
                 q = qh.q.lock().expect("queue poisoned");
                 if !spun && q.is_empty() && (!ctx.bag_mode || ctx.bag.is_empty()) {
-                    // BOUNDED wait, deliberately. A notification can be
-                    // missed: `signal_done` wakes every queue WITHOUT
+                    // A bounded wait, deliberately. A notification can
+                    // be missed: `signal_done` wakes every queue without
                     // holding that queue's mutex, so a worker sitting
                     // between "decided to park" and "actually waiting"
-                    // sleeps through it and never returns — the block
+                    // sleeps through it and never returns. The block
                     // drains, `seal` finishes, and the pool then hangs
-                    // forever joining that thread. (Introducing the spin
-                    // above widened that window enough to hit it every
-                    // run; the race predates it.) A timeout makes any
-                    // missed wake self-healing, and costs nothing when
-                    // wakes arrive normally.
+                    // forever joining that thread. (Introducing the
+                    // spin above widened that window enough to hit it
+                    // on every run; the race predates it.) A timeout
+                    // makes any missed wake self-healing, and costs
+                    // nothing when wakes arrive normally.
                     qh.parked.store(true, Ordering::Release);
                     let (nq, _) = qh.cv.wait_timeout(q, PARK_POLL).expect("queue poisoned");
                     q = nq;
@@ -4139,17 +4203,19 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             ctx.bal_base,
             &mut || take_read_buf(&mut read_stash, &ctx.recycle),
         );
-        // Timestamps stay WORKER-LOCAL and fold once per block. Stamping
-        // them globally cost two clock reads and two contended RMWs per
-        // transaction — on a 2.7us transfer, the instrumentation was a
-        // measurable share of the work it claimed to measure.
+        // Timestamps stay worker-local and fold once per block. Stamping
+        // them globally cost two clock reads and two contended
+        // read-modify-writes per transaction. On a small transfer, the
+        // instrumentation was a measurable share of the work it claimed
+        // to measure.
         let done_at = ctx.started.elapsed().as_nanos() as u64;
         let busy_ns = done_at.saturating_sub(t_busy_at);
         local_busy_ns += busy_ns;
         local_first_ns = local_first_ns.min(t_busy_at);
         local_last_ns = local_last_ns.max(done_at);
-        // Census the write set against dispatch: an account whose domain
-        // hashes to another worker can be written by more than one thread.
+        // Check the write set against dispatch: an account whose domain
+        // hashes to another worker can be written by more than one
+        // thread.
         if let Ok(res) = &r {
             for (addr, _) in res.ws.accounts.iter() {
                 if *addr == FEE_SINK {
@@ -4173,17 +4239,17 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
             return;
         }
 
-        // COMPLETION: park the index in this worker's own buffer
+        // Completion: park the index in this worker's own buffer
         // (uncontended) and only touch the DAG once a batch has
         // accumulated. `prune_batch == 1` is the immediate policy.
         //
-        // `pending` increments BEFORE the buffer push: prune runs
-        // concurrently (another worker's batch, the tail's drain
-        // loop) and subtracts what it drains — a completion visible
-        // in a buffer before its increment landed underflowed the
-        // counter (debug-build overflow panic; found by the P3b
-        // adversarial test's abort storms). Incremented-but-unpushed
-        // is the safe direction: a spurious prune drains nothing.
+        // `pending` increments before the buffer push. Prune runs
+        // concurrently (another worker's batch, the tail's drain loop)
+        // and subtracts what it drains. A completion visible in a
+        // buffer before its increment landed underflowed the counter
+        // (a debug-build overflow panic, found by the speculative-release
+        // adversarial test's abort storms). Incremented-but-unpushed is the safe
+        // direction: a spurious prune drains nothing.
         if ctx.bag_mode {
             local_next = ctx.complete_inline(job);
         } else {
@@ -4200,8 +4266,8 @@ fn run_worker_block<S: StateDatabase>(ctx: &BlockCtx<S>, worker: usize) {
     }
 }
 
-/// Batch entry point over a transient pool — kept for tests and simple
-/// callers; long-lived callers (the A/B harness, the P3 actor) hold a
+/// Batch entry point over a transient pool. Kept for tests and simple
+/// callers; long-lived callers (the A/B harness, the live actor) hold a
 /// [`with_pool`] scope and amortize the spawn away entirely.
 pub fn execute_block_stm<S: StateDatabase + Sync + Clone + 'static>(
     snapshot: &S,
@@ -4229,16 +4295,16 @@ pub fn execute_block_stm<S: StateDatabase + Sync + Clone + 'static>(
 }
 
 /// The sequential reference path (also the fallback): `ExecScope` per
-/// block, canonical order — the executor's streaming semantics.
-/// [`execute_block_sequential`] with the RLP already decoded — the
-/// FAIR baseline for A/B against the parallel engine.
+/// block, in canonical order, the executor's streaming semantics.
+/// [`execute_block_sequential`] with the RLP already decoded: the fair
+/// baseline for A/B against the parallel engine.
 ///
 /// The parallel path receives pre-decoded envelopes from `prepare`
-/// (readers do it, off the execution thread); the sequential path used
-/// to decode inline, so a naive A/B charged ~180ns/tx to sequential
-/// only — 0.7ms per 4000-tx block, which inflated every ratio by 2-9%.
-/// Production gets the same benefit: whoever reads the stream can hand
-/// the decode to either engine.
+/// (readers do it, off the execution thread). The sequential path used
+/// to decode inline, so a naive A/B charged the decode cost to
+/// sequential only, which inflated every ratio. Production gets the
+/// same benefit: whoever reads the stream can hand the decode to either
+/// engine.
 pub fn execute_block_sequential_decoded<S: StateDatabase + Sync>(
     snapshot: &S,
     base: Option<&PendingDelta>,
@@ -4292,9 +4358,10 @@ pub fn execute_block_sequential<S: StateDatabase + Sync>(
     let mut receipts = Vec::with_capacity(txs.len());
     let mut delta = PendingDelta::new();
     let mut cumulative = 0u64;
-    // Diagnostic split, env-gated: how much of the sequential wall is
-    // `execute_tx` itself vs the delta fold around it. Comparing engines
-    // by their outer walls alone has misattributed overhead twice.
+    // Diagnostic split, env-gated: how much of the sequential wall time
+    // is `execute_tx` itself versus the delta fold around it. Comparing
+    // engines by their outer walls alone has misattributed overhead
+    // twice.
     let timing = std::env::var_os("KARDAMOM_SEQ_TIMING").is_some();
     let mut exec_ns = 0u64;
     for (i, (tx_idx, position, envelope)) in txs.iter().enumerate() {
@@ -4320,7 +4387,7 @@ pub fn execute_block_sequential<S: StateDatabase + Sync>(
     Ok((receipts, delta))
 }
 
-/// One worker's EVM over its multi-version view — ExecScope's shape with
+/// One worker's EVM over its multi-version view: ExecScope's shape with
 /// the concurrent DB swapped in.
 type WorkerEvm<'a, S> = revm::handler::MainnetEvm<
     revm::context::Context<
@@ -4331,15 +4398,15 @@ type WorkerEvm<'a, S> = revm::handler::MainnetEvm<
     >,
 >;
 
-/// Execute one tx against its multi-version view. Mirrors
-/// `ExecScope::execute_tx` exactly — #92 skip semantics, write-set
-/// emission, receipt shape — with MvCache publish in place of the
-/// sequential commit. The worker's EVM is reused across txs; only the
-/// view's index and read log are re-aimed.
+/// Execute one transaction against its multi-version view. Mirrors
+/// `ExecScope::execute_tx` exactly (#92 skip semantics, write-set
+/// emission, receipt shape), with MvCache publish in place of the
+/// sequential commit. The worker's EVM is reused across transactions;
+/// only the view's index and read log are re-aimed.
 #[allow(clippy::too_many_arguments)]
 /// Pop a cleared read-record buffer (batch-refilled from the recycle
-/// pool, one lock per 64 txs); falls back to a fresh allocation while
-/// the pool warms up.
+/// pool, one lock per 64 transactions); falls back to a fresh
+/// allocation while the pool warms up.
 fn take_read_buf(stash: &mut Vec<Vec<ReadRecord>>, pools: &RecyclePools) -> Vec<ReadRecord> {
     if let Some(b) = stash.pop() {
         return b;
@@ -4402,7 +4469,7 @@ fn execute_one<S: StateDatabase>(
         .unwrap_or_else(|| alloy_env.max_fee_per_gas());
 
     {
-        // Re-aim the worker's view at this tx.
+        // Re-aim the worker's view at this transaction.
         let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
         db.idx = local_idx;
         db.reads.clear();
@@ -4429,9 +4496,9 @@ fn execute_one<S: StateDatabase>(
         .evm_ns
         .fetch_add(t_evm.elapsed().as_nanos() as u64, Ordering::Relaxed);
     let gas_used = outcome.result.gas().tx_gas_used();
-    // Wire logs straight from the borrowed result — the intermediate
-    // `logs.clone()` (topics Vecs + data Bytes per log, every success)
-    // was allocation for its own sake.
+    // Wire logs straight from the borrowed result. The intermediate
+    // `logs.clone()` (topic Vecs and data Bytes per log, on every
+    // success) was allocation for its own sake.
     let (status, wire_logs) = match &outcome.result {
         ExecutionResult::Success { logs, .. } => {
             (ReceiptStatus::Success, logs.iter().map(wire_log).collect())
@@ -4441,12 +4508,13 @@ fn execute_one<S: StateDatabase>(
     };
 
     let ws = write_set_from_evm_state(&outcome.state);
-    // EIP-7928 capture: this tx's fragment at its BLOCK-GLOBAL index,
-    // through the SAME update_account the streaming path uses on the same
-    // `outcome.state`. Everything the MV cache tracks reads canonically
-    // here (a wound would replace this fragment); the fee sink is the one
-    // untracked account — the commit pass rewrites its balance write to
-    // the materialized prefix, exactly as it rewrites the WriteSet's.
+    // EIP-7928 capture: this transaction's fragment at its block-global
+    // index, through the same update_account the streaming path uses on
+    // the same `outcome.state`. Everything the mv cache tracks reads
+    // canonically here (a wound would replace this fragment). The fee
+    // sink is the one untracked account: the commit pass rewrites its
+    // balance write to the computed prefix, exactly as it rewrites the
+    // WriteSet's.
     let bal_frag = bal_base.map(|b| {
         let mut frag = revm::state::bal::Bal::new();
         let idx = b + local_idx as u64 + 1;
@@ -4455,14 +4523,16 @@ fn execute_one<S: StateDatabase>(
         }
         frag
     });
-    // POOLED JOURNAL: revm's finalize mem::takes the state map out of
-    // the journal into `outcome.state`, leaving a capacity-0 map behind
-    // — every tx then regrew a fresh table (measured as the shared
-    // per-tx allocation floor, ~2.5 allocs/tx in the <4K bucket). Hand
-    // the SPENT table back: its entries drop here (they are tx-local by
-    // contract — a stale entry would be read as a cached truth by the
-    // next tx's load_account), its capacity survives, and the journal's
-    // own entry vec / transient storage already clear in place.
+    // Pooled journal: revm's finalize mem::takes the state map out of
+    // the journal into `outcome.state`, leaving a zero-capacity map
+    // behind. Every transaction then regrew a fresh table, which
+    // measurement showed as a large share of the per-transaction
+    // allocation floor on light workloads. Hand the spent table back:
+    // its entries drop here (they are transaction-local by contract, so
+    // a stale entry would be read as a cached truth by the next
+    // transaction's load_account), its capacity survives, and the
+    // journal's own entry vec and transient storage already clear in
+    // place.
     {
         let mut spent = std::mem::take(&mut outcome.state);
         spent.clear();
@@ -4470,10 +4540,10 @@ fn execute_one<S: StateDatabase>(
             .inner
             .state = spent;
     }
-    // Publish in the ordered helper's sequence (code+storage, THEN
-    // accounts — see `MvCache::publish_write_set`), skipping the fee sink
-    // (Accumulator: all workers see block-start; the commit pass
-    // materializes the prefixes).
+    // Publish in the ordered helper's sequence (code and storage, then
+    // accounts; see `MvCache::publish_write_set`), skipping the fee
+    // sink (Accumulator: all workers see block-start; the commit pass
+    // computes the prefixes).
     let t_pub = std::time::Instant::now();
     mv.publish_write_set(local_idx, &ws, FEE_SINK);
     metrics
@@ -4487,11 +4557,11 @@ fn execute_one<S: StateDatabase>(
         .unwrap_or(U256::ZERO);
 
     let reads = {
-        // Take this tx's read log back out of the worker's view. The
-        // replacement comes from the RECYCLE pool (cleared, capacity
-        // intact from a previous block's tx): the fresh
-        // per-tx Vec + its growth reallocs were the largest
-        // STM-specific allocation (~4KB/tx at contract weight).
+        // Take this transaction's read log back out of the worker's
+        // view. The replacement comes from the recycle pool (cleared,
+        // with capacity intact from a previous block's transaction).
+        // The fresh per-transaction Vec and its growth reallocations
+        // were the largest STM-specific allocation.
         let db = revm::context_interface::ContextTr::db_mut(&mut **evm);
         std::mem::replace(&mut db.reads, fresh_reads())
     };

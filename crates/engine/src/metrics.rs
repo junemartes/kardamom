@@ -1,42 +1,41 @@
-//! Metric name constants for the executor. Emission sites live in
-//! `actor.rs` (block-apply, state-commit, block-number gauge) and
-//! `executor.rs` (per-tx counter via `execute_tx` / `execute_deposit_tx`
-//! return values inspected in `actor::spawn_exec`).
+//! Metric name constants for the executor.
+//!
+//! Emission sites:
+//!   - `actor.rs`: block-apply duration, state-commit duration, block-number
+//!     gauge.
+//!   - `executor.rs`: per-tx counter, from `execute_tx` and
+//!     `execute_deposit_tx` return values, checked in `actor::spawn_exec`.
 
 pub const TX_APPLIED_TOTAL: &str = "kardamom_executor_tx_applied_total";
 pub const BLOCK_APPLY_DURATION_SECONDS: &str = "kardamom_executor_block_apply_duration_seconds";
 pub const STATE_COMMIT_DURATION_SECONDS: &str = "kardamom_executor_state_commit_duration_seconds";
 pub const BLOCK_NUMBER: &str = "kardamom_executor_block_number";
 
-// The clustered sealer (the Java Aeron Cluster service) exposes no Prometheus
-// endpoint of its own, so the EXECUTOR re-exports the sealer's output as it
-// decodes cluster egress (`reader/cluster.rs`): each in-order delivered
-// Boundary bumps the counter and sets the gauge to the sealer's declared block
-// number. They measure the boundary stream as observed at that executor's
-// subscription, not JVM-internal state. The validator consumes the same
-// shared subscription but constructs it with the emission SUPPRESSED
-// (`suppress_sealer_metrics`), so only executor exporters publish these
-// series; probes may still `max()` across the executor replicas (each replica
-// re-exports its own view).
+// The clustered sealer (the Java Aeron Cluster service) has no Prometheus
+// endpoint. So the executor re-exports the sealer's output as it decodes
+// cluster egress (`reader/cluster.rs`). Each in-order Boundary message bumps
+// the counter and sets the gauge to the sealer's block number. These metrics
+// measure the boundary stream at that executor's subscription. They do not
+// measure JVM-internal state.
+//
+// The validator uses the same shared subscription, but it suppresses the
+// emission (`suppress_sealer_metrics`). So only executor exporters publish
+// these series. Probes can still take the `max()` across executor replicas;
+// each replica re-exports its own view.
 pub const SEALER_BLOCK_NUMBER: &str = "kardamom_sealer_block_number";
 pub const SEALER_BOUNDARIES_TOTAL: &str = "kardamom_sealer_boundaries_emitted_total";
 
-// Full-resync fallback (replay window overrun): bumped by the executor binary
-// when the cluster refuses REPLAY_FROM (`REPLAY_UNAVAILABLE`) and the node
-// repairs itself with a peer checkpoint — or fails to. Labelled
-// `outcome=peer-checkpoint|unrecoverable`. Rare by design; any non-zero rate
-// is worth an alert (a node fell behind the retention window).
-/// EIP-7928 BAL publication (spec: bal-attribution-parallel-validation).
+/// EIP-7928 BAL publication.
 pub const BAL_FRAME_BYTES: &str = "kardamom_executor_bal_frame_bytes";
 pub const BAL_ENCODE_SECONDS: &str = "kardamom_executor_bal_encode_seconds";
 pub const BAL_PUBLISH_TOTAL: &str = "kardamom_executor_bal_publish_total";
 pub const BAL_RETAINED_BLOCKS: &str = "kardamom_executor_bal_retained_blocks";
 
-/// P1 footprint shadow (spec: block-stm-executor §P1) — emitted by the
-/// `footprint-shadow` thread (`crate::shadow`), executor role only, behind
-/// `KARDAMOM_FOOTPRINT_SHADOW=1`. The spec's `footprint_prediction_hit_rate`
-/// / `footprint_false_independent_total` names, namespaced like every other
-/// executor series.
+/// Footprint shadow. The `footprint-shadow`
+/// thread (`crate::shadow`) emits this. It runs only for the executor role,
+/// behind `KARDAMOM_FOOTPRINT_SHADOW=1`. The names match
+/// `footprint_prediction_hit_rate` and `footprint_false_independent_total`
+/// exactly, namespaced like every other executor series.
 pub const FOOTPRINT_BLOCKS_TOTAL: &str = "kardamom_executor_footprint_blocks_total";
 pub const FOOTPRINT_PREDICTION_HIT_RATE: &str = "kardamom_executor_footprint_prediction_hit_rate";
 pub const FOOTPRINT_FALSE_INDEPENDENT_TOTAL: &str =
@@ -51,16 +50,22 @@ pub const FOOTPRINT_PREDICTED_EDGES: &str = "kardamom_executor_footprint_predict
 pub const FOOTPRINT_PREDICTED_CP_RATIO: &str = "kardamom_executor_footprint_predicted_cp_ratio";
 pub const FOOTPRINT_ORACLE_CP_RATIO: &str = "kardamom_executor_footprint_oracle_cp_ratio";
 
-/// Health-beacon beats recorded (i.e. blocks closed with the health-check
-/// feature active). Flat at 0 while the feature is dormant; once activated it
-/// advances once per block, so a stalled counter against a rising
-/// `BLOCK_NUMBER` means the feature stopped firing.
+/// Health-beacon beats recorded: blocks closed with the health-check feature
+/// active. This stays at 0 while the feature is off. Once active, it advances
+/// once per block. If this counter stalls while `BLOCK_NUMBER` rises, the
+/// feature has stopped firing.
 pub const HEALTH_BEACON_BEATS_TOTAL: &str = "kardamom_executor_health_beacon_beats_total";
 
+// Full-resync fallback, for a replay-window overrun. The executor binary
+// bumps this when the cluster refuses REPLAY_FROM (`REPLAY_UNAVAILABLE`) and
+// the node repairs itself with a peer checkpoint, or fails to repair itself.
+// The label is `outcome=peer-checkpoint` or `outcome=unrecoverable`. This
+// event is rare by design. Any non-zero rate is worth an alert. It means a
+// node fell behind the retention window.
 pub const RESYNC_TOTAL: &str = "kardamom_executor_resync_total";
-// The invalid-tx-skip counter is emitted from inside the `no_std` exec core
-// (`invalid_skip`), so the constant and its `record_` helper live there;
-// re-exported here so the metric namespace stays browsable in one place.
+// The invalid-tx-skip counter comes from inside the `no_std` exec core
+// (`invalid_skip`). The constant and its `record_` helper live there. This
+// re-export keeps the metric namespace browsable in one place.
 pub use kardamom_exec_core::metrics::{INVALID_TX_SKIPPED_TOTAL, record_invalid_tx_skipped};
 
 pub fn describe() {

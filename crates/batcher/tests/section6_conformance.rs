@@ -1,27 +1,27 @@
-//! §6 conformance test (post to Anvil → reconstruct from L1).
+//! Section 6 conformance test: post to Anvil, then reconstruct from L1.
 //!
-//! End-to-end exercise of the **new M+1 archive topology**:
+//! An end-to-end exercise of the M+1 archive topology:
 //!
 //! 1. Build per-sequencer tx_data archives with full `TxEnvelope` bytes.
 //! 2. Build the tx_ordering archive with the canonical `TxOrderingMessage`
-//!    record stream (`TxRef + BoundaryStart`).
-//! 3. Drive the offline `MultiArchiveReader` → `BatchAccumulator` →
+//!    record stream (`TxRef` and `BoundaryStart`).
+//! 3. Drive the offline `MultiArchiveReader`, `BatchAccumulator`, and
 //!    `pack_blocks` pipeline to produce the same `PostedBatch` the
 //!    lease-holder would broadcast.
-//! 4. Deploy `KardamomL2Settlement` via the kardamom factory and call
+//! 4. Deploy `KardamomL2Settlement` through the kardamom factory, and call
 //!    `postBatch(prevBatchIndex, versionedHashes, l2BlockStart,
-//!    l2BlockEnd)` from the batcher EOA. The blob bytes themselves are
-//!    *not* sent to anvil (4844 sidecar broadcasting is a future task);
-//!    however the calldata path and the `BatchPosted` event are exercised
+//!    l2BlockEnd)` from the batcher EOA. The blob bytes themselves are not
+//!    sent to anvil, because 4844 sidecar broadcasting is a future task.
+//!    Still, this exercises the calldata path and the `BatchPosted` event
 //!    against the live contract.
-//! 5. Reconstruct the L2 stream from the locally-held blob bytes and assert
-//!    it matches the inputs — same invariant a real L1-observer client would
-//!    use to recover the L2 state.
+//! 5. Reconstruct the L2 stream from the locally held blob bytes, and
+//!    check it matches the inputs. This is the same invariant a real
+//!    L1-observer client would use to recover the L2 state.
 //!
-//! Skips gracefully if anvil is not installed (same convention the deployer
-//! and `anvil_e2e.rs` use). The test exists to pin down the §6 conformance
-//! invariant under the  input topology: split data and ordering
-//! must round-trip through the batcher exactly the same as the pre-split
+//! Skips gracefully if anvil is not installed (the same convention the
+//! deployer and `anvil_e2e.rs` use). This test pins down the section 6
+//! conformance invariant under the M+1 input topology: split data and
+//! ordering must round-trip through the batcher exactly as the pre-split
 //! single-archive layout did.
 
 use std::collections::HashMap;
@@ -55,8 +55,8 @@ fn pos(o: i32) -> BPosition {
     }
 }
 
-/// Write the M+1 synthetic archives that emulate a  sequencer:
-/// 2 sequencers, 3 txs each, 1 boundary on B.
+/// Write the M+1 synthetic archives that emulate a multi-sequencer setup:
+/// 2 sequencers, 3 txs each, and 1 boundary on B.
 fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::PathBuf>) {
     // Per-sequencer envelopes.
     let envs_a0: Vec<TxEnvelope> = (0..3)
@@ -100,9 +100,9 @@ fn write_archives(dir: &TempDir) -> (std::path::PathBuf, HashMap<u8, std::path::
     // Canonical order on B: round-robin a0/a1 for 6 refs, then a boundary.
     let mut b_buf = Vec::new();
     let mut b_off = 0i32;
-    // Use distinct tx_hashes per ref so the executor's dedup doesn't
-    // collapse them; this loop drives an offline-reader test so the
-    // executor isn't involved, but keep them distinct for hygiene.
+    // Use a distinct tx_hash for each ref, so the executor's dedup would
+    // not collapse them. This loop drives an offline-reader test, so the
+    // executor is not involved, but keep the hashes distinct anyway.
     let mut hash_seed: u8 = 0;
     for a_pos in &a_positions {
         hash_seed = hash_seed.wrapping_add(1);
@@ -223,8 +223,8 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
             ResolvedRecord::Boundary { marker, .. } => {
                 let closed = batcher.accumulator().observe_boundary(marker);
                 let pack = pack_blocks(&cfg, std::slice::from_ref(&closed)).expect("pack");
-                // Reconstruct *locally* from the blobs we just packed —
-                // mirrors what a §6 L1-observer client does after
+                // Reconstruct locally from the blobs just packed. This
+                // mirrors what a section 6 L1-observer client does after
                 // downloading sidecar bytes from the beacon node.
                 let reconstructed = reconstruct(&pack.blobs).expect("reconstruct");
                 assert_eq!(reconstructed.len(), 1);
@@ -280,13 +280,13 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
     assert_eq!(entries.len(), 1);
     let settlement_addr = entries[0].proxy;
 
-    // Deterministic stub versioned hashes — the real broadcast path uses
-    // `alloy-consensus::BlobTransactionSidecar` which derives KZG commitments
-    // from the blobs and then computes the versioned hash. Computing KZG
-    // commitments requires the trusted setup; out of scope for this test.
-    // The contract only stores the hashes and emits them — it never opens
-    // the blob bytes — so a stub is sufficient to exercise the
-    // post-batch / event-emission path.
+    // Deterministic stub versioned hashes. The real broadcast path uses
+    // `alloy-consensus::BlobTransactionSidecar`, which derives KZG
+    // commitments from the blobs and then computes the versioned hash.
+    // Computing KZG commitments needs the trusted setup, which is out of
+    // scope for this test. The contract only stores the hashes and emits
+    // them; it never opens the blob bytes. So a stub is enough to exercise
+    // the post-batch and event-emission path.
     let versioned_hashes: Vec<B256> = (0..posted.blobs.len())
         .map(|i| B256::repeat_byte(0xA0 + i as u8))
         .collect();
@@ -325,10 +325,10 @@ async fn section6_conformance_m_plus_one_to_l1_and_back() {
     assert!(found, "BatchPosted event missing");
 
     // ----- Stage 4: reconstruct from the locally-held blob bytes. -----
-    // In production a §6 observer fetches the blob bytes from the L1 beacon
-    // node by versioned hash; here we use the bytes we already have since
-    // the test scope is the offline → on-chain → reconstruct invariant, not
-    // beacon-node integration.
+    // In production, a section 6 observer fetches the blob bytes from the
+    // L1 beacon node by versioned hash. Here, this test uses the bytes it
+    // already has, because the test scope is the offline, on-chain, and
+    // reconstruct invariant, not beacon-node integration.
     let reconstructed = reconstruct(&posted.blobs).expect("reconstruct posted batch");
     assert_eq!(reconstructed.len(), 1);
     let want = [1000u64, 2000, 1001, 2001, 1002, 2002];

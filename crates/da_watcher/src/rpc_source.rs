@@ -1,14 +1,14 @@
 //! Alloy-provider-backed implementation of [`crate::source::L1Source`].
 //!
-//! Two responsibilities only:
-//!   * map `finalized_block_number()` → `eth_getBlockByNumber("finalized")`,
-//!   * map `lockbox_logs(...)` → `eth_getLogs(...)` filtered by the lockbox
-//!     address and the `DepositInitiated` / `UpgradeInitiated` event
-//!     signatures, then ABI-decode each result into a [`LockboxLog`].
+//! It has only two jobs:
+//!   * map `finalized_block_number()` to `eth_getBlockByNumber("finalized")`,
+//!   * map `lockbox_logs(...)` to `eth_getLogs(...)`, filtered by the
+//!     lockbox address and the `DepositInitiated` and `UpgradeInitiated`
+//!     event signatures, then ABI-decode each result into a [`LockboxLog`].
 //!
-//! Ported verbatim from PR #10's `crates/node/src/l1_source_rpc.rs`. The
-//! event signature is byte-pinned to the on-chain `ETHLockbox.sol` ABI by
-//! the contracts' bytecode-hash CI check.
+//! Ported from `crates/node/src/l1_source_rpc.rs`. The contracts'
+//! bytecode-hash CI check byte-pins the event signature to the on-chain
+//! `ETHLockbox.sol` ABI.
 
 use alloy_primitives::{Address, B256, U256};
 use alloy_provider::Provider;
@@ -22,8 +22,9 @@ use crate::source::{DepositLog, L1Source, L1SourceError, LockboxLog};
 
 sol! {
     /// Mirror of `contracts/src/L1/ETHLockbox.sol::DepositInitiated`.
-    /// The Rust-side wire signature must stay byte-identical with the Solidity
-    /// declaration; CI's bytecode-hash pin catches drift on the contract side.
+    /// The Rust-side wire signature must stay byte-identical with the
+    /// Solidity declaration. CI's bytecode-hash pin catches drift on the
+    /// contract side.
     #[derive(Debug)]
     event DepositInitiated(
         uint64 indexed depositNonce,
@@ -34,8 +35,8 @@ sol! {
         bytes data
     );
 
-    /// Mirror of `contracts/src/L1/ETHLockbox.sol::UpgradeInitiated` — the
-    /// upgrade transaction. `activationTimestamp` is epoch-MILLISECONDS.
+    /// Mirror of `contracts/src/L1/ETHLockbox.sol::UpgradeInitiated`, the
+    /// upgrade transaction. `activationTimestamp` is in epoch milliseconds.
     #[derive(Debug)]
     event UpgradeInitiated(
         uint64 indexed upgradeNonce, uint256 indexed featureId, uint64 activationTimestamp
@@ -78,8 +79,8 @@ where
             .map_err(|e| L1SourceError::Provider(e.to_string()))?
             .ok_or_else(|| {
                 // The caller only ever asks for blocks at or below the
-                // finalized tip, so a miss is a reorg or a lying provider —
-                // not an expected "not yet" like NotFinalized.
+                // finalized tip. So a miss means a reorg or a lying
+                // provider, not an expected "not yet" like NotFinalized.
                 L1SourceError::Provider(format!("finalized L1 block {number} not found"))
             })?;
         Ok((block.header.hash, block.header.parent_hash))
@@ -91,9 +92,10 @@ where
         from_block: u64,
         to_block: u64,
     ) -> Result<Vec<LockboxLog>, L1SourceError> {
-        // ONE query for both event kinds: a topic0 set, not two round trips.
-        // Two queries could succeed and fail independently, which would let an
-        // epoch derive with its deposits but without its upgrade.
+        // One query for both event kinds, using a topic0 set, not two round
+        // trips. Two separate queries could succeed and fail independently,
+        // which could let an epoch derive with its deposits but without its
+        // upgrade.
         let filter = Filter::new()
             .address(lockbox)
             .event_signature(vec![
@@ -115,9 +117,9 @@ where
 
 /// Decode one lockbox log, dispatching on `topic[0]`.
 ///
-/// An unrecognised topic0 is a hard `Decode` error rather than a skip: the
-/// filter asked for exactly two signatures, so anything else means the provider
-/// ignored the filter, and silently dropping it would derive an epoch that
+/// An unrecognized topic0 is a hard `Decode` error, not a skip. The filter
+/// asked for exactly two signatures, so any other topic means the provider
+/// ignored the filter. Silently dropping it would derive an epoch that
 /// disagrees with L1.
 pub(crate) fn decode_lockbox_log(log: &RpcLog) -> Result<LockboxLog, L1SourceError> {
     let topic0 = *log
@@ -173,14 +175,13 @@ pub(crate) fn decode_upgrade_log(log: &RpcLog) -> Result<UpgradeLog, L1SourceErr
 
 /// Decode a single `DepositInitiated` log into a [`DepositLog`].
 ///
-/// Fails on:
-///  * `topic[0] != DepositInitiated::SIGNATURE_HASH` → `Decode`,
-///  * ABI-decode failure → `Decode`,
-///  * `mint > u128::MAX` (the deposit type's `mint` field is `u128`) →
-///    `Decode`,
-///  * missing `block_hash` / `log_index` (only happens for pending logs,
-///    which `eth_getLogs` with explicit block bounds will not return) →
-///    `Decode`.
+/// This function returns `Decode` when:
+///  * `topic[0] != DepositInitiated::SIGNATURE_HASH`,
+///  * the ABI decode fails,
+///  * `mint > u128::MAX` (the deposit type's `mint` field is `u128`),
+///  * `block_hash` or `log_index` is missing. This happens only for a
+///    pending log, which `eth_getLogs` with explicit block bounds does not
+///    return.
 pub(crate) fn decode_deposit_log(log: &RpcLog) -> Result<DepositLog, L1SourceError> {
     let topic0 = log
         .topic0()
@@ -324,8 +325,8 @@ mod tests {
         assert_eq!(out.block_number, 456);
     }
 
-    /// One filtered query returns both kinds interleaved; the dispatcher must
-    /// route on topic0 rather than on position or count.
+    /// One filtered query returns both kinds interleaved. The dispatcher
+    /// must route by topic0, not by position or count.
     #[test]
     fn dispatches_both_event_kinds_on_topic0() {
         let dep = synthetic_log(U256::from(5u64), 21_000, Bytes::new());
@@ -341,9 +342,9 @@ mod tests {
         ));
     }
 
-    /// A provider that ignores the topic filter must be caught, not skipped:
-    /// silently dropping an unknown log would derive an epoch that disagrees
-    /// with L1 while looking perfectly healthy.
+    /// A provider that ignores the topic filter must be caught, not skipped.
+    /// Silently dropping an unknown log would derive an epoch that
+    /// disagrees with L1, while looking healthy.
     #[test]
     fn dispatcher_rejects_an_unfiltered_third_event() {
         let mut log = synthetic_log(U256::from(1u64), 21_000, Bytes::new());

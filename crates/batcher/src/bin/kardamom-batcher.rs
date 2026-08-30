@@ -1,23 +1,24 @@
-//! `kardamom-batcher` CLI. Two modes:
+//! `kardamom-batcher` CLI. It has two modes:
 //!
-//! **Live service** (`--live`, #39): tail the canonical ordering from the
-//! Aeron Cluster egress (joining tx_data via the engine reader stack), pack
-//! batches as boundaries arrive, and post each to L1 as it closes, resuming
-//! across restarts from the durable cursor + on-chain `lastBatchIndex`. See
-//! `docs/agents/batcher-live-l1-spec.md` and `kardamom_batcher::live` (this
-//! binary only validates the flag set and hands off to `live::run`).
+//! Live service (`--live`): tails the canonical ordering from the Aeron
+//! Cluster egress (joining tx_data through the engine reader stack), packs
+//! batches as boundaries arrive, and posts each one to L1 as it closes. It
+//! resumes across restarts from the durable cursor and the on-chain
+//! `lastBatchIndex`. See `docs/agents/batcher-live-l1-spec.md` and
+//! `kardamom_batcher::live`. This binary only validates the flag set and
+//! hands off to `live::run`.
 //!
-//! **Offline** (default): pure orchestration —
+//! Offline (the default): pure orchestration.
 //!   - Open the offline tx_ordering segment reader at `--channel-b-segment`.
-//!   - Open per-sequencer tx_data segment readers via
+//!   - Open per-sequencer tx_data segment readers with
 //!     `--channel-a-archive sid=path,sid=path,...`.
 //!   - Accumulate per-block batches as `BlockBoundaryStart` markers arrive.
-//!   - In `--dry-run` (default) just report what would be posted. When an L1
-//!     endpoint + signer + settlement address + DA store are supplied and
-//!     `--dry-run=false`, post each batch as a real EIP-4844 blob transaction
-//!     to `KardamomL2Settlement` and record the blobs in the DA store — the
-//!     data-availability write path that the `kardamom-reconstruct` tool
-//!     inverts.
+//!   - With `--dry-run` (the default), just report what would be posted.
+//!     When an L1 endpoint, signer, settlement address, and DA store are
+//!     supplied, and `--dry-run=false`, post each batch as a real EIP-4844
+//!     blob transaction to `KardamomL2Settlement`, and record the blobs in
+//!     the DA store. This is the data-availability write path that the
+//!     `kardamom-reconstruct` tool inverts.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -36,16 +37,16 @@ use tracing::{info, warn};
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-batcher", version)]
 struct Cli {
-    /// Live service mode (#39): tail the canonical ordering from the Aeron
-    /// Cluster egress (joining tx_data), pack batches as boundaries arrive,
-    /// and post each to L1 as it closes. Requires `--config`, `--dry-run=false`
-    /// and the L1 flags; the segment-file flags are ignored.
+    /// Live service mode: tails the canonical ordering from the Aeron
+    /// Cluster egress (joining tx_data), packs batches as boundaries
+    /// arrive, and posts each one to L1 as it closes. Requires `--config`,
+    /// `--dry-run=false`, and the L1 flags. Ignores the segment-file flags.
     #[arg(long, default_value_t = false)]
     live: bool,
 
-    /// Path to the tx_ordering Aeron Archive segment file (.rec) — the
-    /// canonical orderer carrying `TxOrderingMessage` records (TxRef + boundary).
-    /// Offline mode only.
+    /// The path to the tx_ordering Aeron Archive segment file (.rec). This
+    /// is the canonical orderer, carrying `TxOrderingMessage` records
+    /// (TxRef and boundary). Offline mode only.
     #[arg(long, alias = "segment", required_unless_present = "live")]
     channel_b_segment: Option<PathBuf>,
 
@@ -63,12 +64,13 @@ struct Cli {
     no_compress: bool,
 
     /// Skip L1 broadcast; only inspect the archive. Live posting requires
-    /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, `--da-store`.
+    /// `--dry-run=false` plus `--l1-rpc`, `--l1-key`, `--settlement`, and
+    /// `--da-store`.
     ///
-    /// A real boolean VALUE flag, not `SetTrue`: with clap's default bool
-    /// action `--dry-run=false` is rejected outright ("unexpected value"), so
-    /// the documented live invocation was unusable. Bare `--dry-run` still
-    /// means true.
+    /// This is a real boolean value flag, not `SetTrue`. With clap's
+    /// default bool action, `--dry-run=false` is rejected outright
+    /// ("unexpected value"), which would make the documented live
+    /// invocation unusable. A bare `--dry-run` still means true.
     #[arg(
         long,
         default_value_t = true,
@@ -82,7 +84,8 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_L1_RPC")]
     l1_rpc: Option<String>,
 
-    /// Batcher EOA private key (hex) — must equal the settlement's `l1Batcher`.
+    /// The batcher EOA private key (hex). Must equal the settlement's
+    /// `l1Batcher`.
     #[arg(long, env = "KARDAMOM_L1_KEY")]
     l1_key: Option<String>,
 
@@ -107,15 +110,15 @@ struct Cli {
     #[arg(long, default_value_t = 1)]
     shards: u8,
 
-    /// This node's cluster-egress endpoint `ip:port` (overrides the config's
-    /// egress_channel, injected per node by the Nomad job).
+    /// This node's cluster-egress endpoint `ip:port`. It overrides the
+    /// config's egress_channel, and the Nomad job injects it per node.
     #[arg(long, env = "KARDAMOM_CLUSTER_EGRESS_ENDPOINT")]
     cluster_egress_endpoint: Option<String>,
 
-    /// UDP endpoint on this node where refetched tx_data / tx_deposits
-    /// fragments land (join-miss recovery from the remote durability
-    /// archives). Unset ⇒ refetch disabled; a lost envelope is then fatal
-    /// after the join timeout.
+    /// The UDP endpoint on this node where refetched tx_data and
+    /// tx_deposits fragments land (join-miss recovery from the remote
+    /// durability archives). If unset, refetch is disabled, and a lost
+    /// envelope is then fatal after the join timeout.
     #[arg(long, env = "KARDAMOM_REPLAY_DESTINATION")]
     replay_destination_endpoint: Option<String>,
 
@@ -124,8 +127,8 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_ARCHIVE_CONTROL_RESPONSE")]
     archive_control_response_endpoint: Option<String>,
 
-    /// Durable cursor file: the ordering-stream position of the last
-    /// confirmed L1 post (live mode; required there).
+    /// The durable cursor file: the ordering-stream position of the last
+    /// confirmed L1 post. Live mode only; required there.
     #[arg(long, env = "KARDAMOM_BATCHER_CURSOR")]
     cursor_file: Option<PathBuf>,
 
@@ -137,8 +140,9 @@ struct Cli {
     #[arg(long, default_value_t = 5)]
     l1_retries: u32,
 
-    /// DA blob store directory: each posted blob is written here keyed by its
-    /// versioned hash, so `kardamom-reconstruct` can fetch the bytes later.
+    /// The DA blob store directory. Each posted blob is written here, keyed
+    /// by its versioned hash, so `kardamom-reconstruct` can fetch the bytes
+    /// later.
     #[arg(long)]
     da_store: Option<PathBuf>,
 
@@ -146,13 +150,13 @@ struct Cli {
     #[arg(long, env = "KARDAMOM_METRICS_ADDR", default_value = "127.0.0.1:9002")]
     metrics_addr: SocketAddr,
 
-    /// Host identifier; stamped on every metric.
+    /// A host identifier. Stamped on every metric.
     #[arg(long, env = "KARDAMOM_HOST_ID", default_value = "local")]
     host_id: String,
 }
 
-/// The L1 flag tuple both post paths require; `mode` names the flag that
-/// asked for it so the error message stays exact (`--live` vs
+/// The L1 flag tuple both post paths require. `mode` names the flag that
+/// asked for it, so the error message stays exact (`--live` or
 /// `--dry-run=false`).
 fn require_l1_flags<'a>(
     cli: &'a Cli,
@@ -259,9 +263,9 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Validate the live-mode flag set, then hand off to
-/// [`kardamom_batcher::live::run`] — the batcher as a third cluster-egress
-/// consumer (front-end wiring mirrors the validator; the feed loop and L1
-/// sender live in `kardamom_batcher::live`).
+/// [`kardamom_batcher::live::run`], the batcher as a third cluster-egress
+/// consumer. Front-end wiring mirrors the validator; the feed loop and L1
+/// sender live in `kardamom_batcher::live`.
 async fn live_main(cli: Cli) -> anyhow::Result<()> {
     if cli.dry_run {
         bail!(

@@ -1,13 +1,13 @@
-//! Pins the `KardamomChainState` predeploy in `chains/dev-withdrawals.toml`:
+//! Checks the `KardamomChainState` predeploy in `chains/dev-withdrawals.toml`.
+//! The predeploy:
 //!   * exists at the canonical chain-state address,
-//!   * carries runtime bytecode byte-equal to the forge-compiled artifact,
-//!   * and the Rust-side constants the derivation rule encodes with
-//!     (`SYSTEM_UPGRADER`, the `setFeature` selector) match the compiled ABI.
+//!   * has runtime bytecode that is byte-equal to the forge-compiled artifact,
+//!   * and matches the compiled ABI for the Rust constants the derivation
+//!     rule uses (`SYSTEM_UPGRADER`, the `setFeature` selector).
 //!
-//! Regression target: the L2 write-authority check lives in Solidity while the
-//! sender that satisfies it is minted in Rust. If those two drift, every
-//! upgrade silently reverts on-chain — a failure that would otherwise only
-//! surface in the e2e suite, and only as "the flag never activated".
+//! The L2 write-authority check lives in Solidity. The sender that satisfies
+//! it is minted in Rust. If the two drift apart, every upgrade reverts
+//! on-chain without a clear error, and only the flag fails to activate.
 
 use std::path::PathBuf;
 
@@ -58,16 +58,14 @@ fn dev_withdrawals_genesis_predeploys_chain_state_with_artifact_bytecode() {
 #[test]
 fn rust_system_upgrader_matches_the_contracts_constant() {
     let Some(v) = artifact() else { return };
-    // The constant is inlined into the runtime bytecode, so read it back
-    // through the ABI-declared getter's compiled value: the source is the
-    // authority, and `forge inspect` exposes it via the deployed source map
-    // only indirectly — so assert on the literal in the source instead, which
-    // is what a reviewer edits.
+    // The constant is inlined into the runtime bytecode. Checking the
+    // compiled bytecode for it is indirect, so check the literal value in
+    // the Solidity source instead. The source is the value a reviewer edits.
     let workspace = PathBuf::from(env!("CARGO_WORKSPACE_DIR"));
     let src = std::fs::read_to_string(workspace.join("contracts/src/L2/KardamomChainState.sol"))
         .expect("read KardamomChainState.sol");
-    // solc requires the EIP-55 checksummed form in an address literal, so this
-    // is exactly the string that must appear in the source.
+    // solc requires the EIP-55 checksummed form for an address literal. This
+    // is the exact string that must appear in the source.
     let want = SYSTEM_UPGRADER.to_checksum(None);
     assert!(
         src.contains(&want),
@@ -76,7 +74,7 @@ fn rust_system_upgrader_matches_the_contracts_constant() {
          check would reject every upgrade deposit the derivation rule mints",
     );
 
-    // Belt and braces: the address must be a real constant in the ABI surface.
+    // Also check that the address is a real constant in the ABI surface.
     assert!(
         v["abi"]
             .as_array()
@@ -103,9 +101,10 @@ fn rust_set_feature_selector_matches_the_compiled_abi() {
 
 #[test]
 fn chain_state_predeploy_address_is_the_canonical_one() {
-    // Guards a fat-finger in either the TOML or the constant; the two are
-    // written in different files and nothing else would catch a mismatch
-    // until a system deposit landed at an empty account and silently no-oped.
+    // Checks for a typing error in the TOML file or the constant. The two
+    // values live in different files. Without this check, a mismatch stays
+    // hidden until a system deposit lands at an empty account and does
+    // nothing.
     assert_eq!(
         CHAIN_STATE,
         "0x4200000000000000000000000000000000000017"

@@ -1,10 +1,12 @@
-//! Execute the embedded DeFi bench contracts on the REAL kardamom engine.
+//! This test executes the embedded DeFi bench contracts on the real
+//! kardamom engine.
 //!
-//! This is the gate between "forge compiled it" and "a 15-minute cluster
-//! deploy": every op family (deploy, seed, swap, vault deposit/withdraw,
-//! CLOB place/cancel) must produce a SUCCESS receipt with contract-shaped
-//! gas and a non-empty write set on `execute_tx` + `MockStateDatabase`,
-//! exactly as the executor will run them.
+//! It gates between "forge compiled it" and a full cluster deploy.
+//! Every operation family, meaning deploy, seed, swap, vault deposit
+//! and withdraw, and CLOB place and cancel, must produce a success
+//! receipt with contract-shaped gas and a non-empty write set on
+//! `execute_tx` with `MockStateDatabase`, exactly as the executor
+//! will run them.
 
 use alloy_primitives::{Address, U256};
 use kardamom_bench::load::defi::{deployment_txs, pregenerate_defi};
@@ -80,7 +82,7 @@ fn defi_workload_executes_on_the_engine() {
         (receipt, ws)
     };
 
-    // Deployments: three contract accounts with code.
+    // Deployments: expect three contract accounts with code.
     let mut deploy_gas = 0;
     for d in &deploys {
         let (r, ws) = run(d, addr0, &mut delta, &mut cumulative);
@@ -94,7 +96,7 @@ fn defi_workload_executes_on_the_engine() {
         "creates are code-write heavy: {deploy_gas}"
     );
 
-    // Run the head of each sender's queue (seed + mixed ops).
+    // Run the head of each sender's queue: seed, then mixed operations.
     let mut op_gas = Vec::new();
     for (si, queue) in queues.iter().enumerate() {
         let sender = signers[si].signer.address();
@@ -110,9 +112,9 @@ fn defi_workload_executes_on_the_engine() {
         }
     }
 
-    // Gas profile sanity: contract calls, not transfers. Swaps/vault/clob
-    // ops must average WELL above 21k, with heavy tail ops (cold-slot CLOB
-    // places) above 100k.
+    // Check the gas profile: these are contract calls, not transfers.
+    // Swap, vault, and CLOB operations must average well above 21k gas,
+    // with heavy tail operations, such as cold-slot CLOB places, above 100k.
     let avg = op_gas.iter().sum::<u64>() / op_gas.len() as u64;
     let max = *op_gas.iter().max().unwrap();
     assert!(avg > 30_000, "avg gas {avg} too low for a contract mix");
@@ -121,8 +123,8 @@ fn defi_workload_executes_on_the_engine() {
         "max gas {max} — no storage-heavy op executed?"
     );
 
-    // The pool's hot reserve slots must have moved from their constructor
-    // values (proof the swap path actually swaps).
+    // The pool's hot reserve slots must move from their constructor
+    // values. This proves the swap path actually swaps.
     let r0 = delta
         .storage
         .get(&(contracts.pool, alloy_primitives::B256::ZERO));

@@ -20,13 +20,13 @@ struct Cli {
     #[arg(long, default_value = "http://127.0.0.1:8545", global = true)]
     rpc_url: String,
 
-    /// Canonical owner address (Safe or EOA). Same owner ⇒ same factory address.
+    /// Canonical owner address (Safe or EOA). The same owner gives the same
+    /// factory address.
     ///
-    /// NOT `global`: clap forbids required global args (debug builds panic on
-    /// the assert; release builds skip it and land in broken parsing where no
-    /// pre-subcommand `--owner` ever satisfies the requirement — found the
-    /// first time CI actually invoked the `deploy` subcommand, #39). Pass it
-    /// before the subcommand.
+    /// This field is not `global`. Clap forbids a required global argument.
+    /// A debug build panics on the assert; a release build skips the assert
+    /// and parsing breaks, because no pre-subcommand `--owner` ever satisfies
+    /// the requirement. Pass `--owner` before the subcommand.
     #[arg(long, required = true)]
     owner: Address,
 
@@ -36,39 +36,41 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Bootstrap the factory if absent. Anyone can run this; the resulting factory
-    /// is always owned by `--owner`.
+    /// Bootstrap the factory if it is absent. Anyone can run this. The
+    /// resulting factory is always owned by `--owner`.
     EnsureFactory {
         /// Hex private key or "env:VAR_NAME". Pays for the bootstrap tx.
         #[arg(long)]
         private_key: String,
     },
 
-    /// Deploy one or more contracts in one tx. Implies ensure-factory.
-    /// `--l2-chain-id` and `--l2-minter` are positionally paired and repeat together.
+    /// Deploy one or more contracts in one transaction. This implies
+    /// ensure-factory. `--l2-chain-id` and `--l2-minter` are paired by
+    /// position and repeat together.
     Deploy {
         /// Hex private key or "env:VAR_NAME".
         #[arg(long)]
         private_key: String,
 
-        /// Contract IDs to deploy (e.g. ETHLockbox, WithdrawalOutputOracle).
-        /// Same id repeats per L2.
+        /// Contract IDs to deploy, for example ETHLockbox or
+        /// WithdrawalOutputOracle. The same id can repeat per L2.
         #[arg(required = true)]
         ids: Vec<String>,
 
-        /// L2 chain IDs to target (one per id × L2 combination).
+        /// L2 chain IDs to target, one for each id-L2 combination.
         #[arg(long = "l2-chain-id", required = true)]
         l2_chain_ids: Vec<u64>,
 
-        /// L2 minter addresses, positionally paired with `--l2-chain-id`. Must
-        /// match its count when deploying ETHLockbox (initialize `_l2Minter`) or
-        /// KardamomL2Settlement (reused as the initialize `_l1Batcher`).
+        /// L2 minter addresses, paired by position with `--l2-chain-id`. The
+        /// count must match when you deploy ETHLockbox (its `_l2Minter` init
+        /// arg) or KardamomL2Settlement (reused as its `_l1Batcher` init arg).
         #[arg(long = "l2-minter")]
         l2_minters: Vec<Address>,
 
-        /// Output oracle address wired into ETHLockbox.initialize. If omitted, the
-        /// oracle being deployed in this same invocation is used (its address is
-        /// predicted); otherwise defaults to the zero address (deposit-only).
+        /// Output oracle address for ETHLockbox.initialize. If you omit it,
+        /// the deployer uses the oracle deployed in this same run, with its
+        /// address predicted. If no such oracle is deployed, it defaults to
+        /// the zero address, for deposit-only mode.
         #[arg(long = "output-oracle")]
         output_oracle: Option<Address>,
 
@@ -85,7 +87,8 @@ enum Command {
         finalization_window: u64,
     },
 
-    /// Upgrade contracts to the next version across one or more L2s in one tx.
+    /// Upgrade contracts to the next version, across one or more L2s, in one
+    /// transaction.
     Upgrade {
         /// Hex private key or "env:VAR_NAME".
         #[arg(long)]
@@ -98,9 +101,10 @@ enum Command {
         l2_chain_ids: Vec<u64>,
     },
 
-    /// Install the ERC-7955 CREATE2 factory runtime via `anvil_setCode` —
-    /// DEV chains only (a real chain uses ERC-7955's presigned bootstrap tx).
-    /// Idempotent; run before the first `deploy` against a fresh anvil.
+    /// Install the ERC-7955 CREATE2 factory runtime through `anvil_setCode`.
+    /// This works only on dev chains; a real chain uses the ERC-7955
+    /// presigned bootstrap transaction. This command is idempotent. Run it
+    /// before the first `deploy` against a fresh anvil.
     #[command(name = "bootstrap-7955-anvil")]
     Bootstrap7955Anvil,
 
@@ -134,9 +138,9 @@ async fn main() -> Result<()> {
             finalization_window,
         } => {
             let contract_ids = parse_ids(&ids)?;
-            // Every id whose init args index into `l2_minters` must be covered
-            // here, or the positional `l2_minters[i]` below panics (index out
-            // of bounds) instead of failing with a usable error.
+            // Every id whose init args index into `l2_minters` must appear
+            // here. Otherwise, the positional `l2_minters[i]` below panics
+            // with an index-out-of-bounds error, instead of a clear message.
             let minter_consumers: Vec<&str> = contract_ids
                 .iter()
                 .filter_map(|id| match id {
@@ -204,8 +208,9 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Build a [`Deployer`] connected to `rpc_url`. With a `key`, the provider
-/// signs with it and the signer's address is returned as the operator.
+/// Build a [`Deployer`] connected to `rpc_url`. If `key` is given, the
+/// provider signs with it, and this function returns the signer's address
+/// as the operator.
 fn deployer(
     rpc_url: &str,
     owner: Address,
@@ -260,8 +265,8 @@ async fn run_deploy(
 
     deployer.ensure_factory(operator).await?;
 
-    // Per-contract init args. For each id × L2, emit one Op::Deploy with the
-    // contract-specific initialize calldata.
+    // Per-contract init args. For each id and L2 pair, emit one Op::Deploy
+    // with the contract-specific initialize calldata.
     let deploying_oracle = ids.contains(&ContractId::WithdrawalOutputOracle);
     let mut ops: Vec<Op> = Vec::new();
     for id in &ids {
@@ -269,8 +274,9 @@ async fn run_deploy(
             let init_args = match id {
                 ContractId::EthLockbox => {
                     let minter = l2_minters[i];
-                    // Wire the oracle: explicit flag, else the oracle deployed in
-                    // this same batch (predicted), else zero (deposit-only).
+                    // Pick the oracle address: the explicit flag, else the
+                    // oracle deployed in this same batch (predicted), else
+                    // zero for deposit-only mode.
                     let oracle = match output_oracle {
                         Some(a) => a,
                         None if deploying_oracle => {
@@ -289,15 +295,15 @@ async fn run_deploy(
                 ContractId::WithdrawalOutputOracle => {
                     oracle_init_args(attester, challenger, finalization_window)?
                 }
-                // NOTE: reuses the positional --l2-minter as the settlement
-                // contract's `_l1Batcher` (documented on the flag). A dedicated
-                // --l1-batcher flag is a follow-up if the roles ever diverge.
+                // Reuse the positional --l2-minter as the settlement
+                // contract's `_l1Batcher` init arg (documented on the flag).
+                // Add a dedicated --l1-batcher flag if the roles ever diverge.
                 ContractId::KardamomL2Settlement => encode_address_arg(l2_minters[i]),
-                // The proof oracle's init wires the SP1 verifier gateway,
-                // program vkey, and genesis root — deployment parameters the
-                // CLI does not model yet. Deploy it via the library API
-                // (`encode_proof_oracle_init_args`, as the e2e does) until a
-                // dedicated flag set lands with the prover ops work.
+                // The proof oracle's init needs the SP1 verifier gateway,
+                // program vkey, and genesis root. The CLI does not model
+                // these parameters yet. Deploy it through the library API
+                // (`encode_proof_oracle_init_args`, as the e2e test does)
+                // until a dedicated flag set is added.
                 ContractId::KardamomProofOracle => bail!(
                     "KardamomProofOracle CLI deployment needs --sp1-verifier/--program-vkey/\
                      --genesis-root flags (not yet modeled); use the library API"
@@ -398,8 +404,8 @@ fn parse_contract_id(s: &str) -> Result<ContractId> {
     }
 }
 
-/// Encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`,
-/// requiring the attester/challenger flags.
+/// Encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`.
+/// The attester and challenger flags are required.
 fn oracle_init_args(
     attester: Option<Address>,
     challenger: Option<Address>,
@@ -411,7 +417,7 @@ fn oracle_init_args(
     Ok(encode_oracle_init_args(attester, challenger, window))
 }
 
-/// Fetch registry entries (optionally filtered by L2) and print them.
+/// Fetch registry entries, optionally filtered by L2, and print them.
 async fn print_addresses(deployer: &Deployer<DynProvider>, l2_chain_id: Option<u64>) -> Result<()> {
     print_entries(&deployer.addresses(l2_chain_id).await?);
     Ok(())

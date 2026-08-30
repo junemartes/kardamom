@@ -1,12 +1,16 @@
-//! Pipelined-commit settling for the exec thread: the shared settle sweep
-//! (forward durably-committed boundaries, swap the snapshot, rebuild the
-//! parent read layer), its two entry points — the idle probe and the
-//! boundary arm's depth-capped variant — and the end-of-stream close-out.
+//! Pipelined-commit settling for the exec thread.
 //!
-//! The sweep itself is ONE method ([`ExecState::settle_ready`]); the boundary
-//! entry point adds only its blocking full-depth `wait_committed` prelude.
-//! Pre-split the sweep existed verbatim twice (idle-probe arm and boundary
-//! arm) — a one-sided edit there would have been a real divergence bug.
+//! This module has the shared settle sweep. The sweep forwards
+//! durably-committed boundaries, swaps the snapshot, and rebuilds the
+//! parent read layer. It also has two entry points for the sweep: the idle
+//! probe, and the boundary arm's depth-capped variant. It also has the
+//! end-of-stream close-out.
+//!
+//! The sweep is one method, [`ExecState::settle_ready`]. The boundary entry
+//! point only adds its blocking full-depth `wait_committed` step first.
+//! Before this split, the sweep existed twice, in the idle-probe arm and
+//! the boundary arm. An edit to only one copy would have caused a real
+//! divergence bug.
 
 use std::time::Instant;
 
@@ -19,9 +23,9 @@ use super::exec_thread::{ExecState, Flow};
 use super::ports::{StateWriterQueue, StateWriterSignal};
 use super::types::ExecToCommit;
 
-/// Matches `kardamom_state::geometry::HORIZON_BLOCKS` — the writer's
-/// own bounded queue depth; a deeper exec pipeline would just
-/// block in `submit` instead.
+/// Matches `kardamom_state::geometry::HORIZON_BLOCKS`, the writer's own
+/// bounded queue depth. A deeper exec pipeline would only block in
+/// `submit` instead.
 pub(super) const COMMIT_PIPELINE_DEPTH: usize = 4;
 
 impl<S, Q, P, E> ExecState<S, Q, P, E>
@@ -31,12 +35,13 @@ where
     P: StateWriterQueue + 'static,
     E: crate::reader::EpochObserver + 'static,
 {
-    /// The settle sweep: pop every in-flight commit at or below `durable`
-    /// and forward its boundary — downstream never observes a boundary a
-    /// crash could un-commit. When anything settled, swap to the newest
-    /// settled block's snapshot and rebuild the merged parent read layer
-    /// from the still-unsettled survivors (a merged map cannot be
-    /// subtracted from). `msg` keeps the two call sites' log shapes
+    /// The settle sweep. It pops every in-flight commit at or below
+    /// `durable` and forwards its boundary. This way, downstream never
+    /// sees a boundary that a crash could un-commit. When anything
+    /// settles, the sweep swaps to the newest settled block's snapshot. It
+    /// also rebuilds the merged parent read layer from the still-unsettled
+    /// survivors, because a merged map cannot be subtracted from. The
+    /// `msg` argument keeps the log shape of the two call sites
     /// distinguishable.
     pub(super) fn settle_ready(
         &mut self,
@@ -76,12 +81,13 @@ where
         Ok(Flow::Continue)
     }
 
-    /// Boundary-arm settling: the non-blocking [`Self::settle_ready`] sweep,
-    /// preceded by the only wait the pipeline ever pays. Only when the
-    /// pipeline is at full depth K does the exec thread block for the
-    /// OLDEST commit — the recorded histogram measures exactly that
-    /// residual stall (sustained non-zero residuals mean the writer is K
-    /// full block intervals behind and this back-pressure is correct).
+    /// Boundary-arm settling. This runs the non-blocking
+    /// [`Self::settle_ready`] sweep, after the only wait the pipeline ever
+    /// pays. The exec thread blocks for the oldest commit only when the
+    /// pipeline is at full depth K. The recorded histogram measures
+    /// exactly this residual stall. A sustained non-zero residual means
+    /// the writer is K full block intervals behind, and this
+    /// back-pressure is correct.
     pub(super) fn settle_at_boundary(&mut self) -> Result<Flow, ExecutorError> {
         let mut durable = self.sw_signal.committed()?;
         if self.inflight.len() >= COMMIT_PIPELINE_DEPTH
@@ -103,21 +109,19 @@ where
         self.settle_ready(durable, "pipelined commits settled; snapshot swapped")
     }
 
-    /// Idle-probe settling: same non-blocking settle sweep as the boundary
-    /// arm, minus the full-depth blocking wait (an idle probe must never
-    /// park).
+    /// Idle-probe settling. This runs the same non-blocking settle sweep
+    /// as the boundary arm, without the full-depth blocking wait. An idle
+    /// probe must never park.
     pub(super) fn on_idle_probe(&mut self) -> Result<Flow, ExecutorError> {
-        // Settle ONLY at a block edge: with a block OPEN
-        // (scope materialized / records buffered), the live
-        // ExecScope's cache is seeded against the CURRENT
-        // snapshot ∘ parent — swapping the snapshot and
-        // rebuilding parent under it mid-block mixes read
-        // bases and diverges execution (caught by the load
-        // shard's validator divergence latch on the first
-        // soak of this probe). Between blocks — the idle-tail
-        // case this probe exists for — both are empty, and a
-        // mid-block gap simply defers to the next boundary's
-        // sweep exactly as before the probe existed.
+        // Settle only at a block edge. With a block open (the scope is
+        // materialized, or records are buffered), the live ExecScope's
+        // cache is seeded against the current snapshot and parent.
+        // Swapping the snapshot and rebuilding the parent mid-block would
+        // mix read bases and cause execution to diverge.
+        //
+        // Between blocks, both are empty. This is the idle-tail case this
+        // probe exists for. A mid-block gap simply defers to the next
+        // boundary's sweep, the same as before this probe existed.
         if self.scope.is_some() || !self.buffered.is_empty() {
             return Ok(Flow::Continue);
         }
@@ -128,8 +132,8 @@ where
         )
     }
 
-    /// Clean end of stream: settle every in-flight commit
-    /// so the final boundaries aren't silently dropped.
+    /// Clean end of stream. Settle every in-flight commit so the pipeline
+    /// does not silently drop the final boundaries.
     pub(super) fn on_closed(&mut self) -> Result<(), ExecutorError> {
         if let Some((last, _)) = self.inflight.back() {
             let last_n = last.block_number;

@@ -1,28 +1,30 @@
-//! The bridge contract bindings and the anvil dev accounts the L1 harness
-//! signs (or impersonates) with. Pure declarations — all behaviour lives in
-//! the parent module, which re-exports everything here.
+//! The bridge contract bindings, and the anvil dev accounts the L1
+//! harness signs (or impersonates) with. These are pure declarations. All
+//! behavior lives in the parent module, which re-exports everything here.
 
 use alloy_primitives::{Address, address};
 use alloy_sol_types::sol;
 
-/// Factory owner; impersonated on anvil rather than key-signed.
+/// The factory owner. Anvil impersonates this account instead of
+/// signing with its key.
 pub const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
-/// The L2 minter authorized on the lockbox (unused by these scenarios, which
-/// exercise the deposit/withdraw paths rather than minter-gated calls).
+/// The L2 minter authorized on the lockbox. These scenarios do not use
+/// this account, since they exercise the deposit and withdraw paths, not
+/// minter-gated calls.
 pub const L2_MINTER: Address = address!("00000000000000000000000000000000000000BE");
 
-/// Anvil dev account #0 — the oracle's attester (and the account prefunded by
-/// `chains/dev-withdrawals.toml` on L2).
+/// Anvil dev account #0: the oracle's attester (and the account
+/// prefunded by `chains/dev-withdrawals.toml` on L2).
 pub const ATTESTER_KEY: &str = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
 pub const ATTESTER_ADDR: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
-/// Anvil dev account #1 — the oracle's challenger, and the EOA these
+/// Anvil dev account #1: the oracle's challenger, and the account these
 /// scenarios deposit from.
 pub const DEPOSITOR_KEY: &str =
     "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
 pub const DEPOSITOR_ADDR: Address = address!("70997970C51812dc3A010C7d01b50e0d17dc79C8");
-/// Anvil dev account #2 — the batcher EOA. It must be a REAL funded key: the
-/// DA path sends genuine EIP-4844 blob transactions, which cannot be
-/// impersonated.
+/// Anvil dev account #2: the batcher account. This must be a real,
+/// funded key. The DA path sends genuine EIP-4844 blob transactions,
+/// which cannot use an impersonated account.
 pub const BATCHER_KEY: &str = "0x5de4111afa1a4b94908f83103eb1f1706367c2e68ca870fc3fb9a804cdab365a";
 pub const BATCHER_ADDR: Address = address!("3C44CdDdB6a900fa2b585dd299e03d12FA4293BC");
 
@@ -53,8 +55,9 @@ sol! {
             uint64 gasLimit,
             bytes data
         );
-        /// The upgrade transaction. Authorized to the factory owner;
-        /// `activationTimestamp` is epoch-MILLISECONDS, 0 = immediately.
+        /// The upgrade transaction. Only the factory owner may call this.
+        /// `activationTimestamp` is in epoch milliseconds; 0 means
+        /// immediately.
         function initiateUpgrade(uint256 featureId, uint64 activationTimestamp) external;
         function upgradeNonce() external view returns (uint64);
         event UpgradeInitiated(
@@ -72,7 +75,8 @@ sol! {
     }
 
     /// The L2 predeploy at `kardamom_types::withdrawals::MESSAGE_PASSER`.
-    /// No Rust binding exists in the workspace, so declare one here.
+    /// No Rust binding for it exists in the workspace, so this declares
+    /// one here.
     #[sol(rpc)]
     contract L2ToL1MessagePasser {
         function initiateWithdrawal(address target) external payable;

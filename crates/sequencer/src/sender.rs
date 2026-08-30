@@ -1,26 +1,26 @@
 //! Sender accessor for ingress tx frames.
 //!
-//!: the proxy (S1) recovers the sender during batched secp256k1
-//! verification and writes it into [`kardamom_types::TxEnvelope::sender`]
-//! (typed `Address`, never `Option`). The sequencer trusts this value
-//! unconditionally — no fallback, no `recover_signer()`, no paranoid-check
-//! mode. The sequencer performs zero secp256k1 work on the hot path, which
-//! keeps the §3 nonce-check budget at ≤3µs per tx.
+//! The ingress proxy recovers the sender during batched secp256k1 verification.
+//! It writes the sender into [`kardamom_types::TxEnvelope::sender`] as a
+//! typed `Address`, never an `Option`. The sequencer trusts this value
+//! unconditionally: no fallback, no `recover_signer()`, and no
+//! paranoid-check mode. The sequencer does zero secp256k1 work on the hot
+//! path. This keeps the §3 nonce-check budget at 3 microseconds or less per
+//! transaction.
 //!
-//! This module is a thin accessor that exists for two reasons:
-//!  1. To make the trust assumption explicit at call sites (`sender_of(env)`
-//!     reads better than `env.sender`).
-//!  2. To give us a single place to insert a debug-only panic if the field is
-//!     ever observed as `Address::ZERO` in test builds, which would indicate
-//!     the proxy regressed.
+//! This module is a thin accessor. It exists for two reasons:
+//!  1. It makes the trust assumption explicit at call sites. `sender_of(env)`
+//!     reads better than `env.sender`.
+//!  2. It gives one place to add a debug-only panic if the field is ever
+//!     `Address::ZERO` in test builds. That would show the proxy regressed.
 
 use alloy_primitives::Address;
 use kardamom_types::TxEnvelope;
 
 /// Return the proxy-populated sender for a [`TxEnvelope`].
 ///
-/// This is `#[inline]` so the compiler folds it into the caller; the
-/// `debug_assert!` is removed in release builds.
+/// This function is `#[inline]`, so the compiler folds it into the caller.
+/// The `debug_assert!` check is removed in release builds.
 #[inline]
 pub fn sender_of(envelope: &TxEnvelope) -> Address {
     debug_assert!(

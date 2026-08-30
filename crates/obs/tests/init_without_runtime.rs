@@ -1,10 +1,8 @@
-//! `init` must work from a plain, non-async `main` — no ambient Tokio
-//! runtime. da-watcher calls it exactly this way, and the naive
-//! `PrometheusBuilder::build()` panics with "there is no reactor running"
-//! outside a runtime context (the regression that crash-looped every
-//! service gate on the first version of the dedicated-exporter change).
-//! The scrape below is raw std TcpStream on purpose: the whole test runs
-//! runtime-free, end to end.
+//! `init` must work from a plain, non-async `main`, with no ambient Tokio
+//! runtime. da-watcher calls it exactly this way. Outside a runtime
+//! context, a naive `PrometheusBuilder::build()` panics with "there is no
+//! reactor running". The scrape below uses a raw std TcpStream on purpose,
+//! so the whole test runs runtime-free, end to end.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -13,10 +11,10 @@ use std::time::{Duration, Instant};
 #[test]
 fn init_and_scrape_without_ambient_runtime() {
     // Bind port 0 via a throwaway listener to pick a free port, then reuse it.
-    // The pick-then-rebind window is racy (another process can grab the port
-    // in between — the exporter binds eagerly, so init fails if so), so retry
-    // with a fresh port; a bind failure happens before the global recorder is
-    // installed, which is what makes calling init again safe.
+    // The pick-then-rebind window is racy: another process can grab the port
+    // in between, and the exporter binds eagerly, so init fails if it does.
+    // Retry with a fresh port in that case. A bind failure happens before
+    // the global recorder is installed, so calling init again is safe.
     let mut free: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let mut last_err = None;
     for _ in 0..5 {
@@ -38,7 +36,7 @@ fn init_and_scrape_without_ambient_runtime() {
 
     metrics::gauge!("kardamom_obs_test_gauge").set(42.0);
 
-    // The listener is bound once init returns; poll briefly for the accept
+    // The listener is bound once init returns. Poll briefly for the accept
     // loop to start serving.
     let deadline = Instant::now() + Duration::from_secs(10);
     let body = loop {

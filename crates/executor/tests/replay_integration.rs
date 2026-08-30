@@ -1,12 +1,12 @@
-//! Integration test: feed a synthetic stream of (txs + boundaries) into an
-//! `Executor` and assert the tx_receipts output matches expectation.
+//! Integration test: feed a synthetic stream of txs and boundaries into
+//! an `Executor`, and check the tx_receipts output against expectation.
 //!
-//! Post-S4-arch-update wiring: single-sequencer
-//! (M=1) topology. Envelopes are pushed onto a fake tx_data; tiny
-//! `TxRef` records + a `BlockBoundaryStart` are pushed onto fake channel
-//! B in the same canonical order. The executor's M+1 readers join the
-//! two streams via the in-process `JoinBuffer`. The expected receipts
-//! and slim boundaries on tx_receipts are unchanged from pre-split.
+//! Wiring after the join-buffer architecture update: single-sequencer (M=1)
+//! topology. Envelopes push onto a fake tx_data. Tiny `TxRef` records
+//! and a `BlockBoundaryStart` push onto fake channel B, in the same
+//! canonical order. The executor's M+1 readers join the two streams
+//! through the in-process `JoinBuffer`. The expected receipts and slim
+//! boundaries on tx_receipts are unchanged from before the split.
 
 use std::thread;
 use std::time::Duration;
@@ -30,9 +30,9 @@ use kardamom_executor::{
 };
 
 /// Bridge a crossbeam receiver of `(BPosition, TxEnvelope)` into a
-/// `TxDataSubscription`. The `BPosition` we emit is the tx_data
-/// position (the value sequencers publish in `TxRef`); we make it equal
-/// to a synthetic offset for the test.
+/// `TxDataSubscription`. The `BPosition` this emits is the tx_data
+/// position (the value sequencers publish in `TxRef`). The test sets it
+/// equal to a synthetic offset.
 struct ChanTxDataSub {
     sequencer_id: u8,
     rx: Receiver<(BPosition, KtTxEnvelope)>,
@@ -89,7 +89,8 @@ impl EngineWiring for TestWiring {
     type Epoch = NoEpochCheck;
 }
 
-/// Proxy-style envelope builder: sign, encode raw_tx, populate sender + tx_hash.
+/// Proxy-style envelope builder: sign, encode raw_tx, and fill in sender
+/// and tx_hash.
 fn transfer(signer: &PrivateKeySigner, nonce: u64, to: Address, val: u64) -> KtTxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),
@@ -125,9 +126,9 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     let from = signer.address();
     let to = address!("00000000000000000000000000000000000ABCDE");
 
-    // Shared MockStateDatabase — the writer applies each block's delta back
-    // into it so the next block's snapshot reflects the previous block's
-    // writes (matching the production libmdbx semantics).
+    // Shared MockStateDatabase. The writer applies each block's delta
+    // back into it, so the next block's snapshot reflects the previous
+    // block's writes. This matches the production libmdbx semantics.
     let snap = MockStateDatabase::builder()
         .account(from, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
@@ -137,7 +138,8 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     let (b_tx, b_rx) = bounded::<(BPosition, TxOrderingMessage)>(64);
     let (c_tx, c_rx) = bounded::<CMessage>(64);
 
-    // 4 txs → boundary block 1 → 3 txs → boundary block 2 → 3 txs → boundary block 3.
+    // 4 txs, then boundary block 1, then 3 txs, then boundary block 2,
+    // then 3 txs, then boundary block 3.
     let mut nonce: u64 = 0;
     let mut bpos_off: i32 = 0;
     let mut a_pos: i32 = 0;
@@ -163,8 +165,9 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
             bpos_off += 1;
             a_pos += 200;
         }
-        // end_tx_idx = cumulative COUNT of canonical records through this
-        // block. bpos_off advanced once per TxRef, so it IS that count.
+        // end_tx_idx equals the cumulative count of canonical records
+        // through this block. bpos_off advanced once per TxRef, so it
+        // equals that count.
         b_tx.send((
             bpos(bpos_off),
             TxOrderingMessage::BoundaryStart(BlockBoundaryStart {
@@ -221,8 +224,8 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
                 receipts += 1;
             }
             CMessage::BlockBoundary(b) => {
-                // S0: BlockBoundary has no state_root_commitment field.
-                // We assert only the slim three-field shape via destructure.
+                // BlockBoundary has no state_root_commitment field yet.
+                // This destructure checks only the slim three-field shape.
                 let BlockBoundary {
                     block_number,
                     end_tx_idx: _,
@@ -236,9 +239,9 @@ fn replay_10_txs_across_3_blocks_yields_expected_c_stream() {
     }
     assert_eq!(receipts, 10);
     assert_eq!(boundaries, 3);
-    // CRITICAL (S0): every receipt's tx_hash must equal the inbound
-    // envelope's tx_hash, byte-for-byte, in the same order. The executor
-    // never recomputes — it propagates.
+    // Every receipt's tx_hash must equal the inbound envelope's
+    // tx_hash, byte-for-byte, in the same order. The executor never
+    // recomputes it; the executor only passes it through.
     assert_eq!(got_hashes, expected_hashes);
 
     join.join().expect("no panic").expect("exec ok");

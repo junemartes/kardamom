@@ -1,10 +1,11 @@
-//! async-profiler attachment for the sealer's JVM.
+//! This module attaches async-profiler to the sealer's JVM.
 //!
-//! The sealer runs as a Java Aeron Cluster node inside an inner Docker
-//! container (Nomad docker driver) inside the DinD node container, so every
-//! interaction is a two-level `docker exec`/`docker cp` chain. Profiling uses
-//! itimer mode: it samples on-CPU time from a signal timer and needs neither
-//! perf_events (unavailable in the nested containers) nor kernel symbols.
+//! The sealer runs as a Java Aeron Cluster node, inside an inner Docker
+//! container run by the Nomad docker driver, inside the DinD node
+//! container. So every interaction is a two-level `docker exec` and
+//! `docker cp` chain. Profiling uses itimer mode: it samples on-CPU
+//! time from a signal timer, and needs neither perf_events, which is
+//! unavailable in the nested containers, nor kernel symbols.
 
 use std::path::Path;
 use std::process::Command;
@@ -13,9 +14,9 @@ use anyhow::{Context, bail};
 
 use crate::perf::cluster::{docker_exec, sh};
 
-/// Pinned async-profiler release. Override the download with
-/// `KARDAMOM_ASYNC_PROFILER_TGZ=/path/to/async-profiler-<ver>-linux-x64.tar.gz`
-/// for offline hosts.
+/// The pinned async-profiler release. On an offline host, override the
+/// download with
+/// `KARDAMOM_ASYNC_PROFILER_TGZ=/path/to/async-profiler-<ver>-linux-x64.tar.gz`.
 const AP_VERSION: &str = "3.0";
 const AP_URL: &str = "https://github.com/async-profiler/async-profiler/releases/download/v3.0/async-profiler-3.0-linux-x64.tar.gz";
 
@@ -23,7 +24,8 @@ fn ap_dirname() -> String {
     format!("async-profiler-{AP_VERSION}-linux-x64")
 }
 
-/// Fetch (or reuse) the async-profiler tarball in `cache_dir`.
+/// Fetch the async-profiler tarball into `cache_dir`, or reuse it if
+/// already there.
 fn fetch_tarball(cache_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
     if let Ok(local) = std::env::var("KARDAMOM_ASYNC_PROFILER_TGZ") {
         return Ok(local.into());
@@ -41,7 +43,7 @@ fn fetch_tarball(cache_dir: &Path) -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// Copy async-profiler into the sealer's inner `cluster-*` container.
-/// Idempotent — re-staging over an existing copy is fine.
+/// This is idempotent: re-staging over an existing copy is fine.
 pub fn stage(node: &str, cache_dir: &Path) -> anyhow::Result<()> {
     let tgz = fetch_tarball(cache_dir)?;
     sh(
@@ -63,16 +65,17 @@ docker exec "$cid" sh -c 'cd /tmp && tar xzf ap.tgz'"#,
     Ok(())
 }
 
-/// Profile the sealer JVM on `node` for `secs`, writing the interactive HTML
-/// flamegraph and the collapsed-stacks text into `out_dir`. Returns the
-/// collapsed stacks (one `frame;frame;... count` line per unique stack).
+/// Profile the sealer JVM on `node` for `secs`. Writes the interactive
+/// HTML flame graph and the collapsed-stacks text into `out_dir`.
+/// Returns the collapsed stacks, one `frame;frame;... count` line for
+/// each unique stack.
 pub fn run(node: &str, secs: u64, out_dir: &Path) -> anyhow::Result<String> {
     let ap = ap_dirname();
     println!("==> profiling {node} for {secs}s (itimer)");
-    // asprof emits one output format per run, so this takes two passes while
-    // the soak holds the rate steady: the full-length collapsed capture (the
-    // report's source of truth), then a short HTML pass for the interactive
-    // flamegraph.
+    // asprof emits one output format per run. So this takes two passes
+    // while the soak holds the rate steady: the full-length collapsed
+    // capture, the report's source of truth, then a short HTML pass for
+    // the interactive flame graph.
     docker_exec(
         node,
         &format!(
@@ -121,9 +124,9 @@ docker cp "$cid":/tmp/perf.html /tmp/perf.html"#
     Ok(collapsed)
 }
 
-/// Render a static SVG flamegraph from collapsed stacks if `flamegraph.pl`
-/// (or a local copy) is available; best-effort — the collapsed file and HTML
-/// always exist regardless.
+/// Render a static SVG flame graph from collapsed stacks, if
+/// `flamegraph.pl`, or a local copy, is available. This is best-effort:
+/// the collapsed file and HTML exist either way.
 pub fn render_svg(out_dir: &Path, title: &str) -> anyhow::Result<Option<std::path::PathBuf>> {
     let script = out_dir.join("flamegraph.pl");
     if !script.exists() {

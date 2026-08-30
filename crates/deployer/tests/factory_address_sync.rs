@@ -1,8 +1,8 @@
-//! Cross-check: the FACTORY constant baked into KardamomUUPSBase.sol matches the
-//! address computed by `addresses::factory_proxy_address(...)` for the canonical
-//! dev/test owner. Production owners produce different addresses (and a different
-//! KardamomUUPSBase build); this test pins the address for the dev path used in
-//! local + CI testing.
+//! Checks that the FACTORY constant in KardamomUUPSBase.sol matches the
+//! address that `addresses::factory_proxy_address(...)` computes for the
+//! canonical dev/test owner. A production owner gives a different address
+//! and a different KardamomUUPSBase build. This test covers only the dev
+//! path used in local and CI testing.
 
 use std::path::PathBuf;
 
@@ -10,8 +10,8 @@ use alloy_primitives::{Address, address};
 use kardamom_deployer::addresses::{factory_impl_address, factory_proxy_address};
 use kardamom_deployer::embedded;
 
-/// Canonical owner used by `deploy_e2e` and any other dev/test deployment. Must match
-/// the owner baked into KardamomUUPSBase.FACTORY.
+/// Canonical owner for `deploy_e2e` and other dev/test deployments. It must match
+/// the owner in KardamomUUPSBase.FACTORY.
 const DEV_OWNER: Address = address!("00000000000000000000000000000000DEAD0001");
 
 #[test]

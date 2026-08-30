@@ -1,4 +1,4 @@
-//! Smoke test: calling `kardamom_obs::init("ingress", ...)` exposes
+//! Smoke test. A call to `kardamom_obs::init("ingress", ...)` exposes
 //! `/metrics` with the expected counters.
 
 use std::net::{SocketAddr, TcpListener};
@@ -8,9 +8,10 @@ async fn ingress_metrics_endpoint_serves_expected_counters() {
     let addr = free_port();
     kardamom_obs::init("ingress", addr, "local", "test", "test").expect("init");
 
-    // Touch the counter the ingress crate is expected to publish so the
-    // describe_counter call doesn't require driving the full binary.
-    // Uses the crate's constants so a rename in src/metrics.rs fails here.
+    // Touch the counter that the ingress crate must publish. This lets
+    // describe_counter run without the full binary.
+    // The test uses the crate's constants, so a rename in src/metrics.rs
+    // makes this test fail.
     metrics::counter!(kardamom_ingress::metrics::TX_RECEIVED_TOTAL).increment(0);
 
     let body = scrape(&format!("http://{addr}/metrics")).await;

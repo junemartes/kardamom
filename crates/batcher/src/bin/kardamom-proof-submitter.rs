@@ -1,12 +1,13 @@
 //! `kardamom-proof-submitter`: posts batch validity proofs to the
 //! `KardamomProofOracle`, aligned with the settlement's L1-as-truth batch
-//! cursor (spec: no-std-exec-core, PR 4).
+//! cursor. See the no-std-exec-core spec.
 //!
-//! Thin poster over [`kardamom_batcher::submit_next_proof`]: each tick it
-//! asks the oracle for the next unproven batch, looks for the prover's
-//! output files (`--proofs-dir/batch-<first>-<last>/`, the zk-host layout),
-//! and submits when both exist. Submission is permissionless — the proof is
-//! the authorization; the key only pays gas.
+//! A thin poster over [`kardamom_batcher::submit_next_proof`]. On each
+//! tick, it asks the oracle for the next unproven batch, looks for the
+//! prover's output files (`--proofs-dir/batch-<first>-<last>/`, the
+//! zk-host layout), and submits when both exist. Submission is
+//! permissionless; the proof is the authorization, and the key only pays
+//! gas.
 
 use std::path::PathBuf;
 use std::time::Duration;

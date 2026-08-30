@@ -1,12 +1,14 @@
-//! Offline reproducer for the deterministic K=20 DeFi divergence.
+//! This is an offline reproducer for the deterministic K=20 DeFi
+//! divergence.
 //!
-//! Three separate cluster deploys produced the byte-identical divergence
-//! "chunk 2 (txs 21..=40): vault/slot0 claimed 3.192e18, recomputed
-//! absent" — a deterministic workload point, not chaos. This sweep runs
-//! many deterministic block compositions of the REAL bench contracts
-//! through `execute_block_parallel` at K=20 (and K=1), comparing each
-//! against sequential execution through the executor's exact capture
-//! path. Any composition that diverges is the repro.
+//! Three separate cluster deploys produced the same divergence: in
+//! chunk 2 (transactions 21 through 40), vault/slot0 was claimed as a
+//! nonzero value but recomputed as absent. This is a deterministic
+//! workload point, not chaos. This sweep runs many deterministic block
+//! compositions of the real bench contracts through
+//! `execute_block_parallel` at K=20 and K=1, and compares each against
+//! sequential execution through the executor's exact capture path. Any
+//! composition that diverges is the repro.
 
 use alloy_primitives::{Address, U256};
 use kardamom_bench::load::defi::{DefiContracts, deployment_txs, pregenerate_defi};
@@ -46,7 +48,8 @@ fn envelope(t: &PlannedTx, sender: Address, i: u64) -> TxEnvelope {
     }
 }
 
-/// xorshift — deterministic composition shuffling (no external RNG dep).
+/// This is xorshift, for deterministic composition shuffling with no
+/// external RNG dependency.
 fn xs(state: &mut u64) -> u64 {
     let mut x = *state;
     x ^= x << 13;
@@ -56,7 +59,7 @@ fn xs(state: &mut u64) -> u64 {
     x
 }
 
-/// Shared pool for the sweep (persistent, like production).
+/// The shared pool for the sweep. It is persistent, like production.
 fn repro_pool() -> &'static kardamom_stm::pool::WorkerPool {
     use std::sync::OnceLock;
     static POOL: OnceLock<kardamom_stm::pool::WorkerPool> = OnceLock::new();
@@ -80,8 +83,8 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
     let _: DefiContracts = contracts;
     let queues = pregenerate_defi(&signers, CHAIN_ID, &contracts, 120, 0, 1_000_000_000).unwrap();
 
-    // Block 1 (setup): deploys + every sender's seed op, executed
-    // sequentially — becomes the PARENT layer for the repro blocks.
+    // Block 1 is setup: the deploys and every sender's seed operation,
+    // executed in order. This becomes the parent layer for the repro blocks.
     let mut parent = PendingDelta::new();
     let mut cumulative = 0u64;
     let mut gi = 0u64;
@@ -107,7 +110,7 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
             gi += 1;
         }
         for (si, q) in queues.iter().enumerate() {
-            let t = &q[0]; // seed()
+            let t = &q[0]; // This is the seed() operation.
             let (r, ws) = execute_tx(
                 &snap,
                 None,
@@ -128,10 +131,11 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
         }
     }
 
-    // Sweep: many deterministic compositions of blocks 2..: interleave the
-    // senders' op queues under different shuffles, 60 txs per block, and
-    // check K=20 AND K=1 parallel against sequential for each.
-    let mut next_op_idx = vec![1usize; queues.len()]; // per-sender queue cursor
+    // Sweep: many deterministic compositions of blocks starting at 2.
+    // Interleave the senders' operation queues under different shuffles,
+    // 60 transactions per block, and check K=20 and K=1 parallel against
+    // sequential for each.
+    let mut next_op_idx = vec![1usize; queues.len()]; // A per-sender queue cursor.
     let mut rng: u64 = 0x00C0FFEE_D15EA5E5;
     let mut parent = parent;
     for block in 2..14u64 {
@@ -147,10 +151,11 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
             next_op_idx[si] += 1;
             txs.push((si, &queues[si][idx]));
         }
-        // Per-sender order within the block must stay nonce-monotonic —
-        // the composition above guarantees it (cursor only advances).
+        // Each sender's order within the block must stay nonce-monotonic.
+        // The composition above guarantees this, since the cursor only advances.
 
-        // SEQUENTIAL truth + the executor's claims (per-tx capture).
+        // This computes the sequential truth and the executor's claims,
+        // through per-transaction capture.
         let mut seq_delta = PendingDelta::new();
         let mut bal = revm::state::bal::Bal::new();
         let mut cum = 0u64;
@@ -215,15 +220,18 @@ fn k20_defi_parallel_matches_sequential_across_compositions() {
     }
 }
 
-/// The burst-block case that produced the live divergence: a stall makes
-/// the sealer pack the WHOLE backlog into one giant block, so the contract
-/// DEPLOYMENTS land in chunk 1 and the calls in later chunks — CREATE then
-/// CALL across a chunk boundary within one block. The original spec
-/// excluded code from attribution ("the account-entry dependency orders
-/// it") — correct for the wave-DAG model, WRONG for the seeded model:
-/// batch 2 never waits for batch 1, so without code claims its seed has
-/// account entries but EMPTY bytecode, every contract call no-ops, and
-/// verification reports "recomputed absent".
+/// This is the burst-block case that produced the live divergence. A
+/// stall makes the sealer pack the whole backlog into one giant block,
+/// so the contract deployments land in chunk 1 and the calls land in
+/// later chunks: a CREATE, then a CALL, across a chunk boundary within
+/// one block.
+///
+/// The original spec excluded code from attribution, reasoning that
+/// the account-entry dependency orders it. That reasoning is correct
+/// for the wave-DAG model, but wrong for the seeded model: batch 2
+/// never waits for batch 1. So without code claims, its seed has
+/// account entries but empty bytecode, every contract call becomes a
+/// no-op, and verification reports "recomputed absent".
 #[test]
 fn create_then_call_across_chunks_in_one_block() {
     let signers = mnemonic::derive_signers(ANVIL_PHRASE, SENDERS).unwrap();
@@ -240,11 +248,12 @@ fn create_then_call_across_chunks_in_one_block() {
     let (deploys, contracts) = deployment_txs(&signers, CHAIN_ID, 0, 1_000_000_000).unwrap();
     let queues = pregenerate_defi(&signers, CHAIN_ID, &contracts, 8, 0, 1_000_000_000).unwrap();
 
-    // ONE block: deploys (bal 1-3), all seeds, then two rounds of ops —
-    // spans multiple K=20 chunks with the CREATEs in chunk 1.
+    // One block: the deploys (bal 1-3), all seeds, then two rounds of
+    // operations. This spans multiple K=20 chunks, with the CREATEs in
+    // chunk 1.
     let mut txs: Vec<(usize, &PlannedTx)> = deploys.iter().map(|d| (0usize, d)).collect();
     for (si, q) in queues.iter().enumerate() {
-        txs.push((si, &q[0])); // seed()
+        txs.push((si, &q[0])); // This is the seed() operation.
     }
     for round in 1..3 {
         for (si, q) in queues.iter().enumerate() {

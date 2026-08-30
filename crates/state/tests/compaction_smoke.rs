@@ -1,6 +1,6 @@
-//! Smoke test: compact_to produces a directory containing a libmdbx data
-//! file. Does not verify byte-for-byte equivalence (that's the responsibility
-//! of libmdbx itself).
+//! A smoke test. `compact_to` produces a directory containing a
+//! libmdbx data file. This test does not verify byte-for-byte
+//! equivalence; that is libmdbx's own responsibility.
 
 use kardamom_state::compact_to;
 use kardamom_state::env::{Durability, StateEnvBuilder};
@@ -16,10 +16,10 @@ fn compact_emits_a_directory() {
     let dst_dir = tempfile::tempdir().unwrap();
     let dst = dst_dir.path().join("compacted");
     compact_to(&env, &dst).unwrap();
-    // mdbx creates either:
-    //   - a directory containing `mdbx.dat` (subdir mode, the default), or
-    //   - a single file `compacted` (NOSUBDIR mode).
-    // Both are acceptable for the smoke test — assert non-empty in either case.
+    // mdbx creates one of:
+    //   - A directory containing `mdbx.dat` (subdir mode, the default).
+    //   - A single file named `compacted` (NOSUBDIR mode).
+    // Both are acceptable for this smoke test. Assert non-empty in either case.
     assert!(
         dst.exists(),
         "expected dest path to exist: {}",

@@ -1,5 +1,5 @@
-//! Property: `pack_to_blobs` ↔ `unpack_from_blobs` round-trips any byte input
-//! ≤ 6 blobs of payload.
+//! Property: `pack_to_blobs` and `unpack_from_blobs` round-trip any byte
+//! input of up to 6 blobs of payload.
 
 use kardamom_batcher::blob::{USABLE_BYTES_PER_BLOB, pack_to_blobs, unpack_from_blobs};
 use proptest::prelude::*;
@@ -7,7 +7,7 @@ use proptest::prelude::*;
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(64))]
 
-    /// Round-trip arbitrary payloads up to ~3 blobs in size.
+    /// Round-trip arbitrary payloads up to about 3 blobs in size.
     #[test]
     fn round_trip_packs(payload in proptest::collection::vec(any::<u8>(), 0..(3 * USABLE_BYTES_PER_BLOB))) {
         let blobs = pack_to_blobs(&payload).unwrap();

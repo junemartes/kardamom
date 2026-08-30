@@ -1,12 +1,15 @@
-//! The correctness gate: drive randomized blocks through the **production**
-//! incremental update path ([`super::update_for_block`]) and assert the root
-//! matches the full-rebuild oracle after every block, plus a stored-node-table
-//! equivalence check against a from-scratch build (the orphan detector).
+//! The correctness gate. This drives randomized blocks through the
+//! production incremental update path ([`super::update_for_block`]),
+//! and asserts that the root matches the full-rebuild oracle after every
+//! block. It also runs a stored-node-table equivalence check against a
+//! from-scratch build, as an orphan detector.
 //!
-//! A deterministic regression (`extension_collapse_regrow_no_stale_orphans`)
-//! mines addresses whose hashed keys share nibble prefixes to construct the
-//! stored-branch-under-extension → collapse → regrow → stale-skip geometry
-//! that the visited−updated removal scheme missed (silent root divergence).
+//! A deterministic regression test
+//! (`extension_collapse_regrow_no_stale_orphans`) mines addresses whose
+//! hashed keys share nibble prefixes. This constructs the
+//! stored-branch-under-extension, collapse, regrow, stale-skip geometry
+//! that the visited-minus-updated removal scheme missed, which caused a
+//! silent root divergence.
 
 use std::collections::BTreeMap;
 
@@ -30,13 +33,13 @@ struct Basic {
 struct Block {
     acct_upserts: Vec<(Address, Basic)>,
     acct_deletes: Vec<Address>,
-    storage: Vec<(Address, B256, U256)>, // value 0 == delete slot
+    storage: Vec<(Address, B256, U256)>, // A value of 0 deletes the slot.
 }
 
 impl Block {
-    /// The production write payload for this block. An account delete is an
-    /// upsert to the EIP-161-empty account (zero nonce/balance/code), which is
-    /// exactly what `update_for_block` interprets as removal.
+    /// The production write payload for this block. An account delete is
+    /// an upsert to the EIP-161-empty account, with zero nonce, balance,
+    /// and code. `update_for_block` interprets this exactly as removal.
     fn to_delta(&self, block_number: u64) -> BlockDelta {
         let mut accounts: Vec<AccountChange> = self
             .acct_upserts
@@ -139,12 +142,12 @@ fn temp_env() -> (tempfile::TempDir, StateEnv) {
     (dir, env)
 }
 
-/// The orphan detector: replay the model's *cumulative* state into a fresh env
-/// as one block and require both node tables to be byte-identical to the
-/// incrementally-maintained ones. Stored branch nodes are a pure function of
-/// the leaf set (masks and hashes depend only on subtree content), so any
-/// extra row in the incremental tables is a stale orphan and any differing row
-/// is drift.
+/// The orphan detector. Replay the model's cumulative state into a
+/// fresh env as one block, and require both node tables to be
+/// byte-identical to the incrementally maintained ones. Stored branch
+/// nodes are a pure function of the leaf set: masks and hashes depend
+/// only on subtree content. So any extra row in the incremental tables
+/// is a stale orphan, and any differing row is drift.
 fn assert_node_tables_match_fresh_build(
     env: &StateEnv,
     accts: &BTreeMap<Address, Basic>,
@@ -178,10 +181,11 @@ fn assert_node_tables_match_fresh_build(
 fn incremental_equals_full_rebuild_over_random_blocks() {
     let (_dir, env) = temp_env();
 
-    // A larger pool grows the account trie deep enough to exercise multi-level
-    // stored branch nodes, extension-shaped children (hashed keys sharing 2+
-    // nibbles), and collapse/regrow cycles — small pools collapse to a shallow
-    // trie that never stores intermediate nodes off exact child paths.
+    // A larger pool grows the account trie deep enough to exercise
+    // multi-level stored branch nodes, extension-shaped children (hashed
+    // keys sharing 2 or more nibbles), and collapse and regrow cycles. A
+    // small pool collapses to a shallow trie that never stores
+    // intermediate nodes off exact child paths.
     let addrs: Vec<Address> = (1u16..=160)
         .map(|i| {
             let mut b = [0u8; 20];
@@ -197,10 +201,10 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
     for block in 0..80u64 {
         let mut rng = block.wrapping_mul(0x1234_5678_9abc_def1) ^ 0xdead_beef;
 
-        // One canonical op per account per block (a real aggregated BlockDelta
-        // never repeats an account): None = delete, Some = non-empty upsert.
-        // Deletes are frequent (1 in 4) so subtries keep collapsing and
-        // regrowing.
+        // Use one op per account per block. A real, aggregated BlockDelta
+        // never repeats an account. None means delete; Some means a
+        // non-empty upsert. Deletes happen often, 1 in 4, so subtries
+        // keep collapsing and regrowing.
         let mut ops: BTreeMap<Address, Option<Basic>> = BTreeMap::new();
         let n_acct = 1 + (splitmix(&mut rng) % 6);
         for _ in 0..n_acct {
@@ -220,8 +224,9 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
                 );
             }
         }
-        // Storage ops, deduped per (addr, slot) with last write winning. Only on
-        // accounts that exist (or are upserted this block).
+        // Storage ops, deduplicated per (addr, slot), with the last write
+        // winning. These only apply to accounts that exist, or are
+        // upserted this block.
         let mut stor_ops: BTreeMap<(Address, B256), U256> = BTreeMap::new();
         let n_stor = splitmix(&mut rng) % 5;
         for _ in 0..n_stor {
@@ -249,7 +254,7 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
             }
         }
         for ((addr, slot), val) in &stor_ops {
-            // skip storage on accounts being deleted this block
+            // Skip storage on accounts being deleted this block.
             if matches!(ops.get(addr), Some(None)) {
                 continue;
             }
@@ -265,7 +270,7 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
             if b.acct_deletes.contains(addr) {
                 continue;
             }
-            // upserts are always non-empty (see block generation).
+            // Upserts are always non-empty. See the block-generation code above.
             m_accts.insert(*addr, *basic);
         }
         for (addr, slot, val) in &b.storage {
@@ -296,20 +301,22 @@ fn incremental_equals_full_rebuild_over_random_blocks() {
     assert_node_tables_match_fresh_build(&env, &m_accts, &m_stor, "final");
 }
 
-/// The exact geometry F09.1 missed, constructed deterministically by mining
-/// addresses whose hashed keys share nibble prefixes:
+/// This test constructs, deterministically, the exact geometry that an
+/// earlier removal scheme missed. It mines addresses whose hashed keys
+/// share nibble prefixes:
 ///
-/// 1. block 1 stores a branch node under an extension (at 2-nibble path
-///    `[n0,n1]`, while the walker only ever exact-gets `[n0]`);
-/// 2. block 2 rebuilds that subtrie from leaves (exact-get miss at `[n0]`)
-///    with content that both collapses `[n0,n1]` *and* drifts the surviving
-///    subtree under `[n0,n1,n2]` — under visited−updated removal the
-///    `[n0,n1]` node becomes a stale orphan holding a pre-drift child hash;
-/// 3. block 3 regrows a stored node at exactly `[n0]` whose tree_mask points
-///    into the orphaned region without re-upserting `[n0,n1]`;
-/// 4. block 4 changes a sibling under `[n0,n1]`: the walk exact-hits the stale
-///    orphan and add_branch-skips its "unchanged" child via the stale hash —
-///    silently wrong root.
+/// 1. Block 1 stores a branch node under an extension, at the 2-nibble
+///    path `[n0,n1]`. The walker only ever exact-gets `[n0]`.
+/// 2. Block 2 rebuilds that subtrie from leaves, after an exact-get miss
+///    at `[n0]`. The new content both collapses `[n0,n1]` and drifts the
+///    surviving subtree under `[n0,n1,n2]`. Under the old
+///    visited-minus-updated removal scheme, the `[n0,n1]` node becomes a
+///    stale orphan that holds a pre-drift child hash.
+/// 3. Block 3 regrows a stored node at exactly `[n0]`. Its `tree_mask`
+///    points into the orphaned region, without re-upserting `[n0,n1]`.
+/// 4. Block 4 changes a sibling under `[n0,n1]`. The walk exact-hits the
+///    stale orphan, and skips its "unchanged" child with `add_branch`,
+///    using the stale hash. The result is a silently wrong root.
 #[test]
 fn extension_collapse_regrow_no_stale_orphans() {
     let nibs5 = |a: &Address| -> [u8; 5] {
@@ -320,8 +327,8 @@ fn extension_collapse_regrow_no_stale_orphans() {
         })
     };
     // Mine an address whose first five hashed-key nibbles satisfy `pred`.
-    // (Salted addresses never collide with `a` below: its tail bytes are
-    // non-zero.)
+    // A salted address never collides with `a` below, because its tail
+    // bytes are non-zero.
     let mine = |pred: &dyn Fn(&[u8; 5]) -> bool| -> Address {
         for salt in 0u64..3_000_000 {
             let mut bytes = [0u8; 20];
@@ -334,22 +341,24 @@ fn extension_collapse_regrow_no_stale_orphans() {
         panic!("address mining exhausted — hashed-key prefix never found");
     };
 
-    // `a` defines the target prefix [n0,n1,n2,n3]; the rest are mined relative
-    // to it (keys are keccak-hashed, so we search rather than choose).
+    // `a` defines the target prefix [n0,n1,n2,n3]. The rest are mined
+    // relative to it. Keys are keccak-hashed, so this searches for them
+    // instead of choosing them directly.
     let a = Address::repeat_byte(0xa5);
     let an = nibs5(&a);
-    // b: shares 4 nibbles with a, diverges at nibble 4 → branch(a,b) at
-    // [n0,n1,n2,n3], making [n0,n1,n2] a stored node.
+    // b shares 4 nibbles with a, and diverges at nibble 4. This makes
+    // branch(a,b) at [n0,n1,n2,n3], and [n0,n1,n2] a stored node.
     let b = mine(&|m| m[..4] == an[..4] && m[4] != an[4]);
-    // e: shares 3 nibbles, diverges at nibble 3 → makes [n0,n1,n2] a branch.
+    // e shares 3 nibbles, and diverges at nibble 3. This makes
+    // [n0,n1,n2] a branch.
     let e = mine(&|m| m[..3] == an[..3] && m[3] != an[3]);
-    // c: shares 2 nibbles, diverges at nibble 2 → makes [n0,n1] a branch
-    // (stored under the extension from the root's n0 child).
+    // c shares 2 nibbles, and diverges at nibble 2. This makes [n0,n1] a
+    // branch, stored under the extension from the root's n0 child.
     let c = mine(&|m| m[..2] == an[..2] && m[2] != an[2]);
-    // d: shares 1 nibble, diverges at nibble 1 → later regrows a stored branch
-    // at exactly [n0].
+    // d shares 1 nibble, and diverges at nibble 1. It later regrows a
+    // stored branch at exactly [n0].
     let d = mine(&|m| m[0] == an[0] && m[1] != an[1]);
-    // anchor: different first nibble, so the root is always a branch.
+    // anchor has a different first nibble, so the root is always a branch.
     let anchor = mine(&|m| m[0] != an[0]);
 
     let (_dir, env) = temp_env();
@@ -388,8 +397,8 @@ fn extension_collapse_regrow_no_stale_orphans() {
         txn.get::<Vec<u8>>(db.dbi(), path).unwrap().is_some()
     };
 
-    // 1. Stored branch under an extension: nodes at [n0,n1] and [n0,n1,n2],
-    //    nothing at [n0].
+    // 1. A stored branch under an extension: nodes at [n0,n1] and
+    //    [n0,n1,n2], and nothing at [n0].
     step(
         &mut model,
         &[(anchor, 10), (a, 11), (b, 12), (e, 13), (c, 14)],
@@ -403,23 +412,25 @@ fn extension_collapse_regrow_no_stale_orphans() {
     );
     assert!(!stored_node_at(&an[..1]));
 
-    // 2. Collapse [n0,n1] (delete c) while drifting the surviving subtree
-    //    (a's balance): the subtrie is rebuilt from leaves after an exact-get
-    //    miss at [n0], so only prefix-clearing removes the [n0,n1] node.
+    // 2. Collapse [n0,n1] by deleting c, while drifting the surviving
+    //    subtree, a's balance. The subtrie is rebuilt from leaves after
+    //    an exact-get miss at [n0], so only prefix clearing removes the
+    //    [n0,n1] node.
     step(&mut model, &[(a, 21)], &[c], "block2");
     assert!(
         !stored_node_at(&an[..2]),
         "stale orphan left at [n0,n1] after the subtree collapsed (F09.1)"
     );
 
-    // 3. Regrow a stored node at exactly [n0] whose tree_mask points into the
-    //    (formerly) orphaned region.
+    // 3. Regrow a stored node at exactly [n0]. Its tree_mask points into
+    //    the formerly orphaned region.
     step(&mut model, &[(d, 15)], &[], "block3");
     assert!(stored_node_at(&an[..1]));
 
-    // 4. Change a sibling under [n0,n1]: with the orphan present the walk
-    //    exact-hits it and add_branch-skips its "unchanged" child via a hash
-    //    predating block 2's drift — silently wrong root.
+    // 4. Change a sibling under [n0,n1]. With the orphan present, the
+    //    walk exact-hits it, and skips its "unchanged" child with
+    //    add_branch, using a hash from before block 2's drift. The
+    //    result is a silently wrong root.
     step(&mut model, &[(c, 16)], &[], "block4");
 
     assert_node_tables_match_fresh_build(&env, &model, &no_stor, "after regrow");
@@ -471,10 +482,10 @@ fn empty_then_one_account_then_delete() {
     let (_dir, env) = temp_env();
     let a = Address::repeat_byte(0x42);
 
-    // empty
+    // Start empty.
     assert_eq!(apply_block(&env, &Block::default()), empty_root());
 
-    // one funded account
+    // Add one funded account.
     let b1 = Block {
         acct_upserts: vec![(
             a,
@@ -489,7 +500,7 @@ fn empty_then_one_account_then_delete() {
     let r1 = apply_block(&env, &b1);
     assert_ne!(r1, empty_root());
 
-    // delete it -> back to empty
+    // Delete it. Back to empty.
     let b2 = Block {
         acct_deletes: vec![a],
         ..Default::default()

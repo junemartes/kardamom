@@ -1,5 +1,6 @@
-//! Pipelined-commit tests: parent-layer visibility across unsettled blocks,
-//! depth-K blocking behavior, and idle-tail settling via the probe.
+//! Pipelined-commit tests. These check parent-layer visibility across
+//! unsettled blocks, depth-K blocking behavior, and idle-tail settling
+//! through the probe.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -17,12 +18,12 @@ use crate::state::{MockStateDatabase, StaticSnapshotSource};
 use super::test_support::{ImmediateCommit, RecordingQueue, StagedCommit, legacy, pos};
 use super::{ExecToCommit, ExecutorConfig, ResumePoint, spawn_exec};
 
-/// Pipelined commit: block N+1 executes against snapshot ∘ parent(N)
-/// while N's commit is unsettled, and boundaries still forward in order
-/// after their block is durable. The StaticSnapshotSource NEVER advances
-/// — cross-block visibility can only come through the parent layer, so a
-/// broken layer makes the block-2 spend fail (status 0) and this test
-/// red.
+/// This test checks pipelined commit. Block N+1 executes against
+/// snapshot plus parent(N) while block N's commit is still unsettled.
+/// Boundaries still forward in order once their block is durable. The
+/// StaticSnapshotSource never advances, so cross-block visibility can
+/// only come from the parent layer. A broken layer makes the block-2
+/// spend fail (status 0) and turns this test red.
 #[test]
 fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     let signer_a = PrivateKeySigner::random();
@@ -31,9 +32,9 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     let b = signer_b.address();
     let c = address!("00000000000000000000000000000000000ABCDE");
 
-    // Only A is funded at genesis; B's balance exists ONLY in block 1's
-    // delta until that block's commit lands (which the static source
-    // never exposes).
+    // Only A is funded at genesis. B's balance exists only in block 1's
+    // delta until that block's commit lands. The static source never
+    // exposes that commit.
     let snap = MockStateDatabase::builder()
         .account(a, U256::from(10u128.pow(18)), 0, KECCAK_EMPTY)
         .build();
@@ -42,7 +43,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(8);
     let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(8);
 
-    // Block 1: A → B, a fat transfer so B can pay gas in block 2.
+    // Block 1: A sends to B, a large transfer so B can pay gas in block 2.
     tx_r2e
         .send(ReaderToExec::Tx {
             tx_idx: TxIndex(0),
@@ -58,7 +59,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
             l1_origin: 0,
         }))
         .unwrap();
-    // Block 2: B → C spends funds B only has via block 1's writes.
+    // Block 2: B sends to C, spending funds B has only from block 1's writes.
     tx_r2e
         .send(ReaderToExec::Tx {
             tx_idx: TxIndex(1),
@@ -92,9 +93,9 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     );
     h.join().expect("no panic").expect("exec ok");
 
-    // e2c ordering proves the pipeline shape: block 2's receipt streams
-    // BEFORE boundary 1 forwards (boundary 1 settles at boundary 2's
-    // entry; boundary 2 settles at end of stream).
+    // The e2c ordering proves the pipeline shape. Block 2's receipt streams
+    // before boundary 1 forwards. Boundary 1 settles when boundary 2
+    // enters; boundary 2 settles at the end of the stream.
     let mut kinds = Vec::new();
     while let Ok(m) = rx_e2c.try_recv() {
         kinds.push(match m {
@@ -111,7 +112,7 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
         "receipts stream ahead; boundaries settle in order at the next boundary / stream end"
     );
 
-    // Block 2's delta must show the spend: C received 60.
+    // Block 2's delta must show the spend: C receives 60.
     let log = writer_log.lock().unwrap();
     assert_eq!(log.len(), 2);
     let (_, d2) = &log[1];
@@ -123,10 +124,11 @@ fn exec_pipelines_commit_and_next_block_reads_parent_layer() {
     assert_eq!(c_acc.balance, U256::from(60u64));
 }
 
-/// Depth-K pipelining: under a writer that never advances on its own,
-/// execution runs K=4 blocks ahead without blocking (boundaries
-/// withheld), the 5th boundary blocks for exactly the OLDEST commit,
-/// and settles forward in order. End of stream drains the rest.
+/// This test checks depth-K pipelining. With a writer that never advances
+/// on its own, execution runs K=4 blocks ahead without blocking
+/// (boundaries stay withheld). The 5th boundary blocks only for the
+/// oldest commit, then settles forward in order. The end of the stream
+/// drains the rest.
 #[test]
 fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
     let snap = MockStateDatabase::builder().build();
@@ -167,9 +169,9 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
     );
     h.join().expect("no panic").expect("exec ok");
 
-    // Boundaries 1-4 pipeline without any blocking wait; boundaries 5
-    // and 6 each block once for the oldest commit; end-of-stream drains
-    // with one final wait. 2 capacity waits + 1 drain wait.
+    // Boundaries 1-4 pipeline without any blocking wait. Boundaries 5 and
+    // 6 each block once for the oldest commit. The end of stream drains
+    // with one final wait: 2 capacity waits plus 1 drain wait.
     assert_eq!(
         blocking_waits.load(std::sync::atomic::Ordering::SeqCst),
         3,
@@ -189,14 +191,13 @@ fn exec_pipelines_k_deep_and_blocks_only_at_capacity() {
     assert_eq!(writer_log.lock().unwrap().len(), 6, "all deltas submitted");
 }
 
-/// Idle-tail settling (the #129 regression that turned chain-semantics
-/// red): in-flight commits below depth K must settle and forward their
-/// boundaries WITHOUT any further input on the reader channel — via the
-/// idle probe — once the writer reports them durable. Before the probe,
-/// settling only happened at the NEXT boundary, so an idle chain's last
-/// ≤K boundary closeouts never published (stalled ingress watermarks,
-/// executor/validator drains that never converged, uncovered attester
-/// blocks).
+/// This test checks idle-tail settling. In-flight commits below depth K
+/// must settle and forward their boundaries with no further input on the
+/// reader channel, using the idle probe, once the writer reports them
+/// durable. Before the probe, settling happened only at the next
+/// boundary. So an idle chain's last boundary closeouts (up to K of them)
+/// never published. This stalled ingress watermarks and
+/// executor/validator drains, and left attester blocks uncovered.
 #[test]
 fn exec_settles_inflight_commits_while_idle() {
     let snap = MockStateDatabase::builder().build();
@@ -207,9 +208,9 @@ fn exec_settles_inflight_commits_while_idle() {
     let (tx_r2e, rx_r2e) = bounded::<ReaderToExec>(16);
     let (tx_e2c, rx_e2c) = bounded::<ExecToCommit>(16);
 
-    // Three boundaries — BELOW depth K, so nothing blocks and, with a
-    // writer stuck at 0, nothing settles either. The channel stays OPEN:
-    // no end-of-stream drain can rescue them.
+    // Three boundaries, below depth K, so nothing blocks. With the writer
+    // stuck at 0, nothing settles either. The channel stays open, so no
+    // end-of-stream drain can rescue them.
     for n in 1..=3u64 {
         tx_r2e
             .send(ReaderToExec::Boundary(BlockBoundaryStart {
@@ -238,9 +239,9 @@ fn exec_settles_inflight_commits_while_idle() {
         None::<NoEpochCheck>,
     );
 
-    // The writer catches up on its own; the exec thread must notice via
-    // the idle probe and forward all three boundaries, with NO blocking
-    // wait and NO further reader input.
+    // The writer catches up on its own. The exec thread must notice
+    // through the idle probe and forward all three boundaries, with no
+    // blocking wait and no further reader input.
     durable.store(3, std::sync::atomic::Ordering::SeqCst);
     let mut boundaries = Vec::new();
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

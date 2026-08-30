@@ -1,17 +1,17 @@
-//! Scheduled libmdbx compaction (§5).
+//! Scheduled libmdbx compaction (spec section 5).
 //!
-//! libmdbx is copy-on-write; long-running databases fragment. The plan is:
+//! libmdbx is copy-on-write. Long-running databases fragment. The plan is:
 //!
 //! 1. Open a hot mirror directory next to the live env.
-//! 2. Call `mdbx_env_copy` with `MDBX_CP_COMPACT` — this walks the live env's
+//! 2. Call `mdbx_env_copy` with `MDBX_CP_COMPACT`. This walks the live env's
 //!    pages and writes a compacted copy into the mirror.
-//! 3. Atomically swap the mirror into the live path (rename + reopen).
+//! 3. Atomically swap the mirror into the live path (rename and reopen).
 //!
-//! For v0 this is exposed as a one-shot [`compact_to`] function; an external
-//! scheduler (systemd timer, cron) invokes it once per day.
+//! In v0, this is a one-shot [`compact_to`] function. An external scheduler,
+//! such as a systemd timer or cron, calls it once per day.
 //!
-//! `signet-libmdbx` 0.8 does not expose `mdbx_env_copy` on its safe surface,
-//! so we call the underlying FFI directly via `Environment::with_raw_env_ptr`.
+//! `signet-libmdbx` 0.8 does not expose `mdbx_env_copy` in its safe API. We
+//! call the underlying FFI directly, through `Environment::with_raw_env_ptr`.
 
 use std::ffi::CString;
 use std::path::Path;
@@ -22,11 +22,11 @@ use tracing::{info, warn};
 use crate::env::StateEnv;
 use crate::error::StateError;
 
-/// Copy-with-compact the env to `dest`. Caller is responsible for swapping
-/// `dest` into place if it wants the compacted copy to become the live env.
+/// Copy the env to `dest`, with compaction. The caller must swap `dest`
+/// into place to make the compacted copy the live env.
 ///
-/// The live env stays online for reads and writes throughout — compaction
-/// runs against an RO snapshot of the env.
+/// The live env stays online for reads and writes throughout compaction.
+/// Compaction runs against a read-only snapshot of the env.
 pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
     info!(src = %env.path().display(), dst = %dest.display(), "starting compaction");
     if dest.exists() {
@@ -36,8 +36,8 @@ pub fn compact_to(env: &StateEnv, dest: &Path) -> Result<(), StateError> {
             dest.display()
         )));
     }
-    // Ensure the parent exists; mdbx_env_copy creates the destination
-    // subdirectory itself.
+    // Make sure the parent directory exists. mdbx_env_copy creates the
+    // destination subdirectory itself.
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }

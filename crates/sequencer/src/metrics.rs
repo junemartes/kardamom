@@ -1,8 +1,8 @@
 //! Sequencer metrics.
 //!
-//! The binary owns the exporter; this module just declares names + helper
-//! functions. Default no-op recorder is a smoke test only; production binaries
-//! wire `metrics-exporter-prometheus` per the workspace stack.
+//! The binary owns the exporter. This module only declares names and helper
+//! functions. The default no-op recorder is for smoke tests only. Production
+//! binaries wire up `metrics-exporter-prometheus`, per the workspace stack.
 
 use metrics::{counter, gauge, histogram};
 
@@ -14,32 +14,32 @@ pub const PENDING_BUFFER_EVICTIONS: &str = "kardamom_sequencer_pending_evictions
 pub const BACKPRESSURE_EVENTS: &str = "kardamom_sequencer_backpressure_total";
 pub const NONCE_CHECK_DURATION_SECONDS: &str = "kardamom_sequencer_nonce_check_duration_seconds";
 
-// Lag detection + receipt-floor resync (docs/agents/sequencer-lag-resync-spec.md).
+// Lag detection and receipt-floor resync. See docs/agents/sequencer-lag-resync-spec.md.
 pub const RESYNC_MODE: &str = "kardamom_sequencer_resync_mode";
 pub const RESYNC_ENTERED: &str = "kardamom_sequencer_resync_entered_total";
-/// Bumped by the egress FEED thread the moment it observes a lag signature
-/// (boundary-arrival gap past the silence threshold) — starvation-proof,
-/// unlike `RESYNC_ENTERED`, which requires the publish loop to be running.
-/// The chaos suite asserts on THIS counter.
+/// The egress FEED thread bumps this counter as soon as it sees a lag
+/// signature (a boundary-arrival gap past the silence threshold). This
+/// works even if the publish loop stalls, unlike `RESYNC_ENTERED`, which
+/// needs the publish loop to run. The chaos suite checks this counter.
 pub const RESYNC_LAG_SUSPECTED: &str = "kardamom_sequencer_resync_lag_suspected_total";
 pub const RESYNC_SKIPPED_EXECUTED: &str = "kardamom_sequencer_resync_skipped_executed_total";
 pub const RECEIPT_FLOOR_SENDERS: &str = "kardamom_sequencer_receipt_floor_senders";
 pub const RECEIPT_FLOOR_ADVANCES: &str = "kardamom_sequencer_receipt_floor_advances_total";
 pub const CANONICAL_WATERMARK: &str = "kardamom_sequencer_canonical_watermark";
-/// #85: refs published but not yet receipt-confirmed as canonically
-/// committed (gauge), and refs rewound + re-published after the confirm
-/// timeout (counter). A sustained nonzero republish rate means offers are
-/// landing in a void (dead-leader window) or receipts are not flowing.
+/// A gauge for refs that are published but not yet receipt-confirmed as
+/// committed. A counter for refs that are rewound and republished after
+/// the confirm timeout. A steady nonzero republish rate means offers land
+/// in a void (a dead-leader window), or receipts are not flowing.
 pub const REF_UNCONFIRMED: &str = "kardamom_sequencer_ref_unconfirmed";
 pub const REF_REPUBLISHED: &str = "kardamom_sequencer_ref_republished_total";
 
-/// Pre-registered per-partition metric HANDLES for the hot loop.
+/// Pre-registered per-partition metric handles for the hot loop.
 ///
-/// Every `counter!(NAME, "partition" => p.to_string())` call boxes a fresh
-/// metrics `Key` and allocates the label `String` — the service allocation
-/// profile measured that as 6 of the sequencer's 10 allocations per
-/// transaction. Handles are registered ONCE at construction; recording
-/// through them is allocation-free.
+/// Each `counter!(NAME, "partition" => p.to_string())` call boxes a new
+/// metrics `Key` and allocates the label `String`. The allocation profile
+/// found this caused 6 of the sequencer's 10 allocations per transaction.
+/// The handles are registered once at construction, so recording through
+/// them does not allocate.
 pub struct HotMetrics {
     pub ingest: metrics::Counter,
     pub publish: metrics::Counter,
@@ -103,11 +103,12 @@ pub fn record_resync_enter(partition: u32) {
     record_resync_mode(partition, true);
 }
 
-/// Unix timestamp of process start. Restart-proof discriminator for the
-/// chaos harness: counters reset across a restart to values identical to a
-/// fresh baseline (entered=1 from the startup resync), but a start time
-/// AFTER a known event proves the process is a newborn — over plain HTTP,
-/// with no docker-exec (which wedges for minutes post-thaw on CI runners).
+/// Unix timestamp of process start.
+/// This is a restart-proof signal for the chaos harness. After a restart,
+/// counters reset to the same values as a fresh baseline (entered=1 from
+/// the startup resync). But a start time after a known event proves the
+/// process is new. This works over plain HTTP, with no docker-exec, which
+/// can hang for minutes after a thaw on CI runners.
 pub const START_TIME_SECONDS: &str = "kardamom_sequencer_start_time_seconds";
 
 pub fn record_start_time() {
@@ -152,8 +153,8 @@ mod tests {
 
     #[test]
     fn record_helpers_smoke() {
-        // Default recorder is no-op until installed; these calls just exercise
-        // the API surface so it stays compiling.
+        // The default recorder is a no-op until installed. These calls only
+        // exercise the API surface, to keep it compiling.
         record_ingest(0);
         record_publish(0);
         record_buffered_future(0);

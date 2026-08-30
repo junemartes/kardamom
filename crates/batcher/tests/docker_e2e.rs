@@ -1,33 +1,34 @@
-//! E2E test scaffold: real Aeron Media Driver + Aeron Archive in Docker via
-//! the [`kardamom_log::testing::AeronTestCluster`] harness from S3.
+//! E2E test scaffold: a real Aeron Media Driver and Aeron Archive in
+//! Docker, through the [`kardamom_log::testing::AeronTestCluster`] harness
+//! from `kardamom-log`.
 //!
-//!— mock-based unit and integration tests in this crate stay;
-//! this is *additional* coverage that brings up the real Aeron container so we
-//! catch wire-format / IPC / back-pressure bugs the in-process reader cannot
-//! surface.
+//! The mock-based unit and integration tests in this crate stay as they
+//! are. This is additional coverage that brings up the real Aeron
+//! container, so it can catch wire-format, IPC, and back-pressure bugs the
+//! in-process reader cannot surface.
 //!
-//! Gated behind `feature = "docker-e2e"` because it requires a Docker daemon
-//! and ~30s startup; default `cargo test` skips it.
+//! Gated behind `feature = "docker-e2e"`, because it needs a Docker daemon
+//! and about 30 seconds of startup time. The default `cargo test` skips it.
 //!
-//! ** scope:** brings up the Aeron container, writes synthetic
-//! segment files in the canonical KAR1-internal frame format that the
-//! batcher's offline `TypedSegmentReader` consumes:
-//!   - one **tx_ordering** archive carrying `TxOrderingMessage` records
-//!     (`TxRef + BoundaryStart`); and
-//!   - one or more **per-sequencer tx_data** archives carrying the full
+//! Test scope: bring up the Aeron container, and write synthetic segment
+//! files in the canonical KAR1-internal frame format that the batcher's
+//! offline `TypedSegmentReader` consumes:
+//!   - one tx_ordering archive, carrying `TxOrderingMessage` records
+//!     (`TxRef` and `BoundaryStart`); and
+//!   - one or more per-sequencer tx_data archives, carrying the full
 //!     `TxEnvelope` records the refs point at.
 //!
 //! Then it runs the full batcher pipeline through the
-//! [`MultiArchiveReader`] (read → resolve → accumulate → pack → reconstruct
-//! → assert blobs), and asserts a `BatchPosted`-shaped `PostBatchParams`
-//! could be assembled.
+//! [`MultiArchiveReader`]: read, resolve, accumulate, pack, reconstruct,
+//! and check the blobs. It checks that a `BatchPosted`-shaped
+//! `PostBatchParams` could be assembled.
 //!
-//! The full path "publish to tx_ordering / tx_data[i] with rusteron →
-//! recorder writes Aeron-native segment frames → batcher decodes via
-//! rusteron-archive replay protocol" lands when the high-level archive
-//! wrappers ship from `log`. The harness assertion below is the
-//! gating proof that this crate's test target can reach the Aeron container,
-//! which is the prerequisite that wrapper landing unblocks.
+//! The full path, "publish to tx_ordering and tx_data[i] with rusteron,
+//! then the recorder writes Aeron-native segment frames, then the batcher
+//! decodes them through the rusteron-archive replay protocol", lands when
+//! the high-level archive wrappers ship from `log`. The harness assertion
+//! below is the gating proof that this crate's test target can reach the
+//! Aeron container. That is the prerequisite the wrapper landing unblocks.
 
 #![cfg(feature = "docker-e2e")]
 
@@ -55,8 +56,8 @@ fn pos(o: i32) -> BPosition {
 
 /// Build a 2-sequencer M+1 archive set: A0, A1, B.
 ///
-/// 4 txs alternate between sequencer 0 and 1; B records the canonical order
-/// (the alternation) and closes the block with a `BoundaryStart`.
+/// 4 txs alternate between sequencer 0 and 1. B records the canonical
+/// order (the alternation), and closes the block with a `BoundaryStart`.
 fn write_synthetic_archives(
     dir: &TempDir,
 ) -> (std::path::PathBuf, HashMap<u8, std::path::PathBuf>) {
@@ -187,15 +188,15 @@ async fn aeron_cluster_starts_and_batcher_round_trips_the_m_plus_one_topology() 
         "unexpected archive endpoint {archive_endpoint}"
     );
 
-    // 2. Write the M+1 synthetic archives using the batcher's own
-    //    KAR1-internal frame writer. The full "publish via Aeron →
-    //    SegmentReader" round-trip waits on the high-level tx_ordering /
+    // 2. Write the M+1 synthetic archives with the batcher's own
+    //    KAR1-internal frame writer. The full "publish through Aeron, then
+    //    SegmentReader" round trip waits on the high-level tx_ordering and
     //    tx_data archive wrappers in `log`.
     let dir = TempDir::new().unwrap();
     let (b_segment, a_segments) = write_synthetic_archives(&dir);
 
-    // 3. Open the M-archive reader and drive the batcher pipeline:
-    //    walk B → resolve refs against per-A indexes → accumulate → pack →
+    // 3. Open the M-archive reader and drive the batcher pipeline: walk B,
+    //    resolve refs against per-A indexes, accumulate, pack, and
     //    reconstruct.
     let cfg = BatcherConfig::default();
     let mut batcher = Batcher::new(cfg.clone(), MockSender::default());

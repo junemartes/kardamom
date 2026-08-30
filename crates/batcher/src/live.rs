@@ -1,23 +1,25 @@
-//! Live batcher (#39): tail the canonical ordering from the Aeron Cluster
-//! egress, join tx_data, pack and post batches to L1 as a long-lived service.
+//! Live batcher: tails the canonical ordering from the Aeron Cluster
+//! egress, joins tx_data, packs batches, and posts them to L1 as a
+//! long-lived service.
 //!
-//! The batcher is a third cluster-egress consumer next to the executor and
-//! validator, reusing the `kardamom-engine` reader stack (cluster tx_ordering
-//! subscription + tx_data join buffer + archive refetch) verbatim; only the
-//! sink differs — `ReaderToExec` records feed a [`BatchAccumulator`] instead
-//! of an execution pipeline, and `Deposit` records are skipped (deposits are
-//! absent from DA by design; they are re-derivable from L1 — see
-//! `docs/agents/l1-origin-deposit-derivation-spec.md`).
+//! The batcher is a third cluster-egress consumer, next to the executor and
+//! the validator. It reuses the `kardamom-engine` reader stack (cluster
+//! tx_ordering subscription, tx_data join buffer, archive refetch) as-is.
+//! Only the sink differs: `ReaderToExec` records feed a [`BatchAccumulator`]
+//! instead of an execution pipeline. `Deposit` records are skipped, because
+//! deposits are absent from DA by design. A reconstructor re-derives them
+//! from L1; see `docs/agents/l1-origin-deposit-derivation-spec.md`.
 //!
 //! Durability model (see `docs/agents/batcher-live-l1-spec.md`):
-//! - L1 (`lastBatchIndex` + the `BatchPosted` event) is the authoritative
+//! - L1 (`lastBatchIndex` and the `BatchPosted` event) is the authoritative
 //!   record of what has been posted.
-//! - The cursor file is the ordering-stream position matching that truth,
-//!   written ONLY after a confirmed post (at-least-once, like the
-//!   da-watcher's L1 cursor). A stale or lost cursor causes re-observation;
-//!   the feed loop drops re-observed blocks (`block_number <=
-//!   skip_through_block`) without posting, and the contract CAS makes any
-//!   double post revert loudly instead of landing.
+//! - The cursor file holds the ordering-stream position matching that
+//!   truth. It is written only after a confirmed post (at-least-once, like
+//!   the da-watcher's L1 cursor). A stale or lost cursor causes
+//!   re-observation. The feed loop drops re-observed blocks
+//!   (`block_number <= skip_through_block`) without posting. The contract's
+//!   compare-and-swap check makes any double post revert loudly instead of
+//!   landing.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -41,25 +43,27 @@ use crate::da_store::FsBlobStore;
 use crate::l1::{post_batch, read_posted_batches};
 use crate::settlement::IKardamomL2Settlement;
 
-/// Top-level config the batcher deserializes from `--config` in live mode.
-/// Same `[cluster]` section shape as the executor's / validator's.
+/// Top-level config the batcher reads from `--config` in live mode. It uses
+/// the same `[cluster]` section shape as the executor and the validator.
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 #[serde(default)]
 pub struct BatcherFileConfig {
     pub cluster: kardamom_engine::reader::cluster::ClusterConfig,
 }
 
-/// Live-mode metric names, alongside [`metric_names`]. In live mode
-/// `kardamom_batcher_batches_posted_total` / `_blobs_posted_total` count
-/// CONFIRMED L1 posts (receipt observed or reconciled on-chain), not packed
+/// Live-mode metric names, alongside [`metric_names`]. In live mode,
+/// `kardamom_batcher_batches_posted_total` and `_blobs_posted_total` count
+/// confirmed L1 posts (receipt observed or reconciled on-chain), not packed
 /// batches.
 pub mod live_metric_names {
-    /// L1 post attempts that failed and were retried (transient transport /
-    /// CAS races that reconciled as not-ours).
+    /// L1 post attempts that failed and were retried. This includes
+    /// transient transport errors and CAS races that reconciled as not
+    /// ours.
     pub const L1_POST_RETRIES: &str = "kardamom_batcher_l1_post_retries_total";
     /// Highest L2 block confirmed on L1 by this batcher.
     pub const LAST_POSTED_BLOCK: &str = "kardamom_batcher_last_posted_block";
-    /// The contract's `lastBatchIndex` after our latest confirmed post.
+    /// The contract's `lastBatchIndex` after this batcher's latest confirmed
+    /// post.
     pub const LAST_BATCH_INDEX: &str = "kardamom_batcher_last_batch_index";
     /// Closed blocks buffered, waiting for the group to fill or flush.
     pub const PENDING_BLOCKS: &str = "kardamom_batcher_pending_blocks";
@@ -68,9 +72,10 @@ pub mod live_metric_names {
     pub const SKIPPED_POSTED_BLOCKS: &str = "kardamom_batcher_skipped_posted_blocks_total";
 }
 
-/// Durable cursor: the ordering-stream position matching the last confirmed
-/// L1 post. `next_index`/`next_block` seed the cluster replay request;
-/// `last_batch_index` ties the position to the contract's CAS counter.
+/// The durable cursor: the ordering-stream position matching the last
+/// confirmed L1 post. `next_index` and `next_block` seed the cluster replay
+/// request. `last_batch_index` ties the position to the contract's CAS
+/// counter.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BatchCursor {
     pub next_index: u64,
@@ -79,9 +84,9 @@ pub struct BatchCursor {
 }
 
 impl BatchCursor {
-    /// Fresh consumer: no records seen, first boundary is block 1, nothing
-    /// posted (`lastBatchIndex` starts at 0 on-chain; batch indices are
-    /// 1-based).
+    /// A fresh consumer: no records seen, the first boundary is block 1,
+    /// and nothing is posted (`lastBatchIndex` starts at 0 on-chain; batch
+    /// indices start at 1).
     pub fn genesis() -> Self {
         Self {
             next_index: 0,
@@ -100,7 +105,8 @@ impl BatchCursor {
         }
     }
 
-    /// Atomic write (tmp + rename in the same directory).
+    /// An atomic write: write to a temp file, then rename it into place in
+    /// the same directory.
     pub fn store(&self, path: &Path) -> Result<()> {
         let tmp = path.with_extension("tmp");
         std::fs::write(&tmp, serde_json::to_vec(self).expect("cursor serializes"))
@@ -111,18 +117,18 @@ impl BatchCursor {
     }
 }
 
-/// What L1 says has been posted: the CAS counter and the block the chain is
-/// covered through (the latest `BatchPosted.l2BlockEnd`; 0 when nothing has
-/// been posted — L2 blocks are 1-based).
+/// What L1 says has been posted: the CAS counter, and the block the chain
+/// is covered through (the latest `BatchPosted.l2BlockEnd`; 0 when nothing
+/// is posted yet, since L2 blocks start at 1).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct L1Truth {
     pub last_batch_index: u64,
     pub covered_through_block: u64,
 }
 
-/// The settlement contract's CAS counter (`lastBatchIndex`). Shared by
-/// [`read_l1_truth`] and the offline post path (which needs only the counter,
-/// not the `BatchPosted` event scan).
+/// The settlement contract's CAS counter (`lastBatchIndex`). Both
+/// [`read_l1_truth`] and the offline post path use this. The offline path
+/// needs only the counter, not the `BatchPosted` event scan.
 pub async fn read_last_batch_index<P: Provider>(provider: &P, settlement: Address) -> Result<u64> {
     IKardamomL2Settlement::new(settlement, provider)
         .lastBatchIndex()
@@ -131,9 +137,9 @@ pub async fn read_last_batch_index<P: Provider>(provider: &P, settlement: Addres
         .context("read lastBatchIndex")
 }
 
-/// Parse the batcher key and connect the wallet-backed L1 provider + the
-/// local DA blob store — the signer/provider/blob-store setup shared by the
-/// live service and the offline `--dry-run=false` post path.
+/// Parse the batcher key. Connect the wallet-backed L1 provider and the
+/// local DA blob store. The live service and the offline `--dry-run=false`
+/// post path share this signer, provider, and blob-store setup.
 pub async fn connect_l1(
     rpc: &str,
     key: &str,
@@ -149,9 +155,9 @@ pub async fn connect_l1(
     Ok((provider, da_store))
 }
 
-/// Read the settlement contract's view. The event scan runs from L1 block 0 —
-/// fine against the dev-cluster anvil; a long-lived L1 wants a deployment
-/// block hint here.
+/// Read the settlement contract's view. The event scan runs from L1 block
+/// 0. This is fine against the dev-cluster anvil. A long-lived L1 should
+/// pass a deployment block hint here.
 pub async fn read_l1_truth<P: Provider>(provider: &P, settlement: Address) -> Result<L1Truth> {
     let last = read_last_batch_index(provider, settlement).await?;
     if last == 0 {
@@ -176,12 +182,14 @@ pub async fn read_l1_truth<P: Provider>(provider: &P, settlement: Address) -> Re
 /// Reconcile the cursor file against L1 at startup. Returns the cursor to
 /// replay from and the block to skip through (drop without posting).
 ///
-/// - No cursor file: genesis replay; L1 coverage is skipped, not re-posted.
-/// - Cursor behind L1 (crash between post and cursor write): replay from the
-///   cursor, skip through L1's covered block.
-/// - Cursor AHEAD of L1: the chain regressed under us (e.g. anvil reset while
-///   `/opt/kardamom` survived) — fail-stop; the operator decides which side
-///   is real. Silently re-posting would fork the DA history.
+/// - No cursor file: replay from genesis; skip L1 coverage instead of
+///   re-posting it.
+/// - Cursor behind L1 (a crash between post and cursor write): replay from
+///   the cursor, and skip through L1's covered block.
+/// - Cursor ahead of L1: the chain regressed under this batcher (for
+///   example, an anvil reset while `/opt/kardamom` survived). Stop, and let
+///   the operator decide which side is real. Silently re-posting would
+///   fork the DA history.
 pub fn reconcile(cursor: Option<BatchCursor>, l1: L1Truth) -> Result<(BatchCursor, u64)> {
     match cursor {
         None => {
@@ -205,9 +213,9 @@ pub fn reconcile(cursor: Option<BatchCursor>, l1: L1Truth) -> Result<(BatchCurso
     }
 }
 
-/// Streaming L1 sender: posts one packed group at a time, strictly
-/// serialized by the contract CAS, persisting the cursor only after a
-/// confirmed post.
+/// A streaming L1 sender. It posts one packed group at a time, strictly
+/// serialized by the contract's CAS check, and persists the cursor only
+/// after a confirmed post.
 pub struct LiveSender<P> {
     handle: tokio::runtime::Handle,
     provider: P,
@@ -240,12 +248,13 @@ impl<P: Provider> LiveSender<P> {
         }
     }
 
-    /// Post `batch` and persist `cursor` once the post is confirmed. Retries
-    /// transient failures with bounded backoff; a failure that reconciles
-    /// on-chain as OUR batch having landed (duplicate send after a receipt
-    /// timeout, CAS revert of the duplicate) counts as success. Any foreign
-    /// advance of `lastBatchIndex` is fatal — the batcher is single-instance
-    /// and the CAS exists to make that race loud.
+    /// Post `batch` and persist `cursor` once the post is confirmed. Retry
+    /// transient failures with bounded backoff. A failure that reconciles
+    /// on-chain as this batch having landed (for example, a duplicate send
+    /// after a receipt timeout, or a CAS revert of the duplicate) counts as
+    /// success. Any foreign advance of `lastBatchIndex` is fatal. The
+    /// batcher is single-instance, and the CAS check exists to make that
+    /// race loud.
     pub fn post_confirmed(&mut self, batch: &PostedBatch, mut cursor: BatchCursor) -> Result<()> {
         cursor.last_batch_index = self.prev_index + 1;
         let mut attempt: u32 = 0;
@@ -263,9 +272,9 @@ impl<P: Provider> LiveSender<P> {
                     break;
                 }
                 Err(e) => {
-                    // Before retrying, ask the chain whether our tx actually
-                    // landed (receipt timeout / StaleBatchIndex revert of a
-                    // duplicate send both look like errors locally).
+                    // Before retrying, ask the chain whether the tx actually
+                    // landed. A receipt timeout and a `StaleBatchIndex`
+                    // revert of a duplicate send both look like local errors.
                     let truth = self
                         .handle
                         .block_on(read_l1_truth(&self.provider, self.settlement));
@@ -294,7 +303,7 @@ impl<P: Provider> LiveSender<P> {
                             self.prev_index,
                             t.last_batch_index,
                         ),
-                        Ok(_) => { /* not landed — genuinely transient */ }
+                        Ok(_) => { /* not landed: a genuine transient failure */ }
                         Err(re) => warn!(error = %format!("{re:#}"), "reconcile read failed"),
                     }
                     attempt += 1;
@@ -343,15 +352,16 @@ pub struct FeedConfig {
     pub compress: bool,
     /// Post a partial group if the oldest pending block has waited this long.
     pub flush: Duration,
-    /// Drop closed blocks at or below this number without posting — L1
-    /// already covers them (startup reconcile).
+    /// Drop closed blocks at or below this number without posting. L1
+    /// already covers them, from the startup reconcile.
     pub skip_through_block: u64,
 }
 
-/// The live feed loop: `ReaderToExec` records → accumulator → close policy →
-/// [`LiveSender`]. Runs on a dedicated (blocking) thread until the reader
-/// channel closes or a post fail-stops. Crash-only: no graceful drain — the
-/// cursor is at-least-once and restart re-observes.
+/// The live feed loop. `ReaderToExec` records flow through the accumulator,
+/// then the close policy, then to [`LiveSender`]. It runs on a dedicated
+/// blocking thread until the reader channel closes or a post fails and
+/// stops the loop. This is crash-only: there is no graceful drain. The
+/// cursor is at-least-once, and a restart re-observes records.
 pub fn run_feed<P: Provider>(
     rx: Receiver<ReaderToExec>,
     mut sender: LiveSender<P>,
@@ -389,12 +399,11 @@ pub fn run_feed<P: Provider>(
             Ok(ReaderToExec::Tx {
                 envelope, position, ..
             }) => acc.observe_tx(envelope, position),
-            // Deposits are absent from DA by design: re-derivable from L1
-            // (mirrors MultiArchiveReader skipping DepositRefs offline).
-            // Deposits are absent from DA by design: re-derivable from L1.
-            // The epoch marker is skipped for the same reason — a
-            // reconstructor reads the origin off the block boundary and
-            // re-derives that L1 block's deposits itself.
+            // Deposits are absent from DA by design. A reconstructor
+            // re-derives them from L1 (this mirrors MultiArchiveReader
+            // skipping DepositRefs offline). Skip the epoch marker for the
+            // same reason: a reconstructor reads the origin from the block
+            // boundary and re-derives that L1 block's deposits itself.
             Ok(ReaderToExec::Deposit { .. } | ReaderToExec::Epoch { .. }) => {}
             Ok(ReaderToExec::Boundary(b)) => {
                 let closed = acc.observe_boundary(b);
@@ -422,9 +431,9 @@ pub fn run_feed<P: Provider>(
     }
 }
 
-/// Everything [`run`] needs from the CLI, already validated: the binary
-/// checks the L1 flag tuple / `--config` / `--cursor-file` presence first so
-/// its error messages can name the exact flag combination.
+/// Everything [`run`] needs from the CLI, already validated. The binary
+/// checks the L1 flag tuple, `--config`, and `--cursor-file` presence
+/// first, so its error messages can name the exact flag combination.
 #[derive(Debug, Clone)]
 pub struct LiveArgs {
     pub rpc: String,
@@ -446,12 +455,12 @@ pub struct LiveArgs {
     pub l1_retries: u32,
 }
 
-/// Live service mode (#39): the batcher as a third cluster-egress consumer.
-/// Front-end wiring mirrors the validator: M tx_data subscriptions +
-/// tx_deposits feeding the join buffers, archive refetch on join miss, and
-/// the canonical ordering from the Aeron Cluster egress with the replay
-/// request seeded from the durable cursor. Runs until SIGTERM/Ctrl-C or a
-/// feed-loop fail-stop.
+/// Live service mode: the batcher as a third cluster-egress consumer.
+/// Front-end wiring mirrors the validator: M tx_data subscriptions and
+/// tx_deposits feed the join buffers, archive refetch runs on a join miss,
+/// and the canonical ordering comes from the Aeron Cluster egress, with the
+/// replay request seeded from the durable cursor. Runs until SIGTERM,
+/// Ctrl-C, or a feed-loop failure that stops it.
 pub async fn run(args: LiveArgs) -> Result<()> {
     use kardamom_engine::reader::{
         JoinBuffer, ReaderConfig, spawn_tx_data_reader, spawn_tx_ordering_reader,
@@ -496,9 +505,9 @@ pub async fn run(args: LiveArgs) -> Result<()> {
         args.replay_destination_endpoint.as_deref(),
     );
 
-    // Dedicated cluster runtime, exactly as in the executor/validator: the
-    // cluster session must never contend with the tx_data work on `rt`. The
-    // guard must outlive the feed loop.
+    // A dedicated cluster runtime, exactly as in the executor and
+    // validator. The cluster session must never contend with the tx_data
+    // work on `rt`. The guard must outlive the feed loop.
     let (_cluster_guard, cluster_sub) = bin_support::connect_cluster_ordering(
         args.aeron_dir.as_deref(),
         file_cfg.cluster.to_live(),
@@ -513,14 +522,14 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     for sub in tx_data_subs {
         reader_handles.push(spawn_tx_data_reader(sub, join_buffer.clone()));
     }
-    // No tx_deposits reader: deposits ride inside the epoch record on the
-    // canonical stream, so there is nothing to join against.
+    // There is no tx_deposits reader. Deposits ride inside the epoch record
+    // on the canonical stream, so there is nothing to join against.
     let (feed_tx, feed_rx) = crossbeam_channel::bounded(1 << 14);
-    // The default 100 ms join timeout is an IPC-locality assumption; on the
-    // cluster's UDP multicast a transient frame drop takes the archive
-    // refetch (which only engages after `join_refetch_after` = 10 s) to
-    // repair. The executor/validator learned this in #84/#89 — same bounded
-    // budget here, else the batcher dies before refetch can ever fire.
+    // The default 100 ms join timeout assumes IPC locality. On the
+    // cluster's UDP multicast, a transient frame drop needs the archive
+    // refetch to repair it, and refetch only engages after
+    // `join_refetch_after` (10 s). Use the same bounded budget here as the
+    // executor and validator, or the batcher dies before refetch can fire.
     let reader_cfg = ReaderConfig {
         join_timeout: bin_support::bounded_join_timeout(cursor.next_index > 0),
         ..ReaderConfig::default()
@@ -554,16 +563,17 @@ pub async fn run(args: LiveArgs) -> Result<()> {
     let feed_result = tokio::select! {
         r = &mut feed => r.context("feed thread panicked")?,
         () = bin_support::wait_for_shutdown() => {
-            // Exit cleanly: the cursor is reconciled against L1 truth on every
-            // restart, so tearing down mid-batch loses nothing.
+            // Exit cleanly. The cursor is reconciled against L1 truth on
+            // every restart, so tearing down mid-batch loses nothing.
             info!("shutdown signal received; stopping live batcher");
             return Ok(());
         }
     };
 
-    // The feed loop only returns on failure (channel closed or post
-    // fail-stop). Surface the reader threads' errors for context before
-    // propagating — the channel-closed case's root cause lives there.
+    // The feed loop returns only on failure (channel closed, or a post
+    // that stopped it). Surface the reader threads' errors for context
+    // before propagating them. The channel-closed case's root cause lives
+    // there.
     if let Err(e) = &feed_result {
         warn!(error = %format!("{e:#}"), "feed loop exited");
         if ordering_handle.is_finished()

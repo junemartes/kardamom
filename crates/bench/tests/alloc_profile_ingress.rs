@@ -1,32 +1,34 @@
-//! Allocation profile of the ingress tx-submission path (ignored by
-//! default — run explicitly):
+//! This is an allocation profile of the ingress transaction-submission
+//! path. It is ignored by default; run it explicitly:
 //!
 //!   cargo test -p kardamom-bench --test alloc_profile_ingress --release -- \
 //!     --ignored --nocapture
 //!
-//! Drives `IngressProxy::submit_raw` — the shared hot path behind BOTH the
-//! JSON-RPC and binary listeners: overload valve, per-IP rate limit, RLP
-//! decode, batched secp256k1 recovery + keccak256 tx_hash, receipt-cache
-//! lookup, pending-registry park, and the publish onto the tx_data shard
-//! seam — entirely in-process against `MockChannels` (no Aeron, no network,
-//! no jsonrpsee), under the DHAT heap profiler. A harness pump synthesizes
-//! a `Receipt` per published envelope and a periodic `QuorumWatermark`
-//! tick, so the measured window also covers the proxy's production
-//! receipt-side processing (MDS first-wins dedup, receipt-cache insert,
-//! parked-client release through the on-quorum gate).
+//! It drives `IngressProxy::submit_raw`, the hot path shared by both
+//! the JSON-RPC and binary listeners: the overload valve, per-IP rate
+//! limit, RLP decode, batched secp256k1 recovery and keccak256
+//! tx_hash, receipt-cache lookup, pending-registry park, and the
+//! publish onto the tx_data shard seam. All this runs in-process
+//! against `MockChannels`, with no Aeron, no network, and no
+//! jsonrpsee, under the DHAT heap profiler. A harness pump synthesizes
+//! a `Receipt` for each published envelope, and a periodic
+//! `QuorumWatermark` tick, so the measured window also covers the
+//! proxy's production receipt-side processing: MDS first-wins dedup,
+//! receipt-cache insert, and parked-client release through the
+//! on-quorum gate.
 //!
-//! Boundary caveats (also in the harness report):
-//! - `submit_raw` is the deepest separable function: jsonrpsee framing and
-//!   the hex decode of `eth_sendRawTransaction` params live above it and
-//!   are NOT measured.
-//! - Per-op numbers include the harness driver (one `tokio::spawn` per
-//!   submission — analogous to the per-request task the RPC server spawns)
-//!   and the tiny synthetic receipt pump (flat `Receipt` construct + two
-//!   broadcast sends per tx; nonce comes from a prebuilt hash map, no
-//!   decode).
+//! Boundary notes, also in the harness report:
+//! - `submit_raw` is the deepest separable function. The jsonrpsee
+//!   framing and the hex decode of `eth_sendRawTransaction` parameters
+//!   live above it, and this profile does not measure them.
+//! - The per-operation numbers include the harness driver, one
+//!   `tokio::spawn` per submission, similar to the per-request task
+//!   the RPC server spawns, and the small synthetic receipt pump: a
+//!   flat `Receipt` construct plus two broadcast sends per transaction,
+//!   with the nonce read from a prebuilt hash map instead of decoded.
 //!
-//! Writes dhat-heap-ingress.json next to this crate's Cargo.toml
-//! (per-callsite attribution, viewable with dh_view.html).
+//! Writes dhat-heap-ingress.json next to this crate's Cargo.toml,
+//! with per-callsite attribution viewable with dh_view.html.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -48,18 +50,20 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 const ANVIL_PHRASE: &str = "test test test test test test test test test test test junk";
 const CHAIN_ID: u64 = 1;
 const SENDERS: u32 = 64;
-/// Submissions kept in flight per driver batch (bounded so the 1,024-slot
-/// mock receipt broadcast can never lag-drop under the profiler).
+/// The submissions kept in flight for each driver batch. This is
+/// bounded, so the 1,024-slot mock receipt broadcast can never
+/// lag-drop under the profiler.
 const INFLIGHT: usize = 512;
-const WARMUP: usize = 2 * INFLIGHT; // 1,024 outside the window
-const MEASURED: usize = 10 * INFLIGHT; // 5,120 measured
+const WARMUP: usize = 2 * INFLIGHT; // Outside the measured window.
+const MEASURED: usize = 10 * INFLIGHT; // Inside the measured window.
 
 type Proxy = IngressProxy<MockChannels, MockChannels>;
 
-/// Fake downstream: drain each tx_data shard, stamp a monotone tx_ordering
-/// position, and echo a synthetic `Receipt`. Nonce comes from the prebuilt
-/// `tx_hash -> nonce` map so the pump does no per-tx decoding (keeps the
-/// harness's own allocation footprint near zero).
+/// A fake downstream. It drains each tx_data shard, stamps a monotone
+/// tx_ordering position, and echoes a synthetic `Receipt`. The nonce
+/// comes from the prebuilt `tx_hash -> nonce` map, so the pump does no
+/// per-transaction decoding. This keeps the harness's own allocation
+/// footprint near zero.
 fn spawn_receipt_pump(
     mock: &MockChannels,
     rx_vec: Vec<tokio::sync::mpsc::UnboundedReceiver<kardamom_types::TxEnvelope>>,
@@ -94,11 +98,12 @@ fn spawn_receipt_pump(
     }
 }
 
-/// Production quorum watermarks are periodic egress-progress snapshots, not
-/// per-tx events; a per-tx watermark would turn `release_satisfied`'s
-/// registry walk into an O(n^2) harness artifact. 500us models the deploy's
-/// snapshot cadence closely enough for the on-quorum gate to release parked
-/// clients within a tick.
+/// A production quorum watermark is a periodic egress-progress
+/// snapshot, not a per-transaction event. A per-transaction watermark
+/// would turn `release_satisfied`'s registry walk into an O(n^2)
+/// harness artifact. A 500-microsecond interval models the deploy's
+/// snapshot cadence closely enough for the on-quorum gate to release
+/// parked clients within a tick.
 fn spawn_watermark_ticker(mock: &MockChannels, position: Arc<AtomicI32>) {
     let watermark_bus = mock.watermark_bus.clone();
     tokio::spawn(async move {
@@ -115,9 +120,9 @@ fn spawn_watermark_ticker(mock: &MockChannels, position: Arc<AtomicI32>) {
     });
 }
 
-/// Submit `raws` with at most `INFLIGHT` concurrent in-flight submissions,
-/// awaiting every receipt. One spawned task per submission, like the RPC
-/// server's per-request handler tasks.
+/// Submit `raws` with at most `INFLIGHT` submissions in flight at once,
+/// awaiting every receipt. This spawns one task per submission, like
+/// the RPC server's per-request handler tasks.
 async fn submit_all(proxy: Arc<Proxy>, ip: IpAddr, raws: &[Bytes]) {
     for chunk in raws.chunks(INFLIGHT) {
         let mut handles = Vec::with_capacity(chunk.len());
@@ -135,8 +140,9 @@ async fn submit_all(proxy: Arc<Proxy>, ip: IpAddr, raws: &[Bytes]) {
 #[test]
 #[ignore = "profiling run — invoke explicitly with --ignored"]
 fn ingress_submission_allocation_profile() {
-    // Pre-generate valid signed raw txs: 64 mnemonic-derived senders,
-    // sequential nonces, round-robin interleaved (kardamom_bench helpers).
+    // Pre-generate valid signed raw transactions: 64 mnemonic-derived
+    // senders, with sequential nonces, interleaved in rotation, using
+    // the kardamom_bench helpers.
     let signers = mnemonic::derive_signers(ANVIL_PHRASE, SENDERS).unwrap();
     let raws = presign_transfers(
         &signers,
@@ -147,8 +153,8 @@ fn ingress_submission_allocation_profile() {
         0,
     )
     .unwrap();
-    // presign_transfers round-robins senders per nonce step: index i is
-    // signer i % SENDERS at nonce i / SENDERS.
+    // presign_transfers rotates senders at each nonce step: index i is
+    // signer i % SENDERS, at nonce i / SENDERS.
     let nonce_by_hash: Arc<HashMap<B256, u64>> = Arc::new(
         raws.iter()
             .enumerate()
@@ -165,8 +171,9 @@ fn ingress_submission_allocation_profile() {
     let position = Arc::new(AtomicI32::new(0));
     let proxy: Arc<Proxy> = rt.block_on(async {
         let cfg = IngressConfig {
-            // All traffic comes from one IP here; the limiter must never be
-            // the thing measured (production spreads clients across IPs).
+            // All traffic comes from one IP here. The limiter must never be
+            // the thing this profile measures; production spreads clients
+            // across IPs.
             rate_limit_per_ip_per_sec: NonZeroU32::new(1_000_000_000).unwrap(),
             rate_limit_burst: NonZeroU32::new(1_000_000).unwrap(),
             pending_receipt_timeout: Duration::from_secs(10),
@@ -179,13 +186,13 @@ fn ingress_submission_allocation_profile() {
         proxy
     });
 
-    // Warm up OUTSIDE the measured window: fills the sig-verify ring, the
-    // receipt cache / seen-receipts / pending dashmap shards, and the tokio
-    // runtime's internal pools.
+    // Warm up outside the measured window: this fills the sig-verify ring,
+    // the receipt-cache, seen-receipts, and pending dashmap shards, and
+    // the tokio runtime's internal pools.
     rt.block_on(submit_all(proxy.clone(), ip, &raws[..WARMUP]));
 
-    // Measured window under DHAT: the full in-process submission round
-    // trip, INFLIGHT concurrent per batch.
+    // This is the measured window under DHAT: the full in-process
+    // submission round trip, with INFLIGHT submissions concurrent per batch.
     let profiler = dhat::Profiler::builder().build();
     let stats0 = dhat::HeapStats::get();
     let t0 = std::time::Instant::now();
@@ -211,9 +218,10 @@ fn ingress_submission_allocation_profile() {
         n as f64 / wall.as_secs_f64() / 1e3
     );
 
-    // Quiesce the runtime (pump/watcher/ticker tasks) BEFORE finalizing the
-    // profiler so the dump is not raced by background allocation.
+    // Quiesce the runtime (the pump, watcher, and ticker tasks) before
+    // finalizing the profiler, so the dump does not race a background
+    // allocation.
     drop(rt);
-    drop(profiler); // writes dhat-heap.json with per-callsite attribution
+    drop(profiler); // This writes dhat-heap.json with per-callsite attribution.
     let _ = std::fs::rename("dhat-heap.json", "dhat-heap-ingress.json");
 }

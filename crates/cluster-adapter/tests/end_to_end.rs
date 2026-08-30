@@ -1,13 +1,13 @@
-//! End-to-end through the Rust adapter chain:
+//! End-to-end test through the Rust adapter chain:
 //!
-//! `ClusterRefPublisher` → (in-Rust service mock mirroring the Java
-//! `CanonicalSealerState`: dedup + canonical_count + boundary) →
+//! `ClusterRefPublisher`, then an in-Rust service mock that mirrors the Java
+//! `CanonicalSealerState` (dedup, canonical_count, boundary), then
 //! `ClusterTxOrderingSubscription`.
 //!
-//! This validates the whole Rust path against the documented wire contract and
-//! the Java service's deterministic logic (which is separately unit-tested in
-//! `cluster/sealer-service`). Fully in-memory and deterministic — no Aeron, no
-//! cluster, no threads.
+//! This checks the whole Rust path against the documented wire contract and
+//! the Java service's deterministic logic (unit-tested separately in
+//! `cluster/sealer-service`). The test is fully in memory and deterministic:
+//! no Aeron, no cluster, no threads.
 
 use std::collections::{HashSet, VecDeque};
 
@@ -20,8 +20,9 @@ use kardamom_sequencer::outbound::TxOrderingRefPublisher;
 use kardamom_sequencer::outbound::cluster::ClusterRefPublisher;
 use kardamom_types::{BPosition, TxOrderingMessage, TxRef};
 
-/// Mirrors the Java `CanonicalSealerState`: FIFO first-seen dedup, 0-based
-/// canonical index, and a 250 ms-floored boundary timer.
+/// Mirrors the Java `CanonicalSealerState`. It does FIFO first-seen dedup,
+/// keeps a 0-based canonical index, and floors the boundary timer to 250
+/// ms.
 struct MockService {
     seen: HashSet<[u8; 32]>,
     fifo: VecDeque<[u8; 32]>,
@@ -54,7 +55,8 @@ impl MockService {
         true
     }
 
-    /// Process one ingress frame; emit a relayed egress frame iff first-seen.
+    /// Process one ingress frame. Emit a relayed egress frame only if the
+    /// frame is first-seen.
     fn on_ingress(&mut self, ingress: &[u8]) -> Option<Vec<u8>> {
         let (cid, relayed) = split_ingress(ingress).unwrap();
         if !self.first_seen(cid) {
@@ -65,7 +67,7 @@ impl MockService {
         Some(encode_egress_record(idx, relayed))
     }
 
-    /// Stamp a boundary at `clock_ms`; advance the block number.
+    /// Stamp a boundary at `clock_ms`, and advance the block number.
     fn tick(&mut self, clock_ms: u64) -> Vec<u8> {
         let frame = encode_egress_boundary(self.block, self.count, (clock_ms / 250) * 250, 0);
         self.block += 1;
@@ -117,12 +119,12 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
             Ok((pos, TxOrderingMessage::TxRef(r))) => records.push((pos, r)),
             Ok((_pos, TxOrderingMessage::BoundaryStart(bnd))) => boundary = Some(bnd),
             Ok((_pos, other)) => panic!("unexpected message {other:?}"),
-            Err(_) => break, // TxOrderingClosed = clean EOF
+            Err(_) => break, // TxOrderingClosed means a clean EOF
         }
     }
 
-    // The duplicate A collapsed: exactly 3 unique records, in order, with
-    // monotonic 0-based canonical positions.
+    // The duplicate A collapsed. There are exactly 3 unique records, in
+    // order, with monotonic 0-based canonical positions.
     assert_eq!(records.len(), 3, "duplicate must be deduped");
     assert_eq!(records[0].1, a);
     assert_eq!(records[1].1, b);
@@ -131,8 +133,9 @@ fn dedup_order_and_boundary_alignment_end_to_end() {
     assert_eq!(records[1].0, BPosition::from_index(1));
     assert_eq!(records[2].0, BPosition::from_index(2));
 
-    // The boundary's end_tx_idx equals the deduped record count (3); l2 is
-    // floored to the 250 ms tick; block number is genesis (1).
+    // The boundary's end_tx_idx equals the deduped record count (3). The l2
+    // timestamp is floored to the 250 ms tick. The block number is genesis
+    // (1).
     let bnd = boundary.expect("a boundary was emitted");
     assert_eq!(bnd.block_number, 1);
     assert_eq!(bnd.end_tx_idx.as_index(), 3);

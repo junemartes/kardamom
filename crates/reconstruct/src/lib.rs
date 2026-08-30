@@ -1,20 +1,21 @@
 //! Rebuild-from-L1: re-execute DA-recovered blocks into a fresh state DB.
 //!
-//! [`kardamom_batcher::recon::reconstruct`] turns the blobs the batcher posted
-//! back into `Vec<BlockFrame>`; this crate drives those blocks through the
-//! shared execution engine ([`kardamom_engine::replay_blocks`]) into a
-//! trie-aware libMDBX state DB, yielding the reconstructed head + canonical
-//! state root. That root can be compared against the chain's canonical root
-//! (the validator's) to prove the L2 state is fully recoverable from L1 data
-//! alone — the bottom-of-stack data-availability backstop.
+//! [`kardamom_batcher::recon::reconstruct`] turns the blobs the batcher
+//! posted back into `Vec<BlockFrame>`. This crate drives those blocks
+//! through the shared execution engine ([`kardamom_engine::replay_blocks`])
+//! into a trie-aware libMDBX state DB, and returns the reconstructed head
+//! and canonical state root. Comparing that root against the chain's
+//! canonical root (the validator's) proves the L2 state is fully
+//! recoverable from L1 data alone: the bottom-of-stack data-availability
+//! backstop.
 //!
 //! This is the only consumer of the state DB outside the executor and the
-//! validator; it lives in its own crate (rather than the batcher) so the
-//! batcher itself stays state-free — it only produces and decodes DA blobs.
+//! validator. It lives in its own crate, not the batcher, so the batcher
+//! itself stays state-free: it only produces and decodes DA blobs.
 //!
-//! Deposits are out of scope here for the same reason they are absent from the
-//! DA payload (the batcher's `MultiArchiveReader` skips `DepositRef`s); see
-//! [`kardamom_engine::replay`].
+//! Deposits are out of scope here, for the same reason they are absent
+//! from the DA payload: the batcher's `MultiArchiveReader` skips
+//! `DepositRef`s. See [`kardamom_engine::replay`].
 
 use std::path::Path;
 
@@ -23,16 +24,16 @@ use kardamom_engine::{ReplayBlock, ReplayOutcome, replay_blocks};
 use kardamom_state::{Durability, StateEnvBuilder};
 use kardamom_types::{AccountChange, CodeEntry, TxEnvelope};
 
-/// Error from the rebuild-from-L1 reconstruction path (opening the state env or
-/// replaying blocks through the engine).
+/// Error from the rebuild-from-L1 reconstruction path: opening the state
+/// env, or replaying blocks through the engine.
 #[derive(Debug, thiserror::Error)]
 #[error("reconstruct: {0}")]
 pub struct ReconstructError(pub String);
 
 /// Convert a DA-recovered [`BlockFrame`] into an engine [`ReplayBlock`].
 ///
-/// Each `TxFrame` becomes a [`TxEnvelope`] whose proxy-stamped `sender` /
-/// `tx_hash` are carried verbatim across the blob round-trip — the execution
+/// Each `TxFrame` becomes a [`TxEnvelope`]. Its proxy-stamped `sender` and
+/// `tx_hash` carry over verbatim across the blob round-trip. The execution
 /// engine trusts them exactly as it does on the hot path.
 pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
     ReplayBlock {
@@ -51,10 +52,10 @@ pub fn block_frame_to_replay(frame: &BlockFrame) -> ReplayBlock {
     }
 }
 
-/// Re-execute DA-recovered `blocks` (in order) into a fresh durable state DB at
-/// `state_dir`, seeding genesis first. Returns the reconstructed head + state
-/// root. `blocks` must be the chain's blocks in canonical block order (as
-/// recovered from consecutive posted batches).
+/// Re-execute DA-recovered `blocks` (in order) into a fresh durable state DB
+/// at `state_dir`, seeding genesis first. Returns the reconstructed head and
+/// state root. `blocks` must be the chain's blocks in canonical block order,
+/// as recovered from consecutive posted batches.
 pub fn reconstruct_state(
     state_dir: &Path,
     chain_id: u64,
@@ -122,8 +123,8 @@ mod tests {
     }
 
     /// The core DA guarantee: packing blocks into blobs, recovering them, and
-    /// re-executing yields the *same* state root as executing the originals.
-    /// If the KAR1 codec or blob packing perturbed a single tx byte, the roots
+    /// re-executing gives the same state root as executing the originals. If
+    /// the KAR1 codec or blob packing changed a single tx byte, the roots
     /// would diverge.
     #[test]
     fn blob_roundtrip_reconstructs_identical_state_root() {
@@ -158,7 +159,7 @@ mod tests {
             }],
         };
 
-        // Pack → blobs → reconstruct → re-execute.
+        // Pack into blobs, reconstruct, then re-execute.
         let cfg = BatcherConfig::default();
         let batch = pack_blocks(&cfg, &[block1.clone(), block2.clone()]).unwrap();
         let frames = reconstruct(&batch.blobs).unwrap();
@@ -168,7 +169,7 @@ mod tests {
         let recovered =
             reconstruct_state(recon_dir.path(), CHAIN_ID, &genesis(from), &[], &frames).unwrap();
 
-        // Directly replay the *original* envelopes (no DA round-trip) as the
+        // Directly replay the original envelopes (no DA round trip) as the
         // oracle.
         let oracle_dir = tempfile::tempdir().unwrap();
         let oracle_env = StateEnvBuilder::new(oracle_dir.path())

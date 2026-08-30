@@ -1,12 +1,12 @@
-//! The prover-spool contract (spec: no-std-exec-core, phase 3c): a block
-//! captured, anchored, and spooled against a REAL writer-committed
-//! pre-state snapshot must produce a frame that (a) re-verifies one-shot in
-//! the guest shape and (b) names the exact post root the live trie-aware
-//! writer then commits for the same block.
+//! The prover-spool contract: a block
+//! captured, anchored, and spooled against a real writer-committed
+//! pre-state snapshot must produce a frame that re-verifies one-shot in
+//! the guest shape, and that names the exact post root the live
+//! trie-aware writer then commits for the same block.
 //!
-//! This drives `spool_block` — the per-block body of the async spool task —
-//! against a production `StateWriter` (TrieMode::Incremental) and the MVCC
-//! `StateSnapshot` pin, exactly the live wiring minus the tokio loop.
+//! This drives `spool_block`, the per-block body of the async spool
+//! task, against a production `StateWriter` (TrieMode::Incremental) and
+//! the MVCC `StateSnapshot` pin: the live wiring, minus the tokio loop.
 
 use std::time::{Duration, Instant};
 
@@ -78,8 +78,9 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
     let sender = signer.address();
     let zeroer_hash = keccak256(ZEROER_CODE);
 
-    // With KARDAMOM_EMIT_BATCH_SPOOL=dir set, the spool lands there (blocks
-    // 2 and 3 — a REAL contiguous batch) for the zk-host batch round trip.
+    // When KARDAMOM_EMIT_BATCH_SPOOL=dir is set, the spool lands there
+    // (blocks 2 and 3, a real contiguous batch) for the zk-host batch
+    // round trip.
     let export = std::env::var("KARDAMOM_EMIT_BATCH_SPOOL").ok();
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path().join("state"))
@@ -88,8 +89,8 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         .unwrap();
     let writer = StateWriter::spawn_with_trie(env, TrieMode::Incremental).unwrap();
 
-    // --- Block 1: the seed, through the PRODUCTION writer (accounts +
-    // code + storage + trie + meta all land as live commits do).
+    // --- Block 1: the seed, through the production writer (accounts,
+    // code, storage, trie, and meta all land as live commits do).
     let seed = BlockDelta {
         block_number: 1,
         accounts: vec![
@@ -129,7 +130,7 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         .send(WriteBatch::new(boundary(1, 1_700_000_000), seed))
         .unwrap();
 
-    // Wait for the committed snapshot at block 1 (the spool's pre-state pin).
+    // Wait for the committed snapshot at block 1: the spool's pre-state pin.
     let deadline = Instant::now() + Duration::from_secs(10);
     let snap = loop {
         if let Some(s) = writer.snapshot_rx.current()
@@ -141,8 +142,9 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    // --- Block 2: transfer to a fresh account + zero a slot (storage
-    // deletion collapse — the anchoring shape that needs the fixed point).
+    // --- Block 2: transfer to a fresh account and zero a slot (a
+    // storage deletion collapse, the anchoring shape that needs the
+    // fixed point).
     let records = vec![
         tx(&signer, RECIPIENT, 0, 250_000, 0),
         tx(&signer, ZEROER, 1, 0, 1),
@@ -161,7 +163,7 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         .unwrap_or_else(|| dir.path().join("spool"));
     let outputs = spool_block(&spool, CHAIN_ID, &snap, 2, env2, &records).expect("spool block 2");
 
-    // (a) The spooled frame re-verifies ONE-SHOT in the guest shape.
+    // (a) The spooled frame re-verifies one-shot in the guest shape.
     let bytes = std::fs::read(spool.join("block-2/prover-input.rkyv")).unwrap();
     let expected = std::fs::read(spool.join("block-2/expected-outputs.bin")).unwrap();
     assert_eq!(expected, outputs.encode());
@@ -209,8 +211,8 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
     assert_eq!(anchored.post_state_root, outputs.post_state_root);
     assert_eq!(anchored.bal_commitment, outputs.bal_commitment);
 
-    // (b) The LIVE writer commits block 2 and lands on the spooled post
-    // root — proof queue and chain agree before any proving happens.
+    // (b) The live writer commits block 2 and lands on the spooled post
+    // root: the proof queue and the chain agree before any proving happens.
     let mut delta2 = BlockDelta {
         block_number: 2,
         accounts: anchored
@@ -260,9 +262,9 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         "spooled post root must equal the live writer's root"
     );
 
-    // --- Block 3: one more transfer, spooled against the pinned snapshot
-    // at block 2 — the second half of a REAL contiguous batch (the batch
-    // guest requires the root chain to link 2 → 3).
+    // --- Block 3: one more transfer, spooled against the pinned
+    // snapshot at block 2, the second half of a real contiguous batch.
+    // The batch guest requires the root chain to link 2 to 3.
     let snap2 = {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -292,10 +294,10 @@ fn spooled_frame_reverifies_and_matches_the_live_writer_root() {
         "the spooled chain must link 2 -> 3"
     );
 
-    // A spool against the WRONG pre-state snapshot fails closed.
+    // A spool against the wrong pre-state snapshot must be rejected.
     let stale = spool_block(
-        &spool, CHAIN_ID, &snap, // still pinned at block 1
-        3,     // but claiming to be block 3 (pre-state 2)
+        &spool, CHAIN_ID, &snap, // Still pinned at block 1.
+        3,     // But claims to be block 3 (pre-state 2).
         env2, &records,
     );
     assert!(

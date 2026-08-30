@@ -1,32 +1,31 @@
-//! Validator node core: cross-check the local re-execution against the
-//! sequencer's published artifacts, fail-stop on divergence.
+//! Validator node core: check the local re-execution against the sequencer's
+//! published data. Stop the process on a mismatch.
 //!
-//! A validator reuses the whole [`kardamom_engine`] pipeline — the same reader/
-//! join topology and `execute_tx` core the executor runs — but wires two
-//! role-specific seams instead of publishing receipts:
+//! A validator reuses the whole [`kardamom_engine`] pipeline. It uses the
+//! same reader/join topology and `execute_tx` core as the executor, but it
+//! wires two role-specific seams instead of publishing receipts:
 //!
 //! - [`ValidatorWriterQueue`] wraps the trie-aware state writer's
 //!   [`StateWriterQueue`](kardamom_engine::StateWriterQueue). At each block
-//!   close it receives the locally-computed
-//!   [`BlockDelta`](kardamom_types::BlockDelta) (`submit(boundary, delta)`),
-//!   cross-checks its **write-set** against the executor's per-block **BAL**
-//!   (subscribed on `tx_bal`), and forwards the delta to the trie-aware writer
-//!   (which advances the MPT state root). A write-set mismatch is a proven
-//!   execution divergence → fail-stop.
+//!   close, it receives the local
+//!   [`BlockDelta`](kardamom_types::BlockDelta) (`submit(boundary, delta)`).
+//!   It checks the delta's write-set against the executor's per-block BAL
+//!   (subscribed on `tx_bal`), then sends the delta to the trie-aware
+//!   writer, which advances the MPT state root. A write-set mismatch proves
+//!   an execution divergence, so the validator stops.
 //! - [`ValidatorReceiptSink`] implements
-//!   [`TxReceiptsPublication`](kardamom_engine::TxReceiptsPublication). It does
-//!   not publish anything; instead it cross-checks each locally-recomputed
-//!   receipt against the executor's published receipt (subscribed on
-//!   `tx_receipts`) for the same `tx_idx`. A receipt mismatch is also
-//!   fail-stop.
+//!   [`TxReceiptsPublication`](kardamom_engine::TxReceiptsPublication). It
+//!   does not publish data. Instead it checks each recomputed receipt
+//!   against the executor's published receipt (subscribed on `tx_receipts`)
+//!   for the same `tx_idx`. A receipt mismatch also stops the validator.
 //!
-//! Both seams are the *existing* engine trait seams — no engine change is
-//! needed. The buffers ([`BalBuffer`], [`ReceiptBuffer`]) are filled by the
-//! binary's Aeron subscriber tasks and drained by the (sync) exec/commit
-//! threads, blocking briefly for the matching artifact to arrive.
+//! Both seams are existing engine trait seams; the engine needs no change.
+//! The binary's Aeron subscriber tasks fill the buffers ([`BalBuffer`],
+//! [`ReceiptBuffer`]). The sync exec/commit threads drain the buffers and
+//! wait briefly for the matching data to arrive.
 //!
-//! Module layout: the seams live in `seams.rs`, their verification buffers in
-//! `buffers.rs`; both are re-exported here so the crate root stays the single
+//! Module layout: the seams are in `seams.rs`, their verification buffers
+//! are in `buffers.rs`. Both re-export here, so the crate root is the one
 //! import path.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,8 +33,9 @@ use std::sync::{Arc, Mutex};
 
 use kardamom_engine::ExecutorError;
 
-/// L1 output attester: collects `MessagePassed` leaves from re-executed
-/// blocks, builds the per-output withdrawals root, posts to the L1 oracle.
+/// L1 output attester. It collects `MessagePassed` leaves from re-executed
+/// blocks, builds the per-output withdrawals root, and posts it to the L1
+/// oracle.
 pub mod flight;
 pub mod parallel;
 
@@ -51,9 +51,9 @@ mod seams;
 pub use buffers::*;
 pub use seams::*;
 
-/// Shared divergence flag. Once tripped, the validator has observed a proven
-/// discrepancy between its independent re-execution and the sequencer's output;
-/// the surrounding seams return an error so the engine pipeline halts.
+/// Shared divergence flag. Once set, the validator has found a proven
+/// mismatch between its own re-execution and the sequencer's output. The
+/// seams then return an error, so the engine pipeline stops.
 #[derive(Debug, Default)]
 pub struct Divergence {
     halted: AtomicBool,
@@ -65,7 +65,8 @@ impl Divergence {
         Arc::new(Self::default())
     }
 
-    /// Record a divergence (idempotent — the first reason wins), bump the metric.
+    /// Record a divergence and bump the metric. This is idempotent: the first
+    /// reason wins.
     pub fn record(&self, reason: impl Into<String>) {
         if !self.halted.swap(true, Ordering::SeqCst) {
             let reason = reason.into();
@@ -84,14 +85,18 @@ impl Divergence {
     }
 }
 
-/// Exit-semantics classification for the engine loop's terminal error (spec:
-/// no-std-exec-core, 3a.1). A [`ExecutorError::RecordIdentity`] failure is
-/// proof in hand — keccak/ecrecover refuted the canonical stream's claimed
-/// identity — the same class as a proven divergence, so it must latch (exit
-/// 2, page the humans) rather than exit 1 into the supervisor's restart
-/// loop, where a forging sequencer would be retried forever as an outage.
-/// No `Divergence` arm is needed: every validator seam that proves one
-/// records it before surfacing the error. Everything else is availability.
+/// Classify the engine loop's terminal error for exit semantics.
+///
+/// A [`ExecutorError::RecordIdentity`] error is proof: keccak or ecrecover
+/// rejected the canonical stream's claimed identity. This is the same class
+/// as a proven divergence, so the process must latch (exit 2, page the
+/// humans). It must not exit 1 into the supervisor's restart loop, or a
+/// forging sequencer would look like an outage and retry forever.
+///
+/// No `Divergence` arm is needed here: every validator seam that proves a
+/// divergence records it before it returns the error. Every other error is
+/// an availability issue.
+///
 /// Returns whether the error latched.
 pub fn latch_integrity_failure(divergence: &Divergence, err: &ExecutorError) -> bool {
     match err {

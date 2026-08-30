@@ -3,8 +3,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Cooperative shutdown signal shared with the loop driver. Cloneable so the
-/// signal handler thread can keep one copy and the loop thread another.
+/// Cooperative shutdown signal for the loop driver.
+/// The struct is cloneable. The signal handler thread keeps one copy, and the
+/// loop thread keeps another.
 #[derive(Clone)]
 pub struct Shutdown {
     flag: Arc<AtomicBool>,

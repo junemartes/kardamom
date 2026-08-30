@@ -1,24 +1,24 @@
 //! The `[cluster]` TOML section shared by every cluster client.
 //!
-//! One definition (here, next to [`LiveClusterConfig`] it maps onto) consumed
-//! by every role that connects to the Aeron Cluster (Raft) sealer: the
-//! sequencer (tx_ordering publish), the executor/validator (canonical-stream
-//! consume, via `kardamom_engine::reader::cluster`), and ingress (on-quorum
-//! watermark). The service config modules re-export this type so the schema —
-//! including the magic stream-id/keepalive defaults — can only be changed in
-//! one place.
+//! This is one definition, next to [`LiveClusterConfig`] which it maps onto.
+//! Every role that connects to the Aeron Cluster (Raft) sealer uses it: the
+//! sequencer (tx_ordering publish), the executor and validator
+//! (canonical-stream consume, through `kardamom_engine::reader::cluster`),
+//! and ingress (on-quorum watermark). The service config modules re-export
+//! this type. This way, the schema, including the default stream ID and
+//! keep-alive values, can change in only one place.
 
 use serde::{Deserialize, Serialize};
 
 use crate::live::LiveClusterConfig;
 
-/// Aeron Cluster (Raft) sealer client config — the `[cluster]` TOML section.
+/// Aeron Cluster (Raft) sealer client config: the `[cluster]` TOML section.
 ///
-/// Cluster mode is the only mode: every service that parses this section
-/// always connects to the cluster (there is no `enabled` knob; a legacy
-/// `enabled = true` key in an old config file is ignored by serde). An empty
-/// / missing section is rejected when the connection is actually opened —
-/// [`crate::live::connect`] fails startup on empty `ingress_endpoints` /
+/// Cluster mode is the only mode. Every service that parses this section
+/// always connects to the cluster. There is no `enabled` knob; serde ignores
+/// a legacy `enabled = true` key in an old config file. An empty or missing
+/// section is rejected only when the connection actually opens:
+/// [`crate::live::connect`] fails startup on an empty `ingress_endpoints` or
 /// `egress_channel`.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(default)]
@@ -34,7 +34,7 @@ pub struct ClusterConfig {
 }
 
 impl ClusterConfig {
-    /// Sane stream-id / keepalive defaults when the TOML omits them.
+    /// Default stream ID and keep-alive values, used when the TOML omits them.
     pub fn defaults_applied(mut self) -> Self {
         if self.ingress_stream_id == 0 {
             self.ingress_stream_id = 101;
@@ -83,8 +83,8 @@ mod tests {
 
     #[test]
     fn legacy_enabled_key_is_tolerated() {
-        // Older deploy configs carried a (never-consulted) `enabled = true`;
-        // the field is gone but old files must keep parsing.
+        // Older deploy configs had an `enabled = true` key that was never
+        // used. The field is gone, but old files must still parse.
         let cfg: ClusterConfig = toml::from_str(
             r#"
             enabled = true

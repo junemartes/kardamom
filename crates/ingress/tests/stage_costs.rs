@@ -1,6 +1,6 @@
 //! Per-tx cost of the ingress admission stage, for the end-to-end model.
-//! ECDSA recovery dominates, which is why ingress capacity scales with
-//! cores and why batching there amortizes wakeups, not math.
+//! ECDSA recovery is the largest cost. This is why ingress capacity scales
+//! with core count, and why batching there spreads out wakeups, not math.
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_primitives::{Address, Bytes, Signature, TxKind, U256};
 use alloy_rlp::{Decodable, Encodable};
@@ -52,8 +52,9 @@ fn ingress_stage_costs() {
     }
     let hash = t.elapsed().as_nanos() as f64 / raws.len() as f64;
 
-    // Same operation via libsecp256k1 (C, endomorphism + asm) — the
-    // measurement behind the model's ingress recommendation.
+    // This runs the same operation through libsecp256k1 (C, with
+    // endomorphism and asm). It is the measurement behind the model's
+    // ingress recommendation.
     let secp = secp256k1::SECP256K1;
     let sighashes: Vec<[u8; 32]> = envs
         .iter()
@@ -85,8 +86,8 @@ fn ingress_stage_costs() {
         std::hint::black_box(secp.recover_ecdsa(*msg, sig).unwrap());
     }
     let libsecp = t.elapsed().as_nanos() as f64 / sigs.len() as f64;
-    // Does recovery scale across threads? (The batch verifier's
-    // process_batch runs them in a plain sequential loop today.)
+    // This checks whether recovery scales across threads. Today, the
+    // batch verifier's process_batch runs them in a plain sequential loop.
     for threads in [1usize, 2, 4] {
         let chunk = envs.len() / threads;
         let t = std::time::Instant::now();

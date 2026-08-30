@@ -1,14 +1,14 @@
-//! Chain-wide protocol limits shared by ingress validation and the exec core.
+//! Protocol limits shared by ingress validation and the exec core.
 
-/// EIP-7825 per-transaction gas limit cap (2^24), in force since Osaka.
+/// EIP-7825 gas limit cap for one transaction (2^24). This applies from Osaka.
 ///
-/// revm enforces this cap during tx validation whenever the spec is Osaka or
-/// later — a tx with a higher gas limit is *invalid*, even though the block
-/// gas limit (30M) is larger. The ingress rejects such txs at submission with
-/// a clear error instead of letting total derivation burn them into a
-/// `status=false` skip receipt.
+/// revm enforces this cap during transaction validation from Osaka onward.
+/// A transaction with a higher gas limit is invalid, even if the block gas
+/// limit (30M) is larger. The ingress rejects such a transaction at
+/// submission with a clear error. This stops total derivation from burning
+/// the transaction into a `status=false` skip receipt.
 ///
-/// This is a mirror of `revm::primitives::eip7825::TX_GAS_LIMIT_CAP` so the
-/// ingress does not need a revm dependency; `kardamom-exec-core`'s
-/// `cfg_pinning` test asserts the two stay equal.
+/// This value mirrors `revm::primitives::eip7825::TX_GAS_LIMIT_CAP`. This way
+/// the ingress does not need a revm dependency. The `cfg_pinning` test in
+/// `kardamom-exec-core` checks that the two values stay equal.
 pub const TX_GAS_LIMIT_CAP: u64 = 16_777_216;

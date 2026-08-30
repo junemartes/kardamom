@@ -1,27 +1,28 @@
-//! Allocation profile of the sequencer's per-tx core loop (ignored by
-//! default — run explicitly):
+//! Allocation profile of the sequencer's per-tx core loop.
+//! This test is ignored by default. Run it explicitly:
 //!
 //!   cargo test -p kardamom-sequencer --test alloc_profile --release -- \
 //!     --ignored --nocapture
 //!
-//! Drives `Sequencer::run_once` — frame ingest off the tx_data
+//! This test drives `Sequencer::run_once`: frame ingest from the tx_data
 //! subscription, RLP nonce decode, per-sender nonce state-machine advance,
-//! `TxRef` build + batch publish onto tx_ordering — entirely in-process
-//! against the crate's in-memory fakes (no Aeron, no cluster), under the
-//! DHAT heap profiler. Prints allocs/tx + bytes/tx + wall/tx and writes
-//! dhat-heap-sequencer.json (per-callsite attribution, viewable with
-//! dh_view.html) next to this crate's Cargo.toml.
+//! and `TxRef` build and batch publish onto tx_ordering. It runs
+//! in-process against the crate's in-memory fakes (no Aeron, no cluster),
+//! under the DHAT heap profiler. It prints allocs/tx, bytes/tx, and
+//! wall/tx, and writes dhat-heap-sequencer.json (per-callsite data,
+//! viewable with dh_view.html) next to this crate's Cargo.toml.
 //!
-//! Inputs mirror `benches/throughput.rs`: RLP-encoded signed legacy txs
-//! (~240 B raw frames with 128 B calldata), 64 senders round-robined with
-//! strictly sequential nonces, so every envelope takes the steady-state
-//! Matched → publish path (no future-nonce buffering, no backpressure).
+//! The inputs mirror `benches/throughput.rs`: RLP-encoded signed legacy
+//! transactions (about 240 bytes raw, with 128 bytes of calldata), and 64
+//! senders round-robined with strictly sequential nonces. So every
+//! envelope takes the steady-state Matched-to-publish path, with no
+//! future-nonce buffering and no backpressure.
 //!
-//! NOT measured (documented exclusions): the receipt-floor resync
-//! controller and the #85 unconfirmed-ledger bookkeeping are disabled
-//! (`resync: None`, as in the criterion bench and the IPC dev-run wiring),
-//! and the tx_ordering publisher is the in-memory fake — the real cluster
-//! offer path (rkyv frame encode + Aeron offer) is out of scope here.
+//! This test does not measure the receipt-floor resync controller or the
+//! unconfirmed-ledger bookkeeping. Both are disabled (`resync: None`, as
+//! in the criterion bench and the IPC dev-run wiring). The tx_ordering
+//! publisher is the in-memory fake, so the real cluster offer path (rkyv
+//! frame encode and Aeron offer) is out of scope here.
 
 use alloy_consensus::{SignableTransaction, TxEnvelope as ConsensusEnvelope, TxLegacy};
 use alloy_network::TxSignerSync;
@@ -41,13 +42,14 @@ use kardamom_types::{BPosition, TxDataLoc, TxEnvelope};
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
 const SENDERS: usize = 64;
-/// Nonces per sender processed before the profiler starts (warms the
-/// per-sender nonce map and the publisher's ref vec).
+/// Nonces per sender to process before the profiler starts. This warms
+/// the per-sender nonce map and the publisher's ref vector.
 const WARMUP_NONCES: u64 = 16;
 /// Nonces per sender inside the measured window: 64 x 80 = 5,120 txs.
 const MEASURED_NONCES: u64 = 80;
-/// Calldata padding so the raw frame lands in the realistic 200-400 B
-/// range (empty-input transfers are ~110 B and undercount the RLP decode).
+/// Calldata padding so the raw frame lands in the realistic 200-400 byte
+/// range. An empty-input transfer is about 110 bytes, and undercounts the
+/// RLP decode cost.
 const CALLDATA_BYTES: usize = 128;
 
 fn signer(seed: u64) -> PrivateKeySigner {
@@ -56,9 +58,10 @@ fn signer(seed: u64) -> PrivateKeySigner {
     PrivateKeySigner::from_bytes(&k.into()).unwrap()
 }
 
-/// Signed legacy tx wrapped the way the proxy publishes it onto tx_data:
-/// RLP `raw_tx` plus proxy-stamped `sender` and `tx_hash` (the sequencer
-/// trusts both and never recovers or hashes).
+/// Build a signed legacy transaction, wrapped the way the proxy publishes
+/// it onto tx_data: RLP `raw_tx`, plus a proxy-stamped `sender` and
+/// `tx_hash`. The sequencer trusts both fields and never recovers or
+/// hashes them.
 fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxEnvelope {
     let mut tx = TxLegacy {
         chain_id: Some(1),
@@ -87,10 +90,10 @@ fn signed_envelope(s: &PrivateKeySigner, nonce: u64, correlation_id: u64) -> TxE
 fn sequencer_core_loop_allocation_profile() {
     let signers: Vec<_> = (1..=SENDERS as u64).map(signer).collect();
 
-    // Round-robin senders with strictly sequential per-sender nonces (the
-    // realistic steady-state arrival order): warmup nonces first, then the
-    // measured ones, all preloaded into the scripted subscription OUTSIDE
-    // the profiled window.
+    // Round-robin senders with strictly sequential per-sender nonces.
+    // This is the realistic steady-state arrival order. Load warmup nonces
+    // first, then measured ones, into the scripted subscription before the
+    // profiled window starts.
     let total_nonces = WARMUP_NONCES + MEASURED_NONCES;
     let mut tx_data = ScriptedTxData::default();
     let mut i = 0u64;
@@ -114,8 +117,8 @@ fn sequencer_core_loop_allocation_profile() {
     let mut b = InMemoryTxOrderingRefPublisher::default();
     let mut rc = InMemoryTxErrorPublisher::default();
 
-    // Warm up OUTSIDE the measured window: every envelope is in-order, so
-    // each productive `run_once` ingests exactly one and publishes its ref.
+    // Warm up before the measured window. Every envelope is in order, so
+    // each productive `run_once` call ingests one envelope and publishes its ref.
     for _ in 0..warmup_total {
         assert!(seq.run_once(&mut tx_data, &mut b, &mut rc).expect("warmup"));
     }
@@ -124,14 +127,15 @@ fn sequencer_core_loop_allocation_profile() {
         warmup_total,
         "warmup must publish exactly one ref per envelope"
     );
-    // Pre-reserve the fake publisher's ref vec so its growth doubling does
-    // not pollute the measured counts (the real publisher holds no such vec).
+    // Pre-reserve the fake publisher's ref vector. This stops its growth
+    // doubling from affecting the measured counts. The real publisher holds
+    // no such vector.
     b.refs.lock().unwrap().reserve(measured_total as usize + 16);
 
-    // Measured window under DHAT — the production `run_once` path:
-    // poll -> shard check -> RLP nonce decode -> nonce state machine ->
-    // TxRef build -> batch publish. The final iteration is the empty-queue
-    // idle poll (returns false) and is negligible.
+    // This is the measured window, under DHAT. It runs the production
+    // `run_once` path: poll, shard check, RLP nonce decode, nonce state
+    // machine, TxRef build, batch publish. The final iteration is the
+    // empty-queue idle poll (returns false), and it has little effect.
     let profiler = dhat::Profiler::builder().build();
     let stats0 = dhat::HeapStats::get();
     let t0 = std::time::Instant::now();
@@ -164,6 +168,6 @@ fn sequencer_core_loop_allocation_profile() {
         "implied 1-core: {:.0} ktx/s",
         n as f64 / wall.as_secs_f64() / 1e3
     );
-    drop(profiler); // writes dhat-heap.json with per-callsite attribution
+    drop(profiler); // writes dhat-heap.json with per-callsite data
     let _ = std::fs::rename("dhat-heap.json", "dhat-heap-sequencer.json");
 }

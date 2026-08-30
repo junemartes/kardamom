@@ -1,4 +1,4 @@
-//! End-to-end timeout: with no fake executor draining the partition
+//! End-to-end timeout test. When no fake executor drains the partition
 //! channel, the proxy must time out the client after
 //! `pending_receipt_timeout`.
 

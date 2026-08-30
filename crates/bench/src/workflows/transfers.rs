@@ -1,5 +1,5 @@
-//! `TransfersWorkflow` — saturate the node's write path with signed value
-//! transfers.
+//! `TransfersWorkflow` saturates the node's write path with signed
+//! value transfers.
 
 use alloy_primitives::{B256, Bytes, U256};
 use jsonrpsee::core::client::ClientT;
@@ -15,13 +15,13 @@ use crate::workflows::{ANVIL_MNEMONIC, TRANSFER_SINK, WARMUP_PER_TASK};
 
 const METHOD: &str = "eth_sendRawTransaction";
 
-/// Built-in workflow: presigned-value-transfer load (`eth_sendRawTransaction`).
-/// Stresses the node's write path.
+/// A built-in workflow with presigned-value-transfer load, through
+/// `eth_sendRawTransaction`. It stresses the node's write path.
 #[derive(Debug, Clone)]
 pub struct TransfersWorkflow {
-    /// BIP-39 phrase the signers are derived from.
+    /// The BIP-39 phrase the signers are derived from.
     pub mnemonic: String,
-    /// Balance each prefunded signer EOA gets in genesis.
+    /// The balance each prefunded signer EOA gets in genesis.
     pub signer_balance: U256,
 }
 
@@ -57,10 +57,10 @@ impl BenchWorkflow for TransfersWorkflow {
     ) -> anyhow::Result<Prepared<Self::Item>> {
         let chain_id = preflight_chain_id(client).await?;
         let signers = mnemonic::derive_signers(&self.mnemonic, n_tasks)?;
-        // Warmup: one flat queue, round-robin across all signers for
-        // nonces 0..WARMUP_PER_TASK. The sequential warmup loop preserves
-        // per-signer nonce ordering because each signer's k-th tx is
-        // emitted before any signer's (k+1)-th.
+        // Warmup: one flat queue, rotating across all signers for nonces
+        // 0 to WARMUP_PER_TASK. The warmup loop runs in order, so it keeps
+        // per-signer nonce order: each signer's k-th transaction is
+        // produced before any signer's (k+1)-th transaction.
         let warmup = presign_transfers(
             &signers,
             chain_id,
@@ -69,9 +69,9 @@ impl BenchWorkflow for TransfersWorkflow {
             WARMUP_PER_TASK * signers.len(),
             0,
         )?;
-        // Main: per-task chunks, each signer signs its own
-        // `txs_per_task` items starting at nonce WARMUP_PER_TASK so the
-        // sequence picks up where warmup left off.
+        // Main: per-task chunks. Each signer signs its own `txs_per_task`
+        // items, starting at nonce WARMUP_PER_TASK, so the sequence
+        // continues where warmup left off.
         let mut main: Vec<Vec<Bytes>> = Vec::with_capacity(signers.len());
         for s in &signers {
             let main_chunk = presign_transfers(
@@ -93,8 +93,8 @@ impl BenchWorkflow for TransfersWorkflow {
     }
 }
 
-/// Build prefunded EOA allocs for `n_tasks` signers derived from `mnemonic`.
-/// Shared with `MixedWorkflow` / `CallsWorkflow`.
+/// Build prefunded EOA allocations for `n_tasks` signers derived from
+/// `mnemonic`. `MixedWorkflow` and `CallsWorkflow` share this function.
 pub(crate) fn prefunded_signer_allocs(
     mnemonic: &str,
     n_tasks: u32,

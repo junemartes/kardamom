@@ -1,8 +1,8 @@
 //! Per-sequencer throughput on one core.
 //!
-//! Sender supplied by the proxy (no secp256k1 on this hot path per).
-//! Target per the spec is >100k tx/s per core for simple sigs; this bench
-//! measures `run_once` loop throughput on a single thread.
+//! The proxy supplies the sender, so this hot path does no secp256k1 work.
+//! The spec target is more than 100k tx/s per core for simple signatures.
+//! This bench measures `run_once` loop throughput on one thread.
 
 use std::collections::VecDeque;
 

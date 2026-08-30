@@ -1,22 +1,23 @@
-//! Proof-node generation over the stored trie tables (spec:
-//! no-std-exec-core, phase 3b — the capture side).
+//! Proof-node generation over the stored trie tables, the capture side.
 //!
-//! NOT a read of the node tables: the stored `BranchNodeCompact` rows are
-//! deliberately not a proof set (leaves and extensions are never stored,
-//! and extension-child hash bits are cleared). Proofs come from RE-RUNNING
-//! the incremental walk with a proof retainer — the same walker, cursors,
-//! and hashed-state mirror the per-block root already drives — with the
-//! target paths in the `PrefixSet`, which is what forces descent along
-//! paths the incremental skip would otherwise hash over.
+//! This is not a read of the node tables. The stored `BranchNodeCompact`
+//! rows are deliberately not a proof set: leaves and extensions are
+//! never stored, and extension-child hash bits are cleared. Proofs come
+//! from re-running the incremental walk with a proof retainer. This uses
+//! the same walker, cursors, and hashed-state mirror that the per-block
+//! root already drives, with the target paths in the `PrefixSet`. This
+//! is what forces descent along paths the incremental skip would
+//! otherwise hash over.
 //!
-//! Targets may be FULL keys (`keccak(addr)` / `keccak(slot)` — the witness
-//! read set) or PARTIAL node positions (what the anchor layer's
-//! `MissingNode` names during the capture fixed point); the retainer keeps
-//! every node at or above each target.
+//! Targets may be full keys, `keccak(addr)` or `keccak(slot)`, from the
+//! witness read set, or partial node positions, which is what the
+//! anchor layer's `MissingNode` names during the capture fixed point.
+//! The retainer keeps every node at or above each target.
 //!
-//! Runs against any sync transaction — a read txn over the committed
-//! snapshot is the intended caller shape (proof generation must never sit
-//! inside the writer's commit txn; witness capture is off the commit path).
+//! This runs against any sync transaction. The intended caller shape is
+//! a read transaction over the committed snapshot: proof generation
+//! must never run inside the writer's commit transaction, because
+//! witness capture is off the commit path.
 
 use alloy_primitives::B256;
 use alloy_rlp::Encodable;
@@ -30,8 +31,8 @@ use super::prefix_set::PrefixSet;
 use super::walker;
 use crate::error::StateError;
 
-/// Retained proof nodes (plus the walked root, as a cross-check) for the
-/// ACCOUNT trie at the given targets.
+/// The retained proof nodes, plus the walked root as a cross-check,
+/// for the account trie at the given targets.
 pub fn account_proof_nodes<K: ReadKind>(
     tx: &TxSync<K>,
     account_trie: signet_libmdbx::Database,
@@ -50,8 +51,8 @@ pub fn account_proof_nodes<K: ReadKind>(
     Ok((root, collect(hb)))
 }
 
-/// Retained proof nodes (plus the walked storage root) for ONE account's
-/// storage trie at the given targets.
+/// The retained proof nodes, plus the walked storage root, for one
+/// account's storage trie at the given targets.
 pub fn storage_proof_nodes<K: ReadKind>(
     tx: &TxSync<K>,
     storage_trie: signet_libmdbx::Database,
@@ -73,8 +74,8 @@ pub fn storage_proof_nodes<K: ReadKind>(
     Ok((root, collect(hb)))
 }
 
-/// Nodes < 32 bytes are inline in their parents per MPT and never fetched
-/// by hash — carrying them would only bloat the set.
+/// Nodes under 32 bytes are inline in their parents, under MPT rules,
+/// and are never fetched by hash. Carrying them would only bloat the set.
 fn collect(mut hb: HashBuilder) -> Vec<Bytes> {
     hb.take_proof_nodes()
         .into_inner()

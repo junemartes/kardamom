@@ -1,9 +1,9 @@
 //! Child-process management for the local stack.
 //!
-//! Every stack component (JVMs and service binaries) runs as a plain OS child
-//! with stdout+stderr teed to a per-process log file under the stack's temp
-//! root. Readiness is polled from those log files or from the component's
-//! network surface — never fixed sleeps.
+//! Every stack component (JVMs and service binaries) runs as a plain OS
+//! child. Its stdout and stderr are teed to a per-process log file under
+//! the stack's temp root. This code polls readiness from those log files
+//! or from the component's network surface, never from a fixed sleep.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-/// A supervised child process. Killed (SIGKILL) and reaped on drop so a
-/// panicking test never leaks JVMs or service binaries.
+/// A supervised child process. This is killed (SIGKILL) and reaped on
+/// drop, so a panicking test never leaks JVMs or service binaries.
 pub struct Proc {
     pub name: String,
     child: Child,
@@ -20,16 +20,16 @@ pub struct Proc {
 }
 
 impl Proc {
-    /// Spawn `cmd` with stdout+stderr appended to `log_path`.
+    /// Spawn `cmd`, with stdout and stderr appended to `log_path`.
     ///
-    /// The child is given `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the
-    /// test process. `Drop` handles the ordinary paths, but it cannot run if
-    /// the test binary is killed outright — `cargo test | head` closing the
-    /// pipe (SIGPIPE), a CI step timeout, a panic in the runtime shutdown.
-    /// Without this, every such interruption strands a media driver, a sealer
-    /// JVM and four services; they then compete for CPU and Aeron resources
-    /// and the NEXT run fails at bring-up looking like a flake. (Observed
-    /// exactly that locally: 17 orphaned JVMs after a series of piped runs.)
+    /// The child gets `PR_SET_PDEATHSIG(SIGKILL)`, so it dies with the
+    /// test process. `Drop` handles the normal exit paths, but it cannot
+    /// run if something kills the test binary outright: `cargo test |
+    /// head` closing the pipe (SIGPIPE), a CI step timeout, or a panic
+    /// during runtime shutdown. Without this signal, any such
+    /// interruption would strand a media driver, a sealer JVM, and four
+    /// services. They would then compete for CPU and Aeron resources, and
+    /// the next run would fail at bring-up looking like a flake.
     pub fn spawn(name: &str, mut cmd: Command, log_path: PathBuf) -> Result<Self> {
         let log = std::fs::File::create(&log_path)
             .with_context(|| format!("create log file {}", log_path.display()))?;
@@ -38,14 +38,15 @@ impl Proc {
         unsafe {
             use std::os::unix::process::CommandExt;
             cmd.pre_exec(|| {
-                // SAFETY: async-signal-safe single syscall, the only thing
-                // permitted between fork and exec.
+                // SAFETY: this is one async-signal-safe syscall, the only kind
+                // of call allowed between fork and exec.
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-                // Guard the race where the parent died between fork and here:
-                // without this the child would keep running with no signal
-                // pending, which is the very leak PDEATHSIG exists to prevent.
+                // Guard against the race where the parent died between fork
+                // and here. Without this check, the child would keep
+                // running with no signal pending, exactly the leak
+                // PDEATHSIG exists to prevent.
                 if libc::getppid() == 1 {
                     libc::raise(libc::SIGKILL);
                 }
@@ -75,14 +76,15 @@ impl Proc {
         self.child.id()
     }
 
-    /// SIGKILL + reap. Idempotent.
+    /// Send SIGKILL, then reap the process. Safe to call more than once.
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
 
-    /// SIGTERM, then wait up to `grace` for exit; SIGKILL on overrun.
-    /// Returns true when the process exited within the grace window.
+    /// Send SIGTERM, then wait up to `grace` for the process to exit.
+    /// Send SIGKILL if it overruns. Returns true when the process exited
+    /// within the grace window.
     pub fn terminate(&mut self, grace: Duration) -> bool {
         if !self.is_alive() {
             return true;
@@ -102,8 +104,9 @@ impl Proc {
         false
     }
 
-    /// SIGSTOP — freeze the process without killing it (S7 uses this to
-    /// silence the executor's genuine publications while injecting).
+    /// Send SIGSTOP to freeze the process without killing it (the
+    /// divergence-detection test uses this to silence the executor's
+    /// genuine publications while injecting).
     pub fn suspend(&self) {
         #[cfg(unix)]
         unsafe {
@@ -111,7 +114,7 @@ impl Proc {
         }
     }
 
-    /// SIGCONT — resume a suspended process.
+    /// Send SIGCONT to resume a suspended process.
     pub fn resume(&self) {
         #[cfg(unix)]
         unsafe {
@@ -119,8 +122,9 @@ impl Proc {
         }
     }
 
-    /// Wait up to `timeout` for the process to exit on its own; returns its
-    /// exit code (`None` element when killed by signal) or `None` on timeout.
+    /// Wait up to `timeout` for the process to exit on its own. Returns
+    /// its exit code (the inner `None` means a signal killed it), or
+    /// `None` on timeout.
     pub fn wait_exit(&mut self, timeout: Duration) -> Option<Option<i32>> {
         let deadline = Instant::now() + timeout;
         loop {
@@ -156,9 +160,10 @@ impl Drop for Proc {
     }
 }
 
-/// Poll `path` until it contains `needle` or the deadline passes. Also fails
-/// fast if `proc` exits first (a component that dies during startup should
-/// fail the bring-up immediately, with its log tail, not after a timeout).
+/// Poll `path` until it contains `needle`, or until the deadline passes.
+/// Also fails fast if `proc` exits first. A component that dies during
+/// startup should fail the bring-up right away, with its log tail, not
+/// after a timeout.
 pub fn wait_for_log_line(proc: &mut Proc, needle: &str, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -211,9 +216,10 @@ pub fn wait_for_file(proc: &mut Proc, path: &Path, timeout: Duration) -> Result<
     }
 }
 
-/// Reserve a free TCP port on loopback. The listener is dropped before
-/// returning, so there is a small reuse race — acceptable for tests, and the
-/// OS cycles ephemeral ports rather than re-issuing the same one immediately.
+/// Reserve a free TCP port on loopback. The listener drops before this
+/// function returns, so there is a small reuse race. This is fine for
+/// tests, since the OS cycles ephemeral ports instead of reissuing the
+/// same one right away.
 pub fn free_tcp_port() -> Result<u16> {
     let l = std::net::TcpListener::bind("127.0.0.1:0").context("reserve tcp port")?;
     Ok(l.local_addr()?.port())

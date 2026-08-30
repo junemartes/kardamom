@@ -1,15 +1,16 @@
 //! In-memory pub/sub fakes used by other crates' unit tests.
 //!
-//! Gated behind `#[cfg(any(test, feature = "testing"))]`. Importers add this
-//! crate as `kardamom-log = { workspace = true, features = ["testing"] }`
+//! Gated behind `#[cfg(any(test, feature = "testing"))]`. Importers add
+//! this crate as `kardamom-log = { workspace = true, features = ["testing"] }`
 //! to `[dev-dependencies]`.
 //!
-//! These fakes are intentionally simple: an `Arc<Mutex<Vec<bytes>>>` per
-//! stream id, no Aeron involvement. They preserve **per-publisher FIFO**
-//! order (sufficient for unit-testing components that consume the channel)
-//! but do not model Aeron's concurrent-pub interleaving. Tests that need to
-//! verify behavior under realistic interleaving go through the real Aeron
-//! Docker harness (`docker_e2e.rs`), not these fakes.
+//! These fakes are deliberately simple: an `Arc<Mutex<Vec<bytes>>>` per
+//! stream id, with no Aeron involvement. They preserve per-publisher FIFO
+//! order, which is enough for unit tests of components that consume the
+//! channel, but they do not model Aeron's concurrent-publisher
+//! interleaving. Tests that must check behavior under realistic
+//! interleaving go through the real Aeron Docker harness
+//! (`docker_e2e.rs`), not these fakes.
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -27,8 +28,9 @@ use kardamom_types::{BPosition, FsyncWatermark, TxDataLoc};
 /// Map from `(channel, stream_id)` to shared per-stream state.
 type StreamMap = HashMap<(String, i32), Arc<Mutex<StreamState>>>;
 
-/// In-memory bus shared by all `FakePublication` / `FakeSubscription` handles
-/// that target the same `(channel, stream_id)` pair. Clone is cheap (an `Arc`).
+/// In-memory bus shared by all `FakePublication` and `FakeSubscription`
+/// handles that target the same `(channel, stream_id)` pair. Clone is
+/// cheap, since it is an `Arc`.
 #[derive(Clone, Default)]
 pub struct FakeBus {
     streams: Arc<Mutex<StreamMap>>,
@@ -36,10 +38,10 @@ pub struct FakeBus {
 
 #[derive(Default)]
 struct StreamState {
-    /// Append-only log of (offset, session_id, bytes). Subscribers track their
-    /// read cursor. `session_id` lets the tx_data fake model concurrent
-    /// (active/active) publishers with distinct sessions; non-tx_data publishers
-    /// record `0`.
+    /// Append-only log of (offset, session_id, bytes). Subscribers track
+    /// their read cursor. `session_id` lets the tx_data fake model
+    /// concurrent (active/active) publishers with distinct sessions.
+    /// Non-tx_data publishers record `0`.
     log: Vec<(i64, i32, Vec<u8>)>,
     /// Next byte offset (mimics Aeron's stream position).
     next_offset: i64,
@@ -58,9 +60,9 @@ impl FakeBus {
     }
 }
 
-/// Drop-in for `rusteron_client::AeronPublication` (the shared / concurrent
-/// variant) in tests. Named `Concurrent` historically — keep the name so
-/// existing test code doesn't churn.
+/// Drop-in for `rusteron_client::AeronPublication` (the shared, concurrent
+/// variant) in tests. This keeps the historical name `Concurrent`, so
+/// existing test code does not churn.
 pub struct FakeConcurrentPublication {
     state: Arc<Mutex<StreamState>>,
 }
@@ -70,7 +72,7 @@ impl FakeConcurrentPublication {
         self.offer_with_session(bytes, 0)
     }
 
-    /// `offer` recording an explicit publisher `session_id` on the fragment, so
+    /// `offer` with an explicit publisher `session_id` on the fragment, so
     /// the tx_data fake can model concurrent ingress publishers.
     pub fn offer_with_session(&self, bytes: &[u8], session_id: i32) -> i64 {
         let mut g = self.state.lock().unwrap();
@@ -81,8 +83,8 @@ impl FakeConcurrentPublication {
     }
 
     /// Encode `msg` with rkyv, append it to the stream, and return the
-    /// fragment's *start* `BPosition` (matches the real publisher's
-    /// convention used by [`crate::publisher::offer`]).
+    /// fragment's start `BPosition`. This matches the real publisher's
+    /// convention used by [`crate::publisher::offer`].
     fn publish<T>(&self, msg: &T) -> Result<BPosition, LogError>
     where
         T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
@@ -90,7 +92,7 @@ impl FakeConcurrentPublication {
         self.publish_with_session(msg, 0)
     }
 
-    /// [`publish`](Self::publish) recording an explicit publisher `session_id`.
+    /// [`publish`](Self::publish) with an explicit publisher `session_id`.
     fn publish_with_session<T>(&self, msg: &T, session_id: i32) -> Result<BPosition, LogError>
     where
         T: for<'a> Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, rancor::Error>>,
@@ -107,7 +109,7 @@ impl FakeConcurrentPublication {
     }
 }
 
-/// Mimics `rusteron_client::Header` enough for our consumers.
+/// Mimics `rusteron_client::Header` enough for this crate's consumers.
 #[derive(Clone, Copy, Debug)]
 pub struct FakeHeader {
     term_id: i32,
@@ -145,7 +147,8 @@ pub struct FakeSubscription {
 }
 
 impl FakeSubscription {
-    /// Mirrors the real subscriber's `poll(&mut self, callback, fragment_limit)`.
+    /// Mirrors the real subscriber's
+    /// `poll(&mut self, callback, fragment_limit)`.
     pub fn poll<F: FnMut(&[u8], FakeHeader)>(&mut self, mut f: F, fragment_limit: usize) -> usize {
         let g = self.state.lock().unwrap();
         let mut delivered = 0;
@@ -161,7 +164,7 @@ impl FakeSubscription {
 }
 
 /// High-level fake publication that consumers can use in place of
-/// the real Aeron-backed publishers (e.g. `TxOrderingPublisher`).
+/// the real Aeron-backed publishers (for example `TxOrderingPublisher`).
 pub struct FakePublication {
     pub_handle: FakeConcurrentPublication,
 }
@@ -226,26 +229,28 @@ where
 // ============================================================================
 // TxData and TxOrdering typed fakes.
 //
-// Per:
-//   - TxData[i] is an Aeron *exclusive* publication carrying full
-//     TxEnvelopes. M of them (one per sequencer), each its own stream.
-//   - TxOrdering is the canonical orderer: Aeron *concurrent* multi-publisher
-//     carrying TxOrderingMessage records (TxRef | BoundaryStart), ~16-32 B.
+//   - TxData[i] is an Aeron exclusive publication carrying full
+//     TxEnvelopes. There are M of them, one per sequencer, each its own
+//     stream.
+//   - TxOrdering is the canonical orderer: an Aeron concurrent
+//     multi-publisher stream carrying TxOrderingMessage records
+//     (TxRef | BoundaryStart), about 16-32 bytes.
 //
-// At the in-memory-fake level, "exclusive vs concurrent" collapses (we only
-// model one publisher at a time, so there is no CAS-cursor contention to
-// simulate). The distinction is *type-level*: the tx_data pub/sub pair is
-// parameterised by `TxEnvelope` and constructs single-producer streams keyed
-// by `sequencer_id`; the tx_ordering pub/sub pair is parameterised by
-// `TxOrderingMessage` and shares one stream. Tests that need to verify real
-// concurrent-pub interleaving must use the docker e2e harness.
+// At the in-memory-fake level, "exclusive vs concurrent" collapses. This
+// module only models one publisher at a time, so there is no CAS-cursor
+// contention to simulate. The distinction is at the type level: the
+// tx_data pub/sub pair is parameterised by `TxEnvelope` and builds
+// single-producer streams keyed by `sequencer_id`. The tx_ordering pub/sub
+// pair is parameterised by `TxOrderingMessage` and shares one stream.
+// Tests that must check real concurrent-publisher interleaving need the
+// docker e2e harness instead.
 // ============================================================================
 
 use kardamom_types::{TxEnvelope, TxOrderingMessage, TxRef};
 
-/// TxData[i]: per-sequencer **exclusive** publication of full
-/// `TxEnvelope` bytes. In production this maps to
-/// `Aeron::add_exclusive_publication`; the fake just preserves FIFO.
+/// TxData[i]: per-sequencer exclusive publication of full `TxEnvelope`
+/// bytes. In production this maps to `Aeron::add_exclusive_publication`.
+/// The fake only preserves FIFO order.
 ///
 /// `FakeTxDataPublication::new` requires the caller to hand in the
 /// `sequencer_id`. The fake keeps the id so callers can build a `TxRef`
@@ -258,18 +263,20 @@ pub struct FakeTxDataPublication {
 }
 
 impl FakeTxDataPublication {
-    /// Open the tx_data[i] pub on `bus`, using the channel URI/stream-id
-    /// convention "<channel>"/"<stream_id>". A real wiring uses
-    /// `kardamom_log::config::ChannelsConfig::tx_data_channel_template` to derive
-    /// per-sequencer URIs. Session id defaults to `0` (single publisher).
+    /// Open the tx_data[i] pub on `bus`, using the channel URI and
+    /// stream-id convention "<channel>"/"<stream_id>". Real wiring uses
+    /// `kardamom_log::config::ChannelsConfig::tx_data_channel_template` to
+    /// derive per-sequencer URIs. Session id defaults to `0` (single
+    /// publisher).
     pub fn open(bus: &FakeBus, sequencer_id: u8, channel: &str, stream_id: i32) -> Self {
         Self::open_with_session(bus, sequencer_id, 0, channel, stream_id)
     }
 
-    /// Like [`open`](Self::open) but with an explicit publisher `session_id`, so
-    /// tests can model concurrent (active/active) ingress publishers on one
-    /// shard: distinct session ids keep the executor join key
-    /// `(shard, session, position)` unique even when their `BPosition`s collide.
+    /// Like [`open`](Self::open), but with an explicit publisher
+    /// `session_id`, so tests can model concurrent (active/active) ingress
+    /// publishers on one shard. Distinct session ids keep the executor
+    /// join key `(shard, session, position)` unique, even when their
+    /// `BPosition`s collide.
     pub fn open_with_session(
         bus: &FakeBus,
         sequencer_id: u8,
@@ -290,15 +297,15 @@ impl FakeTxDataPublication {
         self.sequencer_id
     }
 
-    /// This publisher's Aeron `session_id` (what a real media driver assigns
-    /// per publication).
+    /// This publisher's Aeron `session_id` (what a real media driver
+    /// assigns per publication).
     pub fn session_id(&self) -> i32 {
         self.session_id
     }
 
     /// Publish a `TxEnvelope` and return its fragment-start `BPosition` on
-    /// tx_data[i]. The subscriber pairs this position with `session_id` into a
-    /// `TxDataLoc`; the sequencer stamps the session into `TxRef`.
+    /// tx_data[i]. The subscriber pairs this position with `session_id`
+    /// into a `TxDataLoc`. The sequencer stamps the session into `TxRef`.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
         self.pub_handle.publish_with_session(env, self.session_id)
     }
@@ -307,8 +314,8 @@ impl FakeTxDataPublication {
 /// TxData[i]: per-sequencer subscription returning `(BPosition, TxEnvelope)`.
 ///
 /// Executors run M+1 of these (one per tx_data) plus one tx_ordering
-/// subscription. Per they buffer A messages keyed by `BPosition`
-/// until the corresponding `TxRef` arrives on tx_ordering.
+/// subscription. They buffer tx_data messages keyed by `BPosition` until
+/// the matching `TxRef` arrives on tx_ordering.
 pub struct FakeTxDataSubscription {
     sub: FakeSubscription,
 }
@@ -324,9 +331,9 @@ impl FakeTxDataSubscription {
     }
 
     /// Poll and invoke `f` with `(TxDataLoc, TxEnvelope)` per fragment. The
-    /// `TxDataLoc` pairs the publisher `session_id` with the fragment-*start*
-    /// `BPosition` — exactly what the sequencer stamps into `TxRef`
-    /// (`tx_data_session_id` + `tx_data_position`).
+    /// `TxDataLoc` pairs the publisher `session_id` with the fragment-start
+    /// `BPosition`. This is exactly what the sequencer stamps into `TxRef`
+    /// (`tx_data_session_id` and `tx_data_position`).
     pub fn poll<F: FnMut(TxDataLoc, TxEnvelope)>(
         &mut self,
         mut f: F,
@@ -352,9 +359,10 @@ impl FakeTxDataSubscription {
     }
 }
 
-/// TxOrdering: canonical orderer, **concurrent** multi-publisher carrying
-/// [`TxOrderingMessage`] records (TxRef | BoundaryStart). In production this
-/// maps to `Aeron::add_publication` (the shared / concurrent variant).
+/// TxOrdering: the canonical orderer, a concurrent multi-publisher stream
+/// carrying [`TxOrderingMessage`] records (TxRef | BoundaryStart). In
+/// production this maps to `Aeron::add_publication` (the shared, concurrent
+/// variant).
 pub struct FakeTxOrderingPublication {
     pub_handle: FakeConcurrentPublication,
 }
@@ -453,18 +461,18 @@ impl FakeFsyncWatermarkStream {
 }
 
 // ============================================================================
-// AeronTestCluster — testcontainers-driven real Aeron for e2e tests.
+// AeronTestCluster: testcontainers-driven real Aeron for e2e tests.
 //
-// Other crates depend on `kardamom-log` with `features = ["docker-e2e"]` and
-// reuse this struct from their own `tests/` directory. Public API:
+// Other crates depend on `kardamom-log` with `features = ["docker-e2e"]`
+// and reuse this struct from their own `tests/` directory. Public API:
 //
 //   let cluster = AeronTestCluster::single_node().await?;
 //   let endpoint = cluster.archive_control_endpoint(0).await;
 //   // ... build LogConfig pointing at endpoint, run scenario ...
 //   drop(cluster); // tears down container
 //
-// Gated behind `docker-e2e` (which implies `testing`) so the testcontainers
-// dependency doesn't bleed into hosts without a Docker daemon.
+// This is gated behind `docker-e2e` (which implies `testing`), so the
+// testcontainers dependency does not reach hosts without a Docker daemon.
 // ============================================================================
 
 #[cfg(feature = "docker-e2e")]
@@ -476,20 +484,20 @@ mod docker {
     use testcontainers::runners::AsyncRunner;
     use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 
-    /// Tag we use for the locally-built Aeron image.
+    /// Tag for the locally built Aeron image.
     const AERON_IMAGE_NAME: &str = "kardamom-aeron";
     const AERON_IMAGE_TAG: &str = "test";
 
-    /// One Aeron node. Either backed by a Docker container we spawn (the
-    /// default — works on Linux, fails on macOS-Docker due to virtiofs
-    /// breaking `cnc.dat` shared-memory semantics), or an "external" mode
-    /// where the test points us at an already-running Media Driver via the
-    /// `KARDAMOM_AERON_DIR` env var. The external mode lets macOS devs run
-    /// the MD natively (`just aeron-driver-up`).
+    /// One Aeron node. This is either backed by a Docker container this
+    /// code spawns (the default; works on Linux, fails on macOS Docker
+    /// because virtiofs breaks `cnc.dat` shared-memory semantics), or an
+    /// "external" mode where the test points at an already-running Media
+    /// Driver through the `KARDAMOM_AERON_DIR` env var. External mode lets
+    /// macOS developers run the MD natively (`just aeron-driver-up`).
     ///
-    /// The `Container` variant is boxed so the enum stays small — its
-    /// inner `ContainerAsync` is ~200 B vs the `External` variant's two
-    /// `PathBuf`s; clippy's `large_enum_variant` flags the discrepancy.
+    /// The `Container` variant is boxed to keep the enum small. Its inner
+    /// `ContainerAsync` is about 200 bytes versus the `External` variant's
+    /// two `PathBuf`s; clippy's `large_enum_variant` flags that gap.
     enum Node {
         Container(Box<ContainerNode>),
         External {
@@ -519,24 +527,25 @@ mod docker {
         }
     }
 
-    /// Reusable Aeron e2e harness. Each instance owns one or more real Aeron
-    /// containers and exposes the host ports the Rust code should connect to.
+    /// Reusable Aeron e2e harness. Each instance owns one or more real
+    /// Aeron containers and exposes the host ports the Rust code should
+    /// connect to.
     pub struct AeronTestCluster {
         nodes: Vec<Node>,
     }
 
     impl AeronTestCluster {
-        /// Bring up a single Aeron node, or — if the env var
-        /// `KARDAMOM_AERON_DIR` is set — adopt the already-running Media
-        /// Driver that owns that directory. The env path lets a macOS dev
-        /// run `just aeron-driver-up` and then run the e2e tests against a
-        /// host-native MD, dodging the Docker-on-macOS shared-memory
-        /// limitation.
+        /// Bring up a single Aeron node. If the env var
+        /// `KARDAMOM_AERON_DIR` is set, adopt the already-running Media
+        /// Driver that owns that directory instead. This env path lets a
+        /// macOS developer run `just aeron-driver-up` and then run the e2e
+        /// tests against a host-native MD, avoiding the Docker-on-macOS
+        /// shared-memory limitation.
         pub async fn single_node() -> Result<Self, Box<dyn std::error::Error>> {
             if let Ok(dir) = std::env::var("KARDAMOM_AERON_DIR") {
                 let aeron_dir = PathBuf::from(dir);
-                // Convention: archive dir lives next to aeron.dir, matching
-                // the layout `aeron-driver-up` writes.
+                // Convention: the archive dir lives next to aeron.dir,
+                // matching the layout `aeron-driver-up` writes.
                 let archive_dir = aeron_dir
                     .parent()
                     .map(|p| p.join("archive"))
@@ -565,8 +574,8 @@ mod docker {
 
         /// "host:port" the test should pass as the Aeron Archive control
         /// channel endpoint for node `i`. Container mode resolves the
-        /// dynamically-allocated host port; external mode returns the
-        /// fixed port `just aeron-driver-up` configures (8010).
+        /// dynamically allocated host port. External mode returns the
+        /// fixed port that `just aeron-driver-up` configures (8010).
         pub async fn archive_control_endpoint(&self, i: usize) -> String {
             match &self.nodes[i] {
                 Node::Container(c) => {
@@ -616,7 +625,8 @@ mod docker {
         }
 
         /// Stop node `i` (simulates recorder failure for quorum tests).
-        /// In external mode this is a no-op — the operator manages the MD.
+        /// In external mode this is a no-op, since the operator manages
+        /// the MD.
         pub async fn stop(&mut self, i: usize) -> Result<(), Box<dyn std::error::Error>> {
             if let Node::Container(c) = &mut self.nodes[i] {
                 c.container.stop().await?;
@@ -625,13 +635,13 @@ mod docker {
         }
     }
 
-    /// Build the host tempdir + bind-mounted container.
+    /// Build the host tempdir and bind-mounted container.
     ///
-    /// Aeron stores absolute paths inside `cnc.dat` (the command-and-control
-    /// shared-memory file) — when the host client opens the buffer the MD
-    /// has prepared, it follows those paths verbatim. So the bind-mount
-    /// source and destination must share the same absolute path on both
-    /// host and container.
+    /// Aeron stores absolute paths inside `cnc.dat` (the
+    /// command-and-control shared-memory file). When the host client opens
+    /// the buffer the MD has prepared, it follows those paths exactly. So
+    /// the bind-mount source and destination must share the same absolute
+    /// path on both host and container.
     ///
     /// Layout (identical on host and inside container):
     /// ```text
@@ -639,9 +649,9 @@ mod docker {
     ///     dir/              <-- Aeron's `aeron.dir` (cnc.dat, etc.)
     ///     archive/dir/      <-- Aeron Archive's segment files
     /// ```
-    /// Aeron's `MediaDriver.ensureDirectoryIsRecreated` rmdir+mkdir the
-    /// inner `dir/` subdir on every start, so the bind-mounted parent stays
-    /// intact.
+    /// Aeron's `MediaDriver.ensureDirectoryIsRecreated` removes and
+    /// recreates the inner `dir/` subdir on every start, so the
+    /// bind-mounted parent stays intact.
     async fn spawn_node() -> Result<Node, Box<dyn std::error::Error>> {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -684,9 +694,10 @@ mod docker {
         })))
     }
 
-    /// `docker build`s the Aeron image once per test run, idempotent.
-    /// Shells out to the docker CLI because testcontainers doesn't have a
-    /// "build if missing" helper. Cached layers make this fast on repeat runs.
+    /// Runs `docker build` for the Aeron image once per test run; this is
+    /// idempotent. This shells out to the docker CLI because
+    /// testcontainers has no "build if missing" helper. Cached layers make
+    /// repeat runs fast.
     async fn ensure_image_built() -> Result<(), Box<dyn std::error::Error>> {
         use tokio::process::Command;
         let image_ref = format!("{AERON_IMAGE_NAME}:{AERON_IMAGE_TAG}");

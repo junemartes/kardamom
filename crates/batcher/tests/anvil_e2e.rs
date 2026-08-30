@@ -1,8 +1,8 @@
-//! Anvil end-to-end: deploy KardamomL2Settlement via the kardamom factory,
-//! then call `postBatch` from the batcher EOA and assert the on-chain
+//! Anvil end-to-end: deploy KardamomL2Settlement through the kardamom
+//! factory, call `postBatch` from the batcher EOA, and check the on-chain
 //! `BatchPosted` event was emitted with the correct fields.
 //!
-//! Skips gracefully if anvil isn't available (same convention as the
+//! Skips gracefully if anvil is not available (the same convention as the
 //! deployer's `deploy_e2e.rs`).
 
 use alloy_node_bindings::Anvil;
@@ -96,9 +96,9 @@ async fn deploy_settlement_and_post_batch_emits_event() {
     let last_idx_before = settlement.lastBatchIndex().call().await.unwrap();
     assert_eq!(last_idx_before, 0);
 
-    // Post a batch. The blob bytes themselves don't get sent to anvil in this
-    // test — we just verify the calldata path. The contract records the
-    // versioned hashes and emits the event.
+    // Post a batch. The blob bytes themselves are not sent to anvil in
+    // this test; this only checks the calldata path. The contract records
+    // the versioned hashes and emits the event.
     let blob_hashes = vec![B256::repeat_byte(0xA1), B256::repeat_byte(0xA2)];
     let receipt = settlement
         .postBatch(0, blob_hashes.clone(), 100, 105, B256::repeat_byte(0x4C))
@@ -115,7 +115,7 @@ async fn deploy_settlement_and_post_batch_emits_event() {
     let last_idx_after = settlement.lastBatchIndex().call().await.unwrap();
     assert_eq!(last_idx_after, 1);
 
-    // The `BatchPosted` event was emitted with our fields.
+    // The `BatchPosted` event was emitted with the expected fields.
     let logs = receipt.logs();
     let topic0 = IKardamomL2Settlement::BatchPosted::SIGNATURE_HASH;
     let mut found = false;
@@ -150,8 +150,8 @@ async fn deploy_settlement_and_post_batch_emits_event() {
     }
 }
 
-/// Live-sender loop (#39) against real anvil: a confirmed post advances the
-/// CAS and persists the cursor; a foreign advance of `lastBatchIndex` is a
+/// The live-sender loop against real anvil: a confirmed post advances the
+/// CAS and persists the cursor. A foreign advance of `lastBatchIndex` is a
 /// fail-stop, not a silent retry.
 #[tokio::test]
 async fn live_sender_confirms_and_rejects_foreign_writer() {
@@ -169,16 +169,17 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
             return;
         }
     };
-    // Blob txs need a real signer; use a funded anvil dev account as the
-    // batcher EOA and make it the settlement's `l1Batcher`.
+    // Blob txs need a real signer. Use a funded anvil dev account as the
+    // batcher EOA, and make it the settlement's `l1Batcher`.
     let batcher_signer: alloy_signer_local::PrivateKeySigner = anvil.keys()[2].clone().into();
     let batcher_addr = batcher_signer.address();
     let provider = ProviderBuilder::new()
         .wallet(EthereumWallet::from(batcher_signer))
         .connect_http(anvil.endpoint_url());
 
-    // Factory + settlement deploy via a PLAIN provider — the wallet-filled
-    // one would try to locally sign the impersonated DEV_OWNER txs.
+    // Deploy the factory and settlement with a plain provider. The
+    // wallet-filled provider would try to locally sign the impersonated
+    // DEV_OWNER txs.
     let deploy_provider = ProviderBuilder::new()
         .disable_recommended_fillers()
         .connect_http(anvil.endpoint_url());
@@ -217,8 +218,8 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
     let cursor_path = dir.path().join("cursor.json");
     let da_store = FsBlobStore::open(dir.path().join("da")).unwrap();
 
-    // One empty block — the smallest legal batch (dense coverage posts empty
-    // blocks too).
+    // One empty block: the smallest legal batch. Dense coverage posts
+    // empty blocks too.
     let block1 = ClosedBlock {
         block_number: 1,
         l2_timestamp: 7,
@@ -236,8 +237,8 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         2,
         cursor_path.clone(),
     );
-    // post_confirmed blocks on the runtime handle — run it off-runtime, as
-    // the production feed thread does.
+    // post_confirmed blocks on the runtime handle. Run it off the runtime,
+    // as the production feed thread does.
     let cursor1 = BatchCursor {
         next_index: 0,
         next_block: 2,
@@ -282,8 +283,9 @@ async fn live_sender_confirms_and_rejects_foreign_writer() {
         .unwrap();
     assert!(receipt.status());
 
-    // ...so the sender's next post must fail-stop (reconcile sees index 2
-    // covering block 9, which is not our batch), not retry into a fork.
+    // So the sender's next post must fail-stop. Reconcile sees index 2
+    // covering block 9, which is not this batch. It must not retry into a
+    // fork.
     let block2 = ClosedBlock {
         block_number: 2,
         l2_timestamp: 8,

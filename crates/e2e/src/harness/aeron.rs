@@ -1,10 +1,11 @@
 //! Host-native `ArchivingMediaDriver` for the Rust services.
 //!
-//! Mirrors `just aeron-driver-up` (same jar, same JVM opens, same 4 MiB term
-//! buffers) but on per-stack temp dirs and OS-assigned ports so concurrent
-//! stacks never collide. The Java `ClusterNode` runs its OWN embedded driver
-//! (see `sealer.rs`); this one is only for `kardamom-{ingress,sequencer,
-//! executor}` attaching via `--aeron-dir`.
+//! This matches `just aeron-driver-up` (same jar, same JVM opens, same
+//! 4 MiB term buffers), but it uses per-stack temp directories and
+//! OS-assigned ports, so concurrent stacks never collide. The Java
+//! `ClusterNode` runs its own embedded driver (see `sealer.rs`). This
+//! driver is only for `kardamom-{ingress,sequencer,executor}`, which
+//! attach through `--aeron-dir`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,7 +15,7 @@ use anyhow::{Context, Result};
 
 use super::proc::{Proc, free_udp_port, wait_for_file};
 
-/// Locate the aeron-all jar: `KARDAMOM_AERON_ALL_JAR`, else the
+/// Find the aeron-all jar. Use `KARDAMOM_AERON_ALL_JAR` if set, else the
 /// `just aeron-driver-up` cache path.
 pub fn aeron_all_jar() -> Result<PathBuf> {
     if let Ok(p) = std::env::var("KARDAMOM_AERON_ALL_JAR") {
@@ -40,8 +41,9 @@ pub struct MediaDriver {
     pub proc: Proc,
     pub aeron_dir: PathBuf,
     pub archive_dir: PathBuf,
-    /// The archive's UDP control endpoint. Refetch clients (the executor's
-    /// join-miss recovery) address the archive here.
+    /// The archive's UDP control endpoint. Refetch clients, such as the
+    /// executor's join-miss recovery, address the archive at this
+    /// endpoint.
     pub archive_control_endpoint: String,
 }
 
@@ -76,10 +78,11 @@ impl MediaDriver {
         .arg(format!(
             "-Daeron.archive.replication.channel=aeron:udp?endpoint=127.0.0.1:{repl}"
         ))
-        // GC + safepoint log: the driver-stall flake family ("MediaDriver
-        // keepalive: age>10000ms" client aborts) needs to distinguish a JVM
-        // pause from host-level CPU/disk starvation — pair this with the
-        // stack's host-load.log timeline.
+        // This is a GC and safepoint log. The driver-stall flake family
+        // (client aborts with a "MediaDriver keepalive: age>10000ms"
+        // message) needs to tell a JVM pause apart from host-level CPU or
+        // disk starvation. Compare this log with the stack's
+        // host-load.log timeline.
         .arg(format!(
             "-Xlog:gc*,safepoint=info:file={}/md-jvm.log:time,uptime,level,tags",
             root.display()

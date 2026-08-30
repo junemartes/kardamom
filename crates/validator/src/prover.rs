@@ -1,20 +1,21 @@
-//! The prover spool (spec: no-std-exec-core, phase 3c): live assembly of
+//! The prover spool: live assembly of
 //! anchored prover inputs, one frame per block, behind `--prove-batches`.
 //!
-//! Proving must never touch chain liveness, so the spool sits ENTIRELY off
-//! the hot path: it feeds from the flight ring (records the block-exec
-//! strategy already retains) and from the writer's snapshot channel, and
-//! it PINS each block's pre-state by holding the [`StateSnapshot`] whose
-//! MVCC read txn anchors exactly that state — the "stamp when the parent's
-//! commit settles" rule made concrete. A block whose pre-state snapshot
-//! was never observed (the settle sweep can jump several blocks under the
-//! depth-K pipeline) or whose records aged out of the ring is DROPPED with
-//! a counter, never awaited: proving lags, it does not stall, and PR 4's
-//! batch cursor tolerates gaps by design.
+//! Proving must never touch chain liveness, so the spool sits entirely off
+//! the hot path. It feeds from the flight ring (records the block-exec
+//! strategy already retains) and from the writer's snapshot channel. It
+//! pins each block's pre-state by holding the [`StateSnapshot`] whose MVCC
+//! read txn anchors exactly that state; this makes the "stamp when the
+//! parent's commit settles" rule concrete. A block whose pre-state
+//! snapshot was never observed (the settle sweep can jump several blocks
+//! under the depth-K pipeline), or whose records aged out of the ring, is
+//! dropped with a counter, never awaited. Proving lags, but it does not
+//! stall, and the batch cursor tolerates gaps by design.
 //!
 //! Each spooled frame is `spool_dir/block-N/{prover-input.rkyv,
-//! expected-outputs.bin}` — exactly the fixture layout the SP1 host runner
-//! (`guest/kardamom-zk-host`) consumes, so the spool IS the prover queue.
+//! expected-outputs.bin}`. This is exactly the fixture layout the SP1 host
+//! runner (`guest/kardamom-zk-host`) consumes, so the spool is the prover
+//! queue.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -36,11 +37,11 @@ use crate::flight::FlightRing;
 use crate::parallel::execute_block_sequential;
 use crate::witness::{anchor_block_witness, capture_block_witness};
 
-/// A whole-block strategy for validators that run `--prove-batches` WITHOUT
-/// `--parallel-validation`: identical semantics to the engine's streaming
-/// path (it delegates to the shared sequential driver), but records flow
-/// through the whole-block buffer so the flight ring — the spool's feed —
-/// sees every block.
+/// A whole-block strategy for validators that run `--prove-batches`
+/// without `--parallel-validation`. It has the same semantics as the
+/// engine's streaming path, since it delegates to the shared sequential
+/// driver, but records flow through the whole-block buffer, so the flight
+/// ring, the spool's feed, sees every block.
 pub fn sequential_block_exec<D: StateDatabase + Sync + 'static>(
     flight: Arc<FlightRing>,
 ) -> BlockExec<D> {
@@ -56,7 +57,7 @@ pub fn sequential_block_exec<D: StateDatabase + Sync + 'static>(
     )
 }
 
-/// Convert exec-core records to the prover wire (the guest rebuilds them).
+/// Convert exec-core records to the prover wire form; the guest rebuilds them.
 fn wire_records(records: &[BufferedRecord]) -> Vec<ProverRecord> {
     records
         .iter()
@@ -83,8 +84,8 @@ fn wire_records(records: &[BufferedRecord]) -> Vec<ProverRecord> {
         .collect()
 }
 
-/// Capture, anchor, and spool ONE block against its pinned pre-state
-/// snapshot. `snap` MUST be anchored at `block - 1`.
+/// Capture, anchor, and spool one block against its pinned pre-state
+/// snapshot. `snap` must be anchored at `block - 1`.
 pub fn spool_block(
     spool_dir: &std::path::Path,
     chain_id: u64,
@@ -143,8 +144,8 @@ pub fn spool_block(
     Ok(outputs)
 }
 
-/// Build the wire frame. The boundary carried is the one the block executed
-/// under (`env` holds its fields — reconstructed to the exact live shape).
+/// Build the wire frame. The boundary carried is the one the block ran
+/// under; `env` holds its fields, rebuilt to the exact live shape.
 pub fn assemble_prover_input(
     chain_id: u64,
     env: ExecEnv,
@@ -170,10 +171,10 @@ pub fn assemble_prover_input(
     }
 }
 
-/// Spawn the spool task. Polls the writer's snapshot channel; for each
-/// observed snapshot at block M, tries to prove block M+1 (records from
-/// the flight ring) against that PINNED snapshot. Blocks whose window was
-/// skipped are counted and dropped.
+/// Spawn the spool task. It polls the writer's snapshot channel. For each
+/// observed snapshot at block M, it tries to prove block M+1, with
+/// records from the flight ring, against that pinned snapshot. Blocks
+/// whose window was skipped are counted and dropped.
 pub fn spawn_prover_spool(
     spool_dir: PathBuf,
     chain_id: u64,
@@ -182,7 +183,7 @@ pub fn spawn_prover_spool(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         const TICK: Duration = Duration::from_millis(100);
-        // The next block to prove; its pre-state snapshot is `pending - 1`.
+        // This is the next block to prove; its pre-state snapshot is `pending - 1`.
         let mut pending: Option<u64> = None;
         let mut held: Option<StateSnapshot> = None;
         loop {
@@ -196,8 +197,8 @@ pub fn spawn_prover_spool(
                 if at == next - 1 {
                     held = Some(snap.clone());
                 } else if at >= next {
-                    // The settle sweep jumped past next-1: those pre-state
-                    // views are unreachable now (MVCC has no history API).
+                    // The settle sweep jumped past next-1. Those pre-state
+                    // views are unreachable now, since MVCC has no history API.
                     crate::metrics::counter_prover_skipped((at + 1) - next);
                     tracing::warn!(
                         from = next,
@@ -208,12 +209,13 @@ pub fn spawn_prover_spool(
                     held = None;
                     continue;
                 } else {
-                    continue; // snapshot still behind the pending block
+                    continue; // The snapshot is still behind the pending block.
                 }
             }
             let Some((_, env, records)) = flight.records_for(next) else {
-                // Records not executed yet (normal), or aged out of the
-                // ring (drop — the ring outpaced us).
+                // Either the records are not executed yet (normal), or
+                // they aged out of the ring, so drop them: the ring
+                // outpaced us.
                 if at >= next + 2 {
                     crate::metrics::counter_prover_skipped(1);
                     tracing::warn!(block = next, "prover spool: records aged out; dropped");
@@ -233,11 +235,11 @@ pub fn spawn_prover_spool(
                     );
                 }
                 Err(e) => {
-                    // An anchoring failure here is a REAL integrity signal
-                    // (the same classes the guest fail-stops on) — but the
-                    // spool is an observer, not a verifier seam: log loudly
-                    // and keep the chain alive; the verification paths own
-                    // fail-stop.
+                    // An anchoring failure here is a real integrity
+                    // signal, one of the same classes the guest stops on.
+                    // But the spool is an observer, not a verifier seam:
+                    // log it loudly and keep the chain alive. The
+                    // verification paths own the stop.
                     crate::metrics::counter_prover_failed();
                     tracing::error!(block = next, error = %e, "prover spool: block failed");
                 }

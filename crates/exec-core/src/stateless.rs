@@ -1,22 +1,23 @@
-//! The `no_std` block driver + the hardened stateless entry (spec:
-//! no-std-exec-core, phase 3).
+//! The `no_std` block driver, and the hardened stateless entry.
 //!
-//! [`execute_block`] is the single-scope sequential driver both live roles
-//! already used (hoisted verbatim from the validator so the zk guest links
-//! the exact production code path): one [`ExecScope`] per block, deposits
-//! folded into the scope cache so later txs observe their writes.
+//! [`execute_block`] is the single-scope sequential driver both live
+//! roles already use. It is hoisted verbatim from the validator, so the
+//! zk guest links the exact production code path: one [`ExecScope`] per
+//! block, with deposits folded into the scope cache so later txs observe
+//! their writes.
 //!
-//! [`execute_block_stateless`] is the GUEST shape: the same driver over a
-//! fail-closed [`WitnessDb`], with the trust boundary CLOSED. The live
-//! pipeline trusts `TxEnvelope.sender` / `tx_hash` from the proxy (S0); a
-//! proof cannot. Before executing, every tx record's identity is re-derived
-//! in-guest — `tx_hash = keccak256(raw_tx)` and `sender` recovered from the
-//! secp256k1 signature (pure-Rust k256) — and any mismatch aborts with
-//! [`ExecutorError::RecordIdentity`].
+//! [`execute_block_stateless`] is the guest shape: the same driver over a
+//! fail-closed [`WitnessDb`], with the trust boundary closed. The live
+//! pipeline trusts `TxEnvelope.sender` and `tx_hash` from the proxy; a
+//! proof cannot. Before executing, this re-derives every tx record's
+//! identity in-guest: `tx_hash = keccak256(raw_tx)`, and `sender`
+//! recovered from the secp256k1 signature (pure-Rust k256). Any mismatch
+//! aborts with [`ExecutorError::RecordIdentity`].
 //!
-//! Known gaps, deliberately NOT closed here (documented in the spec):
+//! Known gaps, left open on purpose (documented in the spec):
+//!
 //! - Deposits: `source_hash` derives from L1 data the guest does not yet
-//!   carry (deposit-derivation phases D/E) — deposit identity remains a
+//!   carry (deposit-derivation phases D and E). Deposit identity stays a
 //!   trusted input until the witness is L1-anchored.
 //! - The witness itself is unanchored until phase 3b (MPT proofs against
 //!   `pre_state_root`).
@@ -35,9 +36,10 @@ use crate::exec_types::TxIndex;
 use crate::executor::{ExecScope, decode_alloy_envelope, execute_deposit_tx};
 use crate::witness::WitnessDb;
 
-/// One canonical record of a block, in execution order. Clone is cheap:
-/// envelope/deposit byte payloads are refcounted `Bytes` (the validator's
-/// flight ring keeps recent blocks' records for receipt-divergence dumps).
+/// One canonical record of a block, in execution order. Clone is cheap.
+/// Envelope and deposit byte payloads are reference-counted `Bytes` (the
+/// validator's flight ring keeps recent blocks' records for
+/// receipt-divergence dumps).
 #[derive(Clone)]
 pub enum BufferedRecord {
     Tx {
@@ -53,26 +55,28 @@ pub enum BufferedRecord {
 }
 
 /// What a block-execution strategy returns: the block's receipts in block
-/// order (block-cumulative gas already correct) and its merged writes.
+/// order (with block-cumulative gas already correct), and its merged
+/// writes.
 #[derive(Debug)]
 pub struct BlockExecOutput {
     pub receipts: Vec<Receipt>,
     pub delta: PendingDelta,
-    /// EIP-7928 capture, when the strategy produced one (the executor's
-    /// parallel path captures per-tx fragments and folds them via
-    /// [`crate::bal_ladder::merge_bal_fragments`] so BAL publication
-    /// survives the strategy swap). `None` from strategies that never
-    /// publish (the validator verifies BALs, it does not emit them) and
-    /// from the sequential drivers, whose callers capture through
+    /// EIP-7928 capture, when the strategy produced one. The executor's
+    /// parallel path captures per-tx fragments and folds them through
+    /// [`crate::bal_ladder::merge_bal_fragments`], so BAL publication
+    /// survives a strategy swap. This is `None` for strategies that never
+    /// publish (the validator verifies BALs; it does not emit them), and
+    /// for the sequential drivers, whose callers capture through
     /// [`execute_block_with_bal`] instead.
     pub bal: Option<revm::state::bal::Bal>,
 }
 
-/// Execute a block's records sequentially over `snapshot ∘ parent`: ONE
-/// scope for the whole block, deposit writes folded into the scope cache so
-/// later txs observe them. This IS the validator's sequential re-execution
-/// path (`execute_block_sequential` delegates here) — and therefore the
-/// exact semantics a stateless replay must reproduce.
+/// Execute a block's records sequentially, over `snapshot` composed with
+/// `parent`. This uses one scope for the whole block, with deposit writes
+/// folded into the scope cache so later txs observe them. This is the
+/// validator's sequential re-execution path (`execute_block_sequential`
+/// delegates here), so it defines the exact semantics a stateless replay
+/// must reproduce.
 pub fn execute_block<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -82,15 +86,11 @@ pub fn execute_block<S: StateDatabase>(
     execute_block_inner(snapshot, parent, records, env, None).map(|(out, _)| out)
 }
 
-/// [`execute_block`] with EIP-7928 capture: also returns the block's raw
-/// (granularity-1) access list, built through the SAME per-tx capture hooks
-/// the live executor publishes from — `Bal::update_account` for txs,
-/// the synthetic-WriteSet path for deposits.
-/// [`execute_block`] with EIP-7928 capture kept in revm form: the output's
-/// `bal` field carries the block's `Bal` (granularity 1), ready for the
-/// executor's boundary handoff to the BAL publisher. This is the executor
-/// strategy's sequential/decline arm — same driver, same capture hooks as
-/// [`execute_block_with_bal`], different artifact form.
+/// [`execute_block`] with EIP-7928 capture, kept in revm form. The
+/// output's `bal` field carries the block's `Bal` (granularity 1), ready
+/// for the executor's boundary handoff to the BAL publisher. This is the
+/// executor strategy's sequential arm: same driver and capture hooks as
+/// [`execute_block_with_bal`], just a different output shape.
 pub fn execute_block_capture<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -103,6 +103,10 @@ pub fn execute_block_capture<S: StateDatabase>(
     Ok(out)
 }
 
+/// [`execute_block`] with EIP-7928 capture. This also returns the block's
+/// raw (granularity-1) access list, built through the same per-tx capture
+/// hooks the live executor publishes from: `Bal::update_account` for txs,
+/// and the synthetic-WriteSet path for deposits.
 pub fn execute_block_with_bal<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -155,18 +159,19 @@ fn execute_block_inner<S: StateDatabase>(
     ))
 }
 
-/// Execute ONE canonical record inside an existing block scope — the
-/// Tx-vs-Deposit dispatch every whole-block strategy shares. A Tx runs in
-/// the scope; a Deposit runs outside it (rare, own commit semantics) against
-/// `snapshot ∘ parent ∘ delta`, and its writes are folded into the scope
-/// cache so later records observe them. `delta` is the caller's accumulated
-/// block/batch delta; `parent` its seed layer.
+/// Execute one canonical record inside an existing block scope. This is
+/// the tx-versus-deposit dispatch that every whole-block strategy shares.
+/// A tx runs in the scope. A deposit runs outside it (rare, with its own
+/// commit semantics), against `snapshot` composed with `parent` and
+/// `delta`, and its writes are folded into the scope cache so later
+/// records observe them. `delta` is the caller's accumulated block or
+/// batch delta; `parent` is its seed layer.
 ///
-/// This is the single home of consensus-critical record dispatch: the
+/// This is the single home of consensus-critical record dispatch. The
 /// sequential driver above, the validator's parallel batches, and (through
 /// the driver) the zk guest all execute records through here.
-#[allow(clippy::too_many_arguments)] // mirrors execute_tx/execute_deposit_tx;
-// a params struct would rename the same nine fields without removing any.
+#[allow(clippy::too_many_arguments)] // mirrors execute_tx and execute_deposit_tx;
+// a params struct would just rename these nine fields, not reduce them.
 pub fn execute_record_in_scope<'a, S: StateDatabase>(
     scope: &mut ExecScope<&'a S>,
     snapshot: &'a S,
@@ -209,8 +214,8 @@ pub fn execute_record_in_scope<'a, S: StateDatabase>(
                 cumulative,
                 bal,
             )?;
-            // Fold deposit writes into the scope cache (mirrors the
-            // actor's streaming path) so later txs observe them.
+            // Fold deposit writes into the scope cache, mirroring the
+            // actor's streaming path, so later txs observe them.
             let mut layer = PendingDelta::new();
             layer.apply(out.1.clone());
             scope.seed_layer(&layer)?;
@@ -219,9 +224,9 @@ pub fn execute_record_in_scope<'a, S: StateDatabase>(
     }
 }
 
-/// Re-derive a tx record's identity from its raw bytes — the in-guest
-/// closure of the S0 trust boundary. The live pipeline takes
-/// `sender`/`tx_hash` from the proxy on faith; a proof must not.
+/// Re-derive a tx record's identity from its raw bytes. This closes the
+/// trust boundary in-guest. The live pipeline takes `sender` and
+/// `tx_hash` from the proxy on faith; a proof must not.
 pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError> {
     let computed_hash = keccak256(&envelope.raw_tx);
     if computed_hash != envelope.tx_hash {
@@ -243,20 +248,21 @@ pub fn verify_record_identity(envelope: &TxEnvelope) -> Result<(), ExecutorError
     Ok(())
 }
 
-/// The zk-guest execution shape, with the published BAL as a PROOF INPUT:
-/// verify every tx record's identity, execute the block over NOTHING but
-/// the witness, re-derive the access list through the live capture path,
-/// quantize it at the frame's granularity through the shared
-/// [`crate::bal_ladder`], and require structural equality with the input.
+/// The zk-guest execution shape, with the published BAL as a proof input.
+/// This verifies every tx record's identity, executes the block using
+/// only the witness, re-derives the access list through the live capture
+/// path, quantizes it at the frame's granularity through the shared
+/// [`crate::bal_ladder`], and requires structural equality with the
+/// input.
 ///
-/// Fail-closed three times over — identity forgery
+/// This fails closed in three ways: identity forgery
 /// ([`ExecutorError::RecordIdentity`]), witness incompleteness
 /// ([`crate::witness::WitnessError`] surfaced through execution), and BAL
-/// inequality ([`ExecutorError::Divergence`], the same class the live
-/// validator fail-stops on). On success the proof may bind
-/// [`bal_commitment`]`(expected_bal)` as a public output: the recomputed
-/// list is structurally equal, so the commitment attests the PUBLISHED
-/// artifact.
+/// inequality ([`ExecutorError::Divergence`], the same error class the
+/// live validator fail-stops on). On success, the proof may bind
+/// [`bal_commitment`]`(expected_bal)` as a public output. The recomputed
+/// list is structurally equal, so the commitment attests to the
+/// published artifact.
 pub fn execute_block_stateless(
     witness: &ExecutionWitness,
     parent: Option<&PendingDelta>,
@@ -270,7 +276,7 @@ pub fn execute_block_stateless(
             verify_record_identity(envelope)?;
         }
         // Deposits: identity stays a trusted input until the witness is
-        // L1-anchored (see module docs).
+        // L1-anchored. See the module docs.
     }
     let db = WitnessDb::from_witness(witness);
     let (out, raw_bal) = execute_block_with_bal(&db, parent, records, env)?;
@@ -289,11 +295,11 @@ pub fn execute_block_stateless(
     Ok(out)
 }
 
-/// The 3b proof shape: a stateless execution ANCHORED to the chain's root
-/// history. These are the proof's public outputs — an inductive chain from
-/// genesis: the L1 verifier holds the running root, checks
-/// `pre_state_root` continuity, `bal_commitment` against the posted frame,
-/// and advances to `post_state_root`.
+/// The phase-3b proof shape: a stateless execution anchored to the
+/// chain's root history. These fields are the proof's public outputs, an
+/// inductive chain from genesis. The L1 verifier holds the running root,
+/// checks `pre_state_root` continuity and `bal_commitment` against the
+/// posted frame, and advances to `post_state_root`.
 #[derive(Debug)]
 pub struct AnchoredBlockOutput {
     pub out: BlockExecOutput,
@@ -303,12 +309,12 @@ pub struct AnchoredBlockOutput {
     pub block_number: u64,
 }
 
-/// The FULL guest entry (spec: no-std-exec-core, phase 3b):
-/// [`execute_block_stateless`]'s three fail-closed layers (identity,
-/// witness completeness, BAL equality) plus the MPT anchor on both ends —
-/// the witness is proven against `pre_state_root` BEFORE the first EVM
-/// step, and the post-state root is recomputed from the carried node set
-/// after the last. A prover that fabricates state now has nowhere left to
+/// The full guest entry. This adds the
+/// MPT anchor on both ends to [`execute_block_stateless`]'s three
+/// fail-closed layers (identity, witness completeness, BAL equality). The
+/// witness is proven against `pre_state_root` before the first EVM step,
+/// and the post-state root is recomputed from the carried node set after
+/// the last step. A prover that fabricates state has nowhere left to
 /// stand: the witness must hash-link into a root the L1 already holds.
 pub fn execute_block_anchored(
     witness: &ExecutionWitness,
@@ -334,10 +340,10 @@ pub fn execute_block_anchored(
     })
 }
 
-/// Canonical commitment to a (quantized) access list: keccak256 of its RLP
-/// encoding — the SAME bytes the executor publishes in `BalFrame.bal_rlp`,
-/// so an L1 verifier can check the proof's public output against the posted
-/// frame without re-encoding.
+/// Canonical commitment to a (quantized) access list: keccak256 of its
+/// RLP encoding. These are the same bytes the executor publishes in
+/// `BalFrame.bal_rlp`, so an L1 verifier can check the proof's public
+/// output against the posted frame without re-encoding.
 pub fn bal_commitment(bal: &alloy_eip7928::BlockAccessList) -> alloy_primitives::B256 {
     use alloy_rlp::Encodable;
     let mut rlp = Vec::new();
@@ -345,8 +351,9 @@ pub fn bal_commitment(bal: &alloy_eip7928::BlockAccessList) -> alloy_primitives:
     keccak256(&rlp)
 }
 
-/// Name the first address where two access lists disagree (or the shape
-/// difference) — receipt-mismatch-grade diagnosability (#159's lesson).
+/// Name the first address where two access lists disagree, or describe
+/// the shape difference. This gives the same level of detail as a
+/// receipt-mismatch diagnostic.
 fn first_bal_difference(
     a: &alloy_eip7928::BlockAccessList,
     b: &alloy_eip7928::BlockAccessList,
@@ -368,8 +375,8 @@ mod tests {
     use super::*;
     use alloy_primitives::{Address, B256};
 
-    // A well-formed envelope for identity tests, signed with the anvil #0
-    // dev key (public, dev only).
+    // A well-formed envelope for identity tests. It is signed with
+    // anvil's dev key #0, which is public and for development only.
     fn honest_envelope() -> TxEnvelope {
         use alloy_consensus::{SignableTransaction, TxLegacy};
         use alloy_eips::eip2718::Encodable2718;

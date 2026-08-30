@@ -1,23 +1,25 @@
 //! Offline re-execution of an already-ordered L2 block stream.
 //!
-//! Reconstructs L2 state — and its canonical Ethereum MPT world-state root —
-//! from ordered transactions alone, with no Aeron substrate. This is the
-//! inverse of a live executor run: the DA-recovery path (`rebuild-from-L1`)
-//! decodes the blobs the batcher posted back into ordered blocks and drives
-//! them through here to rebuild a byte-identical state DB. It reuses the exact
-//! per-tx execution ([`execute_tx`]), delta accumulation, and trie-aware state
-//! writer the live executor/validator use, so the reconstructed state root
-//! matches the canonical chain's.
+//! This rebuilds L2 state, and its canonical Ethereum MPT world-state root,
+//! from ordered transactions alone, with no Aeron substrate. It is the
+//! inverse of a live executor run. The DA-recovery path (`rebuild-from-L1`)
+//! decodes the blobs the batcher posted, turns them back into ordered
+//! blocks, and drives them through here to rebuild a byte-identical state
+//! DB. It reuses the same per-tx execution ([`execute_tx`]), delta
+//! accumulation, and trie-aware state writer the live executor and
+//! validator use. So the reconstructed state root matches the canonical
+//! chain's root.
 //!
 //! ## Scope
 //!
-//! L2 transactions only. Deposits (L1-originated) are not carried in the DA
-//! payload — the batcher's `MultiArchiveReader` skips `DepositRef`s — so a
-//! block range that contains deposits cannot be reconstructed to a
-//! byte-identical root from blobs alone; that requires re-deriving deposits
-//! from L1 events (the `da_watcher` path) and interleaving them in canonical
-//! order, a documented follow-up. For deposit-free ranges (the common case,
-//! and everything the load harness produces) the reconstructed root is exact.
+//! This handles L2 transactions only. The DA payload does not carry
+//! deposits (L1-originated txs); the batcher's `MultiArchiveReader` skips
+//! `DepositRef`s. So a block range with deposits cannot reconstruct a
+//! byte-identical root from blobs alone. That needs re-deriving deposits
+//! from L1 events (the `da_watcher` path) and merging them back in
+//! canonical order. This is a documented follow-up. For deposit-free ranges
+//! (the common case, and everything the load harness produces), the
+//! reconstructed root is exact.
 
 use alloy_primitives::B256;
 use kardamom_state::{StateEnv, StateWriter, TrieMode, seed_genesis};
@@ -32,12 +34,12 @@ use crate::exec_types::TxIndex;
 use crate::executor::execute_tx;
 use crate::persist::{MdbxSnapshotSource, MdbxWriterQueue, MdbxWriterSignal};
 
-/// One block to re-execute: boundary metadata + its ordered transactions.
+/// One block to re-execute: its boundary metadata and ordered transactions.
 ///
-/// The transaction list is the block's canonical order (as recovered from the
-/// DA payload). `sender`/`tx_hash` on each [`TxEnvelope`] are trusted exactly
-/// as they are on the hot path — the proxy stamped them at the system boundary
-/// and they were preserved through the DA round-trip.
+/// The transaction list is the block's canonical order, as recovered from
+/// the DA payload. Each [`TxEnvelope`]'s `sender` and `tx_hash` are trusted
+/// as-is, the same as on the hot path. The proxy stamped them at the system
+/// boundary, and the DA round-trip preserved them.
 #[derive(Clone, Debug)]
 pub struct ReplayBlock {
     pub block_number: u64,
@@ -65,9 +67,9 @@ pub enum ReplayError {
     State(#[from] kardamom_state::StateError),
     #[error("execution: {0}")]
     Execution(#[from] crate::error::ExecutorError),
-    /// The writer committed but persisted no state root — it was spawned with
-    /// `TrieMode::Off`. `replay_blocks` always uses `Incremental`, so this only
-    /// fires if the invariant is broken.
+    /// The writer committed, but stored no state root. This means it was
+    /// spawned with `TrieMode::Off`. `replay_blocks` always uses
+    /// `Incremental`, so this fires only if that invariant breaks.
     #[error("reconstruction produced no state root")]
     NoStateRoot,
 }
@@ -80,24 +82,24 @@ struct Counters {
     txs_applied: u64,
     /// Executor-local sanity counter (mirrors the live tx_ordering reader).
     tx_idx: u64,
-    /// Synthetic canonical position. Neither this nor `tx_idx` feed the state
-    /// trie (only accounts/storage/code writes do), so any monotonic sequence
-    /// yields the same reconstructed root; we keep them consistent so the
-    /// per-tx receipts we build are internally coherent.
+    /// Synthetic canonical position. Neither this nor `tx_idx` feeds the state
+    /// trie; only account, storage, and code writes do. So any monotonic
+    /// sequence gives the same reconstructed root. We keep them consistent so
+    /// the per-tx receipts stay internally coherent.
     global_pos: u64,
 }
 
-/// Re-execute `blocks` (in canonical order) into the state DB at `env`, seeding
-/// `genesis_accounts` / `genesis_code` first.
+/// Re-execute `blocks`, in canonical order, into the state DB at `env`.
+/// This seeds `genesis_accounts` and `genesis_code` first.
 ///
-/// `env` should be a fresh state DB (a from-scratch reconstruction). Seeding is
-/// idempotent — an already-seeded env is left untouched — so re-running against
-/// a partially-built DB is safe as long as the genesis matches. Returns the
-/// head block and its canonical state root; the state DB at `env` is left fully
-/// populated on success.
+/// `env` should be a fresh state DB, for a from-scratch reconstruction.
+/// Seeding is idempotent: an already-seeded env is left untouched. So
+/// re-running against a partly built DB is safe, as long as the genesis
+/// matches. This returns the head block and its canonical state root. On
+/// success, the state DB at `env` is fully populated.
 ///
-/// `chain_id` must match the chain being reconstructed (it feeds every tx's
-/// `CfgEnv`); a mismatch silently produces a different — wrong — root.
+/// `chain_id` must match the chain being reconstructed; it feeds every tx's
+/// `CfgEnv`. A mismatch silently produces a different, wrong, root.
 pub fn replay_blocks<I>(
     env: StateEnv,
     chain_id: u64,
@@ -109,15 +111,15 @@ where
     I: IntoIterator<Item = ReplayBlock>,
 {
     // Genesis must be in place before the writer publishes its initial
-    // snapshot, so block 1 already has accounts to debit.
+    // snapshot. Then block 1 already has accounts to debit.
     seed_genesis(&env, genesis_accounts, genesis_code)?;
 
     let handle = StateWriter::spawn_with_trie(env, TrieMode::Incremental)?;
 
     let mut counters = Counters::default();
-    // The writer adapters live inside this helper scope: everything holding a
-    // delta sender drops at its end, which is what lets the writer thread
-    // exit — `handle.shutdown()` below joins it and would deadlock while any
+    // The writer adapters live inside this scope. Everything holding a delta
+    // sender drops at the end of the scope. This lets the writer thread exit.
+    // `handle.shutdown()` below joins the thread. It would deadlock if any
     // sender were still alive.
     let (drive, root) = {
         let mut queue = MdbxWriterQueue::new(handle.delta_tx.clone());
@@ -133,15 +135,15 @@ where
             &mut counters,
         );
 
-        // Read the final root while the drive succeeded and before tearing
-        // down.
+        // Read the final root only if the drive succeeded, and before
+        // tearing down.
         let root = match &drive {
             Ok(()) => source
                 .snapshot_after(counters.head)
                 .state_root()
                 .map_err(ReplayError::from)
                 .and_then(|o| o.ok_or(ReplayError::NoStateRoot)),
-            Err(_) => Ok(B256::ZERO), // unused; `drive?` below returns first
+            Err(_) => Ok(B256::ZERO), // unused: `drive?` below returns the error first
         };
         (drive, root)
     };
@@ -159,9 +161,9 @@ where
     })
 }
 
-/// Inner loop: execute each block's txs, submit the block delta, wait for the
-/// durable commit. Borrows the adapters so the caller can always tear the
-/// writer down afterwards regardless of outcome.
+/// Inner loop. It executes each block's txs, submits the block delta, and
+/// waits for the durable commit. It borrows the adapters, so the caller can
+/// always tear down the writer afterward, no matter the outcome.
 fn drive_blocks<I>(
     queue: &mut MdbxWriterQueue,
     signal: &mut MdbxWriterSignal,
@@ -174,9 +176,10 @@ where
     I: IntoIterator<Item = ReplayBlock>,
 {
     for block in blocks {
-        // Snapshot after the previously-committed block (genesis before the
-        // first). `wait_committed` below keeps the published snapshot anchored
-        // at `counters.head`, so this is exactly the pre-block state view.
+        // Take the snapshot after the previously committed block, or genesis
+        // for the first block. `wait_committed` below keeps the published
+        // snapshot anchored at `counters.head`. So this is exactly the
+        // pre-block state view.
         let snapshot = source.snapshot_after(counters.head);
         let exec_env = ExecEnv {
             chain_id,
@@ -189,8 +192,8 @@ where
         let mut cumulative_gas = 0u64;
         for (i, tx) in block.txs.iter().enumerate() {
             let tx_position = BPosition::from_index(counters.global_pos);
-            // Replay executes one durably-committed block at a time against
-            // its own committed snapshot — no pipelined parent layer.
+            // Replay executes one durably committed block at a time against
+            // its own committed snapshot. There is no pipelined parent layer.
             let (receipt, ws) = execute_tx(
                 &snapshot,
                 None,
@@ -211,12 +214,12 @@ where
             counters.txs_applied += 1;
         }
 
-        // Same block-close protocol actions the live engine runs, through the
-        // same shared implementation — a reconstructor that skipped them would
-        // rebuild a chain whose state diverges from the canonical one the
-        // moment any feature is active. Replay commits one block at a time
-        // against its own committed snapshot, so there is no parent layer to
-        // consult: `delta` then snapshot.
+        // This runs the same block-close protocol actions as the live
+        // engine, through the same shared implementation. A reconstructor
+        // that skipped them would build a chain whose state diverges from
+        // the canonical one as soon as any feature is active. Replay commits
+        // one block at a time against its own committed snapshot, so there
+        // is no parent layer to check: use `delta`, then the snapshot.
         kardamom_exec_core::features::apply_block_close_actions(
             &mut delta,
             block.block_number,
@@ -236,9 +239,9 @@ where
             end_tx_idx: BPosition::from_index(counters.global_pos),
             l2_timestamp: block.l2_timestamp,
             // Offline replay reconstructs from the DA payload, which does not
-            // carry the origin yet (KAR2 adds it — see the deposit-derivation
-            // spec). Zero here is honest: reconstruction currently derives no
-            // deposits, so no block it builds has an epoch to point at.
+            // carry the origin yet (KAR2 adds it; see the deposit-derivation
+            // spec). Zero here is correct: reconstruction derives no deposits
+            // yet, so no block it builds has an epoch to point at.
             l1_origin: 0,
         };
         queue.submit(boundary, block_delta)?;
@@ -266,8 +269,9 @@ mod tests {
 
     const CHAIN_ID: u64 = 1;
 
-    /// Build a signed legacy transfer wrapped as a `kardamom_types::TxEnvelope`,
-    /// exactly as the proxy would hand it downstream (sender + tx_hash stamped).
+    /// Build a signed legacy transfer, wrapped as a `kardamom_types::TxEnvelope`.
+    /// This matches what the proxy hands downstream, with `sender` and
+    /// `tx_hash` stamped.
     fn transfer(signer: &PrivateKeySigner, to: Address, nonce: u64, value: u64) -> TxEnvelope {
         let mut tx = TxLegacy {
             chain_id: Some(CHAIN_ID),
@@ -347,7 +351,7 @@ mod tests {
         assert_eq!(outcome.txs_applied, 3);
         assert_ne!(outcome.state_root, empty_root());
 
-        // Balances reflect the exact transfers (gas_price 0 ⇒ no fee burn).
+        // Balances reflect the exact transfers. Gas price is 0, so there is no fee burn.
         let snap = StateSnapshot::open(&env).unwrap();
         assert_eq!(snap.block_number(), 2);
         assert_eq!(snap.basic(to1).unwrap().unwrap().1, U256::from(125u64)); // 100 + 25
@@ -388,8 +392,8 @@ mod tests {
         )
         .unwrap();
 
-        // Same inputs ⇒ byte-identical reconstructed root. This is the property
-        // the DA round-trip relies on.
+        // Same inputs give a byte-identical reconstructed root. This is the
+        // property the DA round-trip depends on.
         assert_eq!(r1.state_root, r2.state_root);
         assert_eq!(r1.head_block, r2.head_block);
     }

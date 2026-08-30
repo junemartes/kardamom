@@ -1,15 +1,16 @@
-//! `kardamom-load` — open-loop sustained-load + chaos verification harness.
+//! `kardamom-load` is an open-loop sustained-load and chaos verification
+//! harness.
 //!
-//! Drives a pre-generated transaction stream through ingress at a paced rate,
-//! tracks every tx to a receipt (must-deliver), scrapes the cluster's
-//! Prometheus metrics for drop/liveness signals, and renders a pass/fail
-//! verdict. Two shapes:
-//! - **soak** (default): ramp to the sustainable max, then soak at a fraction
-//!   of it for `duration`.
-//! - **chaos** (`--chaos-mode`): skip the ramp, soak at `target_tps` for
-//!   `duration` while an external orchestrator injects failures; transient
-//!   gaps/outages are informational, only never-recovering executors and
-//!   undelivered receipts fail.
+//! It drives a pre-generated transaction stream through ingress at a
+//! paced rate, tracks every transaction to a receipt (must-deliver),
+//! reads the cluster's Prometheus metrics for drop and liveness
+//! signals, and renders a pass-fail verdict. It runs in two modes:
+//! - soak (the default): ramp to the sustainable maximum rate, then
+//!   soak at a fraction of it for `duration`.
+//! - chaos (`--chaos-mode`): skip the ramp, and soak at `target_tps`
+//!   for `duration` while an external orchestrator injects failures.
+//!   A transient gap or outage is only informational. Only a
+//!   never-recovering executor or an undelivered receipt fails the run.
 
 pub mod accounting;
 pub mod config;
@@ -43,7 +44,8 @@ pub(crate) fn hex_u64(s: &str) -> Option<u64> {
     u64::from_str_radix(s.trim_start_matches("0x"), 16).ok()
 }
 
-/// [`hex_u64`] over a JSON string field (`Null`/missing/non-string → `None`).
+/// Apply [`hex_u64`] to a JSON string field. Returns `None` for a null,
+/// missing, or non-string value.
 pub(crate) fn json_hex_u64(v: &serde_json::Value) -> Option<u64> {
     v.as_str().and_then(hex_u64)
 }
@@ -89,12 +91,13 @@ fn per_sender_estimate(cfg: &LoadConfig) -> usize {
     ((est_total as f64 * 1.2 / f64::from(cfg.senders.max(1))).ceil() as usize) + 64
 }
 
-/// Run the harness; returns whether the verdict passed.
+/// Run the harness. Returns whether the verdict passed.
 ///
 /// # Errors
-/// Errors on client construction, chain-id preflight, signer derivation, or
-/// pre-generation failures. A failing *verdict* is not an error — it returns
-/// `Ok(false)` so the caller can choose the exit code.
+/// Returns an error on client construction failure, chain-id preflight
+/// failure, signer derivation failure, or pre-generation failure. A
+/// failing verdict is not an error: this function returns `Ok(false)`
+/// so the caller can choose the exit code.
 pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     let client = Arc::new(
         HttpClientBuilder::default()
@@ -155,9 +158,10 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     };
     let mut queues = Queues::new(queues_vec);
 
-    // DeFi setup: land the three deployments before any load — every
-    // workload call targets their computed addresses, so a call arriving
-    // before its contract exists would revert and poison the verdict.
+    // DeFi setup: land the three deployments before any load starts.
+    // Every workload call targets their computed addresses. A call
+    // that arrives before its contract exists would revert and
+    // spoil the verdict.
     if let Some(deploys) = defi_deploys {
         defi::deploy_and_confirm(&client, &deploys).await?;
     }
@@ -166,9 +170,10 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     let tracker = Arc::new(Tracker::new()?);
     let sem = Arc::new(Semaphore::new(cfg.max_in_flight.max(1) as usize));
     let mut tasks = tokio::task::JoinSet::new();
-    // Outside chaos the ingress receipt cache is stable (no restarts), so an
-    // accepted tx whose receipt can't be re-fetched is a real must-deliver
-    // violation rather than restart noise — verify independently.
+    // Outside chaos mode, the ingress receipt cache is stable, with no
+    // restarts. So an accepted transaction whose receipt cannot be
+    // re-fetched is a real must-deliver violation, not restart noise.
+    // Verify it independently.
     let verify_receipts = !cfg.chaos_mode;
     let mode = if cfg.subscribe {
         SubmitMode::Subscribe
@@ -176,11 +181,11 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
         SubmitMode::Blocking
     };
 
-    // Receipts arrive on one multiplexed WebSocket feed (filtered to this
-    // run's senders): in subscribe mode instead of on each submit's parked
-    // connection, and in blocking mode (feed_confirm) instead of a per-tx
-    // re-fetch after each accepted submit. Runs for the whole ramp + soak;
-    // aborted after the drain.
+    // Receipts arrive on one multiplexed WebSocket feed, filtered to this
+    // run's senders. In subscribe mode, this replaces each submit's
+    // parked connection. In blocking mode (feed_confirm), it replaces a
+    // per-transaction re-fetch after each accepted submit. The feed runs
+    // for the whole ramp and soak, and stops after the drain.
     let feed_confirm = cfg.feed_confirm && !cfg.subscribe;
     let feed = if cfg.subscribe || feed_confirm {
         let ws_url = cfg.rpc.replacen("http", "ws", 1);
@@ -193,11 +198,12 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     } else {
         None
     };
-    // Backstop the feed with a live sweeper: entries the feed misses are
-    // re-fetched within 2-7s instead of at the end-of-run drain. The
-    // cadence must sit WELL inside the ingress receipt cache's query
-    // horizon (capacity / rate — ~27s at 4,800 tx/s with the 128k default,
-    // and eviction is arbitrary, so late polls miss even younger entries).
+    // Back up the feed with a live sweeper. An entry the feed misses is
+    // re-fetched within 2 to 7 seconds, instead of waiting for the
+    // end-of-run drain. Keep this cadence well inside the ingress receipt
+    // cache's query horizon (capacity divided by rate, about 27 seconds at
+    // 4,800 tx/s with the default 128k capacity). Eviction order is
+    // arbitrary, so a late poll can miss even a younger entry.
     let sweeper = feed.as_ref().map(|_| {
         engine::spawn_pending_sweeper(
             Arc::clone(&client),
@@ -255,9 +261,9 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     )
     .await;
 
-    // Join the in-flight submit tasks (so the tail is classified, not merely
-    // "offered"), drain the receipt tail, then a short settle before the
-    // final read.
+    // Join the in-flight submit tasks, so the tail is classified and not
+    // left as merely "offered". Then drain the receipt tail, and wait a
+    // short settle time before the final read.
     let deadline = Instant::now() + cfg.drain_timeout;
     join_submit_tasks(&mut tasks, deadline).await;
     drain(Arc::clone(&client), Arc::clone(&tracker), deadline).await;
@@ -269,10 +275,11 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
     }
     tokio::time::sleep(Duration::from_secs(3)).await;
     let fin = scraper.snapshot().await;
-    // A chaos-restarted executor's block gauge resets to 0, so `final − base`
-    // can be ≤ 0 while it is healthily replaying. Take a recheck sample a few
-    // seconds later so `evaluate` can tell RECOVERING (gauge moving again)
-    // from FROZEN.
+    // A chaos-restarted executor's block gauge resets to 0. So
+    // `final - base` can be zero or negative while it is replaying in a
+    // healthy way. Take a recheck sample a few seconds later, so
+    // `evaluate` can tell RECOVERING, where the gauge moves again, from
+    // FROZEN.
     let recheck = if cfg.chaos_mode {
         tokio::time::sleep(Duration::from_secs(3)).await;
         Some(scraper.snapshot().await)
@@ -293,8 +300,9 @@ pub async fn run(cfg: LoadConfig) -> anyhow::Result<bool> {
             );
         }
     }
-    // In `Offered` mode an unlanded (offered-but-never-receipted) tx is also a
-    // must-deliver violation; fold it into `missing` for the gate.
+    // In `Offered` mode, an unlanded transaction, one that was offered but
+    // never receipted, is also a must-deliver violation. Fold it into
+    // `missing` for the gate.
     let missing_gate = if cfg.completeness == Completeness::Offered {
         missing + unlanded
     } else {
@@ -401,11 +409,11 @@ async fn ramp_to_max(
         } else {
             0.0
         };
-        // Subscribe mode: an ack means *published*, not *receipted*, so the
-        // accept ratio alone would let the ramp sail past the pipeline's
-        // drain rate (admission stays 1.0 while receipts queue). Require
-        // receipts to keep pace with offers within the step, with slack for
-        // the in-flight tail at the step boundary.
+        // In subscribe mode, an ack means published, not receipted. So the
+        // accept ratio alone would let the ramp go past the pipeline's
+        // drain rate, because admission stays at 1.0 while receipts queue
+        // up. Require receipts to keep pace with offers within the step,
+        // with slack for the in-flight tail at the step boundary.
         #[allow(clippy::cast_precision_loss)]
         let recv_ok = if mode == SubmitMode::Subscribe && offered > 0 {
             let receipted = after.receipted - before.receipted;

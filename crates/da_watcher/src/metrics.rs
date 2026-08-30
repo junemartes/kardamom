@@ -1,15 +1,16 @@
-//! DA-watcher metric names + registration.
+//! DA-watcher metric names and registration.
 //!
-//! The binary owns the exporter (via `kardamom_obs::init`); this module just
-//! declares the canonical constant names and the `describe` call that
-//! registers human-readable help strings with the Prometheus recorder.
+//! The binary owns the exporter, through `kardamom_obs::init`. This module
+//! only declares the canonical constant names and the `describe` call that
+//! registers help strings with the Prometheus recorder.
 
 pub const L1_FINALIZED: &str = "kardamom_da_watcher_l1_finalized_block_number";
 pub const DEPOSITS_DETECTED_TOTAL: &str = "kardamom_da_watcher_deposits_detected_total";
 pub const TICK_TOTAL: &str = "kardamom_da_watcher_tick_total";
 pub const EPOCHS_PUBLISHED_TOTAL: &str = "kardamom_da_watcher_epochs_published_total";
-/// Highest L1 block number the watcher has published an epoch for. Together
-/// with `L1_FINALIZED` this is the origin lag — the rule-5 liveness alarm.
+/// Highest L1 block number the watcher has published an epoch for. With
+/// `L1_FINALIZED`, this gives the origin lag used by the rule-5 liveness
+/// alarm.
 pub const EPOCH_ORIGIN: &str = "kardamom_da_watcher_epoch_origin_block_number";
 
 pub fn describe() {

@@ -1,40 +1,41 @@
-//! Block-at-a-time Block-STM execution for the EXECUTOR role
+//! Block-at-a-time Block-STM execution for the executor role
 //! (`--parallel-execution`; scheduler unification B2).
 //!
 //! The engine's exec thread buffers a block's records and hands them to a
-//! [`BlockExec`] strategy at the boundary — the same seam the validator's
-//! parallel verification uses. This module's strategy sends each block to a
-//! **pool-server thread** that owns a persistent [`kardamom_stm`] worker
-//! pool (`with_pool` is scoped and its handle borrows, so it cannot be
-//! captured in the `'static` strategy closure — the server thread is the
-//! bridge, and the STM engine's internals stay untouched).
+//! [`BlockExec`] strategy at the boundary. This is the same seam the
+//! validator's parallel verification uses. This module's strategy sends
+//! each block to a pool-server thread that owns a persistent
+//! [`kardamom_stm`] worker pool. (`with_pool` is scoped and its handle
+//! borrows, so it cannot be captured in the `'static` strategy closure.
+//! The server thread is the bridge, and the STM engine's internals stay
+//! untouched.)
 //!
 //! ## Deposits: segmentation
 //!
-//! The STM engine executes transactions only. A block's records are split
+//! The STM engine executes transactions only. A block's records split
 //! into maximal Tx-runs and Deposit singletons at their canonical
-//! positions: Tx-runs execute on the pool (base = the actor's parent
-//! layer, prior segments layered above it), deposits execute serially
-//! through the same [`execute_record_in_scope`] deposit arm the streaming
-//! path uses, and every segment's delta becomes a read layer for the
-//! next. Indices and cumulative gas are block-global throughout: the
+//! positions. Tx-runs execute on the pool (the base layer is the actor's
+//! parent layer, with prior segments layered above it). Deposits execute
+//! serially through the same [`execute_record_in_scope`] deposit arm the
+//! streaming path uses. Every segment's delta becomes a read layer for
+//! the next. Indices and cumulative gas stay block-global throughout: the
 //! strategy re-derives both across segments in one final pass, exactly
 //! like the validator's batch fold.
 //!
 //! ## BAL parity (merge gate)
 //!
-//! With BAL publication on, the strategy's output MUST be wire-identical
-//! to the streaming capture — the validator cross-checks the published
-//! artifact. Tx fragments are captured inside the STM engine at
-//! block-global indices (fee sink materialized in its commit pass, wound
-//! repairs re-captured canonically), deposits capture through the shared
-//! deposit path, and [`merge_bal_fragments`] folds everything in
-//! canonical order.
+//! With BAL publication on, the strategy's output must be wire-identical
+//! to the streaming capture, because the validator cross-checks the
+//! published artifact. Tx fragments are captured inside the STM engine
+//! at block-global indices (the fee sink is materialized in its commit
+//! pass, and wound repairs are re-captured canonically). Deposits
+//! capture through the shared deposit path, and [`merge_bal_fragments`]
+//! folds everything in canonical order.
 //!
 //! ## Decline gate
 //!
-//! Small/cheap blocks skip the pool entirely (`parallel_worth_it`) and run
-//! the sequential capture driver — which still teaches the gate
+//! Small and cheap blocks skip the pool entirely (`parallel_worth_it`)
+//! and run the sequential capture driver. This still teaches the gate
 //! (`learn_sequential`), so a pool that saw cheap transfers re-enters
 //! parallel execution when heavier blocks arrive.
 
@@ -63,7 +64,7 @@ struct BlockRequest<S> {
     reply: Sender<Result<BlockExecOutput, ExecutorError>>,
 }
 
-/// Executor-facing STM configuration (CLI → pool).
+/// Executor-facing STM configuration (from the CLI to the pool).
 #[derive(Debug, Clone)]
 pub struct StmExecConfig {
     pub workers: usize,
@@ -71,10 +72,10 @@ pub struct StmExecConfig {
     pub keep_hot: bool,
 }
 
-/// Spawn the pool-server thread and return the [`BlockExec`] strategy that
-/// feeds it. The pool (workers, tail lanes, reaper) lives for the server
-/// thread's lifetime; dropping the strategy closes the request channel and
-/// shuts the server down.
+/// Spawn the pool-server thread, and return the [`BlockExec`] strategy
+/// that feeds it. The pool (workers, tail lanes, reaper) lives for the
+/// server thread's lifetime. Dropping the strategy closes the request
+/// channel and shuts the server down.
 pub fn stm_block_exec<S>(cfg: StmExecConfig) -> BlockExec<S>
 where
     S: StateDatabase + Clone + Sync + 'static,
@@ -121,17 +122,17 @@ fn pool_server<S: StateDatabase + Clone + Sync + 'static>(
         keep_hot: cfg.keep_hot,
         ..PoolConfig::default()
     };
-    // Footprint stats persist across blocks: each block's observed write
-    // sets train the next block's predictions (cold start is serial-heavy;
-    // the decline gate covers it).
+    // Footprint stats persist across blocks. Each block's observed write
+    // sets train the next block's predictions (cold start is
+    // serial-heavy; the decline gate covers it).
     let stats = Stats::default();
     let workers = pool_cfg.workers;
     with_pool::<S, _>(pool_cfg, |pool| {
         while let Ok(req) = rx.recv() {
             let out = run_one(pool, workers, &stats, &req);
             if req.reply.send(out).is_err() {
-                // Strategy gone mid-shutdown; keep draining until the
-                // request channel closes.
+                // The strategy is gone mid-shutdown. Keep draining until
+                // the request channel closes.
             }
         }
     });
@@ -194,10 +195,10 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
         });
     }
 
-    // Decline gate: same statistic, same threshold, same learning
-    // discipline as the pool's own gate — the sequential arm here is the
-    // shared capture driver (deposits included), so no segmentation and
-    // no fixups are needed.
+    // Decline gate: same statistic, same threshold, and same learning
+    // discipline as the pool's own gate. The sequential arm here is the
+    // shared capture driver (deposits included), so it needs no
+    // segmentation and no fixups.
     if !pool.parallel_worth_it() {
         let started = Instant::now();
         let out = execute_block_capture(&req.snapshot, req.parent.as_ref(), &req.records, req.env);
@@ -213,9 +214,9 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
     for seg in segment(&req.records) {
         match seg {
             Segment::Txs { start, txs } => {
-                // One INDEPENDENT snapshot per worker (fork_view); a
-                // refused fork shares the strategy's view — correct,
-                // merely serialized — and is counted.
+                // One independent snapshot per worker (`fork_view`). A
+                // refused fork shares the strategy's view: correct, but
+                // serialized, and it is counted.
                 let snapshots: Vec<S> = (0..workers)
                     .map(|_| {
                         req.snapshot.fork_view().unwrap_or_else(|| {
@@ -225,9 +226,9 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                         })
                     })
                     .collect();
-                // Read stack: base = the actor's parent layer (unsettled
-                // predecessor blocks), prior segments layered NEWEST
-                // FIRST above it.
+                // Read stack: the base layer is the actor's parent layer
+                // (unsettled predecessor blocks). Prior segments layer
+                // above it, newest first.
                 let base = req.parent.clone().unwrap_or_default();
                 let layers: Vec<_> = seg_layers.iter().rev().cloned().collect();
                 let mut session =
@@ -243,7 +244,7 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                         "stm: wound repaired during parallel execution"
                     );
                 }
-                // Receipts come back run-local; re-derive block-global
+                // Receipts come back run-local. Re-derive block-global
                 // transaction_index and cumulative gas in arrival order.
                 for (j, mut r) in out.receipts.into_iter().enumerate() {
                     r.transaction_index = start + j as u64;
@@ -255,9 +256,10 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                 seg_layers.push(std::sync::Arc::new(out.delta));
             }
             Segment::Deposit { at, rec } => {
-                // The streaming deposit path, verbatim: execute outside
-                // the scope against snapshot ∘ (parent ∘ prior segments),
-                // capture at the block-global index.
+                // The streaming deposit path, unchanged: execute outside
+                // the scope against the snapshot layered with the parent
+                // and prior segments, and capture at the block-global
+                // index.
                 let mut merged = req.parent.clone().unwrap_or_default();
                 for l in seg_layers.iter() {
                     merged.merge_from(l);
@@ -287,9 +289,9 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
         }
     }
 
-    // Block delta: the segments' writes folded in canonical order (the
-    // parent layer stays OUT — the exec thread owns cross-block
-    // accounting; double-counting it is a silent divergence).
+    // Block delta: the segments' writes folded in canonical order. The
+    // parent layer stays out, because the exec thread owns cross-block
+    // accounting; double-counting it would be a silent divergence.
     let mut delta = PendingDelta::new();
     for l in seg_layers.iter() {
         delta.merge_from(l);

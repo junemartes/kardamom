@@ -1,13 +1,13 @@
-//! End-to-end smoke test for `kardamom_obs::init`: spin up the exporter on an
-//! ephemeral port, scrape `/metrics`, and assert the heartbeat + build_info
-//! show up with the correct global labels.
+//! End-to-end smoke test for `kardamom_obs::init`: start the exporter on an
+//! ephemeral port, scrape `/metrics`, and check that the heartbeat and
+//! build_info show up with the correct global labels.
 
 use std::net::{SocketAddr, TcpListener};
 
 fn free_port() -> SocketAddr {
     let l = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = l.local_addr().expect("local_addr");
-    // Dropping the listener releases the port before the exporter binds it.
+    // Drop the listener to release the port before the exporter binds it.
     drop(l);
     addr
 }
@@ -18,7 +18,7 @@ async fn init_exposes_build_info_and_service_up() {
     kardamom_obs::init("test-service", addr, "test-host", "0.0.0", "deadbeef")
         .expect("init succeeds on a free port");
 
-    // The exporter binds asynchronously — give it a short retry budget.
+    // The exporter binds asynchronously, so give it a short retry budget.
     let url = format!("http://{}/metrics", addr);
     let body = scrape_with_retry(&url).await;
 

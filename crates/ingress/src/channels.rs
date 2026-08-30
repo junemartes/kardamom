@@ -1,14 +1,15 @@
-//! Pub/sub trait surface the proxy talks to.
+//! Pub/sub trait surface that the proxy talks to.
 //!
-//! In production these traits will be implemented by adapters that wrap the
-//! real Aeron publishers/subscribers from [`log`]. For unit and
-//! integration tests we provide [`MockChannels`], a fully in-process
-//! implementation that uses `tokio::sync::mpsc` (for partition publish, which
-//! has a single consumer per partition) and `tokio::sync::broadcast` (for the
-//! tx_receipts / quorum-watermark / block-boundary fan-out streams).
+//! In production, adapters implement these traits. The adapters wrap the
+//! real Aeron publishers and subscribers from [`log`]. For unit and
+//! integration tests, this crate provides [`MockChannels`], a fully
+//! in-process implementation. It uses `tokio::sync::mpsc` for partition
+//! publish, which has a single consumer per partition, and
+//! `tokio::sync::broadcast` for the tx_receipts, quorum-watermark, and
+//! block-boundary fan-out streams.
 //!
-//! Wire types come exclusively from [`types`]; this
-//! module defines **no new wire types**.
+//! Wire types come only from [`types`]. This module defines no new wire
+//! types.
 
 use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
@@ -20,46 +21,50 @@ use kardamom_types::{
 use crate::error::IngressError;
 
 /// Publisher surface. The proxy writes validated `TxEnvelope`s onto the
-/// sender-sharded tx_data streams (`partition_for(envelope.sender, K)`
-/// gives the shard index).
+/// sender-sharded tx_data streams. `partition_for(envelope.sender, K)`
+/// gives the shard index.
 #[async_trait]
 pub trait IngressPublication: Send + Sync + 'static {
-    /// Publish `envelope` onto `channel_A[shard]`. Multiple proxies can
-    /// concurrently publish to the same shard's A stream — Aeron's shared
-    /// publication semantics serialize them into one canonical byte order.
+    /// Publishes `envelope` onto `channel_A[shard]`. Multiple proxies can
+    /// publish to the same shard's A stream at the same time. Aeron's
+    /// shared publication semantics put them into one canonical byte
+    /// order.
     async fn publish_tx_data(&self, shard: usize, envelope: TxEnvelope)
     -> Result<(), IngressError>;
 }
 
 /// Subscriber surface. The proxy subscribes to the tx_receipts `Receipt`
-/// stream (drives the in-memory tx_hash / (sender, nonce) indexes and client
-/// release), the quorum-watermark stream (for ack gating), and the
-/// tx_receipts `BlockBoundary` stream (for `eth_blockNumber`).
+/// stream, which drives the in-memory tx_hash and (sender, nonce) indexes
+/// and client release; the quorum-watermark stream, for ack gating; and
+/// the tx_receipts `BlockBoundary` stream, for `eth_blockNumber`.
 pub trait IngressSubscription: Send + Sync + 'static {
     /// Stream of enriched `Receipt`s observed on tx_receipts. Drives the
-    /// in-memory `tx_hash → Receipt` and `(sender, nonce) → Receipt` indexes
-    /// and releases parked client submissions in `PendingReceipts`.
+    /// in-memory `tx_hash -> Receipt` and `(sender, nonce) -> Receipt`
+    /// indexes, and releases parked client submissions in
+    /// `PendingReceipts`.
     fn subscribe_receipts(&self) -> broadcast::Receiver<Receipt>;
     /// Stream of `QuorumWatermark` snapshots.
     fn subscribe_watermark(&self) -> broadcast::Receiver<QuorumWatermark>;
-    /// Stream of `FsyncWatermark` snapshots from the *local* recorder
-    /// (the per-recorder watermark stream for the host this proxy runs on).
-    /// Used by ack policies that gate on local fsync.
+    /// Stream of `FsyncWatermark` snapshots from the local recorder: the
+    /// per-recorder watermark stream for the host this proxy runs on.
+    /// Ack policies that gate on local fsync use this.
     fn subscribe_local_fsync_watermark(&self) -> broadcast::Receiver<FsyncWatermark>;
-    /// Stream of `BlockBoundary` markers on tx_receipts; backs `eth_blockNumber`.
+    /// Stream of `BlockBoundary` markers on tx_receipts. Backs
+    /// `eth_blockNumber`.
     fn subscribe_block_boundaries(&self) -> broadcast::Receiver<BlockBoundary>;
-    /// Stream of `TxError` records emitted by the sequencer when an inbound
-    /// tx is rejected (e.g. past-nonce / duplicate). Drives early release of
-    /// parked client submissions with a JSON-RPC error.
+    /// Stream of `TxError` records that the sequencer emits when it
+    /// rejects an inbound tx, for example for a past nonce or a
+    /// duplicate. Drives early release of parked client submissions with
+    /// a JSON-RPC error.
     fn subscribe_tx_errors(&self) -> broadcast::Receiver<TxError>;
 }
 
 // ============================================================================
-// MockChannels — in-process implementation for tests and benches.
+// MockChannels: in-process implementation for tests and benches.
 // ============================================================================
 
-/// In-process mock of the future Aeron-backed channels. Used in every `tests/`
-/// integration test and in the criterion benches.
+/// In-process mock of the future Aeron-backed channels. Every integration
+/// test in `tests/` and every criterion bench uses this.
 #[derive(Clone)]
 pub struct MockChannels {
     /// One sender per tx_data shard.
@@ -72,9 +77,9 @@ pub struct MockChannels {
 }
 
 impl MockChannels {
-    /// Build a fresh bus with `shards` tx_data lanes. Returns the bus
-    /// and a `Vec` of receivers, one per shard (the test's "fake
-    /// sequencer" drains these).
+    /// Builds a fresh bus with `shards` tx_data lanes. Returns the bus and
+    /// a `Vec` of receivers, one per shard. The test's fake sequencer
+    /// drains these.
     pub fn new(shards: usize) -> (Self, Vec<mpsc::UnboundedReceiver<TxEnvelope>>) {
         let mut tx_vec = Vec::with_capacity(shards);
         let mut rx_vec = Vec::with_capacity(shards);
@@ -155,7 +160,7 @@ mod tests {
         mock.publish_tx_data(2, env.clone()).await.unwrap();
         let received = rx[2].recv().await.unwrap();
         assert_eq!(received.correlation_id, 1);
-        // Other shards stay empty.
+        // The other shards stay empty.
         assert!(rx[0].try_recv().is_err());
     }
 }

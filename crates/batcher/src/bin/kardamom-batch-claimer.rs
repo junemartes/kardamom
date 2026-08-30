@@ -1,10 +1,10 @@
 //! `kardamom-batch-claimer`: posts optimistic per-block batch claims to the
-//! `KardamomProofOracle` from the validator's prover spool (spec: PR 5).
+//! `KardamomProofOracle` from the validator's prover spool.
 //!
-//! Thin poster over [`kardamom_batcher::claim_next_batch`]: each tick it
-//! claims the next posted batch the spool has covered, bonding from the
-//! oracle's `minBond`. Permissioned only by the bond; the key pays gas +
-//! bond (refunded on honest finalization).
+//! A thin poster over [`kardamom_batcher::claim_next_batch`]. On each tick,
+//! it claims the next posted batch the spool has covered, and bonds from
+//! the oracle's `minBond`. The bond is the only permission check; the key
+//! pays gas and the bond, which is refunded on honest finalization.
 
 use std::path::PathBuf;
 use std::time::Duration;

@@ -1,17 +1,18 @@
-//! In-process multi-ingress (active/active) cluster harness.
+//! In-process multi-ingress, active/active, cluster harness.
 //!
-//! K independent `IngressProxy` replicas share ONE `MockChannels` bus: every
-//! replica publishes to the same per-shard tx_data lanes (multiple publishers
-//! per shard → single mpsc consumer, the fake sequencer/executor) and every
-//! replica subscribes to the same broadcast receipt stream. This is the
-//! deterministic analogue of N ingress nodes in front of the sharded
-//! sequencers. It proves the app-layer replication invariants (D1–D4 of
-//! docs/agents/resilient-ingress-spec.md) without Docker or real Aeron.
+//! K independent `IngressProxy` replicas share one `MockChannels` bus.
+//! Every replica publishes to the same per-shard tx_data lanes, with
+//! multiple publishers per shard reaching a single mpsc consumer, the
+//! fake sequencer and executor. Every replica also subscribes to the
+//! same broadcast receipt stream. This is a deterministic stand-in for N
+//! ingress nodes in front of the sharded sequencers. It proves the
+//! app-layer replication invariants, D1 through D4 of
+//! docs/agents/resilient-ingress-spec.md, without Docker or real Aeron.
 //!
-//! Determinism: one shared bus; the single per-shard consumer assigns positions
-//! in arrival order (no collision); condition waits use a bounded poll on
-//! observable state (`lookup_receipt_by_hash`), never a fixed sleep for
-//! correctness.
+//! Determinism: there is one shared bus, and the single per-shard
+//! consumer assigns positions in arrival order, so there is no
+//! collision. A condition wait uses a bounded poll on observable state,
+//! `lookup_receipt_by_hash`, never a fixed sleep, for correctness.
 
 mod common;
 
@@ -38,18 +39,20 @@ fn nonce_of(raw: &bytes::Bytes) -> u64 {
     TxEnvelope::decode(&mut raw.as_ref()).unwrap().nonce()
 }
 
-/// Shared, observable state of the single fake sequencer/executor that drains
-/// every shard's tx_data lane.
+/// Shared, observable state of the single fake sequencer and executor
+/// that drains every shard's tx_data lane.
 #[derive(Default)]
 struct ExecInner {
-    /// Total envelopes drained across all shards (a re-publish increments it).
+    /// Total envelopes drained across all shards. A re-publish increments
+    /// this.
     seen_count: usize,
     /// `correlation_id` of every drained envelope, in arrival order.
     correlation_ids: Vec<u64>,
     /// Per-shard drained count.
     per_shard: Vec<usize>,
-    /// tx_hashes that have been "executed" (first sight only). A tx published
-    /// twice (active/active retry) is executed exactly once.
+    /// tx_hashes that have been "executed," counting only the first
+    /// sighting. A tx published twice, on an active/active retry, is
+    /// executed exactly once.
     executed: HashSet<B256>,
 }
 
@@ -68,8 +71,9 @@ impl FakeExec {
         }
     }
 
-    /// Record an envelope; return a `Receipt` on the FIRST sight of its
-    /// tx_hash (exactly-once execution), `None` for a duplicate re-publish.
+    /// Records an envelope. Returns a `Receipt` on the first sighting of
+    /// its tx_hash, for exactly-once execution, or `None` for a
+    /// duplicate re-publish.
     fn observe(
         &self,
         shard: usize,
@@ -108,8 +112,8 @@ impl FakeExec {
     }
 }
 
-/// K active/active `IngressProxy` replicas over one shared bus + one fake
-/// sequencer/executor draining every shard.
+/// K active/active `IngressProxy` replicas over one shared bus, and one
+/// fake sequencer and executor draining every shard.
 struct Cluster {
     proxies: Vec<Arc<Proxy>>,
     exec: FakeExec,
@@ -121,8 +125,9 @@ impl Cluster {
         let (mock, receivers) = MockChannels::new(shards as usize);
         let exec = FakeExec::new(shards as usize);
 
-        // One drain task per shard: multiple ingress publishers fan into this
-        // single consumer, which assigns positions in arrival order.
+        // This is one drain task per shard. Multiple ingress publishers
+        // fan into this single consumer, which assigns positions in
+        // arrival order.
         let mut drains = Vec::new();
         for (shard, mut rx) in receivers.into_iter().enumerate() {
             let exec = exec.clone();
@@ -147,8 +152,9 @@ impl Cluster {
                 let cfg = IngressConfig {
                     partition_count_m: shards,
                     ingress_id: id,
-                    // OnOffer: release as soon as the receipt arrives — keeps
-                    // the harness receipt-driven (no watermark gating).
+                    // OnOffer releases as soon as the receipt arrives.
+                    // This keeps the harness receipt-driven, with no
+                    // watermark gating.
                     ack_policy: AckPolicy::OnOffer,
                     pending_receipt_timeout: Duration::from_secs(10),
                     ..IngressConfig::default()
@@ -173,8 +179,9 @@ impl Cluster {
     }
 }
 
-/// Bounded poll on observable state — succeeds fast, fails loudly. Not a fixed
-/// sleep: it asserts a state was reached, not that time passed.
+/// Bounded poll on observable state. Succeeds fast, and fails loudly.
+/// This is not a fixed sleep: it checks that a state was reached, not
+/// that time passed.
 async fn poll_until<F: Fn() -> bool>(what: &str, cond: F) {
     for _ in 0..2000 {
         if cond() {
@@ -195,8 +202,8 @@ fn signer_for_shard(target_shard: u32, m: u32) -> PrivateKeySigner {
     }
 }
 
-/// D2: `correlation_id`s are globally unique across replicas and carry the
-/// originating replica id in their high bits.
+/// D2: `correlation_id`s stay globally unique across replicas, and carry
+/// the originating replica id in their high bits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn correlation_id_unique_and_namespaced_across_replicas() {
     const K: u16 = 4;
@@ -221,15 +228,16 @@ async fn correlation_id_unique_and_namespaced_across_replicas() {
         K as usize * N,
         "all correlation_ids are globally unique"
     );
-    // Exactly N ids per replica, and the high bits identify that replica.
+    // Each replica has exactly N ids, and the high bits identify that
+    // replica.
     for replica in 0..K {
         let count = ids.iter().filter(|c| ingress_id_of(**c) == replica).count();
         assert_eq!(count, N, "replica {replica} owns exactly N correlation_ids");
     }
 }
 
-/// D1: every replica routes a sender to the same shard, and the envelope lands
-/// there regardless of which replica accepted it.
+/// D1: every replica routes a sender to the same shard, and the envelope
+/// lands there no matter which replica accepted it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tx_routes_to_correct_shard_from_any_replica() {
     let m = 4u32;
@@ -237,12 +245,14 @@ async fn tx_routes_to_correct_shard_from_any_replica() {
     let signer = PrivateKeySigner::random();
     let expected = partition_for(signer.address(), m);
 
-    // All replicas agree on the shard (pure function of sender + M).
+    // All replicas agree on the shard, since it is a pure function of
+    // sender and M.
     for p in &cluster.proxies {
         assert_eq!(p.partition_for(signer.address()), expected);
     }
 
-    // Submit nonces 0,1,2 — one via each replica (distinct tx_hashes execute).
+    // This submits nonces 0, 1, 2, one through each replica. Each has a
+    // distinct tx_hash, so each executes.
     for (replica, nonce) in [(0usize, 0u64), (1, 1), (2, 2)] {
         let r = cluster
             .submit(replica, common::sign_legacy(&signer, nonce))
@@ -262,7 +272,8 @@ async fn tx_routes_to_correct_shard_from_any_replica() {
     );
 }
 
-/// D4: a receipt fans out to every replica's cache (the basis for failover).
+/// D4: a receipt fans out to every replica's cache. This is the basis
+/// for failover.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn receipt_caches_on_all_replicas() {
     let cluster = Cluster::start(3, 2);
@@ -280,15 +291,17 @@ async fn receipt_caches_on_all_replicas() {
     }
 }
 
-/// D4: a client that fails over to another replica after its tx executed is
-/// served from that replica's cache — with NO re-publish to the sequencers.
+/// D4: a client that fails over to another replica after its tx executed
+/// gets served from that replica's cache, with no re-publish to the
+/// sequencers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failover_retry_served_from_cache_no_republish() {
     let cluster = Cluster::start(2, 2);
     let signer = PrivateKeySigner::random();
 
     let first = cluster.submit(0, common::sign_legacy(&signer, 0)).await;
-    // Wait until replica 1 has cached the receipt (the failover precondition).
+    // This waits until replica 1 has cached the receipt, the failover
+    // precondition.
     let p1 = cluster.proxies[1].clone();
     let h = first.tx_hash;
     poll_until("replica 1 caches receipt", || {
@@ -297,7 +310,8 @@ async fn failover_retry_served_from_cache_no_republish() {
     .await;
 
     let before = cluster.exec.seen_count();
-    // Failover: the same (sender, nonce) submitted to replica 1.
+    // This is the failover: the same (sender, nonce) submitted to
+    // replica 1.
     let again = cluster.submit(1, common::sign_legacy(&signer, 0)).await;
 
     assert_eq!(again.tx_hash, first.tx_hash, "served the same receipt");
@@ -308,15 +322,17 @@ async fn failover_retry_served_from_cache_no_republish() {
     );
 }
 
-/// D1: multiple replicas concurrently publishing to the SAME shard all reach
-/// the single consumer, and every submit resolves. (The in-process consumer
-/// assigns positions by arrival order, so concurrent publishers are safe here —
-/// the real-Aeron concurrent-publisher path is covered by Phase A's session id.)
+/// D1: multiple replicas that publish to the same shard at the same time
+/// all reach the single consumer, and every submit resolves. The
+/// in-process consumer assigns positions by arrival order, so concurrent
+/// publishers are safe here. Phase A's session id covers the
+/// real-Aeron concurrent-publisher path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_publishers_one_shard_all_delivered() {
     let m = 4u32;
     let cluster = Cluster::start(3, m);
-    // Three distinct senders, all routing to shard 0, one per replica.
+    // These are three distinct senders, all routing to shard 0, one per
+    // replica.
     let signers: Vec<_> = (0..3).map(|_| signer_for_shard(0, m)).collect();
 
     let futs: Vec<_> = signers

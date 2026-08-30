@@ -1,12 +1,14 @@
-//! Pre-generation of signed transactions for the load harness.
+//! This module pre-generates signed transactions for the load harness.
 //!
-//! Unlike [`crate::signers::presign_transfers`] (which returns a flat,
-//! round-robined byte vec), this builds **per-sender** queues of
-//! [`PlannedTx`] — each carrying the locally-computed transaction hash and
-//! its nonce — so the engine can (a) pop each sender's txs in per-sender
-//! FIFO nonce order (submits are spawned as concurrent tasks, so wire order
-//! — and hence arrival order at ingress — is not strict) and (b) track every
-//! tx by hash to a receipt independent of the submit response.
+//! Unlike [`crate::signers::presign_transfers`], which returns one flat,
+//! rotated byte vector, this module builds a per-sender queue of
+//! [`PlannedTx`] values. Each value carries the locally computed
+//! transaction hash and its nonce. This lets the engine:
+//! - pop each sender's transactions in per-sender FIFO nonce order.
+//!   Submits run as concurrent tasks, so wire order, and so arrival
+//!   order at ingress, is not strict.
+//! - track every transaction by hash to a receipt, independent of the
+//!   submit response.
 
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -15,28 +17,31 @@ use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 
 use crate::signers::DerivedSigner;
 
-/// One pre-signed transaction plus the metadata the engine/tracker need.
+/// One pre-signed transaction, with the metadata the engine and
+/// tracker need.
 #[derive(Debug, Clone)]
 pub struct PlannedTx {
-    /// EIP-2718-encoded raw transaction bytes (what `eth_sendRawTransaction`
-    /// takes).
+    /// The EIP-2718-encoded raw transaction bytes. This is the value
+    /// `eth_sendRawTransaction` takes.
     pub raw: Bytes,
-    /// The transaction hash, computed locally at sign time so the tracker can
-    /// key on it without trusting the submit response (a submit that errors
-    /// may still have landed).
+    /// The transaction hash, computed locally at sign time. This lets
+    /// the tracker key on the hash without trusting the submit response,
+    /// since a submit that errors can still have landed.
     pub hash: B256,
-    /// Index into the signer set (0-based, after any offset slice).
+    /// The index into the signer set, 0-based, after any offset slice.
     pub sender: usize,
-    /// This tx's nonce.
+    /// This transaction's nonce.
     pub nonce: u64,
 }
 
-/// Pre-sign `per_sender` legacy value transfers for each signer, returning one
-/// queue per signer with strictly increasing nonces from `nonce_start`.
+/// Pre-sign `per_sender` legacy value transfers for each signer.
+/// Returns one queue per signer, with nonces that strictly increase
+/// from `nonce_start`.
 ///
 /// # Errors
 ///
-/// Errors if `signers` is empty or if signing any transaction fails.
+/// Returns an error if `signers` is empty, or if signing a
+/// transaction fails.
 pub fn pregenerate(
     signers: &[DerivedSigner],
     chain_id: u64,

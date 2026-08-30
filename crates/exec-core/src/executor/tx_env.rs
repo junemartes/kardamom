@@ -1,5 +1,5 @@
-//! Envelope decoding and `revm::TxEnv` derivation — for both signed 2718
-//! envelopes ([`tx_env_from_alloy`]) and OP-style deposits
+//! Envelope decoding, and `revm::TxEnv` derivation. This covers both
+//! signed 2718 envelopes ([`tx_env_from_alloy`]) and OP-style deposits
 //! ([`tx_env_from_deposit`]).
 
 use alloy_consensus::Transaction;
@@ -17,8 +17,8 @@ use crate::error::ExecutorError;
 use crate::exec_types::TxIndex;
 
 /// Decode an `alloy_consensus::TxEnvelope` from the `raw_tx` bytes carried
-/// in a `kardamom_types::TxEnvelope`. The signature is already verified by
-/// the proxy (S1, S0); we just need the typed accessors to build a
+/// in a `kardamom_types::TxEnvelope`. The proxy already verified the
+/// signature; this function only needs the typed accessors to build a
 /// revm `TxEnv`.
 pub fn decode_alloy_envelope(
     raw_tx: &Bytes,
@@ -31,21 +31,21 @@ pub fn decode_alloy_envelope(
     })
 }
 
-/// Convert a recovered tx envelope into a `TxEnv`. `signer` is the proxy-
-/// populated sender — never recomputed here (S0).
+/// Convert a recovered tx envelope into a `TxEnv`. `signer` is the sender
+/// the proxy already populated; this function never recomputes it.
 ///
-/// Full struct literal on purpose (#164): this used to end in
-/// `..Default::default()`, silently dropping `tx_type`, `access_list`,
-/// `gas_priority_fee`, and `authorization_list` — 2930/1559/7702 txs
-/// executed with legacy semantics (no access-list warmth, no priority-fee
-/// split, set-code txs as plain calls), measured at 1,292 EEST cases. Every
-/// field is now populated from the envelope; a revm field addition is a
-/// compile error, i.e. a forced decision.
+/// This uses a full struct literal on purpose. It used to end in
+/// `..Default::default()`, which silently dropped `tx_type`, `access_list`,
+/// `gas_priority_fee`, and `authorization_list`. That made 2930, 1559, and
+/// 7702 txs execute with legacy semantics: no access-list warmth, no
+/// priority-fee split, and set-code txs treated as plain calls. Every
+/// field is now populated from the envelope. A revm field addition now
+/// causes a compile error, forcing a decision instead of a silent default.
 pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Address) -> TxEnv {
     use revm::context_interface::either::Either;
     TxEnv {
-        // The EIP-2718 type byte drives revm's per-type validity rules
-        // (e.g. PRIORITY_GREATER_THAN_MAX_FEE, blob-field checks).
+        // The EIP-2718 type byte drives revm's per-type validity rules,
+        // for example PRIORITY_GREATER_THAN_MAX_FEE and blob-field checks.
         tx_type: alloy_env.ty(),
         caller: signer,
         chain_id: alloy_env.chain_id(),
@@ -57,16 +57,17 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
             Some(addr) => TxKind::Call(addr),
             None => TxKind::Create,
         },
-        // For 1559-family types this field is the MAX fee; the effective
-        // price is derived by revm from basefee + priority fee.
+        // For 1559-family types, this field is the max fee. Revm derives
+        // the effective price from basefee plus priority fee.
         gas_price: alloy_env
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas()),
         gas_priority_fee: alloy_env.max_priority_fee_per_gas(),
         access_list: alloy_env.access_list().cloned().unwrap_or_default(),
-        // Type-3 never reaches here in production (rejected at ingress,
-        // `max_blobs_per_tx = 0`); mapped anyway so derivation stays total
-        // and the deterministic invalid-skip fires on the right rule.
+        // Type-3 never reaches here in production. Ingress rejects it,
+        // and `max_blobs_per_tx = 0`. This maps it anyway, so derivation
+        // stays total and the deterministic invalid-skip fires on the
+        // right rule.
         blob_hashes: alloy_env
             .blob_versioned_hashes()
             .map(<[B256]>::to_vec)
@@ -80,8 +81,9 @@ pub fn tx_env_from_alloy(alloy_env: &alloy_consensus::TxEnvelope, signer: Addres
 }
 
 /// Build a `TxEnv` from a deposit envelope. Deposits never deduct fees
-/// (`gas_price = 0`), do not assert chain-id at the envelope layer, and
-/// disable the nonce check at the caller's `cfg.disable_nonce_check = true`.
+/// (`gas_price = 0`), do not check chain ID at the envelope layer, and
+/// disable the nonce check through the caller's
+/// `cfg.disable_nonce_check = true`.
 pub(super) fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
     TxEnv {
         caller: dep.from,
@@ -99,7 +101,7 @@ pub(super) fn tx_env_from_deposit(dep: &Deposit) -> TxEnv {
     }
 }
 
-// -- tx_env_from_alloy typed-field mapping (#164) --------------------
+// -- tx_env_from_alloy typed-field mapping ----------------------------
 #[cfg(test)]
 mod tests {
     use super::*;

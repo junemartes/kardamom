@@ -1,13 +1,13 @@
-//! Snapshot-swap protocol (§5).
+//! Snapshot-swap protocol (spec section 5).
 //!
-//! The writer publishes a fresh `StateSnapshot` after every successful RW
-//! commit. The executor watches the channel and swaps its underlying snapshot
-//! to the new one. Old snapshots are dropped, which releases their mdbx RO
-//! txn and lets the freelist reclaim the corresponding pages.
+//! The writer publishes a fresh `StateSnapshot` after every successful
+//! read-write commit. The executor watches the channel and swaps in the new
+//! snapshot. Dropping an old snapshot releases its mdbx read-only
+//! transaction and lets the freelist reclaim its pages.
 //!
-//! Implementation: zero async, single-producer/single-consumer. We keep the
-//! latest snapshot behind a `Mutex<Option<_>>` and use a length-1
-//! crossbeam_channel to wake the consumer.
+//! This is a single-producer, single-consumer design with no async. We keep
+//! the latest snapshot behind a `Mutex<Option<_>>` and use a length-1
+//! crossbeam channel to wake the consumer.
 
 use std::sync::{Arc, Mutex};
 
@@ -28,7 +28,7 @@ pub struct SnapshotReceiver {
     notify: crossbeam_channel::Receiver<()>,
 }
 
-/// Create a fresh swap channel. Returns the producer + consumer ends.
+/// Create a fresh swap channel. Returns the producer and consumer ends.
 pub fn channel() -> (SnapshotHandle, SnapshotReceiver) {
     let latest = Arc::new(Mutex::new(None));
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -42,13 +42,13 @@ pub fn channel() -> (SnapshotHandle, SnapshotReceiver) {
 }
 
 impl SnapshotHandle {
-    /// Replace the latest snapshot. Drops any prior unconsumed snapshot,
-    /// which releases its mdbx RO txn — exactly the desired behavior since
-    /// the consumer only ever needs the freshest one.
+    /// Replace the latest snapshot. This drops any unconsumed prior
+    /// snapshot and releases its mdbx read-only transaction. This is the
+    /// desired behavior: the consumer only needs the freshest snapshot.
     pub fn publish(&self, snapshot: StateSnapshot) {
         *self.latest.lock().expect("snapshot mutex poisoned") = Some(snapshot);
-        // try_send: if the slot is full, the receiver has not consumed yet —
-        // the latest-pointer update above is sufficient.
+        // Use try_send. If the slot is full, the receiver has not consumed
+        // the last notification yet. The latest-pointer update above is enough.
         let _ = self.notify.try_send(());
     }
 }
@@ -69,8 +69,8 @@ impl SnapshotReceiver {
 
 #[cfg(test)]
 mod tests {
-    // Real swap behavior is tested in tests/snapshot_swap.rs (needs a live env).
-    // Here we only test that the channel mechanics don't deadlock.
+    // tests/snapshot_swap.rs tests the real swap behavior; it needs a live
+    // env. Here we only test that the channel mechanics do not deadlock.
     use super::*;
 
     #[test]

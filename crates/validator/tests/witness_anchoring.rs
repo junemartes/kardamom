@@ -1,19 +1,21 @@
-//! Phase-3b pipeline contract (spec: no-std-exec-core): capture → anchor →
-//! guest, end to end, against the PRODUCTION stored trie.
+//! Full pipeline contract: capture, anchor,
+//! and guest, end to end, against the production stored trie.
 //!
 //! One block runs through real EVM execution with witness capture (phase
-//! 2), the witness is anchored against the validator's committed libmdbx
-//! trie via the recompute-guided fixed point (`anchor_block_witness`), and
-//! the guest entry (`execute_block_anchored`) re-executes from the witness
-//! and proofs ALONE. The closing assertion is the whole series' point: the
-//! guest's recomputed post-state root equals the root the live incremental
-//! writer (`update_for_block`) produces for the same block — proof and
-//! chain agree on state, byte for byte.
+//! 2). The witness is anchored against the validator's committed libmdbx
+//! trie through the recompute-guided fixed point
+//! (`anchor_block_witness`), and the guest entry
+//! (`execute_block_anchored`) re-executes from the witness and proofs
+//! alone. The closing assertion is the point of the whole test: the
+//! guest's recomputed post-state root equals the root the live
+//! incremental writer (`update_for_block`) produces for the same block.
+//! Proof and chain agree on state, byte for byte.
 //!
 //! The block mixes the shapes that stress the anchor: a plain transfer
-//! (account updates + fresh-account creation), a contract call that ZEROES
-//! a storage slot (storage-trie deletion collapse — the fixed point must
-//! pull the off-path sibling), and another that writes a fresh slot.
+//! (account updates and fresh-account creation), a contract call that
+//! zeroes a storage slot (a storage-trie deletion collapse, where the
+//! fixed point must pull the off-path sibling), and another that writes
+//! a fresh slot.
 
 use alloy_consensus::{SignableTransaction, TxLegacy};
 use alloy_eips::eip2718::Encodable2718;
@@ -33,11 +35,11 @@ use kardamom_validator::witness::{anchor_block_witness, capture_block_witness};
 const CHAIN_ID: u64 = 412346;
 const RECIPIENT: Address = address!("000000000000000000000000000000000000dEaD");
 
-/// SSTORE(0, 0); STOP — zeroes slot 0 (the storage-deletion shape).
+/// SSTORE(0, 0); STOP. Zeroes slot 0: the storage-deletion shape.
 const ZEROER: Address = address!("00000000000000000000000000000000000000Aa");
 const ZEROER_CODE: [u8; 6] = [0x60, 0x00, 0x60, 0x00, 0x55, 0x00];
 
-/// SSTORE(3, 0x2a); STOP — writes a fresh slot (storage-insert shape).
+/// SSTORE(3, 0x2a); STOP. Writes a fresh slot: the storage-insert shape.
 const WRITER: Address = address!("00000000000000000000000000000000000000Bb");
 const WRITER_CODE: [u8; 6] = [0x60, 0x2a, 0x60, 0x03, 0x55, 0x00];
 
@@ -88,15 +90,16 @@ fn exec_env() -> ExecEnv {
 
 #[test]
 fn capture_anchor_guest_and_live_trie_agree() {
-    // Deterministic: this test doubles as the prover-fixture generator.
+    // This test is deterministic, so it also doubles as the
+    // prover-fixture generator.
     let signer = PrivateKeySigner::from_bytes(&alloy_primitives::B256::repeat_byte(0x5A)).unwrap();
     let sender = signer.address();
     let zeroer_hash = keccak256(ZEROER_CODE);
     let writer_hash = keccak256(WRITER_CODE);
 
-    // --- Pre-state, seeded IDENTICALLY into the mock (execution) and the
-    // libmdbx trie (anchoring): the sender, both contracts (ZEROER holding
-    // two live slots so zeroing one collapses a branch), background noise.
+    // --- Pre-state, seeded identically into the mock (execution) and the
+    // libmdbx trie (anchoring): the sender, both contracts (ZEROER holds
+    // two live slots, so zeroing one collapses a branch), background noise.
     let mut seed = BlockDelta {
         block_number: 0,
         accounts: vec![
@@ -104,7 +107,7 @@ fn capture_anchor_guest_and_live_trie_agree() {
                 address: sender,
                 nonce: 0,
                 balance: U256::from(10u128.pow(18)),
-                code_hash: B256::ZERO, // live writer maps ZERO → KECCAK_EMPTY
+                code_hash: B256::ZERO, // The live writer maps ZERO to KECCAK_EMPTY.
             },
             AccountChange {
                 address: ZEROER,
@@ -179,7 +182,7 @@ fn capture_anchor_guest_and_live_trie_agree() {
     }
     let snap = mock.build();
 
-    // --- The block: transfer to a fresh account, zero a slot, write a slot.
+    // --- The block: transfer to a fresh account, zero a slot, and write a slot.
     let records = vec![
         tx(&signer, RECIPIENT, 0, 250_000, 0),
         tx(&signer, ZEROER, 1, 0, 1),
@@ -195,14 +198,14 @@ fn capture_anchor_guest_and_live_trie_agree() {
         "the zeroing write must be in the delta"
     );
 
-    // --- Anchor against the committed trie (the capture fixed point).
+    // --- Anchor against the committed trie: the capture fixed point.
     let ro = env.raw().begin_ro_sync().unwrap();
     let tables = TrieTables::open(&ro).unwrap();
     let (proofs, post_root) =
         anchor_block_witness(&ro, &tables, pre_root, &mut witness, &out.delta).expect("anchor");
     assert!(!proofs.nodes.is_empty(), "a real trie yields real proofs");
 
-    // --- Guest shape: one shot over witness + proofs alone.
+    // --- Guest shape: one shot over the witness and proofs alone.
     let anchored = kardamom_engine::stateless::execute_block_anchored(
         &witness,
         &proofs,
@@ -218,11 +221,11 @@ fn capture_anchor_guest_and_live_trie_agree() {
     assert_eq!(anchored.block_number, 1);
     assert_eq!(anchored.out.receipts, out.receipts, "receipts identical");
 
-    // --- Prover fixture export (3c): with KARDAMOM_EMIT_PROVER_FIXTURE=dir
-    // set, serialize the exact ProverInput this test just validated plus
-    // the expected 104-byte PublicOutputs. The SP1 host runner
-    // (guest/kardamom-zk-host) executes the real guest ELF against these
-    // and asserts byte equality — the guest/host round-trip contract.
+    // --- Prover fixture export (spec 3c): when KARDAMOM_EMIT_PROVER_FIXTURE=dir
+    // is set, serialize the exact ProverInput this test just validated,
+    // plus the expected 104-byte PublicOutputs. The SP1 host runner
+    // (guest/kardamom-zk-host) runs the real guest ELF against these and
+    // checks byte equality: the guest/host round-trip contract.
     if let Ok(dir) = std::env::var("KARDAMOM_EMIT_PROVER_FIXTURE") {
         use kardamom_types::{ProverInput, ProverRecord, PublicOutputs};
         let mut bal_rlp = Vec::new();
@@ -281,7 +284,7 @@ fn capture_anchor_guest_and_live_trie_agree() {
         std::fs::write(format!("{dir}/expected-outputs.bin"), expected.encode()).unwrap();
     }
 
-    // --- THE closing assertion: the live incremental writer lands on the
+    // --- The closing assertion: the live incremental writer lands on the
     // guest's recomputed root for the same block.
     let live_root = {
         let txn = env.raw().begin_rw_sync().unwrap();
@@ -323,7 +326,7 @@ fn capture_anchor_guest_and_live_trie_agree() {
         "guest recompute and live incremental trie must agree"
     );
 
-    // --- Tamper: corrupt one proof node byte → the guest fails closed.
+    // --- Tamper: corrupt one proof node byte, and the guest must reject it.
     let mut bad = proofs.clone();
     let mut b0 = bad.nodes[0].to_vec();
     b0[0] ^= 0x01;

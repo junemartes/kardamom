@@ -1,5 +1,5 @@
-//! Sustained throughput per proxy: txs/sec a single proxy can ingest
-//! with everything past the sequencer mocked.
+//! Sustained throughput per proxy. This measures the txs/sec a single
+//! proxy can ingest, with everything past the sequencer mocked.
 
 use std::sync::Arc;
 use std::time::Duration;

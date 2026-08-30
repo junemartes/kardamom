@@ -1,8 +1,8 @@
-//! KAR1 framing — the on-blob payload format.
+//! KAR1 framing: the on-blob payload format.
 //!
-//! Explicitly **no `state_root` field** (S0). After framing, the entire
-//! payload may be zstd-compressed (flag bit 0 set) and then sliced into 31-byte
-//! field-element chunks for blob packing.
+//! This format has no `state_root` field (by design, at this stage). After framing,
+//! zstd can compress the whole payload (flag bit 0 set). The result is then
+//! sliced into 31-byte field-element chunks for blob packing.
 //!
 //! ```text
 //! Header:
@@ -53,8 +53,9 @@ pub struct BlockFrame {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Kar1Payload {
     pub blocks: Vec<BlockFrame>,
-    /// Reflects bit 0 of the flags byte. `encode`/`decode` set this to mirror
-    /// the byte they read or wrote; compression itself happens in [`crate::compress`].
+    /// Reflects bit 0 of the flags byte. `encode` and `decode` set this
+    /// field to match the byte they read or wrote. Compression itself
+    /// happens in [`crate::compress`].
     pub compressed: bool,
 }
 

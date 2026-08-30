@@ -1,7 +1,7 @@
 //! Public error type for the ingress proxy.
 //!
-//! Variants are mapped to JSON-RPC error codes via
-//! `From<IngressError> for ErrorObjectOwned`.
+//! `From<IngressError> for ErrorObjectOwned` maps each variant to a
+//! JSON-RPC error code.
 
 use alloy_primitives::Address;
 use jsonrpsee::types::ErrorObjectOwned;
@@ -44,20 +44,20 @@ pub enum IngressError {
 impl From<IngressError> for ErrorObjectOwned {
     fn from(err: IngressError) -> Self {
         let code = match &err {
-            // limit exceeded (server-specific): retryable overload class
+            // Limit exceeded, a server-specific and retryable overload class.
             IngressError::RateLimited(_) | IngressError::Overloaded(_) => -32005,
-            // invalid params
+            // Invalid params.
             IngressError::Decode(_)
             | IngressError::SignatureInvalid
             | IngressError::Duplicate(_)
             | IngressError::GasLimitExceedsCap(_)
             | IngressError::UnsupportedTxType(_) => -32602,
-            // generic server error; Evicted is retryable once the sender's
-            // nonce is back within the reorder window
+            // Generic server error. Evicted is retryable once the sender's
+            // nonce is back within the reorder window.
             IngressError::PartitionUnavailable(_)
             | IngressError::Timeout
             | IngressError::Evicted(_) => -32000,
-            // internal
+            // Internal error.
             IngressError::Internal(_) => -32603,
         };
         ErrorObjectOwned::owned::<()>(code, err.to_string(), None)

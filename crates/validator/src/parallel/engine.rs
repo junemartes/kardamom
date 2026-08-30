@@ -16,8 +16,8 @@ use kardamom_types::{Receipt, StateDatabase};
 use super::claims::{ClaimIndex, batch_ranges};
 use super::dump::dump_divergence_inputs;
 
-/// A batch's result: its receipts (with LOCAL cumulative gas — the caller
-/// fixes up block-cumulative in order) and its merged writes.
+/// A batch's result: its receipts, with local cumulative gas (the caller
+/// fixes up block-cumulative gas in order), and its merged writes.
 pub struct BatchOutcome {
     pub first_index: u64,
     pub receipts: Vec<Receipt>,
@@ -25,9 +25,9 @@ pub struct BatchOutcome {
 }
 
 /// Build the input layer a batch starting at `before` must observe:
-/// snapshot state overlaid with the latest claim STRICTLY BEFORE the batch
-/// (i.e. the previous batch's end state). Account fields are claimed
-/// independently in EIP-7928, so each triple is assembled from whichever
+/// snapshot state overlaid with the latest claim strictly before the
+/// batch, that is, the previous batch's end state. EIP-7928 claims
+/// account fields independently, so each triple is built from whichever
 /// components have earlier claims, falling back to the snapshot.
 pub fn build_seed<S: StateDatabase>(
     snapshot: &S,
@@ -35,10 +35,10 @@ pub fn build_seed<S: StateDatabase>(
     claims: &ClaimIndex,
     before: u64,
 ) -> Result<PendingDelta, ExecutorError> {
-    // Base = the parent layer (merged not-yet-durable writes of earlier
-    // blocks): the snapshot alone can be K blocks stale under the depth-K
-    // commit pipeline. Claim seeds overlay ON TOP — intra-block claims are
-    // newer than any parent state.
+    // The base is the parent layer: the merged, not-yet-durable writes of
+    // earlier blocks. The snapshot alone can be K blocks stale under the
+    // depth-K commit pipeline. Claim seeds overlay on top, since
+    // intra-block claims are newer than any parent state.
     let mut seed = parent.cloned().unwrap_or_default();
 
     let mut addrs: Vec<Address> = claims.balance.keys().copied().collect();
@@ -51,10 +51,10 @@ pub fn build_seed<S: StateDatabase>(
         let claimed_nonce = claims.nonce_seed(addr, before);
         let claimed_code = claims.code_seed(addr, before);
         if claimed_bal.is_none() && claimed_nonce.is_none() && claimed_code.is_none() {
-            continue; // nothing claimed before this batch — snapshot stands
+            continue; // Nothing is claimed before this batch, so the snapshot stands.
         }
         let base = match seed.accounts.get(&addr) {
-            Some(v) => *v, // parent layer already has the freshest base
+            Some(v) => *v, // The parent layer already has the freshest base.
             None => snapshot
                 .basic(addr)
                 .map_err(|e| ExecutorError::State(format!("seed basic({addr:?}): {e}")))?
@@ -86,15 +86,15 @@ pub fn build_seed<S: StateDatabase>(
     Ok(seed)
 }
 
-// Record dispatch (Tx-vs-Deposit + the deposit fold) lives in the exec core
-// (`stateless::execute_record_in_scope`) — the batch path below runs the
-// same monomorphized dispatch as the sequential driver and the zk guest, so
-// the actor's streaming arms are the only other dispatch left in the tree.
+// Record dispatch (tx vs. deposit, plus the deposit fold) lives in the
+// exec core (`stateless::execute_record_in_scope`). The batch path below
+// runs the same dispatch as the sequential driver and the zk guest, so the
+// actor's streaming arms are the only other dispatch left in the tree.
 use kardamom_engine::stateless::execute_record_in_scope;
 
-/// Execute one batch sequentially over `snapshot ∘ seed`. `first_index` is
-/// the batch's first bal index (1-based); receipts carry LOCAL cumulative
-/// gas.
+/// Execute one batch sequentially over `snapshot` and `seed`. `first_index`
+/// is the batch's first bal index (1-based). Receipts carry local
+/// cumulative gas.
 pub fn execute_batch<S: StateDatabase>(
     snapshot: &S,
     seed: &PendingDelta,
@@ -107,24 +107,25 @@ pub fn execute_batch<S: StateDatabase>(
     let mut delta = PendingDelta::new();
     let mut receipts = Vec::with_capacity(records.len());
     let mut cumulative = 0u64;
-    // At granularity K > 1 the wire claims are chunk-collapsed, so per-tx
-    // comparison is impossible: verification coarsens to the CHUNK — the
-    // batch is chunk-ALIGNED (batch_size == K, enforced by the caller),
-    // its captured Bal is quantized through the SAME shared code the
-    // executor used, and compared once at the end.
+    // At granularity K > 1, the wire claims are chunk-collapsed, so a
+    // per-tx comparison is impossible. Verification coarsens to the
+    // chunk. The batch is chunk-aligned (batch_size == K, enforced by the
+    // caller), its captured Bal is quantized through the same shared code
+    // the executor used, and it is compared once at the end.
     let mut batch_bal = revm::state::bal::Bal::new();
-    // ONE execution scope per batch (EVM + commit-into cache reused across
-    // the batch's txs — the per-tx construction was ~90% of execution-path
-    // allocation). The seed layer plays the parent role.
+    // One execution scope per batch: the EVM and commit-into cache are
+    // reused across the batch's txs. Per-tx construction was about 90% of
+    // execution-path allocation. The seed layer plays the parent role.
     let mut scope = kardamom_engine::executor::ExecScope::new(snapshot, Some(seed), env)?;
     for (i, rec) in records.iter().enumerate() {
         let bal_index = first_index + i as u64;
         let global_index_in_block = bal_index - 1;
-        // Recompute each record's claims through the executor's EXACT
-        // capture path (revm's Bal records per-FIELD changes for txs; the
-        // synthetic WriteSet path for deposits). Comparing a WriteSet
-        // projection instead diverged on every live transfer — symmetric
-        // construction is the only drift-proof comparison.
+        // Recompute each record's claims through the executor's exact
+        // capture path: revm's Bal records per-field changes for txs, and
+        // the synthetic WriteSet path handles deposits. Comparing a
+        // WriteSet projection instead diverged on every live transfer.
+        // Building both sides the same way is the only drift-proof
+        // comparison.
         let (receipt, ws) = execute_record_in_scope(
             &mut scope,
             snapshot,
@@ -140,13 +141,13 @@ pub fn execute_batch<S: StateDatabase>(
         delta.apply(ws);
         receipts.push(receipt);
     }
-    // Verify claims WHERE THEY ARE PRODUCED. At granularity 1 that is per
-    // tx (batch-final comparison alone would leave intra-batch claims
-    // unchecked — neither seeds nor outputs — so a wrong intermediate
-    // attribution would ship while the final state matched); at K > 1 the
-    // finest producible unit IS the chunk, and the aligned batch is one
+    // Verify claims where they are produced. At granularity 1, that is per
+    // tx. A batch-final comparison alone would leave intra-batch claims
+    // unchecked (neither as seeds nor as outputs), so a wrong intermediate
+    // attribution could ship while the final state matched. At K > 1, the
+    // finest producible unit is the chunk, and the aligned batch is one
     // chunk. Both sides of the comparison pass through the shared
-    // capture/quantize path, so shape drift is impossible by construction.
+    // capture and quantize path, so shape drift cannot happen.
     let computed_alloy =
         kardamom_engine::bal_ladder::quantize(batch_bal.into_alloy_bal(), granularity);
     let computed_idx = ClaimIndex::from_alloy(&computed_alloy);
@@ -192,20 +193,21 @@ pub struct BlockOutcome {
     pub batches: usize,
 }
 
-/// Re-execute a block's records (transactions AND deposits) as FULLY
-/// PARALLEL batches, each seeded from the BAL's claims, verifying every
-/// batch's claims where they are produced. Deposits occupy bal indices in
-/// the same space as txs (the executor's streaming capture passes
-/// `tx_index_in_block + 1` for both), so their claims seed later batches
-/// exactly like tx claims — the mint is a balance claim, a CREATE
-/// deposit's bytecode a code claim.
+/// Re-execute a block's records, transactions and deposits, as fully
+/// parallel batches. Each batch seeds from the BAL's claims, and the
+/// function verifies every batch's claims where they are produced.
+/// Deposits occupy bal indices in the same space as txs (the executor's
+/// streaming capture passes `tx_index_in_block + 1` for both), so their
+/// claims seed later batches exactly like tx claims: the mint is a
+/// balance claim, and a CREATE deposit's bytecode is a code claim.
 ///
 /// Returns `Err(ExecutorError::Divergence)` on the first batch whose
-/// recomputed writes differ from what the executor claimed — the claim was
-/// checked at its producing batch, so a false claim cannot be laundered by
-/// later batches that merely consume it.
-#[allow(clippy::too_many_arguments)] // the pool handle + the block-execution
-// inputs; a params struct would rename the same eight fields without removing any.
+/// recomputed writes differ from what the executor claimed. The claim was
+/// checked at its producing batch, so a false claim cannot be laundered
+/// by later batches that only consume it.
+#[allow(clippy::too_many_arguments)] // This groups the pool handle and the
+// block-execution inputs. A params struct would rename the same eight
+// fields without removing any.
 pub fn execute_block_parallel<S: StateDatabase + Sync>(
     pool: &WorkerPool,
     snapshot: &S,
@@ -223,13 +225,13 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
             batches: 0,
         });
     }
-    // SAME-VIEW INVARIANT: the attribution granularity comes from the FRAME
-    // (what the executor actually produced), never from local config. At
-    // K > 1, execution batches must be chunk-ALIGNED — batch size == K and
-    // ranges tile from index 1 — so the chunk a batch verifies is exactly
-    // the chunk the executor collapsed. Claims (and therefore seeds) are
-    // chunk-indexed at K > 1. The pool only distributes the INDICES of
-    // these pre-computed ranges, so it cannot re-batch.
+    // Same-view invariant: the attribution granularity comes from the
+    // frame, what the executor actually produced, never from local
+    // config. At K > 1, execution batches must be chunk-aligned (batch
+    // size == K, and ranges tile from index 1), so the chunk a batch
+    // verifies is exactly the chunk the executor collapsed. Claims, and
+    // so seeds, are chunk-indexed at K > 1. The pool only distributes the
+    // indices of these pre-computed ranges, so it cannot re-batch.
     let k = u64::from(granularity.max(1));
     let effective_batch = if granularity > 1 {
         granularity as usize
@@ -238,23 +240,24 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     };
     let ranges = batch_ranges(txs.len(), effective_batch);
 
-    // One INDEPENDENT snapshot per pool worker (fork_view): sharing one
-    // mdbx snapshot serializes every worker's reads through its single RO
-    // txn's cursors — the Block-STM campaign measured that shape SLOWER
-    // than sequential at w=4. A fork can be refused (the writer advanced
-    // mid-mint, routine under the depth-K commit pipeline); that worker
-    // then shares the strategy's snapshot — correct, merely serialized —
-    // and the fallback is counted so a silent loss of the fix shows up
-    // on the dashboard.
+    // Each pool worker gets one independent snapshot (fork_view). Sharing
+    // one mdbx snapshot serializes every worker's reads through its
+    // single read-only txn's cursors, which measured slower than
+    // sequential at 4 workers. A fork can be refused (the writer advanced
+    // mid-mint, which is routine under the depth-K commit pipeline). That
+    // worker then shares the strategy's snapshot: correct, but
+    // serialized. The fallback is counted, so a silent loss of the fix
+    // shows up on the dashboard.
     let forks: Vec<Option<S>> = (0..pool.workers()).map(|_| snapshot.fork_view()).collect();
     let refused = forks.iter().filter(|f| f.is_none()).count();
     if refused > 0 {
         crate::metrics::counter_fork_fallback(refused as u64);
     }
 
-    // Every batch runs concurrently on the persistent pool: its inputs come
-    // from the claims, so no batch waits on another. Results land in
-    // per-chunk slots (already in first_index order — ranges tile from 1).
+    // Every batch runs concurrently on the persistent pool. Its inputs
+    // come from the claims, so no batch waits on another. Results land in
+    // per-chunk slots, already in first_index order, since ranges tile
+    // from 1.
     let slots: Vec<std::sync::OnceLock<Result<BatchOutcome, ExecutorError>>> =
         ranges.iter().map(|_| std::sync::OnceLock::new()).collect();
     let body = |lane: usize, ci: usize| {
@@ -262,7 +265,7 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
         let slice = &txs[(from as usize - 1)..(to as usize)];
         let snap: &S = forks[lane].as_ref().unwrap_or(snapshot);
         // Seeds look up "latest claim strictly before this batch" in the
-        // CLAIM index space: tx indices at K = 1, chunk ordinals at K > 1.
+        // claim index space: tx indices at K = 1, chunk numbers at K > 1.
         let before = if k > 1 {
             kardamom_engine::bal_ladder::chunk_of(from, k)
         } else {
@@ -280,7 +283,7 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     for s in slots {
         outcomes.push(s.into_inner().expect("pool ran every chunk")?);
     }
-    // Slots are already in block order; the sort is kept as a cheap,
+    // Slots are already in block order. This sort stays as a cheap,
     // explicit statement of the fold's ordering invariant.
     outcomes.sort_by_key(|o| o.first_index);
 
@@ -288,12 +291,12 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     let mut receipts = Vec::with_capacity(txs.len());
     let mut cumulative = 0u64;
     for o in outcomes.iter() {
-        // Claims were verified per tx inside each batch (strictly stronger
-        // than a batch-final comparison, which cannot see intra-batch
-        // attribution).
-        // Fold: later batches overwrite earlier ones (block order).
+        // Claims were verified per tx inside each batch. This is strictly
+        // stronger than a batch-final comparison, which cannot see
+        // intra-batch attribution.
+        // Fold: later batches overwrite earlier ones, in block order.
         delta.merge_from(&o.delta);
-        // Block-cumulative gas: batches computed locally from 0.
+        // Block-cumulative gas: each batch computed its gas locally from 0.
         for r in &o.receipts {
             let mut r = r.clone();
             cumulative += r.gas_used;
@@ -309,10 +312,11 @@ pub fn execute_block_parallel<S: StateDatabase + Sync>(
     })
 }
 
-/// The pre-pool implementation — one `std::thread::scope` spawn per batch —
-/// kept compiling as the A/B reference for the pooled path (engine_tests +
-/// the bench repro sweep compare the two byte-for-byte). Not a production
-/// path: `parallel_block_exec` always dispatches onto the persistent pool.
+/// The pre-pool implementation, with one `std::thread::scope` spawn per
+/// batch. It stays here, compiling, as the reference for the pooled path;
+/// engine_tests and the bench repro sweep compare the two byte-for-byte.
+/// It is not a production path: `parallel_block_exec` always dispatches
+/// onto the persistent pool.
 #[doc(hidden)]
 pub fn execute_block_parallel_scoped<S: StateDatabase + Sync>(
     snapshot: &S,
@@ -390,16 +394,16 @@ pub fn execute_block_parallel_scoped<S: StateDatabase + Sync>(
 // Engine strategy: what the validator hands to the exec loop
 // ---------------------------------------------------------------------------
 
-/// How long a block waits for its BAL claims before falling back to
-/// sequential re-execution. Short: liveness never depends on the BAL.
+/// How long a block waits for its BAL claims before it falls back to
+/// sequential re-execution. This is short, so liveness never depends on the BAL.
 const CLAIM_WAIT: Duration = Duration::from_millis(250);
 
-/// Sequential re-execution of a whole block — the always-available fallback
-/// when the block's BAL claims don't arrive in time. Identical semantics to
-/// the engine's streaming path. The body was hoisted into the `no_std` exec
-/// core with phase 3 (the zk guest links the same driver); this delegation
-/// is the seam that keeps live-validator and stateless execution one code
-/// path by construction.
+/// Sequential re-execution of a whole block: the always-available
+/// fallback when the block's BAL claims do not arrive in time. It has the
+/// same semantics as the engine's streaming path. The body moved into the
+/// `no_std` exec core in phase 3 (the zk guest links the same driver).
+/// This delegation is the seam that keeps live-validator and stateless
+/// execution one code path.
 pub fn execute_block_sequential<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -410,21 +414,21 @@ pub fn execute_block_sequential<S: StateDatabase>(
 }
 
 /// Build the validator's whole-block execution strategy: seeded parallel
-/// batches when this block's BAL claims arrive in time; sequential
-/// otherwise. Deposits participate like transactions — the executor
-/// captures their writes into the BAL at their block index (mint as a
-/// balance claim, CREATE bytecode as a code claim), so deposit-containing
-/// blocks validate in parallel too.
+/// batches when this block's BAL claims arrive in time, sequential
+/// otherwise. Deposits take part like transactions. The executor captures
+/// their writes into the BAL at their block index (mint as a balance
+/// claim, CREATE bytecode as a code claim), so deposit-containing blocks
+/// validate in parallel too.
 pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
     claims: Arc<crate::ClaimBuffer>,
     batch_size: usize,
     workers: usize,
     flight: Option<Arc<crate::flight::FlightRing>>,
 ) -> BlockExec<D> {
-    // The pool is built ONCE and captured: persistent workers across
-    // blocks. The previous shape spawned one OS thread per batch per
-    // block (~500 spawns for a 4k-tx block at K=8) with no bound tied to
-    // the machine.
+    // The pool is built once and captured, so workers persist across
+    // blocks. The previous design spawned one OS thread per batch per
+    // block, about 500 spawns for a 4k-tx block at K=8, with no bound
+    // tied to the machine.
     let pool = Arc::new(WorkerPool::new(workers.max(1), Vec::new()));
     Box::new(
         move |snapshot: &D,
@@ -433,7 +437,7 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
               env: ExecEnv,
               block: u64| {
             if records.is_empty() {
-                // Empty blocks still enter the flight ring: the prover
+                // Empty blocks still enter the flight ring. The prover
                 // spool proves every block, and a gap here would stall it.
                 if let Some(f) = flight.as_ref() {
                     f.push(block, 1, env, records, None);
@@ -463,10 +467,8 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
             ) {
                 Ok(out) => out,
                 Err(e) => {
-                    // FLIGHT RECORDER: the live K=20 DeFi divergence is
-                    // deterministic but has resisted offline modelling
-                    // (the composition sweep passes). Dump the exact
-                    // inputs so the failing block replays as a unit test.
+                    // Dump the exact inputs, so the failing block can
+                    // replay as a unit test.
                     dump_divergence_inputs(block, records, &idx, parent, granularity, &e);
                     return Err(e);
                 }
@@ -475,7 +477,7 @@ pub fn parallel_block_exec<D: StateDatabase + Sync + 'static>(
             Ok(BlockExecOutput {
                 receipts: out.receipts,
                 delta: out.delta,
-                // The validator VERIFIES BALs; it never publishes one.
+                // The validator verifies BALs; it never publishes one.
                 bal: None,
             })
         },

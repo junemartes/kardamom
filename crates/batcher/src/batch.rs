@@ -1,13 +1,13 @@
-//! `BatchAccumulator` — groups txs into per-block batches at
+//! `BatchAccumulator` groups transactions into per-block batches at
 //! `BlockBoundaryStart` markers.
 //!
-//! Spec: §2.6 (sealer emits boundaries onto B) plus S0 (batcher
-//! consumes tx_ordering only; never queries the live sequencer).
+//! The sealer emits boundaries onto B. Today, the
+//! batcher reads only tx_ordering. It never queries the live sequencer.
 //!
-//! The accumulator is **stream-oriented**: it sees a single ordered sequence of
-//! records — interleaved txs and boundary markers — and emits one
-//! [`ClosedBlock`] per boundary. Txs received before the first boundary are
-//! attributed to the first block.
+//! The accumulator is stream-oriented. It reads one ordered sequence of
+//! records, with transactions and boundary markers mixed together. It emits
+//! one [`ClosedBlock`] per boundary. Transactions before the first boundary
+//! belong to the first block.
 
 use kardamom_types::{BPosition, BlockBoundaryStart, TxEnvelope};
 
@@ -44,7 +44,7 @@ impl BatchAccumulator {
     }
 
     /// Observe a boundary. Closes the current block and returns it. The next
-    /// `observe_tx` calls will accumulate into the next block.
+    /// calls to `observe_tx` add to the next block.
     pub fn observe_boundary(&mut self, b: BlockBoundaryStart) -> ClosedBlock {
         let txs = std::mem::take(&mut self.pending);
         ClosedBlock {

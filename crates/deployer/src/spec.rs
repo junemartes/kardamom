@@ -1,4 +1,4 @@
-//! Build `DeploymentSpec` values consumed by `KardamomFactoryV1.applyDeployments`.
+//! Build `DeploymentSpec` values for `KardamomFactoryV1.applyDeployments`.
 
 use alloy_primitives::{Address, B256, Bytes};
 use alloy_sol_types::SolValue;
@@ -14,8 +14,9 @@ pub struct DeploymentSpec {
     pub impl_initcode: Bytes,
     pub init_data: Bytes,
     pub impl_salt: B256,
-    /// If non-zero, the factory skips CREATE2 and reuses this impl. Set by the deployer
-    /// when grouping multi-L2 ops; build_spec always returns zero here.
+    /// If this is non-zero, the factory skips CREATE2 and reuses this impl.
+    /// The deployer sets it when it groups multi-L2 ops. `build_spec` always
+    /// returns zero here.
     pub target_impl: Address,
 }
 
@@ -28,7 +29,8 @@ pub enum Action {
 /// What the operator wants to happen for one contract on one L2.
 #[derive(Debug, Clone)]
 pub enum Op {
-    /// Deploy a fresh contract for `id` on L2 `l2_chain_id` (must not be registered yet).
+    /// Deploy a fresh contract for `id` on L2 `l2_chain_id`. It must not be
+    /// registered yet.
     Deploy {
         l2_chain_id: u64,
         id: ContractId,
@@ -58,7 +60,7 @@ impl Op {
         }
     }
 
-    /// Version the op targets — 1 for Deploy, `new_version` for Upgrade.
+    /// Return the version the op targets: 1 for Deploy, `new_version` for Upgrade.
     pub fn version(&self) -> u64 {
         match self {
             Op::Deploy { .. } => 1,
@@ -67,8 +69,9 @@ impl Op {
     }
 }
 
-/// Build a `DeploymentSpec` for a single `Op`. `target_impl` is always zero here; the
-/// deployer's dedup pass fills it in after grouping by `(id, version)`.
+/// Build a `DeploymentSpec` for a single `Op`. `target_impl` is always zero
+/// here. The deployer's dedup pass fills it in after grouping by
+/// `(id, version)`.
 pub fn build_spec(op: &Op) -> DeploymentSpec {
     match op {
         Op::Deploy {
@@ -101,7 +104,7 @@ pub fn build_spec(op: &Op) -> DeploymentSpec {
     }
 }
 
-/// Encode `initialize(args...)` as 4-byte selector || abi-encoded args.
+/// Encode `initialize(args...)` as a 4-byte selector plus the abi-encoded args.
 pub fn encode_init_calldata(id: ContractId, abi_encoded_args: &Bytes) -> Bytes {
     let sel = id.init_selector();
     let mut out = Vec::with_capacity(4 + abi_encoded_args.len());
@@ -110,25 +113,27 @@ pub fn encode_init_calldata(id: ContractId, abi_encoded_args: &Bytes) -> Bytes {
     Bytes::from(out)
 }
 
-/// Convenience: abi-encode a single address argument for `initialize(address)`.
+/// Abi-encode a single address argument for `initialize(address)`.
 pub fn encode_address_arg(addr: Address) -> Bytes {
     let v = (addr,).abi_encode();
     Bytes::from(v)
 }
 
-/// abi-encode two address arguments, e.g. `ETHLockbox.initialize(l2Minter, outputOracle)`.
+/// Abi-encode two address arguments, for example
+/// `ETHLockbox.initialize(l2Minter, outputOracle)`.
 pub fn encode_address_pair(a: Address, b: Address) -> Bytes {
     Bytes::from((a, b).abi_encode_params())
 }
 
-/// abi-encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`.
+/// Abi-encode `WithdrawalOutputOracle.initialize(attester, challenger, window)`.
 pub fn encode_oracle_init_args(attester: Address, challenger: Address, window: u64) -> Bytes {
     Bytes::from((attester, challenger, window).abi_encode_params())
 }
 
-/// Init args for the v2 `KardamomProofOracle.initialize(address,address,
-/// bytes32,bytes32,bytes32,uint64,uint96)` (PR 5: two vkeys — batch guest
-/// for validity mode, single-block guest for disputes — plus window/bond).
+/// Build init args for the v2
+/// `KardamomProofOracle.initialize(address,address,bytes32,bytes32,bytes32,uint64,uint96)`.
+/// It takes two vkeys: a batch guest for validity mode, and a single-block
+/// guest for disputes. It also takes the challenge window and the bond.
 #[allow(clippy::too_many_arguments)]
 pub fn encode_proof_oracle_init_args(
     settlement: Address,

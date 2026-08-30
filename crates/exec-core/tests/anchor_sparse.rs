@@ -1,17 +1,18 @@
-//! Sparse-trie acceptance gate (spec: no-std-exec-core, phase 3b): the
-//! sparse recompute over a partial node set MUST equal the full oracle —
-//! alloy-trie's one-shot `HashBuilder` root over the complete key set, the
-//! same primitive `kardamom-state`'s oracle wraps.
+//! Sparse-trie acceptance gate. The
+//! sparse recompute over a partial node set must equal the full oracle:
+//! alloy-trie's one-shot `HashBuilder` root over the complete key set,
+//! the same primitive `kardamom-state`'s oracle wraps.
 //!
-//! The MissingNode-retry loop in [`fixed_point`] IS the capture-side
-//! algorithm (recompute-guided completion): the test resolves each named
-//! missing node from a complete node map exactly as the validator resolves
-//! it from the live trie via the proof-retainer walk. Convergence here is
-//! the design's termination argument exercised, not just a test fixture.
+//! The MissingNode-retry loop in [`fixed_point`] is the capture-side
+//! algorithm (recompute-guided completion). The test resolves each named
+//! missing node from a complete node map, exactly as the validator
+//! resolves it from the live trie through the proof-retainer walk.
+//! Convergence here exercises the design's termination argument, not
+//! just a test fixture.
 //!
-//! Deletion-collapse cases are enumerated explicitly — branch→leaf,
-//! branch→extension, root collapse, cascaded multi-delete under one branch
-//! — that's where sparse implementations rot.
+//! Deletion-collapse cases are listed explicitly: branch to leaf, branch
+//! to extension, root collapse, and cascaded multi-delete under one
+//! branch. That is where sparse implementations tend to break.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -22,9 +23,9 @@ use bytes::Bytes as WireBytes;
 use kardamom_exec_core::anchor::{AnchorError, Lookup, NodeStore, SparseTrie};
 use kardamom_types::WitnessProofs;
 
-/// Reference root + COMPLETE node map for a key→value set, via the oracle
-/// builder with every key as a proof target (every path retained = every
-/// node retained).
+/// Reference root, plus a complete node map, for a key-value set. This
+/// uses the oracle builder with every key as a proof target, so every
+/// path is retained, which means every node is retained.
 fn reference(entries: &BTreeMap<B256, Vec<u8>>) -> (B256, HashMap<B256, Bytes>) {
     let targets: Vec<Nibbles> = entries.keys().map(|k| Nibbles::unpack(k)).collect();
     let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(targets));
@@ -34,8 +35,8 @@ fn reference(entries: &BTreeMap<B256, Vec<u8>>) -> (B256, HashMap<B256, Bytes>) 
     let root = hb.root();
     let mut nodes = HashMap::new();
     for (_, node) in hb.take_proof_nodes().into_inner() {
-        // Only nodes ≥ 32 bytes are addressable by hash; smaller ones are
-        // inline in their parents and never fetched.
+        // Only nodes of 32 bytes or more are addressable by hash. Smaller
+        // ones are inline in their parents and never fetched.
         if node.len() >= 32 {
             nodes.insert(keccak256(&node), node);
         }
@@ -56,10 +57,10 @@ fn proofs_from(nodes: impl IntoIterator<Item = Bytes>) -> WitnessProofs {
     }
 }
 
-/// Run `op` under the recompute-guided fixed point: start from `seed`
-/// proof nodes, resolve every `MissingNode` from the complete map, retry.
-/// Returns the result and how many rounds it took (the termination bound
-/// under test: ≤ one round per resolved node).
+/// Run `op` under the recompute-guided fixed point. Start from `seed`
+/// proof nodes, resolve every `MissingNode` from the complete map, and
+/// retry. Returns the result, and how many rounds it took (the
+/// termination bound under test: at most one round per resolved node).
 fn fixed_point<T>(
     seed: Vec<Bytes>,
     all_nodes: &HashMap<B256, Bytes>,
@@ -85,8 +86,8 @@ fn fixed_point<T>(
     }
 }
 
-/// Proof nodes for a set of target keys out of the complete map — the
-/// capture side's initial (read-path) seed.
+/// Proof nodes for a set of target keys, out of the complete map. This
+/// is the capture side's initial (read-path) seed.
 fn paths_for(entries: &BTreeMap<B256, Vec<u8>>, targets: &[B256]) -> Vec<Bytes> {
     let target_nibbles: Vec<Nibbles> = targets.iter().map(|k| Nibbles::unpack(k)).collect();
     let mut hb = HashBuilder::default().with_proof_retainer(ProofRetainer::new(target_nibbles));
@@ -111,7 +112,7 @@ fn val(i: u64) -> Vec<u8> {
     out
 }
 
-/// Dense-ish base state so branches/extensions actually form.
+/// A fairly dense base state, so branches and extensions actually form.
 fn base_state(n: u64) -> BTreeMap<B256, Vec<u8>> {
     (0..n).map(|i| (key(i), val(i))).collect()
 }
@@ -156,8 +157,9 @@ fn lookup_without_proof_names_the_missing_node() {
     }
 }
 
-/// THE core property: updates + inserts + deletions over the sparse trie,
-/// completed by the fixed point, equal the oracle root of the mutated set.
+/// The core property: updates, inserts, and deletions over the sparse
+/// trie, completed by the fixed point, equal the oracle root of the
+/// mutated set.
 #[test]
 fn sparse_mutations_equal_oracle_across_shapes() {
     for n in [1u64, 2, 3, 8, 33, 200] {
@@ -190,8 +192,8 @@ fn sparse_mutations_equal_oracle_across_shapes() {
         }
         let (oracle_root, _) = reference(&post);
 
-        // Sparse: seed with the written keys' pre-paths (the read set), let
-        // the fixed point pull deletion-collapse siblings.
+        // Sparse: seed with the written keys' pre-paths (the read set).
+        // Let the fixed point pull in deletion-collapse siblings.
         let touched: Vec<B256> = updates.iter().map(|(k, _)| *k).collect();
         let seed = paths_for(&entries, &touched);
         let (sparse_root, rounds) = fixed_point(seed, &all, |store| {
@@ -249,13 +251,14 @@ fn deletion_collapses_to_single_leaf_and_to_empty() {
     assert_eq!(empty_root, alloy_trie::EMPTY_ROOT_HASH, "root collapse");
 }
 
-/// Cascaded multi-delete under one branch: keys engineered to share a
-/// prefix so several collapses stack (branch→ext→merge), plus reinsertion
-/// into the collapsed shape.
+/// Cascaded multi-delete under one branch. Keys are engineered to share
+/// a prefix, so several collapses stack (branch to extension to merge),
+/// plus a reinsertion into the collapsed shape.
 #[test]
 fn cascaded_deletes_under_shared_prefixes() {
-    // Keys with a controlled shared prefix: flip only the last byte of the
-    // preimage, then take keys that landed under a common first nibble.
+    // Keys with a controlled shared prefix. Flip only the last byte of
+    // the preimage, then take the keys that land under a common first
+    // nibble.
     let raw: Vec<B256> = (0..4096u64).map(key).collect();
     let mut groups: BTreeMap<u8, Vec<B256>> = BTreeMap::new();
     for k in &raw {
@@ -277,9 +280,9 @@ fn cascaded_deletes_under_shared_prefixes() {
         .collect();
     let (root, all) = reference(&entries);
 
-    // Delete ALL BUT ONE key of the dense group — maximal cascade — and a
-    // few from elsewhere; then insert one fresh key back under the same
-    // prefix (collapse followed by re-split).
+    // Delete all but one key of the dense group (the maximal cascade),
+    // plus a few keys from elsewhere. Then insert one fresh key back
+    // under the same prefix (a collapse followed by a re-split).
     let survivors = &dense[0];
     let deletions: Vec<B256> = dense[1..].to_vec();
     let fresh = key(1_000_000);
@@ -303,13 +306,14 @@ fn cascaded_deletes_under_shared_prefixes() {
     });
     assert_eq!(sparse_root, oracle_root, "cascaded collapse + reinsert");
 
-    // The survivor must still prove present afterwards through a fresh walk
-    // over the same set (sanity that the collapse spliced, not dropped).
+    // The survivor must still prove present afterward, through a fresh
+    // walk over the same set. This checks that the collapse spliced the
+    // survivor in, rather than dropping it.
     let _ = survivors;
 }
 
-/// Tampering: a node set whose bytes were altered can only MISS (content
-/// addressing), and an unsorted set is rejected outright.
+/// Tampering: a node set whose bytes were altered can only miss (this is
+/// content addressing), and an unsorted set is rejected outright.
 #[test]
 fn tampered_and_noncanonical_sets_fail_closed() {
     let entries = base_state(32);
@@ -317,8 +321,8 @@ fn tampered_and_noncanonical_sets_fail_closed() {
     let target = key(3);
     let seed = paths_for(&entries, &[target]);
 
-    // Flip a byte in one node: its hash changes, so the walk MISSES the
-    // original hash — tampering degrades to MissingNode, never bad state.
+    // Flip a byte in one node. Its hash changes, so the walk misses the
+    // original hash. Tampering degrades to MissingNode, never bad state.
     let mut tampered = seed.clone();
     let mut bytes = tampered[0].to_vec();
     bytes[0] ^= 0x01;
@@ -329,8 +333,8 @@ fn tampered_and_noncanonical_sets_fail_closed() {
     match trie.lookup(target) {
         Err(AnchorError::MissingNode { .. }) => {}
         Ok(Lookup::Found(v)) => {
-            // Only acceptable if the tampered node wasn't on this path and
-            // the value still proves out against the real root.
+            // Only acceptable if the tampered node was not on this path,
+            // and the value still proves out against the real root.
             assert_eq!(v, val(3));
         }
         other => panic!(

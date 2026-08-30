@@ -1,9 +1,10 @@
-//! Permutation-invariance and value-change sensitivity tests for write_set_hash.
+//! Tests for write_set_hash: permutation invariance and sensitivity to value
+//! changes.
 //!
-//! Property: for any WriteSet `ws`, building `ws'` by inserting the same
-//! (addr, kind, key, value) tuples in a randomly shuffled order yields
-//! `ws'.hash() == ws.hash()`. Sensitivity: changing any single value flips
-//! the hash.
+//! Property: take a `WriteSet` `ws`. Build `ws'` by inserting the same
+//! (addr, kind, key, value) tuples in a random shuffled order. Then
+//! `ws'.hash() == ws.hash()`. Sensitivity: a change to any single value
+//! flips the hash.
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_executor::delta::WriteSet;
@@ -22,8 +23,9 @@ fn build(
     for (k, v) in storage {
         ws.storage.push((*k, *v));
     }
-    // Sort-on-build IS the invariance mechanism now (was BTreeMap order):
-    // this property test proves shuffled insertion still hashes identically.
+    // Sorting on build is now the invariance mechanism (it used BTreeMap
+    // order before). This test proves shuffled insertion still gives the
+    // same hash.
     ws.finish();
     ws
 }

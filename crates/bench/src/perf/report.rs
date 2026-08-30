@@ -1,5 +1,5 @@
-//! Perf-report assembly: fold the load report and the collapsed-stack
-//! profile into a human-readable `summary.md`.
+//! This module assembles the perf report. It folds the load report and
+//! the collapsed-stack profile into a human-readable `summary.md`.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,18 +16,20 @@ pub struct FrameShare {
     pub pct: f64,
 }
 
-/// Aggregate collapsed stacks into leaf shares and inclusive shares for a
-/// fixed set of infrastructure buckets, so the summary can answer "where does
-/// the CPU go" without the reader opening the flamegraph.
+/// Aggregate collapsed stacks into leaf shares and inclusive shares,
+/// for a fixed set of infrastructure buckets. This lets the summary
+/// answer "where does the CPU go" without the reader opening the
+/// flame graph.
 pub struct ProfileSummary {
     pub total_samples: u64,
     pub top_leaves: Vec<FrameShare>,
     pub buckets: Vec<FrameShare>,
 }
 
-/// Buckets that partition the sealer's CPU story. Matched by substring
-/// against every frame in a stack (inclusive attribution, first match wins,
-/// ordered from most to least specific).
+/// The buckets that partition the sealer's CPU story. The code matches
+/// these by substring against every frame in a stack. Attribution is
+/// inclusive, the first match wins, and the buckets are ordered from
+/// most to least specific.
 const BUCKETS: &[(&str, &str)] = &[
     ("idle-strategy spin/yield", "BackoffIdleStrategy.idle"),
     (
@@ -97,9 +99,10 @@ pub fn analyze_collapsed(collapsed: &str) -> ProfileSummary {
     }
 }
 
-/// Write `summary.md`. The ramp/edge numbers come from the discovery run;
-/// the delivery verdict, latency, and soak shape come from the profiled soak
-/// (a chaos-mode fixed-rate run, which carries no ramp of its own).
+/// Write `summary.md`. The ramp and edge numbers come from the
+/// discovery run. The delivery verdict, latency, and soak shape come
+/// from the profiled soak, a chaos-mode fixed-rate run that carries no
+/// ramp of its own.
 pub fn write_summary(
     out: &OutDir,
     discovery: &LoadReport,

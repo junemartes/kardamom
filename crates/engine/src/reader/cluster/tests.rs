@@ -23,15 +23,15 @@ fn relayed_txref(shard: u8, off: i32) -> Vec<u8> {
 
 #[test]
 fn replay_gap_is_reordered_and_deduped() {
-    // Live-ahead frames arrive FIRST (the session reconnected mid-stream);
-    // the replayed range then fills the gap. Canonical order: r0 r1 b1(end2)
-    // r2 r3 b2(end4) r4 r5.
+    // Live-ahead frames arrive first, because the session reconnected
+    // mid-stream. The replayed range then fills the gap. Canonical order:
+    // r0 r1 b1(end2) r2 r3 b2(end4) r4 r5.
     let egress = FakeEgress::new();
     // Live-ahead: record 5 and boundary 2 arrive before the replay.
     egress.push(encode_egress_record(5, &relayed_txref(1, 5)));
     egress.push(encode_egress_boundary(2, 4, 2_000, 0));
-    // Replayed frames (emission order), incl. a duplicate of record 5's
-    // predecessor range and both boundaries.
+    // Replayed frames, in emission order. This includes a duplicate of
+    // record 5's predecessor range, and both boundaries.
     for i in 0..5 {
         egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
     }
@@ -99,8 +99,8 @@ fn replay_unavailable_is_fatal() {
 
 #[test]
 fn resume_cursor_skips_already_applied_range() {
-    // Consumer resumes at (records=3, next block=2): replayed frames below
-    // the cursor are dropped, delivery starts exactly at the cursor.
+    // Consumer resumes at (records=3, next block=2). Replayed frames below
+    // the cursor are dropped. Delivery starts exactly at the cursor.
     let egress = FakeEgress::new();
     for i in 0..5 {
         egress.push(encode_egress_record(i, &relayed_txref(1, i as i32)));
@@ -134,7 +134,8 @@ fn yields_records_with_monotonic_bposition() {
     assert!(matches!(m0, TxOrderingMessage::TxRef(_)));
     let (p1, _m1) = sub.next().unwrap();
     assert_eq!(p1, BPosition::from_index(1));
-    // Stream closed ⇒ TxOrderingClosed (the reader treats this as clean EOF).
+    // Stream closed gives TxOrderingClosed. The reader treats this as a
+    // clean EOF.
     assert!(matches!(sub.next(), Err(ExecutorError::TxOrderingClosed)));
 }
 
@@ -143,8 +144,9 @@ fn yields_boundary_with_fields_intact() {
     let egress = FakeEgress::new();
     egress.push(encode_egress_boundary(7, 42, 1_700_000_000_250, 0));
     egress.close();
-    // Consumer resumed at (42 records applied, next block 7) — the
-    // boundary is the next in-order item and must decode field-intact.
+    // Consumer resumed at (42 records applied, next block 7). The
+    // boundary is the next in-order item, and must decode with its fields
+    // intact.
     let mut sub = ClusterTxOrderingSubscription::with_cursor(egress, ReplayCursor::new(42, 7));
     let (pos, msg) = sub.next().unwrap();
     match msg {
@@ -158,15 +160,15 @@ fn yields_boundary_with_fields_intact() {
     }
 }
 
-// F07.2 regression: a boundary-only gap across a session reconnect.
-// Cursor at (records=2, next block=1): records 0..1 delivered, block 1 not
-// yet sealed. Boundary b1 was emitted during a brief session outage; the
-// reconnect's first live frame is record 2 — exactly the next index, so no
-// key gap is observed and live mode delivers it. The replayed boundary
-// b1(end=2) then arrives; it canonically precedes record 2, so delivering
-// it now would seal block 1 with block 2's first record inside. That
-// inversion must FAIL-STOP (restart + cursor replay recovers gaplessly),
-// never deliver.
+// Regression test: a boundary-only gap across a session reconnect.
+// Cursor at (records=2, next block=1). Records 0..1 are delivered; block 1
+// is not yet sealed. Boundary b1 was emitted during a brief session
+// outage. The reconnect's first live frame is record 2, exactly the next
+// index, so no key gap is seen, and live mode delivers it. The replayed
+// boundary b1(end=2) then arrives. It canonically precedes record 2, so
+// delivering it now would seal block 1 with block 2's first record inside.
+// This inversion must fail-stop instead of deliver; a restart plus cursor
+// replay recovers with no gaps.
 #[test]
 fn late_boundary_sealing_below_cursor_is_fatal() {
     let egress = FakeEgress::new();
@@ -178,7 +180,7 @@ fn late_boundary_sealing_below_cursor_is_fatal() {
     let (p, m) = sub.next().unwrap();
     assert_eq!(p.as_index(), 2);
     assert!(matches!(m, TxOrderingMessage::TxRef(_)));
-    // The late replayed boundary proves the inversion → fatal.
+    // The late replayed boundary proves the inversion. This is fatal.
     assert!(matches!(
         sub.next(),
         Err(ExecutorError::BoundaryMisaligned { .. })
@@ -192,7 +194,7 @@ fn malformed_frame_is_skipped_not_fatal() {
     egress.push(encode_egress_boundary(1, 0, 0, 0));
     egress.close();
     let mut sub = ClusterTxOrderingSubscription::new(egress);
-    // The malformed frame is skipped; the next good frame is returned.
+    // The malformed frame is skipped. The next good frame is returned.
     let (_pos, msg) = sub.next().unwrap();
     assert!(matches!(msg, TxOrderingMessage::BoundaryStart(_)));
 }

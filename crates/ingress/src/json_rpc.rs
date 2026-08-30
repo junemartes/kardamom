@@ -1,13 +1,13 @@
-//! JSON-RPC server over HTTP and WebSocket via jsonrpsee.
+//! JSON-RPC server over HTTP and WebSocket, through jsonrpsee.
 //!
-//! Method set is the minimal v0 Ethereum subset:
-//! - `eth_chainId`
-//! - `eth_blockNumber` (served from the tx_receipts `BlockBoundary` watcher
-//!   in the proxy)
-//! - `eth_sendRawTransaction`
-//! - `eth_getTransactionReceipt` (state-DB `tx_hash_index` lookup)
-//! - `eth_getBalance` / `eth_getTransactionCount` — return a clear error
-//!   ("deferred to S6 state writer") rather than "method not found".
+//! The method set is the minimal v0 Ethereum subset:
+//! - `eth_chainId`.
+//! - `eth_blockNumber`, served from the tx_receipts `BlockBoundary`
+//!   watcher in the proxy.
+//! - `eth_sendRawTransaction`.
+//! - `eth_getTransactionReceipt`, a state-DB `tx_hash_index` lookup.
+//! - `eth_getBalance` and `eth_getTransactionCount` return a clear error,
+//!   "deferred to S6 state writer," instead of "method not found."
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -50,14 +50,15 @@ pub trait IngressEthApi {
 }
 
 /// Event stream payload for `kardamom_subscribeReceipts`. One subscription
-/// carries three frame kinds: executed-tx receipts, sequencer rejections
-/// (the tx will never receipt), and a lag marker emitted when the subscriber
-/// fell further behind than the feed buffer — the gap must then be recovered
-/// by polling `eth_getTransactionReceipt`.
+/// carries three frame kinds: an executed-tx receipt, a sequencer
+/// rejection, meaning the tx will never receipt, and a lag marker, sent
+/// when the subscriber fell further behind than the feed buffer. The
+/// client must then recover the gap by polling
+/// `eth_getTransactionReceipt`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum ReceiptEvent {
-    /// A tx executed; its enriched receipt was observed on tx_receipts.
+    /// A tx executed, and its enriched receipt was observed on tx_receipts.
     #[serde(rename_all = "camelCase")]
     Receipt { receipt: Box<TransactionReceipt> },
     /// The sequencer rejected the tx.
@@ -68,26 +69,27 @@ pub enum ReceiptEvent {
         reason: String,
         expected_nonce: Option<u64>,
     },
-    /// The subscriber lagged; `skipped` feed items were dropped.
+    /// The subscriber lagged. `skipped` feed items were dropped.
     #[serde(rename_all = "camelCase")]
     Lagged { skipped: u64 },
 }
 
-/// Kardamom-native extensions: fast-ack submission + push receipt delivery.
-/// The Eth-compatible `eth_sendRawTransaction` parks the caller until the
-/// receipt arrives, which costs one held connection per in-flight tx; this
-/// namespace decouples the two so any number of txs can be in flight over a
-/// single connection.
+/// Kardamom-native extensions: fast-ack submission and push receipt
+/// delivery. The Eth-compatible `eth_sendRawTransaction` parks the caller
+/// until the receipt arrives, which costs one held connection per
+/// in-flight tx. This namespace decouples the two, so any number of txs
+/// can be in flight over a single connection.
 #[rpc(server, namespace = "kardamom")]
 pub trait IngressKardamomApi {
-    /// Fast-ack submission: validates, publishes to tx_data, and returns the
-    /// canonical tx hash immediately. Delivery is observed via
-    /// `kardamom_subscribeReceipts` or `eth_getTransactionReceipt`.
+    /// Fast-ack submission. Validates, publishes to tx_data, and returns
+    /// the canonical tx hash right away. The client observes delivery
+    /// through `kardamom_subscribeReceipts` or
+    /// `eth_getTransactionReceipt`.
     #[method(name = "sendRawTransactionAsync")]
     async fn send_raw_transaction_async(&self, bytes: Bytes) -> RpcResult<B256>;
 
-    /// Push feed of deduped receipts and sequencer rejections (WebSocket
-    /// only). `senders` filters to the given addresses; `None` or `[]`
+    /// Push feed of deduped receipts and sequencer rejections, WebSocket
+    /// only. `senders` filters to the given addresses. `None` or `[]`
     /// streams everything.
     #[subscription(name = "subscribeReceipts", item = ReceiptEvent)]
     async fn subscribe_receipts(&self, senders: Option<Vec<Address>>) -> SubscriptionResult;
@@ -122,8 +124,8 @@ where
     }
 
     async fn block_number(&self) -> RpcResult<U256> {
-        //the proxy's tx_receipts watcher (spawned in
-        // `IngressProxy::new`) maintains `latest_block_number: AtomicU64`.
+        // The proxy's tx_receipts watcher, spawned in `IngressProxy::new`,
+        // maintains `latest_block_number: AtomicU64`.
         Ok(U256::from(self.proxy.latest_block_number()))
     }
 
@@ -154,9 +156,10 @@ where
     }
 
     async fn transaction_receipt(&self, hash: B256) -> RpcResult<Option<TransactionReceipt>> {
-        // Served from the in-memory `ReceiptCache` (populated off the
-        // tx_receipts stream) — the ingress holds no state DB. Returns
-        // `null` per JSON-RPC convention if not yet committed.
+        // This is served from the in-memory `ReceiptCache`, populated
+        // off the tx_receipts stream, since the ingress holds no state
+        // DB. Returns `null`, by JSON-RPC convention, if not yet
+        // committed.
         Ok(self.proxy.lookup_receipt_by_hash(hash).map(receipt_to_rpc))
     }
 }
@@ -184,8 +187,8 @@ where
         pending: PendingSubscriptionSink,
         senders: Option<Vec<Address>>,
     ) -> SubscriptionResult {
-        // Tap the feeds *before* accepting so nothing published in between
-        // is missed.
+        // This taps the feeds before accepting, so nothing published in
+        // between is missed.
         let mut receipts = self.proxy.subscribe_receipt_feed();
         let mut errors = self.proxy.subscribe_tx_error_feed();
         let sink = pending.accept().await?;
@@ -232,16 +235,16 @@ where
             let msg = serde_json::value::to_raw_value(&event)
                 .map_err(|e| format!("serialize subscription event: {e}"))?;
             if sink.send(msg).await.is_err() {
-                break; // subscriber went away
+                break; // The subscriber went away.
             }
         }
         Ok(())
     }
 }
 
-/// Human/machine-readable description of a sequencer rejection for the
-/// subscription stream. Exhaustive on purpose: a new `TxErrorReason` variant
-/// must decide its wire shape here.
+/// Human- and machine-readable description of a sequencer rejection for
+/// the subscription stream. This match is exhaustive on purpose: a new
+/// `TxErrorReason` variant must decide its wire shape here.
 fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<u64>) {
     match reason {
         kardamom_types::TxErrorReason::DuplicatedTx { expected_nonce } => {
@@ -253,15 +256,15 @@ fn describe_tx_error(reason: &kardamom_types::TxErrorReason) -> (String, Option<
     }
 }
 
-/// Adapter from our internal `kardamom_types::Receipt` to alloy's
-/// `TransactionReceipt`. The internal type carries the canonical B-position
-/// and `write_set_hash` that the public Eth API does not need; everything
-/// else is now populated by the executor at execution time and ingress just
-/// reshapes the fields.
+/// Adapts the internal `kardamom_types::Receipt` to alloy's
+/// `TransactionReceipt`. The internal type carries the canonical
+/// B-position and `write_set_hash`, which the public Eth API does not
+/// need. The executor now populates everything else at execution time,
+/// and ingress only reshapes the fields.
 ///
-/// `block_hash` stays `None` in v0: the slim `BlockBoundary` has no state
-/// commitment, so there is no meaningful hash to return. JSON-RPC permits
-/// `null` here.
+/// `block_hash` stays `None` in v0. The slim `BlockBoundary` has no
+/// state commitment, so there is no meaningful hash to return. JSON-RPC
+/// allows `null` here.
 fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
     let block_number = r.block_number;
     let logs: Vec<alloy_rpc_types_eth::Log> = r
@@ -294,17 +297,17 @@ fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
         },
         logs_bloom,
     };
-    // Report the tx's REAL EIP-2718 type. This was hardcoded to Legacy, so
-    // every deposit surfaced to clients as a type-0x00 transaction —
-    // bridge tooling identifies deposits by the 0x7E byte.
+    // This reports the tx's real EIP-2718 type. It was hardcoded to
+    // Legacy before, so every deposit surfaced to clients as a type-0x00
+    // transaction. Bridge tooling identifies deposits by the 0x7E byte.
     let inner = match r.tx_type {
         kardamom_types::TX_TYPE_LEGACY => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
         0x01 => alloy_rpc_types_eth::ReceiptEnvelope::Eip2930(with_bloom),
         0x02 => alloy_rpc_types_eth::ReceiptEnvelope::Eip1559(with_bloom),
         0x03 => alloy_rpc_types_eth::ReceiptEnvelope::Eip4844(with_bloom),
-        // Deposits (0x7E) have no alloy-eth envelope variant — the OP type
-        // lives in op-alloy. Legacy is the closest structural carrier; the
-        // authoritative deposit marker for kardamom consumers is
+        // Deposits (0x7E) have no alloy-eth envelope variant; the OP type
+        // lives in op-alloy. Legacy is the closest structural carrier.
+        // The authoritative deposit marker for kardamom consumers is
         // `Receipt::is_deposit()` on the native stream.
         _ => alloy_rpc_types_eth::ReceiptEnvelope::Legacy(with_bloom),
     };
@@ -324,10 +327,10 @@ fn receipt_to_rpc(r: kardamom_types::Receipt) -> TransactionReceipt {
     }
 }
 
-/// Start the jsonrpsee server. Returns the bound `SocketAddr` and a
-/// `ServerHandle` whose drop shuts the server down. An HTTP middleware
-/// extracts the peer IP and stores it in the `PEER_ADDR` task-local for the
-/// duration of each request.
+/// Starts the jsonrpsee server. Returns the bound `SocketAddr` and a
+/// `ServerHandle`; dropping the handle shuts the server down. An HTTP
+/// middleware extracts the peer IP and stores it in the `PEER_ADDR`
+/// task-local for the duration of each request.
 pub async fn start_jsonrpc_server<P, S>(
     proxy: IngressProxy<P, S>,
     addr: SocketAddr,
@@ -336,10 +339,11 @@ where
     P: IngressPublication + Clone + 'static,
     S: IngressSubscription + Clone + 'static,
 {
-    // A parked submit_raw holds its connection until the receipt arrives, so
-    // the connection cap — not the handler — becomes the throughput limit the
-    // moment it is smaller than offered-rate × receipt-latency. Take it from
-    // config instead of jsonrpsee's default (100); see
+    // A parked submit_raw holds its connection until the receipt arrives.
+    // So the connection cap, not the handler, becomes the throughput
+    // limit as soon as it is smaller than the offered rate times the
+    // receipt latency. This takes the cap from config instead of
+    // jsonrpsee's default of 100; see
     // `IngressConfig::rpc_max_connections`.
     let server_cfg = jsonrpsee::server::ServerConfig::builder()
         .max_connections(proxy.cfg.rpc_max_connections)
@@ -362,11 +366,11 @@ where
     Ok((local, server.start(module)))
 }
 
-/// Tiny tower layer that pulls the peer's `SocketAddr` (set on the
-/// request's `extensions` by jsonrpsee's HTTP transport) and stores its IP
-/// in the [`PEER_ADDR`] task-local for the lifetime of the request. If the
-/// extension is missing — e.g. unit-tests with custom transports — the
-/// handler falls back to loopback.
+/// Tiny tower layer. It pulls the peer's `SocketAddr`, set on the
+/// request's `extensions` by jsonrpsee's HTTP transport, and stores its
+/// IP in the [`PEER_ADDR`] task-local for the lifetime of the request. If
+/// the extension is missing, for example in unit tests with custom
+/// transports, the handler falls back to loopback.
 mod peer_addr_layer {
     use std::future::Future;
     use std::net::{IpAddr, Ipv4Addr};
@@ -412,8 +416,8 @@ mod peer_addr_layer {
                 .get::<std::net::SocketAddr>()
                 .map(|s| s.ip())
                 .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-            // `Service::call` traditionally requires that we use the cloned
-            // inner ready service — the standard tower idiom.
+            // `Service::call` traditionally requires the cloned inner
+            // ready service. This is the standard tower idiom.
             let clone = self.inner.clone();
             let mut inner = std::mem::replace(&mut self.inner, clone);
             Box::pin(async move {

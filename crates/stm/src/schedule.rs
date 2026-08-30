@@ -1,24 +1,27 @@
-//! Pessimistic DAG construction (spec: "The strategy stack" / "The graph
-//! index"): the predictor maps each tx to its predicted cells BEFORE
-//! execution; per-cell last-toucher chains in canonical order become the
-//! edges. Predicted overlap ⇒ ordered — no abort storms by construction.
+//! Pessimistic DAG construction: the predictor maps each transaction to
+//! its predicted cells
+//! before execution. Per-cell last-toucher chains in canonical order
+//! become the edges. Predicted overlap means ordered, so no abort storms
+//! happen by construction.
 //!
 //! Strategy routing, v1:
 //! - `SenderChain` falls out of tier-1 (the sender Account cell is always
 //!   predicted).
-//! - `Accumulator`: the fee sink is EXCLUDED from the cells (spec boundary
-//!   #4 — as a key it would chain every block).
+//! - `Accumulator`: the fee sink is excluded from the cells (spec boundary
+//!   #4). As a key it would chain every block.
 //! - `Tail` / cold: an untrained selector maps to the wildcard key ⊤,
-//!   which conflicts with everything — encoded as a BARRIER at the tx's
-//!   canonical position (every in-flight tx before it, everything after
-//!   depends on it). Running cold txs "at the end" instead would let later
-//!   predicted txs read pre-cold state and convert every true conflict
-//!   into a guaranteed validation failure; the barrier keeps ⊤ semantics
-//!   exact ("when unsure, serialize" — at the position the sequencer chose).
-//! - Deposits/epochs never reach this scheduler (serial lane upstream).
+//!   which conflicts with everything. This is encoded as a barrier at the
+//!   transaction's canonical position: every in-flight transaction before
+//!   it, and everything after it, depends on it. Running cold
+//!   transactions "at the end" instead would let later predicted
+//!   transactions read pre-cold state and turn every true conflict into a
+//!   guaranteed validation failure. The barrier keeps ⊤'s meaning exact:
+//!   when unsure, serialize, at the position the sequencer chose.
+//! - Deposits and epochs never reach this scheduler (a serial lane
+//!   upstream handles them).
 //!
-//! Predictions here use the same `Stats::predict` the P1 shadow grades, so
-//! the shadow's `false_independent_total` is a live upper bound on the
+//! Predictions here use the same `Stats::predict` the footprint shadow
+//! scheduler grades, so its `false_independent_total` is a live upper bound on the
 //! validation failures this schedule can produce.
 
 use std::collections::{HashMap, HashSet};
@@ -47,8 +50,9 @@ pub fn scheduling_view(local_idx: u32, envelope: &TxEnvelope) -> TxObs {
     view_from_parts(local_idx, envelope, to, selector, args, has_value)
 }
 
-/// [`scheduling_view`] over a pre-decoded envelope (None = undecodable —
-/// the tier-1-only degenerate view, same as a failed decode).
+/// [`scheduling_view`] over a pre-decoded envelope. `None` means
+/// undecodable: the tier-1-only degenerate view, the same as a failed
+/// decode.
 pub fn scheduling_view_decoded(
     local_idx: u32,
     envelope: &TxEnvelope,
@@ -84,19 +88,22 @@ fn view_from_parts(
     }
 }
 
-/// INCREMENTAL DAG construction — the pipeline shape: the sealer streams
-/// canonical records in order, so when tx i arrives every predecessor it
-/// can have is already admitted; `admit` returns i's full predecessor set
-/// immediately and execution may start before i+1 exists. Pure bookkeeping,
-/// no locks — the engine integrates it under its per-block graph lock.
+/// Incremental DAG construction, for the pipeline shape: the sealer
+/// streams canonical records in order, so when transaction i arrives,
+/// every predecessor it can have is already admitted. `admit` returns i's
+/// full predecessor set right away, and execution may start before i+1
+/// exists. Pure bookkeeping, no locks. The engine integrates it under its
+/// per-block graph lock.
 #[derive(Debug, Default)]
 pub struct DagBuilder {
-    // Per-cell last toucher: chain in canonical order. Reader/writer modes
-    // are not split (predictions don't either — conservative, the same
-    // over-merge the P0 grading priced at ~0% on trained selectors).
+    // Per-cell last toucher: a chain in canonical order. Reader and writer
+    // modes are not split here, matching the predictions. This is
+    // conservative; offline grading priced the same over-merge at about
+    // 0% on trained selectors.
     last_toucher: HashMap<Cell, u32>,
-    // Wildcard bookkeeping: the last barrier, and the txs admitted since
-    // (each already depends on that barrier transitively).
+    // Wildcard bookkeeping: the last barrier, and the transactions
+    // admitted since then (each already depends on that barrier
+    // transitively).
     last_barrier: Option<u32>,
     since_barrier: Vec<u32>,
     pub cold: usize,
@@ -104,9 +111,9 @@ pub struct DagBuilder {
 }
 
 impl DagBuilder {
-    /// Admit tx i (must be called in canonical order) and return its
-    /// DEDUPED predecessor list. `cells` = the prediction (None = cold ⇒
-    /// barrier).
+    /// Admit transaction i (must be called in canonical order) and return
+    /// its deduplicated predecessor list. `cells` is the prediction;
+    /// `None` means cold, so this becomes a barrier.
     pub fn admit(
         &mut self,
         i: u32,
@@ -133,9 +140,10 @@ impl DagBuilder {
                 self.since_barrier.push(i);
             }
             None => {
-                // ⊤: barrier. Depends on every tx since the previous
-                // barrier (those cover the previous barrier transitively);
-                // with none in between, on the previous barrier itself.
+                // ⊤: a barrier. It depends on every transaction since the
+                // previous barrier (those cover the previous barrier
+                // transitively). With none in between, it depends on the
+                // previous barrier itself.
                 self.cold += 1;
                 if self.since_barrier.is_empty() {
                     if let Some(b) = self.last_barrier {
@@ -189,8 +197,9 @@ mod tests {
     use bytes::Bytes;
 
     fn envelope(sender: Address) -> TxEnvelope {
-        // Raw bytes that fail 2718 decode ⇒ selector-less view: tier-1
-        // only, never cold — exactly what a native transfer degrades to.
+        // Raw bytes that fail 2718 decode give a selector-less view:
+        // tier-1 only, never cold. This is what a native transfer
+        // degrades to.
         let raw = Bytes::from_static(&[0xff, 0x00]);
         TxEnvelope {
             correlation_id: 0,
@@ -239,7 +248,7 @@ mod tests {
 
     #[test]
     fn cold_tx_is_a_barrier_at_its_position() {
-        // Cold = a CALL with a selector no stats have seen.
+        // Cold means a CALL with a selector no stats have seen.
         let cold_env = {
             use alloy_consensus::{SignableTransaction, TxLegacy};
             use alloy_eips::eip2718::Encodable2718;
@@ -281,8 +290,8 @@ mod tests {
             &HashSet::new(),
         );
         assert_eq!(s.cold, 1);
-        // 0->2, 1->2 (barrier waits on all in-flight), 2->3 (everything
-        // after waits on the barrier).
+        // 0->2, 1->2: the barrier waits on all in-flight transactions.
+        // 2->3: everything after waits on the barrier.
         assert_eq!(s.indegree[2], 2);
         assert_eq!(s.indegree[3], 1);
         assert!(s.children[2].contains(&3));

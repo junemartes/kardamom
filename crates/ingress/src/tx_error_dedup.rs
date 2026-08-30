@@ -1,40 +1,43 @@
-//! Consumer-side dedup for the `tx_errors` stream under racing sequencer
-//! replicas (F02.6).
+//! Consumer-side dedup for the `tx_errors` stream, under racing sequencer
+//! replicas.
 //!
-//! With P=2 replicas racing per shard, BOTH replicas nonce-order the same
-//! tx_data stream, so a per-tx rejection (`DuplicatedTx` today) is emitted by
-//! both and arrives up to P times at ingress. Worse, a rejection from one
-//! replica can race a *success* from its twin: a replica whose nonce floor is
-//! momentarily stale (e.g. a rejoiner fast-forwarding) may reject a tx its
-//! twin accepted and ordered — the client must get the receipt, not the
-//! losing replica's error.
+//! With P=2 replicas racing per shard, both replicas nonce-order the same
+//! tx_data stream. So a per-tx rejection, today `DuplicatedTx`, is emitted
+//! by both, and arrives up to P times at ingress. Worse, a rejection from
+//! one replica can race a success from its twin: a replica whose nonce
+//! floor is briefly stale, for example a rejoiner fast-forwarding, may
+//! reject a tx that its twin accepted and ordered. In that case the
+//! client must get the receipt, not the losing replica's error.
 //!
-//! [`TxErrorDedup`] therefore keeps a short sliding window of terminal
-//! observations per `(sender, nonce)`:
-//! - [`record_success`](TxErrorDedup::record_success) — called by the receipt
-//!   watcher for every (first-copy) receipt. A success observed within the
-//!   window suppresses any rejection for the same key (success overrides
-//!   rejection).
-//! - [`observe_error`](TxErrorDedup::observe_error) — called by the tx_errors
-//!   watcher. The FIRST error of a given reason class for a key within the
-//!   window is processed; later copies (the twin's duplicate emission) are
-//!   dropped.
+//! [`TxErrorDedup`] keeps a short sliding window of terminal observations
+//! for each `(sender, nonce)`:
+//! - [`record_success`](TxErrorDedup::record_success): the receipt
+//!   watcher calls this for every first-copy receipt. A success observed
+//!   within the window suppresses any rejection for the same key, so
+//!   success overrides rejection.
+//! - [`observe_error`](TxErrorDedup::observe_error): the tx_errors
+//!   watcher calls this. It processes the first error of a given reason
+//!   class for a key within the window, and drops later copies, the
+//!   twin's duplicate emission.
 //!
 //! The window is a TTL, not a first-wins-forever set, because `(sender,
-//! nonce)` keys legitimately recur: a client may resubmit the same duplicate
-//! tx minutes later and must get a prompt rejection again, not a suppressed
-//! one. Replica copies of one emission arrive within milliseconds of each
-//! other (both replicas consume the same stream at roughly the same rate), and
-//! a rejection-vs-success race resolves within the ordering→execution→receipt
-//! latency, so a TTL of a few seconds comfortably covers both while keeping
-//! recurrences independent. The map is additionally capacity-bounded (oldest
-//! evicted) so it cannot grow without limit; an undersized capacity only means
-//! a very late duplicate is reprocessed, which is harmless — the pending-map
-//! release it drives is idempotent (the responder fires at most once).
+//! nonce)` keys legitimately recur: a client may resubmit the same
+//! duplicate tx minutes later, and must get a prompt rejection again, not
+//! a suppressed one. Replica copies of one emission arrive within
+//! milliseconds of each other, since both replicas consume the same
+//! stream at close to the same rate. A rejection-vs-success race resolves
+//! within the ordering-to-execution-to-receipt latency. So a TTL of a few
+//! seconds comfortably covers both cases, while keeping recurrences
+//! independent. The map is also capacity-bounded, with the oldest entry
+//! evicted first, so it cannot grow without limit. If the capacity is too
+//! small, the only effect is that a very late duplicate is reprocessed,
+//! which is harmless: the pending-map release it drives is idempotent, so
+//! the responder fires at most once.
 //!
-//! Dedup is keyed on `{sender, nonce, reason CLASS}` (the enum discriminant,
-//! not the full value): racing replicas can disagree on payload details like
-//! `DuplicatedTx::expected_nonce` while reporting the same rejection.
+//! Dedup is keyed on `{sender, nonce, reason class}`, using the enum
+//! discriminant, not the full value. Racing replicas can disagree on
+//! payload details like `DuplicatedTx::expected_nonce` while reporting
+//! the same rejection.
 
 use std::collections::{HashMap, VecDeque};
 use std::mem::Discriminant;
@@ -44,36 +47,39 @@ use std::time::{Duration, Instant};
 use alloy_primitives::Address;
 use kardamom_types::TxErrorReason;
 
-/// Default sliding window. Must exceed the replica emission skew (ms) and the
-/// rejection-vs-success race window (ordering → receipt latency, well under a
-/// second), while staying far below a plausible client retry of the same
-/// nonce.
+/// Default sliding window. Must exceed the replica emission skew, in
+/// milliseconds, and the rejection-vs-success race window, the
+/// ordering-to-receipt latency, well under a second. It must also stay
+/// far below a plausible client retry of the same nonce.
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(10);
 
-/// Default entry capacity. Terminal marks are only needed for the in-flight
-/// window; tens of thousands is orders of magnitude more than a few seconds
-/// of traffic needs.
+/// Default entry capacity. Terminal marks are needed only for the
+/// in-flight window. Tens of thousands is far more than a few seconds of
+/// traffic needs.
 pub const DEFAULT_CAPACITY: usize = 1 << 16;
 
 /// Last terminal observation for a `(sender, nonce)` key.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mark {
-    /// A receipt was observed — the tx landed; rejections for this key within
-    /// the window are the losing twin's and must be suppressed.
+    /// A receipt was observed, so the tx landed. A rejection for this key
+    /// within the window belongs to the losing twin, and must be
+    /// suppressed.
     Succeeded,
-    /// An error of this reason class was already processed within the window.
+    /// An error of this reason class was already processed within the
+    /// window.
     Rejected(Discriminant<TxErrorReason>),
 }
 
 struct Inner {
     map: HashMap<(Address, u64), (Mark, Instant)>,
-    /// Insertion-time order for TTL purge + capacity eviction. Refreshed keys
-    /// get a new entry; stale queue entries are skipped at purge time by
-    /// comparing the stored timestamp.
+    /// Insertion-time order, for TTL purge and capacity eviction. A
+    /// refreshed key gets a new entry. At purge time, this compares the
+    /// stored timestamp to skip stale queue entries.
     order: VecDeque<((Address, u64), Instant)>,
 }
 
-/// Thread-safe, bounded, TTL-windowed terminal-outcome tracker for tx_errors.
+/// Thread-safe, bounded, TTL-windowed terminal-outcome tracker for
+/// tx_errors.
 pub struct TxErrorDedup {
     inner: Mutex<Inner>,
     window: Duration,
@@ -99,17 +105,17 @@ impl TxErrorDedup {
         }
     }
 
-    /// Record that a receipt for `(sender, nonce)` was observed. Any rejection
-    /// for the same key arriving within the window is suppressed (success
-    /// overrides rejection).
+    /// Records that a receipt for `(sender, nonce)` was observed. This
+    /// suppresses any rejection for the same key that arrives within the
+    /// window, since success overrides rejection.
     pub fn record_success(&self, sender: Address, nonce: u64) {
         self.record_success_at(sender, nonce, Instant::now());
     }
 
-    /// Whether an inbound error should be processed (`true`) or dropped as a
-    /// replica duplicate / overridden-by-success (`false`). Processing an
-    /// error records it, so the twin's copy of the same emission returns
-    /// `false`.
+    /// Returns `true` if the caller should process an inbound error, or
+    /// `false` if it should drop the error as a replica duplicate or as
+    /// overridden by success. Processing an error records it, so the
+    /// twin's copy of the same emission returns `false`.
     pub fn observe_error(&self, sender: Address, nonce: u64, reason: &TxErrorReason) -> bool {
         self.observe_error_at(sender, nonce, reason, Instant::now())
     }
@@ -132,13 +138,14 @@ impl TxErrorDedup {
         let mut g = self.inner.lock().expect("TxErrorDedup poisoned");
         g.purge(now, self.window);
         match g.map.get(&key) {
-            // The tx landed — this rejection lost the race to the twin's
-            // success. Keep the success mark in place.
+            // The tx landed, so this rejection lost the race to the
+            // twin's success. Keep the success mark in place.
             Some((Mark::Succeeded, _)) => false,
-            // Same rejection class already processed within the window — the
-            // twin's duplicate copy.
+            // The same rejection class was already processed within the
+            // window, so this is the twin's duplicate copy.
             Some((Mark::Rejected(c), _)) if *c == class => false,
-            // First sight (or a different rejection class): process it.
+            // This is the first sighting, or a different rejection class,
+            // so process it.
             _ => {
                 g.insert(key, Mark::Rejected(class), now, self.capacity);
                 true
@@ -148,8 +155,8 @@ impl TxErrorDedup {
 }
 
 impl Inner {
-    /// Drop entries older than `window`, skipping order-queue entries that
-    /// were refreshed since they were enqueued.
+    /// Drops entries older than `window`. Skips order-queue entries that
+    /// were refreshed after they were enqueued.
     fn purge(&mut self, now: Instant, window: Duration) {
         while let Some(&(key, at)) = self.order.front() {
             if now.duration_since(at) < window {
@@ -164,13 +171,14 @@ impl Inner {
         }
     }
 
-    /// Insert/refresh `key`, evicting the oldest live entries past `capacity`.
+    /// Inserts or refreshes `key`. Evicts the oldest live entries past
+    /// `capacity`.
     fn insert(&mut self, key: (Address, u64), mark: Mark, now: Instant, capacity: usize) {
         self.map.insert(key, (mark, now));
         self.order.push_back((key, now));
         while self.map.len() > capacity {
             let Some((old_key, old_at)) = self.order.pop_front() else {
-                break; // unreachable: map.len() > 0 implies order entries exist
+                break; // Unreachable: map.len() > 0 means order entries exist.
             };
             if let Some(&(_, cur_at)) = self.map.get(&old_key)
                 && cur_at == old_at
@@ -204,8 +212,9 @@ mod tests {
             d.observe_error_at(s, 7, &dup_reason(9), now),
             "first copy processed"
         );
-        // The twin's copy — same key + class, possibly a different payload
-        // (replicas can disagree on expected_nonce) — is dropped.
+        // The twin's copy has the same key and class, but can have a
+        // different payload, since replicas can disagree on
+        // expected_nonce. This copy must be dropped.
         assert!(!d.observe_error_at(s, 7, &dup_reason(10), now + Duration::from_millis(3)));
     }
 
@@ -220,8 +229,9 @@ mod tests {
 
     #[test]
     fn same_rejection_after_the_window_is_processed_again() {
-        // A client resubmitting the same duplicate tx later must get a prompt
-        // rejection again — the window dedups replica copies, not recurrences.
+        // A client that resubmits the same duplicate tx later must get a
+        // prompt rejection again. The window dedups replica copies, not
+        // recurrences.
         let d = dedup();
         let s = Address::repeat_byte(0x22);
         let now = Instant::now();
@@ -237,14 +247,14 @@ mod tests {
 
     #[test]
     fn success_overrides_a_later_rejection() {
-        // Twin A's receipt landed; twin B's rejection for the same tx must be
-        // suppressed (the tx succeeded).
+        // Twin A's receipt landed, so twin B's rejection for the same tx
+        // must be suppressed, since the tx succeeded.
         let d = dedup();
         let s = Address::repeat_byte(0x33);
         let now = Instant::now();
         d.record_success_at(s, 4, now);
         assert!(!d.observe_error_at(s, 4, &dup_reason(4), now + Duration::from_millis(50)));
-        // ...and the success mark is NOT displaced by the suppressed error.
+        // The suppressed error must not displace the success mark.
         assert!(!d.observe_error_at(s, 4, &dup_reason(4), now + Duration::from_millis(80)));
     }
 
@@ -254,8 +264,9 @@ mod tests {
         let s = Address::repeat_byte(0x44);
         let now = Instant::now();
         d.record_success_at(s, 4, now);
-        // A genuinely new rejection for the same key after the window (e.g. a
-        // late resubmission of the landed tx) is processed normally.
+        // A genuinely new rejection for the same key after the window, for
+        // example a late resubmission of the landed tx, is processed
+        // normally.
         assert!(d.observe_error_at(
             s,
             4,
@@ -271,7 +282,8 @@ mod tests {
         for i in 0..6u8 {
             assert!(d.observe_error_at(Address::repeat_byte(i), 0, &dup_reason(0), now));
         }
-        // Oldest (0, 1) evicted → read as new again; newest still dedup.
+        // The oldest entries (0, 1) are evicted and read as new again.
+        // The newest entries still dedup.
         assert!(!d.observe_error_at(
             Address::repeat_byte(5),
             0,

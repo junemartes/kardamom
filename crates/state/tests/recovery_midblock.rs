@@ -1,11 +1,12 @@
-//! Recovery: drop the writer after some commits; re-open the env; assert the
-//! recovery point matches the last committed block and that the post-recovery
-//! snapshot still serves the right values.
+//! Recovery. Drop the writer after some commits, reopen the env, and
+//! assert that the recovery point matches the last committed block, and
+//! that the post-recovery snapshot still serves the right values.
 //!
-//! Note: a true "mid-block crash" is hard to provoke from Rust since
-//! `mdbx_txn_commit` is atomic. The realistic invariant we test: any
-//! uncommitted txn is discarded; whichever block is last committed, the
-//! snapshot is internally consistent for that block.
+//! Note: a true mid-block crash is hard to provoke from Rust, because
+//! `mdbx_txn_commit` is atomic. The realistic invariant this test
+//! checks: any uncommitted transaction is discarded, and whichever
+//! block is last committed, the snapshot is internally consistent for
+//! that block.
 
 mod common;
 
@@ -26,7 +27,7 @@ fn recovery_point_matches_last_committed_block() {
             .open()
             .unwrap();
         let writer = StateWriter::spawn(env).unwrap();
-        // drain genesis snapshot
+        // Drain the genesis snapshot.
         let _ = writer.snapshot_rx.recv();
         for block in 1..=3u64 {
             writer
@@ -44,23 +45,24 @@ fn recovery_point_matches_last_committed_block() {
         for _ in 0..3 {
             writer.snapshot_rx.recv().unwrap();
         }
-        // Submit a 4th delta but immediately shut down — the writer may or
-        // may not have committed it. We assert resilience either way.
+        // Submit a 4th delta, then immediately shut down. The writer may
+        // or may not have committed it. This test asserts resilience
+        // either way.
         let _ = writer
             .delta_tx
             .send(common::simple_delta(4, addr, 9999, 7, 9999));
         writer.shutdown().unwrap();
     }
 
-    // --- run 2: re-open, assert recovery point + snapshot consistency ---
+    // --- run 2: reopen, and assert recovery point and snapshot consistency ---
     let env = StateEnvBuilder::new(dir.path())
         .durability(Durability::SafeNoSync)
         .open()
         .unwrap();
 
     let rp = read_recovery_point(&env).unwrap();
-    // The writer may have committed block 4 before shutdown. Either 3 or 4
-    // is acceptable; what matters is internal consistency for that block.
+    // The writer may have committed block 4 before shutdown. Either 3 or
+    // 4 is acceptable. What matters is internal consistency for that block.
     assert!(
         rp.last_committed_block == 3 || rp.last_committed_block == 4,
         "expected 3 or 4, got {}",
@@ -69,7 +71,7 @@ fn recovery_point_matches_last_committed_block() {
 
     let snap = StateSnapshot::open(&env).unwrap();
     let (_, balance, _) = snap.basic(addr).unwrap().unwrap();
-    // Block 3 → balance 1003, block 4 → balance 9999.
+    // Block 3 gives balance 1003. Block 4 gives balance 9999.
     let slot = snap.storage(addr, common::slot_key(7)).unwrap();
     if balance == U256::from(1003u64) {
         assert_eq!(slot, U256::from(300u64), "block 3 consistency");

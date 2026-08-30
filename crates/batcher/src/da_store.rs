@@ -1,17 +1,20 @@
-//! Data-availability blob store: the *bytes* behind the on-chain commitments.
+//! Data-availability blob store: the bytes behind the on-chain commitments.
 //!
-//! EIP-4844 blob bytes are not retained on the execution layer and only ~18
-//! days on the consensus layer, so a rollup fetches historical blob bytes from
-//! a DA layer / blob archive keyed by versioned hash, while L1 retains only the
-//! commitments (versioned hashes) + ordering. This models that split: the
-//! batcher writes every posted blob here keyed by its KZG versioned hash; the
-//! reconstructor fetches by the hashes it reads from `BatchPosted` events, so it
-//! only ever consumes blob bytes that L1 has committed to.
+//! The execution layer does not keep EIP-4844 blob bytes. The consensus
+//! layer keeps them for only about 18 days. A rollup must fetch historical
+//! blob bytes from a DA layer or blob archive, keyed by versioned hash. L1
+//! keeps only the commitments (versioned hashes) and their order.
 //!
-//! [`FsBlobStore`] is a filesystem implementation suitable for the local
-//! cluster and tests (a shared volume plays the DA layer). A production
-//! deployment swaps in a [`BlobSource`] backed by a beacon-chain sidecar RPC or
-//! a dedicated DA network — the reconstruction path is generic over the trait.
+//! This store models that split. The batcher writes every posted blob here,
+//! keyed by its KZG versioned hash. The reconstructor fetches blobs by the
+//! hashes it reads from `BatchPosted` events. So it only reads blob bytes
+//! that L1 has committed to.
+//!
+//! [`FsBlobStore`] is a filesystem implementation for the local cluster and
+//! tests. A shared volume plays the role of the DA layer. A production
+//! deployment can swap in a [`BlobSource`] backed by a beacon-chain sidecar
+//! RPC or a dedicated DA network. The reconstruction path is generic over
+//! the trait.
 
 use std::path::{Path, PathBuf};
 
@@ -20,8 +23,9 @@ use alloy_primitives::B256;
 
 use crate::error::BatcherError;
 
-/// Read side: fetch a blob's bytes by its versioned hash. Implemented by the
-/// filesystem store here and (in production) by a beacon/DA-network client.
+/// The read side: fetches a blob's bytes by its versioned hash. The
+/// filesystem store here implements it. In production, a beacon or
+/// DA-network client implements it.
 pub trait BlobSource {
     /// Fetch the blob whose KZG versioned hash is `versioned_hash`.
     fn fetch_blob(&self, versioned_hash: B256) -> Result<Blob, BatcherError>;
@@ -34,7 +38,8 @@ pub struct FsBlobStore {
 }
 
 impl FsBlobStore {
-    /// Open (creating if needed) a blob store rooted at `dir`.
+    /// Open a blob store rooted at `dir`. Create the directory if it does
+    /// not exist.
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, BatcherError> {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
@@ -42,12 +47,12 @@ impl FsBlobStore {
     }
 
     fn path_for(&self, versioned_hash: B256) -> PathBuf {
-        // `{:x}` renders the 32-byte hash as 64 lowercase hex chars, no `0x`.
+        // `{:x}` renders the 32-byte hash as 64 lowercase hex characters, with no `0x` prefix.
         self.dir.join(format!("{versioned_hash:x}.blob"))
     }
 
-    /// Persist `blob` under its `versioned_hash`. Idempotent: re-storing the
-    /// same blob overwrites with identical bytes.
+    /// Save `blob` under its `versioned_hash`. This is idempotent: storing
+    /// the same blob again overwrites it with the same bytes.
     pub fn put(&self, versioned_hash: B256, blob: &Blob) -> Result<(), BatcherError> {
         std::fs::write(self.path_for(versioned_hash), blob.as_slice())?;
         Ok(())

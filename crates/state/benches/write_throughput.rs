@@ -1,7 +1,8 @@
 //! Measure block-delta write throughput at the spec's target size.
 //!
-//! Target: 25 MB per block at 4 Hz = 100 MB/s sustained. We do not pace at
-//! 4 Hz here — we measure raw apply latency per block.
+//! Target: 25 MB per block, at 4 Hz, for 100 MB/s sustained. This
+//! benchmark does not pace at 4 Hz. It measures raw apply latency per
+//! block.
 
 use std::time::Duration;
 
@@ -12,8 +13,9 @@ use kardamom_state::{StateWriter, WriteBatch};
 use kardamom_types::{AccountChange, BPosition, BlockBoundary, BlockDelta, Receipt};
 
 fn big_batch(block: u64) -> WriteBatch {
-    // ~25 MB target: 100 B per account × 250k accounts. Real workload mixes
-    // accounts + storage; we approximate with accounts only for the bench.
+    // The target is about 25 MB: 100 bytes per account, times 250k
+    // accounts. The real workload mixes accounts and storage; this
+    // benchmark approximates it with accounts only.
     let n = 250_000usize;
     let accounts: Vec<AccountChange> = (0..n)
         .map(|i| {

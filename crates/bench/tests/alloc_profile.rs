@@ -1,14 +1,15 @@
-//! Allocation profile of the per-tx execution hot path (ignored by
-//! default — run explicitly):
+//! This is an allocation profile of the per-transaction execution hot
+//! path. It is ignored by default; run it explicitly:
 //!
 //!   cargo test -p kardamom-bench --test alloc_profile --release -- \
 //!     --ignored --nocapture
 //!
-//! Executes a few thousand DeFi txs through `execute_tx` under the DHAT
-//! heap profiler and prints allocations/tx + bytes/tx, writing
-//! dhat-heap.json (per-callsite attribution, viewable with dh_view.html)
-//! next to the workspace root. Numbers feed the allocation-squashing
-//! campaign: the per-core execution ceiling is partly malloc-bound.
+//! It executes a few thousand DeFi transactions through `execute_tx`
+//! under the DHAT heap profiler, and prints allocations per transaction
+//! and bytes per transaction. It writes `dhat-heap.json`, with
+//! per-callsite attribution viewable with dh_view.html, next to the
+//! workspace root. These numbers feed allocation reduction work: the
+//! per-core execution ceiling is partly bound by malloc.
 
 use alloy_primitives::U256;
 use kardamom_bench::load::defi::{deployment_txs, pregenerate_defi};
@@ -28,11 +29,11 @@ const CHAIN_ID: u64 = 412_346;
 const SENDERS: usize = 8;
 const TXS_PER_SENDER: usize = 400;
 
-/// Op family under measurement: `KARDAMOM_PROFILE_OPS` =
-/// mix (default) | swap | vault_deposit | vault_withdraw | clob_place |
-/// clob_cancel | transfer. Per-family numbers separate the contract
-/// execution cost (journal, cache inserts, logs) from the engine
-/// fixed cost — the mix hides where the bytes live.
+/// The operation family under measurement. Set `KARDAMOM_PROFILE_OPS` to
+/// one of: mix (the default), swap, vault_deposit, vault_withdraw,
+/// clob_place, clob_cancel, or transfer. Per-family numbers separate the
+/// contract execution cost, such as journal, cache inserts, and logs,
+/// from the engine's fixed cost. The mix hides where the bytes live.
 fn family() -> String {
     std::env::var("KARDAMOM_PROFILE_OPS").unwrap_or_else(|_| "mix".into())
 }
@@ -86,7 +87,8 @@ fn defi_execution_allocation_profile() {
         },
     );
 
-    // Interleave senders round-robin (realistic block shape), one flat list.
+    // Interleave senders in rotation, for a realistic block shape, into
+    // one flat list.
     let mut txs: Vec<(usize, kardamom_bench::load::plan::PlannedTx)> = Vec::new();
     for i in 0..TXS_PER_SENDER {
         for (si, q) in queues.iter().enumerate() {
@@ -134,7 +136,7 @@ fn defi_execution_allocation_profile() {
         (r, ws)
     }
 
-    // Deploy + warm up OUTSIDE the measured window.
+    // Deploy and warm up outside the measured window.
     for d in &deploys {
         let (_r, ws) = run_one(
             &snap,
@@ -160,9 +162,9 @@ fn defi_execution_allocation_profile() {
         delta.apply(ws);
     }
 
-    // Measured window under DHAT — through the PRODUCTION path: ONE
-    // ExecScope per simulated block, re-scoped every BLOCK_TXS to model
-    // boundaries.
+    // This is the measured window under DHAT, through the production
+    // path: one ExecScope for each simulated block, re-scoped every
+    // BLOCK_TXS to model block boundaries.
     const BLOCK_TXS: usize = 1000;
     let profiler = dhat::Profiler::builder().build();
     let stats0 = dhat::HeapStats::get();
@@ -224,6 +226,6 @@ fn defi_execution_allocation_profile() {
         "implied 1-core: {:.1} Mgas/s",
         (gas as f64 / 1e6) / wall.as_secs_f64()
     );
-    drop(profiler); // writes dhat-heap.json with per-callsite attribution
+    drop(profiler); // This writes dhat-heap.json with per-callsite attribution.
     let _ = std::fs::rename("dhat-heap.json", format!("dhat-heap-{}.json", family()));
 }

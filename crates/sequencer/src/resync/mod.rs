@@ -1,29 +1,31 @@
-//! Lag detection + receipt-floor resync.
+//! Lag detection and receipt-floor resync.
 //!
-//! Implements docs/agents/sequencer-lag-resync-spec.md: a replica that falls
-//! far enough behind its twin can drain re-offers past the cluster's
-//! first-seen dedup horizon, getting the same tx canonically ordered TWICE
-//! (executor-fatal, and it poisons recovery replay — issue #92). The guard is
-//! split into a **provably-safe response** and **cheap triggers**:
+//! Implements docs/agents/sequencer-lag-resync-spec.md. A replica that
+//! falls far enough behind its twin can drain re-offers past the
+//! cluster's first-seen dedup horizon. This orders the same transaction
+//! canonically twice, which is fatal to the executor and poisons recovery
+//! replay. The guard splits into a provably safe response, and cheap
+//! triggers:
 //!
 //! - Response ([`should_skip`](ResyncController::should_skip)): while in
-//!   resync mode, skip a publish iff the sender's **executed-truth floor**
-//!   (derived from the tx_receipts stream, [`FloorUpdate`]) proves the nonce
-//!   already executed. A skip backed by a receipt needs no dedup-window
-//!   guarantee at all; everything unproven is published, so every degraded
-//!   mode (missed receipts, late subscribe) degrades toward *publish* — the
-//!   side guarded by the layered dedup windows — never toward *skip* (a
-//!   canonical nonce gap, which nothing guards; see the removed F02.1
-//!   fast-forward note in [`crate::state`]).
-//! - Triggers: the primary signal is the **canonical-count watermark** — the
-//!   cluster broadcasts every boundary (`end_tx_idx` = global canonical
-//!   count) to publisher sessions too, so the horizon is measured in its
-//!   native units, no clocks and no wire change. A watermark JUMP larger
-//!   than `enter_fraction × dedup_capacity` means this process was blind
-//!   while that many records were ordered (freeze/pause); watermark SILENCE
-//!   means it is partitioned from egress. A sustained publish stall and
-//!   startup round out the triggers. False positives only cost floor
-//!   lookups, which is what lets the triggers stay twitchy and local.
+//!   resync mode, skip a publish only if the sender's executed-truth
+//!   floor (derived from the tx_receipts stream, [`FloorUpdate`]) proves
+//!   the nonce already executed. A skip backed by a receipt needs no
+//!   dedup-window guarantee at all. Everything unproven is published, so
+//!   every degraded mode (missed receipts, late subscribe) degrades
+//!   toward publish, the side the layered dedup windows guard, and never
+//!   toward skip (a canonical nonce gap, which nothing guards; see the
+//!   removed fast-forward note in [`crate::state`]).
+//! - Triggers: the primary signal is the canonical-count watermark. The
+//!   cluster broadcasts every boundary (`end_tx_idx`, the global
+//!   canonical count) to publisher sessions too, so the horizon is
+//!   measured in its native units, with no clocks and no wire change. A
+//!   watermark jump larger than `enter_fraction × dedup_capacity` means
+//!   this process was blind while that many records were ordered (a
+//!   freeze or pause). Watermark silence means it is partitioned from
+//!   egress. A sustained publish stall and startup round out the
+//!   triggers. False positives only cost floor lookups, which is what
+//!   lets the triggers stay twitchy and local.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -36,39 +38,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
-/// One executed-truth observation off the tx_receipts stream: `sender`'s tx
-/// with `executed_nonce` produced a receipt, so the sender's floor is at
-/// least `executed_nonce + 1`.
+/// One executed-truth observation from the tx_receipts stream.
+/// `sender`'s transaction at `executed_nonce` produced a receipt, so the
+/// sender's floor is at least `executed_nonce + 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FloorUpdate {
     pub sender: Address,
     pub executed_nonce: u64,
-    /// L1-originated deposit: consumes no L2 nonce, so it is neither floor
-    /// evidence nor a publish confirmation. Explicit since deposits carry
-    /// `Receipt::tx_type == TX_TYPE_DEPOSIT` — the nonce-0 heuristic this
-    /// replaces could not tell a deposit from a genuine nonce-0 tx.
+    /// An L1-originated deposit. It consumes no L2 nonce, so it is
+    /// neither floor evidence nor a publish confirmation. This is
+    /// explicit because a deposit carries `Receipt::tx_type ==
+    /// TX_TYPE_DEPOSIT`. The nonce-0 heuristic this replaces could not
+    /// tell a deposit apart from a genuine nonce-0 transaction.
     pub deposit: bool,
-    /// #92 marker receipt: the tx was ORDERED (canonical-log commitment is
-    /// proven — it confirms publishes) but consumed no nonce (it is NOT
-    /// floor evidence).
+    /// A marker receipt: the transaction was ordered (canonical-log
+    /// commitment is proven, so it confirms publishes), but it consumed
+    /// no nonce, so it is not floor evidence.
     pub invalid_skip: bool,
 }
 
 /// Shared state between the egress-watermark FEED thread and the publish
 /// loop's controller:
 ///
-/// - `count` — latest boundary `end_tx_idx` (the global canonical count).
-/// - `lag_gap_ms` — a STICKY lag flag: the feed thread sets it when it
-///   observes a boundary inter-arrival gap past the silence threshold, and
-///   the controller consumes it (swap-to-0) on its next iteration. Sticky
-///   because the publish loop can be BLOCKED for long stretches exactly when
-///   lag happens (`LiveIngress::offer` waits on the session thread, which is
-///   mid-reconnect after e.g. a process freeze) — a point-in-time check the
-///   loop must be running to catch was observed to miss a 30 s freeze
-///   entirely (sequencer-lapse CI, run 30163255470). Boundary ARRIVALS are
-///   the liveness signal, not count changes: idle traffic emits boundaries
-///   every tick with an unchanged count, which a value-change tracker
-///   mistakes for silence (observed as enter/exit thrash every 10 s).
+/// - `count`: the latest boundary `end_tx_idx` (the global canonical
+///   count).
+/// - `lag_gap_ms`: a sticky lag flag. The feed thread sets it when it
+///   sees a boundary inter-arrival gap past the silence threshold, and
+///   the controller consumes it (swaps it to 0) on its next iteration.
+///   This flag is sticky because the publish loop can be blocked for long
+///   stretches exactly when lag happens (`LiveIngress::offer` waits on
+///   the session thread, which may be mid-reconnect after a process
+///   freeze). A point-in-time check that needs the loop running to catch
+///   it can miss a freeze entirely. Boundary arrivals are the liveness
+///   signal, not count changes: idle traffic emits boundaries every tick
+///   with an unchanged count, which a value-change tracker would mistake
+///   for silence.
 #[derive(Clone, Default)]
 pub struct SharedWatermark {
     count: Arc<AtomicU64>,
@@ -85,8 +89,9 @@ impl SharedWatermark {
     pub fn load(&self) -> u64 {
         self.count.load(Ordering::Acquire)
     }
-    /// Feed thread: flag an observed boundary-arrival gap (ms). Keeps the
-    /// LARGEST unconsumed gap so a later smaller gap can't shadow a freeze.
+    /// Feed thread: flag an observed boundary-arrival gap, in
+    /// milliseconds. Keeps the largest unconsumed gap, so a later,
+    /// smaller gap cannot hide a freeze.
     pub fn flag_lag(&self, gap_ms: u64) {
         self.lag_gap_ms.fetch_max(gap_ms, Ordering::AcqRel);
     }
@@ -99,32 +104,33 @@ impl SharedWatermark {
     }
 }
 
-/// `[resync]` TOML section / CLI knobs. All defaults follow the spec.
+/// `[resync]` TOML section and CLI settings. All defaults follow the spec.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, default)]
 pub struct ResyncConfig {
-    /// MUST equal the cluster's `-Dkardamom.cluster.dedupCapacity` — the
-    /// horizon this mechanism protects. Logged at startup for the contract
-    /// check.
+    /// Must equal the cluster's `-Dkardamom.cluster.dedupCapacity`: the
+    /// horizon this mechanism protects. Logged at startup for the
+    /// contract check.
     pub dedup_capacity: u64,
-    /// Watermark-jump / gap enter threshold as a PERCENT of the capacity
-    /// (integer so the config stays `Eq`; spec's 0.25 fraction = 25).
+    /// Watermark-jump and gap enter threshold, as a percent of the
+    /// capacity. This is an integer so the config stays `Eq` (the spec's
+    /// 0.25 fraction is 25 here).
     pub enter_percent: u64,
-    /// Boundary-silence trigger: no watermark change for this long ⇒ resync.
-    /// Sized as spec's `boundary_silence_ticks × cluster tick interval`
-    /// (5 × 2000 ms deploy tick).
+    /// Boundary-silence trigger. No watermark change for this long
+    /// enters resync. Sized as the spec's `boundary_silence_ticks ×
+    /// cluster tick interval` (5 × 2000 ms deploy tick).
     pub boundary_silence_ms: u64,
-    /// A publish stall (continuous backpressure / no successful publish while
-    /// work is pending) longer than this enters resync. Fallback trigger for
-    /// the no-egress-signal case.
+    /// A publish stall (continuous backpressure, or no successful publish
+    /// while work is pending) longer than this enters resync. This is the
+    /// fallback trigger for the no-egress-signal case.
     pub publish_stall_ms: u64,
     /// How long conditions must stay calm before exiting resync (hysteresis).
     pub exit_hold_ms: u64,
-    /// #85: how long a published ref may remain unconfirmed (no receipt at
-    /// or above its nonce) before it is rewound and re-published. Must
-    /// comfortably exceed the order→execute→receipt round trip under load;
-    /// re-publishing early is harmless (dedup absorbs), late leaves voided
-    /// refs unrecovered longer.
+    /// How long a published ref may stay unconfirmed (no receipt at or
+    /// above its nonce) before it is rewound and republished. This must
+    /// comfortably exceed the order-execute-receipt round trip under load.
+    /// Republishing early is harmless, since dedup absorbs it. Republishing
+    /// late leaves voided refs unrecovered longer.
     pub confirm_timeout_ms: u64,
 }
 
@@ -148,8 +154,8 @@ impl ResyncConfig {
     }
 }
 
-/// Why resync mode was (re-)entered. Carried in the enter log line, which the
-/// chaos suite greps (`sequencer RESYNC enter`).
+/// Why resync mode was entered or re-entered. Carried in the enter log
+/// line, which the chaos suite greps for (`sequencer RESYNC enter`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnterReason {
     Startup,
@@ -158,27 +164,28 @@ pub enum EnterReason {
     PublishStall { stalled_ms: u64 },
 }
 
-/// Trigger/exit state machine + executed-truth floors. Owned by the publish
-/// loop thread; fed by the receipts thread ([`FloorUpdate`] mpsc) and the
-/// egress-watermark thread ([`SharedWatermark`]).
+/// Trigger-and-exit state machine, plus executed-truth floors. The
+/// publish loop thread owns this. It is fed by the receipts thread
+/// ([`FloorUpdate`] mpsc) and the egress-watermark thread
+/// ([`SharedWatermark`]).
 pub struct ResyncController {
     cfg: ResyncConfig,
     partition: u32,
     active: bool,
     floors: HashMap<Address, u64>,
     floor_rx: Receiver<FloorUpdate>,
-    /// #85 fix B: `(sender, nonce, expected)` contiguity rejects forwarded
-    /// by the egress-watermark thread — the sealer refused a ref whose nonce
-    /// was not the sender's expected next one. `nonce >= expected` means a
+    /// `(sender, nonce, expected)` contiguity rejects, forwarded by the
+    /// egress-watermark thread. The sealer refused a ref whose nonce was
+    /// not the sender's expected next one. `nonce >= expected` means a
     /// gap: rewind the unconfirmed ledger from `expected` and republish.
-    /// `nonce < expected` means the ref already COMMITTED (the guard's
-    /// expected nonce advanced past it) and its dedup entry aged out —
-    /// confirm-by-reject, dropping the ledger entry.
+    /// `nonce < expected` means the ref already committed (the guard's
+    /// expected nonce advanced past it), and its dedup entry aged out.
+    /// This confirms by reject, dropping the ledger entry.
     reject_rx: Receiver<(Address, u64, u64)>,
     watermark: SharedWatermark,
     last_watermark: u64,
-    /// Set once the first boundary has been observed — a jump before the
-    /// session has ever delivered a boundary is indistinct from startup.
+    /// Set once the first boundary has been seen. A jump before the
+    /// session ever delivered a boundary looks the same as startup.
     watermark_seen: bool,
     stall_since: Option<Instant>,
     calm_since: Option<Instant>,
@@ -188,13 +195,13 @@ pub struct ResyncController {
 /// cannot starve the publish path.
 const FLOOR_DRAIN_PER_ITER: usize = 1024;
 
-/// One drain of the receipts channel: `(raised_floors, confirmations)` —
-/// both `(sender, nonce-or-floor)` lists; see
+/// One drain of the receipts channel: `(raised_floors, confirmations)`.
+/// Both are `(sender, nonce-or-floor)` lists. See
 /// [`ResyncController::drain_floor_updates`].
 pub type ReceiptDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
 
 /// One drain of the contiguity-reject channel:
-/// `(committed_drops, gap_rewinds)`; see
+/// `(committed_drops, gap_rewinds)`. See
 /// [`ResyncController::drain_contiguity_rejects`].
 pub type RejectDrain = (Vec<(Address, u64)>, Vec<(Address, u64)>);
 
@@ -219,8 +226,8 @@ impl ResyncController {
             stall_since: None,
             calm_since: None,
         };
-        // Startup trigger: a (re)started replica cannot know what its twin
-        // ordered while it was away — begin filtered until calm.
+        // Startup trigger. A restarted replica cannot know what its twin
+        // ordered while it was away. Begin filtered until calm.
         c.enter(EnterReason::Startup);
         c
     }
@@ -236,34 +243,33 @@ impl ResyncController {
     /// Drain pending receipt updates (bounded per iteration). Returns
     /// `(raised_floors, confirmations)`:
     ///
-    /// - `raised_floors` — senders whose executed-truth floor ROSE, for
-    ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts (#92)
-    ///   and DEPOSIT receipts are NOT floor evidence (a skip consumed no
-    ///   nonce; a deposit has no L2 nonce at all).
-    /// - `confirmations` — `(sender, nonce)` per receipt, INCLUDING skip
-    ///   receipts (ordering in the canonical log is exactly what a publish
-    ///   confirmation needs — #85: an Aeron offer is NOT a commit; only a
-    ///   receipt proves the ref survived into the committed stream) and
-    ///   INCLUDING nonce 0.
+    /// - `raised_floors`: senders whose executed-truth floor rose, for
+    ///   [`crate::state::PartitionState::advance_floor`]. Skip receipts
+    ///   and deposit receipts are not floor evidence: a skip consumed no
+    ///   nonce, and a deposit has no L2 nonce at all.
+    /// - `confirmations`: `(sender, nonce)` for each receipt, including
+    ///   skip receipts (ordering in the canonical log is exactly what a
+    ///   publish confirmation needs, since an Aeron offer is not a
+    ///   commit and only a receipt proves the ref survived into the
+    ///   committed stream) and including nonce 0.
     ///
     ///   Nonce 0 used to be excluded wholesale, because a deposit receipt
-    ///   (filler nonce 0) was indistinguishable from a genuine nonce-0 tx
-    ///   and must not confirm one. The cost was silent and unbounded: a
-    ///   one-tx sender's nonce-0 ref could never be confirmed, so the #85
-    ///   ledger re-offered it every confirm-timeout FOREVER, rewinding that
-    ///   sender's nonce floor on every sweep (observed in CI: 46 rewinds,
-    ///   one every 15s, for the whole soak — issue #124). With
-    ///   `Receipt::tx_type` the two are distinguishable at the source, so
-    ///   the exclusion is now exactly "is this a deposit?".
+    ///   (filler nonce 0) could not be told apart from a genuine nonce-0
+    ///   transaction, and must not confirm one. The cost was silent and
+    ///   unbounded: a one-transaction sender's nonce-0 ref could never be
+    ///   confirmed, so the ledger re-offered it every confirm timeout
+    ///   forever, rewinding that sender's nonce floor on every sweep.
+    ///   With `Receipt::tx_type`, the two are distinguishable at the
+    ///   source, so the exclusion is now exactly "is this a deposit?".
     pub fn drain_floor_updates(&mut self) -> ReceiptDrain {
         let mut raised = Vec::new();
         let mut confirmations = Vec::new();
         for _ in 0..FLOOR_DRAIN_PER_ITER {
             match self.floor_rx.try_recv() {
                 Ok(u) => {
-                    // Deposits consume no L2 nonce: neither a confirmation
-                    // (they never correspond to a published TxRef) nor floor
-                    // evidence.
+                    // A deposit consumes no L2 nonce. It is neither a
+                    // confirmation (it never corresponds to a published
+                    // TxRef) nor floor evidence.
                     if u.deposit {
                         continue;
                     }
@@ -287,29 +293,30 @@ impl ResyncController {
         (raised, confirmations)
     }
 
-    /// Drain pending contiguity rejects (#85 fix B) into
-    /// `(committed_drops, gap_rewinds)`:
+    /// Drain pending contiguity rejects into `(committed_drops,
+    /// gap_rewinds)`:
     ///
-    /// - `committed_drops` — `(sender, nonce)` rejects with
-    ///   `nonce < expected`: the guard's expected nonce is already past this
-    ///   ref, which proves it committed (per-sender contiguity means the
-    ///   guard accepted it on the way up) — its dedup entry merely aged out.
-    ///   The ledger entry is dropped like a receipt confirmation would; NOT
-    ///   dropping it re-offers the ref every confirm-timeout forever (the
-    ///   nonce-0 case has no confirming receipt at all: nonce-0 receipts are
-    ///   deposit-indistinguishable and never confirm). Caveat: if the sealer
-    ///   evicted + re-seeded this sender ABOVE a genuinely-voided ref, this
-    ///   drops a ref that never sealed — but republishing can never seal it
-    ///   either (the guard rejects it forever), so the drop only trades an
-    ///   infinite reject loop for an honest, bounded degradation, in the
-    ///   same eviction-floor class the guard itself documents.
-    /// - `gap_rewinds` — `(sender, expected)` rejects with
-    ///   `nonce >= expected`, deduplicated per sender to the LOWEST expected
-    ///   (a rejected batch produces one reject per entry; one rewind to the
-    ///   lowest covers them all): refs for `expected..nonce` vanished —
-    ///   rewind the unconfirmed ledger and republish.
+    /// - `committed_drops`: `(sender, nonce)` rejects with `nonce <
+    ///   expected`. The guard's expected nonce is already past this ref,
+    ///   which proves it committed (per-sender contiguity means the guard
+    ///   accepted it on the way up). Its dedup entry merely aged out. The
+    ///   ledger entry is dropped, like a receipt confirmation would drop
+    ///   it. Not dropping it would re-offer the ref every confirm timeout
+    ///   forever (the nonce-0 case has no confirming receipt at all,
+    ///   since nonce-0 receipts cannot be told apart from deposits and
+    ///   never confirm). Caveat: if the sealer evicted and re-seeded this
+    ///   sender above a genuinely voided ref, this drops a ref that never
+    ///   sealed. But republishing can never seal it either, since the
+    ///   guard rejects it forever. So the drop only trades an infinite
+    ///   reject loop for an honest, bounded degradation, in the same
+    ///   eviction-floor class the guard itself documents.
+    /// - `gap_rewinds`: `(sender, expected)` rejects with `nonce >=
+    ///   expected`, deduplicated per sender to the lowest expected (a
+    ///   rejected batch produces one reject per entry, and one rewind to
+    ///   the lowest covers them all). Refs for `expected..nonce`
+    ///   vanished, so rewind the unconfirmed ledger and republish.
     ///
-    /// Bounded per iteration like the floor drain.
+    /// Bounded per iteration, like the floor drain.
     pub fn drain_contiguity_rejects(&mut self) -> RejectDrain {
         let mut drops: Vec<(Address, u64)> = Vec::new();
         let mut lowest: HashMap<Address, u64> = HashMap::new();
@@ -333,20 +340,21 @@ impl ResyncController {
 
     /// Per-iteration trigger evaluation. `now` is injected for testability.
     ///
-    /// Silence detection does NOT happen here: this method only runs when the
-    /// publish loop is running, and the loop can be blocked in a session
-    /// offer exactly while lag is happening. The egress FEED thread is the
-    /// silence authority — it flags boundary-arrival gaps into the sticky
-    /// [`SharedWatermark::flag_lag`], consumed here whenever the loop next
-    /// turns. The jump check stays here as a second, loop-local signal.
+    /// Silence detection does not happen here. This method only runs when
+    /// the publish loop is running, and the loop can be blocked in a
+    /// session offer exactly while lag is happening. The egress FEED
+    /// thread is the silence authority: it flags boundary-arrival gaps
+    /// into the sticky [`SharedWatermark::flag_lag`], consumed here
+    /// whenever the loop next turns. The jump check stays here as a
+    /// second, loop-local signal.
     pub fn observe(&mut self, now: Instant) {
         let w = self.watermark.load();
         if let Some(gap_ms) = self.watermark.take_lag() {
             self.enter(EnterReason::BoundarySilence { silent_ms: gap_ms });
         }
         if w != self.last_watermark {
-            // Gauge recorded on CHANGE only — observe runs every loop
-            // iteration and the metrics macro allocates its label each call.
+            // Record the gauge only on change. observe runs every loop
+            // iteration, and the metrics macro allocates its label each call.
             metrics::record_canonical_watermark(self.partition, w);
             let jump = w.saturating_sub(self.last_watermark);
             if self.watermark_seen && jump >= self.cfg.enter_threshold() {
@@ -366,11 +374,12 @@ impl ResyncController {
             self.enter(EnterReason::PublishStall {
                 stalled_ms: now.duration_since(since).as_millis() as u64,
             });
-            self.stall_since = Some(now); // re-arm, avoid re-enter spam
+            self.stall_since = Some(now); // re-arm, to avoid re-enter spam
         }
     }
 
-    /// The publish path made progress (successful publish or idle-with-no-work).
+    /// The publish path made progress (a successful publish, or idle
+    /// with no work).
     pub fn note_publish_ok(&mut self) {
         self.stall_since = None;
     }
@@ -382,8 +391,9 @@ impl ResyncController {
         }
         self.active = true;
         metrics::record_resync_enter(self.partition);
-        // Stable grep target for the chaos suite — keep the "sequencer RESYNC
-        // enter" prefix in lockstep with deploy/cluster/scripts/chaos.sh.
+        // This is a stable grep target for the chaos suite. Keep the
+        // "sequencer RESYNC enter" prefix in lockstep with
+        // deploy/cluster/scripts/chaos.sh.
         tracing::info!(
             partition = self.partition,
             reason = ?reason,
@@ -397,10 +407,10 @@ impl ResyncController {
         if !self.active {
             return;
         }
-        // Calm = the feed thread has raised no unconsumed lag flag (checked
-        // just above in observe) and the publish path is not stalled. The
-        // watermark advancing is NOT required: an idle-but-healthy cluster
-        // emits boundaries with an unchanged count.
+        // Calm means the feed thread has raised no unconsumed lag flag
+        // (checked just above in observe), and the publish path is not
+        // stalled. The watermark does not need to advance: an idle but
+        // healthy cluster emits boundaries with an unchanged count.
         let calm = self.watermark_seen && self.stall_since.is_none();
         if !calm {
             self.calm_since = None;
@@ -420,10 +430,10 @@ impl ResyncController {
     }
 }
 
-/// What [`resync_channel`] hands back: the controller (publish loop), the
-/// floor-update sender (receipts thread), the `(sender, nonce, expected)`
-/// contiguity-reject sender (#85 fix B, egress-watermark thread) and the
-/// shared watermark (egress-watermark thread).
+/// What [`resync_channel`] hands back: the controller (publish loop),
+/// the floor-update sender (receipts thread), the `(sender, nonce,
+/// expected)` contiguity-reject sender (egress-watermark thread), and
+/// the shared watermark (egress-watermark thread).
 pub type ResyncChannel = (
     ResyncController,
     Sender<FloorUpdate>,
@@ -431,9 +441,9 @@ pub type ResyncChannel = (
     SharedWatermark,
 );
 
-/// Build the controller plus the sender halves of the floor-update channel
-/// (handed to the receipts thread) and the contiguity-reject channel (#85
-/// fix B, handed to the egress-watermark thread alongside the shared
+/// Build the controller, plus the sender halves of the floor-update
+/// channel (handed to the receipts thread) and the contiguity-reject
+/// channel (handed to the egress-watermark thread, alongside the shared
 /// watermark).
 pub fn resync_channel(cfg: ResyncConfig, partition: u32) -> ResyncChannel {
     let (tx, rx) = std::sync::mpsc::channel();

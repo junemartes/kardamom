@@ -1,17 +1,20 @@
-//! `kardamom-stm-p2` — Block-STM P2 offline A/B: the same generated blocks
-//! through the sequential engine (`ExecScope`) and the STM engine
-//! (`kardamom-stm`), asserting BYTE-IDENTICAL receipts + delta on every
-//! block, and reporting wall-clock per worker count.
-//! (spec: docs/agents/block-stm-executor-spec.md §P2 / "Measurement plan")
+//! `kardamom-stm-p2` runs a Block-STM offline A/B test. It runs the
+//! same generated blocks through the sequential engine (`ExecScope`)
+//! and the STM engine (`kardamom-stm`), checks that receipts and the
+//! delta are byte-identical on every block, and reports wall-clock
+//! time for each worker count.
 //!
-//! Protocol per block, mirroring production learning dynamics:
-//! 1. timed sequential run (the baseline and the canonical outputs),
-//! 2. timed STM run per worker count, each byte-compared against (1),
-//! 3. untimed capture pass training the footprint stats (prior-blocks-only
-//!    stats feed each block's schedule — cold start, stream order).
+//! The protocol for each block mirrors production learning dynamics:
+//! 1. A timed sequential run: the baseline and the canonical outputs.
+//! 2. A timed STM run for each worker count, each compared byte for
+//!    byte against step 1.
+//! 3. An untimed capture pass that trains the footprint stats.
+//!    Prior-blocks-only stats feed each block's schedule: a cold
+//!    start, in stream order.
 //!
-//! Wall-clock numbers are indicative (shared dev host); the assertion is
-//! the point — the speedup column is the shape, not a benchmark citation.
+//! The wall-clock numbers are indicative, since they run on a shared
+//! dev host. The assertion is the point; the speedup column shows the
+//! shape, not a benchmark citation.
 
 use std::time::Instant;
 
@@ -35,7 +38,7 @@ const ANVIL_MNEMONIC: &str = "test test test test test test test test test test 
 #[derive(Parser, Debug)]
 #[command(name = "kardamom-stm-p2")]
 struct Args {
-    /// uniswap | defi | transfers
+    /// One of: uniswap, defi, transfers.
     #[arg(long, default_value = "uniswap")]
     scenario: String,
     #[arg(long, default_value_t = 8)]
@@ -50,100 +53,107 @@ struct Args {
     swap_share: u64,
     #[arg(long, default_value_t = 10)]
     cross: u64,
-    /// Worker counts to sweep, comma-separated.
+    /// The worker counts to sweep, comma-separated.
     #[arg(long, default_value = "1,2,4,8,12")]
     workers: String,
     #[arg(long, default_value = ".")]
     repo_root: String,
     #[arg(long, default_value_t = 412346)]
     chain_id: u64,
-    /// Print per-block lines.
+    /// Print a line for each block.
     #[arg(long, default_value_t = false)]
     per_block: bool,
-    /// Write an on-CPU flamegraph here (pprof). Guessing which part of
-    /// the read path costs what has been wrong repeatedly — this settles it.
+    /// Write an on-CPU flame graph, through pprof, to this path. This
+    /// settles which part of the read path costs what, instead of guessing.
     #[arg(long)]
     pprof_out: Option<String>,
-    /// State backend: `mock` (in-memory — the harshest baseline, where a
-    /// read costs nothing) or `mdbx` (the real backend, where it does).
+    /// The state backend: `mock` is in-memory, the harshest baseline,
+    /// where a read costs nothing, and `mdbx` is the real backend,
+    /// where a read does cost something.
     #[arg(long, default_value = "mock")]
     state: String,
-    /// DAG prune batch sizes to sweep (completions applied per graph-lock
-    /// acquisition; 1 = update on every completion).
+    /// The DAG prune batch sizes to sweep. This is the number of
+    /// completions applied for each graph-lock acquisition; 1 means
+    /// update on every completion.
     #[arg(long, default_value = "1")]
     prune_batch: String,
-    /// Mean per-tx nanoseconds below which the pool declines a block and
-    /// runs it sequentially. `0` forces parallel execution regardless —
-    /// which is what you want when MEASURING scaling, since the default
-    /// policy would route cheap workloads to the sequential path and hide
-    /// the very numbers under test.
+    /// The mean per-transaction nanoseconds below which the pool
+    /// declines a block and runs it in sequence. `0` forces parallel
+    /// execution regardless. Use `0` when measuring scaling, since the
+    /// default policy would route a cheap workload to the sequential
+    /// path and hide the numbers under test.
     #[arg(long)]
     parallel_worth_ns: Option<u64>,
-    /// Dispatch on the sender instead of the first non-sender cell.
+    /// Dispatch on the sender, instead of the first non-sender cell.
     #[arg(long, default_value_t = false)]
     dispatch_by_sender: bool,
-    /// Eager chain FIFO: enqueue at admission when all unfinished preds
-    /// are already in the same worker's queue. Disable for the A/B
-    /// baseline.
+    /// The eager chain FIFO: enqueue at admission when every unfinished
+    /// predecessor is already in the same worker's queue. Disable this
+    /// for the A/B baseline.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     eager_chain: bool,
-    /// Sticky least-loaded domain assignment instead of pure hashing.
+    /// Use sticky least-loaded domain assignment, instead of pure hashing.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     sticky_assign: bool,
-    /// Pin worker i to core list[i % len], e.g. "2,3,4,5". Empty = OS.
+    /// Pin worker i to core list[i % len], for example "2,3,4,5". An
+    /// empty value leaves it to the OS.
     #[arg(long, default_value = "")]
     pin_cores: String,
-    /// parcounter: how many sload+add+sstore rounds each call performs.
-    /// 1 = the 10-byte micro counter (~4us/tx — a stress test of fixed
-    /// costs); ~25 approximates real contract weight (~10us/tx), which is
-    /// the honest substrate for scaling questions.
+    /// parcounter: how many sload, add, and sstore rounds each call
+    /// performs. `1` is the 10-byte micro counter, about 4 microseconds
+    /// per transaction, a stress test of fixed costs. About 25
+    /// approximates real contract weight, about 10 microseconds per
+    /// transaction, the honest substrate for scaling questions.
     #[arg(long, default_value_t = 1)]
     call_work: usize,
-    /// Flow blocks excluded from timing while the footprint stats warm
-    /// up. The FIRST flow block runs entirely COLD (nothing trained yet):
-    /// every tx is a barrier, the DAG degenerates to a serial chain with
-    /// O(n^2) edge fan-in (measured: 1000 colds, 375k edges, ~30ms serial
-    /// span), and the 8-block average mostly measures that one block.
-    /// Production stats are continuously warm; steady state is the honest
-    /// number.
+    /// The flow blocks excluded from timing while the footprint stats
+    /// warm up. The first flow block runs entirely cold, with nothing
+    /// trained yet: every transaction is a barrier, the DAG degenerates
+    /// to a serial chain with O(n^2) edge fan-in, and the average over
+    /// several blocks mostly measures that one cold block. Production
+    /// stats are continuously warm, so steady state is the honest number.
     #[arg(long, default_value_t = 1)]
     warmup_blocks: usize,
-    /// Engine keep-hot: workers spin-yield between blocks (holds core
-    /// frequency; replaces external SCHED_IDLE spinners).
+    /// Engine keep-hot: workers spin and yield between blocks. This
+    /// holds core frequency, and replaces external SCHED_IDLE spinners.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     keep_hot: bool,
-    /// P3a pipelined measurement: two independent DBs; pass A runs
-    /// sequential per block (timed), pass B streams blocks through
-    /// submit-ahead (depth 2) with lag-1 byte-identical asserts and
-    /// production-shaped settlement. Reports aggregate throughput.
+    /// The pipelined measurement: two independent databases. Pass A
+    /// runs sequentially, one block at a time, timed. Pass B streams
+    /// blocks through submit-ahead, at depth 2, with lag-1
+    /// byte-identical checks and production-shaped settlement. Reports
+    /// aggregate throughput.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pipeline: bool,
-    /// With --pipeline: layer block N+1 on the ENGINE's own deltas,
-    /// released speculatively at block N's fold (spec P3b) — the
-    /// production shape. Default keeps the baseline-delta layering
-    /// (measures pipeline mechanics only). Scenarios must be
-    /// wound-free: a corrected release fails the run loudly.
+    /// With --pipeline, layer block N+1 on the engine's own deltas,
+    /// released speculatively at block N's fold. This is
+    /// the production shape. The default keeps the baseline-delta
+    /// layering, which measures pipeline mechanics only. A scenario
+    /// must be wound-free: a corrected release fails the run loudly.
     #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
     pipeline_speculative: bool,
-    /// Bag scheduler (default): one shared lock-free runnable set,
-    /// inline completion, chain-local hand-off. `false` = legacy
-    /// per-worker FIFO scheduler (stealing + eager coverage) for A/B.
+    /// The bag scheduler, the default: one shared lock-free runnable
+    /// set, inline completion, and chain-local hand-off. `false` uses
+    /// the legacy per-worker FIFO scheduler, with stealing and eager
+    /// coverage, for an A/B comparison.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     bag_scheduler: bool,
-    /// Sharded admission: cell-space shards for dependency discovery
-    /// (0 = serial feed). Lanes run on the caller cores.
+    /// Sharded admission: cell-space shards for dependency discovery.
+    /// `0` means a serial feed. Lanes run on the caller cores.
     #[arg(long, default_value_t = 0)]
     admit_shards: usize,
 }
 
-/// Counting allocator: every alloc through one pair of relaxed counters.
-/// The w=1 gap survived read-path timing (2.5us of 19.2), graph elision,
-/// and a sampling profiler — allocation pressure is the surviving
-/// hypothesis, and counting is the only offline way to test it.
+/// A counting allocator: every allocation goes through one pair of
+/// relaxed counters. Read-path timing, graph elision, and a sampling
+/// profiler all failed to explain the gap at one worker. Allocation
+/// pressure is the remaining hypothesis, and counting is the only
+/// offline way to test it.
 struct CountingAlloc;
 static ALLOC_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static ALLOC_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Size-class histogram: <64, <512, <4K, <32K, <256K, big.
+/// A size-class histogram: under 64, under 512, under 4K, under 32K,
+/// under 256K, and larger.
 static ALLOC_BUCKETS: [std::sync::atomic::AtomicU64; 6] = [
     std::sync::atomic::AtomicU64::new(0),
     std::sync::atomic::AtomicU64::new(0),
@@ -187,9 +197,9 @@ unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
         unsafe { std::alloc::System.dealloc(ptr, layout) }
     }
-    // Explicit, so Vec growth is measured as GROWTH — the default impl
-    // routes through alloc()+dealloc() and makes a 4->8->16 growth series
-    // read as three fresh allocations.
+    // This is explicit, so Vec growth is measured as growth. The default
+    // implementation routes through alloc() and dealloc(), which makes a
+    // 4 to 8 to 16 growth series read as three fresh allocations.
     unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
         REALLOC_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         REALLOC_BYTES.fetch_add(new_size as u64, std::sync::atomic::Ordering::Relaxed);
@@ -214,11 +224,11 @@ fn bucket_snap() -> [(u64, u64); 6] {
     })
 }
 
-// mimalloc as the backing store was TRIED and REVERTED (2026-08-16):
-// it raised block-at-a-time worker busy (+11%) more than it helped the
-// pipeline's span inflation (unchanged) — the contention is not
-// user-space arena locks; see the spec's pipeline-span-inflation note
-// (mmap_lock / page-fault path is the open suspect).
+// mimalloc as the backing store was tried and reverted: it raised
+// block-at-a-time worker busy time more than it helped the pipeline's
+// span inflation, which stayed unchanged. So the contention is not
+// user-space arena locks. See the spec's pipeline-span-inflation note;
+// the mmap_lock or page-fault path is the open suspect.
 #[global_allocator]
 static COUNTING_ALLOC: CountingAlloc = CountingAlloc;
 
@@ -265,9 +275,9 @@ fn assert_identical(
     );
 }
 
-/// Fold a block's ACTUAL footprints into the stats — the capture pass the
-/// live shadow performs, shared by both backends so each block is scheduled
-/// with prior-blocks-only knowledge.
+/// Fold a block's actual footprints into the stats. This is the
+/// capture pass the live shadow performs, shared by both backends so
+/// each block is scheduled with prior-blocks-only knowledge.
 fn train<S: kardamom_types::StateDatabase>(
     snapshot: &S,
     recs: &[(TxIndex, BPosition, TxEnvelope)],
@@ -321,21 +331,23 @@ fn train<S: kardamom_types::StateDatabase>(
     Ok(())
 }
 
-/// mdbx-backed A/B — THE honest baseline.
+/// The mdbx-backed A/B: the honest baseline.
 ///
-/// Every other number in this harness is measured against in-memory Mock
-/// state, where a read costs a hash lookup and sequential execution runs at
-/// ~3 Ggas/s. That is the most hostile possible comparison for a parallel
-/// engine: it maximizes the scheduler's share of the work. Here reads go to
-/// the real backend, so per-tx execution costs what it costs in production
-/// and the coordination overhead is measured against the right denominator.
+/// Every other number in this harness is measured against in-memory
+/// Mock state, where a read costs a hash lookup and sequential
+/// execution runs fast. That is the most hostile possible comparison
+/// for a parallel engine, since it maximizes the scheduler's share of
+/// the work. Here reads go to the real backend, so per-transaction
+/// execution costs what it costs in production, and the coordination
+/// overhead is measured against the right denominator.
 ///
-/// State is MONOTONIC here (a committed block cannot be un-committed), so
-/// the sweep cannot replay a block per worker count against a rewound DB.
-/// Instead each configuration gets a FRESH database and replays the whole
-/// sequence, with both engines reading the SAME snapshot before it advances:
-/// snapshot -> sequential (timed, canonical outputs) -> STM (timed,
-/// byte-compared) -> commit the sequential delta -> next snapshot.
+/// State is monotonic here: a committed block cannot be un-committed.
+/// So the sweep cannot replay a block for each worker count against a
+/// rewound database. Instead, each configuration gets a fresh database
+/// and replays the whole sequence, with both engines reading the same
+/// snapshot before it advances: snapshot, then sequential (timed,
+/// canonical outputs), then STM (timed, checked byte for byte), then
+/// commit the sequential delta, then the next snapshot.
 type FlowRecs = Vec<(TxIndex, BPosition, TxEnvelope)>;
 type FeedPayload = Vec<(
     TxIndex,
@@ -404,7 +416,7 @@ fn run_pipelined(
     let warm = n_setup + warmup_blocks;
 
     for &w in worker_counts {
-        // ---- PASS A: sequential, own DB, timed per flow block ----
+        // Pass A: sequential, its own database, timed for each flow block.
         let (_da, _ra, writer_a) = mk_env()?;
         let mut snap_a = writer_a.snapshot_rx.current().expect("initial snapshot");
         let mut stats = Stats::default();
@@ -444,7 +456,7 @@ fn run_pipelined(
         }
         drop(writer_a);
 
-        // ---- PASS B: pipelined pool, fresh DB, submit-ahead depth 2 ----
+        // Pass B: the pipelined pool, a fresh database, submit-ahead at depth 2.
         let (_db, env_b, writer_b) = mk_env()?;
         let mut snap_b = writer_b.snapshot_rx.current().expect("initial snapshot");
         let cfg = kardamom_stm::execute::PoolConfig {
@@ -460,8 +472,8 @@ fn run_pipelined(
             tail_on_workers: false,
             pin_cores: pin_cores.clone(),
         };
-        // Prepare (decode+predict) upstream and untimed — P3 pays this on
-        // the tx_data readers.
+        // Prepare (decode and predict) upstream and untimed. The live
+        // executor pays this cost on the tx_data readers.
         let mut stats_b = Stats::default();
         let mut gi = 0u64;
         let mut warm_recs: Vec<(usize, FlowRecs)> = Vec::new();
@@ -470,8 +482,9 @@ fn run_pipelined(
             gi += blk.len() as u64;
             warm_recs.push((bi, recs));
         }
-        // Settle setup+warmup on DB B (sequential, untimed), training as
-        // we go — the pipeline starts warm, as production does.
+        // Settle setup and warmup on database B, sequentially and untimed,
+        // training along the way, so the pipeline starts warm, as
+        // production does.
         for (bi, recs) in warm_recs.iter().take(warm) {
             let e = env_of(*bi);
             let (receipts, delta) = execute_block_sequential(&snap_b, None, e, recs)?;
@@ -490,8 +503,9 @@ fn run_pipelined(
                 }
             }
         }
-        // OWNED per-block feed payloads — the loop consumes them without
-        // clones, as production tx_data readers hand owned values.
+        // These are owned per-block feed payloads. The loop consumes them
+        // without clones, since production tx_data readers hand over owned
+        // values.
         let mut feed_payloads: Vec<FeedPayload> = warm_recs
             .iter()
             .skip(warm)
@@ -506,11 +520,11 @@ fn run_pipelined(
             .collect();
 
         let n_flow = baseline.len();
-        // KARDAMOM_PIPE_ASSERT=0 = pure-timing mode: the settler
-        // consumes outcomes (production shape, no on-clock clone) and
-        // the post-hoc byte-asserts are skipped. Default = 1: assert
-        // every block (the correctness pass; slightly pessimistic
-        // timing).
+        // Setting KARDAMOM_PIPE_ASSERT=0 gives pure-timing mode: the
+        // settler consumes outcomes, the production shape, with no clone
+        // on the clock, and the code skips the post-hoc byte checks. The
+        // default, 1, checks every block. This is the correctness pass,
+        // with slightly pessimistic timing.
         let retain_outcomes = std::env::var("KARDAMOM_PIPE_ASSERT")
             .map(|v| v != "0")
             .unwrap_or(true);
@@ -519,21 +533,20 @@ fn run_pipelined(
         let t_pipe = Instant::now();
         kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
             let timing = std::env::var_os("KARDAMOM_STM_PHASE_TIMING").is_some();
-            // SETTLER thread: resolves tickets in order — waits the tail,
-            // records the outcome, finalizes and hands the writer its
-            // batch, and advances the pool's base cache — all OFF the
+            // The settler thread resolves tickets in order: it waits for
+            // the tail, records the outcome, finalizes, hands the writer
+            // its batch, and advances the pool's base cache, all off the
             // submission loop. The loop's only bookkeeping is layer
-            // assembly (Arc clones) and admission.
+            // assembly, through Arc clones, and admission.
             let (settle_tx, settle_rx) =
                 std::sync::mpsc::channel::<(usize, kardamom_stm::execute::BlockTicket)>();
             let settled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let settled_c = settled.clone();
-            // Writer settlement is ASYNC: deltas are sent and never
-            // waited on inside the loop. `advanced_to` tracks which flow
-            // deltas have been mirrored into the pool's base cache after
-            // the writer confirmed them; everything after that is layered
-            // as the pending base (depth grows only if the writer lags a
-            // full execution span).
+            // Writer settlement is asynchronous: the loop sends deltas and
+            // never waits on them. `advanced_to` tracks which flow deltas
+            // are mirrored into the pool's base cache after the writer
+            // confirms them. Everything after that layers as the pending
+            // base; depth grows only if the writer lags a full execution span.
             let outcomes_arc = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(
                 usize,
                 kardamom_stm::execute::StmOutcome,
@@ -561,14 +574,14 @@ fn run_pipelined(
                         }
                         let bi = warm + pfi;
                         let e = env_of2(bi);
-                        // PRODUCTION SHAPE by default: the outcome is
-                        // CONSUMED — finalize by value, no clone. The
-                        // clone + retention exist only for the post-hoc
-                        // byte-asserts (KARDAMOM_PIPE_ASSERT=1, the
-                        // correctness pass) — cloning multi-MB deltas on
-                        // the clock streams through the shared L3 the
-                        // executing span depends on (see the spec's
-                        // span-inflation note).
+                        // By default, this is the production shape: the
+                        // outcome is consumed, finalized by value, with no
+                        // clone. The clone and retention exist only for the
+                        // post-hoc byte checks (KARDAMOM_PIPE_ASSERT=1, the
+                        // correctness pass). Cloning multi-megabyte deltas
+                        // on the clock streams through the shared L3 cache
+                        // the executing span depends on; see the spec's
+                        // span-inflation note.
                         if retain2 {
                             let bd = out
                                 .delta
@@ -585,14 +598,15 @@ fn run_pipelined(
                     Ok(())
                 }
             });
-            // Layer source. BASELINE mode: pass A's deltas, Arc'd up
-            // front — measures pipeline mechanics with the answer known.
-            // SPECULATIVE mode (P3b, the production shape): the engine's
-            // own deltas, received from the tail's streaming release at
-            // each block's FOLD — block fi cannot be layered before
-            // fi-1's release arrives, which is exactly the pipeline's
-            // sync point (execution of fi overlaps only fi-1's
-            // validate/hash/receipts/settle tail).
+            // This is the layer source. In baseline mode, it uses pass
+            // A's deltas, wrapped in an Arc up front, which measures
+            // pipeline mechanics with the answer already known. In
+            // speculative mode (the production shape), it uses the
+            // engine's own deltas, received from the tail's streaming
+            // release at each block's fold. Block fi cannot layer before
+            // fi-1's release arrives; that is exactly the pipeline's sync
+            // point, since fi's execution overlaps only fi-1's validate,
+            // hash, receipts, and settle tail.
             let deltas_arc: Vec<std::sync::Arc<PendingDelta>> = if speculative {
                 Vec::new()
             } else {
@@ -604,9 +618,9 @@ fn run_pipelined(
             let mut engine_deltas: Vec<Option<std::sync::Arc<PendingDelta>>> = vec![None; n_flow];
             let (rel_tx, rel_rx) =
                 std::sync::mpsc::channel::<kardamom_stm::execute::DeltaRelease>();
-            // mv-as-layer: the EARLY release (pre-fold) that block fi
-            // actually binds on; the DeltaRelease above is drained
-            // lazily for base-cache advancement bookkeeping only.
+            // This is mv-as-layer: the early, pre-fold release that block
+            // fi actually binds on. The code drains the DeltaRelease above
+            // lazily, for base-cache advancement bookkeeping only.
             type MvSlot = (
                 std::sync::Arc<kardamom_stm::mv::MvCache>,
                 Option<revm::state::AccountInfo>,
@@ -624,12 +638,12 @@ fn run_pipelined(
             };
             let mut advanced_to: usize = 0;
             if speculative {
-                // THE P3b SEQUENCING (late-bound layers): block fi is
-                // built, FED, and SUBMITTED while fi-1 still executes —
-                // admission is layer-independent — and its read base
-                // binds when fi-1's delta releases at the fold. The
-                // first measurement of the naive order (build AFTER the
-                // release) measured 2.08x vs 2.68x block-at-a-time: the
+                // This is the speculative-release sequencing, with late-bound layers.
+                // Block fi is built, fed, and submitted while fi-1 still
+                // executes, since admission is layer-independent, and its
+                // read base binds when fi-1's delta releases at the fold.
+                // The naive order, building after the release, measured
+                // much lower throughput than block-at-a-time, because the
                 // feed had moved back onto the critical path.
                 for fi in 0..n_flow {
                     let t1 = Instant::now();
@@ -650,13 +664,13 @@ fn run_pipelined(
                     let ticket = sess.submit_streaming_mv(mv_tx.clone(), rel_tx.clone())?;
                     settle_tx.send((fi, ticket)).expect("settler alive");
                     let t_feed = t2.elapsed();
-                    // BIND: wait out fi-1's EARLY release (drain +
-                    // extract — pre-fold; spec P3b mv-as-layer).
+                    // Bind: wait out fi-1's early release, drain and
+                    // extract, pre-fold, per the mv-as-layer design.
                     // Releases arrive in submission order.
-                    // Advancement bookkeeping FIRST — it overlaps
-                    // fi-1's still-running execution instead of sitting
-                    // on the cadence after the bind-wait. Fold deltas
-                    // arrive lazily; drain without blocking.
+                    // Do advancement bookkeeping first. It overlaps fi-1's
+                    // still-running execution, instead of adding to the
+                    // cadence after the bind-wait. Fold deltas arrive
+                    // lazily; drain them without blocking.
                     let t_a = Instant::now();
                     while let Ok(rel) = rel_rx.try_recv() {
                         assert!(
@@ -680,7 +694,7 @@ fn run_pipelined(
                             break;
                         }
                         pool.advance_base(&layer_of(&engine_deltas, advanced_to));
-                        // Settled: hand the shell back to the fold pool.
+                        // Once settled, hand the shell back to the fold pool.
                         if let Some(arc) = engine_deltas[advanced_to].take()
                             && let Ok(d) = std::sync::Arc::try_unwrap(arc)
                         {
@@ -699,8 +713,8 @@ fn run_pipelined(
                             engine_mvs[k] = Some((rel.mv, rel.sink_final));
                         }
                     }
-                    // NEWEST FIRST: the mv caches of unsettled
-                    // predecessors; the sink rides the newest release.
+                    // Newest first: the mv caches of unsettled
+                    // predecessors. The sink rides the newest release.
                     let mv_layers: Vec<std::sync::Arc<kardamom_stm::mv::MvCache>> = (advanced_to
                         ..fi)
                         .rev()
@@ -737,7 +751,7 @@ fn run_pipelined(
                         pool.advance_base(&layer_of(&engine_deltas, advanced_to));
                         advanced_to += 1;
                     }
-                    // NEWEST FIRST.
+                    // Newest first.
                     let layers: Vec<std::sync::Arc<PendingDelta>> = (advanced_to..fi)
                         .rev()
                         .map(|k| layer_of(&engine_deltas, k))
@@ -787,7 +801,7 @@ fn run_pipelined(
                 "  (pure-timing mode: byte-asserts skipped — run KARDAMOM_PIPE_ASSERT=1 for the correctness pass)"
             );
         }
-        // Verification AFTER the clock: every block, byte-identical.
+        // Verify after the clock stops: every block must be byte-identical.
         for (pfi, out) in &outcomes {
             assert_identical(
                 &baseline[*pfi].0,
@@ -861,8 +875,9 @@ fn run_mdbx_ab(
                 .write_map(true)
                 .open()?;
             kardamom_state::seed_genesis(&env, &genesis, &[])?;
-            // Keep an env handle: each worker needs its OWN read
-            // transaction (mdbx serialises reads through one txn's mutex).
+            // Keep an env handle. Each worker needs its own read
+            // transaction, since mdbx serializes reads through one
+            // transaction's mutex.
             let env_for_reads = env.clone();
             let writer = StateWriter::spawn(env)?;
             let mut snapshot = writer
@@ -925,20 +940,21 @@ fn run_mdbx_ab(
                         eprintln!("[prog] block {bi}: seq start");
                     }
 
-                    // Both engines read the SAME snapshot, before it moves.
-                    // KARDAMOM_STM_ONLY: run pool blocks back-to-back with no
-                    // sequential run between them. The per-block timeline
-                    // showed a uniform +30% step (evm AND reads equally) with
-                    // one block at 11.2ms — FASTER than sequential — which is
-                    // the signature of core-frequency ramping: the worker
-                    // parks during each interleaved sequential run and its
-                    // core downclocks. Skipping the interleave keeps the
-                    // worker hot; if the drag vanishes, it was frequency.
+                    // Both engines read the same snapshot, before it moves.
+                    // Setting KARDAMOM_STM_ONLY runs pool blocks
+                    // back-to-back, with no sequential run between them.
+                    // The per-block timeline showed a uniform slowdown
+                    // across both EVM and reads, with one block running
+                    // faster than sequential. This is the signature of
+                    // core-frequency ramping: the worker parks during each
+                    // interleaved sequential run, and its core downclocks.
+                    // Skipping the interleave keeps the worker hot; if the
+                    // drag vanishes, it was frequency.
                     let stm_only = std::env::var_os("KARDAMOM_STM_ONLY").is_some();
-                    // FAIR BASELINE: decode once, OUTSIDE both timers, and
-                    // hand it to the sequential engine the way `prepare`
-                    // hands it to the parallel one. Charging decode to one
-                    // side only inflated every ratio by 2-9%.
+                    // This is a fair baseline: decode once, outside both
+                    // timers, and hand it to the sequential engine the way
+                    // `prepare` hands it to the parallel one. Charging
+                    // decode to only one side inflated every ratio.
                     let seq_decoded: Vec<Option<alloy_consensus::TxEnvelope>> = recs
                         .iter()
                         .map(|(t, _, en)| kardamom_stm::decode_alloy_envelope(&en.raw_tx, *t).ok())
@@ -949,13 +965,14 @@ fn run_mdbx_ab(
                     let (seq_receipts, seq_delta) = if stm_only {
                         (Vec::new(), PendingDelta::new())
                     } else if std::env::var_os("KARDAMOM_SEQ_ON_THREAD").is_some() {
-                        // Discriminator: the pool's per-tx cost exceeds
-                        // sequential's by ~1.8x for PURE-INTERPRETER work.
-                        // Run the same sequential engine on a spawned
-                        // thread pinned to a worker core: if it slows to
-                        // the pool's rate, the tax is THREAD CONTEXT
-                        // (stack, arena, placement); if it stays fast, the
-                        // tax is in the pool's own execution path.
+                        // This is a discriminator: the pool's per-transaction
+                        // cost is notably higher than sequential's for
+                        // pure-interpreter work. Run the same sequential
+                        // engine on a spawned thread pinned to a worker
+                        // core. If it slows to the pool's rate, the tax is
+                        // thread context: stack, arena, or placement. If it
+                        // stays fast, the tax is in the pool's own
+                        // execution path.
                         std::thread::scope(|sc| {
                             sc.spawn(|| {
                                 let core: usize = std::env::var("KARDAMOM_SEQ_CORE")
@@ -1045,8 +1062,8 @@ fn run_mdbx_ab(
                             w,
                         );
                     }
-                    // Off the measured window (a2 snapped above): the
-                    // delta shell goes back to the fold pool.
+                    // This is off the measured window; a2 is snapped
+                    // above. The delta shell goes back to the fold pool.
                     pool.recycle_delta(std::mem::take(&mut out.delta));
                     if prog {
                         eprintln!("[prog] block {bi}: pool done");
@@ -1062,11 +1079,12 @@ fn run_mdbx_ab(
                             ok,
                             seq_receipts.len()
                         );
-                        // Max core clock right now — the busy worker is the
-                        // boosted core, so max ~= the frequency the block
-                        // just ran at. Uniform per-block steps (evm AND
-                        // reads scaling together) are a frequency
-                        // signature, and this settles it.
+                        // This is the maximum core clock right now. The
+                        // busy worker is the boosted core, so the maximum
+                        // is close to the frequency the block just ran at.
+                        // Uniform per-block steps, with EVM and reads
+                        // scaling together, are a frequency signature, and
+                        // this settles it.
                         let mhz: u64 = (0..12)
                             .filter_map(|c| {
                                 std::fs::read_to_string(format!(
@@ -1132,8 +1150,8 @@ fn run_mdbx_ab(
                             .unwrap_or(0);
                     }
 
-                    // Train on this block (prior-blocks-only stats), then
-                    // COMMIT it so the next block reads it from mdbx.
+                    // Train on this block, using prior-blocks-only stats,
+                    // then commit it, so the next block reads it from mdbx.
                     train(&snapshot, &recs, e, None, &mut stats)?;
                     let boundary = BlockBoundary {
                         block_number: e.block_number,
@@ -1141,20 +1159,20 @@ fn run_mdbx_ab(
                         l2_timestamp: e.l2_timestamp,
                         l1_origin: 0,
                     };
-                    // In stm-only mode the pool's delta is the only one —
-                    // and when both run they are asserted byte-identical, so
-                    // this is the same state either way.
+                    // In stm-only mode, the pool's delta is the only one.
+                    // When both engines run, the code checks they are
+                    // byte-identical, so this is the same state either way.
                     let (fin_delta, fin_receipts) = if stm_only {
                         (out.delta, out.receipts)
                     } else {
                         (seq_delta, seq_receipts)
                     };
                     // Mirror the committed delta into the pool's
-                    // pool-lifetime backend cache BEFORE the writer applies
-                    // it — next block's reads hit warm entries instead of
-                    // mdbx (parcounter measured 100% backend reads without
-                    // this: every hot cell changes every block, so a
-                    // per-block cache can never hit).
+                    // pool-lifetime backend cache before the writer applies
+                    // it, so the next block's reads hit warm entries
+                    // instead of mdbx. Without this, parcounter measured
+                    // all backend reads: every hot cell changes every
+                    // block, so a per-block cache can never hit.
                     pool.advance_base(&fin_delta);
                     let bd = fin_delta.finalize(e.block_number, fin_receipts);
                     writer.delta_tx.send(WriteBatch::new(boundary, bd))?;
@@ -1335,7 +1353,7 @@ fn main() -> anyhow::Result<()> {
                 (w.setup_blocks, w.flow_blocks)
             }
             "defi" => {
-                // BenchDefi single-instance — mirrors stm-p0's construction.
+                // BenchDefi single-instance: this mirrors stm-p0's construction.
                 let (deploys, contracts) =
                     defi::deployment_txs(&signers, a.chain_id, 0, 1_000_000_000)?;
                 let per_sender = (a.blocks * a.block_size) / a.senders + 2;
@@ -1382,14 +1400,16 @@ fn main() -> anyhow::Result<()> {
                 (vec![setup], flows)
             }
             "partransfer" => {
-                // FULLY INDEPENDENT plain transfers: sender i (one tx per
-                // block, senders >= block_size) pays 1 wei to a FRESH
-                // address derived from (sender, block) that nothing else
-                // ever touches. No sender chains, no recipient overlap,
-                // no code — the pure 21k-gas rung. The structural
-                // question it isolates: how much of a ~2.5us transaction
-                // do the engine's serial parts (feed ~0.5-0.7us, fold)
-                // consume — i.e. the Amdahl ceiling for micro-txs.
+                // These are fully independent plain transfers: sender i,
+                // one transaction per block, with senders at least
+                // block_size, pays 1 wei to a fresh address derived from
+                // (sender, block) that nothing else ever touches. There
+                // are no sender chains, no recipient overlap, and no
+                // code: this is the pure 21k-gas rung. The structural
+                // question it isolates is how much of a short
+                // transaction the engine's serial parts, the feed and
+                // the fold, consume. That is the Amdahl ceiling for
+                // micro-transactions.
                 use alloy_consensus::{SignableTransaction, TxLegacy};
                 use alloy_eips::eip2718::Encodable2718;
                 use alloy_network::TxSignerSync;
@@ -1429,25 +1449,26 @@ fn main() -> anyhow::Result<()> {
                 (Vec::new(), flows)
             }
             "parcounter" => {
-                // FULLY INDEPENDENT contract calls — the bottom rung of
-                // the dependency ladder. Each sender deploys its OWN
-                // 10-byte counter (slot-0 increment) in setup, then calls
-                // it once per block. With senders >= block_size no two
-                // txs in a block share ANY state: distinct sender,
-                // distinct contract, distinct slot. Any idle time or
-                // sub-linear scaling here is an ENGINE defect by
-                // construction, not workload structure. Contract-call
-                // weight (~15us/tx) keeps the serial feed (<1us/tx) from
-                // masking the scaling, which plain transfers cannot do
-                // (2.5us/tx caps at ~2.2x by Amdahl regardless of the
-                // engine).
+                // These are fully independent contract calls, the bottom
+                // rung of the dependency ladder. Each sender deploys its
+                // own 10-byte counter, a slot-0 increment, in setup, then
+                // calls it once per block. With senders at least
+                // block_size, no two transactions in a block share any
+                // state: distinct sender, distinct contract, distinct
+                // slot. Any idle time or sub-linear scaling here is an
+                // engine defect by construction, not a workload
+                // structure issue. Contract-call weight keeps the serial
+                // feed from masking the scaling, which plain transfers
+                // cannot do: they cap at a low speedup by Amdahl's law,
+                // regardless of the engine.
                 use alloy_consensus::{SignableTransaction, TxLegacy};
                 use alloy_eips::eip2718::Encodable2718;
                 use alloy_network::TxSignerSync;
                 use alloy_primitives::{TxKind, keccak256};
-                // Runtime: `call_work` LOOP iterations of slot0 += 1.
-                // Warm sload/sstore are ~40ns in revm, so only a loop can
-                // reach contract-scale per-tx weight:
+                // The runtime does `call_work` loop iterations of
+                // slot0 += 1. A warm sload or sstore is fast in revm, so
+                // only a loop can reach contract-scale per-transaction
+                // weight:
                 //   PUSH2 N; JUMPDEST@3; PUSH1 0 SLOAD; PUSH1 1 ADD;
                 //   PUSH1 0 SSTORE; PUSH1 1; SWAP1; SUB; DUP1; PUSH1 3;
                 //   JUMPI; STOP
@@ -1476,8 +1497,8 @@ fn main() -> anyhow::Result<()> {
                     0x57,
                     0x00,
                 ];
-                // init: PUSH1 len PUSH1 off PUSH1 0 CODECOPY PUSH1 len
-                // PUSH1 0 RETURN ++ runtime.
+                // The init sequence is: PUSH1 len PUSH1 off PUSH1 0
+                // CODECOPY PUSH1 len PUSH1 0 RETURN, followed by the runtime.
                 let mut init = vec![
                     0x60,
                     runtime.len() as u8,
@@ -1669,10 +1690,10 @@ fn main() -> anyhow::Result<()> {
         worker_counts
     );
 
-    // ---- Pass 0: timed sequential baseline + caches -------------------
-    // Per block: the pre-block delta (base), the canonical outputs, and a
-    // SNAPSHOT of the stats as they stood before the block (so every STM
-    // sweep sees the exact inputs the streaming executor would).
+    // Pass 0 is the timed sequential baseline, plus caches. For each
+    // block: the pre-block delta (the base), the canonical outputs, and
+    // a snapshot of the stats as they stood before the block, so every
+    // STM sweep sees the exact inputs the streaming executor would.
     struct BlockCase {
         env: ExecEnv,
         recs: Vec<(TxIndex, BPosition, TxEnvelope)>,
@@ -1681,9 +1702,9 @@ fn main() -> anyhow::Result<()> {
         seq_receipts: Vec<Receipt>,
         seq_delta: PendingDelta,
         is_flow: bool,
-        /// Upstream-prepared decode+prediction — what P3's tx_data readers
-        /// will hand the executor. Timed separately: it is NOT on the
-        /// feed's serial path.
+        /// The upstream-prepared decode and prediction: what the
+        /// tx_data reader threads will hand the executor. Timed separately,
+        /// since it is not on the feed's serial path.
         prep_us: u64,
     }
     let mut cases: Vec<BlockCase> = Vec::with_capacity(all_blocks.len());
@@ -1718,13 +1739,14 @@ fn main() -> anyhow::Result<()> {
             flow_txs += recs.len();
         }
 
-        // Untimed capture pass: train the stats for the NEXT block
-        // (prior-blocks-only, like the live shadow).
+        // This is an untimed capture pass. It trains the stats for the
+        // next block, using prior-blocks-only data, like the live shadow.
         train(&snap, &recs, env, Some(&delta), &mut stats)?;
 
         delta.merge_from(&seq_delta);
-        // Cost of preparing this block upstream (measured once; the sweep
-        // re-prepares per run so each timed pass starts from raw inputs).
+        // This is the cost of preparing this block upstream, measured
+        // once. The sweep re-prepares for each run, so each timed pass
+        // starts from raw inputs.
         let t_prep = Instant::now();
         for (t, _, e) in &recs {
             let _ = kardamom_stm::execute::prepare(e, *t, &stats_before);
@@ -1742,9 +1764,9 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // ---- Sweep: ONE persistent pool per worker count, blocks streamed
-    // through it — no per-block thread cost, matching the executor
-    // pipeline shape.
+    // The sweep uses one persistent pool for each worker count, with
+    // blocks streamed through it, so there is no per-block thread
+    // cost, matching the executor pipeline shape.
     struct Row {
         workers: usize,
         batch: usize,
@@ -1754,8 +1776,9 @@ fn main() -> anyhow::Result<()> {
         prep_us: u64,
         redundant: u64,
         steals: u64,
-        /// Dispatch imbalance: busiest thread's share vs an even split.
-        /// Domain-affinity assignment collides when domains ~ workers.
+        /// The dispatch imbalance: the busiest thread's share, against
+        /// an even split. Domain-affinity assignment collides when the
+        /// domain count is close to the worker count.
         imbalance: f64,
         imb_n: u64,
         idle_threads: usize,
@@ -1818,9 +1841,10 @@ fn main() -> anyhow::Result<()> {
             kardamom_stm::execute::with_pool(cfg, |pool| -> anyhow::Result<()> {
                 for case in &cases {
                     let base = case.base.clone();
-                    // Upstream stage — in production the tx_data readers,
-                    // here just ahead of the timer: the point is that it
-                    // is NOT on the executor's serial feed.
+                    // This is the upstream stage. In production, the
+                    // tx_data readers do this; here it runs just ahead
+                    // of the timer. The point is that it is not on the
+                    // executor's serial feed.
                     let prepared: Vec<_> = case
                         .recs
                         .iter()

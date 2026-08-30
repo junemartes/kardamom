@@ -1,28 +1,29 @@
 //! Inbound tx_data subscription.
 //!
-//! Under the MDS topology the sequencer subscribes to ONE tx_data
-//! (the one for its address shard) and observes every `TxEnvelope` that
-//! any proxy published there, paired with the Aeron `BPosition` of that
-//! fragment. The sequencer's job is to reorder by per-sender nonce and
-//! republish a `TxRef { tx_hash, shard_id, tx_data_position }` onto tx_ordering.
+//! Under the MDS topology, the sequencer subscribes to one tx_data stream
+//! (the one for its address shard). It sees every `TxEnvelope` that any
+//! proxy published there, paired with the Aeron `BPosition` of that
+//! fragment. The sequencer reorders envelopes by per-sender nonce, then
+//! republishes a `TxRef { tx_hash, shard_id, tx_data_position }` onto
+//! tx_ordering.
 //!
-//! Per / the inbound `TxEnvelope` already has `sender` and
-//! `tx_hash` populated by the proxy — no recovery or hashing happens here.
+//! The inbound `TxEnvelope` already has `sender` and `tx_hash` set by
+//! the proxy. No recovery or hashing happens here.
 
 use crate::error::SequencerError;
 use kardamom_types::{TxDataLoc, TxEnvelope};
 
-/// Subscription to one tx_data stream. Yields `(TxDataLoc, envelope)` per Aeron
-/// fragment — the envelope paired with its publisher `session_id` and
-/// `BPosition`. Production implementations wrap a `log` tx_data subscriber;
-/// tests use [`fakes::ScriptedTxData`].
+/// Subscription to one tx_data stream.
+/// Yields `(TxDataLoc, envelope)` for each Aeron fragment: the envelope
+/// paired with its publisher `session_id` and `BPosition`. Production code
+/// wraps a `log` tx_data subscriber. Tests use [`fakes::ScriptedTxData`].
 ///
-/// Same shape as the executor's `TxDataSubscription` trait; the difference is
-/// the sequencer is one of P concurrent subscribers per shard, while the
-/// executor is the sole consumer per shard for the envelope→ref join. The
-/// session id in `TxDataLoc` discriminates concurrent (active/active) ingress
-/// publishers so the stamped `TxRef.tx_data_session_id` makes the executor join
-/// key unique.
+/// This has the same shape as the executor's `TxDataSubscription` trait.
+/// The difference: the sequencer is one of P concurrent subscribers per
+/// shard, but the executor is the sole consumer per shard for the
+/// envelope-to-ref join. The session id in `TxDataLoc` tells apart
+/// concurrent, active-active ingress publishers. This lets the stamped
+/// `TxRef.tx_data_session_id` give the executor a unique join key.
 pub trait TxDataSubscriber: Send {
     /// Poll for at most one message. Returns:
     ///  - `Ok(Some((loc, env)))` on the next available fragment.
@@ -42,10 +43,10 @@ pub mod fakes {
 
     use super::*;
 
-    /// In-memory tx_data subscription scripted with `(loc, envelope)` pairs in
-    /// arrival order. Tests typically prepare a vector of envelopes and
-    /// synthesize monotonically increasing [`TxDataLoc`]s (session + position)
-    /// before driving `Sequencer::run_once`.
+    /// In-memory tx_data subscription. It is scripted with `(loc, envelope)`
+    /// pairs in arrival order. Tests usually build a vector of envelopes and
+    /// make increasing [`TxDataLoc`] values (session and position) before
+    /// they run `Sequencer::run_once`.
     #[derive(Default)]
     pub struct ScriptedTxData {
         pub queue: VecDeque<(TxDataLoc, TxEnvelope)>,

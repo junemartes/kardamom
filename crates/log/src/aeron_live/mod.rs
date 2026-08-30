@@ -1,65 +1,70 @@
-//! High-level real-Aeron channel adapters that are `Send`-friendly for tokio
-//! consumers.
+//! High-level real-Aeron channel adapters that are `Send`-friendly for
+//! tokio consumers.
 //!
 //! ## Why this module exists
 //!
 //! The raw rusteron types (`rusteron_client::Aeron`, `AeronPublication`,
 //! `AeronSubscription`, `rusteron_archive::AeronArchive`) wrap raw FFI
-//! pointers into a thread-confined C client and are therefore `!Send + !Sync`.
+//! pointers into a thread-confined C client, so they are `!Send + !Sync`.
 //! Production consumers (the proxy/ingress, sequencer, executor, sealer,
-//! state writer, batcher) all live in multi-threaded tokio runtimes; they
-//! need `Send + Sync` handles they can stash in `Arc`s or move into spawned
-//! tasks.
+//! state writer, batcher) all live in multi-threaded tokio runtimes. They
+//! need `Send + Sync` handles they can stash in `Arc`s or move into
+//! spawned tasks.
 //!
-//! This module bridges the gap with a **dedicated Aeron thread** per
-//! [`AeronRuntime`]. The thread owns the `Rc<Aeron>` and every publication /
-//! subscription opened from it. All cross-thread communication flows through
-//! `crossbeam_channel` (outbound publish requests from many tokio tasks → the
-//! one Aeron thread) and `tokio::sync::mpsc::UnboundedSender` (inbound
-//! messages from the Aeron thread → the registered subscriber task).
+//! This module bridges the gap with a dedicated Aeron thread per
+//! [`AeronRuntime`]. The thread owns the `Rc<Aeron>` and every publication
+//! or subscription opened from it. All cross-thread communication flows
+//! through `crossbeam_channel` (outbound publish requests from many tokio
+//! tasks to the one Aeron thread) and
+//! `tokio::sync::mpsc::UnboundedSender` (inbound messages from the Aeron
+//! thread to the registered subscriber task).
 //!
 //! ## Threading rules
 //!
-//! 1. `Aeron` and `AeronArchive` are `!Send + !Sync`. Never move them across
-//!    threads, ever.
+//! 1. `Aeron` and `AeronArchive` are `!Send + !Sync`. Never move them
+//!    across threads.
 //! 2. Use `Rc`, not `Arc`. The Aeron loop runs in a dedicated
 //!    `std::thread::spawn` OS thread.
-//! 3. Cross-thread communication: `crossbeam::channel`,
-//!    `tokio::sync::mpsc`/`broadcast`. Never an Aeron handle.
-//! 4. Tokio multi-thread runtimes silently move tasks across worker threads
-//!    at await points — so the Aeron loop is plain `std::thread`, not tokio.
+//! 3. Use `crossbeam::channel` or `tokio::sync::mpsc`/`broadcast` for
+//!    cross-thread communication. Never send an Aeron handle across
+//!    threads.
+//! 4. Tokio multi-thread runtimes silently move tasks across worker
+//!    threads at await points, so the Aeron loop is plain `std::thread`,
+//!    not tokio.
 //!
 //! ## Handle set
 //!
 //! Maps the MDS channel topology onto Send-friendly handles:
-//! - `TxData{Publisher,Subscriber}Handle` — per-shard envelope channel; the
-//!   proxy/ingress publishes, sequencers + executors + batchers subscribe.
-//! - `TxOrdering{Publisher,Subscriber}Handle` — canonical orderer of tiny
-//!   `TxOrderingMessage` records (`TxRef | BoundaryStart`); sequencers race
-//!   to publish, the sealer also publishes boundaries, the executor /
-//!   batcher subscribe.
-//! - `TxReceipts{Publisher,ReceiptSubscriber,BoundarySubscriber}Handle` —
-//!   receipts + slim boundaries (not recorded); executor publishes, proxy /
-//!   state writer subscribe.
-//! - `ReceiptCache{Publisher,Subscriber}Handle` — proxy ↔ executor receipt
-//!   cache (not recorded).
-//! - `FsyncWatermark{Publisher,Subscriber}Handle` — per-recorder fsync
+//! - `TxData{Publisher,Subscriber}Handle`: per-shard envelope channel. The
+//!   proxy/ingress publishes; sequencers, executors, and batchers
+//!   subscribe.
+//! - `TxOrdering{Publisher,Subscriber}Handle`: canonical orderer of tiny
+//!   `TxOrderingMessage` records (`TxRef | BoundaryStart`). Sequencers
+//!   race to publish, the sealer also publishes boundaries, and the
+//!   executor/batcher subscribe.
+//! - `TxReceipts{Publisher,ReceiptSubscriber,BoundarySubscriber}Handle`:
+//!   receipts plus slim boundaries (not recorded). The executor
+//!   publishes; the proxy/state writer subscribe.
+//! - `ReceiptCache{Publisher,Subscriber}Handle`: the proxy-executor
+//!   receipt cache (not recorded).
+//! - `FsyncWatermark{Publisher,Subscriber}Handle`: per-recorder fsync
 //!   watermark streams feeding the quorum aggregator.
-//! - `Quorum{Publisher,Subscriber}Handle` — aggregated quorum watermark.
+//! - `Quorum{Publisher,Subscriber}Handle`: the aggregated quorum
+//!   watermark.
 //!
-//! (unconditional dep on rusteron.)
+//! This module has an unconditional dependency on rusteron.
 //!
 //! ## Module layout
 //!
-//! - `runtime` — [`AeronRuntime`] (the command bus + spawn/open API) and
+//! - `runtime`: [`AeronRuntime`] (the command bus and spawn/open API) and
 //!   [`PubHandle`].
-//! - `thread` — the dedicated Aeron thread's poll loop and its
+//! - `thread`: the dedicated Aeron thread's poll loop and its
 //!   publication/subscription tables.
-//! - `pending` — the parked-publish retry scheduler ([`IdleBackoff`],
+//! - `pending`: the parked-publish retry scheduler ([`IdleBackoff`],
 //!   `drain_pending`) and its unit tests.
-//! - `handles` — the typed per-channel publisher/subscriber handle pairs.
+//! - `handles`: the typed per-channel publisher/subscriber handle pairs.
 //!
-//! Everything public is re-exported here; downstream imports are always
+//! Everything public is re-exported here. Downstream imports are always
 //! `kardamom_log::aeron_live::<Name>`.
 
 mod handles;
@@ -88,24 +93,25 @@ type Pub = rusteron_client::AeronPublication;
 type Sub = rusteron_client::AeronSubscription;
 type Header = rusteron_client::AeronHeader;
 
-/// Closure that decodes one Aeron fragment + position + publisher `session_id`
-/// and forwards the decoded value (or its raw bytes) somewhere Send-friendly.
-/// Boxed so different message types can share the subscription registration
-/// path. Most consumers ignore `session_id`; the tx_data subscription uses it to
-/// build a [`kardamom_types::TxDataLoc`] so concurrent ingress publishers on one
-/// shard stay disambiguated.
+/// Closure that decodes one Aeron fragment, position, and publisher
+/// `session_id`, and forwards the decoded value (or its raw bytes)
+/// somewhere Send-friendly. Boxed so different message types can share the
+/// subscription registration path. Most consumers ignore `session_id`. The
+/// tx_data subscription uses it to build a [`kardamom_types::TxDataLoc`],
+/// so concurrent ingress publishers on one shard stay distinct.
 pub type DeliverFn = Box<dyn FnMut(&[u8], BPosition, i32) + Send>;
 
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 const ADD_SUB_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long a command round trip ([`runtime`]'s `request`) waits for the Aeron
-/// thread's ack — control-plane opens and `PubHandle::publish_bytes` alike.
-/// Must stay comfortably ABOVE [`crate::offer_retry::OFFER_TIMEOUT`] (the
-/// per-frame queue deadline, enforced for every queued frame each drain pass):
-/// that ordering guarantees the publish ack (delivered or expired) always
-/// resolves before this timeout fires, so a caller can never give up on a
-/// frame that later gets delivered behind its back.
+/// How long a command round trip ([`runtime`]'s `request`) waits for the
+/// Aeron thread's ack. This covers control-plane opens and
+/// `PubHandle::publish_bytes` alike. It must stay well above
+/// [`crate::offer_retry::OFFER_TIMEOUT`] (the per-frame queue deadline,
+/// enforced for every queued frame on each drain pass). That ordering
+/// guarantees the publish ack (delivered or expired) always resolves
+/// before this timeout fires, so a caller can never give up on a frame
+/// that is later delivered behind its back.
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ---------------------------------------------------------------------------

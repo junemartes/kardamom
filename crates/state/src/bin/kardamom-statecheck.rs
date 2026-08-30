@@ -1,18 +1,25 @@
-//! `kardamom-statecheck`: offline state-DB integrity sweep + cross-DB diff.
+//! `kardamom-statecheck`: an offline state-DB integrity sweep and cross-DB
+//! diff tool.
 //!
 //! ```text
 //! kardamom-statecheck <STATE_DIR> [--compare <OTHER_DIR>] [--expect-root <0xROOT>]
 //! ```
 //!
-//! Runs `kardamom_state::integrity::sweep` over `STATE_DIR` (and over
-//! `OTHER_DIR` when given, followed by a table-level `deep_compare`).
-//! `--expect-root` additionally requires the swept DB's persisted state root
-//! to equal the given value (validator DBs only — executor DBs store none).
-//! Exits non-zero on any problem, so it composes as a chaos/e2e assertion
-//! the same way `kardamom-reconstruct --expect-root` does.
+//! This runs `kardamom_state::integrity::sweep` over `STATE_DIR`. If
+//! `OTHER_DIR` is given, it also sweeps that directory, then runs a
+//! table-level `deep_compare`.
 //!
-//! The DBs must not have a live writer (run against stopped services or
-//! copies) — the sweep opens plain mdbx transactions on the given dirs.
+//! `--expect-root` also requires the swept DB's persisted state root to
+//! equal the given value. Only validator DBs have this root; executor DBs
+//! store none.
+//!
+//! The tool exits non-zero on any problem. This lets it compose as a
+//! chaos or end-to-end test assertion, the same way
+//! `kardamom-reconstruct --expect-root` does.
+//!
+//! The DBs must not have a live writer. Run this tool against stopped
+//! services, or against copies. The sweep opens plain mdbx transactions
+//! on the given directories.
 
 use kardamom_state::{StateEnvBuilder, integrity};
 

@@ -1,8 +1,10 @@
 //! Known L1 contract ids and their per-contract metadata.
 //!
 //! Each variant maps to a forge artifact name, a registry id (keccak256 of a
-//! canonical label), and an `initialize` signature used to encode init calldata.
-//! Adding a new L1 contract is one new variant + four match-arms — no factory edit.
+//! canonical label), and an `initialize` signature. The signature encodes
+//! the init calldata.
+//! To add a new L1 contract, add one variant and four match arms. No factory
+//! edit is needed.
 
 use alloy_primitives::{B256, Bytes, U256, keccak256};
 use alloy_sol_types::SolValue;
@@ -12,23 +14,23 @@ use crate::embedded;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContractId {
     EthLockbox,
-    /// L2 data-availability sink for the S7 L1 batcher. Records
+    /// L2 data-availability sink for the L1 batcher. It records
     /// `(prevBatchIndex, blobHashes, l2BlockStart, l2BlockEnd)` and emits
-    /// `BatchPosted` — no state-root storage (S0).
+    /// `BatchPosted`. It does not store a state root.
     KardamomL2Settlement,
     /// L1 registry of attested L2 output roots for the withdrawal off-ramp.
-    /// Permissioned attester proposes outputs; permissioned challenger deletes
-    /// within the finalization window.
+    /// A permissioned attester proposes outputs. A permissioned challenger
+    /// can delete an output within the finalization window.
     WithdrawalOutputOracle,
-    /// L1 zk root chain (spec: no-std-exec-core, PR 4): running state root
-    /// advanced one posted batch at a time on a verified validity proof
-    /// whose public values match the settlement's stored batch entry.
+    /// L1 zk root chain. It holds a running state
+    /// root, advanced one posted batch at a time, on a verified validity
+    /// proof whose public values match the settlement's stored batch entry.
     KardamomProofOracle,
 }
 
 impl ContractId {
-    /// Every variant. The exhaustive match in `creation_bytecode` makes this
-    /// list mandatory-to-update when a new variant is added.
+    /// Every variant. The exhaustive match in `creation_bytecode` forces an
+    /// update to this list when someone adds a new variant.
     pub const ALL: &'static [Self] = &[
         Self::EthLockbox,
         Self::KardamomL2Settlement,
@@ -53,10 +55,11 @@ impl ContractId {
             ContractId::EthLockbox => "initialize(address,address)",
             // KardamomL2Settlement.initialize(address _l1Batcher)
             ContractId::KardamomL2Settlement => "initialize(address)",
-            // WithdrawalOutputOracle.initialize(address attester, address challenger, uint64 window)
+            // WithdrawalOutputOracle.initialize(address attester, address
+            // challenger, uint64 window)
             ContractId::WithdrawalOutputOracle => "initialize(address,address,uint64)",
             // KardamomProofOracle.initialize(settlement, verifier, batchVKey,
-            // blockVKey, genesisRoot, challengeWindow, minBond) — v2 (PR 5).
+            // blockVKey, genesisRoot, challengeWindow, minBond). This is v2.
             ContractId::KardamomProofOracle => {
                 "initialize(address,address,bytes32,bytes32,bytes32,uint64,uint96)"
             }
@@ -68,19 +71,24 @@ impl ContractId {
         keccak256(self.label().as_bytes())
     }
 
-    /// Proxy salt — includes l2_chain_id so each L2 gets a distinct proxy address.
-    /// Must byte-match `KardamomFactoryV1._deployUUPS`, which computes the salt
-    /// itself as `keccak256(abi.encode(uint256 l2ChainId, bytes32 id, "proxy"))`.
-    /// Use `abi_encode_params` (Solidity `abi.encode(args…)` semantics): a plain
-    /// `abi_encode` of the tuple would prepend a leading offset because the tuple
-    /// contains a dynamic member (the string), diverging from Solidity.
+    /// Proxy salt. It includes `l2_chain_id`, so each L2 gets a distinct
+    /// proxy address.
+    ///
+    /// This value must byte-match `KardamomFactoryV1._deployUUPS`, which
+    /// computes the salt as
+    /// `keccak256(abi.encode(uint256 l2ChainId, bytes32 id, "proxy"))`.
+    ///
+    /// Use `abi_encode_params`, which follows Solidity `abi.encode(args...)`
+    /// semantics. A plain `abi_encode` of the tuple would add a leading
+    /// offset, because the tuple has a dynamic member (the string). That
+    /// would not match Solidity.
     pub fn proxy_salt(self, l2_chain_id: u64) -> B256 {
         let encoded = (U256::from(l2_chain_id), self.id(), "proxy".to_string()).abi_encode_params();
         keccak256(encoded)
     }
 
-    /// Impl salt — does NOT include l2_chain_id; impl is shared across L2s.
-    /// `keccak256(abi.encode(id, "impl", version))`.
+    /// Impl salt. It does not include `l2_chain_id`; the impl is shared
+    /// across L2s. Computed as `keccak256(abi.encode(id, "impl", version))`.
     pub fn impl_salt(self, version: u64) -> B256 {
         let encoded = (self.id(), "impl".to_string(), version).abi_encode();
         keccak256(encoded)
@@ -92,9 +100,9 @@ impl ContractId {
         [h[0], h[1], h[2], h[3]]
     }
 
-    /// Creation bytecode for this contract, embedded at build time. Adding a
-    /// new variant without wiring it through `build.rs` is caught by the
-    /// `every_contract_id_has_nonempty_creation_bytecode` test.
+    /// Creation bytecode for this contract, embedded at build time. The
+    /// `every_contract_id_has_nonempty_creation_bytecode` test catches a new
+    /// variant that is not wired through `build.rs`.
     pub fn creation_bytecode(self) -> Bytes {
         match self {
             ContractId::EthLockbox => embedded::eth_lockbox_creation(),
@@ -146,10 +154,10 @@ mod tests {
 
     #[test]
     fn impl_salt_does_not_depend_on_l2_chain_id() {
-        // Important: this property enables impl-sharing across L2s. Don't accidentally
-        // mix l2_chain_id into impl_salt.
+        // This property lets an impl be shared across L2s. Do not mix
+        // `l2_chain_id` into `impl_salt`.
         let v1 = ContractId::EthLockbox.impl_salt(1);
-        // No chain id input at all — same salt no matter the deployment context.
+        // No chain id is an input, so the salt stays the same for any deployment context.
         let v1_again = ContractId::EthLockbox.impl_salt(1);
         assert_eq!(v1, v1_again);
     }
@@ -170,8 +178,8 @@ mod tests {
 
     #[test]
     fn every_contract_id_has_nonempty_creation_bytecode() {
-        // Iterates `ContractId::ALL`; the exhaustive match in `creation_bytecode`
-        // makes the list mandatory-to-update for new variants.
+        // Loop over `ContractId::ALL`. The exhaustive match in
+        // `creation_bytecode` forces an update to the list for new variants.
         for &id in ContractId::ALL {
             assert!(
                 !id.creation_bytecode().is_empty(),

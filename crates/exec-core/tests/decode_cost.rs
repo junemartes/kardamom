@@ -1,12 +1,12 @@
-//! RLP decode cost per tx — the number behind the "prepay decode for both
-//! engines" fairness question in the A/B harness.
+//! RLP decode cost per tx. This is the number behind the "prepay decode
+//! for both engines" fairness question in the A/B harness.
 use alloy_consensus::{SignableTransaction, TxEnvelope, TxLegacy};
 use alloy_primitives::{Address, Bytes, TxKind, U256};
 use alloy_rlp::{Decodable, Encodable};
 
 #[test]
 fn rlp_decode_cost() {
-    // Bare transfer, and a call with 200 bytes of calldata (defi-shaped).
+    // A bare transfer, and a call with 200 bytes of calldata (DeFi-shaped).
     for (label, input) in [
         ("transfer (0B calldata)", Bytes::new()),
         ("call (200B calldata)", Bytes::from(vec![7u8; 200])),

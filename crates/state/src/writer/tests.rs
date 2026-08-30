@@ -31,8 +31,9 @@ fn boundary(block: u64) -> BlockBoundary {
     }
 }
 
-/// Independent oracle: compute the canonical state root from a pure in-memory
-/// model of the accounts + slots, recomputing storage roots from scratch.
+/// An independent oracle. Compute the canonical state root from a pure
+/// in-memory model of the accounts and slots, recomputing storage roots
+/// from scratch.
 fn model_root(
     accounts: &BTreeMap<Address, (u64, U256, B256)>,
     storage: &BTreeMap<Address, BTreeMap<B256, U256>>,
@@ -69,11 +70,12 @@ fn trie_writer_root_matches_model_and_persists() {
         },
         BlockDelta {
             block_number: 2,
-            // 0x11 changes a slot (storage-only: NOT in accounts), 0x22 gets
-            // funds, 0x33 is created (a real, non-empty account) so its slot
-            // below is reachable (an empty account's storage is pruned).
+            // 0x11 changes a slot; this is storage-only, not in accounts.
+            // 0x22 gets funds. 0x33 is created as a real, non-empty
+            // account, so its slot below is reachable. An empty
+            // account's storage is pruned.
             accounts: vec![acct(0x22, 1, 800), acct(0x33, 1, 1)],
-            storage: vec![slot(0x11, 1, 0), slot(0x33, 5, 42)], // zero-out one slot, add 0x33's slot
+            storage: vec![slot(0x11, 1, 0), slot(0x33, 5, 42)], // Zero one slot, add 0x33's slot.
             code: vec![],
             receipts: vec![],
         },
@@ -89,8 +91,8 @@ fn trie_writer_root_matches_model_and_persists() {
     let mut model_accts: BTreeMap<Address, (u64, U256, B256)> = BTreeMap::new();
     let mut model_stor: BTreeMap<Address, BTreeMap<B256, U256>> = BTreeMap::new();
 
-    // Submit all blocks, then shut down — `shutdown()` drains every queued
-    // batch and joins, so on return block 3 is durably committed.
+    // Submit all blocks, then shut down. `shutdown()` drains every queued
+    // batch and joins, so block 3 is durably committed when it returns.
     {
         let env = StateEnvBuilder::new(dir.path())
             .durability(Durability::SafeNoSync)
@@ -115,8 +117,8 @@ fn trie_writer_root_matches_model_and_persists() {
         handle.shutdown().unwrap();
     }
 
-    // Reopen and verify: the persisted root equals an independent rebuild of
-    // the model, is non-empty, and survived the restart.
+    // Reopen and verify. The persisted root equals an independent rebuild
+    // of the model, is non-empty, and survived the restart.
     let env = StateEnvBuilder::new(dir.path())
         .durability(Durability::SafeNoSync)
         .open()
@@ -130,9 +132,10 @@ fn trie_writer_root_matches_model_and_persists() {
 
 #[test]
 fn shadow_check_agrees_every_block() {
-    // In ShadowCheck mode the writer rebuilds the root from scratch each block
-    // and fail-stops on mismatch. The independent rebuild must agree with the
-    // incremental walker every block, so the writer shuts down cleanly.
+    // In ShadowCheck mode, the writer rebuilds the root from scratch each
+    // block, and stops on a mismatch. The independent rebuild must agree
+    // with the incremental walker every block, so the writer shuts down
+    // cleanly.
     let dir = tempfile::tempdir().unwrap();
     let env = StateEnvBuilder::new(dir.path())
         .durability(Durability::SafeNoSync)

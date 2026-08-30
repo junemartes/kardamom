@@ -1,34 +1,36 @@
-//! Does the multi-version cache scale?
+//! This tool asks: does the multi-version cache scale?
 //!
-//! Per-tx execution cost inflates with worker count even on a completely
-//! idle machine — transfers go from 2.35us at one worker to 4.4us at
-//! eight. Inside the pool the read path is tangled with revm, the
-//! allocator, the scheduler and the state backend, so this strips all of
-//! that away: threads do nothing but the shared-structure traffic a
-//! transfer performs, against a real `MvCache`.
+//! Per-transaction execution cost rises with worker count, even on a
+//! fully idle machine: a transfer costs roughly twice as much at eight
+//! workers as at one. Inside the pool, the read path is tangled with
+//! revm, the allocator, the scheduler, and the state backend. This
+//! benchmark strips all of that away: threads do nothing but the
+//! shared-structure traffic a transfer performs, against a real
+//! `MvCache`.
 //!
-//! IT MUST MIRROR A REAL BLOCK or it measures its own artifacts. Two that
-//! bit the first version of this benchmark:
+//! The benchmark must mirror a real block, or it measures its own
+//! artifacts. Two problems affected the first version of this benchmark:
 //!
-//! - `publish_account` SORTED-INSERTS into a per-account version list. A
-//!   real block publishes at most `MAX_BLOCK_TXS` versions and then
-//!   throws the cache away; a long-running loop against one cache is
-//!   quadratic and reported a fictional 283x collapse.
-//! - The engine SKIPS the fee sink on publish (it is folded as a delta
-//!   instead). Publishing it makes every transaction in the block write
-//!   one hot key, which is a property of the benchmark, not the engine.
+//! - `publish_account` does a sorted insert into a per-account version
+//!   list. A real block publishes at most `MAX_BLOCK_TXS` versions and
+//!   then discards the cache. A long-running loop against one cache is
+//!   quadratic, and reported a collapse that did not exist in production.
+//! - The engine skips the fee sink on publish; it folds the fee as a
+//!   delta instead. Publishing it makes every transaction in the block
+//!   write one hot key, which is a property of the benchmark, not the
+//!   engine.
 //!
-//! So: a fresh cache per block, realistic block size, fee sink skipped.
-//! The `--with-sink` mode puts it back, which prices the accumulator
-//! deferral rather than confusing it for cache behaviour.
+//! So this benchmark uses a fresh cache per block, a realistic block
+//! size, and skips the fee sink. The `--with-sink` mode restores it, to
+//! price the accumulator deferral, not to be mistaken for cache behavior.
 
 use alloy_primitives::{Address, B256, U256};
 use kardamom_stm::mv::{AccountVersion, MvCache};
 
-/// Distinct accounts in play, matching the transfers scenario — this
-/// decides how often two threads land on the same shard.
+/// The distinct accounts in play, matching the transfers scenario.
+/// This decides how often two threads land on the same shard.
 const ACCOUNTS: usize = 96;
-/// Transactions per block, near the pool's `MAX_BLOCK_TXS`.
+/// The transactions per block, near the pool's `MAX_BLOCK_TXS`.
 const BLOCK_TXS: usize = 4000;
 const BLOCKS: usize = 60;
 
@@ -46,8 +48,8 @@ fn version(i: u64) -> AccountVersion {
     }
 }
 
-/// One transaction's worth of shared-structure traffic: the two account
-/// reads and two account publishes a value transfer performs.
+/// One transaction's worth of shared-structure traffic: the two
+/// account reads and two account publishes that a value transfer performs.
 #[inline]
 fn tx_pattern(mv: &MvCache, idx: u32, sender: usize, recipient: usize, with_sink: bool) {
     std::hint::black_box(mv.read_account(idx, &addr(sender)));
@@ -62,12 +64,13 @@ fn tx_pattern(mv: &MvCache, idx: u32, sender: usize, recipient: usize, with_sink
 /// How threads pick the accounts they touch.
 #[derive(Clone, Copy, PartialEq)]
 enum Access {
-    /// Every thread cycles through every account — worst case, and NOT
-    /// what the pool does.
+    /// Every thread cycles through every account. This is the worst
+    /// case, and not what the pool does.
     Shared,
-    /// Each thread owns a disjoint residue class of accounts, mirroring
-    /// the domain-hashed dispatch that assigns a contention domain to one
-    /// worker. This is the access pattern the engine actually generates.
+    /// Each thread owns a disjoint residue class of accounts. This
+    /// mirrors the domain-hashed dispatch that assigns one contention
+    /// domain to one worker. This is the access pattern the engine
+    /// actually generates.
     Partitioned,
 }
 
@@ -75,14 +78,14 @@ fn run(threads: usize, with_sink: bool, access: Access) -> f64 {
     let per_thread = BLOCK_TXS / threads;
     let started = std::time::Instant::now();
     for _ in 0..BLOCKS {
-        // One cache per block, exactly as the pool builds one per block.
+        // Use one cache per block, exactly as the pool builds one per block.
         let mv = MvCache::new();
         std::thread::scope(|s| {
             for w in 0..threads {
                 let mv = &mv;
                 s.spawn(move || {
                     for i in 0..per_thread {
-                        // Interleave indices so the version lists grow the
+                        // Interleave indices, so the version lists grow the
                         // way they do under real dispatch.
                         let idx = (i * threads + w) as u32;
                         let (sender, recipient) = match access {
@@ -90,7 +93,7 @@ fn run(threads: usize, with_sink: bool, access: Access) -> f64 {
                                 ((w * 7 + i) % ACCOUNTS, (w * 13 + i * 3 + 1) % ACCOUNTS)
                             }
                             Access::Partitioned => {
-                                // Only accounts congruent to this thread.
+                                // Use only accounts congruent to this thread.
                                 let own = |k: usize| (k % (ACCOUNTS / threads)) * threads + w;
                                 (own(i), own(i * 3 + 1))
                             }

@@ -1,19 +1,18 @@
-//! M=4 sequencers each subscribed to their own tx_data and racing to
-//! publish refs onto a shared canonical tx_ordering (MDS topology —
-//! /).
+//! M=4 sequencers, each subscribed to its own tx_data and racing to
+//! publish refs onto a shared canonical tx_ordering (MDS topology).
 //!
-//! Asserts the system-level invariants of the split:
-//!  * Each ref on tx_ordering has `shard_id` matching the producing
+//! This test checks the system-level invariants of the split:
+//!  * Each ref on tx_ordering has a `shard_id` that matches the producing
 //!    sequencer's shard (no cross-shard leakage).
-//!  * The per-sender nonce sequence reconstructed from the canonical B
-//!    arrival order is strictly ascending and dense.
+//!  * The per-sender nonce sequence, rebuilt from the canonical B arrival
+//!    order, is strictly ascending and dense.
 //!  * The total ref count equals the total input count (no drops, no
-//!    duplicate publishes in the in-memory backpressure-free harness).
+//!    duplicate publishes in the in-memory, backpressure-free harness).
 //!
-//! The in-memory `InMemoryTxOrderingRefPublisher` is `Clone` and routes
-//! all handles to one shared `Vec<TxRef>` — modelling the "single
-//! canonical B stream observed in arrival order" semantics Aeron's
-//! concurrent-publisher provides on real channels.
+//! The in-memory `InMemoryTxOrderingRefPublisher` is `Clone`, and routes
+//! all handles to one shared `Vec<TxRef>`. This models the "single
+//! canonical B stream, observed in arrival order" semantics that Aeron's
+//! concurrent publisher gives on real channels.
 
 use std::collections::HashMap;
 
@@ -83,15 +82,15 @@ fn find_signers_for_partition(target: u32, n: usize, seed_start: u64) -> Vec<Pri
 #[test]
 fn m_eq_4_sequencers_publish_canonical_refs() {
     // Build M sequencers, each subscribed to its own tx_data. They all
-    // share one `InMemoryTxOrderingRefPublisher` (cloning shares the
-    // underlying Vec — same canonical B stream).
+    // share one `InMemoryTxOrderingRefPublisher`. Cloning it shares the
+    // underlying vector, so it is the same canonical B stream.
     let b = InMemoryTxOrderingRefPublisher::default();
     let mut sequencers: Vec<Sequencer> = Vec::with_capacity(M as usize);
     let mut b_pubs: Vec<InMemoryTxOrderingRefPublisher> = Vec::with_capacity(M as usize);
     let mut rcs: Vec<InMemoryTxErrorPublisher> = Vec::with_capacity(M as usize);
     let mut channels_a: Vec<ScriptedTxData> = (0..M).map(|_| ScriptedTxData::default()).collect();
-    // sender_at_pos[(shard, pos)] → (sender, nonce). Used to validate the
-    // canonical-B refs resolve to expected envelopes.
+    // sender_at_pos maps (shard, pos) to (sender, nonce). It checks that
+    // the canonical B refs resolve to the expected envelopes.
     let mut sender_at_pos: HashMap<(u8, BPosition), (Address, u64)> = HashMap::new();
 
     for i in 0u32..M {
@@ -184,9 +183,9 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
         );
     }
 
-    // Walk the canonical B order, resolve every ref against the scripted
-    // tx_data input by (shard, tx_data_position), and assert per-sender nonce
-    // sequences are strictly ascending and dense from 0.
+    // Walk the canonical B order. Resolve every ref against the scripted
+    // tx_data input by (shard, tx_data_position). Check that per-sender
+    // nonce sequences are strictly ascending and dense from 0.
     let mut per_sender_nonces: HashMap<Address, Vec<u64>> = HashMap::new();
     for r in &refs {
         let (sender, nonce) = sender_at_pos
@@ -195,7 +194,7 @@ fn m_eq_4_sequencers_publish_canonical_refs() {
             .expect("every TxRef must resolve to a scripted (shard, position) input");
 
         // The sequencer that owns this ref must agree with the shard router
-        // on this sender — cross-shard routing correctness.
+        // on this sender. This checks cross-shard routing correctness.
         assert_eq!(
             partition_for(sender, M),
             r.shard_id as u32,

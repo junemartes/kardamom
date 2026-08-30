@@ -1,24 +1,34 @@
 //! The incremental trie walker.
 //!
-//! Recursively rebuilds only the changed regions of a trie, feeding
-//! `alloy_trie::HashBuilder`: unchanged subtries with a stored hash are skipped
-//! via `add_branch(..., stored_in_database=true)`; changed subtries are descended
-//! (recurse into stored sub-branches, or emit hashed leaves). When there is no
-//! stored branch node at a path the whole subtrie is rebuilt from its leaves —
-//! so a fresh/small trie degrades to a correct full rebuild, and incrementality
-//! emerges as `HashBuilder` produces stored branch nodes the next time around.
+//! This recursively rebuilds only the changed regions of a trie, feeding
+//! `alloy_trie::HashBuilder`. An unchanged subtrie with a stored hash is
+//! skipped, using `add_branch(..., stored_in_database=true)`. A changed
+//! subtrie is descended: the walker recurses into stored sub-branches,
+//! or emits hashed leaves.
 //!
-//! Deletion tracking: every stored node we *descend into* is recorded; after the
-//! build, removals = visited_old_nodes − new_nodes(`split()`), which captures
-//! subtries that collapsed. That alone is not enough: `tree_mask` bit `i` means
-//! "the child *subtree* under nibble `i` contains stored nodes", not "a node is
-//! stored at exactly `path+[i]`" — under an extension the stored node lives at a
-//! deeper path the exact-path lookup never sees. Whenever the exact-path lookup
-//! misses and a subtrie is rebuilt from its leaves, the whole nibble-path prefix
-//! is recorded in [`TrieUpdates::cleared`] and range-deleted before the new
-//! upserts land, so stored nodes hiding under extensions can never survive as
-//! stale orphans (which a later walk could otherwise exact-hit and use for
-//! `add_branch` skips — silent root divergence).
+//! When there is no stored branch node at a path, the whole subtrie is
+//! rebuilt from its leaves. So a fresh or small trie degrades to a
+//! correct full rebuild, and incrementality emerges as `HashBuilder`
+//! produces stored branch nodes for next time.
+//!
+//! ## Deletion tracking
+//!
+//! Every stored node the walker descends into is recorded. After the
+//! build, `removals` is `visited_old_nodes` minus `new_nodes` (from
+//! `split()`), which captures subtries that collapsed.
+//!
+//! That alone is not enough. `tree_mask` bit `i` means "the child
+//! subtree under nibble `i` contains stored nodes", not "a node is
+//! stored at exactly `path + [i]`". Under an extension, the stored node
+//! lives at a deeper path that the exact-path lookup never sees.
+//!
+//! So, whenever the exact-path lookup misses and a subtrie is rebuilt
+//! from its leaves, this walker records the whole nibble-path prefix in
+//! [`TrieUpdates::cleared`], and range-deletes it before the new upserts
+//! land. This way, a stored node hiding under an extension can never
+//! survive as a stale orphan. Otherwise, a later walk could exact-hit
+//! that orphan and use it for an `add_branch` skip, causing silent root
+//! divergence.
 
 use alloy_primitives::{B256, U256};
 use alloy_trie::{BranchNodeCompact, HashBuilder, Nibbles};
@@ -34,25 +44,26 @@ use crate::error::StateError;
 pub struct TrieUpdates {
     pub upserts: Vec<(Nibbles, BranchNodeCompact)>,
     pub removals: Vec<Nibbles>,
-    /// Nibble-path prefixes whose subtries were rebuilt from leaves because no
-    /// stored node existed at the exact path. Every stored node *under* such a
-    /// prefix (e.g. hiding at a deeper path behind an extension) is stale and
-    /// must be range-deleted **before** `upserts` are applied.
+    /// Nibble-path prefixes whose subtries were rebuilt from leaves,
+    /// because no stored node existed at the exact path. Every stored
+    /// node under such a prefix, for example one hiding at a deeper path
+    /// behind an extension, is stale. Range-delete it before applying
+    /// `upserts`.
     pub cleared: Vec<Nibbles>,
 }
 
-/// Per-walk record of which stored nodes were exact-hit (`visited`) and which
-/// subtrie prefixes were rebuilt from leaves after an exact-path miss
-/// (`cleared`).
+/// A per-walk record. `visited` holds the stored nodes that were
+/// exact-hit. `cleared` holds the subtrie prefixes rebuilt from leaves
+/// after an exact-path miss.
 #[derive(Default)]
 struct WalkLog {
     visited: Vec<Nibbles>,
     cleared: Vec<Nibbles>,
 }
 
-/// Compute the account-trie root incrementally. `account_trie`/`hashed_accounts`
-/// are the table handles; `prefix_set` holds `keccak(addr)` of every changed
-/// account. Returns `(root, updates)`.
+/// Compute the account-trie root incrementally. `account_trie` and
+/// `hashed_accounts` are the table handles. `prefix_set` holds
+/// `keccak(addr)` for every changed account. Returns `(root, updates)`.
 pub(crate) fn account_root<K: crate::trie::cursor::ReadKind>(
     tx: &TxSync<K>,
     account_trie: Database,
@@ -90,10 +101,10 @@ fn walk_account<K: crate::trie::cursor::ReadKind>(
 ) -> Result<(), StateError> {
     match get_branch_node(tx, account_trie, None, path)? {
         None => {
-            // Full leaf rebuild of this subtrie. Stored nodes may still exist
-            // *under* this path (behind extensions, where the exact-path get
-            // can't see them) — mark the prefix for range-deletion so none of
-            // them survives as a stale orphan.
+            // This is a full leaf rebuild of this subtrie. Stored nodes may
+            // still exist under this path, behind extensions, where the
+            // exact-path get cannot see them. Mark the prefix for range
+            // deletion, so none of them survives as a stale orphan.
             log.cleared.push(*path);
             for (k, parts) in collect_hashed_accounts_under(tx, hashed_accounts, path)? {
                 if parts.is_empty() {
@@ -105,15 +116,17 @@ fn walk_account<K: crate::trie::cursor::ReadKind>(
         Some(node) => {
             log.visited.push(*path);
             let (tm, hm) = (node.tree_mask.get(), node.hash_mask.get());
-            // Iterate ALL 16 nibbles, not just the stored node's (stale)
-            // state_mask: a new account under a nibble absent from the old mask
-            // must still be surfaced from the hashed state.
+            // Iterate all 16 nibbles, not just the stored node's
+            // state_mask, which may be stale. A new account under a
+            // nibble absent from the old mask must still be surfaced
+            // from the hashed state.
             for i in 0..16u8 {
                 let mut child = *path;
                 child.push(i);
                 let changed = prefix_set.contains_prefix(&child);
                 if (tm & (1 << i)) != 0 {
-                    // stored branch child: skip if unchanged + hashed, else recurse
+                    // A stored branch child. Skip it if unchanged and
+                    // hashed; otherwise recurse.
                     if !changed && (hm & (1 << i)) != 0 {
                         hb.add_branch(child, node.hash_for_nibble(i), true);
                     } else {
@@ -129,8 +142,8 @@ fn walk_account<K: crate::trie::cursor::ReadKind>(
                         )?;
                     }
                 } else {
-                    // leaf-or-empty child: emit any current leaves under it
-                    // (surfaces newly-created accounts).
+                    // A leaf-or-empty child. Emit any current leaves
+                    // under it, to surface newly created accounts.
                     for (k, parts) in collect_hashed_accounts_under(tx, hashed_accounts, &child)? {
                         if parts.is_empty() {
                             continue;
@@ -182,8 +195,9 @@ fn walk_storage<K: crate::trie::cursor::ReadKind>(
 ) -> Result<(), StateError> {
     match get_branch_node(tx, storage_trie, Some(account_hash), path)? {
         None => {
-            // See walk_account: clear the prefix so stored nodes hiding under
-            // extensions can't outlive this leaf rebuild as stale orphans.
+            // See walk_account. Clear the prefix, so stored nodes hiding
+            // under extensions cannot outlive this leaf rebuild as stale
+            // orphans.
             log.cleared.push(*path);
             for (k, v) in collect_hashed_storage_under(tx, hashed_storage, account_hash, path)? {
                 hb.add_leaf(Nibbles::unpack(k.as_slice()), &storage_leaf(v));
@@ -224,9 +238,10 @@ fn walk_storage<K: crate::trie::cursor::ReadKind>(
     Ok(())
 }
 
-/// Proof-generation entry (`trie::proofs`): the account walk from the root
-/// with a caller-owned `HashBuilder` (proof retainer attached) and a
-/// discarded log — proof walks mutate nothing and apply nothing.
+/// The proof-generation entry point (`trie::proofs`): the account
+/// walk from the root, with a caller-owned `HashBuilder` that has a
+/// proof retainer attached, and a discarded log. A proof walk mutates
+/// nothing and applies nothing.
 pub(crate) fn walk_account_for_proofs<K: crate::trie::cursor::ReadKind>(
     tx: &TxSync<K>,
     account_trie: Database,
@@ -248,8 +263,8 @@ pub(crate) fn walk_account_for_proofs<K: crate::trie::cursor::ReadKind>(
     )
 }
 
-/// Proof-generation entry: one storage trie's walk, same contract as
-/// [`walk_account_for_proofs`].
+/// The proof-generation entry for one storage trie's walk. Same
+/// contract as [`walk_account_for_proofs`].
 pub(crate) fn walk_storage_for_proofs<K: crate::trie::cursor::ReadKind>(
     tx: &TxSync<K>,
     storage_trie: Database,
@@ -276,11 +291,15 @@ fn storage_leaf(v: U256) -> Vec<u8> {
     alloy_rlp::encode_fixed_size(&v).to_vec()
 }
 
-/// Build `TrieUpdates`: upserts = the nodes HashBuilder produced; removals =
-/// visited old nodes that are no longer present (collapsed subtries); cleared =
-/// prefixes rebuilt from leaves, whose stored nodes (including any hiding at
-/// deeper paths under extensions, which the walk never exact-visits) must be
-/// range-deleted before the upserts land.
+/// Build `TrieUpdates`.
+///
+/// - `upserts`: the nodes `HashBuilder` produced.
+/// - `removals`: visited old nodes that are no longer present, meaning
+///   collapsed subtries.
+/// - `cleared`: prefixes rebuilt from leaves. Their stored nodes,
+///   including any hiding at deeper paths under extensions that the
+///   walk never exact-visits, must be range-deleted before the upserts
+///   land.
 fn finalize(
     root: B256,
     updated: alloy_trie::HashMap<Nibbles, BranchNodeCompact>,

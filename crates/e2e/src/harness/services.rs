@@ -1,13 +1,15 @@
 //! Spawners for the Rust service binaries.
 //!
-//! Binaries are resolved from the same cargo target dir the test executable
-//! ran from (`target/<profile>/deps/<test>` → `target/<profile>/`), so
-//! `cargo build --bins -p kardamom-{ingress,sequencer,executor,validator,
-//! state,da-watcher}` before `cargo test -p e2e` is the whole contract — the
-//! mechanism the deleted multiprocess e2e used. (`just test-e2e-local` and
-//! the chain-semantics CI job build exactly that set.) Services attach to the shared media driver via
-//! `--aeron-dir` and use the built-in single-host IPC channel defaults (no
-//! `--log-config`), the documented known-good local topology.
+//! Binaries are found in the same cargo target directory the test
+//! executable ran from (`target/<profile>/deps/<test>` leads to
+//! `target/<profile>/`). So the whole contract is: run `cargo build
+//! --bins -p kardamom-{ingress,sequencer,executor,validator,state,
+//! da-watcher}` before `cargo test -p e2e`. This is the same mechanism
+//! the deleted multiprocess e2e used. (`just test-e2e-local` and the
+//! chain-semantics CI job build exactly that set.) Services attach to
+//! the shared media driver with `--aeron-dir`, and use the built-in
+//! single-host IPC channel defaults (no `--log-config`), the documented
+//! known-good local topology.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -18,44 +20,46 @@ use anyhow::{Context, Result};
 
 use super::proc::{Proc, free_tcp_port, free_udp_port};
 
-/// How long an Aeron client tolerates a media driver that has stopped
-/// updating its keepalive before declaring it dead and terminating.
+/// How long an Aeron client waits for a media driver to update its
+/// keepalive before it decides the driver is dead and shuts down.
 ///
-/// Aeron's default is 10 s, which is a hair-trigger for a test stack: a
-/// chain-semantics run is 2 JVMs plus 4–6 service processes on a 2-core CI
-/// runner, and when the box is oversubscribed the driver conductor simply
-/// does not get scheduled for a while. That is not a dead driver, but at the
-/// default every client decides it is one AT THE SAME TIME and the whole
-/// stack tears itself down — which surfaces as unrelated-looking scenario
-/// failures (a validator that "made no progress", a state DB left unsteady
-/// so read-only opens hit MDBX_WANNA_RECOVERY). Instrumenting the driver JVM
-/// showed a 15 s safepoint gap with ZERO GC: pure scheduling starvation.
+/// Aeron's default is 10 s, which is too short for a test stack. A
+/// chain-semantics run is 2 JVMs plus 4 to 6 service processes on a
+/// 2-core CI runner. When the machine is oversubscribed, the driver
+/// conductor may simply not get scheduled for a while. That is not a
+/// dead driver, but at the default, every client decides it is dead at
+/// the same time, and the whole stack tears itself down. This shows up
+/// as unrelated-looking scenario failures: a validator that "made no
+/// progress", or a state database left unsteady so a read-only open
+/// hits `MDBX_WANNA_RECOVERY`. Profiling the driver JVM found scheduling
+/// starvation, not garbage collection, behind these gaps.
 ///
-/// 30 s rides out those stalls while still catching a genuinely dead driver
-/// well inside any scenario timeout. Deployments are untouched — this is the
-/// test harness only — and an outer `AERON_DRIVER_TIMEOUT` still wins, so CI
-/// or a developer can tune it without a rebuild.
+/// A 30 s timeout rides out those stalls, while still catching a
+/// genuinely dead driver well inside any scenario timeout. This does not
+/// change deployments, since it is test-harness only, and an outer
+/// `AERON_DRIVER_TIMEOUT` still wins, so CI or a developer can tune it
+/// with no rebuild.
 const DEFAULT_DRIVER_TIMEOUT_MS: &str = "30000";
 
 /// The driver timeout the harness gives its children, in milliseconds.
-/// Honours an inherited `AERON_DRIVER_TIMEOUT` if one is already set.
+/// Honors an inherited `AERON_DRIVER_TIMEOUT`, if one is already set.
 pub fn driver_timeout_ms() -> String {
     std::env::var("AERON_DRIVER_TIMEOUT").unwrap_or_else(|_| DEFAULT_DRIVER_TIMEOUT_MS.to_string())
 }
 
-/// Environment every spawned Rust service shares. One place, so the services
-/// cannot drift apart on it.
+/// Environment variables every spawned Rust service shares. This is the
+/// one place for them, so the services cannot drift apart.
 fn common_service_env(cmd: &mut Command) {
     cmd.env("RUST_LOG", "info");
-    // Read natively by the Aeron C client in `aeron_context_init`; we never
-    // call `set_driver_timeout_ms`, so nothing overrides it.
+    // The Aeron C client reads this directly in `aeron_context_init`. This
+    // code never calls `set_driver_timeout_ms`, so nothing overrides it.
     cmd.env("AERON_DRIVER_TIMEOUT", driver_timeout_ms());
 }
 
 /// `target/<profile>` directory containing the prebuilt service binaries.
 pub fn bin_dir() -> Result<PathBuf> {
     let exe = std::env::current_exe().context("current_exe")?;
-    // target/<profile>/deps/<test-bin> → target/<profile>
+    // target/<profile>/deps/<test-bin> leads to target/<profile>
     let dir = exe
         .parent() // deps
         .and_then(|p| p.parent()) // <profile>
@@ -106,10 +110,11 @@ pub struct ServiceSpec<'a> {
     pub shards: u32,
     pub chain_id: u64,
     pub genesis: &'a Path,
-    /// `--log-config` for every service. `None` uses the built-in single-host
-    /// IPC defaults (the blessed local path). Set only for the
-    /// archive-durability variant, which needs `[aeron]` archive settings —
-    /// the `[channels]` defaults are inherited, so the topology is unchanged.
+    /// `--log-config` for every service. `None` uses the built-in
+    /// single-host IPC defaults, the accepted local path. Set this only
+    /// for the archive-durability variant, which needs `[aeron]` archive
+    /// settings. The `[channels]` defaults are inherited, so the topology
+    /// does not change.
     pub log_config: Option<&'a Path>,
 }
 
@@ -120,8 +125,8 @@ fn with_log_config(cmd: &mut Command, spec: &ServiceSpec<'_>) {
     }
 }
 
-/// L1 wiring for the bridge scenarios: the da-watcher needs the lockbox to
-/// watch, and the validator's attester needs the oracle + a key.
+/// L1 wiring for the bridge scenarios. The da-watcher needs the lockbox
+/// to watch, and the validator's attester needs the oracle and a key.
 #[derive(Clone)]
 pub struct L1Wiring {
     pub rpc_url: String,
@@ -130,9 +135,9 @@ pub struct L1Wiring {
     pub attester_key: String,
 }
 
-/// Spawn `kardamom-da-watcher` against the anvil L1. `--poll-interval-secs 1`
-/// (vs the 12 s production default) keeps deposit latency inside a test's
-/// patience.
+/// Spawn `kardamom-da-watcher` against the anvil L1.
+/// `--poll-interval-secs 1` (the production default is 12 s) keeps
+/// deposit latency inside a test's patience.
 pub fn spawn_da_watcher(spec: &ServiceSpec<'_>, l1: &L1Wiring) -> Result<Spawned> {
     let metrics_port = free_tcp_port()?;
     let mut cmd = Command::new(bin("kardamom-da-watcher")?);
@@ -205,10 +210,11 @@ pub fn spawn_executor(spec: &ServiceSpec<'_>) -> Result<Spawned> {
     spawn_executor_at(spec, None)
 }
 
-/// Spawn (or RESPAWN) the executor. `fixed_metrics_port` reuses a previous
-/// instance's port so a restarted executor keeps the address scenarios
-/// already hold — the crash-recovery scenario restarts it against the same
-/// state dir, which is what drives the resume-from-cursor path.
+/// Spawn the executor, or respawn it. `fixed_metrics_port` reuses a
+/// previous instance's port, so a restarted executor keeps the address
+/// scenarios already hold. The crash-recovery scenario restarts it
+/// against the same state directory, which drives the resume-from-cursor
+/// path.
 pub fn spawn_executor_at(
     spec: &ServiceSpec<'_>,
     fixed_metrics_port: Option<u16>,
@@ -241,16 +247,16 @@ pub fn spawn_executor_at(
         ])
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-exec"]);
-    // P1 footprint shadow: ON for every e2e executor. Measurement-only
-    // (execution stays sequential; the handoff never blocks), and running
-    // it here is what gives the shadow thread real multi-process pipeline
-    // coverage in CI — its per-block summary lines land in executor.log.
+    // The footprint shadow is on for every e2e executor. It only
+    // measures: execution stays sequential, and the handoff never blocks.
+    // Running it here gives the shadow thread real multi-process pipeline
+    // coverage in CI. Its per-block summary lines land in executor.log.
     cmd.env("KARDAMOM_FOOTPRINT_SHADOW", "1");
     with_log_config(&mut cmd, spec);
-    // Join-miss refetch: only meaningful alongside a log config that lists
-    // durability-archive endpoints (the archive-durability variant). Without
-    // it a restarted executor cannot obtain envelopes for canonical records
-    // replayed from before the crash, and aborts by design.
+    // Join-miss refetch only matters alongside a log config that lists
+    // durability-archive endpoints (the archive-durability variant).
+    // Without it, a restarted executor cannot get envelopes for canonical
+    // records replayed from before the crash, and aborts by design.
     if spec.log_config.is_some() {
         cmd.args([
             "--replay-destination-endpoint",
@@ -262,8 +268,8 @@ pub fn spawn_executor_at(
         ]);
     }
     common_service_env(&mut cmd);
-    // A respawn logs to its own file so the pre-crash log survives for
-    // post-mortem (Proc::spawn truncates).
+    // A respawn logs to its own file, so the pre-crash log survives for
+    // later inspection (`Proc::spawn` truncates its log file).
     let log = if fixed_metrics_port.is_some() {
         "executor-restarted.log"
     } else {
@@ -277,8 +283,8 @@ pub fn spawn_executor_at(
     })
 }
 
-/// Spawn `kardamom-validator` with its own state dir and the trie
-/// shadow-check at the given cadence (`Some(1)` = every block, the
+/// Spawn `kardamom-validator` with its own state directory, and the trie
+/// shadow-check at the given cadence (`Some(1)` checks every block, the
 /// semantics-suite default; the production cluster runs 8).
 pub fn spawn_validator(
     spec: &ServiceSpec<'_>,
@@ -313,19 +319,21 @@ pub fn spawn_validator(
     if let Some(n) = trie_shadow_check {
         cmd.args(["--trie-shadow-check", &n.to_string()]);
     }
-    // L1 output attestation: all three flags together or none (the binary
-    // rejects a partial set). `--attester-post-interval 1` posts an output
-    // per block so a withdrawal becomes finalizable promptly.
+    // L1 output attestation needs all three flags together, or none of
+    // them (the binary rejects a partial set). `--attester-post-interval
+    // 1` posts an output per block, so a withdrawal becomes finalizable
+    // promptly.
     if let Some(l1) = attester {
         cmd.args(["--l1-rpc-url", &l1.rpc_url])
             .args(["--output-oracle", &l1.oracle])
             .args(["--attester-key", &l1.attester_key])
             .args(["--attester-post-interval", "1"])
-            // With the RPC URL, this turns on epoch verification: every epoch
-            // is re-derived from L1 and a mismatch is a divergence. The whole
-            // L1-backed suite therefore runs WITH verification on, so an
-            // honest producer that quietly stopped matching L1 would surface
-            // as a failure in every bridge scenario, not just S11.
+            // With the RPC URL, this turns on epoch verification. Every
+            // epoch is re-derived from L1, and a mismatch counts as a
+            // divergence. So the whole L1-backed suite runs with
+            // verification on. An honest producer that quietly stopped
+            // matching L1 would then surface as a failure in every bridge
+            // scenario, not only the forged-epoch one.
             .args(["--lockbox", &l1.lockbox]);
     }
     common_service_env(&mut cmd);
@@ -382,10 +390,10 @@ pub fn spawn_ingress(spec: &ServiceSpec<'_>, opts: &IngressOptions) -> Result<Sp
         .args(["--metrics-addr", &format!("127.0.0.1:{metrics_port}")])
         .args(["--host-id", "e2e-ingress"]);
     with_log_config(&mut cmd, spec);
-    // The ingress is the tx_data RECORDER: with this flag every shard's
-    // publication is recorded into the shared archive, which is what makes a
-    // crashed consumer's join-miss refetch (and the fsync watermark that
-    // drives its resume cursor) possible at all.
+    // The ingress is the tx_data recorder. With this flag, the shared
+    // archive records every shard's publication. This is what makes a
+    // crashed consumer's join-miss refetch possible, along with the
+    // fsync watermark that drives its resume cursor.
     if spec.log_config.is_some() {
         cmd.arg("--archive-durability");
     }

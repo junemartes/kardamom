@@ -1,42 +1,44 @@
-//! Knob-style defaults shared by both binaries' clap setup.
+//! This module has the default values for both binaries' clap setup.
 //!
-//! Workload-shape config — mnemonic, contract bytecode, mix ratio — lives
-//! inside the individual `BenchWorkflow` implementations in
-//! `crate::workflows`. This module is now just constants.
+//! Workload-shape config, such as mnemonic, contract bytecode, and mix ratio,
+//! lives in the `BenchWorkflow` implementations in `crate::workflows`. This
+//! module holds only constants.
 
 use std::time::Duration;
 
-/// Default `--timeout` value used by the CLI when the user doesn't set
-/// one. Applied independently to the warmup and dispatch phases. Long
-/// enough to cover a meaningful measurement window without leaving the
-/// bench running unattended for minutes.
+/// Default `--timeout` value for the CLI, when the user sets no value.
+/// The CLI applies this to the warmup and dispatch phases on their own.
+/// It gives a useful measurement window without a long unattended run.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default number of sender tasks (= one signer per task).
+/// Default number of sender tasks. Each task uses one signer.
 pub const DEFAULT_CONCURRENCY: u32 = 16;
 
-/// Default number of pre-signed transactions queued per sender task.
+/// Default number of pre-signed transactions in the queue of each sender task.
 pub const DEFAULT_TXS_PER_TASK: u32 = 10_000;
 
-/// Default cap on outstanding requests across all senders. Applied at the
-/// HTTP client layer (`max_concurrent_requests = max_in_flight + MAX_IN_FLIGHT_SLACK`).
+/// Default limit on outstanding requests across all senders.
+/// The HTTP client layer applies this as
+/// `max_concurrent_requests = max_in_flight + MAX_IN_FLIGHT_SLACK`.
 pub const DEFAULT_MAX_IN_FLIGHT: u32 = 5;
 
-/// String form of [`DEFAULT_TIMEOUT`] for `clap`'s `default_value`
-/// (clap needs a `&str` that's then parsed by `humantime::parse_duration`).
+/// String form of [`DEFAULT_TIMEOUT`] for `clap`'s `default_value`.
+/// Clap needs a `&str` value. `humantime::parse_duration` then parses it.
 pub const DEFAULT_TIMEOUT_STR: &str = "10s";
 
-/// jsonrpsee client request timeout. Long enough that the slowest
-/// expected in-process call (a contended write-tx) doesn't trip it.
+/// Request timeout for the jsonrpsee client.
+/// This is long enough that the slowest expected in-process call, a
+/// contended write transaction, does not trip it.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Slack between `Benchmark.max_in_flight` (the user-facing knob) and
+/// Slack between `Benchmark.max_in_flight`, the user-facing setting, and
 /// the jsonrpsee client's `max_concurrent_requests`.
 ///
-/// The +N covers the preflight + post-dispatch RPCs that aren't counted
-/// against the bench budget.
+/// The extra value covers preflight and post-dispatch RPCs. The bench
+/// budget does not count these RPCs.
 pub const MAX_IN_FLIGHT_SLACK: usize = 16;
 
-/// `pprof` sampling frequency in Hz. 999 (not 1000) avoids resonance
-/// with kernel tick / scheduler quantum on most platforms.
+/// `pprof` sampling frequency in Hz.
+/// Use 999, not 1000, to avoid resonance with the kernel tick or
+/// scheduler quantum on most platforms.
 pub const PPROF_HZ: i32 = 999;

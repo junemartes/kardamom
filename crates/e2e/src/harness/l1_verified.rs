@@ -1,27 +1,27 @@
 //! A stand-in for the L1 light client: same JSON-RPC surface, in-process.
 //!
-//! The validator reads L1 through a *verified* endpoint (helios) rather than a
-//! blindly-trusted RPC — see issue #163 and
-//! `deploy/cluster/nomad/l1-light-client.nomad.hcl`. That real client cannot be
-//! exercised here: every kardamom test environment runs anvil as L1, and anvil
-//! is execution-only, so there is no beacon chain for a consensus light client
-//! to sync from.
+//! The validator reads L1 through a verified endpoint (helios), not a
+//! blindly trusted RPC (see
+//! `deploy/cluster/nomad/l1-light-client.nomad.hcl`). This test cannot
+//! exercise that real client: every kardamom test environment runs anvil
+//! as L1, and anvil is execution-only, so there is no beacon chain for a
+//! consensus light client to sync from.
 //!
-//! What CAN be tested is the half that is ours: the contract between the
-//! validator and whatever serves it L1 data. This mock speaks the same `eth_*`
-//! methods helios does — `eth_getBlockByNumber`, `eth_getLogs`,
-//! `eth_blockNumber` — proxying to anvil so the data is real, and can be told
-//! to LIE in specific ways.
+//! What this test can check is the half that is ours: the contract
+//! between the validator and whatever serves it L1 data. This mock speaks
+//! the same `eth_*` methods helios does (`eth_getBlockByNumber`,
+//! `eth_getLogs`, `eth_blockNumber`), proxying to anvil so the data is
+//! real. It can also be told to lie in specific ways.
 //!
-//! That second part is the point. A passthrough proves the validator works
-//! through an interposed endpoint at all; the fault modes prove it actually
-//! rejects a bad L1 view rather than trusting whatever arrives. Without them
-//! "the validator verifies against L1" is an untested claim.
+//! That second part is the point. A passthrough proves the validator
+//! works through an interposed endpoint at all. The fault modes prove it
+//! actually rejects a bad L1 view, instead of trusting whatever arrives.
+//! Without them, "the validator verifies against L1" is an untested claim.
 //!
-//! What this does NOT test: helios's cryptography — the sync-committee
-//! signature checks and Merkle proofs against the beacon-authenticated roots.
-//! That is exactly the part a mock cannot stand in for, and it needs a real
-//! network. Do not read a green run here as validating the light client.
+//! This does not test helios's cryptography: the sync-committee signature
+//! checks and the Merkle proofs against the beacon-authenticated roots. A
+//! mock cannot stand in for that part, which needs a real network. A
+//! green run here does not validate the light client.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,19 +33,21 @@ use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// How the mock should misbehave. Every variant is a lie a real endpoint could
-/// tell — the question each poses is "does the validator notice?".
+/// How the mock should misbehave. Every variant is a lie a real endpoint
+/// could tell. Each one asks: does the validator notice?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fault {
-    /// Serve L1 faithfully. The baseline: verification must still pass with an
-    /// endpoint interposed, or the fault cases prove nothing.
+    /// Serve L1 faithfully. This is the baseline: verification must still
+    /// pass with an endpoint interposed, or the fault cases prove
+    /// nothing.
     None,
-    /// Corrupt the `hash` of every block at or above `from_block`. The epoch on
-    /// the canonical stream then names a hash "L1" disagrees with.
+    /// Corrupt the `hash` of every block at or above `from_block`. The
+    /// epoch on the canonical stream then names a hash that "L1"
+    /// disagrees with.
     WrongBlockHash { from_block: u64 },
-    /// Corrupt only `parentHash`, leaving each block's own hash intact. Each
-    /// block still looks right in isolation — only CHAINING consecutive
-    /// origins catches it, which is the whole reason the verifier does.
+    /// Corrupt only `parentHash`, and leave each block's own hash intact.
+    /// Each block still looks right on its own. Only chaining consecutive
+    /// origins catches this, which is the reason the verifier does it.
     BrokenParentChain { from_block: u64 },
     /// Drop every deposit log. The censorship case, seen from the L1 side.
     SwallowLogs,
@@ -55,8 +57,8 @@ pub enum Fault {
 pub struct VerifiedL1 {
     addr: SocketAddr,
     fault: Arc<std::sync::Mutex<Fault>>,
-    /// Requests served, so a test can prove the validator actually went
-    /// through here rather than reaching anvil directly.
+    /// Requests served. This lets a test prove the validator actually
+    /// went through here, instead of reaching anvil directly.
     served: Arc<AtomicU64>,
     _task: tokio::task::JoinHandle<()>,
 }
@@ -86,12 +88,12 @@ impl VerifiedL1 {
                     let fault = fault.clone();
                     let served = served.clone();
                     tokio::spawn(async move {
-                        // One request per connection is enough for a mock;
-                        // alloy opens as many as it needs.
+                        // One request per connection is enough for a mock.
+                        // alloy opens as many connections as it needs.
                         if let Ok(Some(body)) = read_http_request(&mut sock).await {
-                            // Copy the fault out BEFORE awaiting: holding a
-                            // std MutexGuard across an await makes the future
-                            // non-Send.
+                            // Copy the fault out before awaiting. Holding a
+                            // std MutexGuard across an await would make the
+                            // future non-Send.
                             let active = *fault.lock().unwrap();
                             let reply = handle(&client, &body, active).await;
                             served.fetch_add(1, Ordering::Relaxed);
@@ -181,15 +183,15 @@ async fn handle(client: &HttpClient, body: &[u8], fault: Fault) -> serde_json::V
         .cloned()
         .unwrap_or(serde_json::Value::Array(vec![]));
 
-    // Params travel through as raw JSON: the mock is a pipe, not a parser.
+    // Params travel through as raw JSON. The mock is a pipe, not a parser.
     let params = match params {
         serde_json::Value::Array(a) => a,
         other => vec![other],
     };
     let mut rpc_args = jsonrpsee::core::params::ArrayParams::new();
     for p in &params {
-        // insert() only fails on non-serializable input; these are already
-        // serde_json::Value, so it cannot.
+        // insert() fails only on input that cannot serialize. These values
+        // are already serde_json::Value, so it cannot fail here.
         let _ = rpc_args.insert(p);
     }
     let upstream: Result<serde_json::Value, _> = client.request(method, rpc_args).await;
@@ -224,8 +226,8 @@ fn apply_fault(
             if method == "eth_getBlockByNumber"
                 && block_at_or_after(params, result, from_block) =>
         {
-            // The block's OWN hash stays correct — only its ancestry is a lie,
-            // so nothing but chaining can see it.
+            // The block's own hash stays correct. Only its ancestry is a
+            // lie, so only chaining can see it.
             result["parentHash"] = serde_json::json!(format!("0x{}", "ab".repeat(32)));
         }
         _ => {}
@@ -257,9 +259,10 @@ fn rpc_error(id: serde_json::Value, msg: &str) -> serde_json::Value {
 mod tests {
     use super::*;
 
-    /// The mock must actually corrupt what it proxies. Without this, a green
-    /// fault-injection scenario proves only that nothing broke — the exact
-    /// failure mode where a drill silently stops drilling.
+    /// The mock must actually corrupt what it proxies. Without this check,
+    /// a green fault-injection scenario would only prove that nothing
+    /// broke. That is the exact failure mode where a drill silently stops
+    /// drilling.
     #[tokio::test]
     async fn faults_actually_mutate_the_proxied_reply() {
         let block = serde_json::json!({
@@ -284,7 +287,7 @@ mod tests {
             "hash must be corrupted at the threshold"
         );
 
-        // Below the threshold nothing changes — that is what lets a test arm a
+        // Below the threshold, nothing changes. This lets a test arm a
         // fault without invalidating epochs already verified.
         let mut r = block.clone();
         apply_fault(

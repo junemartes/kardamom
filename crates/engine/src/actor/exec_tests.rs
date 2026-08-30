@@ -1,5 +1,5 @@
-//! Exec-thread tests: streaming execution, boundary emission, BAL capture,
-//! and the boundary-alignment fail-stop.
+//! Exec-thread tests. These cover streaming execution, boundary emission,
+//! BAL capture, and the boundary-alignment fail-stop.
 
 use std::sync::{Arc, Mutex};
 
@@ -46,8 +46,8 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
         })
         .unwrap();
     tx_r2e
-        // Two canonical records applied ⇒ cumulative count 2. end_tx_idx
-        // encodes that count (pos(2) == BPosition::from_index(2)).
+        // Two canonical records apply here, so the cumulative count is 2.
+        // end_tx_idx encodes that count (pos(2) == BPosition::from_index(2)).
         .send(ReaderToExec::Boundary(BlockBoundaryStart {
             block_number: 1,
             end_tx_idx: pos(2),
@@ -80,26 +80,26 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
     assert_eq!(boundary.block_number, 1);
     assert_eq!(boundary.end_tx_idx, pos(2));
     assert_eq!(boundary.l2_timestamp, 1_700_000_000);
-    // The recipient received 150 total across both transfers — verify
-    // by iterating the canonical Vec<AccountChange> the wire form holds.
+    // The recipient gets 150 total from both transfers. Verify this by
+    // iterating the canonical Vec<AccountChange> that the wire form holds.
     let to_acc = delta
         .accounts
         .iter()
         .find(|a| a.address == to)
         .expect("recipient");
     assert_eq!(to_acc.balance, U256::from(150u64));
-    // #109: the block's receipts ride inside the BlockDelta, in arrival
-    // order, so the writer persists them (receipts + tx_hash_index) and
-    // eth_getTransactionReceipt answers from durable state post-restart.
+    // The block's receipts travel inside the BlockDelta, in arrival order.
+    // The writer persists them (receipts and tx_hash_index). This lets
+    // eth_getTransactionReceipt answer from durable state after a restart.
     assert_eq!(delta.receipts.len(), 2, "both txs' receipts persisted");
     assert!(delta.receipts.iter().all(|r| r.block_number == 1));
     assert_eq!(delta.receipts[0].nonce, 0);
     assert_eq!(delta.receipts[1].nonce, 1);
-    // S0 regression guard: destructure to enforce the shape of
-    // BlockBoundary at compile time — specifically that NO state-root
-    // commitment sneaks in. `l1_origin` is a deliberate addition (the L1
-    // epoch this block belongs to); a new field appearing here without a
-    // spec behind it is the thing this guard is watching for.
+    // This destructure is a regression guard. It forces the
+    // compiler to check the shape of BlockBoundary, confirming no
+    // state-root commitment field sneaks in. `l1_origin` is a deliberate
+    // field: the L1 epoch this block belongs to. The guard also catches
+    // any new field added without a spec behind it.
     let BlockBoundary {
         block_number: _,
         end_tx_idx: _,
@@ -108,21 +108,18 @@ fn exec_runs_two_txs_and_emits_slim_boundary() {
     } = boundary;
 }
 
-/// End-to-end through the ACTOR: with a BAL channel attached, the
-/// handoff at each boundary must carry a POPULATED Bal. Live phase-1
-/// measurement produced 1-byte (empty) BALs while deltas were 76KB —
-/// direct `execute_tx` tests passed, so the gap is in this wiring.
-/// Scope-cache visibility across record kinds: a DEPOSIT credits an
-/// account mid-block; a LATER TX in the same block spends that credit.
-/// The deposit runs outside the ExecScope (own commit semantics), so
-/// its writes are folded into the scope cache explicitly — this test
-/// pins that fold. Without it the spend is an insufficient-funds skip.
+/// This test checks scope-cache visibility across record kinds. A
+/// deposit credits an account mid-block. A later transaction in the same
+/// block spends that credit. The deposit runs outside the ExecScope, with
+/// its own commit semantics, so its writes must fold into the scope cache
+/// explicitly. Without this fold, the spend fails as an
+/// insufficient-funds skip.
 #[test]
 fn deposit_credit_is_visible_to_later_txs_in_the_block() {
     let signer = PrivateKeySigner::random();
     let from = signer.address();
     let to = address!("00000000000000000000000000000000000BEEF0");
-    // The sender does NOT exist pre-block: only the deposit funds it.
+    // The sender does not exist before the block. Only the deposit funds it.
     let snap = MockStateDatabase::builder().build();
     let writer_log = Arc::new(Mutex::new(Vec::new()));
 
@@ -177,8 +174,8 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
     );
     h.join().expect("no panic").expect("exec ok");
 
-    // The transfer must have EXECUTED (status true), not skipped for
-    // missing funds: the deposit's credit reached the scope cache.
+    // The transfer must execute (status true), not skip for missing funds.
+    // This shows the deposit's credit reached the scope cache.
     let mut saw_transfer_success = false;
     while let Ok(msg) = rx_e2c.try_recv() {
         if let ExecToCommit::Receipt(r) = msg
@@ -195,6 +192,11 @@ fn deposit_credit_is_visible_to_later_txs_in_the_block() {
     assert!(saw_transfer_success, "transfer receipt not observed");
 }
 
+/// This test goes through the actor. With a BAL channel attached, the
+/// handoff at each boundary must carry a populated Bal. Direct
+/// `execute_tx` tests pass, but early measurement showed empty BALs
+/// despite large deltas, so the gap is in this wiring, not the execution
+/// logic.
 #[test]
 fn exec_handoff_carries_a_populated_bal() {
     let signer = PrivateKeySigner::random();
@@ -269,8 +271,8 @@ fn exec_rejects_misaligned_boundary() {
             position: pos(0),
         })
         .unwrap();
-    // Boundary claims 5 canonical records (pos(5) == from_index(5)) but we
-    // only applied 1 ⇒ count mismatch ⇒ BoundaryMisaligned.
+    // The boundary claims 5 canonical records (pos(5) == from_index(5)),
+    // but we applied only 1. This count mismatch causes BoundaryMisaligned.
     tx_r2e
         .send(ReaderToExec::Boundary(BlockBoundaryStart {
             block_number: 1,
@@ -309,11 +311,11 @@ fn exec_rejects_misaligned_boundary() {
     assert!(matches!(res, Err(ExecutorError::BoundaryMisaligned { .. })));
 }
 
-/// P1 footprint shadow: with `shadow_tx` wired, each non-empty block
-/// hands its per-tx captures (envelope + gas + read/write cells) to the
-/// shadow channel at the boundary — and the handed-off block survives a
-/// full `process_block` pass (grade + train) without touching execution
-/// outputs.
+/// This test checks the footprint shadow path. With `shadow_tx` wired,
+/// each non-empty block hands its per-transaction captures (envelope,
+/// gas, and read/write cells) to the shadow channel at the boundary. The
+/// handed-off block must survive a full `process_block` pass (grade and
+/// train) without changing execution outputs.
 #[test]
 fn exec_hands_off_shadow_captures_at_boundary() {
     let signer = PrivateKeySigner::random();
@@ -370,8 +372,8 @@ fn exec_hands_off_shadow_captures_at_boundary() {
     assert_eq!(blk.captures.len(), 2);
     for (i, c) in blk.captures.iter().enumerate() {
         assert_eq!(c.envelope.sender, from);
-        // A value transfer writes both account tuples; zero gas price
-        // keeps the fee sink out (gas_price = 0 in `legacy`).
+        // A value transfer writes both account tuples. Zero gas price
+        // keeps the fee sink out (`legacy` sets gas_price = 0).
         assert!(
             c.write_cells
                 .contains(&kardamom_footprint::Cell::Account(from))
@@ -385,8 +387,8 @@ fn exec_hands_off_shadow_captures_at_boundary() {
     }
     assert!(srx.try_recv().is_err(), "exactly one block");
 
-    // The handed-off shape feeds the grading path end-to-end: native
-    // transfers are tier-1 (never cold) and same-sender => one chain.
+    // The handed-off shape feeds the grading path end-to-end. Native
+    // transfers are tier-1 (never cold); the same sender gives one chain.
     let mut stats = kardamom_footprint::classifier::Stats::default();
     let mut exclude = std::collections::HashSet::new();
     exclude.insert(kardamom_footprint::Cell::Account(crate::shadow::FEE_SINK));
@@ -411,9 +413,9 @@ fn beacon_in(delta: &kardamom_types::BlockDelta) -> Option<(u64, u64, u64)> {
         .map(|s| unpack_beacon(s.value))
 }
 
-/// Two empty blocks, flag never scheduled: the chain must be byte-identical to
-/// one built without the feature existing. This is the property that lets the
-/// code ship dormant on a live chain.
+/// Two empty blocks, with the flag never scheduled. The chain must be
+/// byte-identical to one built without the feature. This property lets
+/// the code ship dormant on a live chain.
 #[test]
 fn a_dormant_feature_writes_nothing_at_block_close() {
     let writer_log = Arc::new(Mutex::new(Vec::new()));
@@ -460,8 +462,8 @@ fn a_dormant_feature_writes_nothing_at_block_close() {
     }
 }
 
-/// With the flag active, EVERY block records a beacon — the beat counter
-/// increments across blocks and each beacon carries that block's own number
+/// With the flag active, every block records a beacon. The beat counter
+/// increments across blocks. Each beacon carries its own block's number
 /// and header timestamp.
 #[test]
 fn an_active_feature_beats_once_per_block() {
@@ -524,10 +526,10 @@ fn an_active_feature_beats_once_per_block() {
     }
 }
 
-/// The beacon must be timed off the block's OWN header stamp, not the
-/// (previous boundary's) stamp its transactions executed with. A feature
-/// scheduled between two boundaries must therefore fire in the first block
-/// whose header reaches it.
+/// The beacon must use the block's own header timestamp, not the previous
+/// boundary's timestamp used to execute its transactions. So a feature
+/// scheduled between two boundaries fires in the first block whose header
+/// reaches it.
 #[test]
 fn activation_is_judged_against_the_blocks_own_header_timestamp() {
     let writer_log = Arc::new(Mutex::new(Vec::new()));
@@ -543,8 +545,8 @@ fn activation_is_judged_against_the_blocks_own_header_timestamp() {
         )
         .build();
 
-    // Headers straddle the activation time: 4_999 (before), 5_000 (exactly at
-    // it — inclusive, so it fires), 5_001 (after).
+    // Headers straddle the activation time: 4_999 (before), 5_000 (at
+    // activation, inclusive, so it fires), and 5_001 (after).
     for (block_number, ts) in [(1u64, 4_999u64), (2, 5_000), (3, 5_001)] {
         tx_r2e
             .send(ReaderToExec::Boundary(BlockBoundaryStart {

@@ -1,24 +1,30 @@
 //! TxOrdering wire message: the canonical-orderer payload in the split
 //! architecture.
 //!
-//! TxOrdering carries only three things, all small:
-//!   1. [`TxRef`] — a pointer into the per-sequencer tx_data archive,
-//!      written by sequencers via Aeron *concurrent* multi-publisher.
-//!   2. [`DepositRef`] — a pointer into the `tx_deposits` archive, also
-//!      written by sequencers in response to deposit messages observed on
-//!      `tx_deposits`. Carries the canonical ordering of L1 deposits
-//!      interleaved with regular L2 txs.
-//!   3. [`BlockBoundaryStart`] — block-boundary marker written by the sealer
-//!      (also concurrent multi-publisher on the same stream so the boundary
-//!      is canonically ordered with the surrounding refs).
+//! TxOrdering carries these reference records, all small:
+//!   1. [`TxRef`] — a pointer into the per-sequencer tx_data archive.
+//!      Sequencers write it using Aeron's concurrent multi-publisher.
+//!   2. [`DepositRef`] — a pointer into the `tx_deposits` archive. Sequencers
+//!      also write it, in response to deposit messages seen on
+//!      `tx_deposits`. It carries the canonical order of L1 deposits,
+//!      interleaved with regular L2 transactions.
+//!   3. [`BlockBoundaryStart`] — a block-boundary marker written by the
+//!      sealer. The sealer also uses concurrent multi-publisher on the same
+//!      stream, so the boundary is canonically ordered with the surrounding
+//!      references.
 //!
-//! All three variants are tiny (~16-36 B), so the tx_ordering CAS cursor sees
-//! only reference traffic; the bulk-data path runs on M parallel exclusive
-//! channel A archives plus the deposits archive.
+//! A fourth variant, [`TxOrderingMessage::Epoch`], also travels on this
+//! stream. Unlike the three above it is not a small reference: it carries
+//! an epoch's deposits by value. See its own doc for why.
 //!
-//! Encoded as a 1-byte tag prefix followed by the rkyv archive of the variant.
-//! We keep the tag *outside* the rkyv archive so that a reader can branch
-//! cheaply on the first byte before paying the validation cost.
+//! The three reference variants above are tiny, about 16 to 36 bytes. So
+//! the tx_ordering CAS cursor sees mostly reference traffic. The bulk-data
+//! path runs on M parallel exclusive channel A archives, plus the deposits
+//! archive.
+//!
+//! This is encoded as a 1-byte tag prefix, followed by the rkyv archive of
+//! the variant. The tag stays outside the rkyv archive, so a reader can
+//! branch cheaply on the first byte before it pays the validation cost.
 
 use rkyv::{Archive, Deserialize, Serialize};
 
@@ -27,8 +33,8 @@ use crate::deposit::DepositRef;
 use crate::epoch::EpochRecord;
 use crate::txref::TxRef;
 
-/// One tx_ordering wire record. Variants are kept narrow to preserve the
-/// "tiny payload" property that makes tx_ordering's concurrent publication
+/// One tx_ordering wire record. Variants stay narrow. This keeps the "tiny
+/// payload" property that makes tx_ordering's concurrent publication
 /// affordable.
 #[derive(Clone, Debug, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
@@ -39,39 +45,38 @@ pub enum TxOrderingMessage {
     DepositRef(DepositRef),
     /// A block-boundary marker emitted by the sealer.
     BoundaryStart(BlockBoundaryStart),
-    /// An L1 epoch: its origin plus that L1 block's deposits, in log order.
+    /// An L1 epoch: its origin, plus that L1 block's deposits, in log order.
     ///
-    /// Ordered like any other record, but the sealer treats the carrying
-    /// frame as origin-advancing — it closes the current block first, so an
-    /// epoch's deposits always LEAD a block, and stamps its `l1_number` into
-    /// every subsequent boundary. See
+    /// This record is ordered like any other. But the sealer treats its
+    /// frame as origin-advancing: it closes the current block first, so an
+    /// epoch's deposits always lead a block. The sealer then stamps the
+    /// epoch's `l1_number` into every following boundary. See
     /// `docs/agents/l1-origin-deposit-derivation-spec.md`.
     Epoch(EpochRecord),
 }
 
 impl TxOrderingMessage {
-    /// Whether this record is a tx ref (vs. a sealer-emitted boundary or a
-    /// deposit ref).
+    /// Returns true if this record is a transaction reference.
     pub const fn is_tx_ref(&self) -> bool {
         matches!(self, Self::TxRef(_))
     }
 
-    /// Whether this record is a deposit ref.
+    /// Returns true if this record is a deposit reference.
     pub const fn is_deposit_ref(&self) -> bool {
         matches!(self, Self::DepositRef(_))
     }
 
-    /// Whether this record is a block-boundary marker.
+    /// Returns true if this record is a block-boundary marker.
     pub const fn is_boundary(&self) -> bool {
         matches!(self, Self::BoundaryStart(_))
     }
 
-    /// Whether this record is an L1 epoch.
+    /// Returns true if this record is an L1 epoch.
     pub const fn is_epoch(&self) -> bool {
         matches!(self, Self::Epoch(_))
     }
 
-    /// If this record is a tx ref, return the contained `TxRef`.
+    /// Returns the contained `TxRef` if this record is a transaction reference.
     pub const fn as_tx_ref(&self) -> Option<&TxRef> {
         match self {
             Self::TxRef(r) => Some(r),
@@ -79,7 +84,7 @@ impl TxOrderingMessage {
         }
     }
 
-    /// If this record is a deposit ref, return the contained `DepositRef`.
+    /// Returns the contained `DepositRef` if this record is a deposit reference.
     pub const fn as_deposit_ref(&self) -> Option<&DepositRef> {
         match self {
             Self::DepositRef(d) => Some(d),
@@ -87,7 +92,7 @@ impl TxOrderingMessage {
         }
     }
 
-    /// If this record is an epoch, return it.
+    /// Returns this record's `EpochRecord` if it is an epoch.
     pub const fn as_epoch(&self) -> Option<&EpochRecord> {
         match self {
             Self::Epoch(e) => Some(e),
@@ -95,7 +100,7 @@ impl TxOrderingMessage {
         }
     }
 
-    /// If this record is a boundary marker, return it.
+    /// Returns this record's `BlockBoundaryStart` if it is a boundary marker.
     pub const fn as_boundary(&self) -> Option<&BlockBoundaryStart> {
         match self {
             Self::BoundaryStart(b) => Some(b),

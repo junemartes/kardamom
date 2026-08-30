@@ -1,20 +1,21 @@
 //! Kardamom `no_std` execution core.
 //!
-//! The pure state-transition slice of the engine: per-tx revm execution
-//! ([`executor`]), write-set / delta accumulation ([`delta`]), deterministic
-//! block env construction ([`block_env`]), BAL quantization ([`bal_ladder`]),
-//! and the shared error type ([`error`]). Everything here is a pure function
-//! of `(state snapshot, canonical input)` — no I/O, no Aeron, no libmdbx, no
-//! clocks, no entropy — so a zk-guest build can link the exact code the live
-//! executor and validator run.
+//! This is the pure state-transition part of the engine. It has per-tx revm
+//! execution ([`executor`]), write-set and delta accumulation ([`delta`]),
+//! deterministic block env construction ([`block_env`]), BAL quantization
+//! ([`bal_ladder`]), and the shared error type ([`error`]). Every function
+//! here depends only on the state snapshot and the canonical input. There is
+//! no I/O, no Aeron, no libmdbx, no clock, and no entropy. This lets a
+//! zk-guest build link the exact code that the live executor and validator
+//! run.
 //!
-//! `kardamom-engine` re-exports these modules; engine consumers keep their
+//! `kardamom-engine` re-exports these modules. Engine consumers keep their
 //! `kardamom_engine::executor::…` paths. Guest builds depend on this crate
-//! directly with `default-features = false`.
+//! directly, with `default-features = false`.
 //!
-//! The `std` feature (default) adds the operational side-channels — the
-//! tracing/metrics emission on the invalid-tx skip path and the [`state`]
-//! mock fixtures. Execution SEMANTICS are identical with and without.
+//! The `std` feature (default) adds operational side channels: tracing and
+//! metrics on the invalid-tx skip path, and the [`state`] mock fixtures.
+//! Execution semantics are the same with or without this feature.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 

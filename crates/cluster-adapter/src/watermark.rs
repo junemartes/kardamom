@@ -1,13 +1,13 @@
-//! `ClusterWatermark` — the durable position ingress's `on-quorum` ack gate
-//! consumes, derived from cluster egress progress.
+//! `ClusterWatermark`: the durable position that the ingress's on-quorum ack
+//! gate consumes. It comes from cluster egress progress.
 //!
-//! A record only reaches egress after the leader's replicated state machine
-//! processed it, which only happens once it is **committed by a Raft quorum**.
-//! So observing a relayed record (or a boundary) on egress is a
-//! quorum-durability signal: the durable canonical count is monotonically the
-//! highest we have seen. This replaces the standalone sealer's
-//! archive-recording-position watermark; the message it feeds ingress is
-//! unchanged (a monotonic count).
+//! A record reaches egress only after the leader's replicated state machine
+//! processes it. This only happens once a Raft quorum commits the record. So
+//! a relayed record (or a boundary) on egress is a quorum-durability signal:
+//! the durable canonical count is the highest value seen so far. This
+//! replaces the old standalone sealer's archive-recording-position
+//! watermark. The message it sends to ingress is unchanged: a monotonic
+//! count.
 
 /// Monotonic durable-count watermark.
 #[derive(Debug, Clone, Default)]

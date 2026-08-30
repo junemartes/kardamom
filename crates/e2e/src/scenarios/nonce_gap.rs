@@ -1,22 +1,24 @@
-//! S4 — `nonce_gap_is_never_processed`.
+//! `nonce_gap_is_never_processed`.
 //!
-//! The nonce-gap contract, observed end to end:
+//! The nonce-gap contract, checked end to end:
 //!
-//! 1. A gap parks its successors, it never executes them: nonces {0,1,2}
-//!    land; {4,5} (gap at 3) park server-side and fail with the documented
-//!    `-32000` timeout — bounded, no hang, and the executor's applied
-//!    counter proves 4/5 were never run.
+//! 1. A gap parks its later transactions and never executes them. Nonces
+//!    {0,1,2} land. Nonces {4,5} (the gap is at 3) park on the server and
+//!    fail with the documented `-32000` timeout. The wait has a bound, the
+//!    server does not hang, and the executor's applied counter proves that
+//!    4 and 5 never ran.
 //! 2. Gap isolation: while one sender is gapped, other senders keep landing
-//!    transactions at normal latency (the post-#87 no-wedge property).
-//! 3. Late fill: submitting nonce 3 drains the sequencer-buffered {4,5} —
-//!    receipts appear for all three, and resubmitting the timed-out raws
-//!    returns instantly from the receipt cache with the same hashes.
-//! 4. Disorder variant: a fresh sender submitting {5,3,1,0,2,4} staggered in
-//!    that wire order lands all six (reorder window, no gap involved).
+//!    transactions at normal latency (the no-wedge property).
+//! 3. Late fill: submitting nonce 3 drains the sequencer-buffered {4,5}.
+//!    Receipts appear for all three, and resubmitting the timed-out raw
+//!    transactions returns instantly from the receipt cache with the same
+//!    hashes.
+//! 4. Disorder variant: a fresh sender submits {5,3,1,0,2,4} in that wire
+//!    order, staggered, and all six land (a reorder window, with no gap).
 //!
-//! Run this scenario on a stack with a SHORT pending-receipt timeout (the
-//! Target-L default of 30 s would stretch step 1 pointlessly) and a client
-//! timeout comfortably above it.
+//! Run this scenario on a stack with a short pending-receipt timeout. The
+//! Target-L default of 30 s would stretch step 1 with no benefit. Use a
+//! client timeout well above the server timeout.
 
 use std::time::Duration;
 
@@ -80,7 +82,7 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         parked.spawn(async move { (tx.nonce, rpc.send_raw(&tx.raw).await) });
     }
 
-    // --- Step 2: gap isolation — a bystander lands txs while {4,5} park. ----
+    // --- Step 2: gap isolation. A bystander lands txs while {4,5} park. ----
     let bystander = &signers[p.bystander];
     for n in 0..3u64 {
         let tx = l2::sign_transfer(bystander, t.chain_id, n, to, 1)?;
@@ -95,8 +97,8 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     }
 
     // --- Step 1c: the parked pair times out with -32000, bounded. -----------
-    // Lower bound uses a wide margin (park/2) purely to prove the error came
-    // from the server-side park, not an eager local rejection.
+    // The lower bound uses a wide margin (park/2). This only proves that the
+    // error came from the server park, not from an eager local rejection.
     while let Some(j) = parked.join_next().await {
         let (nonce, out) = j.context("parked join")?;
         match out.result {
@@ -141,8 +143,8 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     let out = t.rpc.send_raw(&tx3.raw).await;
     out.result
         .map_err(|e| anyhow::anyhow!("late fill nonce 3 failed: {e}"))?;
-    // 4 and 5 executed as part of the drained run: their receipts appear
-    // without resubmission…
+    // The pipeline executed 4 and 5 as part of the drained run. Their
+    // receipts appear with no resubmission.
     poll_until(
         "drained gap receipts (4,5)",
         Duration::from_secs(10),
@@ -155,8 +157,8 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
     )
     .await
     .context("nonces 4/5 must execute once the gap fills")?;
-    // …and an idempotent resubmit of the original raws returns immediately
-    // from the receipt cache with the same hashes.
+    // An idempotent resubmit of the original raw transactions returns
+    // immediately from the receipt cache, with the same hashes.
     for tx in [&tx4, &tx5] {
         let out = t.rpc.send_raw(&tx.raw).await;
         let h = out
@@ -174,7 +176,7 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         .await
         .context("all six gapped-sender txs + three bystander txs applied")?;
 
-    // --- Step 4: disorder variant — {5,3,1,0,2,4} in that wire order. --------
+    // --- Step 4: disorder variant: {5,3,1,0,2,4} in that wire order. --------
     let disorder = &signers[p.disorder];
     let order = [5u64, 3, 1, 0, 2, 4];
     let mut set = tokio::task::JoinSet::new();
@@ -182,8 +184,9 @@ pub async fn run(t: &Target, p: Params) -> Result<()> {
         let tx = l2::sign_transfer(disorder, t.chain_id, n, to, 1)?;
         let rpc = t.rpc.clone();
         set.spawn(async move { (n, rpc.send_raw(&tx.raw).await) });
-        // Stagger so wire arrival order roughly follows the scripted order
-        // (submission is concurrent; the pipeline must not care either way).
+        // Stagger submissions so the wire arrival order roughly follows the
+        // planned order. Submission is concurrent, and the pipeline must
+        // not care about the order either way.
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     while let Some(j) = set.join_next().await {

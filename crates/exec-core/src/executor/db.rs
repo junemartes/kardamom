@@ -1,7 +1,7 @@
-//! Snapshot-backed `revm::DatabaseRef` adapters and the shared
-//! view-composition primitive ([`seed_cache_layer`]) that both the tx path
+//! Snapshot-backed `revm::DatabaseRef` adapters, and the shared
+//! view-composition primitive ([`seed_cache_layer`]). Both the tx path
 //! ([`super::ExecScope`]) and the deposit path
-//! ([`super::execute_deposit_tx`]) layer on.
+//! ([`super::execute_deposit_tx`]) build on this.
 
 use alloy_primitives::Bytes as AlloyBytes;
 use alloy_primitives::{Address, B256, U256};
@@ -15,15 +15,17 @@ use alloc::string::{String, ToString};
 
 use crate::delta::PendingDelta;
 
-/// `revm::DatabaseRef` adapter for a `StateDatabase` snapshot. Reads only —
-/// writes go through revm's per-tx state journal returned by `transact`.
+/// A `revm::DatabaseRef` adapter for a `StateDatabase` snapshot. This is
+/// read-only. Writes go through revm's per-tx state journal, returned by
+/// `transact`.
 pub struct SnapshotRef<'a, S: StateDatabase> {
     pub inner: &'a S,
 }
 
-/// Owned variant of [`SnapshotRef`]: [`super::ExecScope`] must be storable
-/// across the actor's loop iterations, so it owns its snapshot (`S` can
-/// still be a `&T` via the blanket `StateDatabase for &T` impl).
+/// An owned variant of [`SnapshotRef`]. [`super::ExecScope`] must be
+/// storable across the actor's loop iterations, so it owns its snapshot.
+/// (`S` can still be a `&T`, through the blanket `StateDatabase for &T`
+/// impl.)
 pub struct SnapshotDb<S: StateDatabase> {
     pub inner: S,
 }
@@ -56,18 +58,18 @@ impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
         Ok(a.map(|(nonce, balance, code_hash)| AccountInfo {
             balance,
             nonce,
-            // Genesis-seeded EOAs carry `code_hash = B256::ZERO` in the state
-            // DB, and revm's CacheDB normalizes zero code hashes to
+            // Genesis-seeded EOAs carry `code_hash = B256::ZERO` in the
+            // state DB. Revm's CacheDB normalizes zero code hashes to
             // KECCAK_EMPTY when accounts pass through an execution scope
-            // (`CacheDB::insert_contract`). Without normalizing HERE too, the
-            // code_hash an account's write set carries depends on WHERE it was
-            // read from — the mdbx snapshot (fresh scope ⇒ ZERO) vs the
-            // intra-scope commit cache (⇒ KECCAK_EMPTY). The executor batches
-            // per block and the validator per BAL chunk, so a fresh account's
-            // first two txs straddling a validator batch boundary while
-            // sharing an executor block produced a wsh-only receipt
-            // "divergence" and a validator fail-stop (#159). Two spellings of
-            // "no code" must hash identically.
+            // (`CacheDB::insert_contract`). Without normalizing here too,
+            // the code_hash an account's write set carries would depend on
+            // where it was read from: the mdbx snapshot gives ZERO, but the
+            // intra-scope commit cache gives KECCAK_EMPTY. The executor
+            // batches per block, and the validator batches per BAL chunk.
+            // So a fresh account touched by two txs that straddle a
+            // validator batch boundary, but share an executor block, could
+            // produce a false receipt divergence and a validator
+            // fail-stop. Both spellings of "no code" must hash the same.
             code_hash: if code_hash == B256::ZERO {
                 KECCAK_EMPTY
             } else {
@@ -93,9 +95,9 @@ impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
     }
 
     fn storage_ref(&self, address: Address, index: U256) -> Result<U256, Self::Error> {
-        // kardamom-types' StateDatabase::storage takes a B256 key; revm uses
-        // U256. The two are isomorphic — U256 is a 32-byte big-endian integer
-        // and B256 is a 32-byte buffer.
+        // kardamom-types' StateDatabase::storage takes a B256 key. Revm
+        // uses U256. The two are equivalent: U256 is a 32-byte big-endian
+        // integer, and B256 is a 32-byte buffer.
         let key = B256::from(index.to_be_bytes::<32>());
         self.inner
             .storage(address, key)
@@ -103,35 +105,36 @@ impl<S: StateDatabase> DatabaseRef for SnapshotRef<'_, S> {
     }
 
     fn block_hash_ref(&self, _number: u64) -> Result<B256, Self::Error> {
-        // CONSENSUS RULE (v0, pinned by phase 3): BLOCKHASH returns the zero
-        // hash for EVERY height. The kardamom-types StateDatabase trait
-        // exposes no block_hash and no ancestor cache exists; every execution
-        // profile — live executor, validator re-exec, stateless guest — flows
-        // through this one adapter, so the rule holds uniformly and a proof
-        // replays it exactly. Introducing a real ancestor chain is a
-        // deliberate consensus change (new spec + coordinated release), not
-        // a wiring fix.
+        // Consensus rule (version 0, pinned by phase 3): BLOCKHASH returns
+        // the zero hash for every height. The kardamom-types StateDatabase
+        // trait exposes no block_hash, and there is no ancestor cache.
+        // Every execution profile (live executor, validator re-exec,
+        // stateless guest) flows through this one adapter, so the rule
+        // holds uniformly and a proof replays it exactly. Adding a real
+        // ancestor chain is a deliberate consensus change (a new spec and
+        // a coordinated release), not a wiring fix.
         Ok(B256::ZERO)
     }
 }
 
-/// Concrete error type for `SnapshotRef`. We collapse the `StateDatabase`
-/// associated error into a string so the `revm::Database` blanket impl can
-/// see a single concrete type.
+/// Concrete error type for `SnapshotRef`. This collapses the
+/// `StateDatabase` associated error into a string, so the
+/// `revm::Database` blanket impl sees a single concrete type.
 #[derive(Debug, thiserror::Error)]
 #[error("snapshot ref error: {0}")]
 pub struct StateRefError(pub String);
 
 impl revm::database_interface::DBErrorMarker for StateRefError {}
 
-/// Seed one delta layer into a block cache — later inserts overwrite, so
-/// seeding parent-then-delta composes the `snapshot ∘ parent ∘ delta` view.
+/// Seed one delta layer into a block cache. Later inserts overwrite
+/// earlier ones, so seeding parent then delta composes the `snapshot`,
+/// `parent`, `delta` view.
 ///
-/// This is the ONE view-composition primitive: the tx path
+/// This is the one view-composition primitive. The tx path
 /// ([`super::ExecScope::seed_layer`]) and the deposit path
-/// ([`super::execute_deposit_tx`]) both go through it, and the executor and
-/// validator MUST compose the view identically — a one-sided change here is
-/// a consensus divergence, not a refactor.
+/// ([`super::execute_deposit_tx`]) both go through it. The executor and
+/// validator must compose the view the same way. A one-sided change here
+/// causes a consensus divergence, not just a refactor.
 pub(super) fn seed_cache_layer<DB: DatabaseRef>(
     cache: &mut CacheDB<DB>,
     layer: &PendingDelta,

@@ -1,6 +1,7 @@
-//! Wire roundtrip tests. Deliberately one module spanning both directions:
-//! the roundtrips encode on one side and decode on the other (ingress →
-//! service relay → egress), which is exactly the property that must hold.
+//! Wire roundtrip tests. This is deliberately one module that spans both
+//! directions. The roundtrips encode on one side and decode on the other
+//! (ingress, then service relay, then egress). That is exactly the
+//! property that must hold.
 
 use alloy_primitives::{Address, B256};
 use kardamom_types::{BPosition, DepositRef, TxOrderingMessage, TxRef};
@@ -28,8 +29,9 @@ fn depositref() -> DepositRef {
     )
 }
 
-/// Ingress → (service relays from the canonical id) → egress → decode
-/// reproduces the TxRef; the guard header is consumed, not relayed.
+/// Ingress, then the service relays from the canonical ID, then egress,
+/// then decode: this reproduces the TxRef. The guard header is consumed,
+/// not relayed.
 #[test]
 fn txref_ingress_relay_egress_roundtrip() {
     let r = txref();
@@ -53,7 +55,7 @@ fn txref_ingress_relay_egress_roundtrip() {
 fn depositref_ingress_relay_egress_roundtrip() {
     let r = depositref();
     let ingress = encode_ingress_depositref(&r);
-    // Deposits carry the guard-exempt zero sender.
+    // Deposits use a zero sender, which the guard check exempts.
     assert_eq!(ingress_sender_nonce(&ingress).unwrap(), (Address::ZERO, 0));
     let (cid, relayed) = split_ingress(&ingress).unwrap();
     assert_eq!(cid, r.source_hash.0);
@@ -95,8 +97,8 @@ fn ingress_layout_is_kind_sender_nonce_id_then_fields() {
     assert_eq!(&b[29..61], r.tx_hash.as_slice());
     assert_eq!(b[61], RT_TXREF);
     assert_eq!(b[62], 3); // shard_id
-    // The relayed payload begins with the canonical id — the guard
-    // header never reaches the executors.
+    // The relayed payload begins with the canonical ID. The guard header
+    // never reaches the executors.
     let (_cid, relayed) = split_ingress(&b).unwrap();
     assert_eq!(&relayed[0..32], r.tx_hash.as_slice());
 }
@@ -124,7 +126,7 @@ fn replay_request_roundtrip() {
     let b = encode_replay_request(1234, 56);
     assert_eq!(b[0], KIND_REPLAY_REQUEST);
     assert_eq!(decode_replay_request(&b).unwrap(), (1234, 56));
-    // A record ingress message is NOT a replay request.
+    // A record ingress message is not a replay request.
     assert!(decode_replay_request(&encode_ingress_txref(&txref(), Address::ZERO, 0)).is_err());
 }
 

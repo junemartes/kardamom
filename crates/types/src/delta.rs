@@ -1,7 +1,7 @@
 //! Block-write payload from executor to state writer.
 //!
-//! Carries the full account / storage / code mutations + receipts produced by
-//! a sealed block, so the S6 state writer can commit them atomically.
+//! Carries all account, storage, and code mutations, plus receipts, from a
+//! sealed block. The state writer commits them atomically.
 
 use alloc::vec::Vec;
 
@@ -35,9 +35,9 @@ pub struct StorageChange {
     pub value: U256,
 }
 
-/// A single code-hash → bytecode mapping in a block delta. Stored as its own
-/// struct (rather than the `(B256, Bytes)` tuple in the original plan) so we
-/// can apply the rkyv `with` adapters cleanly.
+/// A single code-hash-to-bytecode mapping in a block delta. This is its own
+/// struct, not a `(B256, Bytes)` tuple as in the original plan. This lets the
+/// rkyv `with` adapters apply cleanly.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct CodeEntry {
@@ -47,31 +47,32 @@ pub struct CodeEntry {
     pub code: Bytes,
 }
 
-/// `tx_bal` wire frame (spec:
-/// docs/agents/bal-attribution-parallel-validation-spec.md): the merged
-/// final-value write set plus the EIP-7928 Block Access List (canonical
-/// alloy RLP) carrying per-slot `(tx_index, value)` write lists and
-/// per-account storage reads.
+/// `tx_bal` wire frame. See
+/// `docs/agents/bal-attribution-parallel-validation-spec.md`. It carries the
+/// merged final-value write set, plus the EIP-7928 Block Access List
+/// (canonical alloy RLP). The list carries per-slot `(tx_index, value)`
+/// write lists and per-account storage reads.
 ///
-/// UNVERSIONED by choice: this was a V1/V2 enum, but V1 (the receipts-free
-/// delta alone) had exactly one producer — a legacy writer-queue tee that
-/// the publisher thread superseded and that nothing wired anymore — so the
-/// discriminant only bought a permanent match arm on every consumer and an
-/// injection-path footgun (the S7 corrupt-BAL drill silently stopped
-/// drilling when its hand-rolled frames kept the pre-wrapper shape). While
-/// the chain is v0 the wire is free to change; add versioning back when
-/// there is a second live shape to carry.
+/// This type has no version, by choice. It was once a V1/V2 enum. V1 (the
+/// delta alone, without receipts) had only one producer: a legacy
+/// writer-queue tee. The publisher thread replaced that producer, and
+/// nothing else used V1. So the version tag added only a permanent match arm
+/// for every consumer, and a risk for injection paths: the corrupt-BAL
+/// drill silently stopped working when its hand-built frames kept the old
+/// shape. The wire format can still change while the chain is at v0. Add
+/// versioning back when there is a second live shape to carry.
 #[derive(Clone, Debug, Archive, Serialize, Deserialize)]
 #[rkyv(derive(Debug))]
 pub struct BalFrame {
-    /// The merged final-value write set for the block (receipts stripped:
-    /// they dominate frame size and fat frames collapsed the validator's
-    /// lapse window, #113).
+    /// The merged final-value write set for the block. Receipts are
+    /// stripped: they dominate frame size, and large frames collapsed the
+    /// validator's lapse window.
     pub delta: BlockDelta,
     /// RLP-encoded EIP-7928 block access list (attribution), quantized at
-    /// `granularity`. Empty when capture is disabled.
+    /// `granularity`. This is empty when capture is disabled.
     pub bal_rlp: Vec<u8>,
-    /// Attribution granularity: 1 = per-tx; K > 1 collapses K-tx chunks.
+    /// Attribution granularity. `1` means per-transaction. `K > 1` collapses
+    /// chunks of `K` transactions.
     pub granularity: u16,
 }
 

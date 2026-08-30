@@ -1,9 +1,9 @@
 //! Per-partition nonce-check state machine.
 //!
-//! Single-owner: this struct is held by exactly one OS thread (the sequencer
-//! event loop). No locks, no atomics. The pure-functional design isolates the
-//! algorithm from the Aeron I/O surface; every nontrivial test in this crate
-//! exercises it directly.
+//! This struct has a single owner: exactly one OS thread (the sequencer
+//! event loop) holds it. There are no locks and no atomics. The
+//! pure-functional design isolates the algorithm from the Aeron I/O
+//! surface. Every nontrivial test in this crate exercises it directly.
 
 use std::collections::HashMap;
 
@@ -21,14 +21,16 @@ pub enum ProcessAction<T> {
 pub enum NonceOutcome {
     Matched,
     Buffered,
-    /// Buffered this nonce; a further-future nonce (`evicted_nonce`) was dropped
-    /// to make room, preserving the drainable low run. The dropped tx is
-    /// far-future and re-submitted by the client before it is needed.
+    /// This nonce was buffered. A further-future nonce (`evicted_nonce`)
+    /// was dropped to make room, to keep the drainable low run. The
+    /// dropped transaction is far in the future, and the client resubmits
+    /// it before it is needed.
     BufferedEvicting {
         evicted_nonce: u64,
     },
-    /// This nonce was itself the furthest-future and the buffer was full, so it
-    /// was rejected (not buffered) to protect the drainable low run.
+    /// This nonce was itself the furthest in the future, and the buffer
+    /// was full. So it was rejected, not buffered, to protect the
+    /// drainable low run.
     RejectedTooFar {
         nonce: u64,
     },
@@ -63,10 +65,10 @@ impl<T> PartitionState<T> {
         self.next.get(&sender).copied().unwrap_or(0)
     }
 
-    /// Returns the cached next-nonce for `sender`, or `None` if the sender
-    /// has never been seen by this partition. Used by the cache-miss
-    /// hydration path: a `None` triggers a one-time canonical lookup
-    /// against the state DB before falling through to [`Self::process`].
+    /// Returns the cached next nonce for `sender`, or `None` if this
+    /// partition has never seen the sender. The cache-miss hydration path
+    /// uses this: a `None` triggers a one-time canonical lookup against
+    /// the state DB before it falls through to [`Self::process`].
     pub fn next_nonce_known(&self, sender: Address) -> Option<u64> {
         self.next.get(&sender).copied()
     }
@@ -75,8 +77,9 @@ impl<T> PartitionState<T> {
         self.next.insert(sender, n);
     }
 
-    /// Primary-side: handle an incoming tx. Returns publish actions in
-    /// canonical order; the caller drives the outbound publishers.
+    /// Primary-side: handle an incoming transaction. Returns publish
+    /// actions in canonical order. The caller drives the outbound
+    /// publishers.
     pub fn process(&mut self, sender: Address, nonce: u64, payload: T) -> ProcessResult<T> {
         let expected = self.next_nonce(sender);
         if nonce < expected {
@@ -108,9 +111,9 @@ impl<T> PartitionState<T> {
             };
         }
 
-        // nonce == expected: prefer the buffered entry at this nonce if one
-        // exists (e.g. backpressure-retry path), then drain the contiguous
-        // run.
+        // nonce == expected: prefer the buffered entry at this nonce, if
+        // one exists (for example, the backpressure-retry path). Then drain
+        // the contiguous run.
         let first_payload = self
             .pending
             .get_mut(&sender)
@@ -137,16 +140,16 @@ impl<T> PartitionState<T> {
         }
     }
 
-    /// Push a payload back into the pending buffer so the next call to
-    /// `process(sender, nonce, _)` will pick it up and publish it. Also
-    /// rewinds `next_nonce` so the retry sees `nonce == expected`.
+    /// Push a payload back into the pending buffer, so the next call to
+    /// `process(sender, nonce, _)` picks it up and publishes it. This also
+    /// rewinds `next_nonce`, so the retry sees `nonce == expected`.
     ///
-    /// Used by [`crate::sequencer::Sequencer::run_once`] when the canonical
-    /// `TxRef` publish (`TxOrderingRefPublisher::try_publish_ref`) returns
-    /// `Backpressure` — we must NOT advance state for a message whose ref did
-    /// not actually land on B. Also marks the sender as "drain-pending" so a
-    /// subsequent call to [`Self::drain_pending`] can resume the publish
-    /// without needing fresh ingress.
+    /// [`crate::sequencer::Sequencer::run_once`] calls this when the
+    /// canonical `TxRef` publish (`TxOrderingRefPublisher::try_publish_ref`)
+    /// returns `Backpressure`. The state must not advance for a message
+    /// whose ref did not actually land on B. This also marks the sender as
+    /// "drain-pending", so a later call to [`Self::drain_pending`] can
+    /// resume the publish without fresh ingress.
     pub fn reinsert_for_retry(&mut self, sender: Address, nonce: u64, payload: T) {
         // Rewind expected nonce so the retry treats it as a Match.
         self.next.insert(sender, nonce);
@@ -154,30 +157,30 @@ impl<T> PartitionState<T> {
             .pending
             .entry(sender)
             .or_insert_with(|| PendingBuffer::new(self.max_pending_per_sender));
-        // UNBOUNDED insert: a capacity-enforcing insert here can EVICT the
-        // lowest rebuffered nonce when the buffer is (still) full — e.g. a
-        // full future-run drained by `process` plus the in-flight ingress item
-        // rebuffered after backpressure overshoots capacity by one, and the
-        // eviction would silently lose a ref the floor already rewound below
-        // (a permanent per-sender gap). The rebuffered items were accounted
-        // for by this buffer moments ago; capacity re-applies to fresh
-        // ingress only.
+        // This insert is unbounded. A capacity-enforcing insert here could
+        // evict the lowest rebuffered nonce when the buffer is still full.
+        // For example: a full future run, drained by `process`, plus the
+        // in-flight ingress item, rebuffered after backpressure, overshoots
+        // capacity by one. Evicting here would silently lose a ref that the
+        // floor already rewound below it: a permanent per-sender gap. This
+        // buffer accounted for the rebuffered items moments ago. Capacity
+        // applies only to fresh ingress.
         buf.reinsert(nonce, payload);
     }
 
     /// Walk every sender whose pending buffer has an entry at its expected
-    /// next nonce, and emit `Publish` actions for the contiguous run. Used by
-    /// the primary loop to flush backpressured-then-rebuffered payloads
-    /// without needing fresh ingress messages.
+    /// next nonce, and emit `Publish` actions for the contiguous run. The
+    /// primary loop uses this to flush backpressured-then-rebuffered
+    /// payloads without needing fresh ingress messages.
     ///
-    /// Returns the publish actions in canonical order (per sender, ascending
-    /// nonce). Senders are visited in arbitrary order — but within a sender
-    /// the nonces are strictly ascending and dense, which is the only
-    /// ordering the canonical log cares about.
+    /// Returns the publish actions in canonical order (per sender,
+    /// ascending nonce). Senders are visited in arbitrary order. Within a
+    /// sender, the nonces are strictly ascending and dense, which is the
+    /// only order the canonical log cares about.
     pub fn drain_pending(&mut self) -> Vec<(Address, u64, T)> {
         let mut out = Vec::new();
-        // Borrow `pending` and `next` as disjoint fields so we don't need to
-        // snapshot the sender list into a `Vec` first.
+        // Borrow `pending` and `next` as separate fields. This avoids
+        // snapshotting the sender list into a `Vec` first.
         for (&sender, buf) in self.pending.iter_mut() {
             let expected = self.next.get(&sender).copied().unwrap_or(0);
             let mut advanced = expected;
@@ -192,20 +195,21 @@ impl<T> PartitionState<T> {
         out
     }
 
-    /// Advance `sender`'s expected nonce to an **executed-truth floor** (a
-    /// receipt proves every nonce `< floor` already executed on the canonical
-    /// chain). Entries buffered below the floor are dropped — they are proven
-    /// duplicates of executed txs, so this can never create a canonical gap.
-    /// Buffered entries at/after the floor become drainable by
-    /// [`Self::drain_pending`] on the next loop iteration.
+    /// Advance `sender`'s expected nonce to an executed-truth floor. A
+    /// receipt proves that every nonce below `floor` already executed on
+    /// the canonical chain. Entries buffered below the floor are dropped:
+    /// they are proven duplicates of executed transactions, so this can
+    /// never create a canonical gap. Buffered entries at or after the
+    /// floor become drainable by [`Self::drain_pending`] on the next loop
+    /// iteration.
     ///
     /// Returns `Some((previous_next_nonce, dropped_count))` when the floor
-    /// actually advanced, `None` when it was already at/behind `next`.
+    /// advanced, or `None` when it was already at or behind `next`.
     ///
-    /// This is the SOUND replacement for the removed stream-adaptive
-    /// fast-forward (note below): it advances on execution evidence from the
-    /// receipts stream, never on locally-inferred stream gaps — a
-    /// client-abandoned nonce hole produces no receipt and therefore never
+    /// This is the sound replacement for the removed stream-adaptive
+    /// fast-forward (see the note below). It advances only on execution
+    /// evidence from the receipts stream, never on locally inferred stream
+    /// gaps. A client-abandoned nonce hole produces no receipt, so it never
     /// advances the floor. See docs/agents/sequencer-lag-resync-spec.md.
     pub fn advance_floor(&mut self, sender: Address, floor: u64) -> Option<(u64, usize)> {
         let cur = self.next_nonce(sender);
@@ -221,23 +225,22 @@ impl<T> PartitionState<T> {
         Some((cur, dropped))
     }
 
-    // NOTE — `fast_forward_stalled` (the F02.1/F02.2 "stream-adaptive
-    // nonce-floor fast-forward") was REMOVED after CI run 29687514869: a
-    // sequencer cannot locally distinguish "the twin already ordered the gap"
-    // (the rejoin case it was built for) from "NOBODY ordered the gap" (a
-    // client-abandoned nonce hole — txs dropped at ingress under overload or
-    // during a chaos outage, so they never reached tx_data at all). In the
-    // second case BOTH replicas adopt the same hole and publish a canonical
-    // stream with a nonce gap, which every executor fail-stops on
-    // (revm NonceTooHigh is fatal) — observed as all three executors
-    // crash-looping in all five cluster-e2e shards (load: tx 3836 vs state
-    // 3833 at the 600tps overload step; chaos: tx 4098 vs state 1818 after a
-    // leader-kill window). A stalled sender must stall HERE, where it is
-    // recoverable, never poison the canonical stream. This re-opens F02.1's
-    // rejoined-replica-coverage finding; a sound fix needs a global signal
-    // (e.g. hydrating floors from a canonical/receipt stream), not a local
-    // timeout. See docs/reviews/2026-07-17-30-commit-review/
-    // fixes-CI-replay-loop.md (round 4).
+    // NOTE: `fast_forward_stalled` (the stream-adaptive nonce-floor
+    // fast-forward) was removed. A sequencer cannot locally tell "the twin
+    // already ordered the gap" (the rejoin case it was built for) apart
+    // from "nobody ordered the gap" (a client-abandoned nonce hole: a
+    // transaction dropped at ingress under overload, or during a chaos
+    // outage, so it never reached tx_data at all).
+    //
+    // In the second case, both replicas adopt the same hole and publish a
+    // canonical stream with a nonce gap. Every executor fail-stops on that
+    // (revm's NonceTooHigh is fatal). A stalled sender must stall here,
+    // where it is recoverable, and never poison the canonical stream.
+    //
+    // A sound fix needs a global signal, such as hydrating floors from a
+    // canonical or receipt stream, not a local timeout. See
+    // docs/reviews/2026-07-17-30-commit-review/fixes-CI-replay-loop.md
+    // (round 4).
 }
 
 #[cfg(test)]

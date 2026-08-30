@@ -1,6 +1,7 @@
-//! TxReceipts: receipts + boundaries (RAM only). The executor publishes both
-//! streams; ingress / the state writer subscribe, either on the legacy shared
-//! IPC channel or via MDS fan-in over per-replica unicast endpoints.
+//! TxReceipts: receipts and boundaries (RAM only). The executor publishes
+//! both streams. Ingress and the state writer subscribe, either on the
+//! legacy shared IPC channel or through MDS fan-in over per-replica
+//! unicast endpoints.
 
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use tracing::{error, info, warn};
@@ -11,16 +12,17 @@ use crate::config::ChannelsConfig;
 use crate::error::LogError;
 use kardamom_types::{BPosition, BlockBoundary, Receipt};
 
-/// Attach replicas `0..executor_count` to an MDS fan-in subscription: the
-/// shared loop behind the receipts/boundary `open_auto` constructors.
+/// Attach replicas `0..executor_count` to an MDS fan-in subscription. This
+/// is the shared loop behind the receipts/boundary `open_auto`
+/// constructors.
 ///
-/// STATIC MEMBERSHIP (Consul-watch fallback): this runs once at startup over
-/// the fixed `0..executor_count` index space. The executor job is a
-/// count-based Nomad job with `distinct_hosts`, so replica indices are stable
-/// and a restarting replica keeps its index/endpoint — the static attach
-/// therefore stays correct across restarts. The full design watches the
-/// `executor-receipts` Consul service and add/removes destinations on
-/// membership change; see TODO(consul-watch) on
+/// Static membership (Consul-watch fallback): this runs once at startup
+/// over the fixed `0..executor_count` index space. The executor job is a
+/// count-based Nomad job with `distinct_hosts`, so replica indices stay
+/// stable, and a restarting replica keeps its index and endpoint. The
+/// static attach therefore stays correct across restarts. The full design
+/// watches the `executor-receipts` Consul service and adds or removes
+/// destinations on membership change; see TODO(consul-watch) on
 /// `ChannelsConfig::tx_receipts_executor_count`.
 fn attach_mds_endpoints(
     kind: &str,
@@ -48,16 +50,17 @@ fn attach_mds_endpoints(
     Ok(())
 }
 
-/// Shared MDS destination plumbing for the receipts and boundary subscriber
-/// handles: the retained `sub_id` (`Some` only when opened via `open_mds` —
-/// the subscription id MDS destinations attach to; `None` for the legacy
-/// single-channel subscription) plus the [`AeronRuntime`] clone the
-/// add/remove commands go through. Both handles delegate here so the
-/// "non-MDS subscription" guard cannot drift between them.
+/// Shared MDS destination plumbing for the receipts and boundary
+/// subscriber handles: the retained `sub_id` (`Some` only when opened
+/// through `open_mds`, the subscription id MDS destinations attach to;
+/// `None` for the legacy single-channel subscription) plus the
+/// [`AeronRuntime`] clone the add/remove commands go through. Both handles
+/// delegate here, so the "non-MDS subscription" guard cannot drift between
+/// them.
 struct MdsSub {
     sub_id: Option<u32>,
     rt: AeronRuntime,
-    /// Names the side-stream in error messages ("receipts" / "boundary").
+    /// Names the side-stream in error messages ("receipts" or "boundary").
     kind: &'static str,
 }
 
@@ -92,21 +95,22 @@ impl MdsSub {
 }
 
 /// TxReceipts publisher. The executor uses `publish_receipt` and
-/// `publish_boundary` on the same channel, but with separate stream ids so
-/// subscribers can demultiplex without an in-band tag.
+/// `publish_boundary` on the same channel, but with separate stream ids,
+/// so subscribers can demultiplex without an in-band tag.
 ///
 /// Two open modes:
-/// - [`open`](Self::open): the legacy **single shared channel**
-///   (`tx_receipts_channel`) — the lone executor publishes, ingress subscribes
-///   directly. This is the single-host IPC default.
-/// - [`open_mds`](Self::open_mds): the **multi-destination-subscription**
-///   (fan-in) path. Each executor replica publishes to its OWN unicast UDP
-///   endpoint (`ch.tx_receipts_endpoint(replica_idx)`), and the single ingress
-///   attaches every replica's endpoint to one `control-mode=manual`
-///   subscription. Both modes publish receipts on `tx_receipts_stream_id` and
-///   boundaries on `tx_receipts_stream_id + 1`; only the channel URI differs,
-///   so `publish_receipt`/`publish_boundary` (and the executor commit thread's
-///   must-deliver retry that drives them) are identical across modes.
+/// - [`open`](Self::open): the legacy single shared channel
+///   (`tx_receipts_channel`). The lone executor publishes, and ingress
+///   subscribes directly. This is the single-host IPC default.
+/// - [`open_mds`](Self::open_mds): the multi-destination-subscription
+///   (fan-in) path. Each executor replica publishes to its own unicast UDP
+///   endpoint (`ch.tx_receipts_endpoint(replica_idx)`), and the single
+///   ingress attaches every replica's endpoint to one
+///   `control-mode=manual` subscription. Both modes publish receipts on
+///   `tx_receipts_stream_id` and boundaries on `tx_receipts_stream_id + 1`.
+///   Only the channel URI differs, so `publish_receipt`/`publish_boundary`
+///   (and the executor commit thread's must-deliver retry that drives
+///   them) are identical across modes.
 #[derive(Clone)]
 pub struct TxReceiptsPublisherHandle {
     inner: PubHandle,
@@ -123,13 +127,14 @@ impl TxReceiptsPublisherHandle {
         })
     }
 
-    /// MDS (fan-in) publisher: this replica publishes BOTH streams to its own
-    /// per-replica unicast endpoint `ch.tx_receipts_endpoint(replica_idx)`,
-    /// which ingress attaches as a destination on its aggregating subscription.
-    /// `replica_idx` is the executor's recorder-id (`NOMAD_ALLOC_INDEX`).
+    /// MDS (fan-in) publisher: this replica publishes both streams to its
+    /// own per-replica unicast endpoint
+    /// `ch.tx_receipts_endpoint(replica_idx)`, which ingress attaches as a
+    /// destination on its aggregating subscription. `replica_idx` is the
+    /// executor's recorder-id (`NOMAD_ALLOC_INDEX`).
     ///
-    /// Errors if MDS is not configured (no `tx_receipts_control_channel`), so a
-    /// misconfigured executor fails fast instead of silently using IPC.
+    /// Errors if MDS is not configured (no `tx_receipts_control_channel`),
+    /// so a misconfigured executor fails fast instead of silently using IPC.
     pub fn open_mds(
         rt: &AeronRuntime,
         ch: &ChannelsConfig,
@@ -140,9 +145,10 @@ impl TxReceiptsPublisherHandle {
                 "open_mds: tx_receipts MDS not configured (replica {replica_idx})"
             ))
         })?;
-        // Boundaries publish to a DISTINCT endpoint (port) from receipts, since
-        // ingress's two manual subscriptions each bind their destination socket
-        // — a shared endpoint collides. See ChannelsConfig::tx_receipts_endpoint.
+        // Boundaries publish to a distinct endpoint (port) from receipts,
+        // because ingress's two manual subscriptions each bind their
+        // destination socket, and a shared endpoint would collide. See
+        // ChannelsConfig::tx_receipts_endpoint.
         let boundary_endpoint = ch
             .tx_receipts_boundary_endpoint(replica_idx)
             .ok_or_else(|| {
@@ -156,16 +162,17 @@ impl TxReceiptsPublisherHandle {
         })
     }
 
-    /// Publish a BATCH of receipts as one wire frame (`Vec<Receipt>`,
-    /// rkyv-encoded). One encode + one offer + one ack round trip per batch:
-    /// the previous receipt-per-frame path paid a blocking cross-thread ack
-    /// round trip PER RECEIPT on the executor's commit thread — at thousands
-    /// of receipts/s that serialization was the dominant per-tx publish
-    /// cost. The subscriber fans batches back out into individual
-    /// `(BPosition, Receipt)` deliveries, so consumers are unchanged; every
-    /// receipt in a batch shares the frame's stream position (consumers key
-    /// on `Receipt.tx_idx`, not the stream position). All receipt frames are
-    /// batch frames — a single receipt rides a batch of one.
+    /// Publish a batch of receipts as one wire frame (`Vec<Receipt>`,
+    /// rkyv-encoded). This is one encode, one offer, and one ack round
+    /// trip per batch. The previous receipt-per-frame path paid a blocking
+    /// cross-thread ack round trip per receipt on the executor's commit
+    /// thread. At thousands of receipts per second that serialization was
+    /// the dominant per-tx publish cost. The subscriber fans batches back
+    /// out into individual `(BPosition, Receipt)` deliveries, so consumers
+    /// are unchanged. Every receipt in a batch shares the frame's stream
+    /// position (consumers key on `Receipt.tx_idx`, not the stream
+    /// position). All receipt frames are batch frames; a single receipt
+    /// rides a batch of one.
     pub fn publish_receipts(&self, batch: &Vec<Receipt>) -> Result<BPosition, LogError> {
         self.inner.publish(batch)
     }
@@ -178,13 +185,14 @@ impl TxReceiptsPublisherHandle {
         self.boundary.publish(b)
     }
 
-    /// Fire-and-forget boundary publish. The block-boundary side-stream is a
-    /// marker — ingress acks on the receipt / durable watermark, NOT on this —
-    /// so it must NEVER block the executor's commit thread. A must-deliver
-    /// boundary that can't reach a not-yet-connected ingress (e.g. during
-    /// startup before ingress's MDS destinations attach) would back up the
-    /// commit→exec channel and freeze ALL state progress. Encodes and hands the
-    /// frame to the Aeron thread; delivery is best-effort.
+    /// Fire-and-forget boundary publish. The block-boundary side-stream is
+    /// a marker; ingress acks on the receipt or durable watermark, not on
+    /// this, so it must never block the executor's commit thread. A
+    /// must-deliver boundary that cannot reach a not-yet-connected ingress
+    /// (for example during startup, before ingress's MDS destinations
+    /// attach) would back up the commit-to-exec channel and freeze all
+    /// state progress. This encodes and hands the frame to the Aeron
+    /// thread; delivery is best effort.
     pub fn publish_boundary_best_effort(&self, b: &BlockBoundary) -> Result<(), LogError> {
         let bytes = codec::encode(b)?;
         self.boundary.publish_best_effort(bytes);
@@ -194,22 +202,23 @@ impl TxReceiptsPublisherHandle {
 
 /// TxReceipts subscriber for receipts.
 ///
-/// In the legacy IPC path ([`open`](Self::open)) this is a plain subscription
-/// on the shared `tx_receipts_channel`. In the MDS fan-in path
-/// ([`open_mds`](Self::open_mds)) it is opened on the `control-mode=manual`
-/// `tx_receipts_control_channel`; the caller then attaches each executor
-/// replica's endpoint via [`add_destination`](Self::add_destination). The
-/// retained `sub_id` is what `add_destination`/`remove_destination` target.
+/// In the legacy IPC path ([`open`](Self::open)) this is a plain
+/// subscription on the shared `tx_receipts_channel`. In the MDS fan-in
+/// path ([`open_mds`](Self::open_mds)) it is opened on the
+/// `control-mode=manual` `tx_receipts_control_channel`. The caller then
+/// attaches each executor replica's endpoint with
+/// [`add_destination`](Self::add_destination). The retained `sub_id` is
+/// what `add_destination`/`remove_destination` target.
 pub struct TxReceiptsSubscriberHandle {
     rx: UnboundedReceiver<(BPosition, Receipt)>,
     mds: MdsSub,
 }
 
 impl TxReceiptsSubscriberHandle {
-    /// Fan a `Vec<Receipt>` batch frame (the only receipt wire format — see
+    /// Fan a `Vec<Receipt>` batch frame (the only receipt wire format; see
     /// [`TxReceiptsPublisherHandle::publish_receipts`]) back out into
-    /// per-receipt deliveries, preserving in-frame order. Consumers keep the
-    /// exact `(BPosition, Receipt)` stream they always had.
+    /// per-receipt deliveries, preserving in-frame order. Consumers keep
+    /// the exact `(BPosition, Receipt)` stream they always had.
     fn batch_fanout_deliver(
         msg_tx: tokio::sync::mpsc::UnboundedSender<(BPosition, Receipt)>,
     ) -> DeliverFn {
@@ -241,12 +250,12 @@ impl TxReceiptsSubscriberHandle {
         })
     }
 
-    /// [`open_mds`](Self::open_mds) + attach replicas `0..executor_count`
-    /// when the MDS control channel is configured, plain
-    /// [`open`](Self::open) otherwise — the one shape every consumer binary
-    /// (ingress, sequencer, validator) needs. A `None` endpoint under MDS is
-    /// a misconfiguration and errors rather than silently subscribing to a
-    /// subset of executors.
+    /// Calls [`open_mds`](Self::open_mds) and attaches replicas
+    /// `0..executor_count` when the MDS control channel is configured, or
+    /// plain [`open`](Self::open) otherwise. This is the one shape every
+    /// consumer binary (ingress, sequencer, validator) needs. A `None`
+    /// endpoint under MDS is a misconfiguration and errors, instead of
+    /// silently subscribing to a subset of executors.
     pub fn open_auto(
         rt: &AeronRuntime,
         ch: &ChannelsConfig,
@@ -266,8 +275,8 @@ impl TxReceiptsSubscriberHandle {
     }
 
     /// MDS (fan-in) subscriber: one `control-mode=manual` subscription on
-    /// `ch.tx_receipts_control_channel` that the caller attaches per-replica
-    /// executor endpoints to. Errors if MDS is not configured.
+    /// `ch.tx_receipts_control_channel` that the caller attaches
+    /// per-replica executor endpoints to. Errors if MDS is not configured.
     pub fn open_mds(rt: &AeronRuntime, ch: &ChannelsConfig) -> Result<Self, LogError> {
         if !ch.tx_receipts_mds_enabled() {
             return Err(LogError::Aeron(
@@ -286,8 +295,9 @@ impl TxReceiptsSubscriberHandle {
         })
     }
 
-    /// Attach an executor replica's endpoint as an MDS destination. Only valid
-    /// on a handle opened via [`open_mds`](Self::open_mds). Idempotent.
+    /// Attach an executor replica's endpoint as an MDS destination. Only
+    /// valid on a handle opened with [`open_mds`](Self::open_mds).
+    /// Idempotent.
     pub fn add_destination(&self, uri: &str) -> Result<(), LogError> {
         self.mds.add_destination(uri)
     }
@@ -307,30 +317,31 @@ impl TxReceiptsSubscriberHandle {
 
     /// Drop the handle's `AeronRuntime` clone, keeping only the receiver.
     ///
-    /// USE THIS when the receiver is moved into a long-lived pump task that
+    /// Use this when the receiver moves into a long-lived pump task that
     /// ends on `recv() == None`. Keeping the whole handle there creates an
-    /// ownership CYCLE that makes the process unkillable by SIGTERM: the
-    /// runtime shuts down only when its LAST clone drops
-    /// ([`AeronRuntime::drop`]), the shutdown is what closes subscriptions,
-    /// and closing them is what makes `recv()` return `None` — so a pump
-    /// task holding a clone waits for a shutdown that its own clone is
-    /// preventing. `drop(rt)` in `main` then silently does nothing, every
-    /// other subscription stays open, and any thread joining on
-    /// end-of-stream hangs forever.
+    /// ownership cycle that makes the process unkillable by SIGTERM. The
+    /// runtime shuts down only when its last clone drops
+    /// ([`AeronRuntime::drop`]). That shutdown is what closes
+    /// subscriptions, and closing them is what makes `recv()` return
+    /// `None`. So a pump task holding a clone waits for a shutdown that
+    /// its own clone is preventing. `drop(rt)` in `main` then silently
+    /// does nothing, every other subscription stays open, and any thread
+    /// joining on end-of-stream hangs forever.
     ///
-    /// Destinations can no longer be attached/detached afterwards, so call
-    /// it only once MDS membership is established (destinations attached at
-    /// open time survive — they live in the driver, not in this handle).
+    /// Destinations can no longer be attached or detached afterwards, so
+    /// call this only once MDS membership is established (destinations
+    /// attached at open time survive; they live in the driver, not in
+    /// this handle).
     pub fn into_receiver(self) -> UnboundedReceiver<(BPosition, Receipt)> {
         self.rx
     }
 }
 
 /// TxReceipts subscriber for boundaries. Mirrors
-/// [`TxReceiptsSubscriberHandle`] but for the `tx_receipts_stream_id + 1`
-/// boundary side-stream: [`open`](Self::open) for the legacy shared channel,
-/// [`open_mds`](Self::open_mds) + [`add_destination`](Self::add_destination)
-/// for the fan-in path.
+/// [`TxReceiptsSubscriberHandle`], but for the `tx_receipts_stream_id + 1`
+/// boundary side-stream: [`open`](Self::open) for the legacy shared
+/// channel, and [`open_mds`](Self::open_mds) plus
+/// [`add_destination`](Self::add_destination) for the fan-in path.
 pub struct TxReceiptsBoundarySubscriberHandle {
     rx: UnboundedReceiver<(BPosition, BlockBoundary)>,
     mds: MdsSub,
@@ -365,11 +376,12 @@ impl TxReceiptsBoundarySubscriberHandle {
         })
     }
 
-    /// Boundary twin of [`TxReceiptsSubscriberHandle::open_auto`]: MDS +
-    /// attach `0..executor_count` when configured, plain subscription
-    /// otherwise. Boundaries ride distinct per-replica endpoints from
-    /// receipts (each manual subscription binds its destination socket) —
-    /// see [`ChannelsConfig::tx_receipts_boundary_endpoint`].
+    /// Boundary twin of [`TxReceiptsSubscriberHandle::open_auto`]: MDS
+    /// plus attaching `0..executor_count` when configured, or a plain
+    /// subscription otherwise. Boundaries ride distinct per-replica
+    /// endpoints from receipts (each manual subscription binds its
+    /// destination socket); see
+    /// [`ChannelsConfig::tx_receipts_boundary_endpoint`].
     pub fn open_auto(
         rt: &AeronRuntime,
         ch: &ChannelsConfig,

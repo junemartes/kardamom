@@ -1,8 +1,9 @@
-//! Cluster orchestration for the perf pipeline: purge the previous
-//! deployment, wipe node state, and re-run `ci-cluster.sh` (KEEP=1, load and
-//! chaos stages skipped) from the orchestrator container — the same
-//! bring-up path CI and `local-cluster.sh` use, so a perf run always measures
-//! a fresh chain with the current build.
+//! This module does cluster orchestration for the perf pipeline: purge
+//! the previous deployment, wipe node state, and re-run `ci-cluster.sh`,
+//! with `KEEP=1` and the load and chaos stages skipped, from the
+//! orchestrator container. This is the same bring-up path CI and
+//! `local-cluster.sh` use, so a perf run always measures a fresh chain
+//! with the current build.
 
 use std::process::Command;
 
@@ -32,7 +33,8 @@ pub const SEALER_NODES: &[&str] = &[
 
 const NOMAD_ADDR: &str = "http://192.168.56.10:4646";
 
-/// Run a command, capture stdout, error with context on non-zero exit.
+/// Run a command, and capture stdout. Errors with context on a
+/// non-zero exit code.
 pub fn sh(program: &str, args: &[&str]) -> anyhow::Result<String> {
     let out = Command::new(program)
         .args(args)
@@ -53,11 +55,12 @@ pub fn docker_exec(container: &str, script: &str) -> anyhow::Result<String> {
     sh("docker", &["exec", container, "bash", "-c", script])
 }
 
-/// Stop + purge every Nomad job, then wipe per-node state so the next deploy
-/// starts a fresh chain with new-build allocs. `nomad job status` is parsed
-/// from its plain table output (the `-t` template flag silently emits nothing
-/// for the list form). Periodic-batch children (`batcher/periodic-*`) are
-/// purged with their parent.
+/// Stop and purge every Nomad job, then wipe per-node state, so the
+/// next deploy starts a fresh chain with new-build allocations. This
+/// function parses `nomad job status` from its plain table output,
+/// because the `-t` template flag silently emits nothing for the list
+/// form. A periodic-batch child, such as `batcher/periodic-*`, is
+/// purged along with its parent.
 pub fn purge() -> anyhow::Result<()> {
     println!("==> purging nomad jobs");
     docker_exec(
@@ -86,20 +89,22 @@ done"#
     Ok(())
 }
 
-/// True when the cluster's control node container exists (running or not) —
-/// the discriminator between "redeploy over an existing cluster" (purge
-/// first) and "the cluster is gone" (a torn-down host, e.g. after another
-/// session's teardown): purging a missing cluster used to fail the whole
-/// `up` with "No such container: kardamom-control-0" even though
-/// ci-cluster.sh handles from-scratch creation fine.
+/// Returns true when the cluster's control node container exists,
+/// whether running or not. This tells apart "redeploy over an existing
+/// cluster", which needs a purge first, from "the cluster is gone",
+/// for example a torn-down host after another session's teardown.
+/// Purging a missing cluster failed the whole `up` with "No such
+/// container: kardamom-control-0", even though ci-cluster.sh handles
+/// from-scratch creation fine.
 fn cluster_exists() -> bool {
     sh("docker", &["inspect", "kardamom-control-0"]).is_ok()
 }
 
-/// Bring the stack up fresh: `local-cluster.sh build` (reproducible builder +
-/// orchestrator image), then `ci-cluster.sh` from a fresh orchestrator with
-/// KEEP=1 and the load/chaos stages skipped. Blocks until the deploy's smoke
-/// gates pass; the cluster is left running.
+/// Bring the stack up fresh: run `local-cluster.sh build`, which
+/// builds the reproducible builder and orchestrator image, then run
+/// `ci-cluster.sh` from a fresh orchestrator with `KEEP=1` and the
+/// load and chaos stages skipped. This function blocks until the
+/// deploy's smoke gates pass, and leaves the cluster running.
 pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     let root = repo_root.to_str().context("repo root not utf-8")?;
     if !skip_build {
@@ -177,7 +182,8 @@ pub fn up(repo_root: &std::path::Path, skip_build: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One `docker stats` sample of a set of containers → `(name, cpu%)`.
+/// Take one `docker stats` sample of a set of containers. Returns
+/// `(name, cpu%)` for each.
 pub fn cpu_sample(containers: &[&str]) -> anyhow::Result<Vec<(String, f64)>> {
     let mut args = vec!["stats", "--no-stream", "--format", "{{.Name}} {{.CPUPerc}}"];
     args.extend_from_slice(containers);
@@ -191,9 +197,9 @@ pub fn cpu_sample(containers: &[&str]) -> anyhow::Result<Vec<(String, f64)>> {
         .collect())
 }
 
-/// The sealer node currently doing leader work = the busiest sealer
-/// container, sampled twice to dodge a transient spike. Only meaningful
-/// while load is flowing.
+/// The sealer node currently doing leader work: the busiest sealer
+/// container, sampled twice to avoid a transient spike. This result is
+/// meaningful only while load is flowing.
 pub fn detect_sealer_leader() -> anyhow::Result<String> {
     let mut totals: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
     for _ in 0..2 {

@@ -1,22 +1,23 @@
 //! Aeron publishers for the split-architecture log tier:
 //!
-//! - **TxData[i]** — per-sequencer **exclusive** publication of full
-//!   `TxEnvelope` bytes. One per sequencer; the sequencer is the only
-//!   publisher to its own tx_data stream, so there is no CAS-cursor
-//!   contention and writes run at near-`memcpy` speed.
-//! - **TxOrdering** — canonical orderer. Shared (concurrent) multi-publisher
-//!   carrying the small [`TxOrderingMessage`] enum (`TxRef | BoundaryStart`).
-//!   Many publisher handles (M sequencers + the sealer) may offer to the
-//!   same Aeron stream; Aeron serialises them into a single byte order, and
-//!   that order *is* the canonical L2 ordering (system invariant I1).
-//! - **QuorumWatermark** — the single archive-at-the-sealer durable position.
+//! - TxData[i]: per-sequencer exclusive publication of full `TxEnvelope`
+//!   bytes. There is one per sequencer. The sequencer is the only publisher
+//!   to its own tx_data stream, so there is no CAS-cursor contention, and
+//!   writes run at near-`memcpy` speed.
+//! - TxOrdering: the canonical orderer. This is a shared (concurrent)
+//!   multi-publisher stream carrying the small [`TxOrderingMessage`] enum
+//!   (`TxRef | BoundaryStart`). Many publisher handles (M sequencers plus the
+//!   sealer) may offer to the same Aeron stream. Aeron puts them into a
+//!   single byte order, and that order is the canonical L2 ordering (system
+//!   invariant I1).
+//! - QuorumWatermark: the single archive-at-the-sealer durable position.
 //!
 //! Channel URIs in [`crate::config::ChannelsConfig`] are stored as `String`
-//! for ergonomics; we convert to `CString`/`&CStr` at the FFI boundary since
-//! the rusteron 0.1.16x bindings exclusively take `&CStr`.
+//! for convenience. This module converts them to `CString`/`&CStr` at the
+//! FFI boundary, because the rusteron 0.1.16x bindings only take `&CStr`.
 //!
-//! (unconditional dep on rusteron.) Not used in default
-//! `cargo test` runs.
+//! This module has an unconditional dependency on rusteron. It is not used
+//! in default `cargo test` runs.
 
 use std::ffi::CString;
 use std::time::Duration;
@@ -34,18 +35,18 @@ use kardamom_types::{
     BPosition, BlockBoundaryStart, QuorumWatermark, TxEnvelope, TxOrderingMessage, TxRef,
 };
 
-// rusteron re-exports we depend on. `AeronPublication` is the shared
-// (concurrent) variant; `AeronExclusivePublication` is the single-publisher
-// variant. TxOrdering uses shared (concurrent multi-publisher serialised into
-// the canonical order); tx_data uses exclusive (one writer per stream,
+// rusteron re-exports this module depends on. `AeronPublication` is the
+// shared (concurrent) variant. `AeronExclusivePublication` is the
+// single-publisher variant. TxOrdering uses shared (multiple publishers put
+// into the canonical order). tx_data uses exclusive (one writer per stream,
 // near-memcpy speed).
 type AeronClient = rusteron_client::Aeron;
 type Pub = rusteron_client::AeronPublication;
 type ExclusivePub = rusteron_client::AeronExclusivePublication;
 
-/// How long `add_publication` is allowed to spin waiting for the Media Driver
-/// to acknowledge the registration. 5s is generous for ipc/udp; production
-/// deployments tune via env vars.
+/// How long `add_publication` may spin while it waits for the Media Driver
+/// to acknowledge the registration. 5 seconds is generous for ipc/udp.
+/// Production deployments tune this with env vars.
 const ADD_PUB_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn cstring(s: &str) -> Result<CString, LogError> {
@@ -72,19 +73,18 @@ fn add_exclusive_pub(
 }
 
 // ===========================================================================
-// TxData[i] — per-sequencer exclusive publisher of full TxEnvelopes.
+// TxData[i]: per-sequencer exclusive publisher of full TxEnvelopes.
 // ===========================================================================
 
 /// TxData[i]: per-sequencer exclusive publisher of full `TxEnvelope`
-/// bytes. The sequencer is the only writer to its own A-stream — no
-/// CAS-cursor contention — and the recorded archive is the source of truth
-/// for the bulk transaction data referenced from tx_ordering.
+/// bytes. The sequencer is the only writer to its own A-stream, so there is
+/// no CAS-cursor contention. The recorded archive is the source of truth
+/// for the bulk transaction data that tx_ordering references.
 ///
-/// Per-A URIs are derived from
-/// [`ChannelsConfig::tx_data_channel_template`] (e.g. `"aeron:ipc?alias=a-{sid}"`)
-/// with `{sid}` substituted for the sequencer id. Stream ids are derived as
-/// `tx_data_stream_id_base + sequencer_id` so M parallel tx_data streams can
-/// coexist on a shared Media Driver.
+/// Per-A URIs come from [`ChannelsConfig::tx_data_channel_template`] (for
+/// example `"aeron:ipc?alias=a-{sid}"`), with `{sid}` replaced by the
+/// sequencer id. Stream ids are `tx_data_stream_id_base + sequencer_id`, so
+/// M parallel tx_data streams can share one Media Driver.
 pub struct TxDataPublisher {
     sequencer_id: u8,
     pub_handle: ExclusivePub,
@@ -113,8 +113,8 @@ impl TxDataPublisher {
     }
 
     /// Publish a full `TxEnvelope` to tx_data[i]. Returns the fragment's
-    /// position on the tx_data stream — the value the sequencer will hand
-    /// to [`kardamom_types::TxRef::new`] when writing the canonical record
+    /// position on the tx_data stream. The sequencer passes this value to
+    /// [`kardamom_types::TxRef::new`] when it writes the canonical record
     /// to tx_ordering.
     pub fn publish(&self, env: &TxEnvelope) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, env)
@@ -122,14 +122,14 @@ impl TxDataPublisher {
 }
 
 // ===========================================================================
-// TxOrdering — canonical orderer, tiny refs (+ sealer boundaries).
+// TxOrdering: canonical orderer, tiny refs plus sealer boundaries.
 // ===========================================================================
 
-/// TxOrdering: canonical orderer. Concurrent (shared) publisher carrying
-/// [`TxOrderingMessage`] records — `TxRef` (~16 B) and `BlockBoundaryStart`.
-/// Bulk transaction bytes flow on the per-sequencer tx_data archives;
-/// tx_ordering only ever sees small records, so the canonical-orderer CAS
-/// cursor stays cheap.
+/// TxOrdering: the canonical orderer. A concurrent (shared) publisher that
+/// carries [`TxOrderingMessage`] records: `TxRef` (about 16 bytes) and
+/// `BlockBoundaryStart`. Bulk transaction bytes flow on the per-sequencer
+/// tx_data archives. tx_ordering only ever sees small records, so the
+/// canonical-orderer CAS cursor stays cheap.
 pub struct TxOrderingPublisher {
     pub_handle: Pub,
 }
@@ -160,8 +160,8 @@ impl TxOrderingPublisher {
     }
 
     /// Lower-level publish: hand an already-built [`TxOrderingMessage`] to
-    /// the publisher. Useful when downstream batches refs and boundaries
-    /// before emitting.
+    /// the publisher. Use this when downstream code batches refs and
+    /// boundaries before it sends them.
     pub fn publish_message(&self, m: &TxOrderingMessage) -> Result<BPosition, LogError> {
         offer(&self.pub_handle, m)
     }
@@ -188,11 +188,11 @@ impl QuorumPublisher {
     }
 }
 
-/// Unifies the two Aeron publication variants behind a single `offer_bytes`.
-/// `Pub` (concurrent) is used by channels B/C/watermark/quorum/receipt-cache;
-/// `ExclusivePub` (single-writer) by tx_data[i]. Both expose the same
-/// `i64`-returning `offer` over `&[u8]` — the trait just lets us write one
-/// retry loop instead of two.
+/// Unifies the two Aeron publication variants behind one `offer_bytes`
+/// method. `Pub` (concurrent) serves channels B, C, watermark, quorum, and
+/// receipt-cache. `ExclusivePub` (single-writer) serves tx_data[i]. Both
+/// expose the same `i64`-returning `offer` over `&[u8]`. The trait lets one
+/// retry loop serve both, instead of two.
 trait OfferBytes {
     fn offer_bytes(&self, bytes: &[u8]) -> i64;
 }
@@ -224,20 +224,20 @@ where
 {
     let bytes: AlignedVec = codec::encode(msg)?;
     let len = bytes.len();
-    // `AeronPublication::offer` returns the new stream position (>=0) or a
-    // negative status code. `offer_with_deadline` retries on any negative —
-    // crucially waiting out NOT_CONNECTED so a frame published before the
-    // subscriber's image forms (the multi-host connect race) is delivered rather
-    // than dropped. See crate::offer_retry for the full rationale.
+    // `AeronPublication::offer` returns the new stream position (>= 0) or a
+    // negative status code. `offer_with_deadline` retries on any negative
+    // code. This waits out NOT_CONNECTED, so a frame published before the
+    // subscriber's image forms (the multi-host connect race) is delivered
+    // instead of dropped. See crate::offer_retry for the full reasoning.
     let r = offer_with_deadline(|| p.offer_bytes(bytes.as_slice()), OFFER_TIMEOUT)?;
-    // Aeron returns the position *after* the message; callers want the
-    // fragment's *start* (so the value embedded in a TxRef matches what the
-    // subscriber later sees as the fragment's term_offset).
+    // Aeron returns the position after the message. Callers want the
+    // fragment's start position, so the value in a TxRef matches what the
+    // subscriber later sees as the fragment's term_offset.
     Ok(decode_position(r - len as i64))
 }
 
 /// Aeron returns a stream position as `(term_id << 32) | term_offset` packed
-/// into i64. Unpack into our `BPosition`.
+/// into i64. Unpack it into a `BPosition`.
 fn decode_position(p: i64) -> BPosition {
     let term_id = (p >> 32) as i32;
     let term_offset = (p & 0xFFFF_FFFF) as i32;

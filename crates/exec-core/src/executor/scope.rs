@@ -1,6 +1,6 @@
-//! [`ExecScope`] — the per-block EVM + committed cache — plus the free
+//! [`ExecScope`]: the per-block EVM and committed cache, plus the free
 //! [`execute_tx`] compatibility wrapper and the deterministic invalid-skip
-//! path (#92).
+//! path.
 
 use alloy_consensus::Transaction;
 use alloy_primitives::{Address, B256};
@@ -21,42 +21,43 @@ use super::db::{SnapshotDb, seed_cache_layer};
 use super::tx_env::{decode_alloy_envelope, tx_env_from_alloy};
 use super::write_set::{wire_log, write_set_from_evm_state};
 
-/// Per-tx READ-touch capture for the footprint shadow scheduler
-/// (spec: block-stm-executor §P1). The block-level EIP-7928 BAL cannot
-/// attribute reads per tx — a slot read after another tx wrote it leaves no
+/// Per-tx read-touch capture for the footprint shadow scheduler. The
+/// block-level EIP-7928 BAL cannot
+/// attribute reads per tx. A slot read after another tx wrote it leaves no
 /// trace at all (revm keeps writer indexes only), and `storage_reads` is
-/// block-scoped — so the shadow captures the read side here, at the same
-/// point the BAL capture runs, from the same `outcome.state`. Writes need no
-/// capture: the returned `WriteSet` already carries them exactly.
+/// block-scoped. So the shadow captures the read side here, at the same
+/// point the BAL capture runs, from the same `outcome.state`. Writes need
+/// no capture: the returned `WriteSet` already carries them exactly.
 ///
-/// `account_reads` holds accounts revm loaded but never TOUCHED — the
-/// BALANCE / EXTCODE* / STATICCALL / DELEGATECALL subject class. Note that
-/// plain CALL targets do NOT appear: EIP-161 marks even a zero-value CALL's
-/// recipient as touched (the state-clearing rule), which revm mirrors, so a
-/// call target is only visible through its storage reads / `WriteSet` entry.
-/// `slot_reads` holds every accessed slot whose value did not change, on
-/// touched and untouched accounts alike.
+/// `account_reads` holds accounts revm loaded but never touched: the
+/// BALANCE, EXTCODE*, STATICCALL, and DELEGATECALL subject class. Note
+/// that plain CALL targets do not appear here. EIP-161 marks even a
+/// zero-value CALL's recipient as touched (the state-clearing rule),
+/// which revm mirrors, so a call target is visible only through its
+/// storage reads or `WriteSet` entry. `slot_reads` holds every accessed
+/// slot whose value did not change, on both touched and untouched
+/// accounts.
 #[derive(Debug, Default, Clone)]
 pub struct TouchSet {
     pub account_reads: Vec<Address>,
     pub slot_reads: Vec<(Address, B256)>,
 }
 
-/// Per-BLOCK execution scope: ONE `CacheDB` (layered over
-/// `parent ∘ snapshot`) that revm COMMITS into after each tx, and ONE EVM
-/// instance whose tx-env is swapped per transaction.
+/// A per-block execution scope: one `CacheDB` (layered over `parent`
+/// composed with `snapshot`) that revm commits into after each tx, and
+/// one EVM instance whose tx-env is swapped per transaction.
 ///
-/// This replaces the old per-tx construction, which DHAT measured at ~90%
-/// of all execution-path allocation (421KB/tx): eight 32KB interpreter
-/// stacks per tx (the EVM rebuilt per call) plus a rehash storm from
-/// re-seeding the whole block delta into a fresh cache for every tx. The
-/// per-tx `delta` seeding disappears entirely — the committed cache IS the
-/// intra-block view; `PendingDelta` remains the boundary/BAL artifact,
-/// maintained by the caller exactly as before.
+/// This replaces the old per-tx construction, which DHAT measured at
+/// about 90% of all execution-path allocation (421KB/tx): eight 32KB
+/// interpreter stacks per tx (the EVM rebuilt per call), plus a rehash
+/// storm from re-seeding the whole block delta into a fresh cache for
+/// every tx. Per-tx `delta` seeding disappears entirely. The committed
+/// cache is now the intra-block view. `PendingDelta` remains the
+/// boundary and BAL artifact, maintained by the caller exactly as before.
 ///
 /// The free [`execute_tx`] wrapper (one scope per call) keeps the old
-/// signature for replay and tests; hot paths hold a scope per block
-/// (executor) or per batch (validator).
+/// signature, for replay and tests. Hot paths hold one scope per block
+/// (the executor) or per batch (the validator).
 pub struct ExecScope<S: StateDatabase> {
     evm: revm::handler::MainnetEvm<
         revm::context::Context<
@@ -70,8 +71,8 @@ pub struct ExecScope<S: StateDatabase> {
 }
 
 impl<S: StateDatabase> ExecScope<S> {
-    /// Build the block's scope: cache seeded with the PARENT layer only
-    /// (fixed for the whole block), EVM constructed once.
+    /// Build the block's scope. The cache is seeded with the parent layer
+    /// only (fixed for the whole block), and the EVM is constructed once.
     pub fn new(
         snapshot: S,
         parent: Option<&PendingDelta>,
@@ -81,13 +82,13 @@ impl<S: StateDatabase> ExecScope<S> {
         Self::new_with_envs(snapshot, parent, env, block, cfg)
     }
 
-    /// Like [`ExecScope::new`], but with caller-supplied revm envs instead of
-    /// the [`ExecEnv`]-derived production ones. This is the seam the EEST
-    /// conformance runner uses to execute under a *fixture's* block env
-    /// (coinbase, basefee, difficulty, blob params) — it tests the engine's
-    /// revm integration, not kardamom's boundary derivation. Production
-    /// paths use [`ExecScope::new`]; `env` here only feeds the metadata on
-    /// skip receipts (block number).
+    /// Like [`ExecScope::new`], but with caller-supplied revm envs, instead
+    /// of the ones derived from [`ExecEnv`]. This is the seam the EEST
+    /// conformance runner uses to execute under a fixture's block env
+    /// (coinbase, basefee, difficulty, blob params). It tests the
+    /// engine's revm integration, not kardamom's boundary derivation.
+    /// Production paths use [`ExecScope::new`]. Here, `env` only feeds
+    /// the metadata on skip receipts (block number).
     pub fn new_with_envs(
         snapshot: S,
         parent: Option<&PendingDelta>,
@@ -108,16 +109,17 @@ impl<S: StateDatabase> ExecScope<S> {
         Ok(scope)
     }
 
-    /// Seed a delta layer into the block cache (later seeds overwrite).
-    /// Used for the parent layer at construction and by the compatibility
-    /// wrapper for a caller-maintained live delta.
+    /// Seed a delta layer into the block cache. Later seeds overwrite
+    /// earlier ones. This is used for the parent layer at construction,
+    /// and by the compatibility wrapper for a caller-maintained live
+    /// delta.
     pub fn seed_layer(&mut self, layer: &PendingDelta) -> Result<(), ExecutorError> {
         let cache = revm::context_interface::ContextTr::db_mut(&mut *self.evm);
         seed_cache_layer(cache, layer).map_err(ExecutorError::State)
     }
 
     #[allow(clippy::too_many_arguments)] // matches the free execute_tx's shape;
-    // see the equivalent allow there for the rationale.
+    // see the matching allow there for the reason.
     pub fn execute_tx(
         &mut self,
         tx_idx: TxIndex,
@@ -127,26 +129,31 @@ impl<S: StateDatabase> ExecScope<S> {
         cumulative_gas_used_before: u64,
         // EIP-7928 capture: see the free `execute_tx`.
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
-        // Footprint-shadow read capture: see [`TouchSet`]. `None` everywhere
-        // except the executor's streaming path with the shadow enabled.
+        // Footprint-shadow read capture: see [`TouchSet`]. This is `None`
+        // everywhere except the executor's streaming path, with the
+        // shadow enabled.
         touches: Option<&mut TouchSet>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
-        // DERIVATION IS TOTAL (#92): a canonical record that is DETERMINISTICALLY
-        // invalid — undecodable bytes, or a tx revm rejects at validation
-        // (NonceTooLow duplicate past every dedup layer, NonceTooHigh from a
-        // sealed gap, insufficient balance, …) — must NOT halt execution: every
-        // replica, the recovery replay, and the validator all see the same input
-        // and would all halt in lockstep, permanently (a poisoned log wedges
-        // recovery replay on the same record forever). Instead it is SKIPPED with
-        // a receipt: `status=false, gas_used=0` — unreachable by real execution,
-        // since any executed tx (revert or halt included) charges at least
-        // intrinsic gas — so the pair is the wire-visible skip marker
-        // ([`kardamom_types::Receipt::is_invalid_skip`]). The skip is part of the
-        // deterministic state transition (empty write set, no state change,
-        // counters advance), identical across live / replay / validator re-exec.
-        // Non-deterministic failures (Database errors) still fail-stop below.
-        // A skip is LOUD: any occurrence means an upstream guard failed
-        // (`kardamom_executor_invalid_tx_skipped_total` deserves an alert).
+        // Derivation must be total. A canonical record that is
+        // deterministically invalid must not halt execution. This
+        // includes undecodable bytes, and a tx revm rejects at validation
+        // (a NonceTooLow duplicate that got past every dedup layer,
+        // NonceTooHigh from a sealed gap, insufficient balance, and so
+        // on). Every replica, the recovery replay, and the validator all
+        // see the same input, and would all halt in lockstep, forever (a
+        // poisoned log wedges recovery replay on the same record
+        // forever). Instead, this skips the record with a receipt:
+        // `status=false, gas_used=0`. Real execution can never produce
+        // this pair, since any executed tx (including a revert or a
+        // halt) charges at least intrinsic gas. So the pair is the
+        // wire-visible skip marker
+        // ([`kardamom_types::Receipt::is_invalid_skip`]). The skip is
+        // part of the deterministic state transition (empty write set,
+        // no state change, counters advance), identical across the live
+        // path, replay, and validator re-execution. Non-deterministic
+        // failures (database errors) still fail-stop below. A skip is
+        // loud by design: any occurrence means an upstream guard failed,
+        // and `kardamom_executor_invalid_tx_skipped_total` should alert.
         let alloy_env = match decode_alloy_envelope(&inbound_envelope.raw_tx, tx_idx) {
             Ok(env_) => env_,
             Err(e) => {
@@ -174,14 +181,14 @@ impl<S: StateDatabase> ExecScope<S> {
         )
     }
 
-    /// [`Self::execute_tx`] with the RLP already decoded.
+    /// [`Self::execute_tx`], with the RLP already decoded.
     ///
-    /// Decoding is ~180ns/tx and is naturally done by whoever reads the
-    /// tx stream (the STM engine's `prepare` does exactly this, off the
-    /// execution thread). Exposing the pre-decoded entry point lets the
-    /// SEQUENTIAL path have the same benefit — and lets the A/B harness
-    /// compare the two engines on equal footing instead of charging
-    /// decode to one side only.
+    /// Decoding costs about 180ns/tx, and whoever reads the tx stream
+    /// naturally does it (the STM engine's `prepare` does exactly this,
+    /// off the execution thread). Exposing the pre-decoded entry point
+    /// lets the sequential path get the same benefit, and lets the A/B
+    /// harness compare the two engines on equal footing, instead of
+    /// charging decode to only one side.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_tx_decoded(
         &mut self,
@@ -194,12 +201,13 @@ impl<S: StateDatabase> ExecScope<S> {
         bal: Option<(&mut revm::state::bal::Bal, u64)>,
         touches: Option<&mut TouchSet>,
     ) -> Result<(Receipt, WriteSet), ExecutorError> {
-        let signer = inbound_envelope.sender; // trusted from proxy; no recovery
+        let signer = inbound_envelope.sender; // trusted from the proxy; no recovery
         let nonce = alloy_env.nonce();
         let to = alloy_env.to();
-        // Effective gas price mirrors the value `tx_env_from_alloy` feeds revm:
-        // legacy/2930 `gas_price` when present, otherwise the 1559/4844
-        // `max_fee_per_gas` cap. v0 has basefee = 0 so the cap is what's paid.
+        // Effective gas price mirrors the value `tx_env_from_alloy` feeds
+        // to revm: the legacy or 2930 `gas_price` when present, otherwise
+        // the 1559 or 4844 `max_fee_per_gas` cap. Version 0 has
+        // basefee = 0, so the cap is what gets paid.
         let effective_gas_price = alloy_env
             .gas_price()
             .unwrap_or_else(|| alloy_env.max_fee_per_gas());
@@ -207,8 +215,8 @@ impl<S: StateDatabase> ExecScope<S> {
         let tx_env = tx_env_from_alloy(alloy_env, signer);
         let outcome = match self.evm.transact(tx_env) {
             Ok(o) => o,
-            // Deterministic input-invalidity: every replica computes the same
-            // rejection from the same (state, tx) — skip, never halt (#92).
+            // Deterministic input invalidity: every replica computes the
+            // same rejection from the same state and tx. Skip, never halt.
             Err(revm::context::result::EVMError::Transaction(reason)) => {
                 return Ok(invalid_skip(
                     &format!("{reason:?}"),
@@ -233,8 +241,9 @@ impl<S: StateDatabase> ExecScope<S> {
                     cumulative_gas_used_before,
                 ));
             }
-            // Database / custom failures are LOCAL, not derivable from the input:
-            // halting here is correct (crash recovery replays cleanly).
+            // Database or custom failures are local, not derivable from
+            // the input. Halting here is correct; crash recovery replays
+            // cleanly.
             Err(e) => {
                 return Err(ExecutorError::Execution {
                     idx: tx_idx,
@@ -252,10 +261,10 @@ impl<S: StateDatabase> ExecScope<S> {
             }
         };
 
-        // Build the write set from revm's per-tx EvmState. Only touched / changed
-        // accounts and slots are emitted, which keeps the per-tx hash stable
-        // across replicas (revm's iteration is over an AddressMap; we re-sort
-        // into BTreeMap inside WriteSet via insert).
+        // Build the write set from revm's per-tx EvmState. Only touched
+        // and changed accounts and slots are emitted, which keeps the
+        // per-tx hash stable across replicas. Revm iterates over an
+        // AddressMap; `WriteSet::finish` sorts the entries afterward.
         let ws = write_set_from_evm_state(&outcome.state);
         if let Some((bal, bal_index)) = bal {
             for (addr, account) in outcome.state.iter() {
@@ -275,8 +284,9 @@ impl<S: StateDatabase> ExecScope<S> {
                 }
             }
         }
-        // Fold this tx's writes into the block cache: later txs read them
-        // directly — no per-tx re-seeding (this WAS 84% of all allocation).
+        // Fold this tx's writes into the block cache. Later txs read
+        // them directly, with no per-tx re-seeding (that used to cause
+        // 84% of all allocation).
         revm::DatabaseCommit::commit(
             revm::context_interface::ContextTr::db_mut(&mut *self.evm),
             outcome.state,
@@ -285,21 +295,21 @@ impl<S: StateDatabase> ExecScope<S> {
         let write_set_hash = ws.hash();
         let wire_logs = logs.iter().map(wire_log).collect();
         let cumulative_gas_used = cumulative_gas_used_before + gas_used;
-        // Contract address is meaningful only for successful CREATE txs.
-        // Failed CREATEs and any CALL tx have `contract_address = None`.
+        // Contract address is meaningful only for a successful CREATE tx.
+        // A failed CREATE and any CALL tx have `contract_address = None`.
         let contract_address = if to.is_none() && status.is_success() {
             Some(signer.create(nonce))
         } else {
             None
         };
 
-        // CRITICAL (S0): copy `tx_hash` straight from the inbound envelope —
-        // DO NOT recompute via keccak256(raw_tx). The proxy (S1) is the canonical
+        // Copy `tx_hash` straight from the inbound envelope. Do not
+        // recompute it with keccak256(raw_tx). The proxy is the canonical
         // hash producer.
         let receipt = Receipt {
             tx_idx: tx_position,
             tx_hash: inbound_envelope.tx_hash,
-            // EIP-2718 type read off the raw envelope (legacy ⇒ 0x00).
+            // EIP-2718 type, read from the raw envelope (legacy is 0x00).
             tx_type: kardamom_types::tx_type_of(&inbound_envelope.raw_tx),
             status: status.is_success(),
             gas_used,
@@ -318,23 +328,25 @@ impl<S: StateDatabase> ExecScope<S> {
     }
 }
 
-/// Execute one tx against a snapshot + the current PendingDelta. Returns the
-/// receipt plus a fresh per-tx WriteSet. The caller folds the WriteSet into
-/// the PendingDelta before invoking the next tx so later txs see the writes.
+/// Execute one tx against a snapshot and the current `PendingDelta`.
+/// Returns the receipt, plus a fresh per-tx `WriteSet`. The caller folds
+/// the `WriteSet` into the `PendingDelta` before calling this for the
+/// next tx, so later txs see the writes.
 ///
 /// `inbound_envelope: &TxEnvelope` is `kardamom_types::TxEnvelope`. Its
-/// `sender` and `tx_hash` are trusted unconditionally — the proxy (S1)
-/// populated them at the system boundary. The executor **never recomputes
-/// `tx_hash`** (S0) and **never recovers a sender** (S0); it
-/// copies both fields straight through into the outbound `Receipt`.
+/// `sender` and `tx_hash` are trusted unconditionally; the proxy
+/// populated them at the system boundary. The executor never recomputes
+/// `tx_hash` and never recovers a sender. It copies both fields straight
+/// through into the outbound `Receipt`.
 ///
-/// `tx_index_in_block` is the zero-based index within the in-flight block
-/// (resets at every `BlockBoundaryStart`). `cumulative_gas_used_before` is the
-/// running gas sum for txs already executed in the same block; the returned
-/// receipt's `cumulative_gas_used` equals this plus the new tx's `gas_used`.
+/// `tx_index_in_block` is the zero-based index within the in-flight
+/// block (it resets at every `BlockBoundaryStart`).
+/// `cumulative_gas_used_before` is the running gas sum for txs already
+/// executed in the same block. The returned receipt's
+/// `cumulative_gas_used` equals this plus the new tx's `gas_used`.
 #[allow(clippy::too_many_arguments)] // 8 args is the natural shape of an
-// "execute one tx" entry point — packaging them into a struct would shuffle
-// the noise around without reducing it.
+// "execute one tx" entry point. Packaging them into a struct would just
+// move the noise around, not reduce it.
 pub fn execute_tx<S: StateDatabase>(
     snapshot: &S,
     parent: Option<&PendingDelta>,
@@ -345,16 +357,17 @@ pub fn execute_tx<S: StateDatabase>(
     inbound_envelope: &TxEnvelope,
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
-    // EIP-7928 capture (spec: bal-attribution-parallel-validation): when
-    // set, every account/slot this tx touched is recorded into the block's
-    // Bal under `bal_index` (1-based tx position per revm's convention) —
-    // writes as (index, value), read-only accesses into storage_reads.
-    // revm classifies from original-vs-present in `outcome.state`.
+    // EIP-7928 capture. When set, this records every account and slot
+    // the tx touched into the
+    // block's Bal, under `bal_index` (a 1-based tx position, by revm's
+    // convention). Writes go in as (index, value); read-only accesses go
+    // into storage_reads. Revm classifies each by comparing original and
+    // present values in `outcome.state`.
     bal: Option<(&mut revm::state::bal::Bal, u64)>,
 ) -> Result<(Receipt, WriteSet), ExecutorError> {
-    // Compatibility wrapper: one throwaway scope per call (replay + tests).
-    // Hot paths hold an [`ExecScope`] per block/batch instead — that is
-    // where the allocation win lives.
+    // A compatibility wrapper: one throwaway scope per call, for replay
+    // and tests. Hot paths hold an [`ExecScope`] per block or batch
+    // instead. That is where the allocation savings come from.
     let mut scope = ExecScope::new(snapshot, parent, env)?;
     scope.seed_layer(delta)?;
     scope.execute_tx(
@@ -368,15 +381,18 @@ pub fn execute_tx<S: StateDatabase>(
     )
 }
 
-/// Build the deterministic SKIP receipt for a canonical record that is
-/// invalid at execution (#92): `status=false, gas_used=0` (the wire-visible
-/// marker — real execution always charges intrinsic gas), empty logs, EMPTY
-/// write set (`WriteSet::default().hash()` on both the live and re-exec
-/// sides), gas accounting unchanged. Loud by design: log + counter — a skip
-/// existing at all means an upstream guard (sequencer nonce fence, cluster
-/// dedup, resync floors) let an invalid record reach the canonical log.
-/// Public: the Block-STM engine (`kardamom-stm`) produces the identical
-/// skip artifact on its parallel path — one definition, one wire shape.
+/// Build the deterministic skip receipt for a canonical record that is
+/// invalid at execution: `status=false, gas_used=0` (the wire-visible
+/// marker, since real execution always charges intrinsic gas), empty
+/// logs, an empty write set (`WriteSet::default().hash()` on both the
+/// live and re-exec sides), and unchanged gas accounting. This is loud by
+/// design: a log plus a counter. A skip existing at all means an upstream
+/// guard (sequencer nonce fence, cluster dedup, or resync floor) let an
+/// invalid record reach the canonical log.
+///
+/// Public API: the Block-STM engine (`kardamom-stm`) produces the
+/// identical skip artifact on its parallel path. One definition, one
+/// wire shape.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(feature = "std"), allow(unused_variables))]
 pub fn invalid_skip(
@@ -389,8 +405,8 @@ pub fn invalid_skip(
     tx_index_in_block: u64,
     cumulative_gas_used_before: u64,
 ) -> (Receipt, WriteSet) {
-    // Loudness is a `std`-side concern; the skip receipt itself is the
-    // consensus artifact and is produced identically in guest builds.
+    // Loudness is a `std`-side concern. The skip receipt itself is the
+    // consensus artifact, and guest builds produce it identically.
     #[cfg(feature = "std")]
     {
         tracing::error!(
@@ -467,15 +483,15 @@ mod tests {
         }
     }
 
-    // ── #92: deterministically-invalid canonical txs SKIP, never halt ──────
+    // -- Deterministically invalid canonical txs skip, never halt ---------
 
     #[test]
     fn nonce_too_low_skips_with_marker_receipt_and_chain_continues() {
         let signer = PrivateKeySigner::random();
         let from = signer.address();
         let to = address!("0000000000000000000000000000000000001234");
-        // Sender's canonical nonce is 5: a nonce-3 tx (a duplicate past every
-        // dedup layer) is deterministically invalid.
+        // The sender's canonical nonce is 5. A nonce-3 tx (a duplicate
+        // past every dedup layer) is deterministically invalid.
         let snap = MockStateDatabase::builder()
             .account(from, U256::from(10u128.pow(18)), 5, KECCAK_EMPTY)
             .build();
@@ -510,7 +526,7 @@ mod tests {
         );
         assert!(ws.accounts.is_empty() && ws.storage.is_empty() && ws.code.is_empty());
 
-        // The chain continues: the sender's REAL next tx (nonce 5) executes.
+        // The chain continues. The sender's real next tx, nonce 5, executes.
         let env2 = ExecEnv::new(1, &boundary(1));
         let live = signed_transfer(&signer, to, 1_000, 5);
         let (r2, _) = execute_tx(
@@ -588,12 +604,13 @@ mod tests {
         )
         .expect("execute");
 
-        //the receipt's tx_hash MUST equal the inbound envelope's
-        // tx_hash byte-for-byte. No recomputation in the executor.
+        // The receipt's tx_hash must equal the inbound envelope's
+        // tx_hash, byte for byte. The executor never recomputes it.
         assert_eq!(receipt.tx_hash, env_tx.tx_hash);
-        assert!(receipt.status); // success = bool true (kardamom_types::Receipt)
+        assert!(receipt.status); // success is bool true (kardamom_types::Receipt)
         assert!(receipt.gas_used >= 21_000);
-        // Both accounts touched: sender (balance + nonce) and recipient (balance).
+        // Both accounts are touched: the sender (balance and nonce) and
+        // the recipient (balance).
         assert!(ws.account(&from).is_some());
         assert!(ws.account(&to).is_some());
         assert_eq!(ws.account(&to).unwrap().1, U256::from(1_000u64));
@@ -606,7 +623,7 @@ mod tests {
         assert_eq!(receipt.to, Some(to));
         assert_eq!(receipt.contract_address, None);
         assert_eq!(receipt.nonce, 0);
-        assert_eq!(receipt.effective_gas_price, 0); // tx built with gas_price = 0
+        assert_eq!(receipt.effective_gas_price, 0); // the tx was built with gas_price = 0
         assert_eq!(receipt.block_number, 1);
         assert_eq!(receipt.transaction_index, 0);
         assert_eq!(receipt.cumulative_gas_used, receipt.gas_used);
@@ -646,8 +663,8 @@ mod tests {
         let gas_after_tx1 = r1.cumulative_gas_used;
         delta.apply(ws1);
 
-        // Second transfer from the same sender; nonce must be 1, sender
-        // balance must already be debited 100.
+        // Second transfer from the same sender. The nonce must be 1, and
+        // the sender balance must already show a debit of 100.
         let tx2 = signed_transfer(&signer, to, 50, 1);
         let (r2, ws2) = execute_tx(
             &snap,
@@ -666,15 +683,15 @@ mod tests {
         assert_eq!(r2.tx_hash, tx2.tx_hash);
         assert_eq!(ws2.account(&to).unwrap().1, U256::from(150u64));
         assert_eq!(ws2.account(&from).unwrap().0, 2); // nonce
-        // RPC enrichment: tx2 sees a higher nonce + transaction_index;
-        // cumulative_gas_used accumulates across both txs in the block.
+        // RPC enrichment: tx2 sees a higher nonce and transaction_index.
+        // cumulative_gas_used adds up across both txs in the block.
         assert_eq!(r2.nonce, 1);
         assert_eq!(r2.transaction_index, 1);
         assert_eq!(r2.cumulative_gas_used, gas_after_tx1 + r2.gas_used);
     }
 
-    /// Regression: EIP-7928 capture must actually populate the block Bal
-    /// when a Bal handle is supplied to `execute_tx` (spec phase 1). An
+    /// Regression: EIP-7928 capture must actually populate the block BAL
+    /// when a BAL handle is supplied to `execute_tx` (spec phase 1). An
     /// empty BAL means the validator has nothing to verify or seed from.
     #[test]
     fn execute_tx_captures_into_the_block_bal() {
@@ -710,7 +727,8 @@ mod tests {
             "capture produced an EMPTY BAL for a tx that wrote {} accounts",
             ws.accounts.len()
         );
-        // Sender and recipient must both appear with balance/nonce claims.
+        // The sender and recipient must both appear, with balance or
+        // nonce claims.
         let has_sender = alloy.iter().any(|a| {
             a.address == from && (!a.balance_changes.is_empty() || !a.nonce_changes.is_empty())
         });
@@ -720,10 +738,10 @@ mod tests {
         );
     }
 
-    /// Production shape: the SECOND tx in a block executes against a
-    /// non-empty `delta` (seeded into the CacheDB). Capture must still
-    /// record it — the first live measurement produced empty BALs while
-    /// deltas were 76KB/block, and empty-delta tests passed.
+    /// Production shape: the second tx in a block executes against a
+    /// non-empty `delta`, seeded into the CacheDB. Capture must still
+    /// record it. An earlier bug produced empty BALs once deltas grew to
+    /// about 76KB/block, even though empty-delta tests passed.
     #[test]
     fn execute_tx_captures_with_a_seeded_delta() {
         let signer = PrivateKeySigner::random();
@@ -754,7 +772,7 @@ mod tests {
         delta.apply(ws1);
         let after_tx1 = bal.clone().into_alloy_bal().len();
 
-        // tx2 runs with the seeded delta — the production path.
+        // tx2 runs with the seeded delta. This is the production path.
         let tx2 = signed_transfer(&signer, to, 500, 1);
         let (_r2, ws2) = execute_tx(
             &snap,
@@ -774,7 +792,8 @@ mod tests {
         let alloy = bal.into_alloy_bal();
         assert!(after_tx1 > 0, "tx1 must be captured");
         assert!(!alloy.is_empty(), "capture must survive a seeded delta");
-        // tx2's claims must be present: some account carries a bal_index 2 change.
+        // tx2's claims must be present: some account carries a
+        // bal_index 2 change.
         let has_tx2 = alloy.iter().any(|a| {
             a.balance_changes.iter().any(|c| c.block_access_index == 2)
                 || a.nonce_changes.iter().any(|c| c.block_access_index == 2)

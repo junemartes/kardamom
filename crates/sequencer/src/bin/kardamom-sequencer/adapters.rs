@@ -1,4 +1,4 @@
-//! Adapters: log::aeron_live handles → sequencer trait surface.
+//! Adapters that convert log::aeron_live handles to the sequencer trait surface.
 
 use kardamom_log::aeron_live::{
     TxDataSubscriberHandle, TxDepositsSubscriberHandle, TxErrorsPublisherHandle,
@@ -43,12 +43,12 @@ impl EpochSubscriber for LiveEpochSub {
     }
 }
 
-/// Live `TxErrorPublisher` wrapping a `TxErrorsPublisherHandle`. Sequencer-
-/// emitted rejections (duplicate / past-nonce today) are published on the
-/// `tx_errors` Aeron channel; ingress consumes them to release parked
-/// clients early. Publish failures are logged and dropped — the canonical
-/// state has already advanced (or the tx was rejected), so there is nothing
-/// to roll back.
+/// Live `TxErrorPublisher` that wraps a `TxErrorsPublisherHandle`.
+/// The sequencer publishes rejections (today: duplicate or past-nonce) on
+/// the `tx_errors` Aeron channel. Ingress reads them to release parked
+/// clients early. A publish failure is logged and dropped: the canonical
+/// state has already advanced, or the transaction was rejected, so there
+/// is nothing to roll back.
 pub struct LiveTxErrorPub {
     handle: TxErrorsPublisherHandle,
 }

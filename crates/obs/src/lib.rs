@@ -9,9 +9,9 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 
 pub mod bin;
 
-/// [`init`] with the version/git-sha incantation filled in at the CALL
-/// site, so each binary stamps its own crate version (a plain helper fn
-/// would bake in kardamom-obs's).
+/// [`init`] with the version and git-sha values filled in at the call
+/// site, so each binary stamps its own crate version. A plain helper
+/// function would bake in kardamom-obs's version instead.
 ///
 /// ```ignore
 /// kardamom_obs::init_service!("ingress", args.metrics_addr, &args.host_id)?;
@@ -29,8 +29,8 @@ macro_rules! init_service {
     };
 }
 
-/// Whether an exporter build failure is a TCP bind `AddrInUse` (the ONLY
-/// retryable class — #122). Checked structurally through the error chain,
+/// Check whether an exporter build failure is a TCP bind `AddrInUse` error,
+/// the only retryable class. This checks the error chain structurally,
 /// with a string fallback in case the exporter crate stringifies the io
 /// error instead of sourcing it.
 fn is_addr_in_use(e: &anyhow::Error) -> bool {
@@ -67,40 +67,41 @@ pub fn init(
         return Err(anyhow!("host_id must be non-empty"));
     }
 
-    // Build AND run the exporter on a DEDICATED thread with its own
+    // Build and run the exporter on a dedicated thread with its own
     // single-threaded runtime, never on the service's tokio runtime.
     // `PrometheusBuilder::install()` spawns onto the ambient runtime when one
-    // exists, which couples scrape liveness to service-runtime health: a
-    // wedged or starved service runtime silently takes /metrics down with it,
-    // and every probe reads "service gone" when the truth is "service wedged"
-    // (see issue #76 — the node-failure-executor blackout). A dedicated
-    // thread keeps /metrics answering regardless, so wedged-but-alive is
-    // observable as `kardamom_service_up == 1` with stale gauges.
+    // exists. That would couple scrape liveness to service-runtime health: a
+    // wedged or starved service runtime would silently take /metrics down
+    // with it, so every probe would read "service gone" when the truth is
+    // "service wedged". A dedicated thread keeps /metrics answering
+    // regardless, so a wedged-but-alive service shows as
+    // `kardamom_service_up == 1` with stale gauges.
     //
-    // The whole build runs INSIDE the dedicated runtime's context because
-    // `PrometheusBuilder::build()` requires an ambient Tokio reactor ("there
-    // is no reactor running" otherwise) — and some callers (da-watcher) call
-    // `init` from a plain non-async main. The channel hand-off makes init
-    // fail-fast and guarantees the recorder is globally installed before
-    // init returns (so `describe_*!`/`gauge!` below always hit it).
+    // The whole build runs inside the dedicated runtime's context, because
+    // `PrometheusBuilder::build()` needs an ambient Tokio reactor (it fails
+    // with "there is no reactor running" otherwise), and some callers
+    // (da-watcher) call `init` from a plain non-async main. The channel
+    // hand-off makes init fail fast and guarantees the recorder is globally
+    // installed before init returns, so `describe_*!` and `gauge!` below
+    // always reach it.
     //
     // Fail-fast includes the HTTP bind: metrics-exporter-prometheus (0.18)
     // binds the TCP listener synchronously inside `build()`, so a port
-    // collision surfaces through `ready_tx` as an init error rather than a
-    // healthy-looking service with no /metrics. Pinned by the
-    // init_port_in_use integration test — if a dependency upgrade moves the
-    // bind into the exporter future's first poll, that test fails and the
-    // bind must be made eager here (e.g. pre-bind a std TcpListener).
-    // #122: EADDRINUSE gets a BOUNDED retry; every other bind/build error
-    // stays fail-fast. A port squatter is usually a wedged or frozen
-    // predecessor seconds away from being reaped by its supervisor — dying
-    // instantly burns one restart attempt per squat, and under a
-    // `mode = "fail"` restart policy (the validator: 5 attempts, then stay
-    // down) that converts a transient squat into a PERMANENT outage
-    // (reproduced end-to-end in #122: frozen validator holds :9006, every
-    // replacement dies at bind, alloc stranded). The default budget
-    // (24 × 5 s = 2 min) outlives a supervisor reap cycle; tests shrink it
-    // via the env knobs.
+    // collision surfaces through `ready_tx` as an init error, rather than as
+    // a healthy-looking service with no /metrics. The init_port_in_use
+    // integration test pins this: if a dependency upgrade moves the bind
+    // into the exporter future's first poll, that test fails, and the bind
+    // must be made eager here again (for example, by pre-binding a std
+    // TcpListener).
+    //
+    // An `AddrInUse` error gets a bounded retry; every other bind or build
+    // error stays fail-fast. A port squatter is usually a wedged or frozen
+    // predecessor seconds away from being reaped by its supervisor. Dying
+    // instantly would burn one restart attempt per squat, and under a
+    // `mode = "fail"` restart policy (the validator allows 5 attempts, then
+    // stays down), that would turn a transient squat into a permanent
+    // outage. The default budget (24 x 5 s = 2 min) outlives a supervisor
+    // reap cycle; tests shrink it through the env knobs below.
     let bind_retries: u32 = std::env::var("KARDAMOM_OBS_BIND_RETRIES")
         .ok()
         .and_then(|v| v.parse().ok())

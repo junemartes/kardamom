@@ -25,7 +25,7 @@ fn log_codec_access_and_materialize() {
 #[test]
 fn log_codec_tx_ref_roundtrip() {
     // TxData still carries full TxEnvelopes (above). TxOrdering carries
-    // tiny TxRef-based messages. Verify both wire shapes encode
+    // tiny TxRef-based messages. This checks that both wire shapes encode
     // through the shared codec helpers.
     let r = TxRef {
         tx_hash: alloy_primitives::B256::ZERO,
@@ -37,9 +37,10 @@ fn log_codec_tx_ref_roundtrip() {
         tx_data_session_id: 0,
     };
     let bytes = encode(&r).unwrap();
-    // ~16 B on the wire (TxRef is sequencer_id: u8 + BPosition: i32+i32 + padding).
-    // Hard-bound at 64 to give rkyv 0.8 some metadata headroom without letting
-    // the type grow silently — a regression in size is a regression in the
+    // About 16 bytes on the wire (TxRef is sequencer_id: u8 plus
+    // BPosition: i32+i32 plus padding). This hard-bounds it at 64 to give
+    // rkyv 0.8 some metadata headroom without letting the type grow
+    // silently. A regression in size is a regression in the
     // canonical-orderer's CAS-cursor pressure.
     assert!(
         bytes.len() <= 64,
