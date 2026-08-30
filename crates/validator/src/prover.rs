@@ -118,11 +118,18 @@ pub fn spool_block(
 
     let mut bal_rlp = Vec::new();
     alloy_rlp::Encodable::encode(&bal, &mut bal_rlp);
+    let mut digest = kardamom_types::BlockRecordsDigest::new(block);
+    for r in records {
+        if let BufferedRecord::Tx { envelope, .. } = r {
+            digest.add_tx(&envelope.raw_tx);
+        }
+    }
     let outputs = PublicOutputs {
         pre_state_root: pre_root,
         post_state_root: post_root,
-        bal_commitment: keccak256(&bal_rlp),
         block_number: block,
+        records_digest: digest.finish(),
+        bal_commitment: keccak256(&bal_rlp),
     };
     let input = assemble_prover_input(chain_id, env, witness, proofs, records, bal_rlp, 1);
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&input)

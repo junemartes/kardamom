@@ -2,8 +2,9 @@
 //!
 //! Two reads:
 //!   * `finalized_block_number()` — the latest L1 block tagged `finalized`.
-//!   * `deposit_logs(lockbox, from, to)` — `DepositInitiated` events emitted
-//!     by `lockbox` in the inclusive range `[from, to]`.
+//!   * `lockbox_logs(lockbox, from, to)` — `DepositInitiated` **and**
+//!     `UpgradeInitiated` events emitted by `lockbox` in the inclusive range
+//!     `[from, to]`, in canonical `(block, log_index)` order.
 //!
 //! Errors split between transport/decode failures ([`L1SourceError`]) and
 //! "L1 has no finalized block yet" — the latter is classified separately so
@@ -12,10 +13,10 @@
 use alloy_primitives::{Address, B256};
 use async_trait::async_trait;
 
-// `DepositLog` — the decoded `DepositInitiated` event — lives in
-// `kardamom_types::epoch` alongside the derivation rule that consumes it, so
-// producer and verifier share one definition.
-pub use kardamom_types::epoch::DepositLog;
+// The decoded log shapes live in `kardamom_types::epoch` alongside the
+// derivation rule that consumes them, so producer and verifier share one
+// definition.
+pub use kardamom_types::epoch::{DepositLog, LockboxLog, UpgradeLog};
 
 /// Errors that can surface from an `L1Source`. Exclusively transport- or
 /// decode-level; semantic deposit failures (overflow, dedup) come back from
@@ -61,15 +62,21 @@ pub trait L1Source: Send + Sync + 'static {
         Ok(self.block_ids(number).await?.0)
     }
 
-    /// `DepositInitiated` logs emitted by `lockbox` in the inclusive block
-    /// range `[from_block, to_block]`. Order within the response is the
-    /// canonical (block, log_index) order.
-    async fn deposit_logs(
+    /// Lockbox logs — `DepositInitiated` and `UpgradeInitiated` — emitted by
+    /// `lockbox` in the inclusive block range `[from_block, to_block]`. Order
+    /// within the response is the canonical (block, log_index) order.
+    ///
+    /// Both event kinds MUST come back from one query. Fetching them
+    /// separately and merging would let a partial failure drop one kind
+    /// silently, and the producer and verifier would then derive different
+    /// epochs from the same L1 block — the exact divergence
+    /// `derive_epoch` exists to make impossible.
+    async fn lockbox_logs(
         &self,
         lockbox: Address,
         from_block: u64,
         to_block: u64,
-    ) -> Result<Vec<DepositLog>, L1SourceError>;
+    ) -> Result<Vec<LockboxLog>, L1SourceError>;
 }
 
 #[cfg(any(test, feature = "testing"))]
@@ -85,8 +92,8 @@ pub mod fakes {
         /// Pre-scripted outcomes for `finalized_block_number()` calls
         /// (FIFO). `Ok(tip)` returns the tip; `Err` returns the error.
         pub tips: Mutex<VecDeque<Result<u64, L1SourceError>>>,
-        /// Pre-scripted outcomes for `deposit_logs(...)` calls (FIFO).
-        pub logs: Mutex<VecDeque<Result<Vec<DepositLog>, L1SourceError>>>,
+        /// Pre-scripted outcomes for `lockbox_logs(...)` calls (FIFO).
+        pub logs: Mutex<VecDeque<Result<Vec<LockboxLog>, L1SourceError>>>,
         /// Hash returned for a given block number. Unlisted numbers get a
         /// deterministic filler (`repeat_byte(number)`) so tests that don't
         /// care about hashes don't have to populate this.
@@ -117,8 +124,13 @@ pub mod fakes {
             self.tips.lock().unwrap().push_back(r);
         }
 
-        pub fn push_logs(&self, r: Result<Vec<DepositLog>, L1SourceError>) {
+        pub fn push_logs(&self, r: Result<Vec<LockboxLog>, L1SourceError>) {
             self.logs.lock().unwrap().push_back(r);
+        }
+
+        /// Convenience for the common case: script a round of deposit logs.
+        pub fn push_deposit_logs(&self, logs: Vec<DepositLog>) {
+            self.push_logs(Ok(logs.into_iter().map(LockboxLog::Deposit).collect()));
         }
     }
 
@@ -157,12 +169,12 @@ pub mod fakes {
             Ok((at(number), at(number.saturating_sub(1))))
         }
 
-        async fn deposit_logs(
+        async fn lockbox_logs(
             &self,
             _lockbox: Address,
             _from_block: u64,
             _to_block: u64,
-        ) -> Result<Vec<DepositLog>, L1SourceError> {
+        ) -> Result<Vec<LockboxLog>, L1SourceError> {
             self.logs
                 .lock()
                 .unwrap()

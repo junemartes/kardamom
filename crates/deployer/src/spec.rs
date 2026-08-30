@@ -126,14 +126,31 @@ pub fn encode_oracle_init_args(attester: Address, challenger: Address, window: u
     Bytes::from((attester, challenger, window).abi_encode_params())
 }
 
-/// Init args for `KardamomProofOracle.initialize(address,address,bytes32,bytes32)`.
+/// Init args for the v2 `KardamomProofOracle.initialize(address,address,
+/// bytes32,bytes32,bytes32,uint64,uint96)` (PR 5: two vkeys — batch guest
+/// for validity mode, single-block guest for disputes — plus window/bond).
+#[allow(clippy::too_many_arguments)]
 pub fn encode_proof_oracle_init_args(
     settlement: Address,
     verifier: Address,
-    program_vkey: alloy_primitives::B256,
+    batch_vkey: alloy_primitives::B256,
+    block_vkey: alloy_primitives::B256,
     genesis_root: alloy_primitives::B256,
+    challenge_window_secs: u64,
+    min_bond_wei: alloy_primitives::U256,
 ) -> Bytes {
-    Bytes::from((settlement, verifier, program_vkey, genesis_root).abi_encode_params())
+    Bytes::from(
+        (
+            settlement,
+            verifier,
+            batch_vkey,
+            block_vkey,
+            genesis_root,
+            challenge_window_secs,
+            min_bond_wei,
+        )
+            .abi_encode_params(),
+    )
 }
 
 #[cfg(test)]

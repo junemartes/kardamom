@@ -258,10 +258,14 @@ fn run_one<S: StateDatabase + Clone + Sync + 'static>(
                 // The streaming deposit path, verbatim: execute outside
                 // the scope against snapshot ∘ (parent ∘ prior segments),
                 // capture at the block-global index.
-                let mut merged = req.parent.clone().unwrap_or_default();
-                for l in seg_layers.iter() {
-                    merged.merge_from(l);
-                }
+                let merged = seg_layers.iter().fold(
+                    req.parent.clone().unwrap_or_default(),
+                    |mut merged, l| {
+                        merged.merge_from(l);
+                        merged
+                    },
+                );
+
                 let mut scope = ExecScope::new(&req.snapshot, Some(&merged), req.env)?;
                 let mut frag = revm::state::bal::Bal::new();
                 let (receipt, ws) = execute_record_in_scope(
