@@ -104,9 +104,12 @@ pub const DEFAULT_TX_ERROR_GRACE: Duration = Duration::from_millis(500);
 pub struct PendingReceipts {
     policy: AckPolicy,
     map: PendingMap,
-    /// Latest watermarks observed. Cached to avoid one-receiver-per-await
-    /// fanout.
-    latest: Arc<Mutex<Watermarks>>,
+    /// Latest watermarks observed — one `watch` slot per kind. `watch` IS
+    /// the "cache the latest value, no one-receiver-per-await fanout"
+    /// primitive the old `Arc<Mutex<Watermarks>>` hand-built: writers
+    /// `send_replace`, readers `borrow` with no lock and no await.
+    quorum: tokio::sync::watch::Sender<Option<BPosition>>,
+    local: tokio::sync::watch::Sender<Option<BPosition>>,
     /// See [`DEFAULT_TX_ERROR_GRACE`]; overridable for tests.
     error_grace: Duration,
     /// Watermark-ORDERED index of parked entries: `(tx_idx, seq) → Weak`.
@@ -141,7 +144,8 @@ impl PendingReceipts {
         Self {
             policy,
             map: Arc::new(DashMap::new()),
-            latest: Arc::new(Mutex::new(Watermarks::default())),
+            quorum: tokio::sync::watch::Sender::new(None),
+            local: tokio::sync::watch::Sender::new(None),
             error_grace,
             parked: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             park_seq: std::sync::atomic::AtomicU64::new(0),
@@ -186,7 +190,7 @@ impl PendingReceipts {
         };
         let mut e = entry.lock().await;
         e.receipt = Some(receipt.clone());
-        let latest = *self.latest.lock().await;
+        let latest = self.watermarks();
         if self.gate_satisfied(&latest, receipt.tx_idx) {
             if let Some(resp) = e.responder.take() {
                 // Release only; the woken waiter's Drop removes the slot.
@@ -209,8 +213,9 @@ impl PendingReceipts {
             // belongs to — and if that was the burst's FINAL tick, the
             // waiter would hang until client timeout, holding its
             // connection (an fd amplifier at burst tails). Re-draining
-            // after the park is idempotent and closes the window.
-            let latest2 = *self.latest.lock().await;
+            // after the park is idempotent and closes the window. The
+            // re-read is a lock-free `borrow` now.
+            let latest2 = self.watermarks();
             if self.gate_satisfied(&latest2, tx_idx) {
                 self.release_satisfied().await;
             }
@@ -268,17 +273,27 @@ impl PendingReceipts {
         }
     }
 
-    /// Called when a new quorum-watermark snapshot is observed.
+    /// Called when a new quorum-watermark snapshot is observed. The drain
+    /// runs inline so the release happens on the same tick with no
+    /// scheduler hop.
     pub async fn update_quorum_watermark(&self, wm: QuorumWatermark) {
-        self.latest.lock().await.quorum = Some(wm.position);
+        self.quorum.send_replace(Some(wm.position));
         self.release_satisfied().await;
     }
 
     /// Called when a new local-fsync watermark snapshot is observed (from
     /// the per-recorder stream for the local host).
     pub async fn update_local_watermark(&self, wm: FsyncWatermark) {
-        self.latest.lock().await.local = Some(wm.position);
+        self.local.send_replace(Some(wm.position));
         self.release_satisfied().await;
+    }
+
+    /// The latest watermark pair, read lock-free from the watch slots.
+    fn watermarks(&self) -> Watermarks {
+        Watermarks {
+            quorum: *self.quorum.borrow(),
+            local: *self.local.borrow(),
+        }
     }
 
     /// Walk every parked entry and release the ones whose stored receipt's
@@ -286,7 +301,7 @@ impl PendingReceipts {
     /// reader like every watcher path: it releases through the oneshot and
     /// leaves slot removal to the woken waiter's Drop.
     async fn release_satisfied(&self) {
-        let latest = *self.latest.lock().await;
+        let latest = self.watermarks();
         // Effective release watermark: the MIN over the watermark kinds the
         // policy requires. Absent required watermark ⇒ nothing releases.
         let mut effective: Option<BPosition> = None;
