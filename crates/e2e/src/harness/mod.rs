@@ -336,7 +336,10 @@ impl LocalStack {
         for (name, addr) in stack.metric_addrs() {
             metrics::poll_until(
                 &format!("{name} /metrics"),
-                Duration::from_secs(30),
+                // An upper bound, not a pace. 30s was not enough for
+                // process startup on a contended runner with two stacks
+                // launching at once (#250).
+                Duration::from_secs(90),
                 Duration::from_millis(200),
                 || async move { Ok(metrics::scrape(addr).await.ok().map(|_| ())) },
             )
@@ -345,7 +348,7 @@ impl LocalStack {
         let probe = l2::L2Client::new(&stack.ingress.rpc_url, Duration::from_secs(2))?;
         metrics::poll_until(
             "ingress eth_chainId",
-            Duration::from_secs(30),
+            Duration::from_secs(90),
             Duration::from_millis(200),
             || {
                 let probe = probe.clone();
